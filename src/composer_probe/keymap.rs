@@ -1030,29 +1030,23 @@ impl ClaudeEnv {
         }
     }
 
-    /// Reads the sources again, before an admission or at a settlement. A
-    /// read that differs from the spawn's holds this check and every later
-    /// one ([`Hold::Changed`]), as [`ClaudeKeymap::check`] does, except a
-    /// file that reads as a write caught half done, which holds this check
-    /// alone ([`Hold::Unparsable`]) and is read again at the next. It does
-    /// file I/O: call it with no lock held.
+    /// Reads the sources again, before an admission or at a settlement,
+    /// retrying a file that reads as a write caught half done
+    /// ([`read_claude_env_settled`]). A read that still differs from the
+    /// spawn's holds this check and every later one ([`Hold::Changed`]), as
+    /// [`ClaudeKeymap::check`] does, a file that still can't be parsed
+    /// included (the revcxfix2 review's LOW-2: a document Claude Code may
+    /// read and the deck can't, such as one with trailing commas, would
+    /// otherwise hold one check at a time and pass again once reverted).
+    /// What it can't see is a change undone before the next check reads it.
+    /// It does file I/O and the retries' sleeps: call it with no lock held,
+    /// off the executor.
     pub fn check(&self) -> Result<(), Hold> {
         if self.changed.load(Ordering::SeqCst) {
             return Err(Hold::Changed);
         }
-        let now = read_claude_env(&self.sources);
-        if now == self.at_spawn {
+        if read_claude_env_settled(&self.sources) == self.at_spawn {
             return claude_env_guard(&self.at_spawn);
-        }
-        if now.len() == self.at_spawn.len()
-            && now
-                .iter()
-                .zip(&self.at_spawn)
-                .all(|((path, read), (was_path, was))| {
-                    path == was_path && (read == was || read.transient())
-                })
-        {
-            return Err(Hold::Unparsable);
         }
         self.changed.store(true, Ordering::SeqCst);
         Err(Hold::Changed)

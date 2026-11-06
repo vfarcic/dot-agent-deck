@@ -2722,7 +2722,7 @@ fn probe_099_claude_env_sources_it_cannot_follow() {
     }
 }
 
-/// Scenario: Take a Claude Code's `env` sources before its spawn and judge them for the bound agent, then read them again as each check does. The same sources and reads pass; another working directory is `Changed`, `--settings` on its arguments `Editor` and unread arguments `Unmeasured`. After settlement a rewrite that leaves every `env` as it was (Claude Code rewrites `~/.claude.json` at each start) passes, a file caught half written holds that check alone, and an `env` that changed holds `Changed` for every later check, even once it is changed back.
+/// Scenario: Take a Claude Code's `env` sources before its spawn and judge them for the bound agent, then read them again as each check does. The same sources and reads pass; another working directory is `Changed`, `--settings` on its arguments `Editor` and unread arguments `Unmeasured`. After settlement a rewrite that leaves every `env` as it was (Claude Code rewrites `~/.claude.json` at each start) passes, and an `env` that changed, or a file that still can't be parsed after the check's retries (left half written, or with trailing commas), holds `Changed` for every later check, even once it is changed back.
 #[spec("inbox/probe/099")]
 #[test]
 fn probe_099_claude_env_is_compared_with_its_spawn_read() {
@@ -2773,10 +2773,6 @@ fn probe_099_claude_env_is_compared_with_its_spawn_read() {
         r#"{"permissions": {}}"#,
     );
     assert_eq!(env.check(), Ok(()), "a settings file with no env created");
-    write(&global, r#"{"numStartups": 2, "env": {"#);
-    assert_eq!(env.check(), Err(Hold::Unparsable), "caught half written");
-    write(&global, r#"{"numStartups": 3, "env": {"A": "1"}}"#);
-    assert_eq!(env.check(), Ok(()), "a half-written read doesn't latch");
     write(
         &global,
         r#"{"numStartups": 3, "env": {"A": "1", "VISUAL": "nvim"}}"#,
@@ -2784,6 +2780,26 @@ fn probe_099_claude_env_is_compared_with_its_spawn_read() {
     assert_eq!(env.check(), Err(Hold::Changed));
     write(&global, r#"{"numStartups": 3, "env": {"A": "1"}}"#);
     assert_eq!(env.check(), Err(Hold::Changed), "the hold latches");
+
+    // A read that still can't be parsed after its retries is a change, not a
+    // write caught half done: a document Claude Code may read (trailing
+    // commas) and the deck can't would otherwise hold one check at a time,
+    // and pass again once reverted (the revcxfix2 review's LOW-2).
+    for (row, now) in [
+        ("still half written", r#"{"numStartups": 2, "env": {"#),
+        (
+            "trailing commas",
+            r#"{"env": {"A": "1", "VISUAL": "nvim",},}"#,
+        ),
+    ] {
+        write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+        let env = ClaudeEnv::new(&baseline);
+        assert_eq!(env.check(), Ok(()), "{row}: before");
+        write(&global, now);
+        assert_eq!(env.check(), Err(Hold::Changed), "{row}");
+        write(&global, r#"{"numStartups": 1, "env": {"A": "1"}}"#);
+        assert_eq!(env.check(), Err(Hold::Changed), "{row}: latched");
+    }
 }
 
 /// Scenario: Judge a Codex home's `.env` file as the deck does before it checks a Codex's box (the revcxfix review's MEDIUM-B): no file passes, and so do lines naming only other variables; `VISUAL` or `EDITOR` in any form Codex reads (plain, `export`, quoted, spaced, any case), even in a comment or beside non-UTF-8 bytes, holds `Editor`, as does a file that can't be read. A `.env` created, changed or removed after the spawn's read holds `Changed`.
