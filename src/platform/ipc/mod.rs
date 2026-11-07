@@ -58,9 +58,9 @@ use crate::platform::transport::{AttachTransport, TransportReadHalf, TransportWr
 #[cfg(all(unix, test))]
 pub(crate) use unix::tests::{QueueFull, SaturatedListener};
 #[cfg(unix)]
-pub use unix::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
+pub use unix::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf, peer_closed};
 #[cfg(windows)]
-pub use windows::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf};
+pub use windows::{IpcClient, IpcListener, IpcReadHalf, IpcStream, IpcWriteHalf, peer_closed};
 
 /// PRD #741 M3: the attach protocol runs over an [`IpcStream`] on both
 /// backends, and each backend's `into_split` is what carries the drop semantics

@@ -7513,8 +7513,10 @@ const CODEX_PREFLIGHT_BASE: Duration = Duration::from_secs(60);
 /// Run one preflight `codex` call to completion or to `deadline`, killing it
 /// there. Output goes to a FILE rather than pipes for the reason
 /// [`opencode_model_probe`] gives. Returns the exit status, or `None` when the
-/// deadline killed it, with stdout and stderr together.
-fn run_codex_preflight(
+/// deadline killed it, with stdout and stderr together. Public so a test file's
+/// own Codex preflight (`codex_live_001`'s sandbox probe) gets the same bounded,
+/// kill-only-this-child wait without a sleep of its own (linkage-check rule 5).
+pub fn run_codex_preflight(
     command: &mut std::process::Command,
     deadline: Instant,
 ) -> Result<(Option<std::process::ExitStatus>, String), String> {
@@ -8277,8 +8279,16 @@ pub(crate) fn seed_claude_project_trust(
     // "Is this a project you created or one you trust?" prompt — which defaults
     // to "No", so it never times out on its own — for the full 120s, and the
     // cast reads as a product failure rather than a harness one.
+    //
+    // The host's document is re-based without what the deck's input-box check
+    // holds on ([`without_claude_check_holds`]); a test's own is left as the
+    // test wrote it.
     let mut cfg: serde_json::Value = read_claude_json_object(&test_cfg_path)
-        .or_else(|| read_claude_json_object(&host_home().join(".claude.json")))
+        .or_else(|| {
+            let mut host = read_claude_json_object(&host_home().join(".claude.json"))?;
+            without_claude_check_holds(&mut host);
+            Some(host)
+        })
         .unwrap_or_else(|| serde_json::json!({ "hasCompletedOnboarding": true }));
     if !cfg["projects"].is_object() {
         cfg["projects"] = serde_json::json!({});
@@ -8543,7 +8553,8 @@ pub fn seed_claude_worker_home(home: &Path, trust_paths: &[String]) -> std::io::
 /// through unchanged. A truly-malformed settings.json (still invalid
 /// after comment stripping) is now fail-CLOSED — we refuse to
 /// continue rather than risk shipping the host's hook commands into
-/// the test.
+/// the test. It also drops what the deck's input-box check holds on
+/// ([`without_claude_check_holds`]).
 pub(crate) fn strip_hooks_from_claude_settings(raw: &str) -> std::io::Result<String> {
     let cleaned = strip_jsonc_comments(raw);
     let mut v: serde_json::Value = serde_json::from_str(&cleaned).map_err(|e| {
@@ -8556,8 +8567,50 @@ pub(crate) fn strip_hooks_from_claude_settings(raw: &str) -> std::io::Result<Str
     if let Some(obj) = v.as_object_mut() {
         obj.remove("hooks");
     }
+    without_claude_check_holds(&mut v);
     serde_json::to_string_pretty(&v)
         .map_err(|e| std::io::Error::other(format!("serialize sanitized settings.json: {e}")))
+}
+
+/// Removes from a host Claude Code document (its `settings.json`, or the
+/// `~/.claude.json` a test HOME is re-based from) what the deck's input-box
+/// check holds a Claude Code on (`keymap::claude_env_member` and
+/// `claude_env_guard`, the revcxfix2 review's LOW-4): every member named
+/// `__proto__`, or `VISUAL` or `EDITOR` in any case, at any depth, and
+/// `HOME`, `CLAUDE_CONFIG_DIR` and every name starting with the deck's own
+/// `DOT_AGENT_DECK_` (the revcxfix3 review's NEW-1), in any case, from the
+/// top-level `env`.
+/// Left in, a developer whose own settings set an editor there would see
+/// every lane-2 Claude probe test held and timed out, which reads like a
+/// product regression; their own panes are held the same way, by design.
+pub(crate) fn without_claude_check_holds(v: &mut serde_json::Value) {
+    fn deep(v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::Object(members) => {
+                members.retain(|name, _| {
+                    name != "__proto__"
+                        && !["VISUAL", "EDITOR"]
+                            .iter()
+                            .any(|editor| name.eq_ignore_ascii_case(editor))
+                });
+                members.values_mut().for_each(deep);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(deep),
+            _ => {}
+        }
+    }
+    deep(v);
+    if let Some(env) = v.get_mut("env").and_then(|env| env.as_object_mut()) {
+        let deck = dot_agent_deck::composer_probe::keymap::DECK_ENV_PREFIX;
+        env.retain(|name, _| {
+            !["HOME", "CLAUDE_CONFIG_DIR"]
+                .iter()
+                .any(|moved| name.eq_ignore_ascii_case(moved))
+                && !name
+                    .get(..deck.len())
+                    .is_some_and(|start| start.eq_ignore_ascii_case(deck))
+        });
+    }
 }
 
 /// Strip `//` line comments and `/* … */` block comments from a
@@ -10851,6 +10904,46 @@ pub(crate) fn config_containment_env() -> [(&'static str, String); 2] {
     ]
 }
 
+/// The umask every harness process runs under (PRD #1666 part 3, act28):
+/// group and others lose write, so the modes the harness's directories get
+/// don't depend on the developer's umask.
+#[cfg(unix)]
+const HARNESS_UMASK: libc::mode_t = 0o022;
+
+/// Sets the process umask to [`HARNESS_UMASK`], once per test process, from
+/// [`harness_temp_root`]'s initialisation.
+///
+/// The composer probe's path rule (`src/composer_probe/path_rule.rs`) refuses
+/// an export whose directories are group- or other-writable, and the harness
+/// puts the agent's `TMPDIR`, `CODEX_HOME` and their parents under the
+/// per-test HOME. Under a developer's `umask 0002` those directories, the
+/// HOME included, were created `0775`, the path rule refused them, and 25
+/// lane-1 tests in `e2e_probe_delivery` and `e2e_live_segments` failed
+/// locally while passing on RWX for the same tree. Pinning the umask
+/// covers the directories the harness makes and those its daemon's children
+/// (Python and Rust stand-ins) make, which a mode given at each of the
+/// harness's own calls would not reach.
+///
+/// It runs once, so a test that sets another umask after its first harness
+/// call keeps it. (`tests/context_publish.rs` sets and restores its own, but
+/// it doesn't link this harness, so the pin doesn't reach it.)
+///
+/// What the pin also hides: the editor helper's own root falls back from
+/// `<state_dir>/editor` to `$XDG_RUNTIME_DIR` when an ancestor of the state
+/// root is group-writable (`src/composer_probe/instance.rs`), and the
+/// harness's state roots, under its default temp base, no longer are, so
+/// lane 2 doesn't exercise that fallback; lane 1 does
+/// (`tests/e2e_editor_installation.rs`).
+#[cfg(unix)]
+fn pin_harness_umask() {
+    // SAFETY: `umask(2)` swaps a per-process value and cannot fail. nextest
+    // runs one process per test, and this runs inside a `OnceLock`
+    // initialisation before the harness creates its temp root.
+    unsafe {
+        libc::umask(HARNESS_UMASK);
+    }
+}
+
 pub(crate) fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
@@ -10859,6 +10952,11 @@ pub(crate) fn harness_temp_root() -> &'static Path {
             // is where the panic hook — and with it the load baseline — gets
             // installed for them. Idempotent; a no-op when already installed.
             install_credential_redaction();
+            // Before the first directory the harness makes, so that it, the
+            // daemons it spawns and their stand-ins create everything at the
+            // same modes whatever the developer's umask is.
+            #[cfg(unix)]
+            pin_harness_umask();
             let choice = harness_temp_base();
             for warning in &choice.warnings {
                 eprintln!("[harness] WARNING: {warning}");
@@ -12688,6 +12786,144 @@ pub fn write_late_announcing_paste_agent(
     )
 }
 
+/// PRD #1666 part 3, round 5-wake: an agent stand-in the doorbell can type
+/// into. In an e2e build the deck types only into an editor whose screen it has
+/// measured, and for tests that is the stand-in profile
+/// (`DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin`, its contract in
+/// `tests/support/inbox_doorbell.rs`). This one puts its terminal in raw mode,
+/// draws that profile's rows and logs each line submitted to it to `argv[2]`:
+/// with `argv[3]` set to `late`, as [`LATE_ANNOUNCE_RECEIVED`] then
+/// `submitted|line`, each submit also reported with a `UserPromptSubmit` hook
+/// as Claude Code reports it; with `record`, as the line itself, and a
+/// doorbell line also runs `argv[1] inbox fetch` in the pane and appends what
+/// it printed.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub const PROFILED_AGENT: &str = r#"import os, sys, tty, termios, json, subprocess, re, select
+tty.setraw(0, termios.TCSANOW)
+deck, log, style = sys.argv[1], sys.argv[2], sys.argv[3]
+ring = re.compile(r'^\([a-z]{6}\) dot-agent-deck: message ')
+line = bytearray()
+escape = bytearray()
+taken = []
+def note(text):
+    with open(log, 'ab') as f:
+        f.write(text + b'\n')
+def redraw():
+    cols = os.get_terminal_size(0).columns
+    content = bytes(line) if line else b'\x1b[2m<empty>\x1b[22m'
+    os.write(1, b'\x1b[2J\x1b[HDOORBELL-STANDIN-READY\r\n' + b'W' * cols + b'\r\n\r\n'
+             + b''.join(b'SUBMITTED:' + t + b'\r\n' for t in taken[-5:])
+             + b'COMPOSER: ' + content)
+redraw()
+geometry = os.get_terminal_size(0)
+while True:
+    if os.get_terminal_size(0) != geometry:
+        geometry = os.get_terminal_size(0)
+        redraw()
+    if not select.select([0], [], [], 0.025)[0]:
+        continue
+    chunk = os.read(0, 4096)
+    if not chunk: break
+    for c in chunk:
+        if escape:
+            escape.append(c)
+            if len(escape) == 2 and c != 0x5b and c != 0x4f:
+                escape.clear()
+            elif len(escape) >= 3 and 0x40 <= c <= 0x7e:
+                escape.clear()
+        elif c == 27:
+            escape.append(c)
+        elif c == 13:
+            value = bytes(line)
+            taken.append(value)
+            line.clear()
+            redraw()
+            if style == 'late':
+                note(b'received|' + value)
+                prompt = {'hook_event_name': 'UserPromptSubmit',
+                          'session_id': 'genuine-' + os.environ.get('DOT_AGENT_DECK_PANE_ID', ''),
+                          'prompt': value.decode('utf-8', 'replace')}
+                subprocess.run([deck, 'hook', '--agent', 'claude-code'], input=json.dumps(prompt).encode(),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+                note(b'submitted|line')
+            else:
+                note(value)
+                if ring.match(value.decode('utf-8', 'replace')):
+                    result = subprocess.run([deck, 'inbox', 'fetch'], capture_output=True, timeout=8)
+                    note(result.stdout + result.stderr)
+        elif c == 21:
+            line.clear()
+        elif c in (8, 127):
+            if line: line.pop()
+        else:
+            line.append(c)
+    redraw()
+"#;
+
+/// Write [`PROFILED_AGENT`] into `dir` and answer its path, which the
+/// stand-in profile's binary variable names.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_profiled_agent(dir: &Path) -> PathBuf {
+    let path = dir.join("profiled-agent.py");
+    std::fs::write(&path, PROFILED_AGENT).expect("write profiled agent");
+    path
+}
+
+/// The shell line that hands a recorder shim's pane to [`PROFILED_AGENT`]
+/// (`script`), recording to `record` in its `record` style.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn exec_profiled_recorder(script: &Path, bin: &str, record: &Path) -> String {
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    format!(
+        "exec python3 {} {} {} record\n",
+        quote(&script.to_string_lossy()),
+        quote(bin),
+        quote(&record.to_string_lossy())
+    )
+}
+
+/// [`write_late_announcing_paste_agent`]'s prologue and genuine
+/// `SessionStart`, then [`PROFILED_AGENT`] in its `late` style as the
+/// reader. Answers the command to start, which names the profiled agent's
+/// path, and that path.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn write_late_announcing_profiled_agent(
+    dir: &Path,
+    log_name: &str,
+    announce_after_secs: u64,
+) -> (String, PathBuf) {
+    let genuine_start = late_announce_hook(
+        r#"{"hook_event_name":"SessionStart","session_id":"genuine-%s"}"#,
+        "\"$DOT_AGENT_DECK_PANE_ID\"",
+        98,
+    );
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let script = write_profiled_agent(dir);
+    let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+    let shell = write_late_announcing_script(
+        dir,
+        &format!(
+            "{prologue}\
+             {genuine_start}\
+             exec python3 \"$1\" {bin} \"$log\" late\n",
+            prologue = late_announce_prologue(log_name, announce_after_secs),
+            bin = quote(bin),
+        ),
+    );
+    // `exec` all the way down, so the pane's own process is the one that runs
+    // the profiled agent's path.
+    let command = format!(
+        "exec {} {}",
+        quote(&shell.to_string_lossy()),
+        quote(&script.to_string_lossy())
+    );
+    (command, script)
+}
+
 /// Issue #1006: the same fixture with a REAL agent as its tail — the shape the
 /// field environment has (`devbox run agent` → init hooks → `claude`), and the
 /// one `prompt/new-pane/016` needs in order to be able to fail at all.
@@ -13725,9 +13961,29 @@ impl AttachInput {
     }
 }
 
+/// How long dropping an [`AttachInput`] waits for the daemon to end the
+/// connection after this client ended its writes, before closing it outright.
+#[cfg(unix)]
+const ATTACH_CLOSE_GRACE: Duration = Duration::from_secs(2);
+
 #[cfg(unix)]
 impl Drop for AttachInput {
     fn drop(&mut self) {
+        // The write half first: the daemon reads every frame this client
+        // sent, then the end of the stream, and ends the connection itself.
+        // Shutting both halves at once failed the daemon's own writes with
+        // `EPIPE` (its attach reply comes before it reads any input), and it
+        // then dropped the connection unread: a drop right after a `write`
+        // lost that write (PRD #1666 part 3, Q35-22: S-22's refusal checks
+        // type into the pane and drop the attach before asserting the echo).
+        // The drain thread reads until the daemon closes, within the grace.
+        let _ = self.stream.shutdown(std::net::Shutdown::Write);
+        let deadline = std::time::Instant::now() + ATTACH_CLOSE_GRACE;
+        while self.drain.as_ref().is_some_and(|d| !d.is_finished())
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         self.stop.store(true, Ordering::Relaxed);
         // Shutting the socket down, not just dropping this half, is what
         // closes it: the drain thread holds a clone of the same socket.

@@ -694,7 +694,10 @@ async fn daemon_status_002_json_output_lists_the_managed_agent_inner() {
                 "claimed": 0,
                 "undeliverable": 0,
                 "last_acked_at": null,
-                "wake": "doorbell",
+                // PRD #1666 part 3, round 5-wake (Q16): the stand-in shows no
+                // start-up header the deck recognises, so the deck won't type
+                // its doorbell, and WAKE says so.
+                "wake": "none",
                 "component": null,
             },
             "label": JSON_LABEL,

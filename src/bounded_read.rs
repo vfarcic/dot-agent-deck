@@ -21,7 +21,9 @@
 //! error wording names that flag because it is the only thing that calls it.
 //! [`read_capped_line`] is the async, line-oriented sibling of the primitive,
 //! written for the daemon's hook socket and applying the identical
-//! refuse-never-truncate rule to a `\n`-delimited message.
+//! refuse-never-truncate rule to a `\n`-delimited message. Its accumulator,
+//! [`CappedLine`], is public for a reader that races the read against a
+//! deadline: kept across the race, it loses no partial line to a cancellation.
 //!
 //! [`crate::config::load_features_file`] applies the same shape inline with
 //! different failure semantics (a bad `[features]` file keeps the previous
@@ -183,51 +185,92 @@ pub async fn read_capped_line<R>(
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    use tokio::io::AsyncBufReadExt as _;
+    CappedLine::default().read(reader, max_bytes).await
+}
 
-    let mut buf: Vec<u8> = Vec::new();
-    loop {
-        let available = match reader.fill_buf().await {
-            Ok(available) => available,
-            Err(e) => return Err(CappedLineError::Io(e)),
-        };
-        if available.is_empty() {
-            // EOF. A trailing partial line is still a line (`Lines` semantics);
-            // nothing buffered means the peer simply closed.
-            if buf.is_empty() {
-                return Ok(None);
-            }
-            return finish(buf);
-        }
-        match available.iter().position(|&b| b == b'\n') {
-            Some(newline) => {
-                // The line's length excludes the newline itself, so a line
-                // ending exactly at the cap is within it.
-                if buf.len() + newline > max_bytes {
-                    return Err(CappedLineError::TooLong {
-                        limit: max_bytes,
-                        line_bytes: buf.len() + newline,
-                    });
+/// [`read_capped_line`]'s accumulator, kept by a caller that may cancel the
+/// read (PRD #1666 part 3, Q85): a `select!` that drops the read future
+/// drops nothing read, because every byte taken from the reader is already
+/// here. The next [`CappedLine::read`] continues the same line, with the cap
+/// counting the bytes from before the cancellation, so a line is never lost
+/// and never restarted from its suffix.
+#[derive(Debug, Default)]
+pub struct CappedLine {
+    buf: Vec<u8>,
+}
+
+impl CappedLine {
+    /// [`read_capped_line`], continuing whatever line an earlier, cancelled
+    /// call left here. Cancellation-safe: it is cancelled only while waiting
+    /// for bytes, and bytes move from `reader` to here with no wait between
+    /// the copy and the `consume`.
+    pub async fn read<R>(
+        &mut self,
+        reader: &mut R,
+        max_bytes: usize,
+    ) -> Result<Option<String>, CappedLineError>
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        use tokio::io::AsyncBufReadExt as _;
+
+        loop {
+            let available = match reader.fill_buf().await {
+                Ok(available) => available,
+                Err(e) => {
+                    self.buf.clear();
+                    return Err(CappedLineError::Io(e));
                 }
-                buf.extend_from_slice(&available[..newline]);
-                reader.consume(newline + 1);
-                return finish(buf);
-            }
-            None => {
-                // Every byte in this chunk belongs to the line, so the line is
-                // already at least this long — no newline can arrive to make
-                // it shorter. Refuse now rather than buffer the overage.
-                let chunk = available.len();
-                if buf.len() + chunk > max_bytes {
-                    return Err(CappedLineError::TooLong {
-                        limit: max_bytes,
-                        line_bytes: buf.len() + chunk,
-                    });
+            };
+            if available.is_empty() {
+                // EOF. A trailing partial line is still a line (`Lines`
+                // semantics); nothing buffered means the peer simply closed.
+                if self.buf.is_empty() {
+                    return Ok(None);
                 }
-                buf.extend_from_slice(available);
-                reader.consume(chunk);
+                return finish(std::mem::take(&mut self.buf));
+            }
+            match available.iter().position(|&b| b == b'\n') {
+                Some(newline) => {
+                    // The line's length excludes the newline itself, so a line
+                    // ending exactly at the cap is within it.
+                    if self.buf.len() + newline > max_bytes {
+                        let line_bytes = self.buf.len() + newline;
+                        self.buf.clear();
+                        return Err(CappedLineError::TooLong {
+                            limit: max_bytes,
+                            line_bytes,
+                        });
+                    }
+                    self.buf.extend_from_slice(&available[..newline]);
+                    reader.consume(newline + 1);
+                    return finish(std::mem::take(&mut self.buf));
+                }
+                None => {
+                    // Every byte in this chunk belongs to the line, so the line
+                    // is already at least this long — no newline can arrive to
+                    // make it shorter. Refuse now rather than buffer the
+                    // overage.
+                    let chunk = available.len();
+                    if self.buf.len() + chunk > max_bytes {
+                        let line_bytes = self.buf.len() + chunk;
+                        self.buf.clear();
+                        return Err(CappedLineError::TooLong {
+                            limit: max_bytes,
+                            line_bytes,
+                        });
+                    }
+                    self.buf.extend_from_slice(available);
+                    reader.consume(chunk);
+                }
             }
         }
+    }
+
+    /// Whether a line is begun and not finished: bytes read that a newline
+    /// or the end hasn't completed yet.
+    pub fn partial(&self) -> bool {
+        !self.buf.is_empty()
     }
 }
 
@@ -745,6 +788,89 @@ mod tests {
             CappedLineError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::InvalidData),
             other => panic!("expected Io(InvalidData), got {other:?}"),
         }
+    }
+
+    /// PRD #1666 part 3 (Q85): a chunk with no newline is counted against
+    /// the cap the moment it arrives, so a first chunk over the cap is
+    /// refused at once rather than taken and waited on, and one exactly at
+    /// the cap is kept until its newline arrives.
+    #[tokio::test]
+    async fn capped_line_counts_a_newline_free_chunk_on_arrival() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut peer, ours) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(ours);
+        let mut line = CappedLine::default();
+        peer.write_all(&[b'x'; 17]).await.unwrap();
+        match line_within_timeout(line.read(&mut reader, 16)).await {
+            Err(CappedLineError::TooLong { limit, line_bytes }) => {
+                assert_eq!((limit, line_bytes), (16, 17));
+            }
+            other => panic!("expected TooLong on arrival, got {other:?}"),
+        }
+
+        let (mut peer, ours) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(ours);
+        let mut line = CappedLine::default();
+        peer.write_all(&[b'x'; 16]).await.unwrap();
+        let waiting = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            line.read(&mut reader, 16),
+        )
+        .await;
+        assert!(
+            waiting.is_err(),
+            "at the cap, still waiting for its newline"
+        );
+        peer.write_all(b"\n").await.unwrap();
+        let got = line_within_timeout(line.read(&mut reader, 16)).await;
+        assert_eq!(got.unwrap().as_deref(), Some("x".repeat(16).as_str()));
+    }
+
+    /// PRD #1666 part 3 (Q85): a read cancelled mid-line loses nothing. The
+    /// prefix it took from the reader stays in the [`CappedLine`], the next
+    /// read finishes the same line rather than returning the suffix as one,
+    /// and the cap counts the bytes from both sides of the cancellation.
+    #[tokio::test]
+    async fn capped_line_keeps_a_line_across_a_cancelled_read() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut peer, ours) = tokio::io::duplex(64);
+        let mut reader = tokio::io::BufReader::new(ours);
+        let mut line = CappedLine::default();
+        peer.write_all(b"{\"a\":").await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            line.read(&mut reader, 64),
+        )
+        .await;
+        assert!(cancelled.is_err(), "no newline yet: still reading");
+        assert!(line.partial(), "the prefix is kept, not dropped");
+        assert!(reader.buffer().is_empty(), "and taken from the reader");
+        peer.write_all(b"1}\nnext\n").await.unwrap();
+        let got = line_within_timeout(line.read(&mut reader, 64)).await;
+        assert_eq!(got.unwrap().as_deref(), Some("{\"a\":1}"));
+        assert!(!line.partial());
+        let got = line_within_timeout(line.read(&mut reader, 64)).await;
+        assert_eq!(got.unwrap().as_deref(), Some("next"));
+
+        // The cap: ten bytes before the cancellation and ten after are a
+        // twenty-byte line, over a sixteen-byte cap, refused whole.
+        peer.write_all(&[b'x'; 10]).await.unwrap();
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            line.read(&mut reader, 16),
+        )
+        .await;
+        assert!(cancelled.is_err());
+        peer.write_all(&[b'x'; 10]).await.unwrap();
+        match line_within_timeout(line.read(&mut reader, 16)).await {
+            Err(CappedLineError::TooLong { limit, line_bytes }) => {
+                assert_eq!((limit, line_bytes), (16, 20));
+            }
+            other => panic!("expected TooLong across the cancellation, got {other:?}"),
+        }
+        assert!(!line.partial(), "a refused line leaves nothing behind");
     }
 
     /// The production constant is generous enough that the largest payload the

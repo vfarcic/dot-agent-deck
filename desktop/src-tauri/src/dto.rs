@@ -788,6 +788,24 @@ pub struct DesktopAgent {
     /// the agent waits on nothing, and from a daemon that predates the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pending_question: Option<DesktopPendingQuestion>,
+    /// PRD #1666 part 3 (Q35): the deck is holding what the user typed into
+    /// this agent's pane (`AgentRecord.input_held`, which the record carries
+    /// whether or not the agent has sent a hook, Q35-20e), copied through: its
+    /// cause is a wire value the webview words, and the rest are numbers.
+    /// Absent while it holds nothing, and from a daemon predating the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<DesktopInputHeld>,
+    /// PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's
+    /// previous agent generation was discarded when it retired
+    /// (`AgentRecord.input_discarded`). Absent while there is none to report.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub input_discarded: bool,
+    /// PRD #1666 part 3 (Q35): the outcomes of this agent's recently held
+    /// answers that carried a client token
+    /// (`SessionSnapshot.answer_settlements`), which the voice panel reads for
+    /// its own token only. Absent while empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub answer_settlements: Vec<DesktopAnswerSettlement>,
     /// PRD #1401: the pull request this agent's work produced, copied through
     /// from `SessionSnapshot.pull_request`. Its fields are single words and its
     /// enum values snake_case, so the core type is the webview's shape as is.
@@ -828,6 +846,14 @@ pub struct DesktopInbox {
     /// messages, so the tile shows them as waiting to wake.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub wake_stalled: bool,
+    /// PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for the
+    /// waiting messages (`possible_draft`, `awaiting_prompt`, `paste_open`),
+    /// the daemon's wire value; `unknown` for one this build does not know.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wake_hold: Option<String>,
+    /// PRD #1666 part 3 (Q35): beside `wake_hold` `cannot_check`, why.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_detail: Option<DesktopHoldDetail>,
     /// PRD #1666 §6.5: the deck messages waiting on the user's Retry or
     /// Cancel. Sender and subject are display copies.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -857,6 +883,72 @@ pub struct DesktopInbox {
     /// (`dot_agent_deck::agent_notice::AgentNotice::display_text`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent_notice: Option<String>,
+}
+
+/// PRD #1666 part 3 (Q35): the webview's view of a `HoldDetail`.
+///
+/// **The strings are NOT scrubbed here**, unlike every other daemon text this
+/// crate projects, and that is deliberate: the card shows a refused path's
+/// control and bidi characters escaped (`holdDetailText` in
+/// `desktop/src/lib/inboxWords.ts`, the TUI's `hold_detail_display`), so the
+/// user sees what is actually in the path, and stripping them here would hide
+/// the very characters that make it refused. They are bounded here to
+/// [`MAX_HOLD_DETAIL_CHARS`] and reach the DOM
+/// only through that escape, as text.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopHoldDetail {
+    /// `filesystem`, `writable_directory`, `foreign_owner`, `acl`,
+    /// `export_file`, `io` or `unknown`.
+    pub cause: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_component: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<String>,
+}
+
+/// PRD #1666 part 3 (Q35): the webview's view of an `InputHeld`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopInputHeld {
+    pub generation: u64,
+    /// `checking`, `check_not_opened`, `check_not_returned`,
+    /// `after_your_ctrl_g`, `queue_full`, `check_blocked` or `unknown`.
+    pub cause: String,
+    pub held_ops: u32,
+    pub held_bytes: u32,
+    pub since_ms: u64,
+}
+
+/// PRD #1666 part 3 (Q35): the webview's view of an `AnswerSettlement`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopAnswerSettlement {
+    pub question_id: String,
+    pub revision: u64,
+    pub client_token: u64,
+    /// `written`, `partial`, `superseded`, `retired`, `write_failed` or
+    /// `unknown`.
+    pub outcome: String,
+}
+
+/// A serde enum's wire value, `unknown` for one with none.
+fn wire_name(value: impl Serialize) -> String {
+    serde_json::to_value(value)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// The longest hold detail string the webview is sent, in characters: the
+/// daemon's own bound on a `HoldDetail` string, which its reader already
+/// applies, restated here because this crate does not name that module
+/// (linkage-check rule 12).
+const MAX_HOLD_DETAIL_CHARS: usize = 256;
+
+/// `text` cut to [`MAX_HOLD_DETAIL_CHARS`].
+fn bounded_hold_detail(text: &str) -> String {
+    text.chars().take(MAX_HOLD_DETAIL_CHARS).collect()
 }
 
 /// PRD #1666 §6.4: one deck message a tile lists with its own Retry and
@@ -952,6 +1044,11 @@ pub struct DesktopPendingQuestion {
     /// rather than answered with a choice made for the old one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub revision: Option<u64>,
+    /// PRD #1666 part 3 (Q35, OQ6): the daemon accepted an answer to this
+    /// question and holds it until it can write it, so the voice panel shows
+    /// it as queued. Its outcome is a settlement, never this clearing.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub answer_queued: bool,
 }
 
 /// The tool a [`DesktopPendingQuestion`] asks about.
@@ -1100,6 +1197,7 @@ pub(crate) fn map_pending_question(
         }),
         answerable,
         revision: question.revision,
+        answer_queued: question.answer_queued,
     }
 }
 
@@ -2298,6 +2396,19 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
             .unwrap_or_else(|| "none".to_string()),
         component: summary.component.as_deref().map(safe_display_text),
         wake_stalled: summary.wake_stalled,
+        wake_hold: summary.wake_hold.and_then(|hold| {
+            serde_json::to_value(hold)
+                .ok()
+                .and_then(|value| value.as_str().map(str::to_string))
+        }),
+        hold_detail: summary
+            .hold_detail
+            .as_ref()
+            .map(|detail| DesktopHoldDetail {
+                cause: wire_name(detail.cause),
+                path_component: detail.path_component.as_deref().map(bounded_hold_detail),
+                filesystem: detail.filesystem.as_deref().map(bounded_hold_detail),
+            }),
         attention: summary
             .notices
             .attention
@@ -2350,6 +2461,44 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
     let pending_question = live
         .and_then(|snapshot| snapshot.pending_question.as_ref())
         .map(map_pending_question);
+    // Q35-20e (U3-04): from the record, which carries it for a generation
+    // that has sent no hook; the live snapshot's copy is the same value.
+    // Bound to the record's own generation where its id names one, as the
+    // TUI binds it (`PaneHeld::new`).
+    let generation: Option<u64> = record.id.parse().ok();
+    let input_held = record
+        .input_held
+        .as_ref()
+        .or(live.and_then(|snapshot| snapshot.input_held.as_ref()))
+        .filter(|held| generation.is_none_or(|generation| held.generation == generation))
+        .map(|held| DesktopInputHeld {
+            generation: held.generation,
+            cause: wire_name(held.cause),
+            held_ops: held.held_ops,
+            held_bytes: held.held_bytes,
+            since_ms: held.since_ms,
+        });
+    // Q35-20e: never a generation's own: the notice names the one it
+    // replaced.
+    let input_discarded = record
+        .input_discarded
+        .as_ref()
+        .zip(generation)
+        .is_some_and(|(discarded, generation)| discarded.generation < generation);
+    let answer_settlements = live
+        .map(|snapshot| {
+            snapshot
+                .answer_settlements
+                .iter()
+                .map(|settlement| DesktopAnswerSettlement {
+                    question_id: settlement.question_id.clone(),
+                    revision: settlement.revision,
+                    client_token: settlement.client_token,
+                    outcome: wire_name(settlement.outcome),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
 
     DesktopAgent {
         id: record.id,
@@ -2374,6 +2523,9 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         inbox,
         delivery_notice,
         pending_question,
+        input_held,
+        input_discarded,
+        answer_settlements,
         pull_request,
         tab,
         // Stamped by the snapshot that lists this record, which knows which
@@ -4076,6 +4228,8 @@ mod tests {
 
     fn fixture_record() -> AgentRecord {
         AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: "agent-7".into(),
             pane_id_env: Some("pane-7".into()),
             display_name: Some("builder".into()),
@@ -4108,6 +4262,8 @@ mod tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             }),
             spawned_at_ms: None,
             // Issue #856: as the DAEMON reported it. The fixture agent is
@@ -4146,6 +4302,8 @@ mod tests {
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             notices: Default::default(),
         });
         let value = serde_json::to_value(map_agent(record)).unwrap();
@@ -4160,6 +4318,133 @@ mod tests {
             value["inbox"].get("attention").is_none(),
             "absent while empty"
         );
+    }
+
+    /// Scenario: Map daemon records whose inbox summary says why the doorbell holds into the desktop DTO: each reason this build knows keeps its wire spelling for the tile, one a newer daemon names reads as `unknown`, and a summary with no reason sends none.
+    #[test]
+    fn agent_mapping_carries_why_the_doorbell_holds() {
+        for (wire, mapped) in [
+            ("possible_draft", "possible_draft"),
+            ("awaiting_prompt", "awaiting_prompt"),
+            ("paste_open", "paste_open"),
+            ("a_newer_reason", "unknown"),
+        ] {
+            let mut record = fixture_record();
+            record.inbox = Some(
+                serde_json::from_value(serde_json::json!({
+                    "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell",
+                    "wake_stalled": true, "wake_hold": wire
+                }))
+                .unwrap(),
+            );
+            let value = serde_json::to_value(map_agent(record)).unwrap();
+            assert_eq!(value["inbox"]["wakeHold"], mapped, "{wire}");
+            assert_eq!(value["inbox"]["wakeStalled"], true, "{wire}");
+        }
+        let mut record = fixture_record();
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell"
+            }))
+            .unwrap(),
+        );
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert!(value["inbox"].get("wakeHold").is_none(), "{value}");
+    }
+
+    /// Scenario: Map daemon records for an agent that has sent no hook (no live snapshot) and whose pane's typing is held, or whose predecessor's held typing was discarded. The hold reaches the webview from the record alone; one naming another generation than the record's, and a discarded notice naming the record's own generation or a later one, reach it as nothing.
+    #[test]
+    fn agent_mapping_reads_held_typing_from_a_record_with_no_hook() {
+        let mut record = fixture_record();
+        record.id = "12".into();
+        record.live = None;
+        record.input_held = serde_json::from_value(serde_json::json!({
+            "generation": 12, "cause": "check_not_opened", "held_ops": 1, "held_bytes": 4, "since_ms": 3
+        }))
+        .unwrap();
+        record.input_discarded = serde_json::from_value(serde_json::json!({
+            "generation": 11, "held_ops": 1, "held_bytes": 4, "at_ms": 3
+        }))
+        .unwrap();
+        let value = serde_json::to_value(map_agent(record.clone())).unwrap();
+        assert_eq!(value["inputHeld"]["cause"], "check_not_opened", "{value}");
+        assert_eq!(value["inputDiscarded"], true, "{value}");
+        record.input_held.as_mut().unwrap().generation = 11;
+        record.input_discarded.as_mut().unwrap().generation = 12;
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        for absent in ["inputHeld", "inputDiscarded"] {
+            assert!(value.get(absent).is_none(), "{absent}: {value}");
+        }
+    }
+
+    /// Scenario: Map a daemon record whose snapshot holds the user's typing, queues an answer, settles two earlier ones and says why it can't check the input box into the desktop DTO; each reaches the webview by its wire spelling, a value a newer daemon names reads as `unknown`, the detail's strings keep their controls for the tile to escape, bounded, and a record with none of them sends none.
+    #[test]
+    fn agent_mapping_carries_held_typing_check_details_and_settlements() {
+        let mut record = fixture_record();
+        let long = format!("/a\u{1b}{}", "é".repeat(300));
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell",
+                "wake_hold": "cannot_check",
+                "hold_detail": {"cause": "filesystem", "path_component": long, "filesystem": "nfs"}
+            }))
+            .unwrap(),
+        );
+        let live = record.live.as_mut().unwrap();
+        live.input_held = serde_json::from_value(serde_json::json!({
+            "generation": 9, "cause": "a_newer_cause", "held_ops": 2, "held_bytes": 7, "since_ms": 5
+        }))
+        .unwrap();
+        live.answer_settlements = serde_json::from_value(serde_json::json!([
+            {"question_id": "q-1", "revision": 7, "client_token": 42, "outcome": "partial"},
+            {"question_id": "q-1", "revision": 6, "client_token": 41, "outcome": "a_newer_outcome"}
+        ]))
+        .unwrap();
+        live.pending_question = serde_json::from_value(serde_json::json!({
+            "id": "q-1", "kind": "permission", "channel": "held", "questions": [],
+            "raised_at_ms": 1, "revision": 7, "answer_queued": true
+        }))
+        .unwrap();
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["inbox"]["wakeHold"], "cannot_check");
+        assert_eq!(value["inbox"]["holdDetail"]["cause"], "filesystem");
+        assert_eq!(value["inbox"]["holdDetail"]["filesystem"], "nfs");
+        let path = value["inbox"]["holdDetail"]["pathComponent"]
+            .as_str()
+            .unwrap();
+        assert!(
+            path.starts_with("/a\u{1b}"),
+            "kept for the tile to escape: {path:?}"
+        );
+        assert_eq!(path.chars().count(), MAX_HOLD_DETAIL_CHARS);
+        assert_eq!(
+            value["inputHeld"],
+            serde_json::json!({"generation": 9, "cause": "unknown", "heldOps": 2, "heldBytes": 7, "sinceMs": 5})
+        );
+        assert_eq!(
+            value["answerSettlements"],
+            serde_json::json!([
+                {"questionId": "q-1", "revision": 7, "clientToken": 42, "outcome": "partial"},
+                {"questionId": "q-1", "revision": 6, "clientToken": 41, "outcome": "unknown"}
+            ])
+        );
+        assert_eq!(value["pendingQuestion"]["answerQueued"], true);
+
+        let value = serde_json::to_value(map_agent(fixture_record())).unwrap();
+        for absent in ["inputHeld", "inputDiscarded", "answerSettlements"] {
+            assert!(value.get(absent).is_none(), "{absent}: {value}");
+        }
+        let mut record = fixture_record();
+        record.inbox = Some(
+            serde_json::from_value(serde_json::json!({
+                "queued": 1, "fetched": 0, "undeliverable": 0, "wake": "doorbell",
+                "wake_hold": "needs_fetch"
+            }))
+            .unwrap(),
+        );
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["inbox"]["wakeHold"], "needs_fetch");
+        assert!(value["inbox"].get("holdDetail").is_none(), "{value}");
     }
 
     /// Scenario: Map a daemon record whose card notices carry the daemon's OpenCode notice — and one of a kind this build does not know, with a control character in it — into the desktop DTO; the tile gets each sentence as a display copy (PRD #2050).

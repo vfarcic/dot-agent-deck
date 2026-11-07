@@ -4491,6 +4491,41 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     await bridge.dispose();
   });
 
+  /// Scenario: inbox/status/034 — While the local deck is on screen, the remote deck's daemon reports that it holds the doorbell for its agent, then that it no longer does. The remote agent's hold follows both without a snapshot, so the agent dashboard's attention counts it; the local agent with the same id is untouched, and the deck screen's drawer records nothing from the remote deck.
+  it("folds another connected deck's wake update into that deck alone", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const withInbox = (dto: DesktopSnapshotDto): DesktopSnapshotDto => ({
+      ...dto,
+      agents: dto.agents.map((agent) => ({ ...agent, inbox: { queued: 1, fetched: 0, undeliverable: 0, wake: "doorbell" } })),
+    });
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_bootstrap") return withInbox(local);
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    onFleet(await bridge.connect());
+    listeners.get("desktop://snapshot")?.({ payload: withInbox(remote) });
+    const wake = (hold?: string) => listeners.get("desktop://daemon-event")?.({ payload: {
+      deck: remoteId, kind: "inbox", pane_id: "pane-1", agent_id: "1", message_id: "m-k3xzq2ab-0000000000000009",
+      state: "queued", wake_update: true, wake_stalled: true, ...(hold ? { wake_hold: hold } : {}),
+    } });
+    const agentOn = (deckId: string) =>
+      (onFleet.mock.calls.at(-1)?.[0] as DeckFleet).find((deck) => deck.connection.deckId === deckId)?.agents[0];
+
+    wake("possible_draft");
+    expect(agentOn(remoteId)?.inbox?.wakeHold).toBe("possible_draft");
+    expect(agentOn(remoteId)?.inbox?.wakeStalled).toBe(true);
+    expect(agentOn(localId)?.inbox?.wakeHold).toBeUndefined();
+    const fleet = onFleet.mock.calls.at(-1)?.[0] as DeckFleet;
+    expect(fleet.find((deck) => deck.connection.deckId === localId)?.evidence).toEqual([]);
+
+    wake();
+    expect(agentOn(remoteId)?.inbox?.wakeHold).toBeUndefined();
+    await bridge.dispose();
+  });
+
   /**
    * The reconnect-shaped half of the same finding. Scenario: hook events are
    * recorded on the local deck, the stored selection then names the remote deck,

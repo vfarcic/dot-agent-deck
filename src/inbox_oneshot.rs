@@ -2439,10 +2439,28 @@ pub(crate) mod tests {
                 Err(io::ErrorKind::TimedOut),
                 "precondition: the deck reads nothing, so the long line is cut"
             );
+            // The deck's end reads with a timeout and reads again until it
+            // sees EOF. A read blocked with no timeout can miss the half-close
+            // on macOS: XNU's `soreceive` drops the reader's socket lock in
+            // `uipc_rcvd` just before it sleeps, a `shutdown(SHUT_WR)` landing
+            // there wakes nobody, and the sleep that follows has no end. A
+            // fresh read sees the EOF at once. (The deck reads with tokio,
+            // which does not block in `soreceive`.)
             let reader = std::thread::spawn(move || {
+                deck.set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
                 let mut bytes = Vec::new();
-                io::Read::read_to_end(&mut deck, &mut bytes).unwrap();
-                bytes
+                loop {
+                    match io::Read::read_to_end(&mut deck, &mut bytes) {
+                        Ok(_) => break bytes,
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) => {}
+                        Err(error) => panic!("the deck's end fails to read: {error}"),
+                    }
+                }
             });
             let report = control_line(&InboxStreamControl {
                 not_handed: vec![at(ID1, 1, 1)],

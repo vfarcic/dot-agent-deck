@@ -16,6 +16,18 @@ use common::TuiDeck;
 use serde_json::json;
 use spec::spec;
 
+/// What the dashboard says when you try to type into a history-only card:
+/// the shared fixture's words, which the desktop tile shows for the same
+/// card (CLAUDE.md rule 22).
+fn history_only_feedback() -> String {
+    let words: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/inbox-display.json")).unwrap();
+    words["inputUnavailable"]["history-only"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
 /// Scenario: Launch a real dashboard with a long-lived synthetic pane, then
 /// identify its Codex session as history-only through a synthetic hook event.
 /// Pressing the card's key must visibly explain the history-only target instead
@@ -58,7 +70,8 @@ fn pane_input_004_history_only_send_reports_result_and_feedback() {
     deck.wait_for_absence("No agent");
 
     deck.send_keys(b"1");
-    let feedback = "History-only session cannot accept live input";
+    let feedback = history_only_feedback();
+    let feedback = feedback.as_str();
     let feedback_visible = deck.wait_for_grid_string_within(feedback, Duration::from_secs(2));
     let grid = deck.snapshot_grid();
 
@@ -113,10 +126,8 @@ fn pane_input_008_stream_rejection_surfaces_feedback_and_exits_input_mode() {
         deck.wait_for_absence("No agent");
 
         deck.send_keys(input);
-        let feedback = deck.wait_for_grid_string_within(
-            "History-only session cannot accept live input",
-            Duration::from_secs(2),
-        );
+        let feedback =
+            deck.wait_for_grid_string_within(&history_only_feedback(), Duration::from_secs(2));
         let grid = deck.snapshot_grid();
         observations.push((
             input_kind,

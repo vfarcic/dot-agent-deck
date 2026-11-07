@@ -1,0 +1,34 @@
+[
+  {
+    "name": "a held doorbell without an agent notice: the row says why, the line keeps the count",
+    "pending": 2,
+    "hold": "cannot_type",
+    "line": "✉2",
+    "notice": "✉2 waiting for the agent to fetch it. Send it a prompt."
+  },
+  {
+    "name": "an empty agent notice is no notice: the hold keeps the row",
+    "pending": 2,
+    "hold": "cannot_type",
+    "agentNotice": "",
+    "line": "✉2",
+    "notice": "✉2 waiting for the agent to fetch it. Send it a prompt."
+  },
+  {
+    "name": "an agent notice takes the row, so the line keeps the hold's queued words",
+    "pending": 2,
+    "hold": "cannot_type",
+    "agentNotice": "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent",
+    "line": "✉2 queued",
+    "notice": "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent"
+  },
+  {
+    "name": "an agent notice beside a stalled hold: the line keeps the stall's words",
+    "pending": 3,
+    "hold": "cannot_type",
+    "stalled": true,
+    "agentNotice": "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent",
+    "line": "✉3 waiting to wake: send it a prompt",
+    "notice": "Add --standalone to the command or run opencode service set disabled true, then restart: OpenCode 2's shared service hides this agent"
+  }
+]

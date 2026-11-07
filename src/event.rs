@@ -282,7 +282,7 @@ fn detect_from_tokens(tokens: &[String], budget: usize) -> Option<AgentType> {
 /// quoted run is preserved so a quoted executable path stays one token). This is
 /// a deliberately small shell-word splitter — enough for agent detection
 /// ([`AgentType::from_command`]), not a full POSIX parser.
-fn tokenize_command(cmd: &str) -> Vec<String> {
+pub(crate) fn tokenize_command(cmd: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut started = false;
@@ -905,6 +905,13 @@ pub const CLEAR_SESSION_START_METADATA_KEY: &str = "session_start_source";
 /// The [`CLEAR_SESSION_START_METADATA_KEY`] value meaning "this `SessionStart`
 /// was caused by the user running `/clear`".
 pub const CLEAR_SESSION_START_METADATA_VALUE: &str = "clear";
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): on the wrapper's final
+/// event, its Idle or Error at its child's exit, how the wrapped command
+/// ended: its exit code (`"0"`, `"2"`), `"signal:<n>"` for a signal, or
+/// `"unknown"` when the wait failed. Additive metadata, ignored by a daemon
+/// that does not read it.
+pub const WRAPPER_CHILD_EXIT_METADATA_KEY: &str = "wrapper_child_exit";
 
 /// Issue #714: `AgentEvent.metadata` key `dot-agent-deck wrap` stamps on every
 /// event its stdout line classifier emits (value
@@ -1670,6 +1677,14 @@ pub enum DaemonMessage {
     /// connection, which then carries the mutation.
     #[serde(rename = "hook_capabilities")]
     HookCapabilities(HookCapabilitiesRequest),
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): a wrapper's sample of its
+    /// agent's line discipline, sent only on a connection to a daemon identity
+    /// (pid and start time) that answered `input_mode_report`, on that
+    /// connection or an earlier one to the same identity. The daemon
+    /// stores it in the generation's input-mode evidence and nothing else, and
+    /// answers one [`SignalAck`].
+    #[serde(rename = "input_mode")]
+    InputMode(InputModeReport),
     /// PRD #1666 part 3, round 5 (plan D1): a task-scoped `work-done`,
     /// answered with a [`WorkDoneTaskReply`] once the deck kept the report.
     #[serde(rename = "work_done_task")]
@@ -1816,6 +1831,22 @@ pub enum DaemonMessage {
     /// its own prompt, as it did before.
     #[serde(rename = "question")]
     Question(Box<QuestionSignal>),
+    /// PRD #1666 part 3 (Q35): the deck's editor helper reports what it
+    /// decided for one editor invocation in an agent's pane, and asks whose
+    /// invocation the daemon finds it to be. Answered with one
+    /// [`ComposerInvocationReply`].
+    ///
+    /// **Withheld unless the daemon answered the same connection's
+    /// [`HookCapabilitiesRequest`] with [`COMPOSER_PROBE`]**
+    /// ([`crate::hook::send_composer_invocation`] holds the check), and no
+    /// daemon does yet: past the provenance gate, this build answers it
+    /// refused [`COMPOSER_INVOCATION_UNSUPPORTED`]. Additive on the unversioned hook
+    /// socket, so it does NOT move the attach `PROTOCOL_VERSION`. An older
+    /// daemon decodes it as neither a `DaemonMessage` nor an [`AgentEvent`]
+    /// (it carries none of an event's required fields), logs it as malformed
+    /// and answers nothing.
+    #[serde(rename = "composer_invocation")]
+    ComposerInvocation(ComposerInvocationRequest),
 }
 
 impl DaemonMessage {
@@ -1830,6 +1861,7 @@ impl DaemonMessage {
             DaemonMessage::Delegate(s) => &s.pane_id,
             DaemonMessage::WorkDone(s) => &s.pane_id,
             DaemonMessage::HookCapabilities(r) => &r.pane_id,
+            DaemonMessage::InputMode(r) => &r.pane_id,
             DaemonMessage::WorkDoneTask(r) => &r.pane_id,
             DaemonMessage::GetSeed(r) => &r.pane_id,
             DaemonMessage::Dispatch(s) => &s.pane_id,
@@ -1849,6 +1881,7 @@ impl DaemonMessage {
             DaemonMessage::InboxOffer(r) => &r.pane_id,
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => &r.pane_id,
             DaemonMessage::Question(s) => &s.pane_id,
+            DaemonMessage::ComposerInvocation(r) => &r.pane_id,
         }
     }
 
@@ -1859,6 +1892,7 @@ impl DaemonMessage {
             DaemonMessage::Delegate(s) => s.token.as_deref(),
             DaemonMessage::WorkDone(s) => s.token.as_deref(),
             DaemonMessage::HookCapabilities(r) => r.token.as_deref(),
+            DaemonMessage::InputMode(r) => r.token.as_deref(),
             DaemonMessage::WorkDoneTask(r) => r.token.as_deref(),
             DaemonMessage::GetSeed(r) => r.token.as_deref(),
             DaemonMessage::Dispatch(s) => s.token.as_deref(),
@@ -1878,6 +1912,7 @@ impl DaemonMessage {
             DaemonMessage::InboxOffer(r) => r.token.as_deref(),
             DaemonMessage::InboxComplete(r) | DaemonMessage::InboxRelease(r) => r.token.as_deref(),
             DaemonMessage::Question(s) => s.token.as_deref(),
+            DaemonMessage::ComposerInvocation(r) => r.token.as_deref(),
         }
     }
 
@@ -1899,6 +1934,10 @@ impl DaemonMessage {
             | DaemonMessage::InboxOffer(_)
             | DaemonMessage::InboxComplete(_)
             | DaemonMessage::InboxRelease(_)
+            | DaemonMessage::InputMode(_)
+            // An invocation speaks for one agent generation's pane, so it
+            // needs a token that attests an agent, as the inbox verbs do.
+            | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::Ack(_) => true,
             DaemonMessage::Delegate(_)
             | DaemonMessage::WorkDone(_)
@@ -1940,6 +1979,8 @@ impl DaemonMessage {
             | DaemonMessage::RestartRole(_)
             | DaemonMessage::SpawnRole(_)
             | DaemonMessage::Ack(_)
+            | DaemonMessage::InputMode(_)
+            | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::Question(_) => None,
         };
         claimed.filter(|id| !id.is_empty())
@@ -1952,6 +1993,7 @@ impl DaemonMessage {
             DaemonMessage::Delegate(_) => "delegate",
             DaemonMessage::WorkDone(_) => "work_done",
             DaemonMessage::HookCapabilities(_) => "hook_capabilities",
+            DaemonMessage::InputMode(_) => "input_mode",
             DaemonMessage::WorkDoneTask(_) => "work_done_task",
             DaemonMessage::GetSeed(_) => "get_seed",
             DaemonMessage::Dispatch(_) => "dispatch",
@@ -1972,6 +2014,7 @@ impl DaemonMessage {
             DaemonMessage::InboxComplete(_) => "inbox_complete",
             DaemonMessage::InboxRelease(_) => "inbox_release",
             DaemonMessage::Question(_) => "question",
+            DaemonMessage::ComposerInvocation(_) => "composer_invocation",
         }
     }
 
@@ -2019,16 +2062,20 @@ impl DaemonMessage {
             // A refused question names the refusal and confirms no verb, so
             // the sender withholds its mutation and says why.
             DaemonMessage::HookCapabilities(_) => serde_json::to_string(&HookCapabilitiesReply {
-                task_scoped_completion: None,
                 code: Some(reason.to_string()),
                 message: Some(message.to_string()),
+                ..Default::default()
             }),
+            DaemonMessage::ComposerInvocation(_) => {
+                serde_json::to_string(&ComposerInvocationReply::refused(reason, message))
+            }
             DaemonMessage::WorkDoneTask(_) => {
                 serde_json::to_string(&WorkDoneTaskReply::refused(reason, message))
             }
             DaemonMessage::WorkDone(_)
             | DaemonMessage::Dispatch(_)
             | DaemonMessage::Ack(_)
+            | DaemonMessage::InputMode(_)
             | DaemonMessage::InboxAnnounce(_) => {
                 serde_json::to_string(&SignalAck::refused(reason, message))
             }
@@ -2097,6 +2144,7 @@ impl DaemonMessage {
             DaemonMessage::Dispatch(_) => serde_json::to_string(&SignalAck::accepted()).ok(),
             DaemonMessage::WorkDone(_)
             | DaemonMessage::HookCapabilities(_)
+            | DaemonMessage::InputMode(_)
             | DaemonMessage::WorkDoneTask(_)
             | DaemonMessage::Delegate(_)
             | DaemonMessage::RestartRole(_)
@@ -2105,6 +2153,7 @@ impl DaemonMessage {
             | DaemonMessage::GetSeed(_)
             | DaemonMessage::Ack(_)
             | DaemonMessage::Question(_)
+            | DaemonMessage::ComposerInvocation(_)
             | DaemonMessage::InboxWait(_)
             | DaemonMessage::InboxAnnounce(_)
             | DaemonMessage::InboxFetch(_)
@@ -3067,6 +3116,27 @@ pub enum BroadcastMsg {
     /// client ever received it.
     #[serde(rename = "hook_binary_notice")]
     HookBinaryNotice(crate::hook_binary::HookBinaryNotices),
+    /// PRD #1666 part 3 (Q35-20e): what a pane's card says of the typing the
+    /// deck holds for its current agent generation changed — a hold began
+    /// showing (300 ms after it began), its cause changed (5 s after it
+    /// began, or as the check moved), it ended, or the generation took the pane
+    /// from one whose held typing was discarded. Carries the whole state,
+    /// which replaces what a client holds for that generation. Sent on a
+    /// change of what the card shows, and once more for every pane, changed
+    /// or not, 30 s after a pass a display notice woke the watcher
+    /// ([`crate::agent_pty::watch_input_held`], R-E-U3-03); not otherwise
+    /// while it stays the same. So a lost or stale one is corrected by the
+    /// pane's next display change, by a resubscription's snapshot, or by
+    /// that repeat.
+    ///
+    /// No [`crate::daemon_protocol::PROTOCOL_VERSION`] bump, for
+    /// [`Self::HookBinaryNotice`]'s and [`Self::InboxHandover`]'s reason: every
+    /// client that can attach to this protocol version reads an unknown kind
+    /// as [`Self::Unknown`]. A TUI that predates it ignores it; a desktop that
+    /// predates it re-reads its agent list, which carries
+    /// [`crate::agent_pty::AgentRecord::input_held`] it does not read either.
+    #[serde(rename = "input_held")]
+    InputHeld(InputHeldUpdate),
     /// A `kind` tag this build has never heard of (issue #801 item 3, applied
     /// by PRD #741 M8).
     ///
@@ -3117,6 +3187,25 @@ pub enum BroadcastMsg {
     Unknown,
 }
 
+/// PRD #1666 part 3 (Q35-20e): the payload of [`BroadcastMsg::InputHeld`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputHeldUpdate {
+    /// The pane whose card it is.
+    pub pane_id: String,
+    /// The agent generation it is about: a client that has moved the pane's
+    /// account past it ignores it.
+    pub agent_id: String,
+    /// The typing the deck holds for that generation, once it shows; absent
+    /// when nothing is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<crate::inbox_display::InputHeld>,
+    /// Typing one of the pane's earlier generations held was discarded when
+    /// it retired; absent once a person's keystroke reached the pane after
+    /// it. A retirement that held nothing leaves it (efix review U3-e).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
+}
+
 /// PRD #1666 §2.8: the payload of [`BroadcastMsg::InboxHandover`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct InboxHandover {
@@ -3160,12 +3249,27 @@ pub struct InboxNotice {
     pub wake_stalled: bool,
     /// PR #1735 fifth review (B-03, B-04): this notice reports the agent's
     /// wake stall ([`Self::wake_stalled`]) and nothing else — the message it
-    /// names (the one the stall was recorded against) did not change state,
+    /// names (the one the stall, or the hold, was last recorded against) did
+    /// not change state,
     /// and `state` repeats the state it is in. Every change of the stall is
     /// sent as one of these, its end included, so a client follows the stall
     /// from them and the summary alone. Additive, as `wake_stalled` is.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_update: bool,
+    /// PRD #1666 part 3, round 5-wake (plan §5.2): with [`Self::wake_update`],
+    /// why the deck holds the doorbell for this pane's agent's waiting
+    /// messages now, if it says. Every wake update a deck that knows this
+    /// field sends carries both it and the current [`Self::wake_stalled`], so a
+    /// client that reads only the stall keeps it right. Additive: a client
+    /// that does not know it ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_hold: Option<crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3 (Q35, OQ1): with [`Self::wake_hold`] `cannot_check`,
+    /// why; sent and cleared with it, so a later hold never inherits an
+    /// earlier one's path. Additive: a client that does not know it ignores
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_detail: Option<crate::inbox_display::HoldDetail>,
     /// PRD #1666 §6.5: this notice carries the pane's whole card notices
     /// ([`Self::notices`]) and nothing else, as [`Self::wake_update`] carries
     /// the wake stall: a client replaces what it holds for the pane with
@@ -3184,6 +3288,13 @@ pub struct InboxNotice {
     /// names by id. Additive: a client that does not know it ignores it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provenance: Option<crate::report_recovery::ReportProvenance>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): with `reason`
+    /// `agent_exited`, what the deck observed ending the generation's pane.
+    /// Additive: absent from an older deck, ignored by an older client, and a
+    /// kind this build does not know reads as
+    /// [`crate::inbox_display::PaneTermination::Unknown`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub termination: Option<crate::inbox_display::PaneTermination>,
     #[serde(flatten, default)]
     pub notices: crate::inbox_hub::InboxCardNotices,
 }
@@ -3732,6 +3843,20 @@ pub struct InboxAnnounceRequest {
     pub pid: Option<u32>,
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §1.4): what a prompt carrying a ring's
+/// doorbell line looked like.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptShape {
+    /// The whole prompt, trimmed, is exactly the one token-led line.
+    Exact,
+    /// The prompt holds the token-led line among other text.
+    WithOtherText,
+    /// A shape this build does not know.
+    #[serde(other)]
+    Unknown,
+}
+
 /// Payload of [`DaemonMessage::InboxFetch`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InboxFetchRequest {
@@ -3760,6 +3885,16 @@ pub struct InboxFetchRequest {
     /// the caller, decided under the inbox's lock with the fetch itself.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub doorbell: Option<String>,
+    /// PRD #1666 part 3, round 5-wake (plan §1.4): the ring token at the head
+    /// of the doorbell line the submitted prompt carried — evidence that this
+    /// ring's line was submitted, reported whether or not the fetch grants
+    /// anything. Additive: an older daemon ignores it, an older hook sends
+    /// none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell_ring: Option<String>,
+    /// The shape of the prompt that carried [`Self::doorbell_ring`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doorbell_prompt: Option<PromptShape>,
     /// PRD #1666 §11: the integration of the component that runs the fetch
     /// (OpenCode's doorbell substitution), as on [`InboxWaitRequest`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4199,6 +4334,21 @@ pub struct HookCapabilitiesRequest {
     pub token: Option<String>,
 }
 
+/// PRD #1666 part 3, round 5-wake (plan §1.3): a wrapper's sample of the line
+/// discipline of the PTY its agent reads. None of an `AgentEvent`'s required
+/// fields, so a daemon that does not know the verb cannot take it for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputModeReport {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    pub seq: u64,
+    pub icanon: bool,
+    pub echo: bool,
+    pub sampled_mono_ns: u64,
+    pub sample_done_mono_ns: u64,
+}
+
 /// The answer to a [`HookCapabilitiesRequest`]. Additive: a field a sender
 /// does not know is ignored, and one it needs but is absent reads as "not
 /// served".
@@ -4206,11 +4356,223 @@ pub struct HookCapabilitiesRequest {
 pub struct HookCapabilitiesReply {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub task_scoped_completion: Option<u32>,
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): this daemon stores
+    /// `input_mode` reports ([`crate::input_mode::INPUT_MODE_REPORT`]). A
+    /// wrapper sends them only to the daemon identity (pid and start time)
+    /// that answered this, on any connection to that identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_mode_report: Option<u32>,
+    /// PRD #1666 part 3 (Q35): this daemon answers
+    /// [`DaemonMessage::ComposerInvocation`] at this version
+    /// ([`COMPOSER_PROBE`]). The shared sender
+    /// ([`crate::hook::send_composer_invocation`]) sends one only on the
+    /// connection whose answer named it. A daemon names it only on a
+    /// connection whose peer it attests as an installed generation's editor
+    /// helper (Q35-14b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_probe: Option<u32>,
+    /// PRD #1666 part 3 (Q35-12, amendment 3 §3.2): this daemon takes a
+    /// drain frontier when a helper reports a [`EditorReport::EditorDone`]
+    /// with a [`EditorTree::Clean`] tree, and acknowledges it with an
+    /// [`EditorFrontierAck`] on the same connection, at this version
+    /// ([`EDITOR_FRONTIER`]). A helper waits for that acknowledgement only
+    /// when the answer named it. No daemon names it yet: none takes a
+    /// frontier before Q35-20a.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub editor_frontier: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// PRD #1666 part 3 (Q35): the version of
+/// [`DaemonMessage::ComposerInvocation`] this build speaks. A sender requires
+/// equality ([`HookCapabilitiesReply::composer_probe`]), never `>=`.
+pub const COMPOSER_PROBE: u32 = 1;
+
+/// PRD #1666 part 3 (Q35-12): the version of the post-editor report and its
+/// acknowledgement this build speaks ([`HookCapabilitiesReply::editor_frontier`]).
+pub const EDITOR_FRONTIER: u32 = 1;
+
+/// PRD #1666 part 3 (Q35-12; amendment 3 §3.2, amendment 6 §2.3): what the
+/// editor helper reports after its editor phase, as one line on the
+/// connection that carried its [`ComposerInvocationRequest`] and on no other.
+/// It isn't a [`DaemonMessage`]: a daemon reads it only on a connection whose
+/// invocation it answered, and a helper sends it only where that exchange
+/// succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "report", rename_all = "snake_case")]
+pub enum EditorReport {
+    /// The editor ran and was reaped; `tree` is what the helper's reap loop
+    /// found of its descendants.
+    EditorDone { tree: EditorTree },
+    /// No editor ran: starting it failed with `errno`, or no editor was
+    /// configured (`errno` absent).
+    SpawnFailed {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        errno: Option<i32>,
+    },
+    /// A report a newer helper names; a daemon is to read it as no report.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the helper's reap loop found once its editor was reaped (amendment 4
+/// §7.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorTree {
+    /// `waitpid(-1, WNOHANG | __WALL)` found no child of the helper.
+    Clean,
+    /// It found a live child: a descendant of the editor reparented to the
+    /// helper.
+    Survivors,
+    /// Neither, within the loop's budget, or the helper couldn't make itself
+    /// the editor's subreaper.
+    Unknown,
+}
+
+/// The daemon's acknowledgement of an [`EditorReport::EditorDone`] with a
+/// clean tree. The helper waits for it for liveness only, and reads any line
+/// as one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "frontier", rename_all = "snake_case")]
+pub enum EditorFrontierAck {
+    /// The frontier was taken.
+    Taken,
+    /// It wasn't taken in time; the daemon keeps the request.
+    Late,
+    /// An acknowledgement a newer daemon names.
+    #[serde(other)]
+    Unknown,
+}
+
+/// PRD #1666 part 3 (Q35): the refusal code of a
+/// [`DaemonMessage::ComposerInvocation`] this daemon does not serve. The
+/// helper (Q35-12) is to read it as it reads an older daemon's silence: a
+/// failed exchange, never [`ComposerOutcome::Unarmed`].
+pub const COMPOSER_INVOCATION_UNSUPPORTED: &str = "unsupported";
+
+/// [`COMPOSER_INVOCATION_UNSUPPORTED`]'s message.
+pub const COMPOSER_INVOCATION_UNSUPPORTED_MESSAGE: &str =
+    "this daemon does not check agents' input boxes, so it decided nothing for this editor";
+
+/// PRD #1666 part 3 (Q35): one editor invocation the deck's helper reports.
+/// None of an [`AgentEvent`]'s required fields, so a daemon that does not
+/// know the verb cannot take it for one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerInvocationRequest {
+    pub pane_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
+    /// The agent generation whose arm the helper read.
+    pub generation: u64,
+    /// What the helper chose, after reading the arm.
+    pub decision: ComposerDecision,
+    /// Whose invocation the helper's own classifier found it to be: recorded,
+    /// never authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ComposerClaim>,
+    /// The segment number the helper read with the arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seg_seen: Option<u64>,
+    /// The native candidate number the helper read with the arm (amendment
+    /// 2 §4.4), from the same publication as `seg_seen`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub native_seen: Option<u64>,
+    /// The arguments the agent invoked the editor with, the export path
+    /// among them; the daemon compares them with what it reads itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+}
+
+/// What the helper chose for an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerDecision {
+    /// The arm was present: no editor opens.
+    Armed,
+    /// The arm was absent: the user's editor opens.
+    Unarmed,
+    /// A tool's invocation: the tool's editor opens.
+    Tool,
+    /// A decision a newer helper names; a daemon is to consume nothing for
+    /// it.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The helper's own class for an invocation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComposerClaim {
+    Owned,
+    Tool,
+    /// Also a class a newer helper names.
+    #[serde(other)]
+    Unknown,
+}
+
+/// The daemon's own read of the agent's exported input box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExportRead {
+    Empty,
+    NonEmpty,
+    Unreadable,
+    /// A read a newer daemon names: a helper is to read it as not empty.
+    #[serde(other)]
+    Unknown,
+}
+
+/// What the daemon decided for a [`ComposerInvocationRequest`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ComposerOutcome {
+    /// The deck's own invocation: its liability is consumed.
+    Mine { read: ExportRead },
+    /// As [`Self::Mine`], and the helper shows the deck's notice first.
+    MineWithNotice { read: ExportRead },
+    /// Not attributable to the deck: nothing consumed, no editor.
+    Uncertain,
+    /// No arm: the user's editor.
+    Unarmed,
+    /// An outcome a newer daemon names: a helper is to read it as
+    /// [`Self::Uncertain`].
+    #[serde(other)]
+    Unknown,
+}
+
+/// The answer to a [`ComposerInvocationRequest`]: an outcome, or a refusal's
+/// code and sentence.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerInvocationReply {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<ComposerOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+impl ComposerInvocationReply {
+    pub fn refused(code: &str, message: &str) -> Self {
+        ComposerInvocationReply {
+            outcome: None,
+            code: Some(code.to_string()),
+            message: Some(message.to_string()),
+        }
+    }
+
+    /// This build's answer to every invocation: not served.
+    pub fn unsupported() -> Self {
+        Self::refused(
+            COMPOSER_INVOCATION_UNSUPPORTED,
+            COMPOSER_INVOCATION_UNSUPPORTED_MESSAGE,
+        )
+    }
 }
 
 /// What a [`WorkDoneTaskRequest`] reports.

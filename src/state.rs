@@ -849,6 +849,20 @@ pub struct SessionSnapshot {
     /// from this snapshot refuses a replayed older aggregate afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_revision: Option<u64>,
+    /// PRD #1666 part 3 (Q35, R5 §10.1): the deck is holding what the user
+    /// typed into this pane while it checks the agent's input box. Additive
+    /// optional, the `blocked` precedent: an older reader ignores the key, so
+    /// no `PROTOCOL_VERSION` bump. No daemon sets it yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<crate::inbox_display::InputHeld>,
+    /// PRD #1666 part 3 (Q35): the outcomes of this pane's recently held
+    /// answers that carried a client token, newest first, at most
+    /// [`crate::question::MAX_ANSWER_SETTLEMENTS`], each kept
+    /// [`crate::question::ANSWER_SETTLEMENT_RETENTION`]. Additive, as
+    /// [`Self::input_held`] is; absent while empty. The daemon fills it per
+    /// agent generation ([`AppState::live_session_for`], Q35-17).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answer_settlements: Vec<crate::question::AnswerSettlement>,
 }
 
 /// Issue #532: a pane's hook generation on the wire — see
@@ -1171,6 +1185,11 @@ impl SessionState {
             pull_request_revision: Some(self.pull_request_revision),
             background: held.and_then(|(background, _)| background.filter(|b| !b.is_empty())),
             background_revision: held.map(|(_, revision)| revision),
+            // PRD #1666 part 3 (Q35): `input_held` is declared on the wire
+            // and set by no daemon yet; the settlements are the daemon's
+            // per generation, which `AppState::live_session_for` fills.
+            input_held: None,
+            answer_settlements: Vec::new(),
         }
     }
 
@@ -1203,6 +1222,13 @@ impl SessionState {
     /// ([`crate::inbox_display::CardInbox::notice_text`]), when there is one.
     pub fn inbox_notice(&self) -> Option<String> {
         self.card_inbox().and_then(|inbox| inbox.notice_text())
+    }
+
+    /// PRD #1666 part 3 (Q35, core §7): the row saying the deck holds what
+    /// the user typed into this agent's pane
+    /// ([`crate::inbox_display::CardInbox::input_held_text`]).
+    pub fn input_held_notice(&self) -> Option<&'static str> {
+        self.card_inbox().and_then(|inbox| inbox.input_held_text())
     }
 
     /// PRD #1666 §2.8: the deck's notice explaining this card's Error — a
@@ -1722,6 +1748,27 @@ pub struct AppState {
     /// a failed integration refresh among them — while it spawns it, before
     /// the client has its card; the surfacing start carries them.
     pane_inboxes: HashMap<String, PaneInbox>,
+    /// PRD #1666 part 3 (Q35-20e): the daemon's latest word on held typing,
+    /// by pane, at most [`MAX_PENDING_INPUT_HELD`] (the oldest word goes
+    /// first), kept apart from the pane's account, which a close drops. A
+    /// generation that took a pane this client is letting go of can be
+    /// announced before the close arrives or after it, and before its card
+    /// is surfaced; an account created later takes the word when it names
+    /// that generation ([`Self::take_pane_inbox`]).
+    ///
+    /// R-E-U2-02: kept coherent with what the account shows, so it never
+    /// brings back a word something newer replaced. A snapshot replaces it
+    /// for every pane it lists and drops it for every pane it doesn't
+    /// ([`Self::take_inbox_snapshot`]); an update the account rejects as a
+    /// retired generation's, or one naming an older generation than the
+    /// word kept, never touches it ([`Self::apply_input_held_update`]); an
+    /// account for a later generation drops it (auditor U3-4); and a stream
+    /// from another daemon process clears it, since agent ids are
+    /// daemon-local ([`Self::learn_stream_incarnation`]).
+    pending_input_held: HashMap<String, PendingHeld>,
+    /// The order [`Self::pending_input_held`]'s words arrived in, for its
+    /// bound.
+    pending_input_held_seq: u64,
     /// Issue #1635: what the TUI's last release check found — the plans for
     /// this machine's copies — set by [`crate::upgrade_dialog::run_checker`]
     /// at start and every re-check interval. `None` until a check succeeds.
@@ -2125,6 +2172,14 @@ pub struct AppState {
     /// Issue #1678: what the last applied event did to its card's background
     /// work — see [`Self::take_applied_background`].
     applied_background: Option<AppliedBackground>,
+    /// PRD #1666 part 3 (Q35-17): per agent generation, the settled answers a
+    /// fence held whose requests carried a client token, newest first, with
+    /// when each settled ([`Self::push_answer_settlement`]). Only the daemon
+    /// writes it; a client's own state keeps it empty.
+    answer_settlements: HashMap<
+        String,
+        std::collections::VecDeque<(std::time::Instant, crate::question::AnswerSettlement)>,
+    >,
 }
 
 pub type SharedState = Arc<RwLock<AppState>>;
@@ -2170,9 +2225,14 @@ impl DoorbellAdmission {
 /// establishing any of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReadinessLevel {
-    /// Nothing from the generation's own hooks. Only an agent whose writer
-    /// recognises its empty composer on screen (Codex) may be rung, and only
-    /// while it does.
+    /// Nothing from the generation's own hooks. Never rung, unless its agent's
+    /// first own hook comes with its first prompt
+    /// ([`crate::agent_registry::FirstHook::WithFirstPrompt`], Codex) and the
+    /// generation's own measured proof holds (PRD #1666 part 3, Q28): an
+    /// activated release latched from its own start-up header, a Clean frame
+    /// of the empty ready composer, its mode evidence and its settle anchor.
+    /// That proof never raises this level, and no own hook route is assumed
+    /// from it.
     Unproven,
     /// Its own `SessionStart`, from an agent that posts it before its prompt
     /// is up (Claude Code): ready once the writer recognises that prompt on
@@ -3860,6 +3920,12 @@ fn arm_idle_worker_watch_for_delegation(
     Some(seq)
 }
 
+/// How often the idle-worker watch re-reads a delegation whose task is still
+/// queued or not yet acknowledged ([`wait_out_pointer_deferral`]). Issue #544
+/// introduced it as the poll of a deferred first write; PRD #1666 removed
+/// those writes, and part 3 (Q35-21) the module it lived in.
+const POINTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Issue #544 (PR #1398 review): keep the idle-worker watch's clock off the
 /// time the delegation's task spent posted but not yet acknowledged by the
 /// worker (PRD #1666; before it, the time a typed pointer waited for the
@@ -3895,7 +3961,7 @@ async fn wait_out_pointer_deferral(
             return true;
         };
         let wait = if clock.pointer_queued || clock.pointer_in_progress {
-            crate::draft_deferral::DRAFT_POLL_INTERVAL
+            POINTER_POLL_INTERVAL
         } else {
             let due = clock.armed_at + timeout + clock.pointer_queued_for + clock.pointer_deferred;
             match due.checked_duration_since(std::time::Instant::now()) {
@@ -6579,6 +6645,17 @@ fn card_inbox_of(event: &AgentEvent) -> Option<crate::inbox_display::CardInbox> 
         .metadata
         .get(crate::inbox_display::CARD_INBOX_ADMISSION_METADATA_KEY)
         .cloned();
+    inbox.hold_detail = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_HOLD_DETAIL_METADATA_KEY)
+        .and_then(|json| serde_json::from_str(json).ok());
+    inbox.input_held = event
+        .metadata
+        .get(crate::inbox_display::CARD_INBOX_INPUT_HELD_METADATA_KEY)
+        .and_then(|cause| serde_json::from_value(serde_json::Value::String(cause.clone())).ok());
+    inbox.input_discarded = event
+        .metadata
+        .contains_key(crate::inbox_display::CARD_INBOX_INPUT_DISCARDED_METADATA_KEY);
     inbox.agent_notice = event
         .metadata
         .get(crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY)
@@ -6633,6 +6710,31 @@ fn set_card_inbox(session: &mut SessionState, inbox: crate::inbox_display::CardI
             code.clone(),
         );
     }
+    if let Some(json) = inbox
+        .hold_detail
+        .as_ref()
+        .and_then(|detail| serde_json::to_string(detail).ok())
+    {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_HOLD_DETAIL_METADATA_KEY.to_string(),
+            json,
+        );
+    }
+    if let Some(serde_json::Value::String(cause)) = inbox
+        .input_held
+        .and_then(|cause| serde_json::to_value(cause).ok())
+    {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_INPUT_HELD_METADATA_KEY.to_string(),
+            cause,
+        );
+    }
+    if inbox.input_discarded {
+        metadata.insert(
+            crate::inbox_display::CARD_INBOX_INPUT_DISCARDED_METADATA_KEY.to_string(),
+            String::new(),
+        );
+    }
     if let Some(notice) = &inbox.agent_notice {
         metadata.insert(
             crate::inbox_display::CARD_INBOX_AGENT_NOTICE_METADATA_KEY.to_string(),
@@ -6683,6 +6785,24 @@ const MAX_SEEN_INBOX_MESSAGES: usize = 256;
 /// Bound on [`PaneInbox::retired`]; the oldest goes first.
 const MAX_RETIRED_INBOX_AGENTS: usize = 8;
 
+/// PRD #1666 part 3 (Q35-20e): how many panes [`AppState::pending_input_held`]
+/// keeps; past it, the oldest word is forgotten to make room. A forgotten
+/// one costs its pane's card the row until the next snapshot or update.
+const MAX_PENDING_INPUT_HELD: usize = 64;
+
+/// PRD #1666 part 3 (Q35-20e): one pane's word in
+/// [`AppState::pending_input_held`], with when it arrived.
+#[derive(Debug, Clone)]
+struct PendingHeld {
+    held: PaneHeld,
+    seq: u64,
+}
+
+/// Whether generation `a` is older than `b`, where both name one.
+fn older_generation(a: &str, b: &str) -> bool {
+    matches!((a.parse::<u64>(), b.parse::<u64>()), (Ok(a), Ok(b)) if a < b)
+}
+
 /// PRD #1666 §2.8: what a client knows of one pane's inbox — the daemon's last
 /// summary, and the messages seen change state since. Keyed by message id, so
 /// a frame repeated or a hand-back (`fetched` → `queued`) counts nothing twice.
@@ -6716,10 +6836,79 @@ struct PaneInbox {
     /// agent for its waiting messages. Set from the summary and from the deck's
     /// wake-stall notices alone (B-03, B-04), which report its end as well.
     stalled: bool,
+    /// PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for
+    /// the waiting messages, from the summary and from every wake update,
+    /// which carries it whole.
+    hold: Option<crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3 (Q35): why the deck can't check the agent's input
+    /// box, carried and replaced with [`Self::hold`], so a later hold never
+    /// keeps an earlier one's path.
+    hold_detail: Option<crate::inbox_display::HoldDetail>,
+    /// PRD #1666 part 3 (Q35, Q35-20e): what the daemon last said of the
+    /// typing it holds for the pane, from its snapshot of the agent
+    /// ([`AppState::take_inbox_snapshot`]) or its live update
+    /// ([`AppState::apply_input_held_update`]). Bound to the generation it
+    /// names: the card shows it only while that generation is this account's
+    /// ([`Self::card`]), and a new account keeps it only when it names the
+    /// new account's generation, which an update sent before the generation's
+    /// handover does ([`Self::retire`]). A stream that moves to another daemon
+    /// process clears it ([`AppState::learn_stream_incarnation`]).
+    held: Option<PaneHeld>,
     /// PRD #1666 §6.5: the items waiting on the user and the card's notices,
     /// from the summary and from each attention notice, which carries them
     /// whole.
     notices: crate::inbox_hub::InboxCardNotices,
+    /// Review U3-a: the stream has moved to another daemon process since
+    /// this account was taken ([`AppState::learn_stream_incarnation`]).
+    /// Agent ids are daemon-local, so its [`Self::agent_id`] and
+    /// [`Self::retired`] name generations of the replaced process: they fence
+    /// no held-typing word from the new one
+    /// ([`AppState::apply_input_held_update`]), and the next account of the
+    /// pane carries none of them ([`Self::retire`]).
+    from_replaced_process: bool,
+}
+
+/// PRD #1666 part 3 (Q35-20e): what the daemon last said of the typing it
+/// holds for one agent generation's pane ([`PaneInbox::held`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PaneHeld {
+    /// The generation it is about.
+    agent_id: String,
+    /// Why the deck holds what the user typed, while it shows a hold.
+    cause: Option<crate::inbox_display::InputHeldCause>,
+    /// The typing one of the pane's earlier generations held was not
+    /// delivered.
+    discarded: bool,
+}
+
+impl PaneHeld {
+    /// `agent_id`'s held typing from the daemon's word on it. A discarded
+    /// notice counts only when it names an earlier generation than the one it
+    /// rides, so a retired generation's own notice never shows on it.
+    fn new(
+        agent_id: &str,
+        held: Option<&crate::inbox_display::InputHeld>,
+        discarded: Option<&crate::inbox_display::InputDiscarded>,
+    ) -> Self {
+        Self {
+            agent_id: agent_id.to_string(),
+            // Bound where the id names a generation, as the desktop's
+            // `map_agent` binds it.
+            cause: held
+                .filter(|held| {
+                    agent_id
+                        .parse::<u64>()
+                        .ok()
+                        .is_none_or(|generation| generation == held.generation)
+                })
+                .map(|held| held.cause),
+            discarded: discarded.is_some_and(|discarded| {
+                agent_id
+                    .parse::<u64>()
+                    .is_ok_and(|generation| discarded.generation < generation)
+            }),
+        }
+    }
 }
 
 /// PRD #1666 §2.8: the inbox a card-surfacing start carries
@@ -6765,7 +6954,11 @@ impl PaneInbox {
             seen: HashMap::new(),
             delivered: summary.last_acked_at.is_some(),
             stalled: summary.wake_stalled,
+            hold: summary.wake_hold,
+            hold_detail: summary.hold_detail.clone(),
+            held: None,
             notices: summary.notices.clone(),
+            from_replaced_process: false,
         }
     }
 
@@ -6775,6 +6968,11 @@ impl PaneInbox {
     /// its own joins them when `next` names another.
     fn retire(&mut self, mut next: PaneInbox) {
         let mut retired = std::mem::take(&mut self.retired);
+        if self.from_replaced_process {
+            // U3-a: another process's ids; this process may reuse them.
+            retired.clear();
+            self.agent_id = None;
+        }
         if let Some(previous) = self.agent_id.take()
             && next.agent_id.as_ref() != Some(&previous)
         {
@@ -6783,6 +6981,16 @@ impl PaneInbox {
         }
         if let Some(current) = next.agent_id.as_ref() {
             retired.retain(|agent| agent != current);
+        }
+        // Q35-20e: a live update for the new generation that came before its
+        // handover stays with it.
+        if next.held.is_none()
+            && self
+                .held
+                .as_ref()
+                .is_some_and(|held| next.agent_id.as_deref() == Some(held.agent_id.as_str()))
+        {
+            next.held = self.held.take();
         }
         if retired.len() > MAX_RETIRED_INBOX_AGENTS {
             retired.drain(..retired.len() - MAX_RETIRED_INBOX_AGENTS);
@@ -6795,8 +7003,19 @@ impl PaneInbox {
     /// agent generation than the counts belong to changes nothing when the
     /// daemon established those counts' generation ([`Self::owned`]) or the
     /// pane's retained history names it ([`Self::retired`]); otherwise it
-    /// starts the counts over.
+    /// starts the counts over. On an account taken under a replaced daemon
+    /// process ([`Self::from_replaced_process`]) any notice naming a
+    /// generation starts them over, the same id included: that process's ids
+    /// fence nothing from this one's (review U3-a).
     fn fold(&mut self, notice: &crate::event::InboxNotice) {
+        if self.from_replaced_process
+            && let Some(named) = notice.agent_id.as_ref()
+        {
+            self.retire(PaneInbox {
+                agent_id: Some(named.clone()),
+                ..PaneInbox::default()
+            });
+        }
         if notice
             .agent_id
             .as_ref()
@@ -6821,8 +7040,11 @@ impl PaneInbox {
             self.notices = notice.notices.clone();
         } else if notice.wake_update {
             // PR #1735 fifth review (B-03): the agent's wake stall changed and
-            // the message it names did not, so nothing is counted.
+            // the message it names did not, so nothing is counted. Round
+            // 5-wake: it carries the hold too, as it stands.
             self.stalled = notice.wake_stalled;
+            self.hold = notice.wake_hold;
+            self.hold_detail = notice.hold_detail.clone();
         } else {
             // PRD #1666 S11: an offered job that left this pane is settled here
             // without having been delivered; `state` is the job's, not the pane's.
@@ -6833,6 +7055,13 @@ impl PaneInbox {
             };
             self.apply(&notice.message_id, state, notice.requeued);
         }
+    }
+
+    /// Q35-20e: [`Self::held`], when it names this account's generation.
+    fn current_held(&self) -> Option<&PaneHeld> {
+        self.held
+            .as_ref()
+            .filter(|held| self.agent_id.as_deref() == Some(held.agent_id.as_str()))
     }
 
     fn claimed(&self) -> usize {
@@ -6863,6 +7092,10 @@ impl PaneInbox {
             pending: self.baseline + new,
             delivered: self.delivered,
             stalled: self.stalled,
+            hold: self.hold,
+            hold_detail: self.hold_detail.clone(),
+            input_held: self.current_held().and_then(|held| held.cause),
+            input_discarded: self.current_held().is_some_and(|held| held.discarded),
             uncertain: count(AttentionKind::uncertain),
             out_of_attempts: count(|kind| kind == AttentionKind::OutOfAttempts),
             not_started: count(|kind| kind == AttentionKind::NotStarted),
@@ -7158,8 +7391,82 @@ impl AppState {
                         session_id: session_id.clone(),
                         established_ms: established_at.timestamp_millis(),
                     });
+                // PRD #1666 part 3 (Q35-17): this generation's settled held
+                // answers.
+                snapshot.answer_settlements =
+                    self.answer_settlements_at(agent_id, std::time::Instant::now());
                 snapshot
             })
+    }
+
+    /// PRD #1666 part 3 (Q35-17, OQ6): record that an answer `generation`'s
+    /// pane held, whose request carried a client token, settled as
+    /// `settlement` says, at `now`. Each generation keeps its
+    /// [`crate::question::MAX_ANSWER_SETTLEMENTS`] most recent, each for
+    /// [`crate::question::ANSWER_SETTLEMENT_RETENTION`]; expired ones, any
+    /// generation's, are dropped here.
+    pub fn push_answer_settlement(
+        &mut self,
+        generation: &str,
+        settlement: crate::question::AnswerSettlement,
+        now: std::time::Instant,
+    ) {
+        let retention = crate::question::ANSWER_SETTLEMENT_RETENTION;
+        self.answer_settlements.retain(|_, kept| {
+            kept.retain(|(at, _)| now.saturating_duration_since(*at) < retention);
+            !kept.is_empty()
+        });
+        let kept = self
+            .answer_settlements
+            .entry(generation.to_string())
+            .or_default();
+        kept.push_front((now, settlement));
+        kept.truncate(crate::question::MAX_ANSWER_SETTLEMENTS);
+    }
+
+    /// PRD #1666 part 3 (Q35-17): `generation`'s settlements as of `now`,
+    /// newest first, without the expired ones.
+    pub fn answer_settlements_at(
+        &self,
+        generation: &str,
+        now: std::time::Instant,
+    ) -> Vec<crate::question::AnswerSettlement> {
+        self.answer_settlements
+            .get(generation)
+            .into_iter()
+            .flatten()
+            .filter(|(at, _)| {
+                now.saturating_duration_since(*at) < crate::question::ANSWER_SETTLEMENT_RETENTION
+            })
+            .map(|(_, settlement)| settlement.clone())
+            .collect()
+    }
+
+    /// PRD #1666 part 3 (Q35-17, OQ6): mark the question pending on `pane_id`
+    /// as `question_id` at `revision` as holding a queued answer, or not.
+    /// Nothing when another question, or another revision, is pending there:
+    /// the flag belongs to the revision the answer was accepted for. Whether
+    /// one was changed.
+    pub fn set_answer_queued(
+        &mut self,
+        pane_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        queued: bool,
+    ) -> bool {
+        let mut changed = false;
+        for session in self.sessions.values_mut() {
+            if session.pane_id.as_deref() == Some(pane_id)
+                && let Some(question) = session
+                    .pending_question
+                    .as_mut()
+                    .filter(|q| q.id == question_id && q.revision == revision)
+            {
+                changed |= question.answer_queued != queued;
+                question.answer_queued = queued;
+            }
+        }
+        changed
     }
 
     /// PRD #1631 (audit T2): the pane of the session `session_id`, if it has
@@ -8148,6 +8455,17 @@ impl AppState {
             {
                 let previous = previous.to_string();
                 self.note_process_replaced(previous);
+                // Q35-20e (R-E-U2-02): agent ids are daemon-local, so another
+                // process's words on held typing name generations this one's
+                // ids may reuse; and its accounts' generations fence nothing
+                // from this one (review U3-a). An account's own word is that
+                // process's too, so a reused id cannot carry it onto this
+                // process's generation (review rev-tidy2 U3-1).
+                self.pending_input_held.clear();
+                for inbox in self.pane_inboxes.values_mut() {
+                    inbox.from_replaced_process = true;
+                    inbox.held = None;
+                }
             }
             self.replaced_processes
                 .retain(|replaced| replaced != process);
@@ -9286,12 +9604,41 @@ impl AppState {
                     .iter()
                     .any(|record| record.pane_id_env.as_deref() == Some(pane.as_str()))
         });
+        // Q35-20e (R-E-U2-02): a word kept for a pane the daemon no longer
+        // lists names a generation that has gone.
+        self.pending_input_held.retain(|pane, _| {
+            records
+                .iter()
+                .any(|record| record.pane_id_env.as_deref() == Some(pane.as_str()))
+        });
         for record in records {
             let Some(pane_id) = record.pane_id_env.as_deref() else {
                 continue;
             };
             match record.inbox.as_ref() {
-                Some(summary) => self.apply_inbox_summary(pane_id, &record.id, summary),
+                Some(summary) => {
+                    // PRD #1666 part 3 (Q35): the record's held typing rides
+                    // the pane's new account, so the card shows it and a
+                    // snapshot without it clears it. Read from the record,
+                    // which carries it whether or not the agent has sent a
+                    // hook (Q35-20e, U3-04); the live snapshot's copy, the
+                    // same value, from a daemon that sets only that one.
+                    let input_held = record.input_held.as_ref().or(record
+                        .live
+                        .as_ref()
+                        .and_then(|snap| snap.input_held.as_ref()));
+                    let held =
+                        PaneHeld::new(&record.id, input_held, record.input_discarded.as_ref());
+                    // R-E-U2-02: the snapshot's word replaces the one kept for
+                    // its generation, so a later account of that generation
+                    // takes the snapshot's, not an older live update's.
+                    self.keep_input_held(pane_id, held.clone());
+                    let next = PaneInbox {
+                        held: Some(held),
+                        ..PaneInbox::from_summary(&record.id, summary)
+                    };
+                    self.take_pane_inbox(pane_id, next);
+                }
                 None => {
                     if !self.managed_pane_ids.contains(pane_id)
                         && self.pane_inboxes.get(pane_id).is_some_and(|inbox| {
@@ -9319,7 +9666,29 @@ impl AppState {
         agent_id: &str,
         summary: &crate::inbox_hub::InboxSummary,
     ) {
-        let next = PaneInbox::from_summary(agent_id, summary);
+        self.take_pane_inbox(pane_id, PaneInbox::from_summary(agent_id, summary));
+    }
+
+    /// `next` as `pane_id`'s account, retiring the one it replaces
+    /// ([`PaneInbox::retire`]), and drawn on its card.
+    fn take_pane_inbox(&mut self, pane_id: &str, mut next: PaneInbox) {
+        // Q35-20e: held typing announced before this account existed.
+        if next.held.is_none()
+            && let Some(pending) = self.pending_input_held.get(pane_id)
+            && next.agent_id.as_deref() == Some(pending.held.agent_id.as_str())
+        {
+            next.held = Some(pending.held.clone());
+        }
+        // Auditor U3-4: a word for a generation older than this account's
+        // can never be taken again.
+        if let Some(agent) = next.agent_id.as_deref()
+            && self
+                .pending_input_held
+                .get(pane_id)
+                .is_some_and(|pending| older_generation(&pending.held.agent_id, agent))
+        {
+            self.pending_input_held.remove(pane_id);
+        }
         self.pane_inboxes
             .entry(pane_id.to_string())
             .or_default()
@@ -9362,6 +9731,89 @@ impl AppState {
         self.refresh_card_inbox(&notice.pane_id);
     }
 
+    /// PRD #1666 part 3 (Q35-20e): the daemon's live word on the typing it
+    /// holds for one agent generation's pane
+    /// ([`crate::event::BroadcastMsg::InputHeld`]). Applied to the panes
+    /// [`Self::apply_inbox_notice`] applies notices to. Bound to the
+    /// generation it names: one this pane's account has retired changes
+    /// nothing, and one naming a generation the account has not reached yet
+    /// waits for that generation's handover ([`PaneInbox::retire`]). Each one
+    /// not rejected is also kept apart from the account
+    /// ([`Self::pending_input_held`]), so a pane closed after it, or never
+    /// managed, still gives it to the account its surfacing creates for that
+    /// generation.
+    pub fn apply_input_held_update(&mut self, update: &crate::event::InputHeldUpdate) {
+        let held = PaneHeld::new(
+            &update.agent_id,
+            update.input_held.as_ref(),
+            update.input_discarded.as_ref(),
+        );
+        // R-E-U2-02: a retired or older generation's late word is rejected
+        // before it is kept, so it can't displace its successor's. An account
+        // taken under a replaced daemon process names that process's
+        // generations, which say nothing of this one's (review U3-a).
+        if self.pane_inboxes.get(&update.pane_id).is_some_and(|inbox| {
+            !inbox.from_replaced_process
+                && (inbox.retired.contains(&update.agent_id)
+                    || inbox
+                        .agent_id
+                        .as_deref()
+                        .is_some_and(|agent| older_generation(&update.agent_id, agent)))
+        }) || self
+            .pending_input_held
+            .get(&update.pane_id)
+            .is_some_and(|pending| older_generation(&update.agent_id, &pending.held.agent_id))
+        {
+            return;
+        }
+        self.keep_input_held(&update.pane_id, held.clone());
+        let inbox = if self.managed_pane_ids.contains(&update.pane_id) {
+            self.pane_inboxes.entry(update.pane_id.clone()).or_default()
+        } else {
+            match self.pane_inboxes.get_mut(&update.pane_id) {
+                Some(inbox) => inbox,
+                None => return,
+            }
+        };
+        if inbox.agent_id.is_none() {
+            inbox.agent_id = Some(update.agent_id.clone());
+        }
+        inbox.held = Some(held);
+        self.refresh_card_inbox(&update.pane_id);
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): keep `held` as `pane_id`'s latest word
+    /// ([`Self::pending_input_held`]), forgetting the oldest pane's past
+    /// [`MAX_PENDING_INPUT_HELD`].
+    fn keep_input_held(&mut self, pane_id: &str, held: PaneHeld) {
+        self.pending_input_held_seq += 1;
+        let seq = self.pending_input_held_seq;
+        self.pending_input_held
+            .insert(pane_id.to_string(), PendingHeld { held, seq });
+        while self.pending_input_held.len() > MAX_PENDING_INPUT_HELD {
+            let Some(oldest) = self
+                .pending_input_held
+                .iter()
+                .min_by_key(|(_, pending)| pending.seq)
+                .map(|(pane, _)| pane.clone())
+            else {
+                break;
+            };
+            self.pending_input_held.remove(&oldest);
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-20e, R-E-U3-02): the panes
+    /// [`Self::pending_input_held`] keeps a word for, for the bound's tests
+    /// in `tests/render_input_held.rs` (an integration test, so it can't be
+    /// `cfg(test)`); no production caller.
+    #[doc(hidden)]
+    pub fn pending_input_held_panes(&self) -> Vec<String> {
+        let mut panes: Vec<String> = self.pending_input_held.keys().cloned().collect();
+        panes.sort();
+        panes
+    }
+
     /// PRD #1666 part 3 (R-2): the refusal code of the request `pane_id`'s
     /// agent made for its own messages, while messages wait for it, with the
     /// agent generation it belongs to.
@@ -9373,6 +9825,24 @@ impl AppState {
                 .as_deref()
                 .map(|code| (inbox.agent_id.as_deref(), code))
         })
+    }
+
+    /// PRD #1666 part 3, round 5-wake (Q6): every pane whose current agent
+    /// generation the deck holds the doorbell for, with the words the
+    /// deck-wide attention item gives its hold
+    /// ([`crate::inbox_display::CardInbox::attention_words`]). Read from the
+    /// pane's account, which a generation change replaces, so a predecessor's
+    /// hold never marks its successor.
+    pub fn held_inbox_panes(&self) -> std::collections::BTreeMap<&str, String> {
+        self.pane_inboxes
+            .iter()
+            .filter_map(|(pane_id, inbox)| {
+                inbox
+                    .card()
+                    .attention_words()
+                    .map(|words| (pane_id.as_str(), words))
+            })
+            .collect()
     }
 
     /// PRD #1666 §6.4: the items `pane_id`'s card lists for the user to
@@ -9415,16 +9885,67 @@ impl AppState {
     }
 
     /// Draw `pane_id`'s inbox on its card.
+    ///
+    /// PRD #1666 part 3 (Q35-20e): while the pane's current generation has
+    /// no card of its own — one that has sent no hook, after its predecessor's
+    /// card was restored as the pane's placeholder — its held-typing row goes
+    /// on the card that predecessor left ([`Self::retired_card_id`]), the
+    /// pane's only card, and nothing else of the account does. Once the
+    /// generation has its own card, that row leaves the predecessor's.
     fn refresh_card_inbox(&mut self, pane_id: &str) {
         let Some(inbox) = self.pane_inboxes.get(pane_id).map(PaneInbox::card) else {
             return;
         };
-        let Some(card_id) = self.inbox_card_id(pane_id) else {
+        let card_id = self.inbox_card_id(pane_id);
+        if let Some(left) = self
+            .retired_card_id(pane_id)
+            .filter(|left| card_id.as_ref() != Some(left))
+            && let Some(card) = self.sessions.get_mut(&left)
+        {
+            let (input_held, input_discarded) = if card_id.is_some() {
+                (None, false)
+            } else {
+                (inbox.input_held, inbox.input_discarded)
+            };
+            let current = card.card_inbox().unwrap_or_default();
+            if current.input_held != input_held || current.input_discarded != input_discarded {
+                set_card_inbox(
+                    card,
+                    crate::inbox_display::CardInbox {
+                        input_held,
+                        input_discarded,
+                        ..current
+                    },
+                );
+            }
+        }
+        let Some(card_id) = card_id else {
             return;
         };
         if let Some(card) = self.sessions.get_mut(&card_id) {
             set_card_inbox(card, inbox);
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): `pane_id`'s newest card belonging to a
+    /// generation its account retired, such as the placeholder a stopped
+    /// generation's card was restored as.
+    fn retired_card_id(&self, pane_id: &str) -> Option<String> {
+        let inbox = self.pane_inboxes.get(pane_id)?;
+        self.sessions
+            .values()
+            .filter(|s| {
+                s.pane_id.as_deref() == Some(pane_id)
+                    && s.agent_id
+                        .as_ref()
+                        .is_some_and(|agent| inbox.retired.contains(agent))
+            })
+            .max_by(|a, b| {
+                a.last_activity
+                    .cmp(&b.last_activity)
+                    .then_with(|| a.session_id.cmp(&b.session_id))
+            })
+            .map(|s| s.session_id.clone())
     }
 
     /// After an event for `pane_id`: a card the pane's inbox is not drawn on
@@ -9434,6 +9955,10 @@ impl AppState {
             return;
         }
         let Some(card_id) = self.inbox_card_id(pane_id) else {
+            // Q35-20e: a card a retired generation left, minted after the
+            // pane's current generation's held typing was learned, takes
+            // its row (`refresh_card_inbox`).
+            self.refresh_card_inbox(pane_id);
             return;
         };
         if self
@@ -14273,10 +14798,21 @@ impl AppState {
         // card reads Needs Input — also when the question rides a `ToolStart`
         // (Codex's `request_user_input`), which on its own would read Working.
         // A Blocked card keeps its status: it is the stickier truth.
+        // PRD #1666 part 3 (Q35-17): `answer_queued` is the daemon's mark of
+        // an answer a fence holds, which a question read off an event never
+        // carries (`PendingQuestion::sanitized`): a repeat of the pending
+        // question at its revision keeps it.
+        let queued = session
+            .pending_question
+            .as_ref()
+            .filter(|q| q.answer_queued)
+            .map(|q| (q.id.clone(), q.revision));
         if clears_question {
             session.pending_question = None;
         }
-        if let Some(question) = raised_question {
+        if let Some(mut question) = raised_question {
+            question.answer_queued = queued
+                .is_some_and(|(id, revision)| id == question.id && revision == question.revision);
             session.pending_question = Some(question);
             if session.status != SessionStatus::Blocked {
                 if session.status != SessionStatus::WaitingForInput {
@@ -20357,11 +20893,14 @@ mod tests {
             reason: None,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: false,
             notices: Default::default(),
             provenance: None,
+            termination: None,
         }
     }
 
@@ -20402,6 +20941,8 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: false,
+                wake_hold: None,
+                hold_detail: None,
                 notices: Default::default(),
             },
         );
@@ -20450,6 +20991,8 @@ mod tests {
             wake: crate::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             notices: crate::inbox_hub::InboxCardNotices {
                 integration,
                 ..Default::default()
@@ -20565,6 +21108,8 @@ mod tests {
         };
         let carried = crate::inbox_hub::InboxSummary {
             wake_stalled: true,
+            wake_hold: None,
+            hold_detail: None,
             notices: notices.clone(),
             ..held_summary(1, None)
         };
@@ -20578,6 +21123,8 @@ mod tests {
             crate::event::InboxNotice {
                 wake_update: true,
                 wake_stalled: true,
+                wake_hold: None,
+                hold_detail: None,
                 ..inbox_notice("pane-q", "m-1", Queued)
             },
         ];
@@ -20762,6 +21309,132 @@ mod tests {
         }
     }
 
+    /// PRD #1666 part 3 (review U3-a, `fold`'s half): a managed pane's
+    /// account of generation 12, three messages pending, was taken under
+    /// daemon process A. The stream moves to process B, whose ids start over;
+    /// B's generation reports on the pane, and a notice of B's queues a
+    /// message before any account of B's reaches it. B's card counts that one
+    /// message, whether B's generation has another id or reuses 12, and a
+    /// second notice of B's counts on top: the account is B's from the first
+    /// one on, so the counts start over only once. Controls,
+    /// under one process: another generation's notice is late and changes
+    /// nothing, and the same generation's counts on top of its account.
+    #[test]
+    fn a_replaced_processs_account_fences_no_notice_from_the_new_one() {
+        use crate::inbox::StateName::Queued;
+        let named = |process: &str| -> Incarnation {
+            serde_json::from_value(serde_json::json!(process)).unwrap()
+        };
+        let run = |reconnect: bool, agent: &str| {
+            let mut state = AppState::default();
+            state.learn_stream_incarnation(named("daemon-a"));
+            state.register_pane("pane-q".to_string());
+            state.take_inbox_snapshot(&[inbox_record("pane-q", "12", Some(held_summary(3, None)))]);
+            if reconnect {
+                state.learn_stream_incarnation(named("daemon-b"));
+            }
+            let card = format!("gen-{agent}");
+            state.apply_event(AgentEvent {
+                session_id: card.clone(),
+                agent_id: Some(agent.to_string()),
+                ..quota_event(EventType::SessionStart, 1)
+            });
+            ["m-new", "m-new2"].map(|message| {
+                state.apply_inbox_notice(&crate::event::InboxNotice {
+                    agent_id: Some(agent.to_string()),
+                    ..inbox_notice("pane-q", message, Queued)
+                });
+                state.sessions[&card]
+                    .card_inbox()
+                    .map(|inbox| inbox.pending)
+            })
+        };
+        assert_eq!(
+            run(false, "3"),
+            [None, None],
+            "control: under one process another generation's notices are late"
+        );
+        assert_eq!(
+            run(false, "12"),
+            [Some(4), Some(5)],
+            "control: under one process the same generation's count on top"
+        );
+        assert_eq!(
+            run(true, "3"),
+            [Some(1), Some(2)],
+            "process B's generation 3 starts the counts over, once"
+        );
+        assert_eq!(
+            run(true, "12"),
+            [Some(1), Some(2)],
+            "process B's reused id 12 starts them over too, once"
+        );
+    }
+
+    /// PRD #1666 part 3 (review rev-tidy2 U3-1): under daemon process A the
+    /// deck holds typing for the pane's generation 12 and says the typing of
+    /// its generation 11 was discarded. The stream moves to process B, whose
+    /// own generation reuses the id 12, and a notice of B's reaches the pane.
+    /// B's card shows neither of A's words: A's held-typing word is about A's
+    /// process, whatever id B's generation reuses. Control, under one process:
+    /// generation 12's own card keeps both words.
+    #[test]
+    fn a_replaced_processs_held_typing_word_does_not_ride_onto_a_reused_id() {
+        use crate::inbox::StateName::Queued;
+        use crate::inbox_display::{InputDiscarded, InputHeld, InputHeldCause};
+        let named = |process: &str| -> Incarnation {
+            serde_json::from_value(serde_json::json!(process)).unwrap()
+        };
+        let run = |reconnect: bool| {
+            let mut state = AppState::default();
+            state.learn_stream_incarnation(named("daemon-a"));
+            state.register_pane("pane-q".to_string());
+            state.take_inbox_snapshot(&[inbox_record("pane-q", "12", Some(held_summary(0, None)))]);
+            state.apply_input_held_update(&crate::event::InputHeldUpdate {
+                pane_id: "pane-q".to_string(),
+                agent_id: "12".to_string(),
+                input_held: Some(InputHeld {
+                    generation: 12,
+                    cause: InputHeldCause::Checking,
+                    held_ops: 1,
+                    held_bytes: 1,
+                    since_ms: 0,
+                }),
+                input_discarded: Some(InputDiscarded {
+                    generation: 11,
+                    held_ops: 1,
+                    held_bytes: 1,
+                    at_ms: 0,
+                }),
+            });
+            if reconnect {
+                state.learn_stream_incarnation(named("daemon-b"));
+            }
+            state.apply_event(AgentEvent {
+                session_id: "gen-12".to_string(),
+                agent_id: Some("12".to_string()),
+                ..quota_event(EventType::SessionStart, 1)
+            });
+            state.apply_inbox_notice(&crate::event::InboxNotice {
+                agent_id: Some("12".to_string()),
+                ..inbox_notice("pane-q", "m-new", Queued)
+            });
+            state.sessions["gen-12"]
+                .card_inbox()
+                .map(|inbox| (inbox.input_held, inbox.input_discarded))
+        };
+        assert_eq!(
+            run(false),
+            Some((Some(InputHeldCause::Checking), true)),
+            "control: under one process generation 12 keeps its own words"
+        );
+        assert_eq!(
+            run(true),
+            Some((None, false)),
+            "process B's reused id 12 carries none of process A's words"
+        );
+    }
+
     /// PRD #1666 §2.8 (auditor R9Q-A03): a new agent's surfacing start reaches
     /// a client that never held an account of the pane's earlier occupant, so
     /// no retained history names it. That occupant's cleanup — its reader
@@ -20899,6 +21572,8 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Native,
                 component: None,
                 wake_stalled: false,
+                wake_hold: None,
+                hold_detail: None,
                 notices: Default::default(),
             },
         );
@@ -20978,6 +21653,8 @@ mod tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: true,
+                wake_hold: None,
+                hold_detail: None,
                 notices: Default::default(),
             },
         );
@@ -21010,6 +21687,69 @@ mod tests {
             if let BroadcastMsg::Inbox(notice) = msg {
                 state.apply_inbox_notice(&notice);
             }
+        }
+    }
+
+    /// Scenario: Attach a TUI card to a real inbox whose agent has one waiting message, then have the deck say the wake stalled and the doorbell holds for a possible draft, change the reason, and stop holding. The card's line keeps the count and its notice row says why while the deck holds, and goes back to the stall's words when it stops. A summary from a newer deck naming a reason this build does not know reads as the stall's words, and one from an older deck with no reason at all reads as it always did.
+    #[spec("inbox/status/034")]
+    #[test]
+    fn status_034_a_card_follows_the_hold_and_reads_older_and_newer_decks() {
+        use crate::inbox::Recipient;
+        use crate::inbox_display::WakeHold;
+        let hub = crate::inbox_hub::InboxHub::new(
+            crate::inbox::DeckId::parse("k3xzq2ab").unwrap(),
+            crate::inbox::InboxLimits::default(),
+            crate::inbox_hub::DEFAULT_KEEPALIVE,
+        );
+        hub.post_direct(
+            Recipient::bound("pane-q", "agent-q"),
+            crate::inbox::Content::from_deck("seed", "task", "do it"),
+        )
+        .unwrap();
+        let (mut state, mut rx) = attached_card(&hub);
+        let card = |state: &AppState| state.sessions["gen-q"].card_inbox().unwrap();
+        hub.set_wake_stalled("pane-q", "agent-q", true);
+        hub.set_wake_hold("pane-q", "agent-q", Some(WakeHold::PossibleDraft));
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(card(&state).full_text().as_deref(), Some("✉1"));
+        assert_eq!(
+            card(&state).notice_text().as_deref(),
+            Some("✉1 waiting: there may be an unsent draft. Send it or clear it.")
+        );
+        hub.set_wake_hold("pane-q", "agent-q", Some(WakeHold::AwaitingPrompt));
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(
+            card(&state).notice_text().as_deref(),
+            Some("✉1 not yet taken: the agent may be waiting at a prompt. Check its pane.")
+        );
+        hub.set_wake_hold("pane-q", "agent-q", None);
+        follow_notices(&mut state, &mut rx);
+        assert_eq!(
+            card(&state).full_text().as_deref(),
+            Some("✉1 waiting to wake: send it a prompt")
+        );
+        assert_eq!(card(&state).notice_text(), None);
+
+        for (summary, why) in [
+            (
+                serde_json::json!({"queued": 1, "fetched": 0, "undeliverable": 0,
+                    "wake": "doorbell", "wake_hold": "a_newer_reason"}),
+                "a reason a newer deck names",
+            ),
+            (
+                serde_json::json!({"queued": 1, "fetched": 0, "undeliverable": 0,
+                    "wake": "doorbell", "wake_stalled": true}),
+                "an older deck's stalled summary",
+            ),
+        ] {
+            let summary: crate::inbox_hub::InboxSummary = serde_json::from_value(summary).unwrap();
+            state.apply_inbox_summary("pane-q", "agent-q", &summary);
+            assert_eq!(
+                card(&state).full_text().as_deref(),
+                Some("✉1 waiting to wake: send it a prompt"),
+                "{why}"
+            );
+            assert_eq!(card(&state).notice_text(), None, "{why}");
         }
     }
 
@@ -22398,6 +23138,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         };
         let wire = serde_json::to_value(&snap).unwrap();
         assert_eq!(
@@ -22469,6 +23211,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         };
         let hydrated = |resets_at_ms| {
             let mut state = AppState::default();

@@ -70,6 +70,19 @@ dot-agent-deck config set bell.on_idle true            # also ring when an agent
 
 Restart the TUI for a change to take effect.
 
+## Turn the doorbell off for Claude Code or Codex
+
+The deck types a doorbell line into an idle Claude Code or Codex to tell it a message is waiting, and checks the agent's input box before it does where it can ([Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app)). It does that for every release of each agent. A pre-release build, one whose version carries a suffix such as `-beta.1` or `-alpha.1`, gets neither: the deck can't read its version, so that agent's messages arrive through its own wake-up and hooks or at your next prompt ([`unknown_release`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). If an agent update makes the doorbell misbehave, turn it off for that agent in `config.toml` on the daemon's host:
+
+```bash
+dot-agent-deck config set doorbell.claude false   # no doorbell or input-box check for Claude Code
+dot-agent-deck config set doorbell.codex false    # no doorbell or input-box check for Codex
+```
+
+Use the config key, and with the desktop app especially: the daemon reads the file each time it starts an agent, so the key works for a daemon that is already running and for one the app started.
+
+`DOT_AGENT_DECK_DOORBELL_CLAUDE` and `DOT_AGENT_DECK_DOORBELL_CODEX` win over the file: `0`, `false` or `off` turn the doorbell off, `1`, `true` or `on` turn it on. The daemon reads them from its own environment, the one it was started with, so a variable works only when it is set where the daemon starts, for example `DOT_AGENT_DECK_DOORBELL_CLAUDE=0 dot-agent-deck` while no daemon is running. A daemon that is already running keeps its environment and never sees a variable you export in a shell afterwards ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)), and a daemon the desktop app starts when you open the app from the Dock, Finder or an application menu doesn't get variables exported in your shell profile. A daemon that runs as a service (`dot-agent-deck daemon install`) doesn't get them from the shell you install it from either: use the config key there, or set the variable in the service and restart it ([Run the Daemon as a Service](daemon-service.md#credentials-and-other-environment)). A change applies to agents started after it, in the TUI and the desktop app alike: restart an agent from the deck, once it has taken its messages, to apply it. With the doorbell off, the agent's messages arrive through its own wake-up and hooks or at your next prompt, and its card says `waiting for the agent to fetch it. Send it a prompt.` when nothing else delivers them ([Turn the doorbell off for an agent](orchestration.md#turn-the-doorbell-off-for-an-agent)).
+
 ## `config.toml` reference
 
 `dot-agent-deck config get <key>` prints a value; `dot-agent-deck config set <key> <value>` writes one. Both exit `1` with `Unknown config key: <key>` and the list of keys for a key that does not exist. Booleans take exactly `true` or `false`.
@@ -83,6 +96,8 @@ Restart the TUI for a change to take effect.
 | `bell.on_waiting_for_input` | boolean | `true` | Bell on waiting for input |
 | `bell.on_idle` | boolean | `false` | Bell on idle |
 | `bell.on_error` | boolean | `true` | Bell on error or blocked |
+| `doorbell.claude` | boolean | `true` | [Doorbell and input-box check](#turn-the-doorbell-off-for-claude-code-or-codex) for Claude Code |
+| `doorbell.codex` | boolean | `true` | [Doorbell](#turn-the-doorbell-off-for-claude-code-or-codex) for Codex |
 
 The file is TOML, and you can edit it by hand:
 
@@ -96,9 +111,13 @@ enabled = true
 on_waiting_for_input = true
 on_idle = false
 on_error = true
+
+[doorbell]
+claude = true
+codex = true
 ```
 
-`config set` rewrites the whole file from the keys above, so comments and any other keys are removed. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and a `config set` then replaces the unparseable file with the defaults plus the key you set. Fix a parse error by hand before running `config set`.
+`config set` rewrites the whole file from the keys above, so comments and any other keys are removed. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and a `config set` then replaces the unparseable file with the defaults plus the key you set. Fix a parse error by hand before running `config set`. While the file can't be used, the daemon also holds the doorbell off for both Claude Code and Codex for the agents it starts, rather than turning it on by default ([`turned_off`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)).
 
 ## Create a project configuration
 

@@ -2980,6 +2980,8 @@ fn live_005_post_reconnect_session_start_remaps_onto_seeded_card() {
         pull_request_revision: None,
         background: None,
         background_revision: None,
+        answer_settlements: Vec::new(),
+        input_held: None,
     };
 
     // Hydration seeds the card from the snapshot; agent_id is minted on it so
@@ -3084,6 +3086,8 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
             if let AttachRequest::ListAgents = req {
                 let over_long = "a".repeat(100_000);
                 let hostile = AgentRecord {
+                    input_held: None,
+                    input_discarded: None,
                     id: "hostile-live-7".into(),
                     pane_id_env: Some("pane-hostile".into()),
                     // Issue #833: hostile in BOTH dimensions, like the live
@@ -3137,6 +3141,8 @@ async fn run_hostile_live_list_server(listener: UnixListener) {
                         pull_request_revision: None,
                         background: None,
                         background_revision: None,
+                        answer_settlements: Vec::new(),
+                        input_held: None,
                     }),
                     spawned_at_ms: None,
                     cli_name: None,
@@ -3573,6 +3579,175 @@ async fn live_011_real_agent_event_cli_status_survives_reconnect_inner() {
     drop(controller);
 }
 
+/// Optional wire observer for investigating #1786 without changing production
+/// code. It forwards the real request/reply bytes, recording registry liveness
+/// at ListAgents and the actual ListAgents/AttachStream responses. Only the
+/// failure path prints the transcript; ordinary runs keep the original socket.
+struct HydrationTrace {
+    path: PathBuf,
+    entries: Arc<Mutex<Vec<String>>>,
+    handle: JoinHandle<()>,
+}
+
+fn hydration_diagnostics_enabled(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+fn hydration_registry_snapshot(registry: &AgentPtyRegistry) -> String {
+    format!(
+        "registry (record, observed_exited)={:?}",
+        registry.agent_records_including_exited()
+    )
+}
+
+/// Scenario: Render diagnostic snapshots of a registered live `cat` child and a retained child that exited normally. Both records remain in the snapshot with accurately labeled exit flags.
+#[spec("session/live/017")]
+#[test]
+fn live_017_diagnostic_registry_labels_live_and_retained_exited_records() {
+    child_lifetime_bound::arm();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build diagnostic control runtime");
+    let _guard = rt.enter();
+    let live = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn live diagnostic control");
+    let exited = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("exit 0"),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn retained exited diagnostic control");
+    rt.block_on(async {
+        let _ = tokio::time::timeout(Duration::from_secs(5), registry.agent_exit_signal(&exited))
+            .await
+            .expect("diagnostic control child must exit within 5s");
+    });
+    let records = registry.agent_records_including_exited();
+    for (id, observed_exited) in [(&live, false), (&exited, true)] {
+        let record = records
+            .iter()
+            .find(|(record, _)| &record.id == id)
+            .expect("both diagnostic control records remain registered");
+        assert_eq!(record.1, observed_exited, "control exit flag for {id}");
+    }
+    let snapshot = hydration_registry_snapshot(&registry);
+    // Stop the children owned by this registry before checking the printed snapshot.
+    registry.shutdown_all();
+    assert!(
+        snapshot.starts_with("registry (record, observed_exited)="),
+        "diagnostic must label the stored exit flag accurately: {snapshot}"
+    );
+    for (id, observed_exited) in [(&live, false), (&exited, true)] {
+        let (record, _) = records.iter().find(|(record, _)| &record.id == id).unwrap();
+        assert!(
+            snapshot.contains(&format!("({record:?}, {observed_exited})")),
+            "diagnostic must print id={id} with observed_exited={observed_exited}: {snapshot}"
+        );
+    }
+}
+
+/// Scenario: Select the test-only hydration observer with a diagnostic option. Only the literal `1` enables it; an absent value, `0`, an empty value and other strings keep hydration on the original socket.
+#[spec("session/live/017")]
+#[test]
+fn live_017_diagnostic_opt_in_requires_literal_one() {
+    for (value, expected) in [
+        (None, false),
+        (Some("1"), true),
+        (Some("0"), false),
+        (Some(""), false),
+        (Some("true"), false),
+        (Some("01"), false),
+        (Some(" 1"), false),
+    ] {
+        assert_eq!(
+            hydration_diagnostics_enabled(value.map(std::ffi::OsStr::new)),
+            expected,
+            "diagnostic option {value:?} must enable tracing only for literal 1"
+        );
+    }
+}
+
+impl Drop for HydrationTrace {
+    fn drop(&mut self) {
+        self.handle.abort();
+    }
+}
+
+impl HydrationTrace {
+    async fn start(daemon: &AgentEventDaemon) -> Self {
+        let path = daemon._dir.path().join("trace.sock");
+        let listener = UnixListener::bind(&path).expect("bind test-only hydration observer");
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let transcript = entries.clone();
+        let target = daemon.attach_path.clone();
+        let registry = daemon.registry.clone();
+        let handle = tokio::spawn(async move {
+            let mut connections = tokio::task::JoinSet::new();
+            while let Ok((mut downstream, _)) = listener.accept().await {
+                let target = target.clone();
+                let transcript = transcript.clone();
+                let registry = registry.clone();
+                connections.spawn(async move {
+                    let result: std::io::Result<()> = async {
+                        let mut upstream = UnixStream::connect(target).await?;
+                        while let Some((kind, request)) = read_frame(&mut downstream).await? {
+                            let parsed = serde_json::from_slice::<AttachRequest>(&request);
+                            let listing = matches!(&parsed, Ok(AttachRequest::ListAgents));
+                            let attaching =
+                                matches!(&parsed, Ok(AttachRequest::AttachStream { .. }));
+                            if listing {
+                                transcript.lock().unwrap().push(format!(
+                                    "before ListAgents {}",
+                                    hydration_registry_snapshot(&registry)
+                                ));
+                            }
+                            write_frame(&mut upstream, kind, &request).await?;
+                            let response = read_frame(&mut upstream).await?;
+                            if listing || attaching {
+                                transcript.lock().unwrap().push(format!(
+                                    "request={parsed:?}; raw response={:?}",
+                                    response.as_ref().map(|(kind, bytes)| (
+                                        *kind,
+                                        String::from_utf8_lossy(bytes).into_owned()
+                                    ))
+                                ));
+                            }
+                            let Some((kind, response)) = response else {
+                                break;
+                            };
+                            write_frame(&mut downstream, kind, &response).await?;
+                            if attaching {
+                                tokio::io::copy_bidirectional(&mut downstream, &mut upstream)
+                                    .await?;
+                                break;
+                            }
+                        }
+                        Ok(())
+                    }
+                    .await;
+                    if let Err(error) = result {
+                        transcript
+                            .lock()
+                            .unwrap()
+                            .push(format!("observer transport error: {error}"));
+                    }
+                });
+            }
+        });
+        Self {
+            path,
+            entries,
+            handle,
+        }
+    }
+}
+
 /// Scenario: A wrapped Codex pane runs under a real daemon, where Codex announced its conversation and the wrapper (reporting under `<pane>-session`) has spoken since; a fresh TUI hydrates through `ListAgents` after its event stream already delivered a wrapper frame. The reconnected TUI must hold the conversation the daemon's send guard holds, and must keep a genuine `SessionStart` it received after the daemon built its reply rather than roll back to the reply. Control: an older daemon's reply carries no generation, so the TUI keeps the id it built from events.
 #[spec("session/live/017")]
 #[test]
@@ -3638,8 +3813,18 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
     }
 
     // A fresh TUI hydrates over the real attach socket (`ListAgents`).
+    // Opt in when reproducing #1786; the default path has no proxy scheduling.
+    let trace = if hydration_diagnostics_enabled(
+        std::env::var_os("DAD_REHYDRATION_DIAGNOSTICS").as_deref(),
+    ) {
+        Some(HydrationTrace::start(&daemon).await)
+    } else {
+        None
+    };
     let controller = Arc::new(EmbeddedPaneController::new(
-        daemon.attach_path.clone(),
+        trace
+            .as_ref()
+            .map_or_else(|| daemon.attach_path.clone(), |trace| trace.path.clone()),
         tokio::runtime::Handle::current(),
     ));
     let hydrated = {
@@ -3651,8 +3836,26 @@ async fn live_017_reconnect_adopts_the_daemons_pane_generation_inner() {
     let pane = hydrated
         .iter()
         .find(|pane| pane.agent_id == agent_id)
-        .unwrap_or_else(|| panic!("the wrapped pane was not hydrated; hydrated={hydrated:?}"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the wrapped pane was not hydrated; hydrated={hydrated:?}; after hydration {}; wire trace={:?}",
+                hydration_registry_snapshot(&daemon.registry),
+                trace.as_ref().map(|trace| trace.entries.lock().unwrap().clone())
+            )
+        })
         .clone();
+    if let Some(trace) = &trace {
+        let entries = trace.entries.lock().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.contains("request=Ok(ListAgents)"))
+                && entries
+                    .iter()
+                    .any(|entry| entry.contains("request=Ok(AttachStream")),
+            "the diagnostic observer must record both hydration steps; trace={entries:?}"
+        );
+    }
     assert!(
         pane.live.is_some(),
         "the daemon's reply must carry the pane's live snapshot"

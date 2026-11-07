@@ -39,6 +39,8 @@ import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
+import { DeckAttention } from "./components/DeckAttention";
+import { deckAttentionText } from "./lib/inboxWords";
 import { SelectDeckNote } from "./components/SelectDeckNote";
 import { ProfilesPanel, ProjectsPanel, PromptLibraryPanel, OrchestrationPanel } from "./components/ConfigurationPanels";
 import { SettingsSheet } from "./components/SettingsSheet";
@@ -869,6 +871,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* PRD #1631 — the question the agent is waiting on, which voice answers
          from this pane, and only from this pane (decision 9). */
       question: paneShownAgent.pendingQuestion,
+      /* PRD #1666 part 3 (Q35) — why the deck holds what was typed into the
+         pane, beside a queued answer, and what became of held answers. */
+      ...(paneShownAgent.inputHeld ? { inputHeld: paneShownAgent.inputHeld } : {}),
+      ...(paneShownAgent.answerSettlements ? { answerSettlements: paneShownAgent.answerSettlements } : {}),
       /* Issue #1668 — sentences about that question name the agent as
          Reading does: an orchestration agent by its run's title too. */
       questionLabel: questionAgentName(paneShownAgent),
@@ -2445,10 +2451,13 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     ...(mode === "fixture" ? [{ label: "Advance fixture", hint: "Move the deterministic loop one node", icon: Zap, run: () => VOICE_ACTIONS.advanceFixture.run(voiceContext) }] : []),
   ];
 
+  // PRD #1666 part 3, round 5-wake (Q6): who the deck holds the doorbell for.
+  const deckAttention = deckAttentionText(snapshot.agents);
+
   return (
     <div className={`control-deck ${evidenceOpen && !allDecks ? "with-evidence" : ""}`}>
       <main className="deck-main">
-        <header className="topbar">
+        <header className={`topbar${deckAttention ? " with-attention" : ""}`}>
           <div className="repo-context">
             <div className="repo-line"><FolderGit2 size={15} /><strong>{activeProject?.displayName || snapshot.repo}</strong><ChevronRight size={13} /><span>{snapshot.runId}</span></div>
             {/*
@@ -2504,6 +2513,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               onClick={requestStop}
             ><CircleStop size={14} /><span>{selectedAgent ? "Close" : "Stop"}</span></button>
           </div>
+          <DeckAttention text={deckAttention} />
         </header>
 
         {mode === "fixture" && (
