@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: inbox_hold_card(with_notice)
+---
+┌ 1 ClaudeCode · api-svc ──────────────────────────────────── ● Idle ✉2 queued ┐
+│Dir:  api-svc                                                                 │
+│Add --standalone to the command or run opencode service set disabled true,    │
+│then restart: OpenCode 2's shared service hides this agent                    │
+│Prmt: move the stats into the border                                          │
+│                                                                              │
+│                                                                              │
+└───────────────────────────────────────────────────────── Last: 1h  Tools: 14 ┘

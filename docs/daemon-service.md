@@ -48,7 +48,7 @@ sudo loginctl enable-linger "$USER"
 
 ## Credentials and other environment
 
-A service does not read your shell profile. The daemon takes `PATH` from your login shell when it starts, and nothing else. Anything else the agents need from the environment, such as an `ANTHROPIC_API_KEY`, has to be given to the service. An agent that logs in through its own flow (Claude Code's `/login`, for example) needs nothing here. `daemon install` never writes credentials anywhere.
+A service does not read your shell profile. The daemon takes `PATH` from your login shell when it starts, and nothing else. Anything else the agents need from the environment, such as an `ANTHROPIC_API_KEY`, has to be given to the service, and so does a variable the daemon itself reads that the list in [What the service changes](#what-the-service-changes) leaves out, such as `DOT_AGENT_DECK_DOORBELL_CLAUDE`; for that one, the `doorbell.claude` key in `config.toml` is simpler ([Configuration](configuration.md#turn-the-doorbell-off-for-claude-code-or-codex)). An agent that logs in through its own flow (Claude Code's `/login`, for example) needs nothing here. `daemon install` never writes credentials anywhere.
 
 **Linux:** add them in a drop-in, which `daemon install` does not overwrite:
 

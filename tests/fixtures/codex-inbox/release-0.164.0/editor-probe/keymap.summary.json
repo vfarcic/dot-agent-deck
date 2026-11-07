@@ -1,0 +1,588 @@
+{
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "mode": "keymap",
+ "error": null,
+ "size": [
+  50,
+  200
+ ],
+ "term": "xterm-256color",
+ "colorterm": "truecolor",
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "setup": "nollm: dummy key, loopback Responses server, bwrap --unshare-net, tmpfs /home /root /tmp /run/user",
+ "recorder_sha256": "1bb22be75acc1823a61dd808202a7dea6609ac44b40f5828d01a97024136fd81",
+ "rows": [
+  {
+   "case": "m58-1-model-only-profile",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "model = \"nollm-model\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  },
+  {
+   "case": "m58-2-profile-binds-f6",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "m58-3-cli-restores-ctrl-g-over-profile",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure",
+    "-c",
+    "tui.keymap.global.open_external_editor=\"ctrl-g\""
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  },
+  {
+   "case": "m58-4-trusted-project-binds-f6",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "work/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "m58-5-unparsable-profile",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "model = = \"x\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": false,
+   "ctrl_g_opened": null,
+   "f6_opened": null,
+   "exit_status": 256,
+   "startup_error": [
+    "ROOT/home/.codex/measure.config.toml:1:9: extra `=`, expected nothing",
+    "|",
+    "1 | model = = \"x\"",
+    "|         ^"
+   ]
+  },
+  {
+   "case": "m58-6-legacy-table-model-only",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[profiles.measure]\nmodel = \"nollm-model\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": false,
+   "ctrl_g_opened": null,
+   "f6_opened": null,
+   "exit_status": 256,
+   "startup_error": [
+    "Error: --profile `measure` cannot be used while ROOT/home/.codex/config.toml contains legacy `profile = \"measure\"` or `[profiles.measure]` config; move those settings",
+    "into ROOT/home/.codex/measure.config.toml and remove the legacy profile selector/table. See https://developers.openai.com/codex/config-advanced#profiles for more inf",
+    "ormation."
+   ]
+  },
+  {
+   "case": "m58-7-legacy-table-binding",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[profiles.measure.tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": false,
+   "ctrl_g_opened": null,
+   "f6_opened": null,
+   "exit_status": 256,
+   "startup_error": [
+    "Error: --profile `measure` cannot be used while ROOT/home/.codex/config.toml contains legacy `profile = \"measure\"` or `[profiles.measure]` config; move those settings",
+    "into ROOT/home/.codex/measure.config.toml and remove the legacy profile selector/table. See https://developers.openai.com/codex/config-advanced#profiles for more inf",
+    "ormation."
+   ]
+  },
+  {
+   "case": "m58-8-profile-file-and-legacy-table",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[profiles.measure]\nmodel = \"nollm-model\"\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "model = \"nollm-model\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": false,
+   "ctrl_g_opened": null,
+   "f6_opened": null,
+   "exit_status": 256,
+   "startup_error": [
+    "Error: --profile `measure` cannot be used while ROOT/home/.codex/config.toml contains legacy `profile = \"measure\"` or `[profiles.measure]` config; move those settings",
+    "into ROOT/home/.codex/measure.config.toml and remove the legacy profile selector/table. See https://developers.openai.com/codex/config-advanced#profiles for more inf",
+    "ormation."
+   ]
+  },
+  {
+   "case": "prec-base-f6",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-base-f6-profile-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-profile-f6-project-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    },
+    "work/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-project-f6-profile-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    },
+    "work/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-base-f6-project-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    },
+    "work/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-cli-f6-over-base-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-c",
+    "tui.keymap.global.open_external_editor=\"f6\""
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-cli-f6-over-profile-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure",
+    "-c",
+    "tui.keymap.global.open_external_editor=\"f6\""
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-cli-f6-over-project-ctrl-g",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-c",
+    "tui.keymap.global.open_external_editor=\"f6\""
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "work/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"ctrl-g\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "prec-cli-ctrl-g-over-project-f6",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-c",
+    "tui.keymap.global.open_external_editor=\"ctrl-g\""
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "work/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  },
+  {
+   "case": "symlinked-profile-binds-f6",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}",
+    "-p",
+    "measure"
+   ],
+   "cwd": "work",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n",
+     "symlink": null
+    },
+    "home/.codex/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": "home/target/measure.config.toml"
+    },
+    "home/target/measure.config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": null,
+   "started": true,
+   "ctrl_g_opened": false,
+   "f6_opened": true,
+   "exit_status": 15
+  },
+  {
+   "case": "untrusted-project-binds-f6",
+   "args": [
+    "--sandbox",
+    "workspace-write",
+    "--ask-for-approval",
+    "never",
+    "-c",
+    "shell_environment_policy.set={}"
+   ],
+   "cwd": "work/sub",
+   "files": {
+    "home/.codex/config.toml": {
+     "text": "model = \"nollm-model\"\nmodel_provider = \"nollm\"\ncheck_for_update_on_startup = false\n\n[projects.\"ROOT/work\"]\ntrust_level = \"trusted\"\n\n[model_providers.nollm]\nname = \"nollm\"\nbase_url = \"http://127.0.0.1:45265/v1\"\nwire_api = \"responses\"\nrequires_openai_auth = true\nrequest_max_retries = 0\nstream_max_retries = 0\n\n[projects.\"ROOT/work/sub\"]\ntrust_level = \"untrusted\"\n",
+     "symlink": null
+    },
+    "work/sub/.codex/config.toml": {
+     "text": "[tui.keymap.global]\nopen_external_editor = \"f6\"\n",
+     "symlink": null
+    }
+   },
+   "dialog": "open-restricted",
+   "started": true,
+   "ctrl_g_opened": true,
+   "f6_opened": false,
+   "exit_status": 15
+  }
+ ]
+}

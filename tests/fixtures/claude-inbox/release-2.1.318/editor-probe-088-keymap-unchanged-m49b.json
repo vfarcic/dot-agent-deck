@@ -1,0 +1,105 @@
+{
+ "release": "2.1.318",
+ "sha256": "708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-a0LUo1/capture",
+ "recorder_sha256": "b3fa8073603f805d5ae03db2b0d1c1e6031bc7cfa37574b5021a05fb8cc8d0ae",
+ "error": null,
+ "rows": [
+  {
+   "cell": "keymap-unchanged",
+   "minute": 1,
+   "elapsed_s": 61.9547204519622,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 2,
+   "elapsed_s": 122.4314592750743,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 3,
+   "elapsed_s": 182.40521052433178,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 4,
+   "elapsed_s": 242.3730513351038,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 5,
+   "elapsed_s": 302.35073406109586,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 6,
+   "elapsed_s": 362.3223461532034,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 7,
+   "elapsed_s": 422.2740326463245,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 8,
+   "elapsed_s": 482.24058384401724,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 9,
+   "elapsed_s": 542.2029890171252,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 10,
+   "elapsed_s": 602.1484710522927,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged-positive",
+   "ctrle": {
+    "opened": true
+   }
+  }
+ ]
+}

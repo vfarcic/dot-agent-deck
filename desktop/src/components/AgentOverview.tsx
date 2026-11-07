@@ -30,6 +30,8 @@ import { DISPLAY_LIMITS, deckName, displayActivity, displayIdentity, displayPath
 import { HookBinaryNotices } from "./HookBinaryNotice";
 import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
+import { deckAttentionText } from "../lib/inboxWords";
+import { DeckAttention } from "./DeckAttention";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -995,6 +997,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * statement about a knowable part of the fleet rather than a guess.
    */
   const known = aggregate.decksUp > 0;
+  // PRD #1666 part 3, round 5-wake (Q6): who the deck holds the doorbell for,
+  // over the decks that answered, as the counters beside it are.
+  const deckAttention = deckAttentionText(decks.filter((deck) => deck.connected).flatMap((deck) => deck.snapshot.agents));
   const countOf = (status: AgentStatus) => aggregate.counts.find((entry) => entry.status === status)?.count ?? 0;
   /**
    * PRD #802 M2 — the overview's "Open deck" controls and
@@ -1533,7 +1538,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     <div className="control-deck overview-screen">
       {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
       <main className="deck-main">
-        <header className="topbar">
+        <header className={`topbar${deckAttention ? " with-attention" : ""}`}>
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong></div>
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
@@ -1570,6 +1575,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             <OverviewColumnPicker columns={columns} onChange={setColumns} />
             <button className="button secondary compact" data-testid="overview-refresh" onClick={() => void runtime.reconnect()}><RefreshCw size={14} /><span>Refresh</span></button>
           </div>
+          <DeckAttention text={deckAttention} />
         </header>
 
         {/*

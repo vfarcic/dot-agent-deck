@@ -1,0 +1,185 @@
+release scanner budget, cores=16 loadavg=6.52 2.70 1.12
+limits (plan §4.6): added hold <= 1000 us p99 and <= 10000 us max per push; cpu <= 50 ms per generation
+codex-0.160.0-composer-24x80 @50x200                       pushes=1840 runs=15 added_hold_us p99=   22.6 max=  292.1 | scanner_us p99=   22.3 max=   79.1 | cpu_ms/gen max=2.67 | work max=9651981 over=false
+codex-0.160.0-deck-tester-fresh-46x130 @50x200             pushes= 238 runs=15 added_hold_us p99=   10.7 max=   78.8 | scanner_us p99=    6.9 max=   43.9 | cpu_ms/gen max=0.49 | work max=1404170 over=false
+codex-0.160.0-deck-tester-respawn-46x130 @50x200           pushes=  55 runs=15 added_hold_us p99=   35.2 max=   81.5 | scanner_us p99=   42.0 max=   43.9 | cpu_ms/gen max=0.13 | work max=452909 over=false
+codex-0.160.0-layout-start-50x200 @50x200                  pushes= 240 runs=15 added_hold_us p99=   40.1 max=   80.3 | scanner_us p99=   38.2 max=   46.4 | cpu_ms/gen max=1.52 | work max=5039446 over=false
+codex-0.160.0-staged-24x80 @50x200                         pushes=1231 runs=15 added_hold_us p99=   22.7 max=  130.5 | scanner_us p99=   22.6 max=   41.6 | cpu_ms/gen max=1.75 | work max=6466755 over=false
+codex-0.160.0-start-update-50x200 @50x200                  pushes=  22 runs=15 added_hold_us p99=   81.9 max=   88.2 | scanner_us p99=   44.3 max=   50.1 | cpu_ms/gen max=0.13 | work max=427189 over=false
+codex-0.164.0-composer-24x80 @50x200                       pushes= 874 runs=15 added_hold_us p99=   24.7 max=   38.2 | scanner_us p99=   24.2 max=   41.7 | cpu_ms/gen max=2.00 | work max=7003887 over=false
+codex-0.164.0-deck-tester-fresh-46x130 @50x200             pushes= 239 runs=15 added_hold_us p99=   10.7 max=   79.5 | scanner_us p99=    6.9 max=   59.0 | cpu_ms/gen max=0.53 | work max=1561252 over=false
+codex-0.164.0-deck-tester-respawn-46x130 @50x200           pushes=  60 runs=15 added_hold_us p99=   37.7 max=   88.1 | scanner_us p99=   42.0 max=   43.8 | cpu_ms/gen max=0.18 | work max=634527 over=false
+codex-0.164.0-hooks-50x200 @50x200                         pushes=  29 runs=15 added_hold_us p99=   90.7 max=  174.4 | scanner_us p99=   90.4 max=   96.4 | cpu_ms/gen max=0.20 | work max=687706 over=false
+codex-0.164.0-layout-start-50x200 @50x200                  pushes= 211 runs=15 added_hold_us p99=   90.9 max=  100.0 | scanner_us p99=   90.6 max=   96.8 | cpu_ms/gen max=3.38 | work max=11351984 over=false
+codex-0.164.0-layout-turn-50x200 @50x200                   pushes= 230 runs=15 added_hold_us p99=   66.0 max=   97.3 | scanner_us p99=   63.6 max=   96.5 | cpu_ms/gen max=2.36 | work max=7505014 over=false
+codex-0.164.0-staged-24x80 @50x200                         pushes= 313 runs=15 added_hold_us p99=   25.2 max=   80.5 | scanner_us p99=   24.2 max=   42.6 | cpu_ms/gen max=1.08 | work max=3668727 over=false
+codex-0.164.0-start-update-50x200 @50x200                  pushes=  19 runs=15 added_hold_us p99=  101.6 max=  104.3 | scanner_us p99=   97.6 max=  100.5 | cpu_ms/gen max=0.19 | work max=645872 over=false
+codex-0.164.0-trust-50x200 @50x200                         pushes=  28 runs=15 added_hold_us p99=   92.5 max=   97.5 | scanner_us p99=   91.2 max=   97.9 | cpu_ms/gen max=0.21 | work max=708865 over=false
+claude-2.1.310-composer-24x80 @50x200                      pushes= 147 runs=15 added_hold_us p99=   42.0 max=  111.2 | scanner_us p99=   41.0 max=  101.3 | cpu_ms/gen max=2.74 | work max=8411492 over=false
+claude-2.1.310-layout-50x200 @50x200                       pushes=  82 runs=15 added_hold_us p99=   47.6 max=  125.4 | scanner_us p99=   46.4 max=   88.7 | cpu_ms/gen max=1.36 | work max=4126790 over=false
+claude-2.1.310-menus-24x80 @50x200                         pushes= 179 runs=15 added_hold_us p99=   32.4 max=  108.4 | scanner_us p99=   33.1 max=   71.0 | cpu_ms/gen max=0.41 | work max=1420129 over=false
+claude-2.1.310-menus-40x120 @50x200                        pushes= 174 runs=15 added_hold_us p99=   36.2 max=  106.1 | scanner_us p99=   37.1 max=   75.1 | cpu_ms/gen max=0.42 | work max=1491612 over=false
+claude-2.1.310-menus-50x200 @50x200                        pushes=  34 runs=15 added_hold_us p99=   70.4 max=  127.7 | scanner_us p99=   81.8 max=   88.9 | cpu_ms/gen max=0.28 | work max=1003033 over=false
+claude-2.1.310-menus-dark-ansi-50x200 @50x200              pushes= 141 runs=15 added_hold_us p99=   45.5 max=  127.4 | scanner_us p99=   44.7 max=   88.8 | cpu_ms/gen max=0.40 | work max=1403779 over=false
+claude-2.1.310-menus-dark-daltonized-50x200 @50x200        pushes= 172 runs=15 added_hold_us p99=   44.3 max=   61.9 | scanner_us p99=   45.1 max=   62.3 | cpu_ms/gen max=0.38 | work max=1489782 over=false
+claude-2.1.310-menus-light-50x200 @50x200                  pushes= 176 runs=15 added_hold_us p99=   44.7 max=   69.7 | scanner_us p99=   45.3 max=   69.0 | cpu_ms/gen max=0.39 | work max=1551095 over=false
+claude-2.1.310-menus-light-ansi-50x200 @50x200             pushes= 170 runs=15 added_hold_us p99=   43.3 max=   67.9 | scanner_us p99=   43.8 max=   67.2 | cpu_ms/gen max=0.38 | work max=1495763 over=false
+claude-2.1.310-menus-truecolor-dark-50x200 @50x200         pushes= 178 runs=15 added_hold_us p99=   46.4 max=   72.5 | scanner_us p99=   47.2 max=   68.4 | cpu_ms/gen max=0.39 | work max=1557067 over=false
+claude-2.1.310-menus-truecolor-light-50x200 @50x200        pushes= 160 runs=15 added_hold_us p99=   46.5 max=   71.9 | scanner_us p99=   47.3 max=   72.2 | cpu_ms/gen max=0.37 | work max=1457718 over=false
+claude-2.1.310-start-50x200 @50x200                        pushes=  16 runs=15 added_hold_us p99=   49.1 max=   55.5 | scanner_us p99=   48.6 max=   56.4 | cpu_ms/gen max=0.10 | work max=362130 over=false
+claude-2.1.310-truecolor-composer-24x80 @50x200            pushes=  14 runs=15 added_hold_us p99=   40.1 max=   40.6 | scanner_us p99=   40.7 max=   41.0 | cpu_ms/gen max=0.09 | work max=422370 over=false
+claude-2.1.312-composer-24x80 @50x200                      pushes= 115 runs=15 added_hold_us p99=   39.6 max=   42.1 | scanner_us p99=   37.8 max=   41.8 | cpu_ms/gen max=2.03 | work max=6689877 over=false
+claude-2.1.312-compound-keys-50x200 @50x200                pushes= 325 runs=15 added_hold_us p99=   18.5 max=   46.5 | scanner_us p99=   18.4 max=   74.6 | cpu_ms/gen max=0.86 | work max=3143044 over=false
+claude-2.1.312-layout-50x200 @50x200                       pushes= 176 runs=15 added_hold_us p99=   78.2 max=   81.6 | scanner_us p99=   76.4 max=   81.1 | cpu_ms/gen max=3.37 | work max=10801638 over=false
+claude-2.1.312-menus-24x80 @50x200                         pushes= 172 runs=15 added_hold_us p99=   32.5 max=   52.1 | scanner_us p99=   33.1 max=   51.7 | cpu_ms/gen max=0.37 | work max=1400948 over=false
+claude-2.1.312-menus-40x120 @50x200                        pushes= 179 runs=15 added_hold_us p99=   36.6 max=   63.1 | scanner_us p99=   37.4 max=   58.7 | cpu_ms/gen max=0.41 | work max=1546120 over=false
+claude-2.1.312-menus-50x200 @50x200                        pushes=  33 runs=15 added_hold_us p99=   63.9 max=   69.9 | scanner_us p99=   63.4 max=   69.4 | cpu_ms/gen max=0.25 | work max=1006296 over=false
+claude-2.1.312-menus-dark-ansi-50x200 @50x200              pushes= 182 runs=15 added_hold_us p99=   43.7 max=   62.2 | scanner_us p99=   44.7 max=   62.3 | cpu_ms/gen max=0.40 | work max=1556013 over=false
+claude-2.1.312-menus-dark-daltonized-50x200 @50x200        pushes= 168 runs=15 added_hold_us p99=   44.5 max=   69.5 | scanner_us p99=   45.3 max=   69.9 | cpu_ms/gen max=0.37 | work max=1461541 over=false
+claude-2.1.312-menus-light-50x200 @50x200                  pushes= 176 runs=15 added_hold_us p99=   44.5 max=   68.9 | scanner_us p99=   45.2 max=   63.9 | cpu_ms/gen max=0.39 | work max=1550391 over=false
+claude-2.1.312-menus-light-ansi-50x200 @50x200             pushes= 174 runs=15 added_hold_us p99=   42.8 max=   69.7 | scanner_us p99=   43.6 max=   62.1 | cpu_ms/gen max=0.37 | work max=1473356 over=false
+claude-2.1.312-menus-truecolor-dark-50x200 @50x200         pushes= 167 runs=15 added_hold_us p99=   47.0 max=   73.8 | scanner_us p99=   47.4 max=   72.2 | cpu_ms/gen max=0.39 | work max=1521712 over=false
+claude-2.1.312-menus-truecolor-light-50x200 @50x200        pushes= 174 runs=15 added_hold_us p99=   46.6 max=   71.9 | scanner_us p99=   47.3 max=   66.2 | cpu_ms/gen max=0.38 | work max=1526271 over=false
+claude-2.1.312-start-50x200 @50x200                        pushes=  11 runs=15 added_hold_us p99=   46.6 max=   51.2 | scanner_us p99=   45.4 max=   45.5 | cpu_ms/gen max=0.05 | work max=314385 over=false
+claude-2.1.312-truecolor-composer-24x80 @50x200            pushes=  10 runs=15 added_hold_us p99=   40.8 max=   42.4 | scanner_us p99=   35.6 max=   41.1 | cpu_ms/gen max=0.09 | work max=415119 over=false
+claude-2.1.317-composer-24x80 @50x200                      pushes= 129 runs=15 added_hold_us p99=   37.5 max=   41.7 | scanner_us p99=   36.2 max=   41.6 | cpu_ms/gen max=1.91 | work max=6356375 over=false
+claude-2.1.317-compound-keys-50x200 @50x200                pushes= 323 runs=15 added_hold_us p99=   18.7 max=   64.0 | scanner_us p99=   18.5 max=   63.8 | cpu_ms/gen max=0.89 | work max=3153922 over=false
+claude-2.1.317-history-24x80 @50x200                       pushes=  54 runs=15 added_hold_us p99=   33.1 max=   34.6 | scanner_us p99=   33.5 max=   34.0 | cpu_ms/gen max=0.15 | work max=627917 over=false
+claude-2.1.317-history-50x200 @50x200                      pushes=  51 runs=15 added_hold_us p99=   46.1 max=   52.5 | scanner_us p99=   45.6 max=   51.6 | cpu_ms/gen max=0.17 | work max=684024 over=false
+claude-2.1.317-layout-50x200 @50x200                       pushes= 173 runs=15 added_hold_us p99=   78.5 max=   82.0 | scanner_us p99=   75.9 max=   80.6 | cpu_ms/gen max=3.00 | work max=9650827 over=false
+claude-2.1.317-menus-24x80 @50x200                         pushes= 167 runs=15 added_hold_us p99=   32.7 max=   50.1 | scanner_us p99=   33.3 max=   47.6 | cpu_ms/gen max=0.34 | work max=1310640 over=false
+claude-2.1.317-menus-40x120 @50x200                        pushes= 170 runs=15 added_hold_us p99=   37.3 max=   54.7 | scanner_us p99=   37.8 max=   54.1 | cpu_ms/gen max=0.37 | work max=1450383 over=false
+claude-2.1.317-menus-50x200 @50x200                        pushes= 170 runs=15 added_hold_us p99=   44.8 max=   70.7 | scanner_us p99=   45.3 max=   70.1 | cpu_ms/gen max=0.38 | work max=1504402 over=false
+claude-2.1.317-menus-dark-ansi-50x200 @50x200              pushes= 174 runs=15 added_hold_us p99=   44.1 max=   70.0 | scanner_us p99=   44.8 max=   63.0 | cpu_ms/gen max=0.38 | work max=1511229 over=false
+claude-2.1.317-menus-dark-daltonized-50x200 @50x200        pushes= 177 runs=15 added_hold_us p99=   44.7 max=   69.9 | scanner_us p99=   45.5 max=   69.2 | cpu_ms/gen max=0.38 | work max=1523413 over=false
+claude-2.1.317-menus-light-50x200 @50x200                  pushes= 174 runs=15 added_hold_us p99=   44.8 max=   70.4 | scanner_us p99=   45.5 max=   69.9 | cpu_ms/gen max=0.38 | work max=1513343 over=false
+claude-2.1.317-menus-light-ansi-50x200 @50x200             pushes= 165 runs=15 added_hold_us p99=   43.3 max=   67.5 | scanner_us p99=   44.0 max=   67.8 | cpu_ms/gen max=0.37 | work max=1468426 over=false
+claude-2.1.317-menus-truecolor-dark-50x200 @50x200         pushes= 174 runs=15 added_hold_us p99=   46.3 max=   72.2 | scanner_us p99=   47.4 max=   72.0 | cpu_ms/gen max=0.41 | work max=1553654 over=false
+claude-2.1.317-menus-truecolor-light-50x200 @50x200        pushes= 175 runs=15 added_hold_us p99=   47.1 max=   65.2 | scanner_us p99=   47.7 max=   65.0 | cpu_ms/gen max=0.39 | work max=1546913 over=false
+claude-2.1.317-start-50x200 @50x200                        pushes=   7 runs=15 added_hold_us p99=   46.6 max=   50.6 | scanner_us p99=   45.7 max=   45.7 | cpu_ms/gen max=0.05 | work max=309447 over=false
+claude-2.1.318-composer-24x80 @50x200                      pushes= 126 runs=15 added_hold_us p99=   38.2 max=   43.5 | scanner_us p99=   37.6 max=   43.4 | cpu_ms/gen max=1.93 | work max=6436051 over=false
+claude-2.1.318-compound-keys-50x200 @50x200                pushes= 325 runs=15 added_hold_us p99=   18.9 max=   54.5 | scanner_us p99=   18.7 max=   51.5 | cpu_ms/gen max=0.85 | work max=3161309 over=false
+claude-2.1.318-history-24x80 @50x200                       pushes=  55 runs=15 added_hold_us p99=   33.2 max=   42.0 | scanner_us p99=   33.6 max=   42.4 | cpu_ms/gen max=0.15 | work max=631144 over=false
+claude-2.1.318-history-50x200 @50x200                      pushes=  52 runs=15 added_hold_us p99=   46.7 max=   54.8 | scanner_us p99=   45.8 max=   52.1 | cpu_ms/gen max=0.17 | work max=687944 over=false
+claude-2.1.318-layout-50x200 @50x200                       pushes= 169 runs=15 added_hold_us p99=   78.7 max=   84.7 | scanner_us p99=   77.3 max=   79.5 | cpu_ms/gen max=3.20 | work max=10281974 over=false
+claude-2.1.318-menus-24x80 @50x200                         pushes= 173 runs=15 added_hold_us p99=   32.5 max=   48.9 | scanner_us p99=   33.2 max=   47.7 | cpu_ms/gen max=0.35 | work max=1355124 over=false
+claude-2.1.318-menus-40x120 @50x200                        pushes= 172 runs=15 added_hold_us p99=   36.5 max=   59.2 | scanner_us p99=   37.3 max=   54.0 | cpu_ms/gen max=0.39 | work max=1492626 over=false
+claude-2.1.318-menus-50x200 @50x200                        pushes= 174 runs=15 added_hold_us p99=   44.8 max=   62.3 | scanner_us p99=   45.5 max=   62.5 | cpu_ms/gen max=0.37 | work max=1474305 over=false
+claude-2.1.318-menus-dark-ansi-50x200 @50x200              pushes= 176 runs=15 added_hold_us p99=   43.9 max=   69.3 | scanner_us p99=   44.7 max=   67.7 | cpu_ms/gen max=0.37 | work max=1473447 over=false
+claude-2.1.318-menus-dark-daltonized-50x200 @50x200        pushes= 175 runs=15 added_hold_us p99=   45.1 max=   71.0 | scanner_us p99=   45.5 max=   70.5 | cpu_ms/gen max=0.39 | work max=1530731 over=false
+claude-2.1.318-menus-light-50x200 @50x200                  pushes= 178 runs=15 added_hold_us p99=   44.5 max=   71.0 | scanner_us p99=   45.4 max=   64.0 | cpu_ms/gen max=0.37 | work max=1488723 over=false
+claude-2.1.318-menus-light-ansi-50x200 @50x200             pushes= 177 runs=15 added_hold_us p99=   42.9 max=   62.8 | scanner_us p99=   43.6 max=   62.2 | cpu_ms/gen max=0.38 | work max=1500621 over=false
+claude-2.1.318-menus-truecolor-dark-50x200 @50x200         pushes= 173 runs=15 added_hold_us p99=   46.9 max=   67.0 | scanner_us p99=   47.5 max=   66.5 | cpu_ms/gen max=0.38 | work max=1521179 over=false
+claude-2.1.318-menus-truecolor-light-50x200 @50x200        pushes= 168 runs=15 added_hold_us p99=   47.2 max=   72.0 | scanner_us p99=   47.8 max=   71.7 | cpu_ms/gen max=0.38 | work max=1485743 over=false
+claude-2.1.318-start-50x200 @50x200                        pushes=   7 runs=15 added_hold_us p99=   51.2 max=   51.3 | scanner_us p99=   51.3 max=   51.8 | cpu_ms/gen max=0.06 | work max=310292 over=false
+codex-0.160.0-composer-24x80 @80x300                       pushes=1840 runs=15 added_hold_us p99=   24.2 max=   92.3 | scanner_us p99=   24.0 max=  173.3 | cpu_ms/gen max=3.13 | work max=10283181 over=false
+codex-0.160.0-deck-tester-fresh-46x130 @80x300             pushes= 238 runs=15 added_hold_us p99=   13.4 max=   61.3 | scanner_us p99=   10.4 max=   29.3 | cpu_ms/gen max=0.54 | work max=1804200 over=false
+codex-0.160.0-deck-tester-respawn-46x130 @80x300           pushes=  55 runs=15 added_hold_us p99=   36.1 max=   41.6 | scanner_us p99=   35.7 max=   36.5 | cpu_ms/gen max=0.11 | work max=706239 over=false
+codex-0.160.0-layout-start-50x200 @80x300                  pushes= 240 runs=15 added_hold_us p99=   43.5 max=   57.0 | scanner_us p99=   38.5 max=   44.6 | cpu_ms/gen max=1.71 | work max=5735646 over=false
+codex-0.160.0-staged-24x80 @80x300                         pushes=1231 runs=15 added_hold_us p99=   25.4 max=   49.1 | scanner_us p99=   24.4 max=   32.5 | cpu_ms/gen max=1.89 | work max=6853555 over=false
+codex-0.160.0-start-update-50x200 @80x300                  pushes=  22 runs=15 added_hold_us p99=   36.1 max=   36.2 | scanner_us p99=   35.8 max=   36.5 | cpu_ms/gen max=0.11 | work max=686939 over=false
+codex-0.164.0-composer-24x80 @80x300                       pushes= 874 runs=15 added_hold_us p99=   27.8 max=   74.2 | scanner_us p99=   26.1 max=   50.8 | cpu_ms/gen max=2.22 | work max=7677887 over=false
+codex-0.164.0-deck-tester-fresh-46x130 @80x300             pushes= 239 runs=15 added_hold_us p99=   14.1 max=   56.1 | scanner_us p99=   10.5 max=   54.8 | cpu_ms/gen max=0.58 | work max=1977422 over=false
+codex-0.164.0-deck-tester-respawn-46x130 @80x300           pushes=  60 runs=15 added_hold_us p99=   43.3 max=   51.5 | scanner_us p99=   42.3 max=   49.7 | cpu_ms/gen max=0.17 | work max=905857 over=false
+codex-0.164.0-hooks-50x200 @80x300                         pushes=  29 runs=15 added_hold_us p99=  101.9 max=  110.9 | scanner_us p99=  100.7 max=  106.6 | cpu_ms/gen max=0.19 | work max=968006 over=false
+codex-0.164.0-layout-start-50x200 @80x300                  pushes= 211 runs=15 added_hold_us p99=  100.9 max=  109.2 | scanner_us p99=  100.2 max=  107.4 | cpu_ms/gen max=3.86 | work max=12643784 over=false
+codex-0.164.0-layout-turn-50x200 @80x300                   pushes= 230 runs=15 added_hold_us p99=   78.5 max=  105.8 | scanner_us p99=   72.8 max=  105.3 | cpu_ms/gen max=2.83 | work max=8776814 over=false
+codex-0.164.0-staged-24x80 @80x300                         pushes= 313 runs=15 added_hold_us p99=   29.3 max=   55.5 | scanner_us p99=   26.2 max=   40.3 | cpu_ms/gen max=1.16 | work max=4062327 over=false
+codex-0.164.0-start-update-50x200 @80x300                  pushes=  19 runs=15 added_hold_us p99=  118.7 max=  120.4 | scanner_us p99=  116.6 max=  118.9 | cpu_ms/gen max=0.18 | work max=925622 over=false
+codex-0.164.0-trust-50x200 @80x300                         pushes=  28 runs=15 added_hold_us p99=  101.5 max=  108.0 | scanner_us p99=  100.0 max=  106.0 | cpu_ms/gen max=0.19 | work max=989015 over=false
+claude-2.1.310-composer-24x80 @80x300                      pushes= 147 runs=15 added_hold_us p99=   48.4 max=   54.1 | scanner_us p99=   47.4 max=   53.1 | cpu_ms/gen max=2.97 | work max=9280282 over=false
+claude-2.1.310-layout-50x200 @80x300                       pushes=  82 runs=15 added_hold_us p99=   54.8 max=   63.9 | scanner_us p99=   56.0 max=   63.6 | cpu_ms/gen max=1.51 | work max=4819990 over=false
+claude-2.1.310-menus-24x80 @80x300                         pushes= 179 runs=15 added_hold_us p99=   42.2 max=   65.1 | scanner_us p99=   43.4 max=   63.9 | cpu_ms/gen max=0.43 | work max=1787329 over=false
+claude-2.1.310-menus-40x120 @80x300                        pushes= 174 runs=15 added_hold_us p99=   45.8 max=   74.9 | scanner_us p99=   47.6 max=   69.9 | cpu_ms/gen max=0.44 | work max=1860012 over=false
+claude-2.1.310-menus-50x200 @80x300                        pushes=  34 runs=15 added_hold_us p99=   75.7 max=   81.5 | scanner_us p99=   74.3 max=   79.7 | cpu_ms/gen max=0.27 | work max=1324533 over=false
+claude-2.1.310-menus-dark-ansi-50x200 @80x300              pushes= 141 runs=15 added_hold_us p99=   57.0 max=   81.0 | scanner_us p99=   55.1 max=   79.7 | cpu_ms/gen max=0.41 | work max=1762079 over=false
+claude-2.1.310-menus-dark-daltonized-50x200 @80x300        pushes= 172 runs=15 added_hold_us p99=   55.1 max=   63.6 | scanner_us p99=   55.7 max=   63.1 | cpu_ms/gen max=0.43 | work max=1856482 over=false
+claude-2.1.310-menus-light-50x200 @80x300                  pushes= 176 runs=15 added_hold_us p99=   54.1 max=   81.5 | scanner_us p99=   56.0 max=   79.9 | cpu_ms/gen max=0.46 | work max=1921395 over=false
+claude-2.1.310-menus-light-ansi-50x200 @80x300             pushes= 170 runs=15 added_hold_us p99=   53.8 max=   78.9 | scanner_us p99=   54.4 max=   72.3 | cpu_ms/gen max=0.43 | work max=1864063 over=false
+claude-2.1.310-menus-truecolor-dark-50x200 @80x300         pushes= 178 runs=15 added_hold_us p99=   55.9 max=   83.6 | scanner_us p99=   57.8 max=   82.5 | cpu_ms/gen max=0.45 | work max=1926567 over=false
+claude-2.1.310-menus-truecolor-light-50x200 @80x300        pushes= 160 runs=15 added_hold_us p99=   56.2 max=   80.4 | scanner_us p99=   58.0 max=   78.8 | cpu_ms/gen max=0.42 | work max=1820418 over=false
+claude-2.1.310-start-50x200 @80x300                        pushes=  16 runs=15 added_hold_us p99=   61.7 max=   67.2 | scanner_us p99=   59.2 max=   64.8 | cpu_ms/gen max=0.11 | work max=628830 over=false
+claude-2.1.310-truecolor-composer-24x80 @80x300            pushes=  14 runs=15 added_hold_us p99=   50.0 max=   53.5 | scanner_us p99=   46.4 max=   51.6 | cpu_ms/gen max=0.10 | work max=678370 over=false
+claude-2.1.312-composer-24x80 @80x300                      pushes= 115 runs=15 added_hold_us p99=   43.3 max=   50.2 | scanner_us p99=   42.8 max=   46.0 | cpu_ms/gen max=2.17 | work max=7203877 over=false
+claude-2.1.312-compound-keys-50x200 @80x300                pushes= 325 runs=15 added_hold_us p99=   18.9 max=   61.2 | scanner_us p99=   18.7 max=   60.1 | cpu_ms/gen max=0.88 | work max=3438094 over=false
+claude-2.1.312-layout-50x200 @80x300                       pushes= 176 runs=15 added_hold_us p99=   83.8 max=  147.9 | scanner_us p99=   82.5 max=   86.7 | cpu_ms/gen max=3.57 | work max=11624288 over=false
+claude-2.1.312-menus-24x80 @80x300                         pushes= 172 runs=15 added_hold_us p99=   41.1 max=   65.5 | scanner_us p99=   43.0 max=   56.4 | cpu_ms/gen max=0.41 | work max=1766548 over=false
+claude-2.1.312-menus-40x120 @80x300                        pushes= 179 runs=15 added_hold_us p99=   45.4 max=   71.7 | scanner_us p99=   47.2 max=   69.7 | cpu_ms/gen max=0.46 | work max=1918120 over=false
+claude-2.1.312-menus-50x200 @80x300                        pushes=  33 runs=15 added_hold_us p99=   74.3 max=   81.2 | scanner_us p99=   72.5 max=   79.5 | cpu_ms/gen max=0.28 | work max=1328196 over=false
+claude-2.1.312-menus-dark-ansi-50x200 @80x300              pushes= 182 runs=15 added_hold_us p99=   52.6 max=   64.6 | scanner_us p99=   54.4 max=   62.8 | cpu_ms/gen max=0.45 | work max=1928313 over=false
+claude-2.1.312-menus-dark-daltonized-50x200 @80x300        pushes= 168 runs=15 added_hold_us p99=   53.1 max=   78.7 | scanner_us p99=   55.0 max=   77.4 | cpu_ms/gen max=0.41 | work max=1827441 over=false
+claude-2.1.312-menus-light-50x200 @80x300                  pushes= 176 runs=15 added_hold_us p99=   53.1 max=   80.5 | scanner_us p99=   54.8 max=   78.2 | cpu_ms/gen max=0.44 | work max=1921091 over=false
+claude-2.1.312-menus-light-ansi-50x200 @80x300             pushes= 174 runs=15 added_hold_us p99=   51.5 max=   77.4 | scanner_us p99=   53.4 max=   73.6 | cpu_ms/gen max=0.42 | work max=1841656 over=false
+claude-2.1.312-menus-truecolor-dark-50x200 @80x300         pushes= 167 runs=15 added_hold_us p99=   55.3 max=   81.3 | scanner_us p99=   57.2 max=   81.4 | cpu_ms/gen max=0.43 | work max=1888812 over=false
+claude-2.1.312-menus-truecolor-light-50x200 @80x300        pushes= 174 runs=15 added_hold_us p99=   55.4 max=   85.4 | scanner_us p99=   57.2 max=   80.7 | cpu_ms/gen max=0.43 | work max=1894171 over=false
+claude-2.1.312-start-50x200 @80x300                        pushes=  11 runs=15 added_hold_us p99=   58.1 max=   60.1 | scanner_us p99=   58.3 max=   61.7 | cpu_ms/gen max=0.07 | work max=567085 over=false
+claude-2.1.312-truecolor-composer-24x80 @80x300            pushes=  10 runs=15 added_hold_us p99=   47.8 max=   56.0 | scanner_us p99=   45.6 max=   45.7 | cpu_ms/gen max=0.09 | work max=671119 over=false
+claude-2.1.317-composer-24x80 @80x300                      pushes= 129 runs=15 added_hold_us p99=   40.9 max=   49.2 | scanner_us p99=   39.5 max=   47.1 | cpu_ms/gen max=2.00 | work max=6846375 over=false
+claude-2.1.317-compound-keys-50x200 @80x300                pushes= 323 runs=15 added_hold_us p99=   19.2 max=   64.4 | scanner_us p99=   19.0 max=   62.2 | cpu_ms/gen max=0.88 | work max=3448972 over=false
+claude-2.1.317-history-24x80 @80x300                       pushes=  54 runs=15 added_hold_us p99=   42.0 max=   50.9 | scanner_us p99=   43.4 max=   48.0 | cpu_ms/gen max=0.16 | work max=893117 over=false
+claude-2.1.317-history-50x200 @80x300                      pushes=  51 runs=15 added_hold_us p99=   57.4 max=   59.3 | scanner_us p99=   55.6 max=   60.9 | cpu_ms/gen max=0.18 | work max=948224 over=false
+claude-2.1.317-layout-50x200 @80x300                       pushes= 173 runs=15 added_hold_us p99=   84.6 max=   92.8 | scanner_us p99=   82.4 max=   86.0 | cpu_ms/gen max=3.20 | work max=10412677 over=false
+claude-2.1.317-menus-24x80 @80x300                         pushes= 167 runs=15 added_hold_us p99=   41.4 max=   63.4 | scanner_us p99=   43.0 max=   61.9 | cpu_ms/gen max=0.39 | work max=1672240 over=false
+claude-2.1.317-menus-40x120 @80x300                        pushes= 170 runs=15 added_hold_us p99=   46.2 max=   68.9 | scanner_us p99=   47.5 max=   68.0 | cpu_ms/gen max=0.42 | work max=1819183 over=false
+claude-2.1.317-menus-50x200 @80x300                        pushes= 170 runs=15 added_hold_us p99=   53.5 max=   80.3 | scanner_us p99=   55.1 max=   78.6 | cpu_ms/gen max=0.43 | work max=1875102 over=false
+claude-2.1.317-menus-dark-ansi-50x200 @80x300              pushes= 174 runs=15 added_hold_us p99=   53.4 max=   79.6 | scanner_us p99=   54.7 max=   78.1 | cpu_ms/gen max=0.47 | work max=1883529 over=false
+claude-2.1.317-menus-dark-daltonized-50x200 @80x300        pushes= 177 runs=15 added_hold_us p99=   53.6 max=   80.7 | scanner_us p99=   55.4 max=   79.4 | cpu_ms/gen max=0.43 | work max=1895713 over=false
+claude-2.1.317-menus-light-50x200 @80x300                  pushes= 174 runs=15 added_hold_us p99=   54.0 max=   80.1 | scanner_us p99=   55.4 max=   78.8 | cpu_ms/gen max=0.43 | work max=1884843 over=false
+claude-2.1.317-menus-light-ansi-50x200 @80x300             pushes= 165 runs=15 added_hold_us p99=   52.8 max=   79.2 | scanner_us p99=   53.9 max=   71.0 | cpu_ms/gen max=0.42 | work max=1837526 over=false
+claude-2.1.317-menus-truecolor-dark-50x200 @80x300         pushes= 174 runs=15 added_hold_us p99=   55.7 max=   81.6 | scanner_us p99=   57.4 max=   80.3 | cpu_ms/gen max=0.47 | work max=1926354 over=false
+claude-2.1.317-menus-truecolor-light-50x200 @80x300        pushes= 175 runs=15 added_hold_us p99=   56.2 max=   69.1 | scanner_us p99=   57.6 max=   58.9 | cpu_ms/gen max=0.44 | work max=1918413 over=false
+claude-2.1.317-start-50x200 @80x300                        pushes=   7 runs=15 added_hold_us p99=   60.0 max=   63.0 | scanner_us p99=   56.2 max=   61.0 | cpu_ms/gen max=0.06 | work max=562147 over=false
+claude-2.1.318-composer-24x80 @80x300                      pushes= 126 runs=15 added_hold_us p99=   41.9 max=   59.7 | scanner_us p99=   42.1 max=   58.9 | cpu_ms/gen max=2.04 | work max=6932051 over=false
+claude-2.1.318-compound-keys-50x200 @80x300                pushes= 325 runs=15 added_hold_us p99=   19.2 max=   61.4 | scanner_us p99=   19.1 max=   61.2 | cpu_ms/gen max=0.88 | work max=3456359 over=false
+claude-2.1.318-history-24x80 @80x300                       pushes=  55 runs=15 added_hold_us p99=   42.7 max=   48.5 | scanner_us p99=   43.4 max=   49.4 | cpu_ms/gen max=0.16 | work max=896344 over=false
+claude-2.1.318-history-50x200 @80x300                      pushes=  52 runs=15 added_hold_us p99=   57.4 max=   64.2 | scanner_us p99=   55.5 max=   62.3 | cpu_ms/gen max=0.18 | work max=952144 over=false
+claude-2.1.318-layout-50x200 @80x300                       pushes= 169 runs=15 added_hold_us p99=   83.3 max=   87.5 | scanner_us p99=   79.3 max=   84.7 | cpu_ms/gen max=3.39 | work max=11075024 over=false
+claude-2.1.318-menus-24x80 @80x300                         pushes= 173 runs=15 added_hold_us p99=   41.5 max=   64.2 | scanner_us p99=   43.1 max=   62.4 | cpu_ms/gen max=0.41 | work max=1720324 over=false
+claude-2.1.318-menus-40x120 @80x300                        pushes= 172 runs=15 added_hold_us p99=   45.3 max=   70.3 | scanner_us p99=   47.3 max=   65.3 | cpu_ms/gen max=0.43 | work max=1864226 over=false
+claude-2.1.318-menus-50x200 @80x300                        pushes= 174 runs=15 added_hold_us p99=   52.9 max=   63.5 | scanner_us p99=   55.2 max=   61.6 | cpu_ms/gen max=0.42 | work max=1843405 over=false
+claude-2.1.318-menus-dark-ansi-50x200 @80x300              pushes= 176 runs=15 added_hold_us p99=   53.2 max=   80.5 | scanner_us p99=   54.7 max=   76.7 | cpu_ms/gen max=0.42 | work max=1843747 over=false
+claude-2.1.318-menus-dark-daltonized-50x200 @80x300        pushes= 175 runs=15 added_hold_us p99=   54.1 max=   81.2 | scanner_us p99=   55.3 max=   79.8 | cpu_ms/gen max=0.43 | work max=1903831 over=false
+claude-2.1.318-menus-light-50x200 @80x300                  pushes= 178 runs=15 added_hold_us p99=   53.5 max=   80.5 | scanner_us p99=   55.0 max=   78.1 | cpu_ms/gen max=0.42 | work max=1859423 over=false
+claude-2.1.318-menus-light-ansi-50x200 @80x300             pushes= 177 runs=15 added_hold_us p99=   50.0 max=   75.7 | scanner_us p99=   53.6 max=   73.9 | cpu_ms/gen max=0.43 | work max=1872921 over=false
+claude-2.1.318-menus-truecolor-dark-50x200 @80x300         pushes= 173 runs=15 added_hold_us p99=   55.7 max=   81.9 | scanner_us p99=   57.2 max=   78.3 | cpu_ms/gen max=0.43 | work max=1891479 over=false
+claude-2.1.318-menus-truecolor-light-50x200 @80x300        pushes= 168 runs=15 added_hold_us p99=   56.1 max=   84.6 | scanner_us p99=   57.6 max=   83.3 | cpu_ms/gen max=0.43 | work max=1853643 over=false
+claude-2.1.318-start-50x200 @80x300                        pushes=   7 runs=15 added_hold_us p99=   60.7 max=   61.5 | scanner_us p99=   56.4 max=   62.1 | cpu_ms/gen max=0.07 | work max=562992 over=false
+ALL measured traces: added_hold_us p99=66.1 max=292.1 (n=417510), worst cpu_ms/gen=3.86
+full 256 KiB window @50x200                                pushes=2889 runs=15 added_hold_us p99=   34.7 max=   87.2 | scanner_us p99=   35.2 max=   67.0 | cpu_ms/gen max=5.27 | work max=18468686 over=false
+full 256 KiB window @80x300                                pushes=2889 runs=15 added_hold_us p99=   35.6 max=   51.4 | scanner_us p99=   37.4 max=   49.0 | cpu_ms/gen max=5.74 | work max=19850246 over=false
+eight panes at once: cores=16 loadavg=4.15 2.53 1.11
+eight panes @50x200: added_hold_us p99=67.3 max=380.5 (n=28546) | scanner_us p99=62.5 max=212.4
+resize of the scanner's grid: max 2856.6 us
+pathological erase-display and anchor rows @512x512: added_hold_us max=2064.3 | scanner_us max=2053.2 | cpu_ms/gen=2.05 | window Some((Some(WorkBudget), Some(Push)))
+pathological line feeds at the bottom @4096x64: added_hold_us max=93.1 | scanner_us max=29.6 | cpu_ms/gen=0.03 | window Some((Some(WorkBudget), Some(Push)))
+pathological reverse index at the top @4096x64: added_hold_us max=1205.5 | scanner_us max=1143.1 | cpu_ms/gen=1.14 | window Some((Some(WorkBudget), Some(Push)))
+pathological scroll up 4096 @4096x64: added_hold_us max=1581.5 | scanner_us max=1512.0 | cpu_ms/gen=1.51 | window Some((Some(WorkBudget), Some(Push)))
+pathological insert lines 4096 @4096x64: added_hold_us max=1515.8 | scanner_us max=1444.7 | cpu_ms/gen=1.44 | window Some((Some(WorkBudget), Some(Push)))
+pathological repeat 65535 in one column @4096x64: added_hold_us max=64.9 | scanner_us max=2.2 | cpu_ms/gen=0.00 | window Some((Some(WorkBudget), Some(Push)))
+pathological alternate screen x8 @512x512: added_hold_us max=14.4 | scanner_us max=1.5 | cpu_ms/gen=0.00 | window Some((Some(WorkBudget), Some(Push)))
+pathological full reset @512x512: added_hold_us max=1359.3 | scanner_us max=1221.8 | cpu_ms/gen=1.22 | window Some((Some(WorkBudget), Some(Push)))
+pathological erase line @512x512: added_hold_us max=2192.0 | scanner_us max=2186.0 | cpu_ms/gen=2.19 | window Some((Some(WorkBudget), Some(Push)))
+pathological erase line, cursor at the start @512x512: added_hold_us max=2059.8 | scanner_us max=2058.4 | cpu_ms/gen=36.87 | window Some((Some(WorkBudget), Some(Total)))
+pathological erase characters 512 @512x512: added_hold_us max=1066.4 | scanner_us max=1066.1 | cpu_ms/gen=30.72 | window Some((Some(WorkBudget), Some(Total)))
+pathological delete characters 512 @512x512: added_hold_us max=229.3 | scanner_us max=228.0 | cpu_ms/gen=7.03 | window Some((Some(ByteLimit), None))
+pathological insert characters 512 @512x512: added_hold_us max=233.5 | scanner_us max=228.9 | cpu_ms/gen=7.03 | window Some((Some(ByteLimit), None))
+pathological erase display below @512x512: added_hold_us max=1889.3 | scanner_us max=1881.2 | cpu_ms/gen=1.88 | window Some((Some(WorkBudget), Some(Push)))
+pathological prints at the row end @4096x64: added_hold_us max=106.8 | scanner_us max=95.4 | cpu_ms/gen=2.05 | window Some((Some(WorkBudget), Some(Total)))
+evidence parser, ALL measured traces @50x200+80x300: added_hold_us p99=155.2 max=340.0 (n=417510)
+evidence parser, pathological erase-display and anchor rows @512x512: added_hold_us max=2004.9 | status work_over_budget
+evidence parser, pathological line feeds at the bottom @4096x64: added_hold_us max=90.5 | status work_over_budget
+evidence parser, pathological reverse index at the top @4096x64: added_hold_us max=1212.6 | status work_over_budget
+evidence parser, pathological scroll up 4096 @4096x64: added_hold_us max=1606.7 | status work_over_budget
+evidence parser, pathological insert lines 4096 @4096x64: added_hold_us max=1368.6 | status work_over_budget
+evidence parser, pathological repeat 65535 in one column @4096x64: added_hold_us max=63.2 | status work_over_budget
+evidence parser, pathological alternate screen x8 @512x512: added_hold_us max=11.5 | status work_over_budget
+evidence parser, pathological full reset @512x512: added_hold_us max=1337.6 | status work_over_budget
+evidence parser, pathological erase line @512x512: added_hold_us max=2155.3 | status work_over_budget
+evidence parser, pathological erase line, cursor at the start @512x512: added_hold_us max=2054.5 | status pending
+evidence parser, pathological erase characters 512 @512x512: added_hold_us max=1132.2 | status pending
+evidence parser, pathological delete characters 512 @512x512: added_hold_us max=222.2 | status pending
+evidence parser, pathological insert characters 512 @512x512: added_hold_us max=234.2 | status pending
+evidence parser, pathological erase display below @512x512: added_hold_us max=1867.2 | status work_over_budget
+evidence parser, pathological prints at the row end @4096x64: added_hold_us max=142.5 | status pending
+test agent_pty::scanner_budget::scanner_budget_measurement ... ok
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 5284 filtered out; finished in 55.00s

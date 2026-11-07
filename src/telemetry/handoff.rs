@@ -746,9 +746,12 @@ mod tests {
             returned: false,
             wake_stalled: false,
             wake_update: false,
+            wake_hold: None,
+            hold_detail: None,
             attention_update: false,
             requeued: false,
             provenance: None,
+            termination: None,
             notices: Default::default(),
         }
     }

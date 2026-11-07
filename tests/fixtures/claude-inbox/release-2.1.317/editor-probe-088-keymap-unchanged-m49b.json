@@ -1,0 +1,105 @@
+{
+ "release": "2.1.317",
+ "sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+ "source_capture": "/var/tmp/dad-claude-editor-measure-iDWGRO/capture",
+ "recorder_sha256": "2a4ccb929ef17940c42f66f3e276fde67f884d46031ca6d2679ca31ff3fbf3a8",
+ "error": null,
+ "rows": [
+  {
+   "cell": "keymap-unchanged",
+   "minute": 1,
+   "elapsed_s": 61.97429407807067,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 2,
+   "elapsed_s": 121.93846224807203,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 3,
+   "elapsed_s": 182.40882916701958,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 4,
+   "elapsed_s": 242.37982860114425,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 5,
+   "elapsed_s": 302.3506814939901,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 6,
+   "elapsed_s": 362.33161590481177,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 7,
+   "elapsed_s": 422.30095694214106,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 8,
+   "elapsed_s": 482.28111732704565,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 9,
+   "elapsed_s": 542.2577444189228,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged",
+   "minute": 10,
+   "elapsed_s": 602.2256170581095,
+   "stat_unchanged": true,
+   "ctrlg": {
+    "opened": false
+   }
+  },
+  {
+   "cell": "keymap-unchanged-positive",
+   "ctrle": {
+    "opened": true
+   }
+  }
+ ]
+}

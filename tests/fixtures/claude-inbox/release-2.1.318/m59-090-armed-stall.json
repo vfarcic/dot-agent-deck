@@ -1,0 +1,259 @@
+{
+ "release": "2.1.318",
+ "sha256": "708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd",
+ "source_capture": "/var/tmp/dad-m59-isOMlN/capture",
+ "recorder_sha256": "a11e7747c6f27fe33b40a5a3ee730c1ef903e200115fc899378b7ee0f823e6f6",
+ "error": null,
+ "rows": [
+  {
+   "trial": 1,
+   "draft": "M59_DRAFT_1",
+   "editor_rc_planned": 0,
+   "sent_t": 3487924796976537,
+   "helper_pid": 1818940,
+   "helper_seen_t": 3487925147220183,
+   "helper_gone_t": 3487930088896419,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.003867669,
+   "helper_life_from_branch_s": 5.001991976,
+   "helper_life_from_ctrl_g_s": 5.291919882,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_1",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 2,
+   "draft": "M59_DRAFT_2",
+   "editor_rc_planned": 0,
+   "sent_t": 3487933665260547,
+   "helper_pid": 1819127,
+   "helper_seen_t": 3487933738021463,
+   "helper_gone_t": 3487938698560634,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.003316424,
+   "helper_life_from_branch_s": 5.002207443,
+   "helper_life_from_ctrl_g_s": 5.033300087,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_2",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 3,
+   "draft": "M59_DRAFT_3",
+   "editor_rc_planned": 0,
+   "sent_t": 3487942287568458,
+   "helper_pid": 1819413,
+   "helper_seen_t": 3487942349451857,
+   "helper_gone_t": 3487947321337767,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004402733,
+   "helper_life_from_branch_s": 5.002520055,
+   "helper_life_from_ctrl_g_s": 5.033769309,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_3",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 4,
+   "draft": "M59_DRAFT_4",
+   "editor_rc_planned": 0,
+   "sent_t": 3487950909229944,
+   "helper_pid": 1819671,
+   "helper_seen_t": 3487950983623834,
+   "helper_gone_t": 3487955944696166,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.006054425,
+   "helper_life_from_branch_s": 5.004140653,
+   "helper_life_from_ctrl_g_s": 5.035466222,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_4",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 5,
+   "draft": "M59_DRAFT_5",
+   "editor_rc_planned": 0,
+   "sent_t": 3487959532965531,
+   "helper_pid": 1820302,
+   "helper_seen_t": 3487959608533836,
+   "helper_gone_t": 3487964572169294,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.005279251,
+   "helper_life_from_branch_s": 5.003252359,
+   "helper_life_from_ctrl_g_s": 5.039203763,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_5",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 6,
+   "draft": "M59_DRAFT_6",
+   "editor_rc_planned": 0,
+   "sent_t": 3487968137524552,
+   "helper_pid": 1821246,
+   "helper_seen_t": 3487968213347084,
+   "helper_gone_t": 3487973171990407,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.005756586,
+   "helper_life_from_branch_s": 5.003840539,
+   "helper_life_from_ctrl_g_s": 5.034465855,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_6",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 7,
+   "draft": "M59_DRAFT_7",
+   "editor_rc_planned": 0,
+   "sent_t": 3487976748844860,
+   "helper_pid": 1822548,
+   "helper_seen_t": 3487976826491786,
+   "helper_gone_t": 3487981779626057,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.003482913,
+   "helper_life_from_branch_s": 5.001752607,
+   "helper_life_from_ctrl_g_s": 5.030781197,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_7",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 8,
+   "draft": "M59_DRAFT_8",
+   "editor_rc_planned": 0,
+   "sent_t": 3487985367965081,
+   "helper_pid": 1822845,
+   "helper_seen_t": 3487985442685467,
+   "helper_gone_t": 3487990401825001,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.007960922,
+   "helper_life_from_branch_s": 5.006571299,
+   "helper_life_from_ctrl_g_s": 5.03385992,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_8",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 9,
+   "draft": "M59_DRAFT_9",
+   "editor_rc_planned": 0,
+   "sent_t": 3487993988763576,
+   "helper_pid": 1823488,
+   "helper_seen_t": 3487994037335282,
+   "helper_gone_t": 3487999022930546,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.007172753,
+   "helper_life_from_branch_s": 5.005324863,
+   "helper_life_from_ctrl_g_s": 5.03416697,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_9",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  },
+  {
+   "trial": 10,
+   "draft": "M59_DRAFT_10",
+   "editor_rc_planned": 0,
+   "sent_t": 3488002613941703,
+   "helper_pid": 1823745,
+   "helper_seen_t": 3488002688694218,
+   "helper_gone_t": 3488007644676444,
+   "zombie_status": null,
+   "helper_life_from_start_s": 5.004476892,
+   "helper_life_from_branch_s": 5.002431785,
+   "helper_life_from_ctrl_g_s": 5.030734741,
+   "notice_in_output": false,
+   "claude_notice_before_end": [],
+   "claude_notice_after_end": [
+    "closed unexpectedly (SIGALRM)"
+   ],
+   "composer_after": "M59_DRAFT_10",
+   "trace_events": [
+    "start",
+    "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }",
+    "pause ready"
+   ],
+   "editor_stages": []
+  }
+ ]
+}

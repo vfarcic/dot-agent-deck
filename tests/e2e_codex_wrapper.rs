@@ -20,19 +20,128 @@ const INTERACTIVE_PROOF_NAME: &str = "codex-interactive-proof.txt";
 /// matching only the meaningful part of it, as `tests/e2e_codex_hooks.rs`.
 const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
 
-/// Whether this host lets an unprivileged process create a user namespace,
-/// which Codex's Linux `workspace-write` sandbox needs (it runs its tools
-/// under `bwrap`). A host that refuses — Ubuntu's
-/// `kernel.apparmor_restrict_unprivileged_userns=1` is the measured case —
-/// makes every shell command and every patch Codex attempts fail with
-/// `bwrap: setting up uid map: Permission denied`, so a test that needs Codex
-/// to do real work there cannot pass whatever the deck does. Probed with
-/// util-linux's `unshare -Ur true`; a host without `unshare` is not judged, so
-/// the test runs and speaks for itself.
+/// Upper bound, before [`common::load_scaled`], on the sandbox preflight's
+/// `codex` calls together. Each is a Codex start with no model turn; measured at
+/// about 0.3 s apiece on a quiet box (Codex 0.164.0, 2026-11-04).
+const CODEX_SANDBOX_PROBE_BASE: Duration = Duration::from_secs(30);
+
+/// The usage line of the `codex sandbox` form this preflight drives, which takes
+/// the command to run directly (`codex sandbox [OPTIONS] [COMMAND]...`, Codex
+/// 0.164.0). A Codex whose `sandbox --help` does not print it is treated as not
+/// offering that form, and the preflight falls back to [`unshare_userns_probe`].
+const CODEX_SANDBOX_USAGE: &str = "Usage: codex sandbox [OPTIONS] [COMMAND]...";
+
+/// Whether Codex's Linux `workspace-write` sandbox can start a command on this
+/// host, asked of Codex itself: `codex sandbox -c sandbox_mode="workspace-write"
+/// -- /bin/true`, which spends no model turn. On a host where it cannot, the
+/// shell commands and patches Codex attempts fail, so a test that needs Codex to
+/// do real work there cannot pass whatever the deck does.
+///
+/// Asked of Codex rather than of the kernel because the answer depends on which
+/// `bwrap` Codex picks. Traced on Ubuntu 26.04 with Codex 0.164.0
+/// (`kernel.apparmor_restrict_unprivileged_userns=1`): with a `bwrap` on `PATH`
+/// Codex runs it, and Ubuntu's shipped `bwrap-userns-restrict` AppArmor profile
+/// lets `/usr/bin/bwrap` create the user namespace, so the sandbox works; with
+/// none it runs its bundled copy, which that host refuses (`bwrap: setting up
+/// uid map: Permission denied` run directly, `bwrap: loopback: Failed
+/// RTM_NEWADDR: Operation not permitted` through Codex). The probe this replaced,
+/// util-linux `unshare -Ur true`, is refused on that host whichever `bwrap` Codex
+/// would use, so it skipped the test there for a reason Codex does not meet.
+///
+/// The probe runs the `codex` and the `bwrap` the deck's pane will resolve: the
+/// `PATH` is [`common::path_with_binary_dir`], the one the test hands the deck,
+/// which also leaves out the deck's telemetry shim. `HOME` and `CODEX_HOME` are a
+/// harness tempdir, never the developer's `~/.codex`, and the cwd is a workspace
+/// inside it, the directory `workspace-write` makes writable. The calls share one
+/// deadline of [`common::load_scaled`] of [`CODEX_SANDBOX_PROBE_BASE`], and a call
+/// still running there is killed by its own child handle.
+///
+/// A Codex without that `sandbox` form, as `sandbox --help` shows (its usage line
+/// is not [`CODEX_SANDBOX_USAGE`], or `--help` fails), is judged by the old
+/// `unshare` probe instead. Linux only, as before.
 fn check_codex_sandbox_can_start() -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Ok(());
     }
+    let path = common::path_with_binary_dir();
+    let codex = std::env::split_paths(&path)
+        .map(|dir| dir.join("codex"))
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            format!(
+                "no `codex` on the PATH the deck's pane gets ({path}), so its sandbox cannot \
+                 be probed"
+            )
+        })?;
+    let scratch = common::harness_tempdir()
+        .map_err(|e| format!("could not create the Codex sandbox probe's home: {e}"))?;
+    let codex_home = scratch.path().join(".codex");
+    let workspace = scratch.path().join("workspace");
+    for dir in [&codex_home, &workspace] {
+        std::fs::create_dir(dir).map_err(|e| format!("could not create {}: {e}", dir.display()))?;
+    }
+    let ceiling = common::load_scaled(CODEX_SANDBOX_PROBE_BASE);
+    let deadline = std::time::Instant::now() + ceiling;
+    let codex_call = |args: &[&str]| {
+        let mut command = std::process::Command::new(&codex);
+        command
+            .args(args)
+            .current_dir(&workspace)
+            .env("PATH", &path)
+            .env("HOME", scratch.path())
+            .env("CODEX_HOME", &codex_home);
+        common::run_codex_preflight(&mut command, deadline)
+    };
+    let probe_args = [
+        "sandbox",
+        "-c",
+        "sandbox_mode=\"workspace-write\"",
+        "--",
+        "/bin/true",
+    ];
+    let shown = format!("{} {}", codex.display(), probe_args.join(" "));
+
+    let (status, output) = codex_call(&probe_args)?;
+    let observed = match status {
+        Some(s) if s.success() => return Ok(()),
+        Some(s) => format!("exited unsuccessfully ({s})"),
+        // Judged as a refusal without asking `--help`: the shared deadline has
+        // passed, so that call would be killed before it could answer.
+        None => format!("did not finish within {ceiling:?}"),
+    };
+    if status.is_some() {
+        let (help_status, help) = codex_call(&["sandbox", "--help"])?;
+        if !help_status.is_some_and(|s| s.success()) || !help.contains(CODEX_SANDBOX_USAGE) {
+            return unshare_userns_probe().map_err(|refused| {
+                format!(
+                    "this Codex does not offer `codex sandbox [COMMAND]...` (`codex sandbox \
+                     --help` did not print {CODEX_SANDBOX_USAGE:?}), and the fallback probe \
+                     refused: {refused}"
+                )
+            });
+        }
+    }
+    let first_lines: Vec<&str> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .take(5)
+        .collect();
+    Err(format!(
+        "Codex's workspace-write sandbox cannot start a command on this host, so Codex cannot \
+         run a shell or apply a patch here: `{shown}` {observed}. Its output began:\n{}",
+        first_lines.join("\n")
+    ))
+}
+
+/// The fallback for a Codex without the `codex sandbox [COMMAND]...` form:
+/// whether this host lets an unprivileged process create a user namespace and
+/// write its uid map, which a `bwrap` with no AppArmor allowance of its own
+/// needs. Probed with util-linux's `unshare -Ur true`; a host without `unshare`
+/// is not judged, so the test runs and speaks for itself. On a host that lets
+/// only an allow-listed `bwrap` create user namespaces (Ubuntu's
+/// `bwrap-userns-restrict`) this refuses even where Codex's sandbox works, which
+/// is why it is only the fallback.
+fn unshare_userns_probe() -> Result<(), String> {
     match std::process::Command::new("unshare")
         .args(["-Ur", "true"])
         .stdin(std::process::Stdio::null())

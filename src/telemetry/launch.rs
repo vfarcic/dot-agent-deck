@@ -204,7 +204,7 @@ pub fn codex_args(args: &[OsString], env: &EnvMap) -> Vec<String> {
 /// the forms its parser takes) whose key is `otel` or under it. Anything else
 /// that mentions `otel.` — a prompt, a model name, a path — is not one, and
 /// nothing after `--` is an option (issue #1845).
-fn codex_overrides_otel(args: &[OsString]) -> bool {
+pub(crate) fn codex_overrides_otel(args: &[OsString]) -> bool {
     let is_otel = |value: &str| {
         let key = value.split_once('=').map_or(value, |(key, _)| key).trim();
         key == "otel" || key.starts_with("otel.")

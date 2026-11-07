@@ -4,15 +4,16 @@
 //!
 //! These tests drive a headless `daemon serve` and send `StartAgent` as raw
 //! JSON to pin the optional field's wire spelling independently of the typed
-//! client. The stand-in is the paste-aware variant of the late-announcing
-//! `claude` probe used by `prompt/new-pane/017`: it emits a genuine
-//! `SessionStart` through the real hook socket and distinguishes bytes queued
-//! before readiness from bytes read afterwards, without spending a credential.
+//! client. The stand-in is the late-announcing `claude` probe used by
+//! `prompt/new-pane/017`, with the e2e stand-in profile's editor as its reader
+//! (PRD #1666 part 3, round 5-wake): it emits a genuine `SessionStart` through
+//! the real hook socket and distinguishes bytes queued before readiness from
+//! bytes read afterwards, without spending a credential.
 //!
 //! Since PRD #1666 the daemon posts the seed to the pane's inbox rather than
 //! typing it, so a seed is "queued once and rung only after readiness": the
 //! inbox holds it exactly once, and the only bytes the stand-in ever reads are
-//! the fixed doorbell line naming it.
+//! the token-led doorbell line naming it.
 
 mod common;
 #[path = "support/inbox_view.rs"]
@@ -86,14 +87,21 @@ fn start_stand_in(
 ) -> String {
     std::fs::create_dir_all(cwd)
         .unwrap_or_else(|e| panic!("create stand-in cwd {}: {e}", cwd.display()));
-    let command = common::write_late_announcing_paste_agent(cwd, log_name, announce_after_secs);
+    // PRD #1666 part 3, round 5-wake: the doorbell types only into a screen
+    // it has measured, so the reader is the stand-in profile's editor.
+    let (command, editor) =
+        common::write_late_announcing_profiled_agent(cwd, log_name, announce_after_secs);
     let mut request = json!({
         "op": "start-agent",
-        "command": wire_path(&command),
+        "command": command,
         "cwd": wire_path(cwd),
         "rows": 24,
         "cols": 100,
-        "env": [["DOT_AGENT_DECK_PANE_ID", pane_id]],
+        "env": [
+            ["DOT_AGENT_DECK_PANE_ID", pane_id],
+            ["DOT_AGENT_DECK_TEST_COMPOSER_PROFILE", "standin"],
+            ["DOT_AGENT_DECK_TEST_COMPOSER_BINARY", wire_path(&editor)],
+        ],
         "display_name": pane_id,
     });
     if let Some(kind) = authoring_kind {
@@ -214,9 +222,18 @@ fn assert_ready_then_received_once(
         .expect("an authoring seed is non-empty");
     for line in received_lines(&log) {
         let line = line.trim();
+        // PRD #1666 part 3, round 5-wake: the doorbell line is led by its
+        // ring token, `(` six lowercase letters `)`.
+        let rung = line
+            .strip_prefix('(')
+            .and_then(|rest| rest.split_at_checked(6))
+            .filter(|(token, rest)| {
+                token.bytes().all(|b| b.is_ascii_lowercase()) && rest.starts_with(')')
+            })
+            .is_some_and(|(_, rest)| rest[1..].trim() == doorbell.trim());
         assert!(
-            line.is_empty() || line == doorbell.trim(),
-            "the stand-in read something other than the fixed doorbell for {id}: {line:?}; \
+            line.is_empty() || rung,
+            "the stand-in read something other than the doorbell line for {id}: {line:?}; \
              the seed's content must never be typed\nstand-in log:\n{log}"
         );
         assert!(
@@ -237,7 +254,7 @@ fn assert_ready_then_received_once(
 
 /// Scenario: Start one readiness-announcing stand-in for each advertised
 /// authoring kind and require the matching TUI seed text to be posted to the
-/// pane's inbox exactly once, with only the fixed doorbell line typed after
+/// pane's inbox exactly once, with only the token-led doorbell line typed after
 /// readiness. The options query and handshake must expose all three kinds and
 /// the capability that makes sending `authoring_kind` safe.
 #[spec("newagent/authoring/001")]

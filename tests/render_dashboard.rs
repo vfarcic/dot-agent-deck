@@ -739,6 +739,448 @@ fn status_012_card_says_a_stalled_wake_and_what_to_do() {
     insta::assert_snapshot!(rendered);
 }
 
+/// A Normal card at 80 columns for an idle agent whose daemon summary has one
+/// queued message, with `extra` merged into the summary.
+fn inbox_hold_card(extra: serde_json::Value) -> String {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.status = SessionStatus::Idle;
+    let mut inbox = serde_json::json!({
+        "queued": 1, "fetched": 0, "undeliverable": 0,
+        "last_acked_at": null, "wake": "doorbell", "component": null
+    });
+    for (key, value) in extra.as_object().unwrap() {
+        inbox[key] = value.clone();
+    }
+    let record: dot_agent_deck::agent_pty::AgentRecord =
+        serde_json::from_value(serde_json::json!({
+            "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+            "live": session.live_snapshot(), "inbox": inbox
+        }))
+        .expect("the daemon's AgentRecord wire shape with a wake hold");
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".to_string());
+    state.sessions.insert(session.session_id.clone(), session);
+    state.resync_after_event_gap(&[record]);
+    let session = state.sessions.remove("sess-card-stats").unwrap();
+    let buffer = render_card_to_buffer(
+        &session,
+        Some("api-svc"),
+        Some(1),
+        CardDensityKind::Normal,
+        0,
+        render_now(),
+        false,
+        80,
+        CardDensityKind::Normal.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+}
+
+/// Scenario: Render waiting messages with each doorbell hold, including needs-fetch and cannot-check, and show its shared reason on the notice row. Unknown holds use the generic stalled words; standalone input warnings remain visible with no messages.
+#[spec("inbox/status/030")]
+#[test]
+fn status_030_card_says_why_the_doorbell_holds() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let stalled_line = format!(
+        "{glyph}1 {}: {}",
+        words["wakeStalled"].as_str().unwrap(),
+        words["wakeStalledHint"].as_str().unwrap()
+    );
+    for hold in [
+        "possible_draft",
+        "awaiting_prompt",
+        "paste_open",
+        "cannot_type",
+        "not_taken",
+        "uncertain_input",
+        "dialog_during_ring",
+        "needs_fetch",
+        "cannot_check",
+    ] {
+        let extra = serde_json::json!({"wake_stalled": true, "wake_hold": hold});
+        let rendered = if matches!(hold, "needs_fetch" | "cannot_check") {
+            probe_card_updates(&[(serde_json::json!({}), extra)]).remove(0)
+        } else {
+            inbox_hold_card(extra)
+        };
+        let line = format!("{glyph}1 {}", words["wakeHolds"][hold].as_str().unwrap());
+        assert!(
+            rendered.contains(&line),
+            "{hold} must say {line:?}:\n{rendered}"
+        );
+        assert!(
+            !rendered.contains(words["wakeStalled"].as_str().unwrap()),
+            "{hold}: the stall's words never sit beside the hold's:\n{rendered}"
+        );
+        if hold == "possible_draft" {
+            insta::assert_snapshot!(rendered);
+        }
+    }
+    for hold in ["uncertain_input", "dialog_during_ring", "cannot_type"] {
+        let rendered = inbox_hold_card(serde_json::json!({
+            "queued": 0, "wake_hold": hold
+        }));
+        match words["wakeHoldsAlone"][hold].as_str() {
+            Some(alone) => assert!(
+                rendered.contains(alone),
+                "{hold} with nothing waiting must say {alone:?}:\n{rendered}"
+            ),
+            None => assert!(
+                !rendered.contains(words["wakeHolds"][hold].as_str().unwrap()),
+                "{hold} says nothing with nothing waiting:\n{rendered}"
+            ),
+        }
+    }
+    for (extra, why) in [
+        (
+            serde_json::json!({"wake_hold": "a_newer_reason"}),
+            "a reason this build does not know",
+        ),
+        (
+            serde_json::json!({"wake_stalled": true}),
+            "a daemon older than the field",
+        ),
+    ] {
+        let rendered = inbox_hold_card(extra);
+        assert!(
+            rendered.contains(&stalled_line),
+            "{why} must say {stalled_line:?}:\n{rendered}"
+        );
+    }
+}
+
+/// Scenario: Render an idle card whose daemon summary has two waiting messages, a held doorbell (`cannot_type`) and the daemon's agent notice about the way the agent runs. The notice row shows the agent notice and the status line keeps the queued words, as the desktop tile does; without the agent notice the row says why the doorbell holds and the line keeps only the count.
+#[spec("inbox/status/035")]
+#[test]
+fn status_035_an_agent_notice_leaves_the_hold_its_line() {
+    let words = inbox_display_words();
+    let glyph = words["glyph"].as_str().unwrap();
+    let notice = dot_agent_deck::agent_notice::OPENCODE_SHARED_SERVICE;
+    let held = serde_json::json!({"queued": 2, "wake_hold": "cannot_type"});
+    let mut with_notice = held.clone();
+    with_notice["agent_notice"] =
+        serde_json::json!({"kind": "opencode_shared_service", "text": notice});
+    let queued_line = format!("{glyph}2 {}", words["queued"].as_str().unwrap());
+    let hold_row = format!(
+        "{glyph}2 {}",
+        words["wakeHolds"]["cannot_type"].as_str().unwrap()
+    );
+    let rendered = probe_card_updates(&[(serde_json::json!({}), with_notice.clone())]).remove(0);
+    assert!(
+        rendered.contains(notice),
+        "the notice row shows the agent notice:\n{rendered}"
+    );
+    assert!(
+        rendered.contains(&queued_line),
+        "the line keeps the hold's words, {queued_line:?}, not the bare count:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains(&hold_row),
+        "the agent notice has the row:\n{rendered}"
+    );
+    // Control: the same hold without the agent notice keeps the row.
+    let control = probe_card_updates(&[(serde_json::json!({}), held)]).remove(0);
+    assert!(control.contains(&hold_row), "{control}");
+    assert!(!control.contains(&queued_line), "{control}");
+    insta::assert_snapshot!(inbox_hold_card(with_notice));
+}
+
+/// Feed real wire snapshots through one client's hydration path, preserving the
+/// same card between updates so clearing a field must clear its visible copy.
+fn probe_card_updates(updates: &[(serde_json::Value, serde_json::Value)]) -> Vec<String> {
+    let mut session = card_stats_session("/home/dev/api-svc");
+    session.status = SessionStatus::Idle;
+    let mut state = AppState::default();
+    state.register_pane("pane-card-stats".into());
+    state
+        .sessions
+        .insert(session.session_id.clone(), session.clone());
+    updates
+        .iter()
+        .map(|(live_extra, inbox_extra)| {
+            let mut live = serde_json::to_value(session.live_snapshot()).unwrap();
+            for (key, value) in live_extra.as_object().unwrap() {
+                live[key] = value.clone();
+            }
+            let mut inbox = serde_json::json!({
+                "queued": 1, "fetched": 0, "undeliverable": 0,
+                "wake": "doorbell", "component": null
+            });
+            for (key, value) in inbox_extra.as_object().unwrap() {
+                inbox[key] = value.clone();
+            }
+            let record = serde_json::from_value(serde_json::json!({
+                "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
+                "live": live, "inbox": inbox
+            }))
+            .unwrap();
+            state.resync_after_event_gap(&[record]);
+            buffer_to_text(&render_card_to_buffer(
+                &state.sessions["sess-card-stats"],
+                Some("api-svc"),
+                Some(1),
+                CardDensityKind::Normal,
+                0,
+                render_now(),
+                false,
+                1800,
+                CardDensityKind::Normal.rendered_height(),
+            ))
+            .lines()
+            .map(|line| line.trim_matches(['│', ' ']))
+            .filter(|line| {
+                !line
+                    .chars()
+                    .all(|c| matches!(c, '─' | '┌' | '┐' | '└' | '┘'))
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+        })
+        .collect()
+}
+
+/// Scenario: Hydrate each held-typing cause into an idle or thinking card with no pending mail, then clear it on that same card. Its shared explanation must appear while held and disappear on the next snapshot.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_held_typing_is_visible_and_clears() {
+    let words = inbox_display_words();
+    let mut missing = Vec::new();
+    let mut checking_line = String::new();
+    for (cause, expected) in words["inputHeld"].as_object().unwrap() {
+        for status in ["idle", "thinking"] {
+            let frames = probe_card_updates(&[
+                (
+                    serde_json::json!({"status": status, "input_held": {
+                        "generation": 9, "cause": cause, "held_ops": 2,
+                        "held_bytes": 7, "since_ms": 1
+                    }}),
+                    serde_json::json!({"queued": 0}),
+                ),
+                (
+                    serde_json::json!({"status": status}),
+                    serde_json::json!({"queued": 0}),
+                ),
+            ]);
+            let expected = expected.as_str().unwrap();
+            if !frames[0].contains(expected) {
+                missing.push(format!(
+                    "{cause}/{status} must show {expected:?}:\n{}",
+                    frames[0]
+                ));
+            }
+            if cause == "checking" && status == "idle" {
+                checking_line = frames[0]
+                    .lines()
+                    .find(|line| line.contains(expected))
+                    .unwrap_or("")
+                    .trim_matches(['│', ' '])
+                    .to_string();
+            }
+            assert!(
+                !frames[1].contains(expected),
+                "clearing {cause} kept its words"
+            );
+        }
+    }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+    insta::assert_snapshot!(checking_line, @"input held: the deck is checking the input box; what you typed or answered will appear in a moment");
+}
+
+/// Scenario: Render both new holds and each cannot-check detail from a daemon snapshot, then replace the reason on the same card. Causes show distinct explanations and path remedies, while a stale detail never follows the new reason.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_hold_details_and_reason_replacement() {
+    let words = inbox_display_words();
+    let mut failures = Vec::new();
+    let mut causes_seen = std::collections::HashSet::new();
+    for cause in [
+        "filesystem",
+        "writable_directory",
+        "foreign_owner",
+        "acl",
+        "export_file",
+        "io",
+    ] {
+        let frames = probe_card_updates(&[
+            (
+                serde_json::json!({}),
+                serde_json::json!({"wake_hold": "cannot_check", "hold_detail": {
+                    "cause": cause, "path_component": "/safe/old-path", "filesystem": "overlayfs"
+                }}),
+            ),
+            (
+                serde_json::json!({}),
+                serde_json::json!({"wake_hold": "needs_fetch"}),
+            ),
+            (serde_json::json!({}), serde_json::json!({})),
+        ]);
+        let explanation = frames[0]
+            .lines()
+            .find(|line| line.contains("/safe/old-path"));
+        if let Some(explanation) = explanation {
+            causes_seen.insert(explanation.to_string());
+            if cause == "filesystem" {
+                for required in [
+                    "overlayfs",
+                    "TMPDIR",
+                    "CODEX_HOME",
+                    "ext4",
+                    "XFS",
+                    "Btrfs",
+                    "tmpfs",
+                    "APFS",
+                    "HFS+",
+                ] {
+                    if !frames[0].contains(required) {
+                        failures.push(format!("filesystem remedy misses {required}"));
+                    }
+                }
+            }
+            if cause == "writable_directory" && !frames[0].contains("chmod g-w") {
+                failures.push(
+                    "owned writable directory must name chmod g-w without interpolating a command"
+                        .into(),
+                );
+            }
+        } else {
+            failures.push(format!(
+                "{cause} must display the refused path:\n{}",
+                frames[0]
+            ));
+        }
+        if !frames[1].contains(words["wakeHolds"]["needs_fetch"].as_str().unwrap()) {
+            failures.push(format!(
+                "{cause} -> needs_fetch lost its words:\n{}",
+                frames[1]
+            ));
+        }
+        assert!(
+            !frames[1].contains("old-path"),
+            "new reason inherited {cause}'s path"
+        );
+        assert!(
+            !frames[2].contains("old-path"),
+            "cleared reason retained its path"
+        );
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(
+        causes_seen.len(),
+        6,
+        "cannot-check causes need distinct explanations"
+    );
+}
+
+/// Scenario: Receive oversized path and wide-glyph filesystem text containing terminal controls, bidi overrides and shell punctuation through the wire. The card shows escaped text bounded to 256 source characters per field, with neither executable command markup nor the suffix beyond the bound.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_wire_details_are_bounded_and_escaped() {
+    let path = format!(
+        "/safe/\n\u{1b}\u{202e}$(touch sentinel);{}PATH_TAIL",
+        "é".repeat(270)
+    );
+    let filesystem = format!("fs-\n\u{1b}\u{202e}{}FS_TAIL", "界".repeat(270));
+    let frames = probe_card_updates(&[(
+        serde_json::json!({}),
+        serde_json::json!({
+            "wake_hold": "cannot_check", "hold_detail": {
+                "cause": "filesystem", "path_component": path, "filesystem": filesystem
+            }
+        }),
+    )]);
+    let rendered = &frames[0];
+    for prefix in [
+        "/safe/\\n\\u{1b}\\u{202e}$(touch sentinel);",
+        "fs-\\n\\u{1b}\\u{202e}",
+    ] {
+        assert!(
+            rendered.contains(prefix),
+            "wire detail must be visibly escaped, not dropped: {prefix:?}\n{rendered}"
+        );
+    }
+    for forbidden in ["PATH_TAIL", "FS_TAIL", "\u{1b}", "\u{202e}"] {
+        assert!(
+            !rendered.contains(forbidden),
+            "unsafe or unbounded detail {forbidden:?}:\n{rendered}"
+        );
+    }
+    // buffer_to_text includes the blank continuation cell after each double-width 界.
+    // Remove that cell padding before comparing source-character bounds.
+    let detail_text = rendered.replace("界 ", "界");
+    for raw in [&path, &filesystem] {
+        let escaped = |limit| {
+            dot_agent_deck::untrusted_text::escape_control_and_bidi(
+                &raw.chars().take(limit).collect::<String>(),
+            )
+        };
+        assert!(
+            detail_text.contains(&escaped(128)),
+            "the detail was dropped or prematurely cut:\n{rendered}"
+        );
+        assert!(
+            !detail_text.contains(&escaped(257)),
+            "a wire field displayed more than 256 source characters:\n{rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("chmod g-w /safe/"),
+        "path became a copy-paste command"
+    );
+}
+
+/// Scenario: A cannot-check snapshot has no detail, or a detail cause from a newer daemon. Each card shows a generic explanation without attributing an unfamiliar cause's path to that reason.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_missing_or_unknown_detail_is_generic() {
+    let words = inbox_display_words();
+    for detail in [
+        serde_json::Value::Null,
+        serde_json::json!({"cause": "future_cause", "path_component": "do-not-inherit"}),
+    ] {
+        let frames = probe_card_updates(&[(
+            serde_json::json!({}),
+            serde_json::json!({
+                "wake_hold": "cannot_check", "hold_detail": detail
+            }),
+        )]);
+        assert!(
+            frames[0].contains(words["wakeHolds"]["cannot_check"].as_str().unwrap()),
+            "missing/unknown detail needs generic words:\n{}",
+            frames[0]
+        );
+        assert!(!frames[0].contains("do-not-inherit"));
+    }
+}
+
+/// Scenario: A new hold has no words in this staged build and its stalled bit is false. The rendered card must still use the documented generic waiting-to-wake fallback; once the hold has words it must show those instead.
+#[spec("inbox/probe/017")]
+#[test]
+fn probe_017_wordless_holds_keep_the_generic_card_fallback() {
+    for hold in [
+        dot_agent_deck::inbox_display::WakeHold::NeedsFetch,
+        dot_agent_deck::inbox_display::WakeHold::CannotCheck,
+    ] {
+        let name = serde_json::to_value(hold).unwrap();
+        let rendered = probe_card_updates(&[(
+            serde_json::json!({}),
+            serde_json::json!({"wake_hold": name}),
+        )])
+        .remove(0);
+        if hold.words().is_none() {
+            assert!(
+                rendered.contains("waiting to wake: send it a prompt"),
+                "a wordless hold needs the generic fallback:\n{rendered}"
+            );
+        } else {
+            assert!(
+                rendered.contains(hold.words().unwrap()),
+                "hold words must reach the card:\n{rendered}"
+            );
+        }
+    }
+}
+
 /// PRD #1666 §6.5: a card whose daemon summary carries `notices` (the attention
 /// items, the integration notice, failed receipts, paused hand-outs) beside
 /// one fetched message, rendered at the Normal density's 80 columns.
@@ -1335,6 +1777,8 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         };
         let mut state = AppState::default();
         state.register_pane("pane-reconnect".to_string());

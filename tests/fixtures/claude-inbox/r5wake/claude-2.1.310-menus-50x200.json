@@ -1,0 +1,141 @@
+{
+  "source_run": "capture",
+  "argv0": "claude",
+  "rows": 50,
+  "cols": 200,
+  "read_lens": [
+    13,
+    30,
+    21,
+    33,
+    24,
+    20,
+    1794,
+    21,
+    565,
+    231,
+    119,
+    56,
+    177,
+    143,
+    119,
+    1292,
+    1371,
+    84,
+    124,
+    316,
+    20,
+    407,
+    93,
+    52,
+    20,
+    665,
+    46,
+    97,
+    92,
+    461,
+    33,
+    24,
+    2761,
+    8
+  ],
+  "points": {
+    "empty": 1956,
+    "slash": 2521,
+    "at": 3104,
+    "bang": 4658,
+    "exit-warning": 6113,
+    "quotation-echo": 7856,
+    "transcript-quotation": 7953,
+    "overview": 11332
+  },
+  "edges": [],
+  "lines": [
+    "Quoted UI phrases: Your conversation moved to the background; describe a task for a new session; Press Ctrl-C again to exit; /help; @file; ! shell mode."
+  ],
+  "release": "2.1.310",
+  "executable_sha256": "b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56",
+  "trace_sha256": "ef5b3263c60ddb4c3e406bc1162d675b09797082a8188d1f0886664435c912e2",
+  "source_capture": "dad-claude-2312-measure-IXkO0O",
+  "captured_on": "2026-10-31",
+  "model": "haiku",
+  "blocked_submissions": 1,
+  "review_status": "candidate",
+  "events": [
+    {
+      "t": 3139657061059340,
+      "send": "/",
+      "off": 1956
+    },
+    {
+      "t": 3139658079211674,
+      "send": "\u001b",
+      "off": 2521
+    },
+    {
+      "t": 3139658379432046,
+      "send": "\u0015",
+      "off": 2752
+    },
+    {
+      "t": 3139658679784827,
+      "send": "@",
+      "off": 2871
+    },
+    {
+      "t": 3139659699084073,
+      "send": "\u001b",
+      "off": 3104
+    },
+    {
+      "t": 3139659999343026,
+      "send": "\u0015",
+      "off": 3247
+    },
+    {
+      "t": 3139660299637112,
+      "send": "!",
+      "off": 3366
+    },
+    {
+      "t": 3139661317718332,
+      "send": "\u001b",
+      "off": 4658
+    },
+    {
+      "t": 3139661618093531,
+      "send": "\u0015",
+      "off": 6029
+    },
+    {
+      "t": 3139661918398968,
+      "send": "\u0003",
+      "off": 6029
+    },
+    {
+      "t": 3139665137384697,
+      "send": "Quoted UI phrases: Your conversation moved to the background; describe a task for a new session; Press Ctrl-C again to exit; /help; @file; ! shell mode.",
+      "off": 6237
+    },
+    {
+      "t": 3139665637594195,
+      "send": "\r",
+      "off": 6553
+    },
+    {
+      "t": 3139666911158068,
+      "send": "\u0015",
+      "off": 7856
+    },
+    {
+      "t": 3139667435342719,
+      "send": "\u001b[D",
+      "off": 7953
+    },
+    {
+      "t": 3139667756575398,
+      "send": "\u001b[D",
+      "off": 8045
+    }
+  ]
+}

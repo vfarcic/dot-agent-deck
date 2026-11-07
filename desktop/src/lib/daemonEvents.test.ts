@@ -37,3 +37,28 @@ describe("daemon event consumers", () => {
     expect(item?.agentId).toBe("7");
   });
 });
+
+describe("inbox/status/032 — what ended an agent's pane, in the events drawer", () => {
+  const notice = (termination?: unknown) => ({
+    kind: "inbox", pane_id: "worker", agent_id: "7", message_id: "m-1", subject: "review",
+    from_label: "the orchestrator", state: "undeliverable", reason: "agent_exited",
+    ...(termination === undefined ? {} : { termination }),
+  });
+
+  /// Scenario: An undeliverable message whose pane ended is shown with the deck's evidence of what ended it, in the shared words; never as the agent exiting.
+  it.each([
+    [{ kind: "pane_command_exited", code: 7, reported_by: "wrapper" }, "the command started in the agent's pane exited (code 7) before taking this message"],
+    [{ kind: "connection_ended", read_end: "eof" }, "the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown"],
+    [{ kind: "replaced" }, "the agent's pane was replaced before it took this message; the message stays with the previous agent"],
+    [{ kind: "closed" }, "the pane was closed before the agent took this message"],
+  ])("names %o", (termination, words) => {
+    expect(mapDaemonEvent(notice(termination), 1)?.summary).toBe(`review · ${words}`);
+  });
+
+  /// Scenario: A notice from an older deck with no termination, or naming a kind or source this build does not know, still reads as the pane having ended rather than failing or claiming the agent exited.
+  it.each([undefined, { kind: "meteor_strike" }, { kind: "pane_command_exited", reported_by: "telepathy" }, "garbage"])("reads %o as the pane having ended", (termination) => {
+    const summary = mapDaemonEvent(notice(termination), 1)?.summary;
+    expect(summary).toBe("review · the agent's pane ended before it took this message");
+    expect(summary).not.toMatch(/agent exited/);
+  });
+});

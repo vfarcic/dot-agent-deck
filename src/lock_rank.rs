@@ -1,6 +1,6 @@
 //! PRD #1666 part 3, round 5 (plan D6): the daemon's ranked runtime locks.
 //!
-//! Five `std::sync::Mutex`es are taken in a fixed order, outermost first:
+//! These `std::sync::Mutex`es are taken in a fixed order, outermost first:
 //!
 //! | rank | lock |
 //! | --- | --- |
@@ -9,9 +9,13 @@
 //! | [`R3`] | the inbox hub's state |
 //! | [`R4`] | the registry's record table (`inner`) |
 //! | [`R5`] | the retained-report store |
+//! | [`GATE`] | a generation's fence gate (PRD #1666 part 3, Q35-15) |
+//! | [`R6`] | a generation's input epoch (PRD #1666 part 3, Q35-06), with no ranked lock taken under it |
 //! | [`LEAF`] | the registry's dispatched units, taken with none of the above held |
 //!
-//! A thread holding rank *n* may take only a rank above *n*. `AppState`'s
+//! A thread holding rank *n* may take only a rank above *n*. The names are the
+//! plan's; only the values' order means anything, which is why [`GATE`],
+//! ranked after the others were named, sits between [`R5`] and [`R6`]. `AppState`'s
 //! `tokio` `RwLock` (R0) is outermost by convention and is **not** seen here:
 //! a thread-local stack is not sound for a guard held across an `.await`, which
 //! R0's callers do. What keeps R0 outermost is that no ranked guard is held
@@ -19,7 +23,7 @@
 //! [`RankedGuard`]) and the audits recorded with the commit that introduced
 //! this module. A green checker is no evidence about R0 or any other lock.
 //!
-//! # Four ways to take a ranked lock
+//! # Five ways to take a ranked lock
 //!
 //! Each existing acquisition site keeps the poison policy it had before it
 //! was routed through here (plan D15 rule 1), by using the form equal to it:
@@ -32,6 +36,11 @@
 //!   never clears poison. It **blocks** until the lock is free, like
 //!   [`RankedMutex::lock`]; "try" names the fallible answer, not a
 //!   non-blocking acquisition;
+//! - [`RankedMutex::try_lock_now`] is the non-blocking one: it answers
+//!   [`NotNow::WouldBlock`] at once while another thread holds the lock, and
+//!   otherwise behaves as `try_lock` does, except that its caller picks the
+//!   poison policy ([`OnPoison`]). It is for a reader that must not wait,
+//!   such as the doorbell's admission check while it holds a pane's writer;
 //! - [`RankedMutex::lock_in_drop`] is for a destructor, and for a helper only
 //!   a destructor calls. It never panics and never asserts, recovers or skips
 //!   poison as its caller asks, and makes no `tracing` call while the thread is
@@ -68,6 +77,16 @@ pub const R3: u8 = 3;
 pub const R4: u8 = 4;
 /// The retained-report store.
 pub const R5: u8 = 5;
+/// A generation's fence gate (`crate::composer_probe::gate`): taken under
+/// the registry's record table ([`R4`]) when a generation retires, and under
+/// the pane writer's async lock (not seen here) for acceptance and release.
+/// The input epoch ([`R6`]) is taken under it; the seam's lock and the
+/// ingress ledger, plain mutexes, are too, and neither is seen here.
+pub const GATE: u8 = 6;
+/// A generation's input epoch (`crate::composer_probe::epoch`): it may be
+/// taken while any of [`R1`]–[`R5`] or [`GATE`] is held, and no ranked lock
+/// may be taken under it.
+pub const R6: u8 = 7;
 /// The registry's dispatched units: taken with no other ranked lock held, and
 /// nothing ranked is taken under it.
 pub const LEAF: u8 = u8::MAX;
@@ -99,7 +118,17 @@ pub enum Unavailable {
     RankViolation,
 }
 
-/// What [`RankedMutex::lock_in_drop`] does with a poisoned lock.
+/// Why [`RankedMutex::try_lock_now`] did not hand out a guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotNow {
+    /// Another thread holds the lock.
+    WouldBlock,
+    /// Poisoned (with [`OnPoison::Skip`]), or a rank violation.
+    Unavailable(Unavailable),
+}
+
+/// What [`RankedMutex::lock_in_drop`] and [`RankedMutex::try_lock_now`] do
+/// with a poisoned lock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnPoison {
     /// Continue on the poisoned state, as `PoisonError::into_inner` does.
@@ -175,6 +204,37 @@ impl<const RANK: u8, T> RankedMutex<RANK, T> {
                 drop(poisoned);
                 Err(Unavailable::Poisoned)
             }
+        }
+    }
+
+    /// Take the lock if no other thread holds it, without waiting: never
+    /// blocks and never panics. A rank violation answers
+    /// [`Unavailable::RankViolation`] (debug builds) and a poisoned lock is
+    /// recovered or refused as `on_poison` says; poison is never cleared. A
+    /// refusal pushes nothing onto the thread's rank stack.
+    pub fn try_lock_now(&self, on_poison: OnPoison) -> Result<RankedGuard<'_, RANK, T>, NotNow> {
+        report_skipped_in_unwind();
+        let token = check(RANK).map_err(|()| {
+            if !std::thread::panicking() {
+                tracing::error!(
+                    rank = RANK,
+                    held = ?held_ranks(),
+                    "lock ranks: an acquisition out of rank order was refused"
+                );
+            }
+            NotNow::Unavailable(Unavailable::RankViolation)
+        })?;
+        match self.mutex.try_lock() {
+            Ok(guard) => Ok(RankedGuard::new(guard, token)),
+            Err(std::sync::TryLockError::WouldBlock) => Err(NotNow::WouldBlock),
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => match on_poison {
+                OnPoison::Recover => Ok(RankedGuard::new(poisoned.into_inner(), token)),
+                OnPoison::Skip => {
+                    // Dropped unused: dropping a guard never clears poison.
+                    drop(poisoned);
+                    Err(NotNow::Unavailable(Unavailable::Poisoned))
+                }
+            },
         }
     }
 
@@ -493,6 +553,9 @@ mod tests {
     /// Scenario: A guard is dropped while its thread's rank stack is already borrowed (a seam that holds the borrow). Its `Drop` does nothing and does not panic; the entry it could not remove is the only trace.
     #[spec("orchestration/work-done/032")]
     #[test]
+    // The rank stack exists only with debug assertions; a release-profile
+    // test build (the scanner budget measurement) has none to borrow.
+    #[cfg(debug_assertions)]
     fn work_done_032_a_guard_drop_with_the_stack_borrowed_does_not_panic() {
         let hub = RankedMutex::<R3, u32>::new(0);
         let guard = hub.lock();
@@ -503,6 +566,71 @@ mod tests {
         // The entry it could not reach is still there: the documented cost.
         assert_eq!(held_ranks(), vec![R3]);
         HELD.with(|held| held.borrow_mut().clear());
+    }
+
+    /// Scenario: Another OS thread holds a ranked lock while this thread asks for it with `try_lock_now`. It answers `WouldBlock` at once instead of waiting, leaves nothing on this thread's rank stack, and hands out the guard once the holder lets go.
+    #[spec("orchestration/work-done/032")]
+    #[test]
+    fn work_done_032_try_lock_now_does_not_wait_for_another_thread() {
+        let mutex = Arc::new(RankedMutex::<R3, u32>::new(5));
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let mutex = Arc::clone(&mutex);
+            std::thread::spawn(move || {
+                let _guard = mutex.lock();
+                held_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+            })
+        };
+        held_rx.recv().unwrap();
+        let asked = std::time::Instant::now();
+        assert_eq!(
+            mutex.try_lock_now(OnPoison::Recover).err(),
+            Some(NotNow::WouldBlock)
+        );
+        assert_eq!(
+            mutex.try_lock_now(OnPoison::Skip).err(),
+            Some(NotNow::WouldBlock)
+        );
+        assert!(
+            asked.elapsed() < std::time::Duration::from_secs(1),
+            "answered without waiting: {:?}",
+            asked.elapsed()
+        );
+        assert!(held_ranks().is_empty(), "a refusal pushes no rank");
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        let guard = mutex.try_lock_now(OnPoison::Skip).expect("free now");
+        assert_eq!(*guard, 5);
+        assert_eq!(held_ranks(), vec![R3]);
+        drop(guard);
+        assert!(held_ranks().is_empty());
+    }
+
+    /// Scenario: Poison a ranked lock, then take it with `try_lock_now` under each poison policy, and take one out of rank order. `Recover` hands out the recovered guard, `Skip` answers `Poisoned`, the out-of-order one answers `RankViolation` without panicking, and the lock is still poisoned at the end.
+    #[spec("orchestration/work-done/032")]
+    #[test]
+    fn work_done_032_try_lock_now_answers_poison_and_rank_as_asked() {
+        let mutex = Arc::new(RankedMutex::<R2, u32>::new(7));
+        poison(&mutex);
+        assert_eq!(
+            mutex.try_lock_now(OnPoison::Skip).err(),
+            Some(NotNow::Unavailable(Unavailable::Poisoned))
+        );
+        assert!(held_ranks().is_empty());
+        assert_eq!(
+            *mutex.try_lock_now(OnPoison::Recover).expect("recovered"),
+            7
+        );
+        assert!(mutex.is_poisoned(), "no form clears poison");
+        let registry = RankedMutex::<R4, u32>::new(0);
+        let _held = registry.lock();
+        assert_eq!(
+            mutex.try_lock_now(OnPoison::Recover).err(),
+            Some(NotNow::Unavailable(Unavailable::RankViolation))
+        );
+        assert_eq!(held_ranks(), vec![R4]);
     }
 
     /// A subscriber that panics on any event, so a `tracing` call made where
