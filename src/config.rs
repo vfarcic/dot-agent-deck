@@ -703,8 +703,8 @@ impl FileOwnership {
 /// When this is false the save is the in-place write, which keeps the owner
 /// and the links: `config set` run as root with the user's `HOME` (`sudo -E`,
 /// or macOS `sudo`) would otherwise leave the user a root-owned config they
-/// cannot save and the daemon cannot read, and a hard-linked config would be
-/// split from its other names.
+/// cannot save (and, if it is `0600`, the daemon cannot read), and a
+/// hard-linked config would be split from its other names.
 #[cfg(unix)]
 fn swap_keeps_owner_and_links(target: Option<FileOwnership>, replacement: FileOwnership) -> bool {
     match target {
@@ -2702,6 +2702,63 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// Issue #2137 (PR #2142 review of 85f6a8c9): the owner/group check is wired
+    /// to the real target, not only correct on its inputs. Scenario: give a
+    /// config one of this user's supplementary groups, save it, and expect the
+    /// same inode, the group kept and the new content written in place. A
+    /// different owner (uid) needs root to produce and is not tested here.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_keeps_a_config_whose_group_was_changed() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        // SAFETY: `getgroups(0, NULL)` only returns the count, and the second
+        // call writes at most `groups.len()` entries into the buffer.
+        let mut groups: Vec<libc::gid_t> =
+            vec![0; unsafe { libc::getgroups(0, std::ptr::null_mut()) }.max(0) as usize];
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(n.max(0) as usize);
+        // A usable group is one `chown` accepts: listed is not always enough
+        // (macOS lists groups it will not hand a file to).
+        let Some(gid) = groups
+            .into_iter()
+            .filter(|&g| g != before.gid())
+            .find(|&g| std::os::unix::fs::chown(&path, None, Some(g)).is_ok())
+        else {
+            eprintln!(
+                "SKIP: this user has no supplementary group other than the file's \
+                 that chown accepts, so a config with a changed group cannot be made here"
+            );
+            return;
+        };
+        assert_eq!(std::fs::metadata(&path).unwrap().gid(), gid);
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        config.save_to(&path).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            after.ino(),
+            before.ino(),
+            "a config whose group the swap would change must be saved in place"
+        );
+        assert_eq!(after.gid(), gid, "the config must keep its group");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_command = \"new\"")
+        );
+        assert!(temp_files_in(dir.path()).is_empty());
     }
 
     /// Issue #2137 (PR #2142 review): `std::fs::write` wrote into the file, so
