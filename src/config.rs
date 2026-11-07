@@ -608,9 +608,10 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
 ///   through the link into its target, so this follows the link chain itself
 ///   and renames over the final target, leaving the links in place. A dangling
 ///   link resolves to its missing target, which is created, as before.
-/// * **The file keeps its mode.** The temp file is given the existing target's
-///   permissions before any byte is written; a new file gets `0666 & !umask`,
-///   which is what `std::fs::write` created.
+/// * **The file keeps its mode.** On unix the temp file is created with the
+///   existing target's permission bits (narrowed by the umask), then given the
+///   target's exact permissions before any byte is written; a new file gets
+///   `0666 & !umask`, which is what `std::fs::write` created.
 /// * **A config the user cannot write is still refused**, with the same error.
 ///
 /// The temp file is opened with `create_new` (`O_EXCL`), so a pre-planted entry
@@ -670,10 +671,6 @@ fn write_config_atomically_with(
     bytes: &[u8],
     write_body: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
 ) -> std::io::Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-
     let target = resolve_symlink_chain(path);
     // `std::fs::write` opened the existing file for writing, so a config the
     // user cannot write (a read-only `chmod 444`) was refused. The rename
@@ -684,41 +681,19 @@ fn write_config_atomically_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let dir = match target.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let name = target
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "config.toml".to_string());
+    let target_perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
 
-    let mut attempt = 0;
-    let (mut file, tmp) = loop {
-        let tmp = dir.join(format!(
-            ".{name}.{}.{}.tmp",
-            std::process::id(),
-            SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)
-        {
-            Ok(file) => break (file, tmp),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
-                attempt += 1;
-            }
-            Err(e) if falls_back_to_in_place_write(AtomicSaveStep::CreateTemp, &e) => {
-                return std::fs::write(&target, bytes);
-            }
-            Err(e) => return Err(e),
+    let (mut file, tmp) = match create_temp_beside(&target, target_perms.as_ref()) {
+        Ok(created) => created,
+        Err(e) if falls_back_to_in_place_write(AtomicSaveStep::CreateTemp, &e) => {
+            return std::fs::write(&target, bytes);
         }
+        Err(e) => return Err(e),
     };
 
     let written = (|| {
-        if let Ok(meta) = std::fs::metadata(&target) {
-            file.set_permissions(meta.permissions())?;
+        if let Some(perms) = &target_perms {
+            file.set_permissions(perms.clone())?;
         }
         write_body(&mut file, bytes)
     })();
@@ -736,6 +711,59 @@ fn write_config_atomically_with(
             } else {
                 Err(e)
             }
+        }
+    }
+}
+
+/// Create the temp file [`write_config_atomically_with`] stages the new
+/// `config.toml` in, in `target`'s folder so the rename stays on one
+/// filesystem. Opened with `create_new` (`O_EXCL`); a name that is taken is
+/// skipped for the next one, up to 16 times.
+///
+/// * **The name does not include the target's.** `.dot-agent-deck-config.
+///   <pid>.<seq>.tmp` is at most 58 bytes, so a config whose own name is near
+///   the 255-byte limit still gets a temp file beside it.
+/// * **On unix the file is created with the target's permission bits**
+///   (`target_perms`, further narrowed by the umask), so it is never more open
+///   than the config it replaces, not even before the caller copies the exact
+///   mode across. With no existing target it gets `0666 & !umask`, as
+///   `std::fs::write` gave a new file.
+fn create_temp_beside(
+    target: &Path,
+    target_perms: Option<&std::fs::Permissions>,
+) -> std::io::Result<(std::fs::File, PathBuf)> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    if let Some(perms) = target_perms {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        options.mode(perms.mode() & 0o777);
+    }
+    #[cfg(not(unix))]
+    let _ = target_perms;
+
+    let mut attempt = 0;
+    loop {
+        let tmp = dir.join(format!(
+            ".dot-agent-deck-config.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match options.open(&tmp) {
+            Ok(file) => return Ok((file, tmp)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -2413,6 +2441,108 @@ mod tests {
             "default_command = \"old\"\n"
         );
         assert!(temp_files_in(dir.path()).is_empty());
+    }
+
+    /// Issue #2137: `std::fs::write` saved a config whose file name is close to
+    /// the filesystem's 255-byte limit (`DOT_AGENT_DECK_CONFIG` can name any
+    /// file). The temp file beside it must not be named after it, or its name
+    /// runs past the limit (ENAMETOOLONG) and the save fails.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_with_a_250_byte_file_name_still_saves() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join(format!("{}.toml", "c".repeat(245)));
+        assert_eq!(path.file_name().unwrap().as_bytes().len(), 250);
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+
+        // The old temp name was `.<name>.<pid>.<seq>.tmp`; this only goes red
+        // where that cannot fit, so say so where the limit is longer.
+        let c_dir = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        let name_max = unsafe { libc::pathconf(c_dir.as_ptr(), libc::_PC_NAME_MAX) };
+        if name_max < 0 || name_max as usize >= 250 + ".x.1.0.tmp".len() {
+            eprintln!(
+                "SKIP: {} allows {name_max}-byte names, so a temp name built from \
+                 a 250-byte config name would fit and this test proves nothing here",
+                dir.path().display()
+            );
+            return;
+        }
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        config.save_to(&path).unwrap();
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_command = \"new\"")
+        );
+        assert!(temp_files_in(dir.path()).is_empty());
+    }
+
+    /// Issue #2137: the temp file that stages a `0600` config's new contents
+    /// must never be readable by anyone else, not even in the moment between
+    /// its creation and the `set_permissions` that copies the target's mode:
+    /// in a folder others can search, another user could open it in that
+    /// moment and keep the descriptor while the secret is written. So the
+    /// file must come out of `open` with no group or other bits.
+    #[cfg(unix)]
+    #[test]
+    fn the_temp_file_for_a_0600_config_is_created_owner_only() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let perms = std::fs::metadata(&path).unwrap().permissions();
+
+        let (file, tmp) = create_temp_beside(&path, Some(&perms)).unwrap();
+        let mode = file.metadata().unwrap().permissions().mode();
+        drop(file);
+        std::fs::remove_file(&tmp).unwrap();
+
+        assert_eq!(
+            mode & 0o077,
+            0,
+            "temp file created with mode {:o}, readable beyond its 0600 target",
+            mode & 0o777
+        );
+    }
+
+    /// Issue #2137: a new config gets what `std::fs::write` gave one, and an
+    /// existing one keeps its own mode — the creation mode only narrows the
+    /// window, the save still ends on the target's exact bits.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_ends_on_the_target_mode_and_a_new_config_gets_the_default() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let config = DashboardConfig::default();
+
+        let existing = dir.path().join("existing.toml");
+        std::fs::write(&existing, "").unwrap();
+        std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).unwrap();
+        config.save_to(&existing).unwrap();
+        assert_eq!(
+            std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let reference = dir.path().join("reference.toml");
+        std::fs::write(&reference, "").unwrap();
+        let fresh = dir.path().join("fresh.toml");
+        config.save_to(&fresh).unwrap();
+        assert_eq!(
+            std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777,
+            "a new config must get the mode std::fs::write gives a new file"
+        );
     }
 
     /// Issue #2137: which errors send the save to the old in-place write.
