@@ -405,14 +405,17 @@ impl DashboardConfig {
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = config_path();
+        self.save_to(&config_path())
+    }
+
+    fn save_to(&self, path: &Path) -> Result<(), String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create config directory: {e}"))?;
         }
         let contents =
             toml::to_string_pretty(self).map_err(|e| format!("Failed to serialize config: {e}"))?;
-        std::fs::write(&path, contents)
+        write_config_atomically(path, contents.as_bytes())
             .map_err(|e| format!("Failed to write config at {}: {e}", path.display()))
     }
 
@@ -592,6 +595,109 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
         ));
     }
     crate::bounded_read::read_capped(file, MAX_DASHBOARD_CONFIG_BYTES, "config file").map(Some)
+}
+
+/// Issue #2137 N1: publish `config.toml` through a temp file and a rename, so
+/// a reader — the daemon checking the doorbell switch as it spawns an agent —
+/// sees the old file or the new one and never the empty or partial file the
+/// truncate-then-write of `std::fs::write` exposed.
+///
+/// Kept to what `std::fs::write` did in every other respect:
+///
+/// * **A symlinked `config.toml` stays a symlink.** `std::fs::write` wrote
+///   through the link into its target, so this follows the link chain itself
+///   and renames over the final target, leaving the links in place. A dangling
+///   link resolves to its missing target, which is created, as before.
+/// * **The file keeps its mode.** The temp file is given the existing target's
+///   permissions before any byte is written; a new file gets `0666 & !umask`,
+///   which is what `std::fs::write` created.
+/// * **A config the user cannot write is still refused**, with the same error.
+///
+/// The temp file is opened with `create_new` (`O_EXCL`), so a pre-planted entry
+/// at its name — a symlink included — is never followed or truncated, only
+/// skipped for the next name.
+fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+
+    let target = resolve_symlink_chain(path);
+    // `std::fs::write` opened the existing file for writing, so a config the
+    // user cannot write (a read-only `chmod 444`) was refused. The rename
+    // needs only the directory's permission, so ask the file first; the probe
+    // neither creates nor truncates.
+    match std::fs::OpenOptions::new().write(true).open(&target) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    let dir = match target.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    };
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "config.toml".to_string());
+
+    let mut attempt = 0;
+    let (mut file, tmp) = loop {
+        let tmp = dir.join(format!(
+            ".{name}.{}.{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(file) => break (file, tmp),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
+                attempt += 1;
+            }
+            Err(e) => return Err(e),
+        }
+    };
+
+    let written = (|| {
+        if let Ok(meta) = std::fs::metadata(&target) {
+            file.set_permissions(meta.permissions())?;
+        }
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    drop(file);
+    let published = written.and_then(|()| std::fs::rename(&tmp, &target));
+    if published.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    published
+}
+
+/// Follow `path` through any symlinks to the entry a write through it would
+/// land on, which need not exist. Stops at the first entry that is not a
+/// symlink or cannot be inspected, and after 40 links (the kernel's own limit),
+/// leaving the open or rename to report what is wrong there.
+fn resolve_symlink_chain(path: &Path) -> PathBuf {
+    let mut current = path.to_path_buf();
+    for _ in 0..40 {
+        let is_link = std::fs::symlink_metadata(&current)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if !is_link {
+            break;
+        }
+        let Ok(link) = std::fs::read_link(&current) else {
+            break;
+        };
+        current = match current.parent() {
+            Some(parent) => parent.join(link),
+            None => link,
+        };
+    }
+    current
 }
 
 fn config_path() -> PathBuf {
@@ -2031,6 +2137,142 @@ pub fn load_features_file(
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// Issue #2137 N1: a reader that opens `config.toml` while `config set`
+    /// saves it — the daemon spawning an agent does exactly that — must see the
+    /// old file or the new one, never an empty file or a prefix of one. A
+    /// prefix can be valid TOML that ends before `[doorbell]`, which reads as
+    /// the doorbell left on.
+    #[test]
+    fn a_config_save_never_shows_a_reader_an_empty_or_partial_file() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = DashboardConfig::default();
+        config.doorbell.claude = false;
+        config.save_to(&path).unwrap();
+        let full = std::fs::read_to_string(&path).unwrap();
+        assert!(full.contains("[doorbell]"), "{full}");
+
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (path, done, full) = (path.clone(), Arc::clone(&done), full.clone());
+            std::thread::spawn(move || {
+                let mut torn = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    match std::fs::read_to_string(&path) {
+                        Ok(seen) if seen != full => torn.push(seen.len()),
+                        Ok(_) => {}
+                        // The rename swaps the entry in one step, so the file
+                        // is never missing either.
+                        Err(_) => torn.push(usize::MAX),
+                    }
+                }
+                torn
+            })
+        };
+        for _ in 0..3000 {
+            config.save_to(&path).unwrap();
+        }
+        done.store(true, Ordering::Relaxed);
+        let torn = reader.join().unwrap();
+        assert!(
+            torn.is_empty(),
+            "a reader saw {} torn reads of {} bytes (lengths seen: {:?})",
+            torn.len(),
+            full.len(),
+            &torn[..torn.len().min(10)]
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), full);
+    }
+
+    /// Issue #2137 N1: the atomic save keeps what `std::fs::write` did for a
+    /// `config.toml` that is a (relative, chained) symlink — the links stay
+    /// links and the final target gets the new content — keeps the target's
+    /// mode, and leaves no temp file behind.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_writes_through_symlinks_keeps_the_mode_and_leaves_no_temp() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let real_dir = dir.path().join("dotfiles");
+        let link_dir = dir.path().join("config");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        std::fs::create_dir_all(&link_dir).unwrap();
+        let real = real_dir.join("deck.toml");
+        std::fs::write(&real, "default_command = \"old\"\n").unwrap();
+        std::fs::set_permissions(&real, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let hop = link_dir.join("hop.toml");
+        std::os::unix::fs::symlink("../dotfiles/deck.toml", &hop).unwrap();
+        let path = link_dir.join("config.toml");
+        std::os::unix::fs::symlink("hop.toml", &path).unwrap();
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        config.save_to(&path).unwrap();
+
+        for link in [&path, &hop] {
+            assert!(
+                std::fs::symlink_metadata(link)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                "{} must stay a symlink",
+                link.display()
+            );
+        }
+        assert!(
+            std::fs::read_to_string(&real)
+                .unwrap()
+                .contains("default_command = \"new\"")
+        );
+        assert_eq!(
+            std::fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        for d in [&real_dir, &link_dir] {
+            let strays: Vec<_> = std::fs::read_dir(d)
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(strays.is_empty(), "temp file left behind: {strays:?}");
+        }
+    }
+
+    /// Issue #2137 N1: `std::fs::write` refused a `config.toml` the user made
+    /// read-only, and the rename — which needs only the directory's
+    /// permission — must not start overwriting it.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_still_refuses_a_read_only_config() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            eprintln!("SKIP: this process can write a 0444 file (running as root)");
+            return;
+        }
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        let err = config.save_to(&path).unwrap_err();
+        assert!(err.starts_with("Failed to write config at "), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default_command = \"old\"\n"
+        );
+    }
 
     /// PRD #1258 (PR #1672 review): the reporting read hands back every warning
     /// the plain bounded read would log — so the host sampler, which reads on
