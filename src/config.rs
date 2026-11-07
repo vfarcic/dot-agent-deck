@@ -724,9 +724,9 @@ fn write_config_atomically_with(
 ///   <pid>.<seq>.tmp` is at most 58 bytes, so a config whose own name is near
 ///   the 255-byte limit still gets a temp file beside it.
 /// * **On unix the file is created with the target's permission bits**
-///   (`target_perms`, further narrowed by the umask), so it is never more open
-///   than the config it replaces, not even before the caller copies the exact
-///   mode across. With no existing target it gets `0666 & !umask`, as
+///   (`target_perms`, further narrowed by the umask), so its permission bits
+///   are never wider than the config's, not even before the caller copies the
+///   exact mode across. With no existing target it gets `0666 & !umask`, as
 ///   `std::fs::write` gave a new file.
 fn create_temp_beside(
     target: &Path,
@@ -2460,6 +2460,8 @@ mod tests {
         // The old temp name was `.<name>.<pid>.<seq>.tmp`; this only goes red
         // where that cannot fit, so say so where the limit is longer.
         let c_dir = std::ffi::CString::new(dir.path().as_os_str().as_bytes()).unwrap();
+        // SAFETY: `c_dir` is a valid NUL-terminated string that outlives the
+        // call, and `pathconf` only reads through it.
         let name_max = unsafe { libc::pathconf(c_dir.as_ptr(), libc::_PC_NAME_MAX) };
         if name_max < 0 || name_max as usize >= 250 + ".x.1.0.tmp".len() {
             eprintln!(
@@ -2496,6 +2498,22 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let dir = crate::test_temp::tempdir().unwrap();
+
+        // Under a umask that already strips group and other bits (077), any
+        // new file comes out owner-only and this test would pass without the
+        // creation mode, so say so instead of passing silently.
+        let reference = dir.path().join("reference.toml");
+        std::fs::write(&reference, "").unwrap();
+        let reference_mode = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+        if reference_mode & 0o077 == 0 {
+            eprintln!(
+                "SKIP: the umask already creates files as {reference_mode:o}, so a temp \
+                 file would be owner-only without its creation mode and this test \
+                 proves nothing here"
+            );
+            return;
+        }
+
         let path = dir.path().join("config.toml");
         std::fs::write(&path, "default_command = \"old\"\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2525,6 +2543,10 @@ mod tests {
         let dir = crate::test_temp::tempdir().unwrap();
         let config = DashboardConfig::default();
 
+        let reference = dir.path().join("reference.toml");
+        std::fs::write(&reference, "").unwrap();
+        let reference_mode = std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777;
+
         let existing = dir.path().join("existing.toml");
         std::fs::write(&existing, "").unwrap();
         std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -2534,8 +2556,25 @@ mod tests {
             0o600
         );
 
-        let reference = dir.path().join("reference.toml");
-        std::fs::write(&reference, "").unwrap();
+        // A mode the umask strips: the temp file is created narrower than
+        // the target, so only the copy of the exact mode puts it back.
+        if reference_mode == 0o666 {
+            eprintln!(
+                "SKIP: the umask strips nothing from 0666, so a 0666 config would \
+                 keep its mode without the mode copy and that case proves nothing here"
+            );
+        } else {
+            let open = dir.path().join("open.toml");
+            std::fs::write(&open, "").unwrap();
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o666)).unwrap();
+            config.save_to(&open).unwrap();
+            assert_eq!(
+                std::fs::metadata(&open).unwrap().permissions().mode() & 0o777,
+                0o666,
+                "a 0666 config must keep 0666 even though the umask narrows the temp file"
+            );
+        }
+
         let fresh = dir.path().join("fresh.toml");
         config.save_to(&fresh).unwrap();
         assert_eq!(
