@@ -77,9 +77,33 @@ For a watch loop, `bacon test-fast` (or `bacon test-e2e` / `bacon test-e2e-live`
 3. Add a `/// Scenario:` doc comment of 1–3 sentences to the test function describing what it does in plain English (Decision 30). Run `cargo xtask docs --tests` whenever you want to refresh the local rendered `.md` under `.dot-agent-deck/recordings/<test>/test.md` — it's a browsing aid (gitignored, regenerated like `cargo doc`), not a commit gate.
 4. Run `cargo xtask linkage-check` locally — it verifies the annotation matches the catalog, the function name carries the required prefix, no raw `sleep` / fixed-count polling crept into `e2e_*.rs`, AND the Scenario doc comment exists + the docs generator succeeds against the current source + catalog (linkage-check rule 7). Before any of those it runs a repository-state preflight, which checks the repository rather than the catalog: it fails on a shallow object store when the clone has more than one worktree or the current checkout is itself a linked worktree, or on a registered worktree whose directory no longer exists, and when it fails `linkage-check` exits without running anything else. So `linkage-check` can fail with no catalog problem at all, and while the preflight fails it reports none of the checks above: fixing a Scenario comment will not change the output until the repository is. Each preflight failure names its remedy; [the linkage-check rule registry](docs/develop/linkage-check-rules.md#what-is-not-a-rule) explains why it is a preflight rather than a rule. If the new ID was previously on `xtask/linkage-check/m2.allowlist`, delete that line.
 
+## Working with forks
+
+dot-agent-deck has forks, and some of what is upstream today came from one: a fork maintainer wrote #427 (worktree reclaim) and #539 (unique orchestration names) and filed #425 (the worktree ownership marker). Whether a fork exists and what lives in it is its maintainer's call. These are the rules upstream holds itself to so that the two stay cheap to work across; they came out of issue #725.
+
+1. **Check before implementing.** When an issue is filed by a fork maintainer, ask whether the fork already has an implementation before writing one. #425 specified the ownership marker, and the fork already had it working; #683 re-implemented it from the spec without asking, and shipped without the fork's follow-up fix for a partially written marker, which became #946.
+2. **Credit fork work when upstream takes it.** When an upstream change ports, builds on or re-derives work from a fork, credit its author with a `Co-Authored-By:` trailer on the commit and a mention in the changelog fragment. #683 referenced the fork nowhere.
+3. **Treat forced divergence as an upstream bug.** A patch a fork carries only because upstream offered no seam for the change is upstream's to fix, whether or not the fork asks. The worked example is the repository identity: `vfarcic/dot-agent-deck` was hardcoded at seven sites across three files, so a fork had to patch all seven, until #945 derived them from one value in `src/repo_identity.rs`.
+
+For the divergence that remains, sort it into three buckets:
+
+| Bucket | What it is | Whose call |
+| --- | --- | --- |
+| **Forced** | the fork patches upstream because upstream offered no seam | upstream's bug: we fix it (rule 3 above) |
+| **Unaware** | a seam already exists and was not used — for example, a presentation-level change can land upstream behind the experimental flag (`src/features.rs`, CLAUDE.md rule 9), off by default | worth surfacing; usually cheap to move upstream |
+| **Chosen** | the fork wants something upstream does not | entirely the fork's |
+
+"Chosen" is a legitimate permanent answer. The point of the split is to empty the first two buckets so that whatever remains is divergence on purpose, not to argue anything out of the third.
+
+Two light asks of a fork, open to a different mechanism if one works better:
+
+- For upstream-track work, treat the upstream PR as part of finishing it rather than as a follow-up. An intent to offer decays; an open PR does not.
+- Where practical, put fork-only code in new files that extend upstream's rather than growing upstream's files, so that a sync mostly applies instead of conflicting everywhere.
+
 ## Developer docs
 
 - [Agent messaging](docs/develop/agent-messaging.md) — per-agent inbox states and limits, native wake and acknowledgement signals, doorbell guards, framing and developer environment tunings.
+- [Doorbell admission](docs/develop/doorbell-admission.md) — what the deck reads before it types the doorbell line, and the work budgets of the parsers that read it.
 
 Maintainer-facing references that are intentionally **not** published live under [`docs/develop/`](docs/develop/). They render as plain Markdown here on GitHub.
 

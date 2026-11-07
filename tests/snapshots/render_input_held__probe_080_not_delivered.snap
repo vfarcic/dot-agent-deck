@@ -1,0 +1,12 @@
+---
+source: tests/render_input_held.rs
+expression: "render(&shown, 160)"
+---
+┌ 1 ClaudeCode · api-svc ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── ● Idle ┐
+│Dir:  api-svc                                                                                                                                                 │
+│not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.                                                       │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+│                                                                                                                                                              │
+└────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────── Last: 1h  Tools: 3 ┘

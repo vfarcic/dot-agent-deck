@@ -2541,21 +2541,97 @@ impl StartupInstall {
     }
 
     /// [`Self::trust`] on a thread of its own (issue #1665). Where no thread
-    /// can be started, it runs here instead, as it did before.
+    /// can be started, it runs here instead, as it did before. Either way it
+    /// holds [`STARTUP_TRUST`] while it runs, which an installed Codex
+    /// generation's spawn waits on before it reads its key-binding baseline
+    /// ([`await_startup_trust`]).
     fn trust_in_background(self) {
         let fallback = self.clone();
+        let running = STARTUP_TRUST.begin();
         let spawned = std::thread::Builder::new()
             .name("codex-startup-trust".to_string())
             .spawn(move || {
+                let _running = running;
                 let _ = self.trust();
             });
         if let Err(e) = spawned {
             tracing::warn!(
                 "codex startup install: no thread for the trust write ({e}); running it now"
             );
+            let _running = STARTUP_TRUST.begin();
             let _ = fallback.trust();
         }
     }
+}
+
+/// PRD #1666 part 3 (Q35-22, loc10's window): the startup trust writes this
+/// process has in flight. The daemon's startup install writes trust into its
+/// `$CODEX_HOME/config.toml` from a thread of its own while panes may
+/// already be spawning, and for a Codex pane that file is a key-binding
+/// source (its home's `config.toml`, or a project layer when the pane starts
+/// in `$HOME`): a write after the spawn read its baseline would refuse every
+/// check of that generation `Keymap(Changed)`. So an installed generation
+/// that reads Codex's sources waits for these writes first, bounded
+/// ([`await_startup_trust`]).
+pub(crate) static STARTUP_TRUST: StartupTrust = StartupTrust::new();
+
+/// How long a spawn waits for [`STARTUP_TRUST`]: the trust write's own bound
+/// ([`HOOKS_LIST_TIMEOUT`]) and a second for its file write. Past it the
+/// spawn goes on, and a write that lands later still refuses the check: it
+/// fails closed.
+pub const STARTUP_TRUST_WAIT: Duration = Duration::from_secs(6);
+
+/// A count of trust writes in flight, and a condition to wait on for none.
+pub(crate) struct StartupTrust {
+    running: std::sync::Mutex<u32>,
+    done: std::sync::Condvar,
+}
+
+/// One trust write in flight: the count goes down when it is dropped, a
+/// panic included.
+pub(crate) struct Running(&'static StartupTrust);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut running = self.0.running.lock().unwrap_or_else(|e| e.into_inner());
+        *running = running.saturating_sub(1);
+        if *running == 0 {
+            self.0.done.notify_all();
+        }
+    }
+}
+
+impl StartupTrust {
+    const fn new() -> Self {
+        Self {
+            running: std::sync::Mutex::new(0),
+            done: std::sync::Condvar::new(),
+        }
+    }
+
+    /// A trust write starts.
+    pub(crate) fn begin(&'static self) -> Running {
+        *self.running.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+        Running(self)
+    }
+
+    /// Wait until no trust write is in flight, at most `bound`: whether
+    /// none is.
+    pub(crate) fn wait(&self, bound: Duration) -> bool {
+        let running = self.running.lock().unwrap_or_else(|e| e.into_inner());
+        let (running, _) = self
+            .done
+            .wait_timeout_while(running, bound, |running| *running > 0)
+            .unwrap_or_else(|e| e.into_inner());
+        *running == 0
+    }
+}
+
+/// Wait, at most [`STARTUP_TRUST_WAIT`], for this process's startup trust
+/// writes ([`STARTUP_TRUST`]): whether none is in flight now. Blocking:
+/// call it off the executor.
+pub fn await_startup_trust() -> bool {
+    STARTUP_TRUST.wait(STARTUP_TRUST_WAIT)
 }
 
 /// PRD #1666 part 3 (H4, round 2's U3): why a startup trust write leaves the
@@ -2683,6 +2759,47 @@ fn report_startup_trust(result: &std::io::Result<TrustOutcome>, cwd: &Path) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Scenario: The daemon's startup trust write is still running when an installed Codex generation spawns. The spawn's wait for it returns once the write is done, not before; with no write in flight it returns at once; a write that outlasts the bound leaves the wait after the bound, reporting it still runs (PRD #1666 part 3, loc10's window).
+    #[spec("inbox/probe/014")]
+    #[test]
+    fn probe_014_a_spawn_waits_for_the_startup_trust_write() {
+        static TRUST: StartupTrust = StartupTrust::new();
+        assert!(
+            TRUST.wait(Duration::from_secs(5)),
+            "nothing in flight: at once"
+        );
+        let running = TRUST.begin();
+        let started = Instant::now();
+        assert!(
+            !TRUST.wait(Duration::from_millis(50)),
+            "still running past the bound"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(50));
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            drop(running);
+        });
+        let waited = Instant::now();
+        assert!(
+            TRUST.wait(Duration::from_secs(10)),
+            "done once the write is"
+        );
+        assert!(
+            waited.elapsed() >= Duration::from_millis(50),
+            "not before it"
+        );
+        writer.join().unwrap();
+        let nested = (TRUST.begin(), TRUST.begin());
+        drop(nested.0);
+        assert!(
+            !TRUST.wait(Duration::from_millis(10)),
+            "one of two still running"
+        );
+        drop(nested.1);
+        assert!(TRUST.wait(Duration::from_millis(10)));
+    }
+
     use super::*;
 
     /// Scenario (PRD #1666 part 3, round 2's U3): a startup trust write that

@@ -244,6 +244,8 @@ mod tests {
 
     fn record(id: &str, pane: &str, live: Option<SessionSnapshot>) -> AgentRecord {
         AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: id.to_string(),
             pane_id_env: Some(pane.to_string()),
             display_name: None,
@@ -283,6 +285,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         }
     }
 
@@ -482,6 +486,8 @@ mod tests {
             wake,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             notices: Default::default(),
         };
         assert_eq!(inbox_cell(Some(&summary(2, 1, WakePath::Native))), "2q 1f");

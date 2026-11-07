@@ -1887,6 +1887,18 @@ struct UiState {
     pane_names: HashMap<String, String>,
     /// Maps pane_id → display name; survives session restarts (e.g. /clear).
     pane_display_names: HashMap<String, String>,
+    /// PRD #1666 part 3, round 5-wake (Q6): this frame's deck-wide attention
+    /// item ([`deck_attention`]), drawn in the tab strip's row, or in the
+    /// deck's title row when no strip is shown. Recomputed every frame from
+    /// the daemon's inbox accounts, so it survives tab switches and a
+    /// reattach and is cleared by nothing the user does in the TUI.
+    deck_attention: Option<String>,
+    /// [`Self::deck_attention`]'s short form ([`deck_attention_short`]),
+    /// shown instead of it on a row too narrow for it.
+    deck_attention_short: Option<String>,
+    /// Whether this frame draws [`Self::deck_attention`] in the tab strip,
+    /// set by `render_frame` before the card grid reads it.
+    deck_attention_in_tab_bar: bool,
     /// PRD #1666 part 2 (G-fix6): what the dashboard's names for a pane were
     /// before its last rename — the card's session id and its
     /// `display_names` / `pane_display_names` entries — so a rename the deck
@@ -2464,6 +2476,9 @@ impl UiState {
             submitted_orchestration_form: None,
             pane_names: HashMap::new(),
             pane_display_names: HashMap::new(),
+            deck_attention: None,
+            deck_attention_short: None,
+            deck_attention_in_tab_bar: false,
             renamed_from: HashMap::new(),
             pane_declared_agent: HashMap::new(),
             pane_metadata: HashMap::new(),
@@ -5727,8 +5742,19 @@ fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Ve
 /// Issue #424 S1: does this user-input byte SUBMIT the agent's input box, given
 /// the byte that immediately preceded it in the same stream?
 ///
+/// **Test builds only** since PRD #1666 part 3 (Q35-21): no daemon code
+/// reads the answer any more (it fed the draft tracker the switch deleted),
+/// and the issue #544 tests keep it pinned against the encoder so the
+/// contract below stays written down. The doorbell's suspension recovery
+/// counts the user's submits over Q35-01's tokenizer instead
+/// (`composer_probe::recovery`). That tokenizer reads `ESC` `CR` as no submit
+/// too, as this does; the two differ on a `CR` inside an escape sequence,
+/// which this counts (`ESC [ CR`) and the tokenizer reads as inside the
+/// sequence. Pi submits on `ESC` `CR` (the table below), which recovery does
+/// not count, so a Pi user's `Alt+Enter` does not lift a suspension.
+///
 /// This lives beside [`keyevent_to_bytes`] because it is that function read
-/// backwards. The daemon's submit drain
+/// backwards. The daemon's input stream
 /// (`PaneInputState::note_user_bytes`) never sees a `KeyEvent` — it sees only
 /// the bytes this encoder produced — so it has to recover which keypress made
 /// them. It used to answer "any CR or LF", which contradicts the encoder
@@ -5745,17 +5771,14 @@ fn keyevent_to_pane_bytes(key: &KeyEvent, application_cursor: bool) -> Option<Ve
 /// | `CR` | plain `Enter` (`:5169`) — and `Ctrl+M`, the same byte by the caret rule | submit | submit |
 ///
 /// Exactly one row submits on every supported agent, and it is the only one
-/// this returns `true` for. `ESC` `CR` is the row that matters: it is a genuine
-/// AMBIGUITY rather than an oversight, and it resolves the way every unknown
-/// here has to. A *missed* drain fails CLOSED — a later same-payload delivery is
-/// refused, which is reported and bounded by the record TTL. A *false* drain
-/// fails OPEN — the replacement stops recognizing itself as a repeat and
-/// submits the user's half-typed draft sandwiched between two copies of the
-/// payload. `ESC[13;{m}u` needs no arm at all: it carries neither byte.
+/// this returns `true` for. `ESC` `CR` is a genuine AMBIGUITY rather than an
+/// oversight, and it resolves toward reading no submit, the direction that
+/// never takes a box holding a draft for an empty one. `ESC[13;{m}u` needs
+/// no arm at all: it carries neither byte.
 ///
 /// `keyevent_submit_classification_matches_prd_227_matrix` (in `agent_pty`)
-/// pins every row against the real encoder and the real stream scanner, so a
-/// change to the forwarding contract cannot silently desynchronize the drain.
+/// pins every row against the real encoder and the test-only stream scanner.
+#[cfg(test)]
 pub(crate) fn user_byte_submits_input_box(preceding: Option<u8>, byte: u8) -> bool {
     /// The ESC the ALT prefix adds at `:5207`.
     const ESC: u8 = 0x1b;
@@ -7358,26 +7381,18 @@ fn drawn_clusters<'a>(span: &'a Span<'a>) -> impl Iterator<Item = (&'a str, usiz
 /// non-live card. Input can't reach a history-only / view-only session, so the
 /// dashboard surfaces this and stays on the dashboard rather than entering
 /// PaneInput and silently dropping keystrokes. `None` for a live session, where
-/// entry proceeds normally.
+/// entry proceeds normally. The words are the ones the desktop's tile shows
+/// for the same card ([`crate::inbox_display::input_unavailable`], merge
+/// review U3-2).
 fn non_live_input_feedback(writable: crate::event::Writable) -> Option<&'static str> {
-    match writable {
-        crate::event::Writable::Live => None,
-        crate::event::Writable::HistoryOnly => {
-            Some("History-only session cannot accept live input")
-        }
-        crate::event::Writable::None => Some("View-only session cannot accept live input"),
-    }
+    crate::inbox_display::input_unavailable(writable)
 }
 
 /// PRD #20 R20-007 (finding #10): human-readable feedback for a typed daemon
-/// stream-rejection `reason` (a `KIND_STREAM_REJECT` frame's payload).
+/// stream-rejection `reason` (a `KIND_STREAM_REJECT` frame's payload), in the
+/// words the desktop shows too (PRD #1666 part 3 Q15-2, CLAUDE.md rule 22).
 fn stream_reject_message(reason: &str) -> String {
-    match reason {
-        "history-only" => "Input not delivered: session is history-only".to_string(),
-        "exited" => "Input not delivered: the agent has exited".to_string(),
-        "stale" | "wrong-session" => "Input not delivered: the pane's session changed".to_string(),
-        other => format!("Input not delivered ({other})"),
-    }
+    crate::inbox_display::input_rejected(reason)
 }
 
 /// PRD #20 R20-007 (finding #10): consume a daemon stream-rejection for
@@ -7399,7 +7414,12 @@ fn apply_stream_rejection_feedback(
         return false;
     }
     ui.status_message = Some((stream_reject_message(reason), now));
-    ui.mode = UiMode::Normal;
+    // PRD #1666 part 3 (R-HOLD's bounded refusal): a refused Ctrl+G leaves
+    // the agent live, and what the person types next goes to it, so the
+    // pane keeps its input, as the desktop's tile keeps it.
+    if !crate::inbox_display::input_rejection_keeps_typing(reason) {
+        ui.mode = UiMode::Normal;
+    }
     true
 }
 
@@ -13857,6 +13877,9 @@ pub fn run_tui(
                 _ => None,
             })
             .collect();
+        // PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item.
+        ui.deck_attention = deck_attention(&snapshot, tab_manager.tabs());
+        ui.deck_attention_short = deck_attention_short(&snapshot);
         let tab_bar_info = TabBarInfo {
             show: tab_manager.show_tab_bar(),
             labels: tab_bar_labels,
@@ -15905,7 +15928,13 @@ pub(crate) fn build_pane_status_for_gate(state: &AppState) -> HashMap<&str, Sess
 ///
 /// Split out of [`render_frame`] because two call sites build it (the card grid
 /// and the everything-filtered-out branch) and only one of them can overflow.
-fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> Line<'static> {
+fn deck_title_line(
+    showing: usize,
+    total_sessions: usize,
+    scroll_hint: &str,
+    attention: Option<(&str, &str)>,
+    width: u16,
+) -> Line<'static> {
     let title_text = if showing < total_sessions {
         format!("— {showing}/{total_sessions} agent(s)")
     } else {
@@ -15932,7 +15961,475 @@ fn deck_title_line(showing: usize, total_sessions: usize, scroll_hint: &str) -> 
                 .add_modifier(Modifier::BOLD),
         ));
     }
+    // PRD #1666 part 3, round 5-wake (Q6): with no tab strip to carry it.
+    // After the title when the row has room for its words, or its short form;
+    // otherwise its short form leads the row, so the title is what is clipped.
+    if let Some((attention, short)) = attention {
+        let room = width
+            .saturating_sub(u16::try_from(Line::from(spans.clone()).width()).unwrap_or(u16::MAX));
+        let short_width = u16::try_from(Span::raw(short).width()).unwrap_or(u16::MAX);
+        if attention_words_fit(attention, room) {
+            spans.push(Span::styled(
+                format!("  {attention}"),
+                deck_attention_style(),
+            ));
+        } else if room >= short_width.saturating_add(2) {
+            spans.push(Span::styled(format!("  {short}"), deck_attention_style()));
+        } else {
+            spans.insert(0, Span::styled(format!("{short} "), deck_attention_style()));
+        }
+    }
     Line::from(spans)
+}
+
+/// PRD #1666 part 3, round 5-wake (Q6): the deck-wide attention item
+/// ([`crate::inbox_display::deck_attention_text`]): the first orchestration
+/// tab's start role whose agent the deck holds the doorbell for is named with
+/// its hold's words, and every other held recipient is counted. Start-role
+/// membership decides who is named, not the role's name.
+fn deck_attention(state: &AppState, tabs: &[Tab]) -> Option<String> {
+    let held = state.held_inbox_panes();
+    let named = tabs.iter().find_map(|tab| match tab {
+        Tab::Orchestration {
+            role_pane_ids,
+            start_role_index,
+            config,
+            ..
+        } => {
+            let words = held.get(role_pane_ids.get(*start_role_index)?.as_str())?;
+            let role = config.roles.get(*start_role_index)?;
+            Some((role.name.as_str(), words.as_str()))
+        }
+        Tab::Dashboard { .. } => None,
+    });
+    let others = held.len() - usize::from(named.is_some());
+    crate::inbox_display::deck_attention_text(named, others)
+}
+
+/// The attention item the deck's title row carries, words and short form:
+/// only when this frame's tab strip does not.
+fn title_attention(ui: &UiState) -> Option<(&str, &str)> {
+    let attention = ui
+        .deck_attention
+        .as_deref()
+        .filter(|_| !ui.deck_attention_in_tab_bar)?;
+    Some((
+        attention,
+        ui.deck_attention_short.as_deref().unwrap_or(attention),
+    ))
+}
+
+/// [`deck_attention`]'s short form for a narrow row: the glyph and how many
+/// recipients the deck holds the doorbell for, naming none (`✉ 2 held`).
+fn deck_attention_short(state: &AppState) -> Option<String> {
+    crate::inbox_display::deck_attention_count(state.held_inbox_panes().len())
+}
+
+/// The columns, after its two-column gap, below which [`deck_attention`]'s
+/// words give way to [`deck_attention_short`]'s: enough for the glyph, a role
+/// name and the start of its hold's words. Above it the words are clipped at
+/// the row's end; below it a clipped sentence would name less than the count.
+const ATTENTION_WORDS_MIN_COLUMNS: u16 = 16;
+
+/// Whether `attention`'s words, rather than its short form, take `room`
+/// columns after a two-column gap: they fit whole there, or leave
+/// [`ATTENTION_WORDS_MIN_COLUMNS`] of themselves.
+fn attention_words_fit(attention: &str, room: u16) -> bool {
+    let words = u16::try_from(Span::raw(attention).width()).unwrap_or(u16::MAX);
+    room.saturating_sub(2) >= words.min(ATTENTION_WORDS_MIN_COLUMNS)
+}
+
+/// Attention reads as attention, not chrome: the colour the overflow hint
+/// takes for the same reason.
+fn deck_attention_style() -> Style {
+    Style::default()
+        .fg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The columns of a `row_width` tab strip kept free of tabs for `attention`:
+/// the item and its two-column gap, at most half the row, so neither the tabs
+/// nor the item can crowd the other off it; but never less than `short` and
+/// one column before it, however narrow the row, so the item is always there.
+fn deck_attention_reserve(attention: &str, short: &str, row_width: u16) -> u16 {
+    let width = |text: &str| u16::try_from(Span::raw(text).width()).unwrap_or(u16::MAX);
+    let wanted = width(attention).saturating_add(2);
+    let least = width(short).saturating_add(1);
+    wanted.min(row_width / 2).max(least).min(row_width)
+}
+
+/// Draw `attention` on the tab strip's row `area` after `after` (where the
+/// tabs end), clipped at the row's end: its words two columns after the tabs,
+/// or, when the row leaves them too little room, `short` with as much of the
+/// gap as the row has.
+fn draw_deck_attention(
+    buf: &mut ratatui::buffer::Buffer,
+    area: Rect,
+    after: u16,
+    attention: &str,
+    short: &str,
+) {
+    let end = area.x.saturating_add(area.width);
+    let room = end.saturating_sub(after);
+    let (text, gap) = if attention_words_fit(attention, room) {
+        (attention, 2)
+    } else {
+        let width = u16::try_from(Span::raw(short).width()).unwrap_or(u16::MAX);
+        (short, room.saturating_sub(width).min(2))
+    };
+    let x = after.saturating_add(gap);
+    if x < end {
+        buf.set_span(
+            x,
+            area.y,
+            &Span::styled(text.to_string(), deck_attention_style()),
+            end - x,
+        );
+    }
+}
+
+#[cfg(test)]
+mod deck_attention_tests {
+    use super::*;
+    use crate::inbox_display::{
+        WAKE_HOLD_AWAITING_PROMPT, WAKE_HOLD_POSSIBLE_DRAFT, WAKE_STALLED, WakeHold,
+    };
+
+    fn summary(queued: usize, hold: Option<WakeHold>) -> crate::inbox_hub::InboxSummary {
+        crate::inbox_hub::InboxSummary {
+            queued,
+            fetched: 0,
+            claimed: 0,
+            undeliverable: 0,
+            last_acked_at: None,
+            wake: crate::inbox_hub::WakePath::Doorbell,
+            component: None,
+            wake_stalled: true,
+            wake_hold: hold,
+            hold_detail: None,
+            notices: Default::default(),
+        }
+    }
+
+    /// A team whose start role, `captain`, sits in `captain-pane` behind
+    /// `coder-pane`, so neither the role's name nor its position decides.
+    fn tabs() -> Vec<Tab> {
+        let role = |name: &str, start: bool| crate::project_config::OrchestrationRoleConfig {
+            agent: None,
+            name: name.to_string(),
+            command: "cat".to_string(),
+            start,
+            description: None,
+            prompt_template: None,
+            clear: true,
+        };
+        vec![
+            Tab::Dashboard {
+                selected_session_id: None,
+                zoomed: false,
+            },
+            Tab::Orchestration {
+                id: 2,
+                name: "team".to_string(),
+                role_pane_ids: vec!["coder-pane".to_string(), "captain-pane".to_string()],
+                role_statuses: vec![OrchestrationRoleStatus::Working; 2],
+                cwd: "/work".to_string(),
+                focused_role_pane_id: None,
+                start_role_index: 1,
+                orchestrator_prompt: None,
+                config: crate::project_config::OrchestrationConfig {
+                    name: "team".to_string(),
+                    default: false,
+                    roles: vec![role("coder", false), role("captain", true)],
+                },
+                status: OrchestrationStatus::WaitingForOrchestrator,
+                had_waiting_pane: false,
+                all_clear_pending: false,
+                split_narrow: false,
+                zoomed: false,
+                orchestration_id: None,
+                context_path: None,
+            },
+        ]
+    }
+
+    fn wake_update(pane: &str, agent: &str, hold: Option<WakeHold>) -> crate::event::InboxNotice {
+        serde_json::from_value(serde_json::json!({
+            "pane_id": pane, "agent_id": agent, "message_id": "m-1", "subject": "s",
+            "from_label": "the orchestrator", "state": "queued", "wake_update": true,
+            "wake_stalled": true, "wake_hold": hold,
+        }))
+        .unwrap()
+    }
+
+    /// PRD #1666 part 3, round 5-wake (`inbox/status/031`'s fast half): the
+    /// held start role is named with its hold's words, whatever its name and
+    /// wherever it sits in the team; the coder's hold and a dashboard agent's
+    /// are counted; an agent with mail and no hold is not.
+    #[test]
+    fn deck_attention_names_the_held_start_role_and_counts_the_rest() {
+        let mut state = AppState::default();
+        state.apply_inbox_summary(
+            "captain-pane",
+            "a1",
+            &summary(1, Some(WakeHold::PossibleDraft)),
+        );
+        state.apply_inbox_summary("coder-pane", "a2", &summary(2, Some(WakeHold::NotTaken)));
+        state.apply_inbox_summary(
+            "other-pane",
+            "a3",
+            &summary(1, Some(WakeHold::AwaitingPrompt)),
+        );
+        state.apply_inbox_summary("quiet-pane", "a4", &summary(3, None));
+        assert_eq!(
+            deck_attention(&state, &tabs()).as_deref(),
+            Some(format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 2 other held").as_str())
+        );
+        // The start role's reason changes: the item follows it.
+        state.apply_inbox_notice(&wake_update(
+            "captain-pane",
+            "a1",
+            Some(WakeHold::AwaitingPrompt),
+        ));
+        assert_eq!(
+            deck_attention(&state, &tabs()).as_deref(),
+            Some(format!("✉ captain: {WAKE_HOLD_AWAITING_PROMPT} · 2 other held").as_str())
+        );
+        // With no tabs, nobody is a start role: everyone is counted.
+        assert_eq!(deck_attention(&state, &[]).as_deref(), Some("✉ 3 held"));
+    }
+
+    /// The item is bound to the pane's current generation: a successor with
+    /// a clean inbox is not named, and its predecessor's late update does not
+    /// mark it. A hold this build does not know reads as the stall's words.
+    #[test]
+    fn deck_attention_follows_the_generation_and_reads_unknown_holds_as_stalled() {
+        let mut state = AppState::default();
+        state.apply_inbox_summary(
+            "captain-pane",
+            "a1",
+            &summary(1, Some(WakeHold::PossibleDraft)),
+        );
+        state.apply_inbox_summary("coder-pane", "a2", &summary(1, Some(WakeHold::Unknown)));
+        state.apply_inbox_summary("captain-pane", "a9", &summary(0, None));
+        state.apply_inbox_notice(&wake_update(
+            "captain-pane",
+            "a1",
+            Some(WakeHold::PossibleDraft),
+        ));
+        assert_eq!(deck_attention(&state, &tabs()).as_deref(), Some("✉ 1 held"));
+        state.apply_inbox_notice(&wake_update(
+            "captain-pane",
+            "a9",
+            Some(WakeHold::UncertainInput),
+        ));
+        assert_eq!(
+            deck_attention(&state, &tabs()),
+            Some(format!(
+                "✉ captain: {} · 1 other held",
+                crate::inbox_display::WAKE_HOLD_UNCERTAIN_INPUT_ALONE
+            ))
+        );
+        state.apply_inbox_notice(&wake_update("captain-pane", "a9", None));
+        state.apply_inbox_notice(&wake_update("coder-pane", "a2", None));
+        assert_eq!(deck_attention(&state, &tabs()), None);
+        let mut alone = AppState::default();
+        alone.apply_inbox_summary("captain-pane", "a1", &summary(1, Some(WakeHold::Unknown)));
+        assert_eq!(
+            deck_attention(&alone, &tabs()),
+            Some(format!("✉ captain: {WAKE_STALLED}: send it a prompt"))
+        );
+    }
+
+    /// The item follows the tabs on the strip's row and is clipped at its end;
+    /// with no strip it rides the deck's title row.
+    #[test]
+    fn deck_attention_is_drawn_after_the_tabs_or_in_the_title() {
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 30, 1));
+        draw_deck_attention(
+            &mut buf,
+            Rect::new(0, 0, 30, 1),
+            10,
+            "✉ captain: held for a reason",
+            "✉ 1 held",
+        );
+        let row: String = (0..30).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "            ✉ captain: held fo");
+        let title: String = deck_title_line(1, 1, "", Some(("✉ 2 held", "✉ 2 held")), 80)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(title.ends_with("  ✉ 2 held"), "{title}");
+        let plain: String = deck_title_line(1, 1, "", None, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.to_string())
+            .collect();
+        assert!(!plain.contains('✉'), "{plain}");
+    }
+
+    /// Draw one whole Dashboard frame at `width` columns with `labels` as its
+    /// tabs and `attention` held, through `compute_frame_layout` and
+    /// `render_frame`; return the strip's row and every tab's header rect.
+    fn crowded_strip(labels: &[&str], attention: &str, width: u16) -> (String, Vec<(usize, Rect)>) {
+        frame_top_row(labels, attention, "✉ 2 held", width, true, 0)
+    }
+
+    /// [`crowded_strip`] with `short` as the item's short form, with the tab
+    /// strip shown or not (`strip`), and with `sessions` agents on the deck:
+    /// the frame's top row, which without a strip is the deck's title row.
+    fn frame_top_row(
+        labels: &[&str],
+        attention: &str,
+        short: &str,
+        width: u16,
+        strip: bool,
+        sessions: usize,
+    ) -> (String, Vec<(usize, Rect)>) {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let ctrl = EmbeddedPaneController::for_render_seam_without_panes();
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.deck_attention = Some(attention.to_string());
+        ui.deck_attention_short = Some(short.to_string());
+        let mut state = AppState::default();
+        for n in 0..sessions {
+            let mut session = super::tests::make_session(SessionStatus::Idle);
+            session.session_id = format!("s-{n}");
+            state.sessions.insert(session.session_id.clone(), session);
+        }
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+            zoomed: false,
+        };
+        let tab_bar = TabBarInfo {
+            show: strip,
+            labels: labels.iter().map(|label| label.to_string()).collect(),
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let area = Rect::new(0, 0, width, 24);
+        let layout = compute_frame_layout(
+            area,
+            &tab_view,
+            &tab_bar,
+            &[],
+            PaneLayout::Stacked,
+            None,
+            bottom_bar_rows(&ui, width, 24),
+        );
+        let filtered = filter_sessions(&state, &ui);
+        let mut terminal = Terminal::new(TestBackend::new(width, 24)).expect("TestBackend");
+        terminal
+            .draw(|frame| {
+                render_frame(
+                    frame,
+                    &state,
+                    &mut ui,
+                    &filtered,
+                    0,
+                    true,
+                    &ctrl,
+                    &tab_view,
+                    &tab_bar,
+                    &layout,
+                    Utc::now(),
+                );
+            })
+            .expect("draw");
+        let buf = terminal.backend().buffer();
+        let row = (0..width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        (row, ui.tab_header_rects.clone())
+    }
+
+    /// Scenario: an 80-column deck with the Dashboard and three orchestration
+    /// tabs of 20-column names, whose labels alone fill the strip's row, holds
+    /// its orchestrator. The whole frame is drawn: every tab stays on the row
+    /// and the attention item still shows after them, not hidden off its end.
+    #[test]
+    fn deck_attention_keeps_its_room_when_the_tabs_crowd_the_row() {
+        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let labels = [
+            "Dashboard",
+            "release-train-alpha1",
+            "release-train-bravo2",
+            "release-train-delta3",
+        ];
+        let (row, headers) = crowded_strip(&labels, &attention, 80);
+        assert!(row.contains("✉ captain: waiting"), "{row}");
+        assert_eq!(
+            headers.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3],
+            "every tab keeps a header on the row: {row}"
+        );
+        let tabs_end = headers.last().map_or(0, |(_, rect)| rect.x + rect.width);
+        assert!(
+            row.chars()
+                .skip(usize::from(tabs_end))
+                .collect::<String>()
+                .contains('✉'),
+            "the item follows the tabs: {row}"
+        );
+        // A short item takes only its own width, leaving the tabs the rest.
+        let (row, _) = crowded_strip(&labels, "✉ 2 held", 80);
+        assert!(row.contains("✉ 2 held"), "{row}");
+    }
+
+    /// Scenario: a deck holding its orchestrator is drawn at narrow widths, with four tabs and with only the Dashboard tab, whose title row then carries the item, or, with no agents on the deck, its top row. At every width the item is still on the top row: its words where they fit, otherwise its short form, `✉ 2 held`.
+    #[test]
+    fn deck_attention_stays_on_a_narrow_row() {
+        let attention = format!("✉ captain: {WAKE_HOLD_POSSIBLE_DRAFT} · 1 other held");
+        let labels = [
+            "Dashboard",
+            "release-train-alpha1",
+            "release-train-bravo2",
+            "release-train-delta3",
+        ];
+        // A crowded strip so narrow that the gap used to take all the room
+        // kept for the item.
+        for width in [4, 6, 10, 16, 24] {
+            let (row, _) = frame_top_row(&labels, &attention, "✉ 2 held", width, true, 1);
+            assert!(row.contains('✉'), "{width}: {row:?}");
+        }
+        let (row, headers) = frame_top_row(&labels, &attention, "✉ 2 held", 24, true, 1);
+        assert!(!headers.is_empty(), "the strip carries it: {row:?}");
+        assert!(row.contains("✉ 2 held"), "the short form, whole: {row:?}");
+        // However narrow the strip, it keeps room for the whole short form
+        // and a column before it, rather than half the row.
+        assert_eq!(deck_attention_reserve(&attention, "✉ 2 held", 12), 9);
+        assert_eq!(deck_attention_reserve(&attention, "✉ 2 held", 4), 4);
+        assert_eq!(deck_attention_reserve(&attention, "✉ 2 held", 80), 40);
+        let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 12, 1));
+        draw_deck_attention(&mut buf, Rect::new(0, 0, 12, 1), 3, &attention, "✉ 2 held");
+        let row: String = (0..12).map(|x| buf[(x, 0)].symbol().to_string()).collect();
+        assert_eq!(row, "    ✉ 2 held");
+        // No strip: the title's own text used to fill a 30-column row first.
+        let title =
+            |width| frame_top_row(&["Dashboard"], &attention, "✉ 2 held", width, false, 1).0;
+        let row = title(30);
+        assert!(row.starts_with("✉ 2 held "), "{row:?}");
+        assert!(row.contains("dot-agent-deck"), "{row:?}");
+        assert!(title(40).contains("agent(s)  ✉ 2 held"), "{:?}", title(40));
+        // Wide enough, the words, after the title.
+        assert!(
+            title(120).contains("agent(s)  ✉ captain: waiting"),
+            "{:?}",
+            title(120)
+        );
+        // No agents on the deck, so no title row: the item is the top row.
+        let empty =
+            |width| frame_top_row(&["Dashboard"], &attention, "✉ 2 held", width, false, 0).0;
+        assert!(empty(10).starts_with(" ✉ 2 held"), "{:?}", empty(10));
+        assert!(
+            empty(30).starts_with(" ✉ captain: waiting"),
+            "{:?}",
+            empty(30)
+        );
+    }
 }
 
 /// Lay out and draw the deck's card grid into `area` — the title row, every card
@@ -16023,6 +16520,8 @@ fn render_card_grid(
         sessions.len(),
         total_sessions,
         &scroll_indicator(hidden_above, hidden_below),
+        title_attention(ui),
+        area.width,
     ));
 
     let mut constraints: Vec<Constraint> = vec![Constraint::Length(1)]; // title
@@ -16314,17 +16813,49 @@ fn render_frame(
             .iter()
             .map(|statuses| statuses.as_deref())
             .collect();
+        // PRD #1666 part 3, round 5-wake (Q6): the attention item follows
+        // the tabs on their row, clipped at its end. Its room is reserved
+        // before the tabs are fitted, so a crowded strip narrows its labels
+        // instead of pushing the item off the row.
+        let attention = ui.deck_attention.as_deref().map(|attention| {
+            (
+                attention,
+                ui.deck_attention_short.as_deref().unwrap_or(attention),
+            )
+        });
+        let tabs_rect = Rect {
+            width: tab_bar_rect.width
+                - attention.map_or(0, |(attention, short)| {
+                    deck_attention_reserve(attention, short, tab_bar_rect.width)
+                }),
+            ..tab_bar_rect
+        };
         let strip = render_tab_strip(
             frame,
-            tab_bar_rect,
+            tabs_rect,
             &tab_bar.labels,
             &closeable,
             tab_bar.active_index,
             &orchestration_statuses,
         );
+        let after_tabs = strip
+            .headers
+            .last()
+            .map_or(tab_bar_rect.x, |(_, rect)| rect.x + rect.width);
+        if let Some((attention, short)) = attention {
+            draw_deck_attention(
+                frame.buffer_mut(),
+                tab_bar_rect,
+                after_tabs,
+                attention,
+                short,
+            );
+        }
+        ui.deck_attention_in_tab_bar = true;
         ui.tab_header_rects = strip.headers;
         ui.tab_close_rects = strip.closes;
     } else {
+        ui.deck_attention_in_tab_bar = false;
         // No tab strip this frame — drop any stale rects so a click can't hit a
         // tab affordance that isn't on screen.
         ui.tab_header_rects.clear();
@@ -16401,6 +16932,22 @@ fn render_frame(
             .style(text_primary())
             .centered();
             frame.render_widget(msg, vertical[1]);
+            // PRD #1666 part 3, round 5-wake (Q6): a deck with no title row
+            // and no tab strip carries the attention item on its top row.
+            if let Some((attention, short)) = title_attention(ui) {
+                let text = if attention_words_fit(attention, dashboard_area.width) {
+                    attention
+                } else {
+                    short
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(format!(" {text}"), deck_attention_style())),
+                    Rect {
+                        height: 1,
+                        ..dashboard_area
+                    },
+                );
+            }
         }
         let ctx_buttons = dashboard_context_buttons(&ui.keybindings, !filtered.is_empty());
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
@@ -16439,7 +16986,13 @@ fn render_frame(
         if draw_sidebar {
             // All filtered out. Nothing is drawn, so nothing can be hidden — no
             // overflow indicator on this title.
-            let title = Paragraph::new(deck_title_line(showing, total_sessions, ""));
+            let title = Paragraph::new(deck_title_line(
+                showing,
+                total_sessions,
+                "",
+                title_attention(ui),
+                dashboard_area.width,
+            ));
             let vertical = Layout::vertical([
                 Constraint::Length(1),
                 Constraint::Fill(1),
@@ -22231,6 +22784,17 @@ fn render_session_card(
         attention.push((
             notice.to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
+        ));
+    }
+
+    // PRD #1666 part 3 (Q35, core §7): the deck holds what the user typed
+    // into this pane, and says why, whether or not messages wait — the
+    // desktop tile's held-input row. On a card whose agent has reported
+    // nothing yet too (Q35-20e, U3-04): the pane holds the typing either way.
+    if let Some(held) = session.input_held_notice() {
+        attention.push((
+            held.to_string(),
+            Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
         ));
     }
 
@@ -34940,7 +35504,7 @@ mod tests {
     // Bell transition detection tests
     // -----------------------------------------------------------------------
 
-    fn make_session(status: SessionStatus) -> SessionState {
+    pub(super) fn make_session(status: SessionStatus) -> SessionState {
         SessionState {
             session_id: String::new(),
             agent_type: AgentType::ClaudeCode,
@@ -40068,7 +40632,7 @@ mod tests {
 
         // Focused + PaneInput → feedback + leave PaneInput (both key & paste map
         // to the same daemon reason, so one reason covers both).
-        for reason in ["history-only", "exited"] {
+        for reason in ["history-only", "exited", "write-failed"] {
             let mut ui = default_ui();
             ui.mode = UiMode::PaneInput;
             let acted =
@@ -40087,6 +40651,12 @@ mod tests {
                 ui.status_message.as_ref().map(|(m, _)| m)
             );
         }
+        // PRD #1666 part 3 (Q35-15 fix 2): a write the agent's terminal
+        // failed is not reported as the agent having exited.
+        assert_eq!(
+            stream_reject_message("write-failed"),
+            "Input not delivered: the agent's terminal did not take it"
+        );
 
         // Rejection for a DIFFERENT (non-focused) pane must not disturb input.
         let mut ui = default_ui();
@@ -40106,6 +40676,52 @@ mod tests {
         let acted =
             apply_stream_rejection_feedback(&mut ui, Some("focused"), "focused", "exited", now);
         assert!(!acted, "a rejection while not in PaneInput must be ignored");
+    }
+
+    /// Scenario: The focused pane is in PaneInput when the daemon refuses the person's Ctrl+G and what they typed after it (`ctrl-g-refused`, the agent still live). The TUI's status line shows the refusal in the words the desktop shows, and the pane keeps its input, so what the person types next still goes to the agent.
+    #[spec::spec("inbox/probe/087")]
+    #[test]
+    fn probe_087_a_refused_ctrl_g_keeps_the_pane_typing() {
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        let acted = apply_stream_rejection_feedback(
+            &mut ui,
+            Some("focused"),
+            "focused",
+            "ctrl-g-refused",
+            now,
+        );
+        assert!(acted, "a refusal for the focused pane acts");
+        assert_eq!(ui.mode, UiMode::PaneInput, "the pane keeps its input");
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some(crate::inbox_display::INPUT_REJECTED_CTRL_G_REFUSED),
+            "the refusal shown in the shared words"
+        );
+    }
+
+    /// Scenario: The focused pane is in PaneInput when the daemon refuses the person's Ctrl+C (or Ctrl+Z or Ctrl+\) and what they typed after it, typed while a deck check had their editor open (`signal-key-refused`, the agent still live). The TUI's status line shows the refusal in the words the desktop shows, and the pane keeps its input, so what the person types next still goes to the agent.
+    #[spec::spec("inbox/probe/010")]
+    #[test]
+    fn probe_010_a_refused_signal_key_keeps_the_pane_typing() {
+        let now = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        let acted = apply_stream_rejection_feedback(
+            &mut ui,
+            Some("focused"),
+            "focused",
+            "signal-key-refused",
+            now,
+        );
+        assert!(acted, "a refusal for the focused pane acts");
+        assert_eq!(ui.mode, UiMode::PaneInput, "the pane keeps its input");
+        assert_eq!(
+            ui.status_message.as_ref().map(|(m, _)| m.as_str()),
+            Some(crate::inbox_display::INPUT_REJECTED_SIGNAL_KEY_REFUSED),
+            "the refusal shown in the shared words"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -41788,6 +42404,8 @@ mod tests {
     ) {
         let (tx, mut rx) = tokio::sync::broadcast::channel(4);
         let record = crate::agent_pty::AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: agent_id.to_string(),
             pane_id_env: Some(pane_id.to_string()),
             display_name: Some(name.to_string()),
@@ -42044,6 +42662,97 @@ mod tests {
             vec![line.to_string(), STARTUP_FIX.to_string()]
         );
         insta::assert_snapshot!(glossary_status_row(&state, &mut ui), @" COMMAND  Claude Code's hooks could not be updated: ~/.claude/settings.json is not valid JSON (left");
+    }
+
+    /// Scenario: Type into a focused pane and have the daemon refuse the input
+    /// because the agent exited, then because its terminal did not take it.
+    /// Each time the deck leaves typing mode and the status line gives the
+    /// reason in the words the desktop's terminal tile shows for the same
+    /// refusal (the shared fixture's `inputRejected`).
+    #[spec("dashboard/status-message/009")]
+    #[test]
+    fn status_message_009_a_refused_input_says_why_in_the_desktops_words() {
+        use tokio::sync::RwLock;
+        let words: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/inbox-display.json")).unwrap();
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let now = std::time::Instant::now();
+        let mut rows = Vec::new();
+        for reason in ["exited", "write-failed"] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::PaneInput;
+            assert!(apply_stream_rejection_feedback(
+                &mut ui,
+                Some("p0"),
+                "p0",
+                reason,
+                now
+            ));
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert_eq!(
+                Some(glossary_status_text(&ui).unwrap()),
+                words["inputRejected"][reason].as_str(),
+                "{reason}"
+            );
+            rows.push(glossary_status_row(&state, &mut ui));
+        }
+        insta::assert_snapshot!(rows[0], @" COMMAND  Input not delivered: the agent has exited");
+        insta::assert_snapshot!(rows[1], @" COMMAND  Input not delivered: the agent's terminal did not take it");
+    }
+
+    /// Scenario: The daemon refuses typing into the focused pane for each of
+    /// its other reasons (history-only, stale, wrong-session): the deck leaves
+    /// typing mode and the status row reads the shared fixture's words.
+    /// Trying to type into a history-only or view-only card says the
+    /// fixture's `inputUnavailable` words, the notice the desktop tile shows
+    /// for the same card (merge review U3-2).
+    #[spec("dashboard/status-message/009")]
+    #[test]
+    fn status_message_009_every_refusal_reason_says_why_in_the_desktops_words() {
+        use tokio::sync::RwLock;
+        let words: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/inbox-display.json")).unwrap();
+        let state: SharedState = Arc::new(RwLock::new(AppState::default()));
+        let now = std::time::Instant::now();
+        let mut rows = Vec::new();
+        for reason in ["history-only", "stale", "wrong-session"] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::PaneInput;
+            assert!(apply_stream_rejection_feedback(
+                &mut ui,
+                Some("p0"),
+                "p0",
+                reason,
+                now
+            ));
+            assert_eq!(ui.mode, UiMode::Normal);
+            assert_eq!(
+                Some(glossary_status_text(&ui).unwrap()),
+                words["inputRejected"][reason].as_str(),
+                "{reason}"
+            );
+            rows.push(glossary_status_row(&state, &mut ui));
+        }
+        assert_eq!(
+            rows[0].trim_end(),
+            " COMMAND  Input not delivered: this agent has no live terminal"
+        );
+        assert_eq!(
+            rows[1].trim_end(),
+            " COMMAND  Input not delivered: the agent in this pane was replaced or closed"
+        );
+        assert_eq!(rows[1], rows[2], "stale and wrong-session read the same");
+        for (writable, value) in [
+            (crate::event::Writable::HistoryOnly, "history-only"),
+            (crate::event::Writable::None, "none"),
+        ] {
+            assert_eq!(
+                non_live_input_feedback(writable),
+                words["inputUnavailable"][value].as_str(),
+                "{value}"
+            );
+        }
+        assert_eq!(non_live_input_feedback(crate::event::Writable::Live), None);
     }
 
     /// Drive `Action::Focus` (Enter) on the one card of `snapshot` against `pc`.

@@ -67,6 +67,54 @@ pub fn prepare(deck: &common::TuiDeck) {
     );
 }
 
+/// The installed Codex release, read from `codex --version`
+/// (`codex-cli 0.164.0`).
+pub fn installed_codex_release() -> Result<String, String> {
+    let output = std::process::Command::new("codex")
+        .arg("--version")
+        .current_dir(std::env::temp_dir())
+        .output()
+        .map_err(|e| format!("`codex --version` did not run: {e}"))?;
+    let text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.split_whitespace()
+        .find(|word| semver::Version::parse(word).is_ok())
+        .map(str::to_string)
+        .ok_or_else(|| format!("`codex --version` printed no release: {text:?}"))
+}
+
+/// The preflight of a test that needs the doorbell typed into Codex: the
+/// deck's Codex facts admit the installed release, as they admit every
+/// release (the facts are the agent's, not a release's), so this fails only
+/// when the facts themselves are not `Go`, or when the installed release is a
+/// pre-release, whose header the deck does not latch. Otherwise the reason, so the test
+/// reports `SKIP:` (UNVERIFIED under `DOT_AGENT_DECK_REQUIRE_REAL_E2E`).
+pub fn codex_facts_admit_installed_release() -> Result<(), String> {
+    use dot_agent_deck::doorbell_activation::{
+        AGENT_FACTS, Activation, LatchedRelease, activation,
+    };
+    use dot_agent_deck::event::AgentType;
+    let installed = installed_codex_release()?;
+    eprintln!("Codex release under test: {installed}");
+    let version = semver::Version::parse(&installed).map_err(|e| e.to_string())?;
+    if !version.pre.is_empty() {
+        return Err(format!(
+            "Codex {installed} is a pre-release, whose start-up header the deck does not latch \
+             (`unknown_release`), so it types no doorbell into it"
+        ));
+    }
+    match activation(
+        &AGENT_FACTS,
+        &AgentType::Codex,
+        &LatchedRelease::Known(version),
+    ) {
+        Activation::Go { .. } => Ok(()),
+        Activation::NoGo(no_go) => Err(format!(
+            "the deck's Codex facts are not Go ({}), so it types no doorbell into Codex {installed}",
+            no_go.clause()
+        )),
+    }
+}
+
 pub struct Codex {
     pub pane: inbox::Pane,
     pub deck: common::TuiDeck,
@@ -87,6 +135,9 @@ impl Codex {
             .with_imported_codex_credentials()
             .with_env("DOT_AGENT_DECK_LOG", "codex-inbox-live.log")
             .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+            // A held task shows its reason after five seconds, not two
+            // minutes (`inbox/codex/009`).
+            .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "5000")
             // A `dot-agent-deck` the model runs by name (the doorbell's
             // `inbox fetch`) is the build under test, not one on the host.
             .with_env("PATH", common::path_with_binary_dir())

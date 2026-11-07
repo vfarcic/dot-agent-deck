@@ -1,0 +1,379 @@
+{
+  "source_run": "capture",
+  "argv0": "claude",
+  "rows": 24,
+  "cols": 80,
+  "read_lens": [
+    13,
+    24,
+    20,
+    1080,
+    9,
+    12,
+    104,
+    132,
+    69,
+    234,
+    474,
+    20,
+    760,
+    101,
+    54,
+    57,
+    20,
+    828,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    43,
+    42,
+    42,
+    42,
+    42,
+    42,
+    517,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    43,
+    42,
+    108,
+    91,
+    42,
+    42,
+    42,
+    86,
+    101,
+    75,
+    69,
+    72,
+    71,
+    68,
+    67,
+    71,
+    43,
+    71,
+    70,
+    73,
+    106
+  ],
+  "points": {
+    "empty": 1158,
+    "mark:up-1": 1158,
+    "up-1": 1262,
+    "mark:up-2": 1262,
+    "up-2": 1394,
+    "mark:up-3": 1394,
+    "up-3": 1463,
+    "mark:ctrl-u": 1463,
+    "cleared": 1697,
+    "before-ring": 1697,
+    "mark:line": 1697,
+    "echoed": 2171,
+    "typed": 2171,
+    "mark:cr": 2171,
+    "submitted": 3163,
+    "after-enter": 4011,
+    "mark:clear": 4011,
+    "after-clear": 8649,
+    "mark:walk-up-1": 8649,
+    "walk-up-1": 8750,
+    "mark:walk-up-2": 8750,
+    "walk-up-2": 8825,
+    "mark:walk-up-3": 8825,
+    "walk-up-3": 8894,
+    "mark:walk-up-4": 8894,
+    "walk-up-4": 8966,
+    "mark:walk-up-5": 8966,
+    "walk-up-5": 9037,
+    "mark:walk-up-6": 9037,
+    "walk-up-6": 9105,
+    "mark:walk-up-7": 9105,
+    "walk-up-7": 9105,
+    "mark:walk-up-8": 9105,
+    "walk-up-8": 9105,
+    "mark:walk-down-1": 9105,
+    "walk-down-1": 9172,
+    "mark:walk-down-2": 9172,
+    "walk-down-2": 9286,
+    "mark:walk-down-3": 9286,
+    "walk-down-3": 9357,
+    "mark:walk-down-4": 9357,
+    "walk-down-4": 9427,
+    "mark:walk-down-5": 9427,
+    "walk-down-5": 9500,
+    "mark:walk-down-6": 9500,
+    "walk-down-6": 9606,
+    "mark:walk-down-7": 9606,
+    "walk-down-7": 9606,
+    "mark:walk-down-8": 9606,
+    "walk-down-8": 9606,
+    "mark:walk-down-9": 9606,
+    "walk-down-9": 9606,
+    "end": 9606
+  },
+  "edges": [],
+  "lines": [
+    "(agrzfp) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b813 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "release": "2.1.317",
+  "executable_sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+  "recorder": "tests/support/claude_history_submit_measure.py",
+  "recorder_sha256": "1ae3a1031e3930037534304afc6ed10b2f4b7346e76863cd60109e75e2b3de68",
+  "release_recorder_sha256": "79931911fe27567810448c5f20e876e38782f64b758968bdacb718e7bc51c36e",
+  "trace_sha256": "f161cbbb24863857f931389463c8432818103d577b698868fc0388d7955716d3",
+  "hook_prompts": [
+    "(agrzfp) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b813 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "hook_events": [
+    "UserPromptSubmit"
+  ],
+  "outcome": {
+    "after_clear": {
+      "box": "",
+      "editable": true,
+      "history": false,
+      "point": "after-clear",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "after_clear_empty_and_ready": true,
+    "after_enter": {
+      "box": "(agrzfp) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b813 waiting, run:\ndot-agent-deck inbox fetch",
+      "editable": true,
+      "history": false,
+      "point": "after-enter",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "after_enter_dialog": "None",
+    "before_ring": {
+      "box": "Try \"refactor <filepath>\"",
+      "editable": true,
+      "history": false,
+      "point": "before-ring",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "before_ring_empty_and_ready": true,
+    "capture": "/var/tmp/dad-claude-release-measure-WfYRhj/capture",
+    "case": "plain",
+    "cleared": {
+      "box": "Try \"refactor <filepath>\"",
+      "editable": true,
+      "history": false,
+      "point": "cleared",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "cleared_empty_and_ready": true,
+    "echo_ms": 62.022899,
+    "history_log": [
+      "HISTORYONEalpha",
+      "HISTORYTWObravo",
+      "HISTORYTHREEcharlie",
+      "HISTORYFOURdelta",
+      "HISTORYFIVEecho",
+      "HISTORYSIXfoxtrot"
+    ],
+    "hook_ms": 238.152592,
+    "line": "(agrzfp) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b813 waiting, run: dot-agent-deck inbox fetch",
+    "load": [
+      [
+        3.74560546875,
+        8.50048828125,
+        11.77783203125
+      ],
+      "some avg10=1.40 avg60=1.26 avg300=6.28 total=204848312106",
+      [
+        3.2177734375,
+        7.91064453125,
+        11.47607421875
+      ],
+      "some avg10=0.68 avg60=1.04 avg300=5.77 total=204848661780"
+    ],
+    "presses": 1,
+    "prompts": [
+      "(agrzfp) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b813 waiting, run: dot-agent-deck inbox fetch"
+    ],
+    "reachable": null,
+    "recalled": [
+      "HISTORYSIXfoxtrot",
+      "HISTORYFIVEecho",
+      "HISTORYFOURdelta",
+      "HISTORYTHREEcharlie",
+      "HISTORYTWObravo",
+      "HISTORYONEalpha"
+    ],
+    "release": "2.1.317",
+    "size": "24x80",
+    "slot": "4/6",
+    "slot_down": null,
+    "slot_text": "HISTORYFOURdelta",
+    "slot_up": null,
+    "trial": 3,
+    "typed": {
+      "box": "(agrzfp) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b813 waiting, run:\ndot-agent-deck inbox fetch",
+      "editable": true,
+      "history": false,
+      "point": "typed",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "typed_holds": "Some(Exact)",
+    "walk": [
+      [
+        "─── History 6/6 ────",
+        "HISTORYSIXfoxtrot"
+      ],
+      [
+        "─── History 5/6 ────",
+        "HISTORYFIVEecho"
+      ],
+      [
+        "─── History 4/6 ────",
+        "HISTORYFOURdelta"
+      ],
+      [
+        "─── History 3/6 ────",
+        "HISTORYTHREEcharlie"
+      ],
+      [
+        "─── History 2/6 ────",
+        "HISTORYTWObravo"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 2/6 ────",
+        "HISTORYTWObravo"
+      ],
+      [
+        "─── History 3/6 ────",
+        "HISTORYTHREEcharlie"
+      ],
+      [
+        "─── History 4/6 ────",
+        "HISTORYFOURdelta"
+      ],
+      [
+        "─── History 5/6 ────",
+        "HISTORYFIVEecho"
+      ],
+      [
+        "─── History 6/6 ────",
+        "HISTORYSIXfoxtrot"
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ]
+    ]
+  },
+  "load": [
+    [
+      3.74560546875,
+      8.50048828125,
+      11.77783203125
+    ],
+    "some avg10=1.40 avg60=1.26 avg300=6.28 total=204848312106",
+    [
+      3.2177734375,
+      7.91064453125,
+      11.47607421875
+    ],
+    "some avg10=0.68 avg60=1.04 avg300=5.77 total=204848661780"
+  ]
+}

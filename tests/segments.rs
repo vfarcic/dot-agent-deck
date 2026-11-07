@@ -1,0 +1,1782 @@
+//! PRD #1666 part 3 (Q35-08; core §4.5–§4.7, amendments 1–6 of Q35-core):
+//! the segment state machine (`inbox/probe/009`), E1F's truth table over the
+//! output bytes (`inbox/probe/050`), and the completion half of the writer
+//! scope's truth table (`inbox/probe/058`), pure over scripted records,
+//! output and times.
+
+use std::time::{Duration, Instant};
+
+use dot_agent_deck::composer_probe::query_ledger::{HazardFifo, T_TRIGGER};
+use dot_agent_deck::composer_probe::record::{
+    Attribution, Cause, Channel, Completion, Decision, EC_POLICY, EcPolicy, Frontier,
+    FrontierOutcome, NotOwned, Observation, RecordKey, Records, Refusal as RecordRefusal, Report,
+    Route, ScopeState, Tree,
+};
+use dot_agent_deck::composer_probe::segments::{
+    Agent, Ended, Front, IN_FLIGHT_MARKERS, Kind, Marker, NOT_RETURNED, Outcome, Refusal,
+    ReturnMarkers, ReturnWatch, SEGMENT_CAP, Seen, Segments, Stage, View,
+};
+use spec::spec;
+
+const G: u64 = 7;
+const HOLD: EcPolicy = EcPolicy::Hold;
+const AUTH: EcPolicy = EcPolicy::Authority;
+const OFF: &[u8] = b"\x1b[?2004l";
+const ON: &[u8] = b"\x1b[?2004h";
+const FRAME: &[u8] = b"\x1b[?2026h";
+
+fn ms(n: u64) -> Duration {
+    Duration::from_millis(n)
+}
+
+/// `n` milliseconds after `t`: a free function, so a call can take it while
+/// the fixture's fields are borrowed.
+fn time(t: Instant, n: u64) -> Instant {
+    t + ms(n)
+}
+
+fn key(pid: u32) -> RecordKey {
+    RecordKey {
+        pid,
+        start: 1_000 + u64::from(pid),
+    }
+}
+
+fn cat(parts: &[&[u8]]) -> Vec<u8> {
+    parts.concat()
+}
+
+/// One generation: its records, hazard FIFO, segments and output markers,
+/// on a clock in milliseconds from `t`.
+struct T {
+    agent: Agent,
+    r: Records,
+    f: HazardFifo,
+    s: Segments,
+    m: ReturnMarkers,
+    t: Instant,
+}
+
+impl T {
+    fn new(agent: Agent, policy: EcPolicy) -> T {
+        T::with(agent, policy, G)
+    }
+
+    /// Segments of generation `G` beside records of `records_generation`.
+    fn with(agent: Agent, policy: EcPolicy, records_generation: u64) -> T {
+        let t = Instant::now();
+        T {
+            agent,
+            r: Records::new(records_generation, policy, t),
+            f: HazardFifo::default(),
+            s: Segments::new(G, agent),
+            m: ReturnMarkers::default(),
+            t,
+        }
+    }
+
+    fn probe(&mut self, at: u64) -> u64 {
+        let n = self
+            .s
+            .open_probe(false, time(self.t, at))
+            .expect("a probe opens");
+        let _ = self.r.raise(G, time(self.t, at));
+        n
+    }
+
+    /// The writer took segment `n`'s trigger at `at`, with the output as fed.
+    fn write(&mut self, n: u64, at: u64) {
+        let offset = self.m.fed();
+        self.s
+            .written(
+                &mut self.r,
+                &mut self.f,
+                n,
+                offset,
+                time(self.t, at),
+                time(self.t, at),
+            )
+            .expect("submitted");
+    }
+
+    fn out(&mut self, bytes: &[u8], at: u64) {
+        let mut seen = Vec::new();
+        self.m.feed(bytes, &mut seen);
+        self.s
+            .on_output(&mut self.r, &mut self.f, &seen, time(self.t, at));
+    }
+
+    fn observe(&mut self, obs: Observation, at: u64) {
+        let _ = self.r.observe(&mut self.f, &obs, time(self.t, at));
+        self.s.settle(&mut self.r, &mut self.f, time(self.t, at));
+    }
+
+    /// A helper `pid` on `channel`, born at `born` and observed at `at`, that
+    /// read `seg`.
+    fn helper(
+        &mut self,
+        pid: u32,
+        channel: Channel,
+        attribution: Attribution,
+        decision: Option<Decision>,
+        seg: Option<u64>,
+        (born, at): (u64, u64),
+    ) {
+        let obs = Observation {
+            generation: G,
+            key: key(pid),
+            channel,
+            attribution,
+            claim: None,
+            decision,
+            seg_seen: seg,
+            native_seen: None,
+            birth_floor: time(self.t, born),
+        };
+        self.observe(obs, at);
+    }
+
+    /// The common case: an `Owned` helper's IPC request with its decision
+    /// and the number it read.
+    fn ipc(&mut self, pid: u32, decision: Decision, seg: u64, at: u64) {
+        self.helper(
+            pid,
+            Channel::Ipc,
+            Attribution::Owned,
+            Some(decision),
+            Some(seg),
+            (at, at),
+        );
+    }
+
+    fn report(&mut self, pid: u32, report: Report, at: u64) {
+        let _ = self
+            .r
+            .report(&mut self.f, G, key(pid), report, time(self.t, at));
+        self.s.settle(&mut self.r, &mut self.f, time(self.t, at));
+    }
+
+    fn frontier(&mut self, pid: u32) {
+        let offset = self.m.fed();
+        let _ = self
+            .r
+            .frontier(G, key(pid), FrontierOutcome::Taken { offset });
+        self.s.settle(&mut self.r, &mut self.f, time(self.t, 0));
+    }
+
+    /// The helper's exit observed and drained at `at`.
+    fn exit(&mut self, pid: u32, at: u64) {
+        let _ = self
+            .r
+            .exit(&mut self.f, G, key(pid), time(self.t, at), time(self.t, at));
+        if let Ok(d) = self.r.drained(&mut self.f, G, key(pid), time(self.t, at)) {
+            let _ = self
+                .s
+                .drained(&mut self.r, &mut self.f, d.fact, time(self.t, at));
+        } else {
+            self.s.settle(&mut self.r, &mut self.f, time(self.t, at));
+        }
+    }
+
+    fn editor(&mut self, pid: u32, at: u64) -> bool {
+        self.s
+            .editor_running_for_test(&mut self.r, &mut self.f, key(pid), time(self.t, at))
+    }
+
+    fn view(&self, at: u64) -> Vec<View> {
+        self.s.view(&self.r, time(self.t, at))
+    }
+
+    fn stages(&self, at: u64) -> Vec<Stage> {
+        self.view(at).iter().map(|v| v.stage).collect()
+    }
+
+    fn ended(&mut self) -> Vec<(Option<u64>, Kind, Outcome)> {
+        self.s
+            .take_ended()
+            .into_iter()
+            .map(|e: Ended| (e.number, e.kind, e.outcome))
+            .collect()
+    }
+
+    fn written(&mut self) -> Vec<Option<u64>> {
+        self.ended()
+            .into_iter()
+            .filter(|e| e.2 == Outcome::Written)
+            .map(|e| e.0)
+            .collect()
+    }
+
+    /// The agent's full return for its kind.
+    fn returns(&mut self, at: u64) {
+        let bytes = match self.agent {
+            Agent::Claude => cat(&[OFF, ON]),
+            Agent::Codex => cat(&[OFF, ON, FRAME]),
+        };
+        self.out(&bytes, at);
+    }
+}
+
+// ---- inbox/probe/009: the segment state machine ----
+
+/// Scenario: On Codex, open a probe, write its trigger, and let its own helper decide `Armed` with the probe's number. The bytes behind it stay held through the helper's exit, `?2004l` and `?2004h` (shown `AwaitingPostFlush`), and the segment completes, releasing them, only at the first `?2026h` after that enable; a held Ctrl+G behind it is numbered only then.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_codex_probe_releases_at_e1f() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    assert_eq!(n, 1);
+    t.s.open_human_g(40).unwrap();
+    assert_eq!(t.stages(0), [Stage::Submitted, Stage::Waiting]);
+    t.write(n, 1);
+    assert_eq!(t.s.next_trigger(), None, "the probe is outstanding");
+    t.ipc(1, Decision::Armed, n, 5);
+    assert_eq!(
+        t.stages(5)[0],
+        Stage::Matched,
+        "a decision releases no Codex byte"
+    );
+    t.out(OFF, 6);
+    t.exit(1, 7);
+    assert_eq!(t.stages(7)[0], Stage::Matched);
+    t.out(ON, 8);
+    assert_eq!(t.stages(8)[0], Stage::AwaitingPostFlush, "E1 alone holds");
+    assert!(t.written().is_empty());
+    t.out(FRAME, 9);
+    assert_eq!(t.written(), [Some(n)], "E1F completes and releases");
+    assert!(matches!(
+        t.r.get(key(1)).unwrap().completion,
+        Completion::Complete { .. }
+    ));
+    assert_eq!(t.stages(9), [Stage::Waiting]);
+    assert_eq!(
+        t.s.next_trigger(),
+        Some(2),
+        "the held Ctrl+G is written next"
+    );
+    assert_eq!(t.s.next_trigger(), None, "once");
+}
+
+/// Scenario: On Claude, open a probe, write it and hold a Ctrl+G behind it. Its helper's `Armed` decision with the probe's number releases what is behind it at once, but the held Ctrl+G is numbered only after the helper's exit and Claude's `?2004l` `?2004h`.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_claude_probe_releases_at_the_decision() {
+    for decision in [Decision::Armed, Decision::Unarmed] {
+        let mut t = T::new(Agent::Claude, AUTH);
+        let n = t.probe(0);
+        t.s.open_human_g(40).unwrap();
+        t.write(n, 1);
+        assert_eq!(t.stages(1)[0], Stage::Unmatched);
+        t.ipc(1, decision, n, 5);
+        assert_eq!(t.stages(5)[0], Stage::Released, "{decision:?}");
+        assert_eq!(t.s.next_trigger(), None, "{decision:?}: not complete");
+        if decision == Decision::Unarmed {
+            // Under Authority an editor-bearing return completes at EC.
+            t.report(1, Report::Done(Tree::Clean), 6);
+            t.exit(1, 7);
+            t.frontier(1);
+            t.out(ON, 8);
+        } else {
+            t.exit(1, 7);
+            t.returns(8);
+        }
+        assert_eq!(t.written(), [Some(n)], "{decision:?}");
+        assert_eq!(t.s.next_trigger(), Some(2), "{decision:?}");
+    }
+    // A `Tool` or unknown decision releases nothing early.
+    for decision in [Decision::Tool, Decision::Unknown] {
+        let mut t = T::new(Agent::Claude, AUTH);
+        let n = t.probe(0);
+        t.write(n, 1);
+        t.ipc(1, decision, n, 5);
+        assert_eq!(t.stages(5)[0], Stage::Matched, "{decision:?}");
+    }
+}
+
+/// Scenario: Write a probe, then hand it evidence that isn't its own: return markers emitted before the trigger was written, a helper that read an older number, a tool's helper that read this number, and, on records of another generation, a helper that read this number and its exit facts. None matches or completes it; each control (its own helper, its own markers, the same generation) does.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_stale_foreign_and_other_generation_evidence() {
+    // Stale: a whole return before the trigger.
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.returns(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 5);
+    t.exit(1, 6);
+    assert_eq!(t.stages(6)[0], Stage::Matched, "stale markers");
+    assert!(t.written().is_empty());
+    t.returns(7);
+    assert_eq!(t.written(), [Some(n)], "the control: its own markers");
+
+    // Foreign: an older number, a tool's helper, an unattributed one.
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n - 1, 2);
+    t.helper(
+        2,
+        Channel::Ipc,
+        Attribution::NotOwned(NotOwned::Tool),
+        Some(Decision::Armed),
+        Some(n),
+        (2, 2),
+    );
+    t.helper(
+        3,
+        Channel::Ipc,
+        Attribution::Unattributable,
+        Some(Decision::Armed),
+        Some(n),
+        (2, 2),
+    );
+    for pid in 1..=3 {
+        t.exit(pid, 3);
+    }
+    assert_eq!(t.view(3)[0].record, None, "nothing foreign matches");
+    t.ipc(4, Decision::Armed, n, 5);
+    assert_eq!(
+        t.view(5)[0].record,
+        Some(key(4)),
+        "the control: its own helper"
+    );
+    t.exit(4, 6);
+    t.returns(7);
+    assert_eq!(t.written(), [Some(n)]);
+
+    // Another generation's records and facts.
+    let mut t = T::with(Agent::Codex, HOLD, G + 1);
+    let n = t.s.open_probe(false, time(t.t, 0)).unwrap();
+    t.write(n, 1);
+    let obs = Observation {
+        generation: G + 1,
+        key: key(1),
+        channel: Channel::Ipc,
+        attribution: Attribution::Owned,
+        claim: None,
+        decision: Some(Decision::Armed),
+        seg_seen: Some(n),
+        native_seen: None,
+        birth_floor: time(t.t, 2),
+    };
+    let _ = t.r.observe(&mut t.f, &obs, time(t.t, 2));
+    t.s.settle(&mut t.r, &mut t.f, time(t.t, 2));
+    let _ =
+        t.r.exit(&mut t.f, G + 1, key(1), time(t.t, 3), time(t.t, 3));
+    let d = t.r.drained(&mut t.f, G + 1, key(1), time(t.t, 3)).unwrap();
+    assert_eq!(
+        t.s.drained(&mut t.r, &mut t.f, d.fact, time(t.t, 3)),
+        Err(Refusal::Stale)
+    );
+    t.returns(4);
+    assert_eq!(t.view(4)[0].record, None, "another generation's record");
+    assert!(t.written().is_empty());
+    assert_eq!(t.r.get(key(1)).unwrap().matched, None);
+}
+
+/// Scenario: Complete a Codex probe with its markers and its helper's drained exit in each order: the whole return before the drain, the drain before the return, a `?2026h` written before the `?2004l`, and a second `?2004l` after the pair before the drain. It completes once the drain and a pair with a frame after it are both there, never on a frame before the enable, and a later `?2004l` starts the pair over.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_markers_and_the_exit_in_either_order() {
+    let run = |before_exit: &[u8], after_exit: &[u8]| {
+        let mut t = T::new(Agent::Codex, HOLD);
+        let n = t.probe(0);
+        t.write(n, 1);
+        t.ipc(1, Decision::Armed, n, 2);
+        t.out(before_exit, 3);
+        let early = t.written();
+        t.exit(1, 4);
+        let at_exit = t.written();
+        t.out(after_exit, 5);
+        (early, at_exit, t.written())
+    };
+    let some = vec![Some(1)];
+    assert_eq!(
+        run(&cat(&[OFF, ON, FRAME]), b""),
+        (vec![], some.clone(), vec![])
+    );
+    assert_eq!(
+        run(b"", &cat(&[OFF, ON, FRAME])),
+        (vec![], vec![], some.clone())
+    );
+    assert_eq!(run(&cat(&[OFF, ON]), FRAME), (vec![], vec![], some.clone()));
+    assert_eq!(
+        run(&cat(&[FRAME, OFF, ON]), b""),
+        (vec![], vec![], vec![]),
+        "a frame before the disable"
+    );
+    assert_eq!(
+        run(&cat(&[OFF, ON, FRAME, OFF]), b""),
+        (vec![], vec![], vec![]),
+        "a later disable starts the pair over"
+    );
+    assert_eq!(
+        run(&cat(&[OFF, ON, FRAME, OFF]), &cat(&[ON, FRAME])),
+        (vec![], vec![], some),
+        "the control: the next pair and frame"
+    );
+}
+
+/// Scenario: Write a probe, then let helpers with no decision and no number be seen by a scan: one born before the trigger was written, one in the same instant, and two born after it. Only a single one born at or after the written instant matches; the earlier one and the pair match nothing. A scan keeps the writer scope pending, so its markers complete nothing until the helper declares `Armed`, and then the segment completes on what already arrived.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_the_birth_frontier() {
+    let scan = |t: &mut T, pid: u32, born: u64, at: u64| {
+        t.helper(
+            pid,
+            Channel::Scan,
+            Attribution::Owned,
+            None,
+            None,
+            (born, at),
+        );
+    };
+    // Before the written instant: no match.
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 10);
+    scan(&mut t, 1, 9, 11);
+    assert_eq!(t.view(11)[0].record, None, "born before the write");
+    // Two after it: ambiguous.
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 10);
+    scan(&mut t, 1, 10, 11);
+    scan(&mut t, 2, 12, 12);
+    // The first sighting matched alone before the second was seen.
+    assert_eq!(t.view(12)[0].record, Some(key(1)));
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.s.open_probe(false, time(t.t, 0)).unwrap();
+    // Both seen before the writer reports the trigger: neither matches.
+    scan(&mut t, 1, 10, 9);
+    scan(&mut t, 2, 12, 9);
+    t.write(n, 10);
+    assert_eq!(t.view(12)[0].record, None, "two candidates");
+
+    // At the written instant, alone: it matches, and waits for `Armed`.
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 10);
+    scan(&mut t, 1, 10, 11);
+    assert_eq!(t.view(11)[0].record, Some(key(1)));
+    assert_eq!(t.r.scope().state(), ScopeState::Pending);
+    t.returns(12);
+    assert!(t.written().is_empty(), "pending refuses E1F");
+    assert_eq!(t.stages(12)[0], Stage::Matched, "not drained");
+    t.ipc(1, Decision::Armed, n, 13);
+    assert_eq!(t.r.scope().state(), ScopeState::Closed);
+    assert!(t.written().is_empty(), "its exit isn't drained");
+    t.exit(1, 14);
+    assert_eq!(t.written(), [Some(n)], "re-evaluated on what had arrived");
+}
+
+/// Scenario: Match a probe by its helper's birth while it has no number, then let the same helper name another segment's number. The segment holds for good, shown `Mismatched`, through its return; the control, the helper naming this segment's number, completes it.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_birth_match_naming_another_number_holds() {
+    for (seen, completes) in [(5, false), (1, true)] {
+        let mut t = T::new(Agent::Codex, HOLD);
+        let n = t.probe(0);
+        t.write(n, 10);
+        t.helper(1, Channel::Scan, Attribution::Owned, None, None, (10, 11));
+        assert_eq!(t.view(11)[0].record, Some(key(1)));
+        t.helper(
+            1,
+            Channel::Ipc,
+            Attribution::Owned,
+            Some(Decision::Armed),
+            Some(seen),
+            (10, 12),
+        );
+        t.exit(1, 13);
+        t.returns(14);
+        if completes {
+            assert_eq!(t.written(), [Some(n)]);
+        } else {
+            assert_eq!(t.stages(14), [Stage::Mismatched]);
+            assert!(t.written().is_empty());
+        }
+    }
+}
+
+/// Scenario: On Claude, write a probe that no helper answers. Exactly `T_TRIGGER` after the write it is still unmatched and no retry opens; past it, it is `Lapsed`, a retry is refused while bytes are held behind it and opens otherwise, superseding it with the next number, and a helper that read the lapsed number matches nothing. A Codex probe never lapses.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_claude_probe_lapses_and_admits_one_retry() {
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.write(n, 0);
+    let tie = T_TRIGGER.as_millis() as u64;
+    assert_eq!(t.stages(tie), [Stage::Unmatched]);
+    assert_eq!(t.s.open_probe(false, time(t.t, tie)), Err(Refusal::Busy));
+    assert_eq!(t.stages(tie + 1), [Stage::Lapsed]);
+    assert_eq!(
+        t.s.open_probe(true, time(t.t, tie + 1)),
+        Err(Refusal::Busy),
+        "bytes held behind it"
+    );
+    let retry = t.s.open_probe(false, time(t.t, tie + 1)).unwrap();
+    assert_eq!(retry, n + 1);
+    assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::Superseded)]);
+    t.write(retry, tie + 2);
+    t.ipc(1, Decision::Armed, n, tie + 3);
+    assert_eq!(t.view(tie + 3)[0].record, None, "the lapsed number");
+    t.ipc(2, Decision::Armed, retry, tie + 4);
+    assert_eq!(t.stages(tie + 4), [Stage::Released], "the control");
+
+    // A lapsed probe with a held Ctrl+G behind it admits no retry.
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.write(n, 0);
+    t.s.open_human_g(1).unwrap();
+    assert_eq!(
+        t.s.open_probe(false, time(t.t, tie + 1)),
+        Err(Refusal::Busy)
+    );
+
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 0);
+    assert_eq!(t.stages(tie * 10), [Stage::Unmatched]);
+    assert_eq!(
+        t.s.open_probe(false, time(t.t, tie * 10)),
+        Err(Refusal::Busy)
+    );
+}
+
+/// Scenario: Hold a person's Ctrl+G behind a completed probe and write it alone; its helper reads its number and decides `Unarmed` (the person's editor). Nothing behind it goes until the editor child is seen running. Under `Hold` its return never completes it, so a second held Ctrl+G is never written and the view shows `AwaitingReturn` with the writer scope's cause; under `Authority` the drain frontier then the return completes it and the second is written.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_held_ctrl_g_releases_to_a_running_editor() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for policy in [HOLD, AUTH] {
+            let mut t = T::new(agent, policy);
+            let n = t.probe(0);
+            t.s.open_human_g(1).unwrap();
+            t.s.open_human_g(2).unwrap();
+            t.write(n, 1);
+            t.ipc(1, Decision::Armed, n, 2);
+            t.exit(1, 3);
+            t.returns(4);
+            assert_eq!(t.written(), [Some(n)]);
+            let g = t.s.next_trigger().unwrap();
+            t.write(g, 5);
+            t.ipc(2, Decision::Unarmed, g, 6);
+            assert_eq!(t.stages(6)[0], Stage::Matched, "{agent:?} {policy:?}");
+            assert!(!t.editor(9, 6), "another record's editor");
+            assert!(t.editor(2, 7));
+            assert_eq!(t.stages(7)[0], Stage::Released, "{agent:?} {policy:?}");
+            t.report(2, Report::Done(Tree::Clean), 8);
+            t.exit(2, 9);
+            t.frontier(2);
+            t.out(&cat(&[ON, FRAME]), 10);
+            let v = t.view(10);
+            if policy == HOLD {
+                assert!(v[0].ec, "{agent:?}: EC is computed, not authority");
+                assert!(t.written().is_empty(), "{agent:?}: Hold completes nothing");
+                assert_eq!(v[0].scope, ScopeState::Open(Cause::EditorReturnUnchecked));
+                assert_eq!(t.s.next_trigger(), None);
+            } else {
+                assert_eq!(t.written(), [Some(g)], "{agent:?}");
+                assert_eq!(t.s.next_trigger(), Some(g + 1));
+            }
+        }
+    }
+}
+
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed` and let it exit with no report (its wait failed), and, separately, an `Unarmed` helper that never reports an editor running. The first holds as `AwaitingReturn` with `EditorEndUnknown`, through a full return, until retirement ends it; the second holds everything until its return completes it under `Authority`.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_wait_unknown_and_an_unseen_editor_hold() {
+    for policy in [HOLD, AUTH] {
+        let mut t = T::new(Agent::Codex, policy);
+        let n = t.probe(0);
+        t.s.open_human_g(1).unwrap();
+        t.write(n, 1);
+        t.ipc(1, Decision::Unarmed, n, 2);
+        t.exit(1, 3);
+        t.returns(4);
+        let v = t.view(4);
+        assert_eq!(v[0].stage, Stage::AwaitingReturn, "{policy:?}");
+        assert_eq!(v[0].scope, ScopeState::Open(Cause::EditorEndUnknown));
+        assert!(t.written().is_empty());
+        t.s.retire();
+        assert_eq!(
+            t.ended(),
+            [
+                (Some(n), Kind::Probe, Outcome::Retired),
+                (None, Kind::HumanG, Outcome::Retired)
+            ]
+        );
+        assert_eq!(t.s.open_probe(false, time(t.t, 5)), Err(Refusal::Retired));
+        assert_eq!(t.s.next_trigger(), None);
+    }
+    // An editor never seen running: nothing goes before completion.
+    let mut t = T::new(Agent::Codex, AUTH);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Unarmed, n, 2);
+    t.report(1, Report::Done(Tree::Clean), 3);
+    t.exit(1, 4);
+    assert_eq!(t.stages(4), [Stage::AwaitingReturn]);
+    t.frontier(1);
+    t.out(ON, 5);
+    assert_eq!(t.stages(5), [Stage::AwaitingReturn], "EC needs the frame");
+    t.out(FRAME, 6);
+    assert_eq!(t.written(), [Some(n)]);
+}
+
+/// Scenario: Release a person's Ctrl+G to its running editor (`Unarmed`, the editor child seen running), then let its helper exit with no report, its wait having failed. Once that unknown ending is drained the segment no longer lets anything still held go: the front reads held and the view `AwaitingReturn`, while the same release with a clean report keeps passing typing to the editor until its return (R-U2-06).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_an_unknown_wait_withdraws_a_running_editors_release() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for report in [None, Some(Report::Done(Tree::Clean))] {
+            let mut t = T::new(agent, HOLD);
+            let g = t.s.open_held_trigger().unwrap();
+            t.write(g, 1);
+            t.ipc(1, Decision::Unarmed, g, 2);
+            assert!(t.editor(1, 3));
+            assert_eq!(
+                t.s.front(),
+                Front::Released,
+                "{agent:?}: the editor reads it"
+            );
+            if let Some(report) = report {
+                t.report(1, report, 4);
+            }
+            t.exit(1, 5);
+            let (front, stage) = (t.s.front(), t.stages(5)[0]);
+            match report {
+                None => {
+                    assert_eq!(front, Front::Held, "{agent:?}: what is still held stays");
+                    assert_eq!(stage, Stage::AwaitingReturn, "{agent:?}");
+                }
+                Some(_) => {
+                    assert_eq!(front, Front::Released, "{agent:?}: a known ending");
+                    assert_eq!(stage, Stage::Released, "{agent:?}");
+                }
+            }
+            t.returns(6);
+            assert_eq!(
+                t.s.front() == Front::Released,
+                report.is_some(),
+                "{agent:?}: a return doesn't restore it"
+            );
+        }
+    }
+}
+
+/// Scenario: Open a probe and publish its number, then, before the writer's report of its trigger reaches the segments, let its own helper read the number and decide `Armed`, exit, and Claude write its whole return. Reported written afterwards, at the offset its job started at, the segment completes from the return it kept. A second probe's trigger fails after the same in-flight return: it ends `WriteFailed`, and the markers it kept complete and release nothing. A held Ctrl+G whose helper decides `Unarmed` and whose editor is seen running before its trigger's report releases once that report arrives (R-U2-01).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_return_read_before_the_written_report_completes_it() {
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    let started = t.m.fed();
+    t.ipc(1, Decision::Armed, n, 2);
+    t.returns(3);
+    t.exit(1, 4);
+    assert!(t.written().is_empty(), "nothing before the report");
+    t.s.written(&mut t.r, &mut t.f, n, started, time(t.t, 1), time(t.t, 5))
+        .unwrap();
+    assert_eq!(t.written(), [Some(n)], "the kept return completes it");
+    assert_eq!(t.s.front(), Front::None);
+
+    let n = t.probe(6);
+    t.ipc(2, Decision::Armed, n, 7);
+    t.returns(8);
+    t.exit(2, 9);
+    t.s.write_failed(n).unwrap();
+    assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::WriteFailed)]);
+    assert_eq!(t.s.front(), Front::None);
+    assert!(
+        t.s.is_empty(),
+        "no segment kept the failed trigger's return"
+    );
+
+    // The same for a fact the observer reports once: a held Ctrl+G's helper
+    // and its running editor seen before its trigger's report arrives.
+    let g = t.s.open_held_trigger().unwrap();
+    t.ipc(3, Decision::Unarmed, g, 10);
+    assert!(!t.editor(3, 11), "no segment has matched it yet");
+    t.write(g, 12);
+    assert_eq!(
+        t.s.front(),
+        Front::Released,
+        "the editor seen first still counts"
+    );
+}
+
+/// Scenario: Release a held Ctrl+G to its helper's running editor, then let the helper drain with no report: the release is cut off for what is still held. The helper's clean report arriving only after that drain (as after a drain that gave up uncertain with its connection still open) doesn't restore the release: the cut-off is the uncertain drain's outcome, and the segment holds until retirement (the audit's U3-3).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_report_after_the_drain_keeps_the_cut_off() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.write(g, 1);
+        t.ipc(1, Decision::Unarmed, g, 2);
+        assert!(t.editor(1, 3));
+        assert_eq!(t.s.front(), Front::Released, "{agent:?}");
+        t.exit(1, 4);
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: cut off at the drain");
+        t.report(1, Report::Done(Tree::Clean), 5);
+        t.returns(6);
+        assert_eq!(
+            t.s.front(),
+            Front::Held,
+            "{agent:?}: a report after the drain doesn't restore it"
+        );
+    }
+}
+
+/// Scenario: Open a probe and, before its trigger's written report, let its helper decide `Armed` and exit while the agent writes more return markers than a segment keeps in flight. With the real disable and enable among the latest kept, the report completes it. With the disable pushed out by later markers, nothing completes and nothing is released, until a whole return after the report completes it: losing markers past the cap costs availability, never authority. A third probe's trigger is withdrawn with a return in flight: it ends `TakenBack`, and its markers go with it (R-B-U3-01, the audit's U3-6).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_in_flight_markers_past_the_cap_and_a_withdrawn_trigger() {
+    let frames = |n: usize| FRAME.repeat(n);
+    let mut t = T::new(Agent::Claude, HOLD);
+
+    // Past the cap, the return at the tail: kept, and it completes.
+    let n = t.probe(0);
+    let started = t.m.fed();
+    t.ipc(1, Decision::Armed, n, 1);
+    t.exit(1, 2);
+    t.out(&frames(IN_FLIGHT_MARKERS + 6), 3);
+    t.returns(4);
+    t.s.written(&mut t.r, &mut t.f, n, started, time(t.t, 0), time(t.t, 5))
+        .unwrap();
+    assert_eq!(t.written(), [Some(n)], "the latest markers hold the return");
+
+    // The disable pushed out, on Codex, whose probe holds until its E1F:
+    // nothing completes or releases, until a whole return after the report.
+    let mut c = T::new(Agent::Codex, HOLD);
+    let n = c.probe(6);
+    let started = c.m.fed();
+    c.ipc(2, Decision::Armed, n, 7);
+    c.exit(2, 8);
+    c.out(OFF, 9);
+    c.out(&frames(IN_FLIGHT_MARKERS), 10);
+    c.out(&cat(&[ON, FRAME]), 11);
+    c.s.written(&mut c.r, &mut c.f, n, started, time(c.t, 6), time(c.t, 12))
+        .unwrap();
+    assert!(
+        c.written().is_empty(),
+        "an enable with no disable completes nothing"
+    );
+    assert_eq!(c.s.front(), Front::Held, "and releases nothing");
+    c.returns(13);
+    assert_eq!(
+        c.written(),
+        [Some(n)],
+        "a whole return after the report does"
+    );
+
+    // Withdrawn with a return in flight: it ends, and so do its markers.
+    let n = t.probe(14);
+    t.ipc(3, Decision::Armed, n, 15);
+    t.exit(3, 16);
+    t.returns(17);
+    t.s.withdrawn(n).unwrap();
+    assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::TakenBack)]);
+    assert!(
+        t.s.is_empty(),
+        "nothing kept the withdrawn trigger's return"
+    );
+    let n = t.probe(18);
+    t.write(n, 19);
+    assert!(
+        t.written().is_empty() && t.s.front() == Front::Held,
+        "a later probe owes nothing to the withdrawn one's markers"
+    );
+}
+
+/// Scenario: Write a held Ctrl+G whose helper decides `Armed`. On Claude it passes through at the decision and completes at E1; on Codex it holds until E1F. A matched helper that decided `Unarmed` and then failed to start the editor holds until E1 on Claude and E1F on Codex under `Authority`, and for good under `Hold`.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_armed_and_spawn_failed_rows() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let n = t.probe(0);
+        t.s.open_human_g(1).unwrap();
+        t.write(n, 1);
+        t.ipc(1, Decision::Armed, n, 2);
+        t.exit(1, 3);
+        t.returns(4);
+        assert_eq!(t.written(), [Some(n)]);
+        let g = t.s.next_trigger().unwrap();
+        t.write(g, 5);
+        t.ipc(2, Decision::Armed, g, 6);
+        let expected = match agent {
+            Agent::Claude => Stage::Released,
+            Agent::Codex => Stage::Matched,
+        };
+        assert_eq!(t.stages(6), [expected], "{agent:?}");
+        t.exit(2, 7);
+        t.out(&cat(&[OFF, ON]), 8);
+        match agent {
+            Agent::Claude => assert_eq!(t.written(), [Some(g)]),
+            Agent::Codex => {
+                assert_eq!(t.stages(8), [Stage::AwaitingPostFlush]);
+                t.out(FRAME, 9);
+                assert_eq!(t.written(), [Some(g)]);
+            }
+        }
+
+        for policy in [HOLD, AUTH] {
+            let mut t = T::new(agent, policy);
+            let n = t.probe(0);
+            t.s.open_human_g(1).unwrap();
+            t.write(n, 1);
+            t.ipc(1, Decision::Armed, n, 2);
+            t.exit(1, 3);
+            t.returns(4);
+            let _ = t.written();
+            let g = t.s.next_trigger().unwrap();
+            t.write(g, 5);
+            t.ipc(2, Decision::Unarmed, g, 6);
+            t.report(2, Report::SpawnFailed { errno: Some(2) }, 7);
+            assert_ne!(t.view(7)[0].stage, Stage::Released);
+            t.exit(2, 8);
+            t.out(&cat(&[OFF, ON]), 9);
+            let mut done = t.written();
+            if agent == Agent::Codex {
+                assert!(done.is_empty(), "{policy:?}: E1 alone");
+                t.out(FRAME, 10);
+                done = t.written();
+            }
+            let expected = if policy == AUTH {
+                vec![Some(g)]
+            } else {
+                vec![]
+            };
+            assert_eq!(done, expected, "{agent:?} {policy:?}");
+        }
+    }
+}
+
+/// Scenario: Take a probe back before the writer starts it, cancel a held Ctrl+G's op, fail a held Ctrl+G's trigger write while its op carries another, and retire. Each ending names what happened: `TakenBack` and `Cancelled` only for triggers never started, a withdrawal after the write refused, `WriteFailed` for the failed trigger and `Gone` for its op's next one, while another op's Ctrl+G is written next.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_truthful_endings() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.s.withdrawn(n).unwrap();
+    assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::TakenBack)]);
+    assert_eq!(t.s.open_human_g(1), Err(Refusal::NotHeld), "nothing holds");
+
+    let n = t.probe(1);
+    t.write(n, 2);
+    assert_eq!(
+        t.s.withdrawn(n),
+        Err(Refusal::NotSubmitted),
+        "it was written"
+    );
+    assert_eq!(t.s.write_failed(n), Err(Refusal::NotSubmitted));
+    assert_eq!(t.s.withdrawn(99), Err(Refusal::NoSegment));
+    t.s.open_human_g(10).unwrap();
+    t.s.open_human_g(10).unwrap();
+    t.s.open_human_g(11).unwrap();
+    t.s.open_human_g(12).unwrap();
+    t.s.open_human_g(12).unwrap();
+    assert_eq!(t.s.cancelled(11), 1);
+    assert_eq!(t.ended(), [(None, Kind::HumanG, Outcome::Cancelled)]);
+    t.ipc(1, Decision::Armed, n, 3);
+    t.exit(1, 4);
+    t.returns(5);
+    assert_eq!(t.written(), [Some(n)]);
+    let g = t.s.next_trigger().unwrap();
+    t.s.write_failed(g).unwrap();
+    assert_eq!(
+        t.ended(),
+        [
+            (Some(g), Kind::HumanG, Outcome::WriteFailed),
+            (None, Kind::HumanG, Outcome::Gone)
+        ]
+    );
+    let g = t.s.next_trigger().unwrap();
+    t.s.withdrawn(g).unwrap();
+    assert_eq!(t.ended(), [(Some(g), Kind::HumanG, Outcome::Cancelled)]);
+    assert_eq!(t.stages(6), [Stage::Waiting], "op 12's other Ctrl+G");
+    t.s.retire();
+    assert_eq!(t.ended(), [(None, Kind::HumanG, Outcome::Retired)]);
+    t.s.retire();
+    assert!(t.ended().is_empty(), "retirement ends once");
+
+    // The cap.
+    let mut t = T::new(Agent::Codex, HOLD);
+    t.probe(0);
+    for op in 1..SEGMENT_CAP as u64 {
+        t.s.open_human_g(op).unwrap();
+    }
+    assert_eq!(t.s.open_human_g(0), Err(Refusal::Full));
+}
+
+/// Scenario: Hold a Codex probe through E1 and an editor-bearing one through its drain, and read the view as the clock passes `NOT_RETURNED`: each shows its stage and turns `not_returned` only once 5 s have passed in it (from the drain, whatever output follows it, then from E1), without being released. A Claude probe released at its decision reads `Released`, never an awaiting stage, through its helper's exit and return markers.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_the_view_publishes_awaiting_stages_only_while_holding() {
+    let wait = NOT_RETURNED.as_millis() as u64;
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    t.exit(1, 3);
+    t.out(OFF, 100);
+    assert!(!t.view(3 + wait - 1)[0].not_returned);
+    assert!(
+        t.view(3 + wait)[0].not_returned,
+        "E5, from the drain, not from later output"
+    );
+    t.out(&cat(&[OFF, ON]), 10);
+    let v = t.view(10 + wait - 1);
+    assert_eq!(v[0].stage, Stage::AwaitingPostFlush);
+    assert!(!v[0].not_returned, "E5′ runs from E1");
+    assert!(t.view(10 + wait)[0].not_returned, "E5′");
+    assert!(t.written().is_empty(), "the display releases nothing");
+
+    let mut t = T::new(Agent::Codex, AUTH);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Unarmed, n, 2);
+    t.report(1, Report::Done(Tree::Clean), 3);
+    t.exit(1, 4);
+    let v = t.view(4 + wait);
+    assert_eq!(v[0].stage, Stage::AwaitingReturn);
+    assert!(v[0].not_returned);
+    assert_eq!(v[0].fact.map(|f| f.key), Some(key(1)));
+
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    t.exit(1, 3);
+    t.out(OFF, 4);
+    for at in [3, 4, 4 + wait] {
+        let v = t.view(at);
+        assert_eq!(v[0].stage, Stage::Released);
+        assert!(!v[0].not_returned);
+    }
+}
+
+/// Scenario: Under `Hold`, let a probe's `Unarmed` editor exit clean, then let a later invocation of the agent's own subsume and delete its record; separately, the same for a Codex probe's `Armed` helper before its return. Each segment keeps the record's exit facts, shows its stage from them, and keeps holding through a full return: subsumption completes the record, not the segment.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_pruned_record_leaves_its_facts_and_the_hold() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Unarmed, n, 2);
+    t.report(1, Report::Done(Tree::Clean), 3);
+    t.exit(1, 4);
+    t.ipc(2, Decision::Armed, 0, 10);
+    assert!(matches!(
+        t.r.get(key(1)).unwrap().completion,
+        Completion::Subsumed { .. }
+    ));
+    let pruned =
+        t.r.prune(&mut t.f, G, key(1), true, time(t.t, 11))
+            .unwrap()
+            .is_some();
+    assert!(pruned);
+    assert!(t.r.get(key(1)).is_none());
+    t.returns(12);
+    t.s.settle(&mut t.r, &mut t.f, time(t.t, 12));
+    let v = t.view(12);
+    assert_eq!(v[0].stage, Stage::AwaitingReturn);
+    assert_eq!(v[0].fact.map(|f| f.key), Some(key(1)));
+    assert_eq!(v[0].fact.map(|f| f.decision), Some(Some(Decision::Unarmed)));
+    assert!(t.written().is_empty());
+
+    // A helper-only record subsumed before its return: its stage is read
+    // from its kept facts, and its return still completes nothing.
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    t.exit(1, 3);
+    t.ipc(2, Decision::Armed, 0, 10);
+    let pruned =
+        t.r.prune(&mut t.f, G, key(1), true, time(t.t, 11))
+            .unwrap()
+            .is_some();
+    assert!(pruned);
+    assert_eq!(t.stages(11), [Stage::Matched]);
+    t.out(&cat(&[OFF, ON]), 12);
+    assert_eq!(t.stages(12), [Stage::AwaitingPostFlush]);
+    t.out(FRAME, 13);
+    assert_eq!(t.stages(13), [Stage::AwaitingPostFlush]);
+    assert!(t.written().is_empty());
+}
+
+/// Scenario: Under `Hold`, a probe's `Unarmed` helper reports its editor clean and its exit is drained before its frontier is taken; then a later invocation subsumes it and its record is deleted. The segment's kept facts show the frontier as requested at the drain, as taken once it is, and still as taken after the record is gone.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_the_kept_facts_follow_the_record_until_it_goes() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Unarmed, n, 2);
+    t.report(1, Report::Done(Tree::Clean), 3);
+    t.exit(1, 4);
+    let frontier = |t: &T| t.view(5)[0].fact.map(|f| f.frontier);
+    assert_eq!(frontier(&t), Some(Frontier::Requested), "at the drain");
+    t.out(b"later output", 5);
+    let offset = t.m.fed();
+    t.frontier(1);
+    assert_eq!(frontier(&t), Some(Frontier::Taken { offset }));
+    t.ipc(2, Decision::Armed, 0, 10);
+    let pruned =
+        t.r.prune(&mut t.f, G, key(1), true, time(t.t, 11))
+            .unwrap()
+            .is_some();
+    assert!(pruned && t.r.get(key(1)).is_none());
+    t.s.settle(&mut t.r, &mut t.f, time(t.t, 12));
+    assert_eq!(
+        frontier(&t),
+        Some(Frontier::Taken { offset }),
+        "kept after the record went"
+    );
+}
+
+// ---- inbox/probe/050: E1F's truth table ----
+
+/// Run a Codex (or Claude) probe whose `Armed` helper drained, then feed
+/// `pushes` after its trigger: whether the segment completed.
+fn completes(agent: Agent, pushes: &[&[u8]], drained: bool) -> bool {
+    let mut t = T::new(agent, HOLD);
+    let n = t.probe(0);
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    if drained {
+        t.exit(1, 3);
+    }
+    for p in pushes {
+        t.out(p, 4);
+    }
+    !t.written().is_empty()
+}
+
+/// Scenario: On Codex, drive a drained, matched `Armed` probe with output after its trigger: nothing, the disable alone, E1 alone, a frame before the disable or before the enable, the frame with combined parameters or an interrupted escape, the markers inside an OSC or DCS payload, a combined enable, and the whole return with no exit drained. Only `?2004l`, `?2004h`, then an exact `?2026h`, with the exit drained, completes it, and on Claude the pair alone does.
+#[spec("inbox/probe/050")]
+#[test]
+fn probe_050_the_e1f_truth_table() {
+    let codex = |pushes: &[&[u8]]| completes(Agent::Codex, pushes, true);
+    assert!(codex(&[OFF, ON, FRAME]), "the positive");
+    assert!(!codex(&[]), "nothing");
+    assert!(!codex(&[OFF]), "the disable alone");
+    assert!(!codex(&[OFF, ON]), "E1 alone holds");
+    assert!(!codex(&[FRAME, OFF, ON]), "a frame before the disable");
+    assert!(!codex(&[OFF, FRAME, ON]), "a frame before the enable");
+    assert!(!codex(&[ON, OFF, FRAME]), "an enable before the disable");
+    for (frame, why) in [
+        (&b"\x1b[?1049;2026h"[..], "combined parameters"),
+        (b"\x1b[?2026;1h", "a mode after 2026"),
+        (b"\x1b[?2026 h", "an intermediate"),
+        (b"\x1b[?2026\x07h", "a BEL inside"),
+        (b"\x1b\x07[?2026h", "ESC BEL ["),
+        (b"\x1b[?2026l", "a reset"),
+        (b"\x1b]0;[?2026h\x07", "an OSC payload"),
+        (b"\x1bP[?2026h\x1b\\", "a DCS payload"),
+    ] {
+        assert!(!codex(&[OFF, ON, frame]), "{why}");
+        let fresh_after = cat(&[frame, FRAME]);
+        assert!(codex(&[OFF, ON, &fresh_after]), "{why}: the fresh control");
+    }
+    // An ESC inside a string ends it and opens the next sequence, so the
+    // exact marker after it counts, as it does for `B` (`060`).
+    assert!(codex(&[OFF, ON, b"\x1b]0;title\x1b[?2026h"]));
+    // Every ESC-to-`[` gap of `060`.
+    for gap in (0x00..=0x1fu8)
+        .filter(|b| ![0x18, 0x1a, 0x1b].contains(b))
+        .chain([0x7f])
+        .chain(0x80..=0xff)
+    {
+        let frame = cat(&[b"\x1b", &[gap], b"[?2026h"]);
+        assert!(!codex(&[OFF, ON, &frame]), "{gap:#04x} after the ESC");
+    }
+    for (enable, why) in [
+        (&b"\x1b[?1;2004h"[..], "a combined enable"),
+        (b"\x1b\x07[?2004h", "ESC BEL ["),
+        (b"\x1b[?2004 h", "an intermediate"),
+        (b"\x1b]0;[?2004h\x07", "an OSC payload"),
+    ] {
+        assert!(!codex(&[OFF, enable, FRAME]), "{why}");
+        assert!(!completes(Agent::Claude, &[OFF, enable], true), "{why}");
+    }
+    assert!(!codex(&[b"\x1b[?1;2004l", ON, FRAME]), "a combined disable");
+    // Split at every offset: completes once whole.
+    let whole = cat(&[OFF, ON, FRAME]);
+    for a in 0..=whole.len() {
+        for b in a..=whole.len() {
+            assert!(
+                codex(&[&whole[..a], &whole[a..b], &whole[b..]]),
+                "split at {a} and {b}"
+            );
+        }
+    }
+    assert!(
+        !completes(Agent::Codex, &[OFF, ON, FRAME], false),
+        "no exit"
+    );
+    assert!(completes(Agent::Claude, &[OFF, ON], true), "Claude: E1");
+    assert!(
+        !completes(Agent::Claude, &[OFF, ON], false),
+        "Claude: no exit"
+    );
+    assert!(!completes(Agent::Claude, &[OFF], true));
+}
+
+/// Scenario: Feed the marker reader the three return markers, split across pushes, and their lookalikes, and read the offsets it reports. Each exact marker is reported once, with the offset of its own ESC however the bytes were split; a lookalike is reported as nothing.
+#[spec("inbox/probe/050")]
+#[test]
+fn probe_050_the_markers_and_their_offsets() {
+    let stream = cat(&[
+        b"ab",
+        OFF,
+        b"\x1b[?1;2004h",
+        ON,
+        b"x",
+        FRAME,
+        b"\x1b[?2026l",
+    ]);
+    let expected = [
+        Seen {
+            marker: Marker::PasteOff,
+            start: 2,
+        },
+        Seen {
+            marker: Marker::PasteOn,
+            start: 20,
+        },
+        Seen {
+            marker: Marker::Frame,
+            start: 29,
+        },
+    ];
+    for at in 0..=stream.len() {
+        let mut m = ReturnMarkers::default();
+        let mut seen = Vec::new();
+        m.feed(&stream[..at], &mut seen);
+        m.feed(&stream[at..], &mut seen);
+        assert_eq!(seen, expected, "split at {at}");
+        assert_eq!(m.fed(), stream.len() as u64);
+    }
+}
+
+/// Scenario: Watch EC after a frontier at offset 10 and E1 after a trigger at offset 10, feeding markers that start before, at and after it. A marker whose ESC is before the bound counts for neither, one at the bound counts, and EC needs no disable.
+#[spec("inbox/probe/050")]
+#[test]
+fn probe_050_the_start_offset_boundary() {
+    let at = |marker, start| Seen { marker, start };
+    let mut ec = ReturnWatch::ec(10);
+    ec.feed(at(Marker::PasteOn, 9));
+    ec.feed(at(Marker::Frame, 12));
+    assert!(!ec.enabled(), "an enable starting before o");
+    ec.feed(at(Marker::PasteOn, 10));
+    assert!(ec.returned(Agent::Claude));
+    assert!(!ec.returned(Agent::Codex));
+    ec.feed(at(Marker::PasteOff, 15));
+    ec.feed(at(Marker::Frame, 20));
+    assert!(ec.returned(Agent::Codex), "EC reads no disable");
+
+    let mut e1 = ReturnWatch::e1(10);
+    e1.feed(at(Marker::PasteOff, 9));
+    e1.feed(at(Marker::PasteOn, 15));
+    assert!(!e1.enabled(), "a disable before the trigger");
+    e1.feed(at(Marker::PasteOff, 10));
+    e1.feed(at(Marker::PasteOn, 10));
+    assert!(!e1.enabled(), "an enable must start after the disable");
+    e1.feed(at(Marker::PasteOn, 18));
+    e1.feed(at(Marker::Frame, 18));
+    assert!(
+        !e1.returned(Agent::Codex),
+        "a frame must start after the enable"
+    );
+    e1.feed(at(Marker::Frame, 26));
+    assert!(e1.returned(Agent::Codex));
+}
+
+// ---- inbox/probe/058: the completion half ----
+
+/// What the writer scope is when a segment's route is ready.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Scope {
+    Closed,
+    /// Another helper seen by a scan with no decision yet.
+    Pending,
+    /// Another helper's `Survivors` report.
+    Open,
+}
+
+/// Scenario: For each agent, policy, writer-scope state (closed, pending on another helper's undecided sighting, open on another helper's survivors) and route (a helper-only probe's E1/E1F, an editor-bearing probe's EC), complete the route's markers and read whether the segment completed. Only a closed scope completes, and EC only under `Authority`; when the pending helper then declares `Armed`, the refused helper-only route completes on the markers it already had.
+#[spec("inbox/probe/058")]
+#[test]
+fn probe_058_completion_routes_against_the_scope() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        for policy in [HOLD, AUTH] {
+            for scope in [Scope::Closed, Scope::Pending, Scope::Open] {
+                for helper_only in [true, false] {
+                    let mut t = T::new(agent, policy);
+                    let n = t.probe(0);
+                    t.write(n, 1);
+                    match scope {
+                        Scope::Closed => {}
+                        Scope::Pending => {
+                            t.helper(9, Channel::Scan, Attribution::Owned, None, None, (0, 2))
+                        }
+                        Scope::Open => {
+                            t.ipc(9, Decision::Armed, 0, 2);
+                            t.report(9, Report::Done(Tree::Survivors), 2);
+                        }
+                    }
+                    let decision = if helper_only {
+                        Decision::Armed
+                    } else {
+                        Decision::Unarmed
+                    };
+                    t.ipc(1, decision, n, 3);
+                    if helper_only {
+                        t.exit(1, 4);
+                        t.returns(5);
+                    } else {
+                        t.report(1, Report::Done(Tree::Clean), 4);
+                        t.exit(1, 4);
+                        t.frontier(1);
+                        t.out(&cat(&[ON, FRAME]), 5);
+                    }
+                    // The oracle, from the amendments: markers complete only
+                    // in a closed scope, and EC only under Authority (under
+                    // Hold the editor-bearing decision opens the scope too).
+                    let expect = scope == Scope::Closed && (helper_only || policy == AUTH);
+                    let done = !t.written().is_empty();
+                    let case = format!("{agent:?} {policy:?} {scope:?} helper-only {helper_only}");
+                    assert_eq!(done, expect, "{case}");
+                    if scope == Scope::Pending && helper_only {
+                        // The pending helper decides; the harness settles
+                        // the segments after every record step.
+                        t.ipc(9, Decision::Armed, 0, 6);
+                        assert_eq!(t.r.scope().state(), ScopeState::Closed, "{case}");
+                        assert_eq!(t.written(), [Some(n)], "{case}: re-evaluated");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Scenario: Under `Hold`, the production policy, a native record whose editor failed to start (an `Unarmed` decision, then `SpawnFailed`), and a native `Clean` editor with its frontier taken, are offered EC after their whole return: the writer scope or the policy refuses both. In a fresh generation whose scope is closed, the policy itself refuses EC to an `Armed` record.
+#[spec("inbox/probe/058")]
+#[test]
+fn probe_058_hold_completes_nothing_by_ec() {
+    assert_eq!(EC_POLICY, HOLD);
+    // Each in its own generation, so neither subsumes the other.
+    for (pid, report) in [
+        (1, Report::SpawnFailed { errno: Some(2) }),
+        (2, Report::Done(Tree::Clean)),
+    ] {
+        let mut t = T::new(Agent::Codex, EC_POLICY);
+        t.ipc(pid, Decision::Unarmed, 0, 1);
+        t.report(pid, report, 2);
+        t.exit(pid, 3);
+        t.frontier(pid);
+        let mut watch = ReturnWatch::ec(t.m.fed());
+        let mut seen = Vec::new();
+        t.m.feed(&cat(&[ON, FRAME]), &mut seen);
+        for s in seen {
+            watch.feed(s);
+        }
+        assert!(watch.returned(Agent::Codex), "EC's markers are there");
+        let refused = t.r.complete(
+            &mut t.f,
+            G,
+            key(pid),
+            Route::EditorBearing,
+            time(t.t, 7),
+            time(t.t, 7),
+        );
+        assert!(
+            matches!(
+                refused,
+                Err(RecordRefusal::Scope(_)) | Err(RecordRefusal::Policy)
+            ),
+            "{pid}: {refused:?}"
+        );
+    }
+    // With the scope closed, the policy is the refusal.
+    let mut t = T::new(Agent::Codex, EC_POLICY);
+    t.ipc(1, Decision::Armed, 0, 1);
+    t.exit(1, 2);
+    assert_eq!(
+        t.r.complete(
+            &mut t.f,
+            G,
+            key(1),
+            Route::EditorBearing,
+            time(t.t, 3),
+            time(t.t, 3)
+        ),
+        Err(RecordRefusal::Policy),
+        "the policy refuses before the route's own checks"
+    );
+}
+
+/// Scenario: On Codex, open a probe and hold a person's Ctrl+G behind it. While the probe is outstanding the front holds; once the probe completes at E1F the unnumbered Ctrl+G at the front asks for its trigger, and once it is numbered it holds again until its own segment releases.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_an_unnumbered_ctrl_g_at_the_front_asks_for_its_trigger() {
+    let mut t = T::new(Agent::Codex, HOLD);
+    assert_eq!(t.s.front(), Front::None);
+    let n = t.probe(0);
+    t.s.open_human_g(40).unwrap();
+    assert_eq!(t.s.front(), Front::Held, "the probe is outstanding");
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 5);
+    t.out(OFF, 6);
+    t.exit(1, 7);
+    t.out(ON, 8);
+    t.out(FRAME, 9);
+    assert_eq!(t.written(), [Some(n)]);
+    assert_eq!(
+        t.s.front(),
+        Front::Trigger,
+        "the Ctrl+G behind the completed probe asks for its trigger"
+    );
+    assert_eq!(t.s.next_trigger(), Some(2));
+    assert_eq!(
+        t.s.front(),
+        Front::Held,
+        "numbered, it holds until it releases"
+    );
+}
+
+/// Scenario: For Claude and Codex, open a `HumanG` from a person's cut Ctrl+G with nothing open: it is the front at once, asking for its trigger, and numbered it holds. Then open one behind a probe that is still open: it waits unnumbered, the front holding, until the probe's trigger is withdrawn, after which it asks for its trigger and takes the next number (A-20d-5).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_cut_ctrl_g_opens_a_humang_that_asks_for_its_trigger() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        t.s.open_cut().unwrap();
+        assert_eq!(t.s.front(), Front::Trigger, "{agent:?}: alone, it asks");
+        assert_eq!(t.s.next_trigger(), Some(1), "{agent:?}");
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: numbered, it holds");
+        assert_eq!(t.s.next_trigger(), None, "{agent:?}: numbered once");
+
+        let mut t = T::new(agent, HOLD);
+        let n = t.probe(0);
+        t.s.open_cut().unwrap();
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: behind the probe");
+        assert_eq!(t.s.next_trigger(), None, "{agent:?}: the probe is open");
+        t.s.withdrawn(n).unwrap();
+        assert_eq!(t.ended(), [(Some(n), Kind::Probe, Outcome::TakenBack)]);
+        assert_eq!(t.s.front(), Front::Trigger, "{agent:?}: now it asks");
+        assert_eq!(t.s.next_trigger(), Some(n + 1), "{agent:?}");
+    }
+}
+
+/// Scenario: On Claude, open a probe, write it and let its own helper decide `Armed`. The decided probe is handed to the epoch's settlement once; handing it back for probe numbers it does not carry changes nothing, and handing it back by its own number hands it out once more.
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_decided_probe_is_handed_out_once_until_handed_back() {
+    let mut t = T::new(Agent::Claude, AUTH);
+    let n = t.probe(0);
+    t.s.open_human_g(40).unwrap();
+    t.write(n, 1);
+    assert!(
+        t.s.take_decided_probes(&t.r).is_empty(),
+        "nothing decided yet"
+    );
+    t.ipc(1, Decision::Armed, n, 5);
+    assert_eq!(
+        t.s.take_decided_probes(&t.r),
+        [(n, key(1), Decision::Armed)]
+    );
+    assert!(t.s.take_decided_probes(&t.r).is_empty(), "once");
+    t.s.undecide(n + 1);
+    t.s.undecide(n + 100);
+    assert!(
+        t.s.take_decided_probes(&t.r).is_empty(),
+        "another number hands back nothing"
+    );
+    t.s.undecide(n);
+    assert_eq!(
+        t.s.take_decided_probes(&t.r),
+        [(n, key(1), Decision::Armed)],
+        "handed back, it is handed out again"
+    );
+    assert!(
+        t.s.take_decided_probes(&t.r).is_empty(),
+        "and once more only"
+    );
+}
+
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running with the identity the observer pinned, once after the record matched the segment and once before it did. Either way the segment's view names that editor process, `(pid, start)`, so a release can ask whether the same process still runs; an editor reported with no identity names none until a pinned report comes (A-20d-6).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_the_segment_keeps_the_pinned_editors_identity() {
+    let editor = RecordKey {
+        pid: 4321,
+        start: 99,
+    };
+    for pinned_first in [false, true] {
+        let mut t = T::new(Agent::Claude, AUTH);
+        let n = t.probe(0);
+        t.s.open_human_g(1).unwrap();
+        t.write(n, 1);
+        t.ipc(1, Decision::Armed, n, 2);
+        t.exit(1, 3);
+        t.returns(4);
+        let g = t.s.next_trigger().unwrap();
+        t.write(g, 5);
+        if pinned_first {
+            assert!(
+                !t.s.editor_pinned_for_test(&mut t.r, &mut t.f, key(2), Some(editor), time(t.t, 5)),
+                "no segment has matched its record yet"
+            );
+        }
+        t.ipc(2, Decision::Unarmed, g, 6);
+        if !pinned_first {
+            assert_eq!(t.view(6)[0].editor, None, "nothing pinned yet");
+            assert!(t.editor(2, 6), "a report with no identity");
+            assert_eq!(t.view(6)[0].editor, None, "it names no process");
+            assert!(t.s.editor_pinned_for_test(
+                &mut t.r,
+                &mut t.f,
+                key(2),
+                Some(editor),
+                time(t.t, 7)
+            ));
+        }
+        let v = t.view(7);
+        assert_eq!(v[0].stage, Stage::Released, "pinned first: {pinned_first}");
+        assert_eq!(v[0].editor, Some(editor), "pinned first: {pinned_first}");
+    }
+}
+
+/// Scenario: Write a held Ctrl+G whose helper decides `Unarmed`, and report its editor running, pinned with a check of whether that very process still runs. While the check says it runs, the held typing is released to it; when the pinned editor has already exited by the time the release would be decided, nothing is released early: the segment is held as one whose editor never ran, until its helper's completion under `Authority` and, under `Hold`, until its helper's clean report is in at its drained exit, after which it releases while the Ctrl+G behind it waits for retirement (A-20d-6, option (a); the revb21 review's U2-1; A-20d-15).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_a_release_rechecks_that_the_pinned_editor_still_runs() {
+    use dot_agent_deck::composer_probe::segments::EditorPin;
+    let editor = RecordKey {
+        pid: 4321,
+        start: 99,
+    };
+    for running in [true, false] {
+        let mut t = T::new(Agent::Claude, AUTH);
+        let n = t.probe(0);
+        t.s.open_human_g(1).unwrap();
+        t.write(n, 1);
+        t.ipc(1, Decision::Armed, n, 2);
+        t.exit(1, 3);
+        t.returns(4);
+        let g = t.s.next_trigger().unwrap();
+        t.write(g, 5);
+        t.ipc(2, Decision::Unarmed, g, 6);
+        assert!(t.s.editor_pinned_with(
+            &mut t.r,
+            &mut t.f,
+            key(2),
+            EditorPin::new(editor, move || running),
+            time(t.t, 7)
+        ));
+        let v = t.view(7);
+        assert_eq!(v[0].editor, Some(editor));
+        if running {
+            assert_eq!(v[0].stage, Stage::Released, "the editor runs");
+        } else {
+            assert_ne!(v[0].stage, Stage::Released, "the editor already exited");
+        }
+    }
+
+    // Under `Hold` (production's policy) the segment never completes. An
+    // editor found gone releases nothing on its pin; once the helper's
+    // clean report was in at its drained exit, the editor's end is known and
+    // it is released (A-20d-15, replacing the revb21 review's U2-1 ruling
+    // (a), under which it held until retirement). This arm asserts nothing
+    // between the report and the exit: the report alone holding is
+    // `probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_the_end`'s.
+    // The Ctrl+G behind it still waits for retirement here, where nothing
+    // drives a refusal (`inbox/probe/087`).
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.s.open_human_g(1).unwrap();
+    t.s.open_human_g(2).unwrap();
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    t.exit(1, 3);
+    t.returns(4);
+    assert_eq!(t.written(), [Some(n)]);
+    let g = t.s.next_trigger().unwrap();
+    t.write(g, 5);
+    t.ipc(2, Decision::Unarmed, g, 6);
+    assert!(t.s.editor_pinned_with(
+        &mut t.r,
+        &mut t.f,
+        key(2),
+        EditorPin::new(editor, || false),
+        time(t.t, 7)
+    ));
+    assert_ne!(t.stages(7)[0], Stage::Released, "the editor already exited");
+    t.report(2, Report::Done(Tree::Clean), 8);
+    t.exit(2, 9);
+    t.frontier(2);
+    t.out(&cat(&[ON, FRAME]), 10);
+    t.returns(11);
+    let v = t.view(11);
+    assert_eq!(
+        v[0].stage,
+        Stage::Released,
+        "released once its helper reported the editor's end and drained (A-20d-15)"
+    );
+    assert!(t.written().is_empty(), "Hold completes nothing");
+    assert_eq!(t.s.next_trigger(), None, "the Ctrl+G behind it stays held");
+    t.s.retire();
+    assert_eq!(
+        t.ended(),
+        [
+            (Some(g), Kind::HumanG, Outcome::Retired),
+            (None, Kind::HumanG, Outcome::Retired)
+        ],
+        "only retirement ends it"
+    );
+}
+
+/// Scenario: For Claude and Codex under `Hold`, write a held Ctrl+G whose helper decides `Unarmed` and runs the person's editor, which is either pinned and already gone when the release is decided or never seen running, with a second Ctrl+G held behind it. Nothing goes while the helper runs, nor on its clean report alone; once that report was in when the helper's exit drained, Claude's segment releases at the drain, while Codex's holds even after its return past the drain frontier (`?2004h`, then `?2026h`), since that frontier isn't premise-backed (the revd21 review's U2-1). The segment stays open, so under `Hold` the second Ctrl+G is never written. A helper that reported survivors releases Claude's too and holds Codex's; a helper that drained with no report, whose clean report arrived only after its drain, or that couldn't account for the editor's tree holds on both until retirement (A-20d-15).
+#[spec("inbox/probe/009")]
+#[test]
+fn probe_009_typing_behind_an_editor_that_ended_goes_once_its_helper_reported_the_end() {
+    use dot_agent_deck::composer_probe::segments::EditorPin;
+    let editor = RecordKey {
+        pid: 4321,
+        start: 99,
+    };
+    // A held Ctrl+G with a second one behind it, its helper `Unarmed`, and
+    // the editor pinned gone (`pinned`) or never reported.
+    let start = |agent: Agent, pinned: bool| {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.s.open_human_g(2).unwrap();
+        t.write(g, 1);
+        t.ipc(1, Decision::Unarmed, g, 2);
+        if pinned {
+            assert!(t.s.editor_pinned_with(
+                &mut t.r,
+                &mut t.f,
+                key(1),
+                EditorPin::new(editor, || false),
+                time(t.t, 3)
+            ));
+        }
+        assert_eq!(
+            t.s.front(),
+            Front::Held,
+            "{agent:?} {pinned}: no editor runs"
+        );
+        t
+    };
+    for agent in [Agent::Claude, Agent::Codex] {
+        for pinned in [true, false] {
+            let mut t = start(agent, pinned);
+            t.report(1, Report::Done(Tree::Clean), 4);
+            assert_eq!(
+                t.s.front(),
+                Front::Held,
+                "{agent:?} {pinned}: the report alone, the helper still running"
+            );
+            t.exit(1, 5);
+            t.frontier(1);
+            if agent == Agent::Codex {
+                assert_eq!(t.s.front(), Front::Held, "Codex: not before its return");
+                t.out(ON, 6);
+                assert_eq!(t.s.front(), Front::Held, "Codex: the enable alone");
+                t.out(FRAME, 7);
+            }
+            // U2-1: the release is Claude's alone; Codex holds through its
+            // return past a frontier E-MF's scan took.
+            let want = match agent {
+                Agent::Claude => Front::Released,
+                Agent::Codex => Front::Held,
+            };
+            assert_eq!(
+                t.s.front(),
+                want,
+                "{agent:?} {pinned}: the editor ended, by its helper's own report"
+            );
+            assert_eq!(
+                t.stages(8)[0] == Stage::Released,
+                agent == Agent::Claude,
+                "{agent:?} {pinned}"
+            );
+            t.returns(9);
+            assert_eq!(t.s.front(), want, "{agent:?} {pinned}: it stays");
+            assert!(
+                t.written().is_empty(),
+                "{agent:?} {pinned}: Hold completes nothing"
+            );
+            assert_eq!(
+                t.s.next_trigger(),
+                None,
+                "{agent:?} {pinned}: the second Ctrl+G stays behind it under Hold"
+            );
+        }
+
+        // Survivors: the helper reaped its editor and found its tree still
+        // running. Claude releases at the drain; Codex takes no frontier.
+        let mut t = start(agent, true);
+        t.report(1, Report::Done(Tree::Survivors), 4);
+        t.exit(1, 5);
+        t.returns(6);
+        let survivors = t.s.front();
+        assert_eq!(
+            survivors == Front::Released,
+            agent == Agent::Claude,
+            "{agent:?}: survivors"
+        );
+
+        // The controls: no report at the drain, one only after it, and a
+        // tree the helper couldn't account for.
+        for (late, report) in [
+            (false, None),
+            (true, Some(Report::Done(Tree::Clean))),
+            (false, Some(Report::Done(Tree::Unknown))),
+        ] {
+            let mut t = start(agent, true);
+            if let (false, Some(report)) = (late, report) {
+                t.report(1, report, 3);
+            }
+            t.exit(1, 4);
+            if let (true, Some(report)) = (late, report) {
+                t.report(1, report, 5);
+            }
+            t.frontier(1);
+            t.returns(6);
+            t.out(&cat(&[ON, FRAME]), 7);
+            assert_eq!(
+                t.s.front(),
+                Front::Held,
+                "{agent:?} {report:?} late={late}: no known end at the drain"
+            );
+            assert_ne!(
+                t.stages(7)[0],
+                Stage::Released,
+                "{agent:?} {report:?} late={late}"
+            );
+            t.s.retire();
+            assert_eq!(
+                t.ended(),
+                [
+                    (Some(1), Kind::HumanG, Outcome::Retired),
+                    (None, Kind::HumanG, Outcome::Retired)
+                ],
+                "{agent:?} {report:?} late={late}: only retirement ends it"
+            );
+        }
+    }
+}
+
+// ---- inbox/probe/087: a segment that can never complete ----
+
+/// Scenario: For Claude and Codex under `Hold`, a held Ctrl+G is written as its own trigger and its helper decides `Unarmed` and runs the person's editor, with two more Ctrl+G presses waiting behind it. The segment releases and the writer scope opens, so it can never complete: it reads stranded, and refusing what waits behind it ends both waiting Ctrl+G presses `Refused`, unwritten, while the front stays released and open. A second refusal finds nothing more; with the editor's helper drained, it is still stranded; only retirement ends the front.
+#[spec("inbox/probe/087")]
+#[test]
+fn probe_087_a_released_segment_whose_scope_is_open_is_stranded() {
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.s.open_human_g(2).unwrap();
+        t.s.open_human_g(3).unwrap();
+        t.write(g, 1);
+        assert!(!t.s.stranded(&t.r), "{agent:?}: unmatched, it holds");
+        t.ipc(1, Decision::Unarmed, g, 2);
+        assert!(!t.s.stranded(&t.r), "{agent:?}: no editor seen, it holds");
+        assert!(!t.s.refuse_behind(&t.r), "{agent:?}: so nothing is refused");
+        assert!(t.editor(1, 3));
+        assert_eq!(t.s.front(), Front::Released, "{agent:?}");
+        assert!(
+            matches!(t.r.scope().state(), ScopeState::Open(_)),
+            "{agent:?}: an `Unarmed` decision opens the scope under Hold"
+        );
+        assert!(
+            t.s.stranded(&t.r),
+            "{agent:?}: released, and never to complete"
+        );
+        assert!(t.s.refuse_behind(&t.r), "{agent:?}");
+        assert_eq!(
+            t.ended(),
+            [
+                (None, Kind::HumanG, Outcome::Refused),
+                (None, Kind::HumanG, Outcome::Refused)
+            ],
+            "{agent:?}: both waiting presses refused, unnumbered"
+        );
+        assert_eq!(t.s.len(), 1, "{agent:?}: the front stays");
+        assert_eq!(t.s.front(), Front::Released, "{agent:?}");
+        assert_eq!(t.s.next_trigger(), None, "{agent:?}: no trigger");
+        assert!(t.s.refuse_behind(&t.r), "{agent:?}: still stranded");
+        assert!(t.ended().is_empty(), "{agent:?}: nothing more to refuse");
+        t.report(1, Report::Done(Tree::Clean), 4);
+        t.exit(1, 5);
+        t.returns(6);
+        assert!(
+            t.s.stranded(&t.r),
+            "{agent:?}: drained, still never to complete"
+        );
+        t.s.retire();
+        assert!(!t.s.stranded(&t.r), "{agent:?}: retired");
+        assert_eq!(
+            t.ended(),
+            [(Some(g), Kind::HumanG, Outcome::Retired)],
+            "{agent:?}: only retirement ends the front"
+        );
+    }
+}
+
+/// Scenario: The controls for a stranded front. On Claude, a probe answered `Armed` releases at its decision with the writer scope closed: it can still complete, so it isn't stranded and nothing waiting behind it is refused, and its return completes it and numbers the next. Under `Authority` an `Unarmed` decision opens no scope, so a released editor segment isn't stranded either. A release cut off by an unknown wait (its helper drained with no report) holds, so it isn't stranded, though the scope is open.
+#[spec("inbox/probe/087")]
+#[test]
+fn probe_087_a_front_that_can_still_complete_or_holds_is_not_stranded() {
+    let mut t = T::new(Agent::Claude, HOLD);
+    let n = t.probe(0);
+    t.s.open_human_g(1).unwrap();
+    t.write(n, 1);
+    t.ipc(1, Decision::Armed, n, 2);
+    assert_eq!(t.s.front(), Front::Released);
+    assert_eq!(t.r.scope().state(), ScopeState::Closed);
+    assert!(!t.s.stranded(&t.r), "it can still complete");
+    assert!(!t.s.refuse_behind(&t.r));
+    assert!(t.ended().is_empty(), "nothing refused");
+    t.exit(1, 3);
+    t.returns(4);
+    assert_eq!(t.written(), [Some(n)], "it completes");
+    assert_eq!(t.s.next_trigger(), Some(2), "and the next goes");
+
+    let mut t = T::new(Agent::Claude, AUTH);
+    let g = t.s.open_held_trigger().unwrap();
+    t.s.open_human_g(2).unwrap();
+    t.write(g, 1);
+    t.ipc(1, Decision::Unarmed, g, 2);
+    assert!(t.editor(1, 3));
+    assert_eq!(t.s.front(), Front::Released);
+    assert_eq!(t.r.scope().state(), ScopeState::Closed, "Authority");
+    assert!(!t.s.stranded(&t.r), "EC can still complete it");
+
+    for agent in [Agent::Claude, Agent::Codex] {
+        let mut t = T::new(agent, HOLD);
+        let g = t.s.open_held_trigger().unwrap();
+        t.s.open_human_g(2).unwrap();
+        t.write(g, 1);
+        t.ipc(1, Decision::Unarmed, g, 2);
+        assert!(t.editor(1, 3));
+        t.exit(1, 4);
+        assert_eq!(t.s.front(), Front::Held, "{agent:?}: cut off");
+        assert!(
+            matches!(t.r.scope().state(), ScopeState::Open(_)),
+            "{agent:?}"
+        );
+        assert!(!t.s.stranded(&t.r), "{agent:?}: it holds, so not stranded");
+        assert!(!t.s.refuse_behind(&t.r), "{agent:?}");
+        assert!(t.ended().is_empty(), "{agent:?}: nothing refused");
+    }
+}

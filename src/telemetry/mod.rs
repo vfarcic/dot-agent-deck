@@ -282,12 +282,22 @@ pub fn commit_spawn(run: Option<PreparedRun>) {
     }
 }
 
+/// Issue #2028: the agent `agent_id` on `pane_id` reached the end of its PTY
+/// while the deck still held it, so it ended by itself
+/// ([`Telemetry::agent_ended_by_itself`]). Called by its PTY reader in the
+/// registry's lock hold that decides so, before [`agent_exited`] ends its run.
+pub fn agent_ended_by_itself(telemetry: Option<&Telemetry>, pane_id: Option<&str>, agent_id: &str) {
+    if let (Some(telemetry), Some(_)) = (telemetry, pane_id) {
+        telemetry.agent_ended_by_itself(agent_id);
+    }
+}
+
 /// The agent `agent_id` on `pane_id` reached the end of its PTY: end its run,
 /// as `daemon_shutdown` while the daemon is shutting down, as `exited` when
-/// the agent is still registered (nothing removed it, so it went by itself),
-/// and as `closed` otherwise. `still_registered` is asked only when telemetry
-/// is on, and `exit_status` (the agent's child's, once it has exited) only
-/// for an agent that went by itself: its child can close its terminal a
+/// the agent was still registered when its PTY ended (nothing had removed it,
+/// so it went by itself, whatever removes it afterwards), and as `closed`
+/// otherwise. `exit_status` (the agent's child's, once it has exited) is asked
+/// only for an agent that went by itself: its child can close its terminal a
 /// moment before it exits, so it is asked again for up to
 /// [`EXIT_CODE_WAIT`].
 pub fn agent_exited(
@@ -295,13 +305,13 @@ pub fn agent_exited(
     pane_id: Option<&str>,
     agent_id: &str,
     shutting_down: bool,
-    still_registered: impl FnOnce() -> bool,
+    registered_at_eof: bool,
     exit_status: impl Fn() -> Option<portable_pty::ExitStatus>,
 ) {
     let (Some(telemetry), Some(pane_id)) = (telemetry, pane_id) else {
         return;
     };
-    let reason = end_reason(shutting_down, still_registered);
+    let reason = end_reason(shutting_down, registered_at_eof);
     let code = (reason == EndReason::Exited)
         .then(|| {
             let deadline = std::time::Instant::now() + EXIT_CODE_WAIT;
@@ -335,10 +345,10 @@ fn exit_code(status: &portable_pty::ExitStatus) -> Option<i32> {
 /// terminal closed.
 pub const EXIT_CODE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
-fn end_reason(shutting_down: bool, still_registered: impl FnOnce() -> bool) -> EndReason {
+fn end_reason(shutting_down: bool, registered_at_eof: bool) -> EndReason {
     if shutting_down {
         EndReason::DaemonShutdown
-    } else if still_registered() {
+    } else if registered_at_eof {
         EndReason::Exited
     } else {
         EndReason::Closed
@@ -763,24 +773,17 @@ mod tests {
 
     #[test]
     fn the_end_reason_follows_shutdown_then_registration() {
-        assert_eq!(
-            end_reason(true, || panic!("not asked during shutdown")),
-            EndReason::DaemonShutdown
-        );
-        assert_eq!(end_reason(false, || true), EndReason::Exited);
-        assert_eq!(end_reason(false, || false), EndReason::Closed);
+        assert_eq!(end_reason(true, true), EndReason::DaemonShutdown);
+        assert_eq!(end_reason(true, false), EndReason::DaemonShutdown);
+        assert_eq!(end_reason(false, true), EndReason::Exited);
+        assert_eq!(end_reason(false, false), EndReason::Closed);
     }
 
     #[test]
     fn the_seams_do_nothing_when_telemetry_is_off() {
-        agent_exited(
-            None,
-            Some("p1"),
-            "a1",
-            false,
-            || panic!("registration is not asked with telemetry off"),
-            || panic!("the exit status is not asked with telemetry off"),
-        );
+        agent_exited(None, Some("p1"), "a1", false, true, || {
+            panic!("the exit status is not asked with telemetry off")
+        });
         observe_pane_input(None, true, "p1", b"x");
         commit_spawn(None);
     }

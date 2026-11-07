@@ -1,0 +1,959 @@
+{
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "mode": "forms",
+ "error": null,
+ "size": [
+  50,
+  200
+ ],
+ "term": "xterm-256color",
+ "colorterm": "truecolor",
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "setup": "nollm: dummy key, loopback Responses server, bwrap --unshare-net, tmpfs /home /root /tmp /run/user",
+ "recorder_sha256": "1bb22be75acc1823a61dd808202a7dea6609ac44b40f5828d01a97024136fd81",
+ "rows": [
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "esc-bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "esc-bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-103-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "mok-103",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "mok-103",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "u-71-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "mok-71",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "mok-71",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "esc-bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "esc-bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-103-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "mok-103",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "mok-103",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "u-71-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "mok-71",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "slash",
+   "form": "mok-71",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "/"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "esc-bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "esc-bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-103-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "mok-103",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "mok-103",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "u-71-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "mok-71",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "ctrlr",
+   "form": "mok-71",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "esc-bel",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "esc-bel",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": true,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-103-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "mok-103",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "mok-103",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-implicit",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-implicit",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-event1",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-event1",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-event2",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-event2",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-event3",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "u-71-event3",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "mok-71",
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "shortcuts",
+   "form": "mok-71",
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "Ask Codex to do anything"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "esc-bel-gap",
+   "split": false,
+   "gap_s": 0,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "esc-bel-gap",
+   "split": false,
+   "gap_s": 0.03,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "forms",
+   "state": "composer",
+   "form": "esc-bel-gap",
+   "split": false,
+   "gap_s": 0.06,
+   "opened": true,
+   "composer_after": "MEASURE_DRAFT"
+  },
+  {
+   "cell": "paste-bel",
+   "state": null,
+   "form": null,
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "BASEPASTETAIL",
+   "run": 1,
+   "next_export_hex": "4241534550415354455441494c"
+  },
+  {
+   "cell": "paste-bel",
+   "state": null,
+   "form": null,
+   "split": false,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "BASEPASTETAIL",
+   "run": 2,
+   "next_export_hex": "4241534550415354455441494c"
+  },
+  {
+   "cell": "paste-bel",
+   "state": null,
+   "form": null,
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "BASEPASTETAIL",
+   "run": 1,
+   "next_export_hex": "4241534550415354455441494c"
+  },
+  {
+   "cell": "paste-bel",
+   "state": null,
+   "form": null,
+   "split": true,
+   "gap_s": 0.0,
+   "opened": false,
+   "composer_after": "BASEPASTETAIL",
+   "run": 2,
+   "next_export_hex": "4241534550415354455441494c"
+  }
+ ]
+}

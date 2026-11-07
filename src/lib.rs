@@ -48,6 +48,10 @@ pub mod daemon_status;
 pub mod daemon_stop;
 pub mod daemon_upgrade;
 pub mod deck_list;
+// PRD #1666 part 3 (Q105b.2): the test and `e2e` builds' writer and attach
+// controls; a release build has none.
+#[cfg(any(test, feature = "e2e"))]
+pub mod e2e_controls;
 // PRD #1666: the deck's persistent id, carried in inbox addresses and message ids.
 pub mod deck_identity;
 pub mod devin_hooks_manage;
@@ -58,10 +62,18 @@ pub mod dispatch;
 pub mod dispatch_return;
 // PRD #1666 S4: the fixed one-line doorbell for an agent with no armed inbox component.
 pub mod doorbell;
+// PRD #1666 part 3 round 5-wake: which agent releases the doorbell may type into.
+pub mod doorbell_activation;
+pub mod doorbell_generation;
+// PRD #1666 part 3 round 5-wake: an agent's screen read losslessly, and the measured recognisers.
+pub mod doorbell_screen;
+pub mod doorbell_switch;
+// PRD #1666 part 3 round 5-wake: the doorbell transaction as a pure model, inert until activation.
+pub mod doorbell_txn;
 // PRD #1589: the record of dispatched units the `close` verb is authorized from.
 pub mod dispatched_units;
-// Issue #544: the per-pane unsent-draft bit the doorbell reads before it writes.
-pub mod draft_deferral;
+// PRD #1666 part 3 (Q35): checking an agent's input box through its own Ctrl+G.
+pub mod composer_probe;
 pub mod embedded_pane;
 // PRD #1419 Decision 4: the user docs embedded at build time for `docs [topic]`.
 pub mod embedded_docs;
@@ -77,6 +89,8 @@ pub mod env_override;
 pub mod error;
 pub mod event;
 pub mod event_subscriber;
+// PRD #1666 part 3 round 5-wake: whether a parsed frame was drawn for the PTY's current width.
+pub mod evidence_state;
 pub mod features;
 pub mod guarded;
 // PRD #1105 M11: when the TUI claims focus on its daemon (terminal focus-in and
@@ -98,6 +112,7 @@ pub mod hooks_refresh;
 pub mod hyperlink;
 // PRD #1666: the per-agent inbox every deck message is posted to (pure data).
 pub mod inbox;
+// PRD #1666 part 3 round 5-wake: human operations on an agent's input, arrival to PTY.
 pub mod inbox_attempts;
 pub mod inbox_cli;
 pub mod inbox_display;
@@ -109,8 +124,11 @@ pub mod inbox_receipt;
 pub mod inbox_receiver;
 pub mod inbox_spills;
 pub mod inbox_watcher;
+pub mod ingress_ledger;
 pub mod init;
 pub mod injected_prompt;
+// PRD #1666 part 3 round 5-wake: a wrapper's samples of its agent's line discipline.
+pub mod input_mode;
 pub mod issue_dispatch;
 pub mod issue_dispatch_run;
 pub mod jsonc_edit;
@@ -153,6 +171,8 @@ pub mod pull_request_info;
 pub mod question;
 pub mod quota_block;
 pub mod quota_signals;
+// PRD #1666 part 3 round 5-wake: an agent's release, read off its start-up header.
+pub mod release_scanner;
 pub mod remote;
 pub mod remote_daemon;
 pub mod remote_doctor;
@@ -216,6 +236,7 @@ pub mod upgrade_dialog;
 pub mod version;
 // vt100 0.18 sizes grids in `NonZeroU16`; the deck's `u16` geometry crosses here.
 pub mod vt_grid;
+pub mod vt_work;
 pub mod watch;
 pub mod worktree_owner;
 pub mod worktree_reclaim;

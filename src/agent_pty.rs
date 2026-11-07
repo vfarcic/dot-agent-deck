@@ -18,7 +18,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, oneshot};
 
 use crate::event::{AgentType, OrchestrationSurface};
-use crate::pane_input::{PaneInputError, SUBMIT_DELAY, encode_pane_payload};
+use crate::pane_input::PaneInputError;
 use crate::state::Ownership;
 use crate::terminal_modes::ReplayModes;
 
@@ -1013,6 +1013,14 @@ pub struct AgentPty {
     /// only inherited forward — so it must be created here, at spawn, and live as
     /// long as the agent. See [`crate::platform::proc::AgentProcessGroup`].
     pub process_group: crate::platform::proc::AgentProcessGroup,
+    /// PRD #1666 part 3 (Q84): the argv the deck executed as the child, the
+    /// launch provenance an editor-probe observer binds `A` from.
+    pub argv: Vec<std::ffi::OsString>,
+    /// PRD #1666 part 3 (E-MF): the boot-clock tick read just before
+    /// `openpty`: a process that could have inherited the master started at
+    /// or after it.
+    #[cfg(target_os = "linux")]
+    pub opened: Option<u64>,
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -1685,6 +1693,10 @@ fn spawn_with_dir(
     // Issue #1884: allocation alone is retried on macOS; nothing below is.
     let pty_system = crate::pty_open_retry::RetryingPtySystem(NativePtySystem::default());
 
+    // PRD #1666 part 3 (E-MF): before the master exists, so every process
+    // that could inherit it started at or after this tick.
+    #[cfg(target_os = "linux")]
+    let opened = crate::composer_probe::master_holders::boot_ticks();
     let pair = pty_system
         .openpty(PtySize {
             rows,
@@ -1840,6 +1852,19 @@ fn spawn_with_dir(
     // reads. Only `spawn_agent`'s overlay, this daemon's own value, reaches a
     // child.
     cmd.env_remove(crate::inbox_receipt::ENV_INBOX_SPOOL);
+    // PRD #1666 part 3 (Q35-13): the editor helper's variables, on the same
+    // rule: every inherited name under the reserved prefix, the three the
+    // helper reads among them, so one left in the daemon's environment never
+    // points a child's helper at another daemon's instance or generation.
+    // This scrubs what is inherited only: the caller's overlay below is
+    // applied afterwards, so a caller that names one in `opts.env` sets it,
+    // on an installed spawn or not. An installed spawn's own overlay is the
+    // daemon's caller that does.
+    for (var, _) in std::env::vars_os() {
+        if crate::composer_probe::install::helper_reserved(&var) {
+            cmd.env_remove(var);
+        }
+    }
     // The receipt watcher's test knobs, likewise: one left in the daemon's
     // environment never reaches an agent's watcher unless the spawn sets it.
     for knob in crate::inbox_watcher::TEST_KNOBS {
@@ -1917,6 +1942,7 @@ fn spawn_with_dir(
         match *never {}
     }
 
+    let argv = cmd.get_argv().clone();
     let child = pair
         .slave
         .spawn_command(cmd)
@@ -1979,6 +2005,9 @@ fn spawn_with_dir(
         writer,
         reader,
         process_group,
+        argv,
+        #[cfg(target_os = "linux")]
+        opened,
     })
 }
 
@@ -2013,10 +2042,50 @@ const GEOMETRY_BROADCAST_CAPACITY: usize = 16;
 pub struct AgentBus {
     tx: broadcast::Sender<Arc<Vec<u8>>>,
     state: Mutex<AgentBusState>,
+    /// The generation the bus carries, for its log lines.
+    label: String,
     /// Test hook run once by the next resize between its ioctl and its ring
     /// clear (`inbox/doorbell/034`).
     #[cfg(test)]
     between_resize_and_clear: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test hook run once by the next push that moves the release capture,
+    /// as soon as its output is published (`inbox/probe/076`).
+    #[cfg(test)]
+    after_latch_published: Mutex<Option<AfterLatchPublished>>,
+    /// PRD #1666 part 3 (Q35-06): the generation's input epoch, which the
+    /// output hook notes into and the generation's PTY writer moves. Kept
+    /// here, outside `state`, so taking it never takes the output lock.
+    input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    /// PRD #1666 part 3 (Q35-14b): the bell of an installed generation's
+    /// observer, shared with the output hook: rung when the release latch
+    /// moves.
+    composer_bell: crate::composer_probe::observe::BellSlot,
+    /// The agent the generation was spawned as, whose release alone sets its
+    /// input grammar (Q83); `None` keeps it strict.
+    spawned_as: Option<AgentType>,
+}
+
+/// Test seam: [`AgentBus`]'s hook for the next push that moves the release
+/// capture, given the pushed bytes.
+#[cfg(test)]
+type AfterLatchPublished = Box<dyn FnOnce(&[u8]) + Send>;
+
+/// What one [`AgentBus::push`] cost under the output lock (plan §9.1). Read
+/// by the budget measurement; production logs the scanner's share per
+/// generation (`release scanner timing`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct PushCost {
+    /// From taking the lock to releasing it.
+    hold_ns: u64,
+    /// The evidence parser's share.
+    evidence_ns: u64,
+    /// The release scanner's wall and CPU nanoseconds, while its window was
+    /// open.
+    scanner: Option<(u64, u64)>,
+    /// The generation's release latch changed, or its window closed: its
+    /// re-projection is due (plan §3.4′).
+    latch_changed: bool,
 }
 
 struct AgentBusState {
@@ -2033,6 +2102,18 @@ struct AgentBusState {
     /// repaints the alternate one in place, and the TUI's cannot-scroll notice
     /// then calls the pane one with nothing to scroll.
     ring_start_modes: ReplayModes,
+    /// PRD #1666 part 3, round 5-wake (plan §2.2): whether the frame parsed
+    /// from this stream was drawn for the PTY's current geometry. Kept under
+    /// the same lock as the ring so a layout edge's ioctl and the bytes around
+    /// it are ordered.
+    evidence: crate::evidence_state::EvidenceState,
+    /// PRD #1666 part 3, round 5-wake (plan §4.6): the generation's release,
+    /// read off its start-up header by a scanner fed every byte of the window.
+    release: crate::release_scanner::ReleaseCapture,
+    /// PRD #1666 part 3 (Q35-02): core's output hook, fed every byte under this
+    /// lock before it is published. Nothing reads it yet, nor the input
+    /// epoch it notes into (Q35-06).
+    output_hook: crate::composer_probe::paste_mode::OutputHook,
 }
 
 impl AgentBusState {
@@ -2061,16 +2142,103 @@ impl Default for AgentBus {
 
 impl AgentBus {
     pub fn new() -> Self {
+        Self::profiled(None, 24, 80)
+    }
+
+    /// [`Self::profiled`] for generation `agent_id`, named in its log lines.
+    pub fn for_generation(
+        agent_id: &str,
+        profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self {
+            label: agent_id.to_string(),
+            ..Self::profiled(profile, rows, cols)
+        }
+    }
+
+    /// A bus whose evidence state tracks `profile`'s screen from a spawn at
+    /// `rows` × `cols` (PRD #1666 part 3, round 5-wake).
+    pub fn profiled(
+        profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
         let (tx, _rx0) = broadcast::channel(BROADCAST_CAPACITY);
+        let input = Arc::new(crate::composer_probe::epoch::GenerationInput::profiled(
+            profile.map_or(
+                crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+                |p| p.cpr_wait_end,
+            ),
+            profile.map(|p| &p.redraw),
+            Instant::now(),
+        ));
+        let output_hook = crate::composer_probe::paste_mode::OutputHook::new(Arc::clone(&input));
+        let composer_bell = output_hook.bell_slot();
         Self {
             tx,
             state: Mutex::new(AgentBusState {
                 scrollback: VecDeque::new(),
                 live_modes: ReplayModes::default(),
                 ring_start_modes: ReplayModes::default(),
+                evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
+                release: crate::release_scanner::ReleaseCapture::start(rows, cols),
+                output_hook,
             }),
+            label: String::new(),
             #[cfg(test)]
             between_resize_and_clear: Mutex::new(None),
+            #[cfg(test)]
+            after_latch_published: Mutex::new(None),
+            input,
+            composer_bell,
+            spawned_as: None,
+        }
+    }
+
+    /// The bus for a generation spawned as `agent` (Q83).
+    pub fn spawned_as(self, agent: Option<AgentType>) -> Self {
+        Self {
+            spawned_as: agent,
+            ..self
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
+    /// latched so far. Takes the output lock.
+    #[cfg(target_os = "linux")]
+    fn latched_for(&self, agent: &AgentType) -> crate::doorbell_activation::LatchedRelease {
+        self.state.lock().unwrap().release.latched_for(agent)
+    }
+
+    /// PRD #1666 part 3 (Q35-06): the generation's input epoch, for its PTY
+    /// writer.
+    fn input(&self) -> &Arc<crate::composer_probe::epoch::GenerationInput> {
+        &self.input
+    }
+
+    /// [`Self::profiled`] with no release scanner: what the budget
+    /// measurement compares a scanning push against (plan §9.1).
+    #[cfg(test)]
+    fn profiled_without_scanner(
+        profile: Option<&'static crate::doorbell_screen::ScreenProfile>,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        let bus = Self::profiled(profile, rows, cols);
+        bus.state.lock().unwrap().release = crate::release_scanner::ReleaseCapture::disabled();
+        bus
+    }
+
+    /// Test seam: run once by the next push that moves the release capture,
+    /// with its bytes, as soon as they are published to subscribers, the
+    /// output lock still held: the hook must not take it.
+    #[cfg(test)]
+    fn run_after_latch_published(&self, pushed: &[u8]) {
+        let hook = self.after_latch_published.lock().unwrap().take();
+        if let Some(hook) = hook {
+            hook(pushed);
         }
     }
 
@@ -2085,11 +2253,48 @@ impl AgentBus {
     /// Append bytes to scrollback and publish to subscribers. Held under the
     /// same lock that subscribers use to take their initial snapshot, so a
     /// concurrent `subscribe` can never split a write between snapshot and
-    /// live receiver.
+    /// live receiver. The PTY reader pushes through [`Self::push_timed`],
+    /// which also says whether the release latch moved.
+    #[cfg(test)]
     fn push(&self, data: Vec<u8>) {
+        self.push_timed(data);
+    }
+
+    /// [`Self::push`], answering what the push cost under the output lock
+    /// (PRD #1666 part 3, round 5-wake, plan §9.1): how long it held the lock,
+    /// the evidence parser's share, and the release scanner's wall and CPU
+    /// time when its window was open.
+    fn push_timed(&self, data: Vec<u8>) -> PushCost {
         let arc = Arc::new(data);
         let mut state = self.state.lock().unwrap();
+        let held = Instant::now();
+        // PRD #1666 part 3, round 5-wake: a parser that starts at a redraw
+        // marker inside this push starts in the modes in force at the marker.
+        let modes_before = state.live_modes.clone();
+        let transition = state.evidence.push(&arc, |at| {
+            let mut modes = modes_before;
+            modes.feed(&arc[..at]);
+            modes.preamble()
+        });
+        let evidence_ns = u64::try_from(held.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        let release = state.release.push(&arc);
+        // Q83: the input grammar follows what the capture holds for the
+        // generation's own agent after the whole push, so a conflict or
+        // another agent's header leaves it strict however the output was
+        // split. It is stored here, under the lock that holds the capture
+        // and before the output is published: a write whose tracker loads
+        // the grammar from now on reads the new one, and a write that loaded
+        // the old one loaded it before anything could see the capture move.
+        if !release.is_empty() {
+            self.input
+                .set_input_grammar(crate::composer_probe::planner::InputGrammar::latched(
+                    self.spawned_as.as_ref(),
+                    |agent| state.release.latched_for(agent),
+                ));
+        }
+        let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
+        state.output_hook.on_output(&arc);
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
@@ -2100,10 +2305,152 @@ impl AgentBus {
             let evicted: Vec<u8> = state.scrollback.drain(..excess).collect();
             state.ring_start_modes.feed(&evicted);
         }
+        #[cfg(test)]
+        let pushed = Arc::clone(&arc);
         // Lossy on purpose: we don't block the reader thread on slow
         // subscribers. `send` returns Err only when there are zero
         // receivers, which is fine — scrollback still has the bytes.
         let _ = self.tx.send(arc);
+        #[cfg(test)]
+        if !release.is_empty() {
+            self.run_after_latch_published(&pushed);
+        }
+        let hold_ns = u64::try_from(held.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        drop(state);
+        let latch_changed = !release.is_empty();
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, "output");
+        }
+        for event in release {
+            self.log_release(&event);
+        }
+        // PRD #1666 part 3 (Q35-14b): an installed generation's observer
+        // settles its permission once the header latched.
+        if latch_changed && let Some(bell) = self.composer_bell.get() {
+            bell.ring();
+        }
+        PushCost {
+            hold_ns,
+            evidence_ns,
+            scanner,
+            latch_changed,
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-20a, A4 §7.2): publish a drain frontier for
+    /// `pending`, under this lock: `Taken{o}`, `o` the output hook's fed
+    /// count, for each request nothing has settled yet. Returns the requests
+    /// this call settled, which their records learn after the lock is
+    /// released, and whether the count was exhausted (every one `Missing`).
+    #[cfg(target_os = "linux")]
+    fn publish_frontier(
+        &self,
+        pending: &[Arc<crate::composer_probe::frontier::Request>],
+    ) -> (Vec<Arc<crate::composer_probe::frontier::Request>>, bool) {
+        use crate::composer_probe::record::FrontierOutcome;
+        let state = self.state.lock().unwrap();
+        let fed = state.output_hook.fed();
+        let outcome = fed.map_or(FrontierOutcome::Missing, |offset| FrontierOutcome::Taken {
+            offset,
+        });
+        let settled = pending
+            .iter()
+            .filter(|request| request.settle(outcome))
+            .cloned()
+            .collect();
+        drop(state);
+        (settled, fed.is_none())
+    }
+
+    /// One `pane release` line.
+    fn log_release(&self, event: &crate::release_scanner::CaptureEvent) {
+        use crate::release_scanner::{CaptureEvent, ScanLatch, WindowClose};
+        let (latch, close) = match event {
+            CaptureEvent::Latched(latch) => (latch, None),
+            CaptureEvent::Closed {
+                reason,
+                latch,
+                cost,
+            } => {
+                // Plan §9.1: what the scanner cost while its window was open,
+                // and, with Q25, its work against its two limits.
+                tracing::debug!(
+                    target: "pane_release",
+                    agent_id = %self.label,
+                    pushes = cost.pushes,
+                    push_us_max = cost.push_ns_max / 1_000,
+                    push_us_total = cost.push_ns_total / 1_000,
+                    cpu_us = cost.cpu_ns / 1_000,
+                    resizes = cost.resizes,
+                    resize_us_max = cost.resize_ns_max / 1_000,
+                    work = cost.work,
+                    push_work_max = cost.push_work_max,
+                    work_limit = cost.over.map(crate::release_scanner::WorkLimit::as_str),
+                    "release scanner timing"
+                );
+                (latch, Some(*reason))
+            }
+        };
+        let close_words = close.map(WindowClose::as_str);
+        match latch {
+            ScanLatch::Latched { agent, release, at } => tracing::info!(
+                target: "pane_release",
+                agent_id = %self.label,
+                agent = ?agent,
+                release = %release,
+                header_completed_at = at,
+                close = close_words,
+                "pane release"
+            ),
+            ScanLatch::Conflict { first, second, at } => tracing::info!(
+                target: "pane_release",
+                agent_id = %self.label,
+                release = "release_conflict",
+                first = %first.1,
+                second = %second.1,
+                at,
+                close = close_words,
+                "pane release"
+            ),
+            ScanLatch::Pending => tracing::info!(
+                target: "pane_release",
+                agent_id = %self.label,
+                release = match close {
+                    Some(WindowClose::Geometry) => "scanner_geometry",
+                    Some(WindowClose::WorkBudget) => "scanner_budget",
+                    _ => "unknown_release",
+                },
+                close = close_words,
+                "pane release"
+            ),
+        }
+    }
+
+    /// Close the generation's header window (PRD #1666 part 3, round
+    /// 5-wake): under the lock `push` takes, so each push is fed wholly
+    /// before or wholly after the close.
+    pub fn close_release(&self, reason: crate::release_scanner::WindowClose) {
+        let event = self.state.lock().unwrap().release.close(reason);
+        if let Some(event) = event {
+            self.log_release(&event);
+        }
+    }
+
+    /// The generation's release capture: its latch, why its window closed,
+    /// and whether its scanner is still alive.
+    pub fn release(
+        &self,
+    ) -> (
+        crate::release_scanner::ScanLatch,
+        Option<crate::release_scanner::WindowClose>,
+        bool,
+    ) {
+        let state = self.state.lock().unwrap();
+        (
+            state.release.latch().clone(),
+            state.release.closed(),
+            state.release.scanner_alive(),
+        )
     }
 
     /// Atomically take the current scrollback snapshot and a receiver
@@ -2144,13 +2491,153 @@ impl AgentBus {
     /// A concurrent `subscribe` either sees the full pre-resize snapshot (and
     /// the live receiver picks up post-resize bytes) or sees an empty
     /// snapshot and the receiver picks up everything — no torn read.
-    fn resize_and_clear<E>(&self, resize: impl FnOnce() -> Result<(), E>) -> Result<(), E> {
+    fn resize_and_clear<E>(
+        &self,
+        rows: u16,
+        cols: u16,
+        resize: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
         let mut state = self.state.lock().unwrap();
         resize()?;
         #[cfg(test)]
         self.run_between_resize_and_clear();
         state.clear_ring();
+        // PRD #1666 part 3 (Q35-18a): under the output lock, so the size
+        // change sits at its place among the queries the hook notes.
+        self.input.size_change(Instant::now());
+        let transition = state
+            .evidence
+            .edge(crate::evidence_state::EdgeReason::Resize, rows, cols);
+        let release = state.release.resize(rows, cols);
+        let epoch = state.evidence.layout_epoch();
+        drop(state);
+        if let Some(event) = release {
+            self.log_release(&event);
+        }
+        tracing::debug!(
+            target: "pane_layout",
+            edge = "resize",
+            rows,
+            cols,
+            ok = true,
+            layout_epoch = epoch,
+            "pane layout edge"
+        );
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, "resize");
+        }
         Ok(())
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §2.2): run a repaint nudge's
+    /// ioctl to `rows` × `cols` under the lock `push` takes, so the edge is
+    /// recorded at its exact place in the stream. The ring is not cleared: an
+    /// attach replay keeps today's behaviour and `geometry_changes` keeps its
+    /// meaning. A failed restore leaves the width unknown until the next
+    /// successful resize.
+    fn resize_and_mark_edge<E>(
+        &self,
+        reason: crate::evidence_state::EdgeReason,
+        rows: u16,
+        cols: u16,
+        resize: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut state = self.state.lock().unwrap();
+        let result = resize();
+        if result.is_ok() {
+            self.input.size_change(Instant::now());
+        }
+        let transition = match (&result, reason) {
+            (Ok(()), _) => state.evidence.edge(reason, rows, cols),
+            (Err(_), crate::evidence_state::EdgeReason::NudgeRestore) => {
+                state.evidence.geometry_unknown()
+            }
+            (Err(_), _) => None,
+        };
+        let release = match &result {
+            Ok(()) => state.release.resize(rows, cols),
+            Err(_) => None,
+        };
+        let epoch = state.evidence.layout_epoch();
+        drop(state);
+        if let Some(event) = release {
+            self.log_release(&event);
+        }
+        tracing::debug!(
+            target: "pane_layout",
+            edge = reason.as_str(),
+            rows,
+            cols,
+            ok = result.is_ok(),
+            layout_epoch = epoch,
+            "pane layout edge"
+        );
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, reason.as_str());
+        }
+        result
+    }
+
+    /// PRD #1666 part 3, round 5-wake: the generation's profile, learned from
+    /// the agent type its own hooks reported, under the lock `push` takes so
+    /// its edge sits at its place in the stream. The generation's input takes
+    /// the profile's redraw timing and `B`'s rule under the same lock
+    /// (Q35-18a), so the frames and queries noted before it are the counted
+    /// rule's and those after it the profile's.
+    fn adopt_profile(&self, profile: &'static crate::doorbell_screen::ScreenProfile) {
+        let mut state = self.state.lock().unwrap();
+        let transition = state.evidence.adopt(profile);
+        self.input
+            .adopt_profile(profile.cpr_wait_end, &profile.redraw, Instant::now());
+        drop(state);
+        if let Some(transition) = transition {
+            log_evidence_transition(&transition, "profile_learned");
+        }
+    }
+
+    /// The pane's width now and every width it has had (the revcxact
+    /// review's MEDIUM-2: what Codex's width witness refused at), for a
+    /// diagnosis line. Widths only: no screen content.
+    pub fn evidence_widths(&self) -> (u16, Vec<u16>) {
+        self.state.lock().unwrap().evidence.widths()
+    }
+
+    /// The evidence state's status, layout epoch and stream position.
+    pub fn evidence(&self) -> (crate::evidence_state::EvidenceStatus, u64, u64) {
+        let state = self.state.lock().unwrap();
+        (
+            state.evidence.status(),
+            state.evidence.layout_epoch(),
+            state.evidence.out_seq(),
+        )
+    }
+
+    /// The current frame and where it stands, read in one hold, while the
+    /// evidence state is Clean (R-D-U2-01).
+    pub fn clean_frame_marked(
+        &self,
+    ) -> Option<(
+        crate::doorbell_screen::Grid,
+        crate::evidence_state::FrameMark,
+    )> {
+        self.state.lock().unwrap().evidence.clean_frame_marked()
+    }
+
+    /// Whether the Clean frame `mark` was read from still stands, read in
+    /// one hold (R-D-U2-01).
+    pub fn frame_unchanged(&self, mark: crate::evidence_state::FrameMark) -> bool {
+        self.state.lock().unwrap().evidence.frame_unchanged(mark)
+    }
+
+    /// The current frame, read losslessly, while the evidence state is Clean.
+    pub fn clean_frame(&self) -> Option<crate::doorbell_screen::Grid> {
+        self.state.lock().unwrap().evidence.clean_frame()
+    }
+
+    /// The cells the evidence parser holds now.
+    #[cfg(test)]
+    fn evidence_parser_cells(&self) -> u32 {
+        self.state.lock().unwrap().evidence.parser_cells()
     }
 
     /// The ring clear [`Self::resize_and_clear`] makes, without a resize.
@@ -2165,6 +2652,345 @@ impl AgentBus {
     /// having to read from that client's socket.
     pub fn receiver_count(&self) -> usize {
         self.tx.receiver_count()
+    }
+}
+
+/// PRD #1666 part 3, round 5-wake: one `pane layout` line per change of a
+/// pane's evidence state.
+/// PRD #1666 part 3 (Q35-14b; amendment 5 §3.6, amendment 6 §3.6):
+/// M-FIRST's line for a generation that retired, taken atomically with the
+/// retirement: when probing first stopped and why, and the pending episodes.
+/// No path or message content. A stop's segment kind (native or check-time)
+/// is the matched segment's, and no segment is matched before Q35-20, so
+/// none is joined here; nor is held input, which nothing holds before the
+/// fence (Q35-15/16), so none was discarded.
+fn log_first_stop(agent_id: &str, stop: &crate::composer_probe::record::FirstStop) {
+    let first = stop.stopped.as_ref();
+    tracing::info!(
+        target: "composer_probe",
+        agent_id = %agent_id,
+        observed_ms = stop.observed.as_millis() as u64,
+        stopped = first.is_some(),
+        cause = ?first.map(|s| s.cause),
+        after_ms = first.map(|s| s.after.as_millis() as u64),
+        source = ?first.map(|s| s.source),
+        attribution = ?first.and_then(|s| s.attribution()),
+        decision = ?first.and_then(|s| s.record).and_then(|r| r.decision),
+        episodes = stop.episodes.len(),
+        episodes_uncounted = stop.episodes_uncounted,
+        held_input_discarded = false,
+        "editor probe first stop"
+    );
+}
+
+fn log_evidence_transition(transition: &crate::evidence_state::Transition, cause: &str) {
+    tracing::debug!(
+        target: "pane_layout",
+        cause,
+        from = transition.from.as_str(),
+        to = transition.to.as_str(),
+        layout_epoch = transition.layout_epoch,
+        out_seq = transition.out_seq,
+        marker_seq = transition.marker_seq,
+        "pane layout evidence"
+    );
+}
+
+/// PRD #1666 part 3, round 5-wake (plan §1.4): a prompt hook's report that
+/// the prompt it saw carried a ring's token-led doorbell line, from the
+/// generation its hook token attests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingEvidence {
+    pub pane_id: String,
+    pub agent_id: String,
+    /// The message the line named, as the hook's doorbell fetch names it.
+    pub message_id: Option<String>,
+    pub token: String,
+    pub shape: crate::event::PromptShape,
+}
+
+/// PRD #1666 part 3, round 5-wake: the process-table and clock reads
+/// [`AgentPtyRegistry::accept_input_mode`] makes, injectable so a test can
+/// stand in a reused pid, another session or another time namespace.
+pub struct InputModeLookups {
+    pub session_of: fn(u32) -> Option<u32>,
+    pub started: fn(u32) -> Option<u64>,
+    pub own_namespace: fn() -> crate::input_mode::NamespaceRead,
+    pub namespace_of: fn(u32) -> crate::input_mode::NamespaceRead,
+    pub now: fn() -> Option<u64>,
+}
+
+impl InputModeLookups {
+    /// This platform's: Linux reads time namespaces; macOS has none, so both
+    /// reads answer "absent" and the check passes.
+    pub const PLATFORM: Self = Self {
+        session_of: crate::platform::proc::session_of,
+        started: crate::platform::proc::process_start_of,
+        #[cfg(target_os = "linux")]
+        own_namespace: || crate::input_mode::own_time_namespace().clone(),
+        #[cfg(not(target_os = "linux"))]
+        own_namespace: || crate::input_mode::NamespaceRead::NotFound,
+        #[cfg(target_os = "linux")]
+        namespace_of: |pid| crate::input_mode::read_time_namespace(Some(pid)),
+        #[cfg(not(target_os = "linux"))]
+        namespace_of: |_| crate::input_mode::NamespaceRead::NotFound,
+        #[cfg(unix)]
+        now: crate::input_mode::monotonic_ns,
+        #[cfg(not(unix))]
+        now: || None,
+    };
+}
+
+/// How many ring evidence reports a pane's channel holds for a slow reader.
+const RING_EVIDENCE_CAPACITY: usize = 16;
+
+/// How a pane's output stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadEnd {
+    Eof,
+    Error(std::io::ErrorKind),
+}
+
+/// What the deck started in the pane: its own wrapper around the agent's
+/// command, or the pane command itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildRole {
+    Wrapper,
+    PaneCommand,
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
+/// ending a generation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Termination {
+    /// The command the deck started in the pane exited with `code`: the
+    /// deck's own child (`role`), or, for a wrapper, the command it ran, as
+    /// it reported (`reported_by`).
+    PaneCommandExited {
+        code: u32,
+        role: ChildRole,
+        reported_by: crate::inbox_display::TerminationSource,
+    },
+    /// The output stream ended and the child had not exited by the bound.
+    ConnectionEnded { read_end: ReadEnd },
+    /// The generation was removed by a respawn that published its successor
+    /// in the pane, whatever became of the successor since.
+    Replaced,
+    /// The generation was removed by a close or the deck's shutdown.
+    Closed,
+    /// The generation was removed by a respawn that had published no
+    /// successor by the bound: the replacement may still come, or fail.
+    ReplacementPending,
+    /// The generation was removed by a respawn that ended with no successor.
+    ReplacementFailed,
+    /// The registry did not hold the generation when its output ended, and
+    /// nothing recorded removing it.
+    Unknown,
+}
+
+impl std::fmt::Display for Termination {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Termination::PaneCommandExited {
+                code,
+                role,
+                reported_by,
+            } => {
+                let role = match role {
+                    ChildRole::Wrapper => "wrapper",
+                    ChildRole::PaneCommand => "pane_command",
+                };
+                let reported_by = match reported_by {
+                    crate::inbox_display::TerminationSource::Wrapper => "wrapper",
+                    _ => "deck",
+                };
+                write!(
+                    f,
+                    "pane_command_exited code={code} child={role} reported_by={reported_by}"
+                )
+            }
+            Termination::ConnectionEnded { read_end } => {
+                write!(f, "connection_ended read_end={}", read_end.label())
+            }
+            Termination::Replaced => write!(f, "replaced"),
+            Termination::Closed => write!(f, "closed"),
+            Termination::ReplacementPending => write!(f, "replacement_pending"),
+            Termination::ReplacementFailed => write!(f, "replacement_failed"),
+            Termination::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
+impl Termination {
+    /// What the generation's notices carry ([`crate::event::InboxNotice::termination`]).
+    pub fn wire(&self) -> crate::inbox_display::PaneTermination {
+        use crate::inbox_display::PaneTermination;
+        match self {
+            Termination::PaneCommandExited {
+                code, reported_by, ..
+            } => PaneTermination::PaneCommandExited {
+                code: *code,
+                reported_by: *reported_by,
+            },
+            Termination::ConnectionEnded { read_end } => PaneTermination::ConnectionEnded {
+                read_end: read_end.label(),
+            },
+            Termination::Replaced => PaneTermination::Replaced,
+            Termination::Closed => PaneTermination::Closed,
+            // Neither says the pane was replaced or closed: only that it ended.
+            Termination::ReplacementPending
+            | Termination::ReplacementFailed
+            | Termination::Unknown => PaneTermination::Unknown,
+        }
+    }
+}
+
+impl ReadEnd {
+    /// `eof`, or the read error's kind in snake case (`broken_pipe`).
+    fn label(&self) -> String {
+        match self {
+            ReadEnd::Eof => "eof".to_string(),
+            ReadEnd::Error(kind) => {
+                let mut label = String::new();
+                for (i, c) in format!("{kind:?}").chars().enumerate() {
+                    if c.is_ascii_uppercase() && i > 0 {
+                        label.push('_');
+                    }
+                    label.push(c.to_ascii_lowercase());
+                }
+                label
+            }
+        }
+    }
+}
+
+/// How long the reader polls, after its stream ended, for the deck's child or
+/// for the respawn that removed its generation: one bound for both.
+const TERMINATION_WAIT: Duration = Duration::from_millis(200);
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what removed a generation
+/// from the registry, and how the respawn that removed it, if one did, came
+/// out. Shared by the generation's record, its reader and the
+/// [`RespawnTicket`] of a respawn that lifted it out, and written under the
+/// lock hold that removes the record or publishes its successor, so the
+/// reader's capture ([`AgentPtyRegistry::capture_termination`]) reads the
+/// generation's own evidence for as long as the reader lives, however many
+/// other generations end meanwhile. Empty while nothing has removed it.
+#[derive(Debug, Default)]
+pub(crate) struct RemovalEvidence {
+    removal: AtomicU8,
+    /// Issue #2028: the child's exit status as the close or respawn that
+    /// removed the generation found it, so an exit the reader saw before the
+    /// removal keeps its code. Set in the lock hold that removes the record
+    /// when the child had exited by then ([`Self::note_child_at_removal`]),
+    /// and otherwise once the remover reaped it ([`Self::record_reaped`]).
+    reaped: std::sync::OnceLock<portable_pty::ExitStatus>,
+    /// Issue #2028 (review): what the record knew of its child when a close
+    /// or respawn removed it, so a generation that ended by itself is still
+    /// told by its own child after the removal.
+    child_at_removal: std::sync::OnceLock<RemovedChild>,
+}
+
+/// What a removed generation's record knew of its child
+/// ([`RemovalEvidence::note_child_at_removal`]).
+#[derive(Debug, Clone)]
+struct RemovedChild {
+    role: ChildRole,
+    /// The wrapper's report of the command it ran, if it gave one.
+    report: Option<String>,
+}
+
+/// What [`RemovalEvidence`] records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Removal {
+    /// A close or shutdown removed the generation.
+    Closed,
+    /// A respawn lifted it out and has not yet published a successor or
+    /// returned.
+    Respawning,
+    /// The respawn published its successor in the pane.
+    Replaced,
+    /// The respawn returned without publishing one.
+    ReplacementFailed,
+}
+
+impl RemovalEvidence {
+    // 0, the default, is nothing recorded.
+    const CLOSED: u8 = 1;
+    const RESPAWNING: u8 = 2;
+    const REPLACED: u8 = 3;
+    const REPLACEMENT_FAILED: u8 = 4;
+
+    fn get(&self) -> Option<Removal> {
+        match self.removal.load(Ordering::SeqCst) {
+            Self::CLOSED => Some(Removal::Closed),
+            Self::RESPAWNING => Some(Removal::Respawning),
+            Self::REPLACED => Some(Removal::Replaced),
+            Self::REPLACEMENT_FAILED => Some(Removal::ReplacementFailed),
+            _ => None,
+        }
+    }
+
+    /// A close or shutdown removed the generation.
+    fn closed(&self) {
+        self.removal.store(Self::CLOSED, Ordering::SeqCst);
+    }
+
+    /// A respawn lifted the generation out.
+    fn respawning(&self) {
+        self.removal.store(Self::RESPAWNING, Ordering::SeqCst);
+    }
+
+    /// The respawn that lifted it out published its successor.
+    fn replaced(&self) {
+        let _ = self.removal.compare_exchange(
+            Self::RESPAWNING,
+            Self::REPLACED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+    }
+
+    /// Issue #2028 (review): called in the lock hold that removes the
+    /// generation's record, so its reader, which reads the record under that
+    /// lock, finds either the record or this: the child's status when it has
+    /// already exited, and its role and wrapper report.
+    fn note_child_at_removal(
+        &self,
+        child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+        role: ChildRole,
+        report: Option<String>,
+    ) {
+        self.record_reaped(child);
+        let _ = self.child_at_removal.set(RemovedChild { role, report });
+    }
+
+    /// What [`Self::note_child_at_removal`] kept of the child.
+    fn child_at_removal(&self) -> Option<RemovedChild> {
+        self.child_at_removal.get().cloned()
+    }
+
+    /// The remover reaped `child`: its status, once it has one. The first
+    /// status recorded stands.
+    fn record_reaped(&self, child: &mut Box<dyn portable_pty::Child + Send + Sync>) {
+        if let Ok(Some(status)) = child.try_wait() {
+            let _ = self.reaped.set(status);
+        }
+    }
+
+    /// The status [`Self::record_reaped`] recorded.
+    fn reaped(&self) -> Option<portable_pty::ExitStatus> {
+        self.reaped.get().cloned()
+    }
+
+    /// The respawn returned: without a successor, unless one was published.
+    fn respawn_returned(&self) {
+        let _ = self.removal.compare_exchange(
+            Self::RESPAWNING,
+            Self::REPLACEMENT_FAILED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 }
 
@@ -2245,25 +3071,118 @@ impl AgentBus {
 /// drain plus kills, and the daemon's own `Arc` outlives this in the normal
 /// case), but it means `Weak` does not remove this thread from the
 /// registry's lifetime entirely — only from keeping it alive unconditionally.
+/// Issue #2028, the `e2e` build only: `DOT_AGENT_DECK_E2E_EXIT_GATE` names a
+/// directory, and the reader, once the generation's exit is published and
+/// before its telemetry run ends, writes its agent id to `<dir>/arrived` and
+/// waits until `<dir>/release` exists. It decides nothing; it only lets a test
+/// act in that window.
+#[cfg(feature = "e2e")]
+struct ExitGate(PathBuf);
+
+#[cfg(feature = "e2e")]
+impl ExitGate {
+    /// How long a hold waits for its release before going on regardless, so
+    /// a test that died can't park a sandbox daemon's reader for good.
+    const LIMIT: Duration = Duration::from_secs(120);
+
+    /// The gate the generation's spawn environment names: its own variables,
+    /// then the daemon's, which the child inherits.
+    fn from_env(env: &[(String, String)]) -> Option<Self> {
+        const NAME: &str = "DOT_AGENT_DECK_E2E_EXIT_GATE";
+        env.iter()
+            .rev()
+            .find(|(k, _)| k == NAME)
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var(NAME).ok())
+            .filter(|dir| !dir.is_empty())
+            .map(|dir| Self(dir.into()))
+    }
+
+    fn hold(&self, agent_id: &str) {
+        let temporary = self.0.join("arrived.tmp");
+        if std::fs::write(&temporary, agent_id).is_err()
+            || std::fs::rename(&temporary, self.0.join("arrived")).is_err()
+        {
+            return;
+        }
+        let start = Instant::now();
+        while start.elapsed() < Self::LIMIT && !self.0.join("release").exists() {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+/// The reader's loop where no frontier is taken (macOS, Windows, and a Linux
+/// generation whose frontier setup failed): read, push, until the end.
+fn read_plain(
+    mut reader: Box<dyn std::io::Read + Send>,
+    bus: &AgentBus,
+    mut pushed: impl FnMut(PushCost),
+) -> ReadEnd {
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break ReadEnd::Eof,
+            Ok(n) => pushed(bus.push_timed(buf[..n].to_vec())),
+            // PRD #1666 part 3, round 5-wake: a read a signal interrupted is
+            // retried, not taken for the end of the stream.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => break ReadEnd::Error(e.kind()),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pump_reader(
-    mut reader: Box<dyn std::io::Read + Send>,
+    reader: Box<dyn std::io::Read + Send>,
     bus: Arc<AgentBus>,
     exited: Arc<AtomicBool>,
+    removal: Arc<RemovalEvidence>,
     change_notify: Arc<Notify>,
     registry: Weak<AgentPtyRegistry>,
     agent_id: String,
     pane_id_env: Option<String>,
     runtime_handle: Option<tokio::runtime::Handle>,
+    #[cfg(target_os = "linux")] frontier: Option<frontier_reader::Frontier>,
+    #[cfg(feature = "e2e")] exit_gate: Option<ExitGate>,
 ) {
-    let mut buf = [0u8; 8192];
-    loop {
-        match reader.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => bus.push(buf[..n].to_vec()),
-            Err(_) => break,
+    // PRD #1666 part 3, round 5-wake: a latch that changed is re-projected,
+    // after the push released the bus lock.
+    let pushed = |cost: PushCost| {
+        if cost.latch_changed
+            && let (Some(registry), Some(pane)) = (registry.upgrade(), pane_id_env.as_deref())
+        {
+            registry.request_reprojection(pane, &agent_id);
         }
+    };
+    // PRD #1666 part 3 (Q35-20a): on Linux the reader also takes drain
+    // frontiers; with no frontier set up it reads as it always has.
+    #[cfg(target_os = "linux")]
+    let read_end = match frontier {
+        Some(frontier) => frontier.run(reader, &bus, pushed),
+        None => read_plain(reader, &bus, pushed),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let read_end = read_plain(reader, &bus, pushed);
+    // Q35-20a: the generation is retiring, so every frontier request still
+    // outstanding is missing, and every later one is at once (A4 §7.2).
+    {
+        let input = bus.input();
+        input.settle_frontier(
+            &input
+                .frontier()
+                .retire(crate::composer_probe::frontier::Retired::Reader),
+        );
     }
+    // PRD #1666 part 3, round 5-wake: the header window ends with the stream.
+    bus.close_release(crate::release_scanner::WindowClose::AgentExit);
+    // Whether the registry still held this generation when its output ended:
+    // read before any of the exit handling below, which can remove it, and in
+    // the lock hold that marks it crashed (issue #2028), so the telemetry
+    // verdict below is the one taken at EOF. In that hold telemetry also
+    // learns of it, so a close that removes the generation after its EOF does
+    // not end its run as closed.
+    //
     // Issue #868: must run regardless of whether `pane_id_env` is set — a
     // dashboard pane crashes just as much as an orchestration one, and the
     // block below (release/sweep/notify) only fires when a pane id exists.
@@ -2276,9 +3195,16 @@ fn pump_reader(
     // `pump_reader_marks_natural_exit_as_crashed_but_not_deliberate_close`
     // failing under plain `cargo test`, and reachable by a `pane restart`
     // refusal check landing in it.
-    if let Some(registry) = registry.upgrade() {
-        registry.mark_agent_crashed(&agent_id);
-    }
+    let registered_at_eof = registry.upgrade().is_some_and(|registry| {
+        let telemetry = registry.telemetry();
+        registry.mark_agent_crashed(&agent_id, || {
+            crate::telemetry::agent_ended_by_itself(
+                telemetry.as_deref(),
+                pane_id_env.as_deref(),
+                &agent_id,
+            );
+        })
+    });
     exited.store(true, Ordering::SeqCst);
     change_notify.notify_one();
     // PRD #1666 part 3, round 5 (plan D7): a respawned unit terminal's
@@ -2294,6 +3220,27 @@ fn pump_reader(
     if let Some(registry) = registry.upgrade() {
         registry.signal_agent_exit(&agent_id);
     }
+    // Issue #2028: the e2e hold between the exit's publication and its
+    // telemetry, with no lock held.
+    #[cfg(feature = "e2e")]
+    if let Some(gate) = exit_gate {
+        gate.hold(&agent_id);
+    }
+    // And its unit-test counterpart (see
+    // [`AgentPtyRegistry::hold_exit_telemetry_for_test`]).
+    #[cfg(test)]
+    if let Some(registry) = registry.upgrade() {
+        let hold = registry
+            .exit_telemetry_holds
+            .lock()
+            .unwrap()
+            .remove(&agent_id);
+        drop(registry);
+        if let Some((reached, release)) = hold {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    }
     // PRD #1741: this generation's telemetry run ends with its PTY.
     if let Some(registry) = registry.upgrade() {
         crate::telemetry::agent_exited(
@@ -2301,13 +3248,27 @@ fn pump_reader(
             pane_id_env.as_deref(),
             &agent_id,
             registry.is_shutting_down(),
-            || registry.is_agent_still_registered(&agent_id),
-            || {
-                let mut inner = registry.inner.lock();
-                inner.agents.get_mut(&agent_id)?.child.try_wait().ok()?
-            },
+            registered_at_eof,
+            || registry.exit_status_after_eof(&agent_id, &removal),
         );
     }
+    // PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
+    // ending this generation, captured before the inbox is told, so the
+    // notices the exit owes say it. The deck observes its own child (the
+    // wrapper, and through it the command it ran, or the pane command) and
+    // the stream, never the agent below them.
+    let termination = registry.upgrade().map(|registry| {
+        let termination =
+            registry.capture_termination(&agent_id, &removal, registered_at_eof, read_end);
+        tracing::info!(
+            target: "pane_reader",
+            agent_id = %agent_id,
+            pane_id = pane_id_env.as_deref().unwrap_or("<none>"),
+            termination = %termination,
+            "pane reader ended"
+        );
+        termination
+    });
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
     // longer reach it. Deliberate closes included: the entry is gone by now, but
     // its messages are not.
@@ -2342,7 +3303,12 @@ fn pump_reader(
         } else {
             crate::inbox_hub::ExitKind::Removed
         };
-        let settled = registry.inbox().agent_exited_as(pane_id, &agent_id, kind);
+        let settled = registry.inbox().agent_exited_as(
+            pane_id,
+            &agent_id,
+            kind,
+            termination.as_ref().map(Termination::wire),
+        );
         exit_walked = settled.walked;
         if settled.walked {
             registry.retire_task_debt_exact(pane_id, &settled.ledgers);
@@ -2485,80 +3451,6 @@ pub(crate) enum ExitedNotice {
     Refused,
 }
 
-/// PRD #1666 S4: what [`AgentPtyRegistry::write_doorbell`] did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DoorbellWrite {
-    /// Every byte went in.
-    Written,
-    /// Only the pre-ring CR went in: it submitted the doorbell's own earlier
-    /// line, found unsubmitted in a gated composer, and the new line was not
-    /// typed on top of it.
-    Flushed,
-    /// The user has an unsent draft in the pane; nothing was written.
-    DraftPending,
-    /// The pane is gone or now belongs to another agent; nothing was written.
-    NotOwner,
-    /// The pane's PTY is not taking input; nothing was written.
-    NotReading,
-    /// PRD #1666 S7: the agent has not reported through its own hooks yet and
-    /// its composer is not on screen, so whatever is there — a start dialog,
-    /// known or not — gets no byte; nothing was written. Part 2: likewise a
-    /// generation not yet ready ([`DoorbellReady`]) whose ready screen is not
-    /// on screen, or that has no screen the writer could recognise.
-    NoComposer,
-    /// PRD #1666 hardening H3: between the doorbell's decision and the write
-    /// the pane stopped being fit for it — a status changed, a dialog opened,
-    /// a native component armed, the message a ring names left the queue, or
-    /// a human frame arrived; nothing was written.
-    NotAdmitted,
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): the pane stopped being fit for
-    /// the write after some of its steps went in (the same reasons as
-    /// [`DoorbellWrite::NotAdmitted`]), so the rest were withheld.
-    /// `steps_written` steps went in, in order; `line_typed` says whether the
-    /// ring's line was among them (its submit CR was then not).
-    Cancelled { steps_written: u8, line_typed: bool },
-    /// A write failed part-way or could not be encoded.
-    Failed,
-}
-
-/// PRD #1666 part 2 (`inbox/doorbell/008`): what the doorbell's generation
-/// has shown of its readiness ([`crate::state::AppState::doorbell_readiness`]),
-/// as far as [`AgentPtyRegistry::write_doorbell`] still has to check it on
-/// screen.
-#[derive(Debug, Clone, Copy)]
-pub enum DoorbellReady {
-    /// Its own hooks showed it ready: nothing more to check.
-    Ready,
-    /// Its own `SessionStart` only, from an agent whose prompt comes up later:
-    /// written to only while this recognises that prompt on screen.
-    Screen(fn(&[String]) -> bool),
-    /// Nothing from its own hooks: written to only through the agent's
-    /// composer gate ([`crate::agent_registry::AgentSpec::doorbell_composer`]),
-    /// and never by an agent without one.
-    Unproven,
-}
-
-/// A human attach frame in flight for a pane
-/// ([`AgentPtyRegistry::human_frame_arriving`]); dropping it ends that, and
-/// the pane's last one removes its count.
-#[must_use]
-pub struct HumanFrameInFlight {
-    counts: Arc<Mutex<HashMap<String, usize>>>,
-    pane_id_env: String,
-}
-
-impl Drop for HumanFrameInFlight {
-    fn drop(&mut self) {
-        let mut counts = self.counts.lock().unwrap();
-        if let Some(count) = counts.get_mut(&self.pane_id_env) {
-            *count -= 1;
-            if *count == 0 {
-                counts.remove(&self.pane_id_env);
-            }
-        }
-    }
-}
-
 /// PRD #20 R20-003/R20-006: the live target that currently owns a pane, resolved
 /// atomically for the identity-guarded send path. Bundles the shared writer with
 /// the identity/liveness needed to re-validate after the writer lock is acquired.
@@ -2566,49 +3458,6 @@ struct PaneWriterTarget {
     writer: Arc<AsyncMutex<PaneWriter>>,
     agent_id: String,
     exited: Arc<AtomicBool>,
-}
-
-/// How far a single `write_all`-style loop got before an error.
-enum WriteProgress {
-    Complete,
-    /// At least one byte written, then an error / write-zero.
-    Partial,
-    /// 0 bytes written — the first write failed (nothing reached the target).
-    NothingWritten,
-    /// Issue #525: the PTY was still taking the write when the delivery stopped
-    /// waiting ([`PtyJobOutcome::Stalled`]). How much of it is in the input box
-    /// cannot be known, and whatever is not yet will still go in if the agent
-    /// ever reads: the bytes are committed, so nothing may be sent after them
-    /// on the assumption that they are not — an erase least of all.
-    Stalled,
-}
-
-/// Write all of `buf`, tracking whether any bytes reached the writer so a
-/// partial write can be told apart from a clean first-write failure. Retries on
-/// `Interrupted` like `write_all`.
-fn write_all_tracked(w: &mut (dyn std::io::Write + Send), buf: &[u8]) -> WriteProgress {
-    let mut written = 0usize;
-    while written < buf.len() {
-        match w.write(&buf[written..]) {
-            Ok(0) => {
-                return if written == 0 {
-                    WriteProgress::NothingWritten
-                } else {
-                    WriteProgress::Partial
-                };
-            }
-            Ok(n) => written += n,
-            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                return if written == 0 {
-                    WriteProgress::NothingWritten
-                } else {
-                    WriteProgress::Partial
-                };
-            }
-        }
-    }
-    WriteProgress::Complete
 }
 
 /// Issue #525: how long a guarded delivery waits on a single PTY write.
@@ -2666,7 +3515,39 @@ pub struct RunningAgent {
     /// than a field behind its async lock, because the removal paths are
     /// synchronous and must not wait on a writer another task holds.
     pub pane_retired: Arc<AtomicBool>,
+    /// PRD #1666 part 3 (Q35-15): [`Self::writer`]'s fence gate, retired with
+    /// the generation by the same synchronous paths as [`Self::pane_retired`].
+    pub(crate) gate: Arc<PaneGate>,
     pub bus: Arc<AgentBus>,
+    /// PRD #1666 part 3, round 5-wake: what the deck started in the pane.
+    pub child_role: ChildRole,
+    /// PRD #1666 part 3, round 5-wake: when the deck's child started, read as
+    /// it was spawned, so a later process given its pid is not taken for it
+    /// ([`AgentPtyRegistry::child_identity`]). `None` when it could not be
+    /// read.
+    pub child_started: Option<u64>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): the wrapper's report
+    /// of how the command it ran in the pane exited
+    /// ([`crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY`]), once it sent one.
+    /// Read only for a [`ChildRole::Wrapper`] child. A report the hook socket
+    /// accepted from the generation's own child, under the same-user trust
+    /// boundary (`crate::hook_provenance`), not one only the wrapper can make.
+    pub wrapper_child_exit: Option<String>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what removed this
+    /// generation, shared with its reader, which reads it once the stream
+    /// ends.
+    pub(crate) removal: Arc<RemovalEvidence>,
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): the generation's
+    /// input-mode evidence, from its wrapper's reports.
+    pub input_mode: Arc<Mutex<crate::input_mode::InputModeStore>>,
+    /// PRD #1666 part 3, round 5-wake (plan §2.1′): every human operation on
+    /// this generation's input, from arrival until its bytes are done with
+    /// the PTY. Closed when the generation retires.
+    pub ingress: Arc<crate::ingress_ledger::IngressLedger>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): this generation's
+    /// doorbell latch cell, attempt numbers and attempt ring, and the
+    /// admission's other per-generation inputs. Retired with the generation.
+    pub doorbell: Arc<crate::doorbell_generation::GenerationDoorbell>,
     /// Value of [`DOT_AGENT_DECK_PANE_ID`] captured from the spawn-time env,
     /// if the caller supplied one. Echoed back to clients via the M2.x
     /// rehydration path so the TUI can re-bind a freshly-attached pane to
@@ -2961,6 +3842,16 @@ pub struct RunningAgent {
     /// token attests with, moved here from its reservation when it is
     /// published. Never on the wire.
     pub attest_facts: crate::hook_provenance::AttestFacts,
+    /// PRD #1666 part 3 (Q35-13): this generation's editor-helper
+    /// installation, `None` when it wasn't installed. Held for the
+    /// generation's life; dropping it unmaps the arm page, and the instance
+    /// files stay.
+    pub composer_install: Option<crate::composer_probe::install::Installation>,
+    /// PRD #1666 part 3 (Q35-14b): the observer of an installed generation,
+    /// which takes its installation over once the record is published
+    /// ([`AgentPtyRegistry::start_composer_observer`]).
+    #[cfg(target_os = "linux")]
+    pub composer: Option<Arc<crate::composer_probe::observe::Observer>>,
 }
 
 /// Issue #714: the source of [`RunningAgent::quota_block`] epochs. Only
@@ -3350,6 +4241,21 @@ pub struct AgentRecord {
         deserialize_with = "lenient_inbox_summary"
     )]
     pub inbox: Option<crate::inbox_hub::InboxSummary>,
+    /// PRD #1666 part 3 (Q35-20, R5 §10.1): the deck is holding what a
+    /// person typed into this generation's pane while it checks the agent's
+    /// input box, on the record whether or not a hook session has reported;
+    /// a live snapshot carries the same value. Additive and optional, the
+    /// [`Self::inbox`] precedent: an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_held: Option<crate::inbox_display::InputHeld>,
+    /// PRD #1666 part 3 (Q35-20e): typing the deck held for one of this
+    /// pane's earlier generations, discarded when it retired, on the record
+    /// of the pane's current, later generation until a person's keystroke
+    /// reaches the pane after it. Retirements that held nothing leave it, however many there are,
+    /// so it can name a generation two or more back (efix review U3-e).
+    /// Additive and optional, as [`Self::input_held`] is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_discarded: Option<crate::inbox_display::InputDiscarded>,
 }
 
 impl AgentRecord {
@@ -3401,6 +4307,20 @@ pub fn attach_prompt_keys(records: &mut [AgentRecord]) {
         record.prompt_keys = record
             .reported_agent_type()
             .and_then(|agent_type| crate::agent_registry::spec(agent_type).prompt_keys.clone());
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20, R5 §10.1): each record's held typing, on the
+/// record and on its live snapshot when it has one. Display only: what it
+/// shows releases nothing.
+pub fn attach_input_held(registry: &AgentPtyRegistry, records: &mut [AgentRecord]) {
+    for record in records {
+        let held = registry.input_held(&record.id);
+        if let Some(live) = record.live.as_mut() {
+            live.input_held = held.clone();
+        }
+        record.input_held = held;
+        record.input_discarded = registry.input_discarded(&record.id);
     }
 }
 
@@ -3472,6 +4392,47 @@ where
 /// that prefix once and disambiguates on the fifth.
 const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 
+/// PRD #1666 part 3, round 5-wake: what a pane's input shows the doorbell's
+/// hold reason ([`AgentPtyRegistry::pane_input_hold`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneInputHold {
+    /// A bracketed paste into the pane has started and not ended.
+    pub paste_open: bool,
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): the box is touched and the deck
+    /// can check it (the generation is `Armable`): something entered it since
+    /// a check last read it empty, and the next ring waits for a check that
+    /// does. A touched box the deck cannot check is [`Self::unchecked`].
+    pub draft: bool,
+    /// PRD #1666 part 3 (Q35-21): the box is touched and the generation's
+    /// observer is not `Armable`, with its permission (`None`: the
+    /// generation has no observer). The doorbell projects this generation's
+    /// reason for it rather than `possible_draft`.
+    pub unchecked: Option<Option<crate::composer_probe::Permission>>,
+    /// How many of the pane's agent's turns have ended on this stream.
+    pub turns: u64,
+}
+
+impl PaneInputHold {
+    /// PRD #1666 part 3 (Q35-21p, Q35-21): the hold one pane's input
+    /// stream shows, with its generation's box `touched` by its input epoch
+    /// and its observer's `permission` (`None`: no observer); the default for
+    /// a pane nothing was written to. Every reader of the hold decision
+    /// comes here ([`PaneInputState::input_hold`]).
+    fn of(
+        stream: Option<&PaneInputStream>,
+        touched: bool,
+        permission: Option<crate::composer_probe::Permission>,
+    ) -> Self {
+        let armable = permission == Some(crate::composer_probe::Permission::Armable);
+        Self {
+            paste_open: stream.is_some_and(|stream| stream.in_paste),
+            draft: touched && armable,
+            unchecked: (touched && !armable).then_some(permission),
+            turns: stream.map_or(0, |stream| stream.turns),
+        }
+    }
+}
+
 /// Issue #424 S1 (both reviewers): where one pane's user-input stream is, as far
 /// as telling a submission apart from a draft needs to know.
 ///
@@ -3479,30 +4440,39 @@ const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 /// the daemon has is the bytes it forwards. Two separate things make "scan for
 /// a CR or an LF" the wrong answer: each reads a box that still holds the
 /// user's draft as submitted. (Before PRD #1666 that let the typed delivery
-/// submit payload + draft + payload as one turn; today the draft bit it clears
-/// is what the doorbell waits on — see [`AgentPtyRegistry::draft_pending`].)
+/// submit payload + draft + payload as one turn.) Since PRD #1666 part 3
+/// (Q35-21) the box's emptiness is the input epoch's
+/// ([`crate::composer_probe::epoch`]), not this stream's: what this stream
+/// still decides is an open paste, the turn count, and the user's own submit
+/// or clear that lifts a suspended doorbell
+/// ([`crate::composer_probe::recovery`]).
 ///
 /// **Framing.** The real TUI forwards `ESC[200~…\n…ESC[201~` when the child
 /// advertises bracketed paste. Those newlines are EDITOR CONTENT, and an agent
 /// TUI in paste mode stores them without submitting anything. That is what
 /// `matched` / `is_start` / `in_paste` track.
 ///
-/// **The keypress behind the byte.** Outside a paste, whether a byte submits is
-/// not this module's call to make: it is fixed by the deck's own forwarding
-/// contract, so it is asked of [`crate::ui::user_byte_submits_input_box`], which
-/// sits next to the encoder that produced the byte. `Ctrl+J` is forwarded as
-/// exactly an LF and `Alt+Enter` as exactly `ESC` `CR`, both of which are
-/// NEWLINE keys the user pressed to keep typing — reading them as submissions
-/// would clear the draft of a box a plain draft, with no paste and no attacker
-/// anywhere near it, still holds.
+/// **The keypress behind the byte: test builds only.** Whether a byte outside
+/// a paste submits the box is fixed by the deck's own forwarding contract,
+/// asked of [`crate::ui::user_byte_submits_input_box`] beside the encoder
+/// that produced it: `Ctrl+J` is forwarded as exactly an LF and `Alt+Enter`
+/// as exactly `ESC` `CR`, NEWLINE keys the user pressed to keep typing.
+/// Since PRD #1666 part 3 (Q35-21) nothing in the daemon reads that decision
+/// (it fed `DraftTracker`, deleted with the switch), so the scan is compiled
+/// into test builds only, where the issue #544 tests keep pinning the
+/// contract against the real encoder. The submit or clear that lifts a
+/// suspended doorbell is [`crate::composer_probe::recovery`]'s, over
+/// Q35-01's tokenizer. Both read `ESC` `CR` as no submit; they differ on a
+/// `CR` inside an escape sequence, which this scan counts (the `CR` of
+/// `ESC [ CR`) and the tokenizer reads as inside the sequence. Pi submits on
+/// `ESC` `CR` (the table in `ui.rs`), and recovery does not count it, so a
+/// Pi user's `Alt+Enter` does not lift a suspension: fail-closed.
 ///
 /// The state is carried ACROSS calls because a paste — and equally an
 /// `Alt+Enter` — arrives as however many writes the client happens to make; a
 /// marker or a two-byte frame split between two of them still matches.
 /// Interleaving from two attached clients can leave `in_paste` stuck true or
-/// misattribute one client's ESC to another's CR. Both of those miss a
-/// submission rather than invent one, so the box reads as holding a draft for
-/// longer than it does, never for shorter.
+/// misattribute one client's ESC to another's CR.
 ///
 /// **One stream, both senders** (issue #544, PR #1398 finding #16). The PTY
 /// reads ONE interleaved byte stream, so this is fed all of it: the user's
@@ -3513,7 +4483,8 @@ const PASTE_MARKER_PREFIX: &[u8] = b"\x1b[20";
 /// behind a byte do not care who sent it: our CR ends the user's half-sent
 /// `ESC`, a multi-line payload's `ESC[201~` closes a paste the user left open,
 /// and a user's partial marker completed by our bytes is a marker. Origin
-/// decides only the draft bit (see [`crate::draft_deferral::DraftTracker`]).
+/// decides only whether a submit or clear is the user's own
+/// ([`crate::composer_probe::recovery::Origin`]).
 #[derive(Default)]
 struct PaneInputStream {
     /// How many bytes of a paste marker have matched so far.
@@ -3521,68 +4492,75 @@ struct PaneInputStream {
     /// Once the fifth byte disambiguates, whether it is the START marker.
     is_start: bool,
     in_paste: bool,
-    /// The byte before the one being fed, which is all
+    /// Test builds only: the byte before the one being fed, which is all
     /// [`crate::ui::user_byte_submits_input_box`] needs to tell a plain `Enter`
     /// from the ESC-prefixed `Alt+Enter`. `None` only at the very start of the
     /// stream, where no prefix can have been sent.
+    #[cfg(test)]
     preceding: Option<u8>,
-    /// Issue #544: whether the user has sent input since their last submit or
-    /// clear — the bit an automatic FIRST write waits on. Fed every byte this
-    /// stream sees, with the submit decision and paste framing above, so the
-    /// two can never disagree about what a byte did. See
-    /// [`crate::draft_deferral::DraftTracker`].
-    draft: crate::draft_deferral::DraftTracker,
+    /// Test builds only: how many bytes the submit scan read as a submit.
+    #[cfg(test)]
+    submits: u64,
+    /// PRD #1666 part 3 (Q35-21, OQ2): the user's own submits and clears in
+    /// the bytes the PTY took, which lift a suspended doorbell. Fed every
+    /// byte this stream sees, both senders', so its framing is the agent's.
+    recovery: crate::composer_probe::recovery::Recovery,
     /// PRD #1666 (r8k R8G-02): the pane's own agent reported a turn starting
     /// ([`TurnEdge::Started`]) and has not reported it ended since. Only an
-    /// Idle that ends such a turn releases anything, so a repeated Idle, or
-    /// an Idle with no busy report before it, releases nothing.
+    /// Idle that ends such a turn counts one, so a repeated Idle, or an Idle
+    /// with no busy report before it, counts nothing.
     busy: bool,
     /// PRD #1666 (r8k R8G-02): how many turns of the pane's own agent have
-    /// ended on this stream — busy, then Idle. A PTY write reads it once the
-    /// write has returned, and its record compares that reading with the
-    /// count then ([`PaneInputState::settle_written_bytes`]).
+    /// ended on this stream — busy, then Idle: the doorbell's turn clock.
     turns: u64,
 }
 
 impl PaneInputStream {
-    /// Feed the user's bytes; `true` if any of them submits the input box.
-    fn feed(&mut self, bytes: &[u8]) -> bool {
-        self.feed_as(bytes, crate::draft_deferral::ByteOrigin::User)
-    }
-
-    /// Feed bytes `origin` wrote; `true` if any of them submits the input box.
+    /// Feed bytes `origin` wrote, in the order the PTY took them: the paste
+    /// framing and the user's own submits and clears
+    /// ([`crate::composer_probe::recovery`]).
     ///
     /// Every byte is fed, deliberately: this is a state machine, so a
     /// short-circuiting `any` would stop tracking paste state at the first
     /// terminator and mis-read the rest of the buffer.
-    fn feed_as(&mut self, bytes: &[u8], origin: crate::draft_deferral::ByteOrigin) -> bool {
-        let mut submitted = false;
-        for byte in bytes {
-            submitted |= self.feed_byte(*byte, origin);
+    fn record(&mut self, bytes: &[u8], origin: crate::composer_probe::recovery::Origin) {
+        self.recovery.feed(bytes, origin);
+        for &byte in bytes {
+            // Every byte is somebody's predecessor, including the ones
+            // consumed as part of a paste marker.
+            #[cfg(test)]
+            let preceding = self.preceding.replace(byte);
+            let keypress = self.frame_byte(byte);
+            #[cfg(test)]
+            if keypress && !self.in_paste && crate::ui::user_byte_submits_input_box(preceding, byte)
+            {
+                self.submits += 1;
+            }
+            #[cfg(not(test))]
+            let _ = keypress;
         }
-        submitted
     }
 
-    /// Feed one byte; `true` if it submits, OUTSIDE a bracketed paste.
-    ///
-    /// Issue #544: the same byte also moves the draft bit, with the submit
-    /// decision just made and the paste framing as it stood BEFORE this byte —
-    /// so the closing marker's bytes are paste content and the opening one's are
-    /// not.
-    fn feed_byte(&mut self, byte: u8, origin: crate::draft_deferral::ByteOrigin) -> bool {
-        let in_paste = self.in_paste;
-        let submits = self.scan_submit(byte);
-        self.draft.feed_byte(byte, submits, in_paste, origin);
-        submits
+    /// Test builds only: feed the user's bytes; `true` if the submit scan
+    /// read any of them as a submit.
+    #[cfg(test)]
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        self.feed_as(bytes, crate::composer_probe::recovery::Origin::User)
     }
 
-    /// The submit half of [`Self::feed_byte`]: paste framing, then the keypress
-    /// behind the byte.
-    fn scan_submit(&mut self, byte: u8) -> bool {
-        // Unconditional, and before the marker matcher's early returns: every
-        // byte is somebody's predecessor, including the ones consumed as part
-        // of a paste marker.
-        let preceding = self.preceding.replace(byte);
+    /// Test builds only: [`Self::record`]; `true` if the submit scan read
+    /// any of the bytes as a submit.
+    #[cfg(test)]
+    fn feed_as(&mut self, bytes: &[u8], origin: crate::composer_probe::recovery::Origin) -> bool {
+        let before = self.submits;
+        self.record(bytes, origin);
+        self.submits != before
+    }
+
+    /// The paste framing of one byte: `false` when it was consumed as part of
+    /// a paste marker, `true` when it is a keypress's byte (inside or outside
+    /// a paste).
+    fn frame_byte(&mut self, byte: u8) -> bool {
         loop {
             if self.matched < PASTE_MARKER_PREFIX.len() {
                 if PASTE_MARKER_PREFIX[self.matched] == byte {
@@ -3601,40 +4579,25 @@ impl PaneInputStream {
                 return false;
             }
             if self.matched == 0 {
-                break;
+                return true;
             }
             // Not a marker after all. Restart the match at this byte — no
             // marker byte repeats its own prefix, so one retry is enough.
             self.matched = 0;
         }
-        !self.in_paste && crate::ui::user_byte_submits_input_box(preceding, byte)
-    }
-}
-
-/// Issue #544: a pane's input stream for `crate::draft_deferral`'s tests,
-/// which drive the draft parser through the real paste framing and submit
-/// scan rather than a copy of them.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct DraftTestStream(PaneInputStream);
-
-#[cfg(test)]
-impl DraftTestStream {
-    /// Feed one byte; `true` if it submits. See [`PaneInputStream::feed_byte`].
-    pub(crate) fn feed_byte(
-        &mut self,
-        byte: u8,
-        origin: crate::draft_deferral::ByteOrigin,
-    ) -> bool {
-        self.0.feed_byte(byte, origin)
     }
 
-    pub(crate) fn in_paste(&self) -> bool {
-        self.0.in_paste
-    }
-
-    pub(crate) fn draft(&self) -> &crate::draft_deferral::DraftTracker {
-        &self.0.draft
+    /// PRD #1666: apply a turn edge the pane's own agent reported. Only an
+    /// Idle that ends a turn under way counts the turn.
+    fn note_turn(&mut self, edge: TurnEdge) {
+        match edge {
+            TurnEdge::Started => self.busy = true,
+            TurnEdge::Ended => {
+                if std::mem::replace(&mut self.busy, false) {
+                    self.turns += 1;
+                }
+            }
+        }
     }
 }
 
@@ -3647,12 +4610,10 @@ pub enum TurnEdge {
     /// pane's stream when it has none yet, so a first turn reported before
     /// any input is still a turn.
     Started,
-    /// The agent reported Idle. When a turn was under way it has ended: what
-    /// a run of the user's Escape keys could have been holding, the interrupt
-    /// of that turn, is released. See
-    /// [`crate::draft_deferral::DraftTracker::turn_ended`]. With no turn under
-    /// way — a repeated Idle, or an agent whose busy reports the deck never
-    /// receives — it releases nothing.
+    /// The agent reported Idle. When a turn was under way it has ended, and
+    /// the pane's turn clock counts it. With no turn under way — a repeated
+    /// Idle, or an agent whose busy reports the deck never receives — it
+    /// counts nothing.
     Ended,
 }
 
@@ -3732,17 +4693,20 @@ impl PaneInputState {
     }
 
     /// Record the user's actual bytes — the human-input sequence above, plus
-    /// what the bytes themselves tell us: the pane's input stream.
-    ///
-    /// Issue #424 S1: "a submission" is decided by [`PaneInputStream`] — paste
-    /// framing here, the keypress behind the byte in
-    /// [`crate::ui::user_byte_submits_input_box`] — and never by scanning for a
-    /// raw CR/LF. A multi-line paste carries newlines the agent's editor STORES,
-    /// and so do the `Ctrl+J` and `Alt+Enter` the deck deliberately forwards as
-    /// newline keys; reading any of them as a submission would clear the draft
-    /// of a box that still holds it.
+    /// what the bytes themselves tell us: the pane's input stream (its paste
+    /// framing, and the user's own submits and clears that lift a suspended
+    /// doorbell, [`crate::composer_probe::recovery`]).
     fn note_user_bytes(&mut self, pane_id_env: &str, bytes: &[u8]) {
         self.note_user_bytes_as(pane_id_env, bytes, true);
+    }
+
+    /// PRD #1666 part 3 (Q35-21, OQ2): how many times the user's own bytes
+    /// have submitted or cleared `pane_id_env`'s box on its current stream
+    /// ([`crate::composer_probe::recovery::Recovery`]).
+    fn user_clears(&self, pane_id_env: &str) -> u64 {
+        self.input
+            .get(pane_id_env)
+            .map_or(0, |stream| stream.recovery.clears())
     }
 
     /// [`Self::note_user_bytes`], for a human's bytes (`human`) or a voice
@@ -3757,7 +4721,7 @@ impl PaneInputState {
         self.input
             .entry(pane_id_env.to_string())
             .or_default()
-            .feed(bytes);
+            .record(bytes, crate::composer_probe::recovery::Origin::User);
     }
 
     /// Drop everything recorded for `pane_id_env` — a different agent now owns
@@ -3788,19 +4752,26 @@ impl PaneInputState {
         self.human_input_seq.contains_key(pane_id_env) || self.input.contains_key(pane_id_env)
     }
 
-    /// Issue #544: has the user sent input into `pane_id_env` since their last
-    /// submit or clear? See [`crate::draft_deferral::DraftTracker`].
-    ///
-    /// An open paste counts from its opening marker on, before any of its
-    /// content has arrived: a paste split across writes is still one paste, and
-    /// a first write let through between the marker and the content lands in
-    /// the middle of it (PR #1398 finding #14). The marker alone does not set
-    /// the tracker's bit, so an empty paste still leaves nothing pending once it
-    /// closes.
-    fn draft_pending(&self, pane_id_env: &str) -> bool {
+    /// PRD #1666 part 3 (Q35-21): the pane's open paste and turn count, with
+    /// its generation's box `touched` by the input epoch and its observer's
+    /// `permission` ([`PaneInputHold::of`]).
+    fn input_hold(
+        &self,
+        pane_id_env: &str,
+        touched: bool,
+        permission: Option<crate::composer_probe::Permission>,
+    ) -> PaneInputHold {
+        PaneInputHold::of(self.input.get(pane_id_env), touched, permission)
+    }
+
+    /// Issue #544: whether a bracketed paste into `pane_id_env` has opened
+    /// and not closed, from its opening marker on, before any of its content
+    /// has arrived.
+    #[cfg(test)]
+    fn in_paste(&self, pane_id_env: &str) -> bool {
         self.input
             .get(pane_id_env)
-            .is_some_and(|stream| stream.in_paste || stream.draft.pending())
+            .is_some_and(|stream| stream.in_paste)
     }
 
     /// PRD #1666: apply a turn edge the agent in `pane_id_env` reported. The
@@ -3811,59 +4782,24 @@ impl PaneInputState {
             return;
         }
         match edge {
-            TurnEdge::Started => {
-                self.input.entry(pane_id_env.to_string()).or_default().busy = true;
-            }
+            TurnEdge::Started => self
+                .input
+                .entry(pane_id_env.to_string())
+                .or_default()
+                .note_turn(edge),
             TurnEdge::Ended => {
-                if let Some(stream) = self.input.get_mut(pane_id_env)
-                    && stream.busy
-                {
-                    stream.busy = false;
-                    stream.turns += 1;
-                    stream.draft.turn_ended();
+                if let Some(stream) = self.input.get_mut(pane_id_env) {
+                    stream.note_turn(edge);
                 }
             }
-        }
-    }
-
-    /// PRD #1666 (r8k R8G-02): the pane's turn count, read by
-    /// [`InputRecorder::turns_after_write`] once a PTY write has returned.
-    fn turns(&self, pane_id_env: &str) -> u64 {
-        self.input.get(pane_id_env).map_or(0, |stream| stream.turns)
-    }
-
-    /// PRD #1666 (r8k R8G-02): bytes just recorded into `pane_id_env` reached
-    /// the PTY before its turn count read `turns_after_write`. If a turn has
-    /// ended since that reading, it ended AFTER these bytes reached the agent,
-    /// and is applied to them as it was to everything recorded before it: an
-    /// interrupt's Escapes recorded late are released, not held.
-    ///
-    /// A turn that ended between the write and the reading is not known to
-    /// have come after the bytes — it may have come before them, and Escapes
-    /// written to an agent that had just gone Idle open a menu there — so it
-    /// is not applied, and the Escapes hold until the next turn ends or the
-    /// user's Enter. That ambiguous window is decided towards holding.
-    ///
-    /// The count is this stream's, not an identity: a stream reset for a new
-    /// owner since the reading can have counted past it. Bytes of a previous
-    /// owner never reach this, because the handover retires every writer
-    /// still on the pane before it resets the stream (see
-    /// [`PaneWriter::retired`]), and [`InputRecorder::record`] skips a retired
-    /// writer.
-    fn settle_written_bytes(&mut self, pane_id_env: &str, turns_after_write: u64) {
-        if let Some(stream) = self.input.get_mut(pane_id_env)
-            && stream.turns > turns_after_write
-        {
-            stream.draft.turn_ended();
         }
     }
 
     /// Issue #544 (PR #1398 finding #16): bytes the DECK just wrote into
     /// `pane_id_env`, fed into the same stream as the user's and in the same
     /// order the PTY received them — see [`PaneInputStream`]. They move the
-    /// paste framing, the submit scan and the draft parser exactly as they
-    /// move the agent's own; a CR of ours that submits clears the draft bit,
-    /// and nothing of ours sets it.
+    /// paste framing exactly as they move the agent's own; none of them is
+    /// the user's submit or clear.
     ///
     /// Deliberately NOT a user keystroke: the human-input sequence does not
     /// move.
@@ -3874,7 +4810,302 @@ impl PaneInputState {
         self.input
             .entry(pane_id_env.to_string())
             .or_default()
-            .feed_as(bytes, crate::draft_deferral::ByteOrigin::Deck);
+            .record(bytes, crate::composer_probe::recovery::Origin::Deck);
+    }
+}
+
+/// PRD #1666 part 3 (Q35-15): one attach frame on its way to the PTY: the
+/// person's bytes, the ticket the frame was admitted under, and where to tell
+/// its connection that it was refused after being accepted. Made once per
+/// frame by the attach loop, which [`PaneWriter::accept`] hands it to.
+pub(crate) struct UserFrame {
+    bytes: Vec<u8>,
+    ticket: Option<crate::ingress_ledger::TicketGuard>,
+    notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    /// PRD #1666 part 3 (Q35-16): where the planner cut it at acceptance,
+    /// if it did: the end of its first Ctrl+G candidate that opens a segment.
+    cut: Option<crate::composer_probe::planner::Cut>,
+    /// PRD #1666 part 3 (Q35-16): the cut op this is a sub-op of, once it was
+    /// split. The ticket stays with the op's last sub-op.
+    part: Option<Arc<SubOps>>,
+    /// PRD #1666 part 3 (Q35-17, core §8.4): a voice answer's keys rather
+    /// than a person's frame: written as an answer, under its question's
+    /// gate, and its outcome sent to whoever awaits it. Never cut: an answer
+    /// the planner would cut is refused before acceptance.
+    answer: Option<HeldAnswer>,
+    /// PRD #1666 part 3 (Q35-20): the input framing at its first byte, as
+    /// the planner read it when the gate took it: what a release reads it
+    /// from to stop short of a candidate.
+    framing: Option<crate::composer_probe::framing::Framing>,
+}
+
+/// PRD #1666 part 3 (Q35-17, core §8.4): what a voice answer's keys carry
+/// through a fence: the gate the writer thread checks before writing them,
+/// with the answer's reservation, and where the job's outcome goes. Dropped
+/// unwritten (retirement, a failed release check), its reply closes and its
+/// reservation clears.
+struct HeldAnswer {
+    gate: AnswerGate,
+    reply: oneshot::Sender<PtyJobDone>,
+}
+
+impl UserFrame {
+    pub(crate) fn new(
+        bytes: Vec<u8>,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    ) -> Self {
+        Self {
+            bytes,
+            ticket,
+            notice,
+            cut: None,
+            part: None,
+            answer: None,
+            framing: None,
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-16, core §4.3): how a release takes this held
+    /// frame. No cut: whole. A cut at its last byte: whole, its candidate
+    /// opening the next segment. Otherwise its prefix through the cut, as a
+    /// sub-op of the same op with no ticket of its own, and this frame left
+    /// as the rest, keeping the ticket, its own next cut read lazily from the
+    /// planner's state at this one: the rest of a cut op is cut at every
+    /// candidate, one release at a time.
+    fn split(&mut self) -> crate::composer_probe::gate::Cutting<UserFrame> {
+        use crate::composer_probe::gate::Cutting;
+        let Some(cut) = self.cut.take() else {
+            return Cutting::Whole;
+        };
+        if cut.at >= self.bytes.len() {
+            return Cutting::Through;
+        }
+        let whole = self.bytes.len();
+        let part = Arc::clone(self.part.get_or_insert_with(|| SubOps::new(whole)));
+        let rest = self.bytes.split_off(cut.at);
+        let prefix = std::mem::replace(&mut self.bytes, rest);
+        self.cut = crate::composer_probe::planner::next_cut(&cut.resume, &self.bytes);
+        self.framing = Some(cut.resume);
+        let taken = prefix.len();
+        Cutting::Split(
+            UserFrame {
+                bytes: prefix,
+                ticket: None,
+                notice: self.notice.clone(),
+                cut: None,
+                part: Some(part),
+                answer: None,
+                framing: None,
+            },
+            taken,
+        )
+    }
+
+    pub(crate) fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Refused before it was accepted: its ticket settles with `reason`. The
+    /// caller tells its connection itself, as before.
+    pub(crate) fn refuse(self, reason: &'static str) {
+        if let Some(ticket) = self.ticket {
+            ticket.refuse(reason);
+        }
+    }
+
+    /// Refused after a fence accepted it: its ticket settles with `reason`,
+    /// and its connection, if it is still there, gets the typed rejection it
+    /// would have got before acceptance. A full rejection queue drops it, as
+    /// the attach loop's own does.
+    fn refuse_accepted(self, reason: &'static str) {
+        // Q35-16 fix: one notice per op, whichever part of it comes first.
+        if let Some(notice) = &self.notice
+            && self.part.as_ref().is_none_or(|part| part.tell_once())
+        {
+            let _ = notice.try_send(reason.as_bytes().to_vec());
+        }
+        // Q35-16: the rest of a cut op whose earlier sub-ops the PTY took
+        // part of settles as written in part, once every earlier sub-op
+        // still with the writer has reported what it took (the fix,
+        // Q3516-R-U2-01).
+        match (self.ticket, &self.part) {
+            (Some(ticket), Some(part)) => part.refuse_rest(ticket, reason),
+            (Some(ticket), None) => ticket.refuse(reason),
+            (None, _) => {}
+        }
+    }
+}
+
+/// A full frame's place in its fence's queue ([`PaneWriter::accept`]).
+pub(crate) type FrameWaiter = crate::composer_probe::gate::Waiter<UserFrame>;
+
+/// What [`PaneWriter::accept`] did with a frame.
+pub(crate) enum Accepted {
+    /// Written now, as before the fence existed: the PTY's outcome.
+    Written(std::io::Result<()>),
+    /// The fence holds it, or it carried no byte and settled.
+    Held,
+    /// No room while the fence holds input: the frame back, and its place.
+    Full(UserFrame, FrameWaiter),
+    /// The generation retired before it was accepted.
+    Retired(UserFrame),
+}
+
+/// PRD #1666 part 3 (Q35-15 fix; core §8.1, R-U2-02/03): what a job a fence
+/// released carries to the writer thread besides its bytes and ticket: the
+/// captured generation's exit token, which the thread checks with the
+/// generation's retirement just before it writes, and the frame's route to
+/// its connection, which a refusal or a failed write there is told through.
+/// A fence's release makes one, and so does a person's op whose Ctrl+G
+/// candidate the planner cut while a liability is out (Q35-16), neither of
+/// which a production build reaches before activation.
+struct Released {
+    exited: Arc<AtomicBool>,
+    notice: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+}
+
+impl Released {
+    /// Tell the frame's connection `reason` with the typed rejection it
+    /// would have got before acceptance; a full rejection queue drops it, as
+    /// the attach loop's own does.
+    fn tell(&self, reason: &'static str) {
+        if let Some(notice) = &self.notice {
+            let _ = notice.try_send(reason.as_bytes().to_vec());
+        }
+    }
+
+    /// Tell the frame's connection its write failed (Q35-15 fix 2,
+    /// R-U2-01/02): `exited` when its generation retired or its target
+    /// exited, which is what the person is told for a dead target before
+    /// acceptance; otherwise [`WRITE_FAILED`], since a failed write is no
+    /// evidence the agent exited.
+    fn tell_failed(&self, retired: bool) {
+        self.tell(if retired || self.exited.load(Ordering::SeqCst) {
+            "exited"
+        } else {
+            WRITE_FAILED
+        });
+    }
+}
+
+/// PRD #1666 part 3 (Q35-15 fix 2, R-U2-01): the typed rejection a released
+/// frame's connection gets when the PTY failed its write, in part or whole,
+/// or its writer thread was gone, while its target is still live. A reason
+/// a client doesn't know reaches the person verbatim, which both clients have
+/// done since `KIND_STREAM_REJECT` existed.
+pub(crate) const WRITE_FAILED: &str = "write-failed";
+
+/// How a job reached [`PtyWriterThread::submit_job`], which decides what is
+/// still left to do at its enqueue.
+enum Acceptance {
+    /// Accepted at this enqueue: it moves the epoch and enters the in-flight
+    /// count here.
+    Now,
+    /// A reply that passed ahead of a closed fence: the gate's decision
+    /// already accepted it, exempt ([`crate::composer_probe::epoch::GenerationInput::pass_ahead`]),
+    /// so it only enters the in-flight count here (R-U2-04).
+    PassedAhead,
+    /// PRD #1666 part 3 (Q35-16): accepted by the planner as the gate let it
+    /// through, which moved its epoch and numbered its native candidates
+    /// there: it enters the in-flight count here, and its numbers are
+    /// published before it is sent.
+    Planned(Option<crate::composer_probe::planner::Natives>),
+    /// Released by a fence, which moved its epoch and counted it in flight
+    /// when it held it; with the cut op it is a sub-op of, if it is one.
+    Released(Released, Option<SubOpRun>),
+}
+
+/// PRD #1666 part 3 (Q35-20e): typing a pane's retired generation held,
+/// for the successor's card, with the human-input counter at the retirement:
+/// a person's keystroke reaching the pane after it ends the notice.
+#[derive(Debug, Clone)]
+struct PaneDiscard {
+    shown: crate::inbox_display::InputDiscarded,
+    input_seq: u64,
+    /// The registry's count of notices recorded when this one was
+    /// ([`RegistryInner::discard_seq`]): its place in retirement order.
+    retired_seq: u64,
+}
+
+/// PRD #1666 part 3 (R-E-U3-02): how many panes' not-delivered notices the
+/// registry keeps. A notice is pruned once a keystroke ends it, but a pane
+/// closed for good never sees one, and the daemon can't tell that close from
+/// a stop the same pane's successor follows (`probe_046`'s retirement
+/// history), so a closed pane's notice is kept; past this many the oldest
+/// retirement's goes.
+const MAX_PANE_DISCARDS: usize = 64;
+
+/// PRD #1666 part 3 (Q35-15): a generation's fence gate
+/// ([`crate::composer_probe::gate`]) with the writer's in-flight count and
+/// the input epoch it reads, so the registry can close it, read it and retire
+/// it without the pane writer's lock.
+///
+/// Until a probe opens a fence (Q35-20), only the `e2e` build's control verb
+/// closes, reads or releases one, so those halves are compiled into that
+/// build and the tests alone; a production build has the gate's acceptance
+/// and its retirement, which find it open.
+pub(crate) struct PaneGate {
+    gate: Arc<crate::composer_probe::gate::Gate<UserFrame>>,
+    in_flight: Arc<PtyInFlight>,
+    #[cfg(any(test, feature = "e2e"))]
+    input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    /// PRD #1666 part 3 (Q35-16): the generation's physical boundary, which
+    /// a doorbell reads and waits on without the pane writer's lock.
+    physical: Arc<crate::composer_probe::planner::Physical>,
+}
+
+impl PaneGate {
+    /// PRD #1666 part 3 (Q35-16, core §12.1): whether the bytes the PTY took
+    /// so far leave the pane's input at a boundary, and the wake for its
+    /// return there.
+    pub(crate) fn physical(&self) -> Arc<crate::composer_probe::planner::Physical> {
+        Arc::clone(&self.physical)
+    }
+
+    /// Close the fence at the generation's output offset as of now. `false`
+    /// once retired.
+    #[cfg(any(test, feature = "e2e"))]
+    pub(crate) fn fence(&self) -> bool {
+        self.gate.fence(self.input.output_offset())
+    }
+
+    #[cfg(any(test, feature = "e2e"))]
+    pub(crate) fn status(&self) -> crate::composer_probe::gate::Status {
+        self.gate.status()
+    }
+
+    /// The generation retired (R5 §4.6 E4): nothing more is accepted, every
+    /// held frame is refused `exited` once, its connection told, and it
+    /// leaves the in-flight count once; full waiters wake to see it. Returns
+    /// how many writes and bytes of a person's typing it discarded
+    /// (Q35-20e), or `None` when the gate had already retired, which retires
+    /// nothing (R-E-U2-01). A held answer isn't counted (auditor U3-7): the
+    /// successor's card says "your held typing", and the answer's refusal
+    /// already tells its answerer.
+    pub(crate) fn retire(&self) -> Option<(usize, usize)> {
+        let (held, _) = self.gate.retire_counted()?;
+        let (mut ops, mut bytes) = (0, 0);
+        for frame in held {
+            if frame.answer.is_none() {
+                ops += 1;
+                bytes += frame.bytes.len();
+            }
+            frame.refuse_accepted("exited");
+            self.in_flight.leave();
+        }
+        Some((ops, bytes))
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): have `notify` told when what the card
+    /// shows of this gate may have changed.
+    pub(crate) fn watch_display(&self, notify: Arc<Notify>) {
+        self.gate.watch_display(notify);
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): the gate's counts, for the card.
+    pub(crate) fn held_status(&self) -> crate::composer_probe::gate::Status {
+        self.gate.status()
     }
 }
 
@@ -3916,6 +5147,31 @@ pub struct PaneWriter {
     /// passed its ownership check before the close and finishes after it can no
     /// longer bring a closed pane's record back.
     retired: Arc<AtomicBool>,
+    /// PRD #1666 part 3 (Q35-15): the generation's fence gate, which every
+    /// attach frame passes through ([`Self::accept`]). Shared with
+    /// [`RunningAgent::gate`], which retires it without this writer's lock.
+    gate: Arc<PaneGate>,
+    /// PRD #1666 part 3 (Q35-15 fix, core §8.1): the generation's exit token,
+    /// set when its reader sees the PTY's end, which is not its retirement
+    /// (the registry can still hold an exited agent): a release checks it,
+    /// and carries it to the writer thread with every job it submits.
+    exited: Arc<AtomicBool>,
+    /// Test-only (R-B-U2-02's forced interleave): run by a release driver
+    /// pass between its read of the front segment and its extraction of
+    /// held input, until it returns `true`.
+    #[cfg(all(test, target_os = "linux"))]
+    mid_pass: Mutex<Option<Box<dyn FnMut() -> bool + Send>>>,
+    /// Test-only (Q16-1's forced interleave): run once by
+    /// [`Self::write_answer`] after its acceptance-time read of whether the
+    /// planner would cut the answer and before the gate takes it.
+    #[cfg(test)]
+    answer_decided: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// PRD #1666 part 3 (Q160b): whether the pane's terminal is canonical
+    /// now ([`crate::doorbell_generation::GenerationDoorbell::canonical`]),
+    /// which the release driver reads behind a check's `Unarmed` editor;
+    /// `None` when it can't be read, or with no doorbell.
+    #[cfg(target_os = "linux")]
+    canonical: Box<dyn Fn() -> Option<bool> + Send + Sync>,
 }
 
 impl PaneWriter {
@@ -3924,20 +5180,287 @@ impl PaneWriter {
         pane_id_env: Option<String>,
         state: Arc<Mutex<PaneInputState>>,
         retired: Arc<AtomicBool>,
+        exited: Arc<AtomicBool>,
+        doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
+        input: Arc<crate::composer_probe::epoch::GenerationInput>,
     ) -> Self {
+        #[cfg(target_os = "linux")]
+        let canonical: Box<dyn Fn() -> Option<bool> + Send + Sync> = match doorbell.clone() {
+            Some(doorbell) => Box::new(move || doorbell.canonical()),
+            None => Box::new(|| None),
+        };
         let pty = PtyWriterThread::spawn(
             inner,
             InputRecorder {
                 pane_id_env,
                 state: state.clone(),
                 retired: retired.clone(),
+                doorbell,
             },
+            input,
         );
+        let gate = Arc::new(PaneGate {
+            gate: Arc::default(),
+            in_flight: Arc::clone(&pty.in_flight),
+            #[cfg(any(test, feature = "e2e"))]
+            input: Arc::clone(&pty.input),
+            physical: Arc::clone(&pty.physical),
+        });
         Self {
             pty,
             state,
             retired,
+            gate,
+            exited,
+            #[cfg(all(test, target_os = "linux"))]
+            mid_pass: Mutex::new(None),
+            #[cfg(test)]
+            answer_decided: Mutex::new(None),
+            #[cfg(target_os = "linux")]
+            canonical,
         }
+    }
+
+    /// Test-only (Q160b): read the pane's terminal mode from `canonical`
+    /// instead of the PTY master.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_canonical(&mut self, canonical: Box<dyn Fn() -> Option<bool> + Send + Sync>) {
+        self.canonical = canonical;
+    }
+
+    /// Test-only: run `hook` once in the next [`Self::write_answer`],
+    /// between its read of whether the planner would cut the answer and the
+    /// gate's acceptance of it (Q16-1).
+    #[cfg(test)]
+    pub(crate) fn set_answer_decided(&self, hook: Box<dyn FnOnce() + Send>) {
+        *self
+            .answer_decided
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(hook);
+    }
+
+    /// PRD #1666 part 3 (Q35-15): this generation's fence gate.
+    pub(crate) fn gate(&self) -> Arc<PaneGate> {
+        Arc::clone(&self.gate)
+    }
+
+    /// PRD #1666 part 3 (Q35-15; R5 §4.3): hand an attach frame to the
+    /// generation's fence gate. With no fence, it is written now and
+    /// awaited, as `write_user_ticketed` writes it; a reply that
+    /// passes ahead of one is too, accepted by the gate's decision itself and
+    /// not classified again at its enqueue. While a fence holds input, it is
+    /// held, ticket and all, and the caller reads its next frame; a zero-byte
+    /// frame settles at once. With no room, it comes back with its place in
+    /// the queue, and the caller drops this writer's lock and waits on that
+    /// place before offering it again. The epoch moves at acceptance: for a
+    /// frame written now at its enqueue, for a held one as it is held, and
+    /// for a passing reply not at all (it is exempt).
+    pub(crate) async fn accept(&self, frame: UserFrame, waiter: Option<FrameWaiter>) -> Accepted {
+        use crate::composer_probe::epoch::{Plan, Writer};
+        use crate::composer_probe::gate::Admission;
+        let input = &self.pty.input;
+        let in_flight = &self.pty.in_flight;
+        let len = frame.bytes.len();
+        let admitted = self.gate.gate.admit(
+            frame,
+            len,
+            waiter,
+            // R-U2-04: the decision is the reply's acceptance, under one
+            // hold of the epoch's lock; nothing classifies it again.
+            |frame, trigger| input.pass_ahead(Writer::Human, &frame.bytes, trigger),
+            |frame| {
+                // R5 §4.7: a held op is in flight from acceptance, and
+                // leaves once, when it is written or refused. Q35-16: a
+                // segment is open, so the planner finds its first cut here,
+                // classified once, and the release reads it.
+                let planned = input.enqueue_planned(Writer::Human, &frame.bytes, Plan::Held);
+                frame.cut = planned.cut;
+                frame.framing = planned.framing;
+                in_flight.count.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        match admitted {
+            Admission::Open(mut frame) => {
+                // Q35-16 (core §4.3): no segment is open. The planner reads
+                // the frame here: with a liability out its first Ctrl+G
+                // candidate cuts it and opens one; with none, its candidates
+                // are native, numbered now and published before it is sent.
+                let planned = input.enqueue_planned(Writer::Human, &frame.bytes, Plan::Open);
+                input.accepted_parks();
+                match planned.cut {
+                    Some(cut) => {
+                        frame.cut = Some(cut);
+                        frame.framing = planned.framing;
+                        self.hold_cut(frame, len);
+                        // The audit's U3-8: a fence closed since admission
+                        // (a probe's arm section) holds it whole, as any
+                        // held op, so the driver hears of it the same way.
+                        input.held_accepted();
+                        Accepted::Held
+                    }
+                    None => Accepted::Written(
+                        self.write_user_accepted(
+                            &frame.bytes,
+                            frame.ticket,
+                            Acceptance::Planned(planned.natives),
+                        )
+                        .await,
+                    ),
+                }
+            }
+            Admission::PassAhead(frame) => {
+                // Accepted already, so the seam a test parks at sits between
+                // that decision and the job reaching the writer.
+                input.accepted_parks();
+                Accepted::Written(
+                    self.write_user_accepted(&frame.bytes, frame.ticket, Acceptance::PassedAhead)
+                        .await,
+                )
+            }
+            Admission::Held => {
+                // R-U2-03: a released segment's driver may now have bytes
+                // to pass; with the gate's and the epoch's locks released.
+                input.held_accepted();
+                Accepted::Held
+            }
+            Admission::Settled(frame) => {
+                input.enqueue(Writer::Human, &[]);
+                if let Some(ticket) = frame.ticket {
+                    ticket.settle_empty();
+                }
+                Accepted::Held
+            }
+            Admission::Full(frame, waiter) => Accepted::Full(frame, waiter),
+            Admission::Retired(frame) => Accepted::Retired(frame),
+            Admission::Refused(_) => unreachable!("a person's held frame is never refused"),
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-16, core §4.3): a frame the gate let through
+    /// whose planner cut it, a liability being out: it is accepted, its epoch
+    /// moved, and the gate now owns it, as it owns a held frame. Its
+    /// connection reads on, and hears of a refusal or a failed write as a
+    /// released frame's does.
+    ///
+    /// **With segments attached (A-20d-5; core §4.3, §4.5, §4.6; A1 §3.3).**
+    /// The Ctrl+G candidate opens a `HumanG`: the gate holds the frame whole
+    /// behind a segmented fence, the segment is opened unnumbered, and the
+    /// release driver, woken by the caller's `held_accepted`, numbers it,
+    /// publishes the number and only then submits the trigger, the bytes
+    /// through the cut, alone; the rest stays held behind that segment until
+    /// its matched helper's row releases it. Nothing of the frame reaches the
+    /// writer from here, so no trigger goes before its number. If the segment
+    /// can't be opened, the fence is still the driver's, and which refusal it
+    /// was decides the rest (revc23 review U3-2): on `Full` (the generation
+    /// already keeps `SEGMENT_CAP` segments) the driver, with no segment
+    /// open, writes what precedes the candidate, then the candidate alone
+    /// after its own number; on `Retired` (the generation retired under the
+    /// call) the driver writes nothing, since retirement refuses the op. A
+    /// fence closed since the frame was let through takes it whole and opens
+    /// nothing. A probe's arm section can't be that fence: admission takes a
+    /// queued probe back under the gate's lock, the lock the arm section
+    /// checks its claim under, so one that started first would have closed
+    /// the fence before admission read it and the op would be held, not let
+    /// through; what reaches it in practice is the `e2e` control's fence
+    /// (revc23 review U3-3).
+    ///
+    /// **With none** (no release driver runs for such a generation, so
+    /// nothing would number and write a held trigger), the prefix through
+    /// the cut is submitted, as a release submits, and the rest is held
+    /// behind the fence it closes.
+    fn hold_cut(&self, frame: UserFrame, len: usize) {
+        let in_flight = &self.pty.in_flight;
+        // In flight from acceptance, as a held frame is.
+        in_flight.count.fetch_add(1, Ordering::SeqCst);
+        let trigger = self.pty.input.output_offset();
+        if self.pty.input.has_segments() {
+            match self.gate.gate.cut_hold(frame, len, trigger) {
+                Ok(true) => {
+                    if let Err(refusal) = self.pty.input.segment_cut() {
+                        tracing::debug!(
+                            target: "composer_probe",
+                            ?refusal,
+                            "a cut's HumanG wasn't opened; on Full the driver writes its candidate alone, and on Retired the op is refused"
+                        );
+                    }
+                }
+                Ok(false) => {}
+                Err(frame) => {
+                    frame.refuse_accepted("exited");
+                    in_flight.leave();
+                }
+            }
+            return;
+        }
+        let split = |frame: &mut UserFrame| {
+            let cutting = frame.split();
+            if matches!(cutting, crate::composer_probe::gate::Cutting::Split(..)) {
+                // One more sub-op in flight: the rest stays held.
+                in_flight.count.fetch_add(1, Ordering::SeqCst);
+            }
+            cutting
+        };
+        match self.gate.gate.cut_open(frame, len, trigger, split) {
+            Ok(through) => {
+                for frame in through {
+                    self.pty.submit_released(frame, Arc::clone(&self.exited));
+                }
+            }
+            Err(frame) => {
+                frame.refuse_accepted("exited");
+                in_flight.leave();
+            }
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-15; R6 §5.3, core §8.1): open the fence and
+    /// submit what it held, in acceptance order, before this writer's lock
+    /// lets anything else be accepted. Q35-16: only as far as the first held
+    /// Ctrl+G candidate the planner cut at, whose prefix goes and whose
+    /// segment keeps the fence closed over the rest. `target` is the release-time check of
+    /// the captured target (the generation still the pane's live owner, and
+    /// writable): when it fails, every held op is refused with its reason
+    /// instead, and its connection told; an exited generation fails it with
+    /// `exited` whatever `target` says. Each submitted job is checked again
+    /// on the writer thread, just before it is written, against this
+    /// generation's retirement and exit, and carries its connection's
+    /// rejection route there ([`Released`]). How many ops it submitted.
+    /// Compiled where a fence can be closed ([`PaneGate`]).
+    #[cfg(any(test, feature = "e2e"))]
+    pub(crate) fn release_fence(&self, target: Result<(), &'static str>) -> usize {
+        // Core §8.1 (R-U2-02): an exited target fails the release-time check
+        // for every caller, whatever `target` says, as the attach loop's
+        // re-validation checks exit first.
+        let target = if self.exited.load(Ordering::SeqCst) {
+            Err("exited")
+        } else {
+            target
+        };
+        let in_flight = &self.pty.in_flight;
+        let held = self
+            .gate
+            .gate
+            .release_cut(self.pty.input.output_offset(), |frame| {
+                let cutting = frame.split();
+                if matches!(cutting, crate::composer_probe::gate::Cutting::Split(..)) {
+                    in_flight.count.fetch_add(1, Ordering::SeqCst);
+                }
+                cutting
+            });
+        let mut submitted = 0;
+        for frame in held {
+            match target {
+                Ok(()) => {
+                    self.pty.submit_released(frame, Arc::clone(&self.exited));
+                    submitted += 1;
+                }
+                Err(reason) => {
+                    frame.refuse_accepted(reason);
+                    self.pty.in_flight.leave();
+                }
+            }
+        }
+        submitted
     }
 
     /// PRD #1631 (audit N1): move `pane_id_env`'s human-input sequence as this
@@ -3952,37 +5475,45 @@ impl PaneWriter {
         }
     }
 
-    /// Write as the DAEMON: the bytes are ours, so they are not user input and
-    /// must not move the human-input sequence. Every daemon-initiated write into
-    /// a pane goes through here; everything that reaches the plain
-    /// [`std::io::Write`] impl or [`Self::write_user`] is somebody else typing.
-    ///
-    /// Issue #544 (PR #1398 finding #16): the bytes are still fed into the
-    /// pane's input stream, as the deck's, at the moment the PTY accepts
-    /// them — see [`DeckSink`].
-    ///
-    /// Issue #525: each write waits at most `stall` for the PTY to take it —
-    /// see [`PtySink::write_tracked`].
-    fn daemon(&self, stall: Duration) -> DeckSink<'_> {
-        DeckSink {
-            writer: self,
-            stall,
-            flushed: None,
-        }
-    }
-
     /// Issue #525: forward a user's bytes (an attach client's `STREAM_IN`
     /// frame), awaiting the PTY rather than blocking the caller's thread on it.
     /// No bound: the frame is the user's own input, and a pane that is not
     /// reading holds it exactly as long as it would hold their keystrokes in a
     /// terminal. Errors as `write_all` would; the flush after it is a no-op on
     /// both PTY backends and its result is ignored, as it always was here.
+    #[cfg(test)]
     pub(crate) async fn write_user(&self, bytes: &[u8]) -> std::io::Result<()> {
+        self.write_user_ticketed(bytes, None).await
+    }
+
+    /// [`Self::write_user`] for a human operation admitted to the
+    /// generation's ledger: the job carrying the bytes takes `ticket` over and
+    /// settles it when it ends (PRD #1666 part 3, round 5-wake).
+    #[cfg(test)]
+    pub(crate) async fn write_user_ticketed(
+        &self,
+        bytes: &[u8],
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> std::io::Result<()> {
+        self.write_user_accepted(bytes, ticket, Acceptance::Now)
+            .await
+    }
+
+    /// `write_user_ticketed` for a frame whose acceptance is
+    /// `acceptance`.
+    async fn write_user_accepted(
+        &self,
+        bytes: &[u8],
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        acceptance: Acceptance,
+    ) -> std::io::Result<()> {
         match self
             .pty
-            .run(
+            .run_accepted(
                 PtyOp::WriteAll(bytes.to_vec(), ByteSource::User, true),
                 None,
+                ticket,
+                acceptance,
             )
             .await
         {
@@ -3997,8 +5528,8 @@ impl PaneWriter {
         Ok(())
     }
 
-    /// PRD #1631 (audit N1): write a voice answer's keys, like
-    /// [`Self::write_user`] but as [`ByteSource::Answer`], and return the
+    /// PRD #1631 (audit N1): write a voice answer's keys, like a person's
+    /// write but as [`ByteSource::Answer`], and return the
     /// human-input counter as it stood once the PTY took them — read while the
     /// caller still holds this writer, which every human keystroke also needs,
     /// so no keystroke can fall between the write and the value. A later human
@@ -4008,15 +5539,129 @@ impl PaneWriter {
     /// Audit T1: the PTY thread writes the keys only if `gate` still holds when
     /// it comes to them — [`AnswerWrite::Superseded`], with nothing written,
     /// otherwise.
+    ///
+    /// PRD #1666 part 3 (Q35-17, core §8.4): the keys pass the generation's
+    /// fence gate as a person's frame does. With no fence they are written now
+    /// and awaited, as before, `queued` called once they are queued. While a
+    /// fence holds input they are held in acceptance order and this returns
+    /// [`AnswerWrite::Held`] at once, without calling `queued`: the caller
+    /// drops this writer and its other locks and awaits the outcome, which
+    /// arrives when a release writes them (the gate checked then) or when they
+    /// are dropped unwritten. A held answer's sequence number is the one at
+    /// its acceptance, so a keystroke accepted after it counts as typed since.
     pub(crate) async fn write_answer(
         &self,
         bytes: &[u8],
         gate: AnswerGate,
         queued: impl FnOnce(),
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
     ) -> std::io::Result<AnswerWrite> {
+        use crate::composer_probe::epoch::{Plan, Writer};
+        use crate::composer_probe::gate::Admission;
+        // Q35-16 (core §4.3): an answer the planner would cut is refused at
+        // acceptance, whole, rather than split. This read decides for an
+        // answer the gate lets through with no fence, which is written
+        // unplanned: a liability out with no fence closed refuses it here.
+        // Outside the `e2e` build's control verb, a liability goes out only
+        // in a probe's arm section, which closes the fence under the gate's
+        // lock; the caller holds this writer, so no probe is queued until the
+        // answer's job reaches the writer, and the gate takes back one queued
+        // before. An arm section that runs after this read finds the answer
+        // held, and the gate decides that case again under its lock (Q16-1).
+        if self
+            .pty
+            .input
+            .would_cut(Writer::Answer, bytes, self.gate.gate.status().fenced)
+            .is_some()
+        {
+            if let Some(ticket) = ticket {
+                ticket.refuse(ANSWER_HOLDS_CTRL_G);
+            }
+            queued();
+            return Ok(AnswerWrite::Refused);
+        }
+        #[cfg(test)]
+        if let Some(hook) = self
+            .answer_decided
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            hook();
+        }
+        let (reply, done) = oneshot::channel();
+        let frame = UserFrame {
+            answer: Some(HeldAnswer { gate, reply }),
+            ..UserFrame::new(bytes.to_vec(), ticket, None)
+        };
+        let input = &self.pty.input;
+        let in_flight = &self.pty.in_flight;
+        let admitted = self.gate.gate.admit_unless(
+            frame,
+            bytes.len(),
+            None,
+            // An answer is never a reply to a query: it passes no fence.
+            |_, _| false,
+            |frame| {
+                // As a person's held frame: in flight and its epoch moved
+                // from acceptance. Q16-1: whether the planner cuts it is
+                // decided again here, in the same hold of the epoch's lock
+                // as its acceptance and under the gate's, so an arm section
+                // that closed this fence and raised a liability after the
+                // read above can't give it a cut a release would split away
+                // from its gate: it is refused whole instead.
+                match input.enqueue_planned_uncut(Writer::Answer, &frame.bytes, Plan::Held) {
+                    Ok(planned) => {
+                        debug_assert!(planned.cut.is_none(), "refused when cut");
+                        frame.framing = planned.framing;
+                        in_flight.count.fetch_add(1, Ordering::SeqCst);
+                        true
+                    }
+                    Err(_) => false,
+                }
+            },
+        );
+        let frame = match admitted {
+            Admission::Open(frame) => frame,
+            Admission::Held => {
+                input.held_accepted();
+                return Ok(AnswerWrite::Held(HeldAnswerWrite {
+                    at: self.state.lock().unwrap().input_seq,
+                    done,
+                }));
+            }
+            Admission::Retired(frame) => {
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse("exited");
+                }
+                queued();
+                return Ok(AnswerWrite::Exited);
+            }
+            Admission::Full(frame, _place) => {
+                // No room behind the fence: refused whole rather than waited
+                // for under the question's lifecycle.
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse(ANSWER_INPUT_FULL);
+                }
+                queued();
+                return Ok(AnswerWrite::Full);
+            }
+            Admission::Refused(frame) => {
+                // Q16-1: a liability went out after the read above.
+                if let Some(ticket) = frame.ticket {
+                    ticket.refuse(ANSWER_HOLDS_CTRL_G);
+                }
+                queued();
+                return Ok(AnswerWrite::Refused);
+            }
+            Admission::PassAhead(_) | Admission::Settled(_) => {
+                unreachable!("an answer passes no fence and its keys carry bytes")
+            }
+        };
+        let HeldAnswer { gate, .. } = frame.answer.expect("an answer frame");
         match self
             .pty
-            .run_queued(PtyOp::Answer(bytes.to_vec(), gate), queued)
+            .run_queued(PtyOp::Answer(frame.bytes, gate), queued, frame.ticket)
             .await
         {
             PtyJobOutcome::Done(PtyJobDone { result: Err(e), .. })
@@ -4041,6 +5686,162 @@ impl PaneWriter {
     async fn until_idle(&self) {
         self.pty.until_idle().await
     }
+
+    /// PRD #1666 part 3, round 5-wake (Q24): queue one job of a doorbell
+    /// transaction, the deck's `bytes` written and flushed in one job, under
+    /// `claim`, the word the transaction's take-back and the writer's start
+    /// both move. Unlike [`Self::daemon`]'s writes it carries no bound and no
+    /// drop guard of its own: the transaction is the job's one withdrawer
+    /// while it runs, and the returned [`DeckJob`] leaves the in-flight count
+    /// once for a take-back it sees. `None` when the writer thread is gone.
+    ///
+    /// PRD #1666 part 3 (Q35-16, core §4.8): the job starts only if, when
+    /// the writer comes to it, the bytes the PTY took leave the pane's input
+    /// where a line may start (in ground, or after a lone ESC) and the
+    /// generation hasn't retired; otherwise it is refused there, writes
+    /// nothing, and [`DeckJob::refused`] says why.
+    #[cfg(test)]
+    pub(crate) fn queue_deck_job(
+        &self,
+        bytes: Vec<u8>,
+        claim: Arc<crate::doorbell_txn::JobClaim>,
+    ) -> Option<DeckJob> {
+        self.queue_deck_job_as(bytes, claim, ByteSource::Deck)
+    }
+
+    /// [`Self::queue_deck_job`] for ring transaction `ring`'s job: its bytes
+    /// are that job's in the epoch, not foreign (Q35-21, R3 §3.5).
+    pub(crate) fn queue_ring_job(
+        &self,
+        bytes: Vec<u8>,
+        claim: Arc<crate::doorbell_txn::JobClaim>,
+        ring: crate::composer_probe::epoch::DeckJobId,
+    ) -> Option<DeckJob> {
+        self.queue_deck_job_as(bytes, claim, ByteSource::Ring(ring))
+    }
+
+    fn queue_deck_job_as(
+        &self,
+        bytes: Vec<u8>,
+        claim: Arc<crate::doorbell_txn::JobClaim>,
+        source: ByteSource,
+    ) -> Option<DeckJob> {
+        let (tx, done) = oneshot::channel();
+        let (refused_tx, refused) = oneshot::channel();
+        let gate = Arc::clone(&self.gate.gate);
+        let (claim, _) = self.pty.submit_job(
+            PtyOp::WriteAll(bytes, source, true),
+            PtyReply::Async(tx),
+            None,
+            claim,
+            Acceptance::Now,
+            Some(start_check(
+                move |ctx| {
+                    // Q35-20 (CX-H): no deck line goes past a closed fence.
+                    if gate.status().fenced {
+                        return Err(DeckLineRefusal::Fenced);
+                    }
+                    deck_line_starts(ctx)
+                },
+                refused_tx,
+            )),
+        )?;
+        Some(DeckJob {
+            claim,
+            in_flight: Arc::clone(&self.pty.in_flight),
+            done,
+            refused,
+            left: false,
+        })
+    }
+
+    /// PRD #1666 part 3 (Q35-16, core §12.1): where the bytes the PTY took
+    /// so far leave the pane's input.
+    pub(crate) fn physical_boundary(&self) -> crate::composer_probe::planner::Boundary {
+        self.pty.physical.boundary()
+    }
+}
+
+/// PRD #1666 part 3, round 5-wake (Q24): a doorbell transaction's job on the
+/// PTY writer thread ([`PaneWriter::queue_deck_job`]), from its enqueue to
+/// its answer, correlated to the job by its own claim and its own answer
+/// channel: one transaction has one job in flight at a time.
+///
+/// The in-flight count stays exact across the three ways the job can go: a
+/// job the writer starts leaves the count when the writer answers it, late
+/// or not; a job the transaction takes back is skipped by the writer, which
+/// leaves nothing, and [`Self::reconcile_take_back`] leaves it once. The
+/// writer's own timeout and drop guard ([`WithdrawUnlessAnswered`]) never
+/// see this job, so nothing else takes it back while its transaction runs.
+pub(crate) struct DeckJob {
+    claim: Arc<crate::doorbell_txn::JobClaim>,
+    in_flight: Arc<PtyInFlight>,
+    done: oneshot::Receiver<PtyJobDone>,
+    /// Why the writer refused to start it (Q35-16), once it did.
+    refused: oneshot::Receiver<DeckLineRefusal>,
+    /// The take-back has left the in-flight count.
+    left: bool,
+}
+
+impl DeckJob {
+    /// PRD #1666 part 3 (Q35-16, I-8): the writer came to the job and its
+    /// start condition refused it, for this reason: none of it was written,
+    /// and the writer left the in-flight count.
+    pub(crate) fn refused(&mut self) -> Option<DeckLineRefusal> {
+        if self.claim.state() != crate::doorbell_txn::ClaimState::Refused {
+            return None;
+        }
+        self.refused.try_recv().ok()
+    }
+
+    /// The writer has claimed the job: some of its bytes may be in.
+    pub(crate) fn started(&self) -> bool {
+        self.claim.state() == crate::doorbell_txn::ClaimState::Started
+    }
+
+    /// Account a take-back: when the claim was taken back, leave the
+    /// in-flight count, once however often this is called, and answer
+    /// `true`, the job never being written.
+    pub(crate) fn reconcile_take_back(&mut self) -> bool {
+        let withdrawn = self.claim.state() == crate::doorbell_txn::ClaimState::Withdrawn;
+        if withdrawn && !self.left {
+            self.left = true;
+            self.in_flight.left_by_withdrawal();
+        }
+        withdrawn
+    }
+
+    /// The writer's answer, once it has come: the bytes the PTY took, and
+    /// whether the write and its flush both succeeded. A job taken back
+    /// never answers.
+    pub(crate) fn try_done(&mut self) -> Option<(usize, bool)> {
+        self.done.try_recv().ok().map(Self::outcome)
+    }
+
+    /// Wait for the writer's answer; `None` when the writer thread is gone
+    /// or the job was taken back.
+    pub(crate) async fn done(&mut self) -> Option<(usize, bool)> {
+        (&mut self.done).await.ok().map(Self::outcome)
+    }
+
+    fn outcome(done: PtyJobDone) -> (usize, bool) {
+        let ok = done.result.is_ok() && done.flushed.as_ref().is_none_or(Result::is_ok);
+        (done.accepted, ok)
+    }
+}
+
+impl Drop for DeckJob {
+    /// Dropped only once its transaction can no longer step (it ended, or
+    /// its task was torn down with it), so this take-back cannot answer the
+    /// transaction's own: a job still queued then is taken back, leaving the
+    /// count once.
+    fn drop(&mut self) {
+        if !self.left && self.claim.withdraw() {
+            self.left = true;
+            self.in_flight.left_by_withdrawal();
+        }
+        self.reconcile_take_back();
+    }
 }
 
 /// Issue #525: whose bytes a PTY job carries, which decides the clock they move
@@ -4048,12 +5849,40 @@ impl PaneWriter {
 /// daemon's own, [`PaneInputState::note_user_bytes`] for everybody else's.
 #[derive(Debug, Clone, Copy)]
 enum ByteSource {
+    /// The deck's bytes with no job named, foreign to every job in the
+    /// epoch. Since Q35-21 every deck line is a named ring job
+    /// ([`ByteSource::Ring`]), so only tests write these.
+    #[cfg(test)]
     Deck,
+    /// PRD #1666 part 3 (Q35-20): a probe's own `0x07`, the deck's, named to
+    /// the epoch as its job's so the probe's settlement can apply. Linux
+    /// only: no other platform writes a probe.
+    #[cfg(target_os = "linux")]
+    Probe(crate::composer_probe::epoch::DeckJobId),
+    /// PRD #1666 part 3 (Q35-21, R3 §3.5): a ring transaction's bytes, the
+    /// deck's, named to the epoch as its job's
+    /// ([`crate::composer_probe::epoch::DeckJobId::ring`]), so the ring's
+    /// `Submitted` reconcile can find its own line the last thing in.
+    Ring(crate::composer_probe::epoch::DeckJobId),
     User,
     /// PRD #1631: a voice answer's keys — recorded as the user's input (they
     /// are the user's answer) without moving the human-input sequence (audit
     /// N1), so the deck's own keys are never mistaken for a human's.
     Answer,
+}
+
+impl ByteSource {
+    /// Whether these are the deck's own bytes rather than a person's.
+    fn is_deck(self) -> bool {
+        match self {
+            #[cfg(test)]
+            ByteSource::Deck => true,
+            #[cfg(target_os = "linux")]
+            ByteSource::Probe(_) => true,
+            ByteSource::Ring(_) => true,
+            ByteSource::User | ByteSource::Answer => false,
+        }
+    }
 }
 
 /// Issue #525: what [`PtyWriterThread`] records into [`PaneInputState`] for the
@@ -4064,23 +5893,14 @@ struct InputRecorder {
     pane_id_env: Option<String>,
     state: Arc<Mutex<PaneInputState>>,
     retired: Arc<AtomicBool>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): the generation's doorbell
+    /// state, whose suspension the user's own submit or clear lifts.
+    doorbell: Option<Arc<crate::doorbell_generation::GenerationDoorbell>>,
 }
 
 impl InputRecorder {
-    /// PRD #1666 (r8k R8G-02): the pane's turn count, read right after a PTY
-    /// write returned and before its bytes are recorded — see
-    /// [`PaneInputState::settle_written_bytes`]. Read under `state`'s lock,
-    /// which is not held across the write: a write can block for as long as
-    /// the agent does not read (issue #525), and that lock serves every pane.
-    fn turns_after_write(&self) -> u64 {
-        self.pane_id_env
-            .as_deref()
-            .map_or(0, |pane_id| self.state.lock().unwrap().turns(pane_id))
-    }
-
-    /// Record `accepted`, the bytes ONE PTY write took, given the pane's turn
-    /// count read after that write ([`Self::turns_after_write`]).
-    fn record(&self, source: ByteSource, accepted: &[u8], turns_after_write: u64) {
+    /// Record `accepted`, the bytes ONE PTY write took.
+    fn record(&self, source: ByteSource, accepted: &[u8]) {
         if accepted.is_empty() {
             return;
         }
@@ -4092,17 +5912,32 @@ impl InputRecorder {
         if self.retired.load(Ordering::SeqCst) {
             return;
         }
+        let clears_before = state.user_clears(pane_id);
         match source {
+            #[cfg(test)]
             ByteSource::Deck => state.note_deck_bytes(pane_id, accepted),
+            #[cfg(target_os = "linux")]
+            ByteSource::Probe(_) => state.note_deck_bytes(pane_id, accepted),
+            ByteSource::Ring(_) => state.note_deck_bytes(pane_id, accepted),
             ByteSource::User => state.note_user_bytes(pane_id, accepted),
             ByteSource::Answer => state.note_user_bytes_as(pane_id, accepted, false),
         }
-        state.settle_written_bytes(pane_id, turns_after_write);
+        // PRD #1666 part 3 (Q35-21, OQ2): the user's own submit or clear, in
+        // the order the PTY took it, lifts a suspended doorbell
+        // ([`crate::composer_probe::recovery`]). It grants nothing the epoch
+        // doesn't: their keys moved it, so the next attempt still needs a
+        // check that reads the box empty.
+        if state.user_clears(pane_id) != clears_before
+            && let Some(doorbell) = &self.doorbell
+            && let Some(latch) = doorbell.user_cleared()
+        {
+            tracing::info!(target: "doorbell", pane_id, ?latch, "doorbell latch: user");
+        }
         // PRD #1741: a person's keys, typed or a voice answer, can be an
         // intervention; the deck's own never are.
         let telemetry = state.telemetry.clone();
         drop(state);
-        let human = !matches!(source, ByteSource::Deck);
+        let human = !source.is_deck();
         crate::telemetry::observe_pane_input(telemetry, human, pane_id, accepted);
     }
 
@@ -4154,7 +5989,9 @@ struct PtyWritePauseArm {
 
 /// Issue #525: one job for [`PtyWriterThread`].
 enum PtyOp {
-    /// One `write` call, as [`std::io::Write::write`] makes it.
+    /// One `write` call, as [`std::io::Write::write`] makes it: the test
+    /// build's blocking writer only (Q16-2).
+    #[cfg(test)]
     Write(Vec<u8>, ByteSource),
     /// Every byte, retrying `Interrupted` and stopping at the first error —
     /// [`write_all_tracked`]'s loop, run where the PTY can block. With `true`,
@@ -4167,6 +6004,7 @@ enum PtyOp {
     /// [`Self::WriteAll`] as [`ByteSource::Answer`], written only if its
     /// [`AnswerGate`] still holds when the thread comes to it.
     Answer(Vec<u8>, AnswerGate),
+    #[cfg(test)]
     Flush,
     /// Test seam: hand the PTY writer back and stop the thread — see
     /// [`AgentPtyRegistry::replace_agent_writer_for_test`].
@@ -4201,22 +6039,266 @@ enum PtyJobOutcome {
     Gone,
 }
 
-const PTY_JOB_QUEUED: u8 = 0;
-const PTY_JOB_STARTED: u8 = 1;
-const PTY_JOB_WITHDRAWN: u8 = 2;
-
 enum PtyReply {
     Async(oneshot::Sender<PtyJobDone>),
+    /// The test build's blocking writer and seams (Q16-2).
+    #[cfg(test)]
     Blocking(std::sync::mpsc::SyncSender<PtyJobDone>),
 }
 
 struct PtyJob {
     op: PtyOp,
-    /// [`PTY_JOB_QUEUED`] until the thread claims it ([`PTY_JOB_STARTED`]) or
-    /// its caller takes it back ([`PTY_JOB_WITHDRAWN`]); whichever CAS wins
-    /// decides whether a single byte of it is ever written.
-    state: Arc<AtomicU8>,
+    /// Queued until the thread claims it to start it or its caller takes it
+    /// back; whichever compare-and-swap wins decides whether a single byte of
+    /// it is ever written. PRD #1666 part 3, round 5-wake (Q24): the same
+    /// word a doorbell transaction holds for the job it queued.
+    state: Arc<crate::doorbell_txn::JobClaim>,
     reply: PtyReply,
+    /// PRD #1666 part 3, round 5-wake (plan §2.1′): the human operation these
+    /// bytes belong to, settled by the thread when the job ends. The deck's
+    /// own writes carry none.
+    ticket: Option<crate::ingress_ledger::JobTicket>,
+    /// PRD #1666 part 3 (Q35-15, core §8.1): an op a fence held and a
+    /// release submitted, checked against the generation's retirement and
+    /// exit just before it is written.
+    released: Option<Released>,
+    /// PRD #1666 part 3 (Q35-16, I-8): the job's start condition, asked on
+    /// the writer thread when it comes to the job. None: it starts as any
+    /// job does.
+    start: Option<StartCheck>,
+    /// PRD #1666 part 3 (Q35-16): the native Ctrl+G candidates the planner
+    /// numbered in it, reported to the hazard FIFO as the PTY takes each.
+    natives: Option<crate::composer_probe::planner::NativeRun>,
+    /// PRD #1666 part 3 (Q35-16, core §4.3): the cut op it is a sub-op of,
+    /// with this sub-op running until the job is dropped (the fix).
+    part: Option<SubOpRun>,
+}
+
+/// PRD #1666 part 3 (Q35-16, I-8): a job's start condition, type-erased: it
+/// asks the job's claim [`crate::doorbell_txn::JobClaim::start_if`] with the
+/// context the writer thread built, hands a refusal's reason to whoever
+/// queued the job, and answers whether the job started.
+type StartCheck =
+    Box<dyn FnOnce(&crate::doorbell_txn::JobClaim, &crate::doorbell_txn::StartCtx) -> bool + Send>;
+
+/// A [`StartCheck`] from `pred`, its refusal's reason sent, unchanged, on
+/// `refused`.
+fn start_check<R: Send + 'static>(
+    pred: impl FnOnce(&crate::doorbell_txn::StartCtx) -> Result<(), R> + Send + 'static,
+    refused: oneshot::Sender<R>,
+) -> StartCheck {
+    Box::new(move |claim, ctx| match claim.start_if(ctx, pred) {
+        crate::doorbell_txn::Start::Started => true,
+        crate::doorbell_txn::Start::Refused(reason) => {
+            let _ = refused.send(reason);
+            false
+        }
+        crate::doorbell_txn::Start::NotQueued => false,
+    })
+}
+
+/// PRD #1666 part 3 (Q35-16, core §4.3): the sub-ops a cut op became, which
+/// share its one ticket. The ticket stays with the last sub-op, which settles
+/// it once with what every sub-op took; a sub-op the PTY fails, in part or
+/// whole, ends every later one `Gone`, refused at its dequeue with nothing
+/// written. Sub-ops are written in order, so the last one settles after every
+/// earlier one has reported.
+///
+/// **The op's settlement waits for its running sub-ops (Q35-16 fix,
+/// Q3516-R-U2-01 / Q3516-A-U2-01).** A held rest refused while an earlier
+/// sub-op is still with the writer (retirement, or a release whose target
+/// check failed, neither of which takes the pane writer) doesn't settle the
+/// ticket from what has been counted so far: a sub-op adds what it took only
+/// once its whole job returns, so the PTY may have taken bytes the count
+/// doesn't show yet. Every sub-op submitted to the writer holds a
+/// [`SubOpRun`] until its job ends or is disposed of; the rest's refusal is
+/// kept here, and settled once, from the final count, when the last of them
+/// ends. Nothing waits for the PTY to do it: whoever ends last settles.
+///
+/// **One notice per op.** The op's connection is told of a refusal or a
+/// failed write once, by whichever of its sub-ops or its rest comes first
+/// ([`Self::tell_once`]).
+#[derive(Debug)]
+pub(crate) struct SubOps {
+    /// The whole op's length.
+    len: usize,
+    /// Shared with the last sub-op's job ticket, which reads it when that
+    /// job ends unrun ([`crate::ingress_ledger::TicketGuard::into_job_after`]).
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    failed: Mutex<Option<std::io::ErrorKind>>,
+    ending: Mutex<SubOpsEnding>,
+    /// The op's connection was told.
+    told: AtomicBool,
+}
+
+/// [`SubOps`]' sub-ops still with the writer, and the refusal of the op's
+/// held rest waiting for them to end.
+#[derive(Debug, Default)]
+struct SubOpsEnding {
+    running: usize,
+    rest: Option<(crate::ingress_ledger::TicketGuard, &'static str)>,
+}
+
+/// One sub-op of a [`SubOps`] submitted to the writer, until its job ends or
+/// is dropped unrun: dropping it is the sub-op's end. On a normal completion
+/// that is after it added what it took; when the writer unwinds or its job is
+/// disposed of, it ends with whatever the aggregate already holds, so bytes
+/// the PTY took that it never added aren't counted. Settles the op's refused
+/// rest when it is the last to end.
+#[derive(Debug)]
+pub(crate) struct SubOpRun(Arc<SubOps>);
+
+impl std::ops::Deref for SubOpRun {
+    type Target = SubOps;
+
+    fn deref(&self) -> &SubOps {
+        &self.0
+    }
+}
+
+impl Drop for SubOpRun {
+    fn drop(&mut self) {
+        let rest = {
+            let mut ending = self.0.ending.lock().unwrap_or_else(|e| e.into_inner());
+            ending.running -= 1;
+            if ending.running == 0 {
+                ending.rest.take()
+            } else {
+                None
+            }
+        };
+        if let Some((ticket, reason)) = rest {
+            ticket.refuse_after(self.0.accepted(), reason);
+        }
+    }
+}
+
+impl SubOps {
+    fn new(len: usize) -> Arc<Self> {
+        Arc::new(Self {
+            len,
+            accepted: Arc::default(),
+            failed: Mutex::new(None),
+            ending: Mutex::default(),
+            told: AtomicBool::new(false),
+        })
+    }
+
+    /// A sub-op is being submitted to the writer: it runs until the returned
+    /// [`SubOpRun`] is dropped.
+    fn run(self: &Arc<Self>) -> SubOpRun {
+        self.ending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .running += 1;
+        SubOpRun(Arc::clone(self))
+    }
+
+    /// The op's held rest is refused with `reason`: its ticket settles now
+    /// when no sub-op is with the writer, and otherwise when the last one
+    /// ends, from what they all took.
+    fn refuse_rest(&self, ticket: crate::ingress_ledger::TicketGuard, reason: &'static str) {
+        let mut ending = self.ending.lock().unwrap_or_else(|e| e.into_inner());
+        if ending.running > 0 {
+            ending.rest = Some((ticket, reason));
+            return;
+        }
+        drop(ending);
+        ticket.refuse_after(self.accepted(), reason);
+    }
+
+    /// Whether this caller is the first to tell the op's connection
+    /// anything: one notice per op.
+    fn tell_once(&self) -> bool {
+        !self.told.swap(true, Ordering::SeqCst)
+    }
+
+    fn took(&self, accepted: usize, error: Option<std::io::ErrorKind>) {
+        self.accepted.fetch_add(accepted, Ordering::SeqCst);
+        if let Some(kind) = error {
+            self.failed
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get_or_insert(kind);
+        }
+    }
+
+    fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+
+    fn failed(&self) -> Option<std::io::ErrorKind> {
+        *self.failed.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+/// PRD #1666 part 3 (Q35-16, I-8): why the writer refused to start one of the
+/// deck's own lines: core's reason type for [`start_check`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeckLineRefusal {
+    /// The bytes the PTY took so far leave the pane's input inside an escape
+    /// sequence, a string or a paste: a deck line starts only in ground or
+    /// after a lone ESC (core §4.8, [`crate::composer_probe::planner::Boundary`]).
+    OffGround,
+    /// The generation retired, a successor published on its pane included.
+    Retired,
+    /// PRD #1666 part 3 (Q35-20, CX-H): a fence holds the pane's input
+    /// while a check runs: the deck's own line is held back with a person's.
+    Fenced,
+}
+
+/// The deck line's start condition (core §4.8): the written stream where a
+/// line may start, and the generation not retired.
+fn deck_line_starts(ctx: &crate::doorbell_txn::StartCtx) -> Result<(), DeckLineRefusal> {
+    if ctx.retired {
+        Err(DeckLineRefusal::Retired)
+    } else if !ctx.boundary.line_may_start() {
+        Err(DeckLineRefusal::OffGround)
+    } else {
+        Ok(())
+    }
+}
+
+impl PtyOp {
+    /// PRD #1666 part 3 (Q35-06, I-1): who writes the job's bytes as the
+    /// input epoch reads it, and the bytes, or `None` for a job that carries
+    /// none. Exhaustive over both enums with no `_` arm, so a new op or byte
+    /// source has to say what it does to the epoch.
+    fn epoch_writer(&self) -> Option<(crate::composer_probe::epoch::Writer, &[u8])> {
+        use crate::composer_probe::epoch::Writer;
+        let writer = |source: ByteSource| match source {
+            #[cfg(test)]
+            ByteSource::Deck => Writer::UnnamedDeck,
+            #[cfg(target_os = "linux")]
+            ByteSource::Probe(job) => Writer::Deck(job),
+            ByteSource::Ring(job) => Writer::Deck(job),
+            ByteSource::User => Writer::Human,
+            ByteSource::Answer => Writer::Answer,
+        };
+        match self {
+            #[cfg(test)]
+            PtyOp::Write(buf, source) => Some((writer(*source), buf)),
+            PtyOp::WriteAll(buf, source, _) => Some((writer(*source), buf)),
+            PtyOp::Answer(buf, _) => Some((writer(ByteSource::Answer), buf)),
+            #[cfg(test)]
+            PtyOp::Flush => None,
+            #[cfg(test)]
+            PtyOp::Surrender(_) => None,
+        }
+    }
+
+    /// How many bytes the job hands the PTY.
+    fn len(&self) -> usize {
+        match self {
+            PtyOp::WriteAll(buf, _, _) | PtyOp::Answer(buf, _) => buf.len(),
+            #[cfg(test)]
+            PtyOp::Write(buf, _) => buf.len(),
+            #[cfg(test)]
+            PtyOp::Flush => 0,
+            #[cfg(test)]
+            PtyOp::Surrender(_) => 0,
+        }
+    }
 }
 
 /// Issue #525: jobs handed to the thread and not yet finished or withdrawn.
@@ -4234,19 +6316,21 @@ impl PtyInFlight {
     }
 
     /// Take a still-queued job back. `true` when it will never be written.
-    fn withdraw(&self, state: &AtomicU8) -> bool {
-        let withdrawn = state
-            .compare_exchange(
-                PTY_JOB_QUEUED,
-                PTY_JOB_WITHDRAWN,
-                Ordering::SeqCst,
-                Ordering::SeqCst,
-            )
-            .is_ok();
+    /// The winner of the take-back leaves the count, here; a writer that
+    /// then finds the job taken back skips it without leaving again.
+    fn withdraw(&self, claim: &crate::doorbell_txn::JobClaim) -> bool {
+        let withdrawn = claim.withdraw();
         if withdrawn {
             self.leave();
         }
         withdrawn
+    }
+
+    /// A job taken back by a withdrawer other than [`Self::withdraw`], which
+    /// left nothing: a doorbell transaction's own take-back (Q24). Its
+    /// driver calls this exactly once for the claim it saw taken back.
+    pub(crate) fn left_by_withdrawal(&self) {
+        self.leave();
     }
 }
 
@@ -4255,8 +6339,38 @@ impl PtyInFlight {
 /// shutdown — leaves no write of its behind to land later unrecorded.
 struct WithdrawUnlessAnswered<'a> {
     in_flight: &'a PtyInFlight,
-    state: &'a AtomicU8,
+    state: &'a crate::doorbell_txn::JobClaim,
     armed: bool,
+    /// The job's ticket, settled `Cancelled` when the job is taken back.
+    ticket: Option<crate::ingress_ledger::TicketHandle>,
+}
+
+impl WithdrawUnlessAnswered<'_> {
+    /// Take the job back if it has not started; `true` when it never will.
+    fn withdraw(&self) -> bool {
+        let withdrawn = self.in_flight.withdraw(self.state);
+        if withdrawn && let Some(ticket) = &self.ticket {
+            ticket.settle_cancelled();
+        }
+        withdrawn
+    }
+
+    /// The job's reply closed unanswered. For the jobs this guard covers (no
+    /// start condition, not released, no part), that means the job was
+    /// dropped, so the writer thread is gone. That rests on those jobs'
+    /// shape: the writer's `continue` paths close a reply unanswered with the
+    /// thread alive for a released job, a later sub-op of a failed cut, a job
+    /// its start condition refused, and a job already withdrawn (revptyfix
+    /// review U3-1). A job the thread never started (one still in the queue
+    /// when the thread ended, PRD #1666 part 3) is taken back here and leaves
+    /// the in-flight count it entered; one the thread started and unwound in
+    /// is left counted. Its ticket is not touched here: the job's own
+    /// `JobTicket`, dropped with the job, settles it.
+    fn gone(&mut self) -> PtyJobOutcome {
+        self.in_flight.withdraw(self.state);
+        self.armed = false;
+        PtyJobOutcome::Gone
+    }
 }
 
 impl Drop for WithdrawUnlessAnswered<'_> {
@@ -4264,7 +6378,7 @@ impl Drop for WithdrawUnlessAnswered<'_> {
         if self.armed {
             // A job the thread has already started is left to finish: its
             // bytes are going to the PTY.
-            self.in_flight.withdraw(self.state);
+            self.withdraw();
         }
     }
 }
@@ -4294,42 +6408,181 @@ impl Drop for WithdrawUnlessAnswered<'_> {
 struct PtyWriterThread {
     jobs: std::sync::mpsc::Sender<PtyJob>,
     in_flight: Arc<PtyInFlight>,
+    /// PRD #1666 part 3 (Q35-06): the generation's input epoch, moved at the
+    /// enqueue below, before a job reaches the thread.
+    input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    /// PRD #1666 part 3 (Q35-16): the physical boundary the thread's
+    /// tracker publishes, one `write(2)` return at a time.
+    physical: Arc<crate::composer_probe::planner::Physical>,
 }
 
 impl PtyWriterThread {
-    fn spawn(inner: Box<dyn std::io::Write + Send>, recorder: InputRecorder) -> Self {
-        Self::spawn_reporting_to(inner, recorder, Arc::default())
+    fn spawn(
+        inner: Box<dyn std::io::Write + Send>,
+        recorder: InputRecorder,
+        input: Arc<crate::composer_probe::epoch::GenerationInput>,
+    ) -> Self {
+        Self::spawn_reporting_to(inner, recorder, Arc::default(), input, Arc::default())
     }
 
     /// [`Self::spawn`], counting its jobs in `in_flight` — kept across a writer
     /// swap so a handle taken from the old thread reports on the new one.
     fn spawn_reporting_to(
-        mut inner: Box<dyn std::io::Write + Send>,
+        inner: Box<dyn std::io::Write + Send>,
         recorder: InputRecorder,
         in_flight: Arc<PtyInFlight>,
+        input: Arc<crate::composer_probe::epoch::GenerationInput>,
+        physical: Arc<crate::composer_probe::planner::Physical>,
     ) -> Self {
         let (jobs, queue) = std::sync::mpsc::channel::<PtyJob>();
         let thread_in_flight = in_flight.clone();
+        let thread_input = Arc::clone(&input);
+        let thread_physical = Arc::clone(&physical);
+        // PRD #1666 part 3 (Q105b.2): the test and `e2e` builds put the
+        // generation's fault plan in front of the PTY, and park at its hold.
+        #[cfg(any(test, feature = "e2e"))]
+        let thread_controls = Arc::clone(input.writer_e2e());
+        #[cfg(not(any(test, feature = "e2e")))]
+        let mut inner = inner;
+        #[cfg(any(test, feature = "e2e"))]
+        let mut inner: Box<dyn std::io::Write + Send> =
+            Box::new(crate::e2e_controls::FaultableWriter {
+                inner,
+                controls: Arc::clone(&thread_controls),
+            });
         std::thread::Builder::new()
             .name("pty-writer".to_string())
             .spawn(move || {
+                // PRD #1666 part 3 (Q35-16): the physical tracker, fed what
+                // the PTY took, one `write(2)` return at a time.
+                let mut tracker = crate::composer_probe::planner::PhysicalTracker::default();
                 while let Ok(job) = queue.recv() {
-                    if job
-                        .state
-                        .compare_exchange(
-                            PTY_JOB_QUEUED,
-                            PTY_JOB_STARTED,
-                            Ordering::SeqCst,
-                            Ordering::SeqCst,
-                        )
-                        .is_err()
-                    {
-                        // Withdrawn by a caller that stopped waiting.
+                    let PtyJob {
+                        op,
+                        state,
+                        reply,
+                        ticket,
+                        released,
+                        start,
+                        natives,
+                        part,
+                    } = job;
+                    #[cfg(any(test, feature = "e2e"))]
+                    thread_controls.at_dequeue(&recorder.retired);
+                    // PRD #1666 part 3 (Q35-16, I-8): a job with a start
+                    // condition starts only if it holds against what this
+                    // thread knows now, in the same serialization as the
+                    // write it would make.
+                    let started = match start {
+                        Some(check) => check(
+                            &state,
+                            &crate::doorbell_txn::StartCtx {
+                                boundary: tracker.boundary(),
+                                retired: recorder.retired.load(Ordering::SeqCst),
+                                now: Instant::now(),
+                            },
+                        ),
+                        None => state.start(),
+                    };
+                    if !started {
+                        // Withdrawn by a caller that stopped waiting, or by
+                        // the doorbell transaction that queued it: whoever
+                        // took it back has left the in-flight count. Refused
+                        // by its start condition: this thread leaves it. Either
+                        // way it is dropped here, at its dequeue, so its reply
+                        // channel closes now and nothing else holds it (I-6′).
+                        if state.state() == crate::doorbell_txn::ClaimState::Refused {
+                            if let Some(ticket) = ticket {
+                                ticket.settle_refused("not-started");
+                            }
+                            thread_in_flight.leave();
+                        }
+                        // The claim goes before the reply closes, so whoever
+                        // the closed reply wakes finds this thread no longer
+                        // holding it.
+                        drop(state);
+                        drop(reply);
                         continue;
                     }
-                    let done = match job.op {
+                    // PRD #1666 part 3 (A-20d-4, Q118b): a probe's job is
+                    // checked for retirement once, in its start condition
+                    // above (this writer's retirement flag, then the gate's
+                    // arm section under the gate's lock, then admission
+                    // under R6), and not again before its write: it carries
+                    // no `released`, so the check below is not its. A
+                    // retirement (close, restart, a spawn over an exited
+                    // agent) that lands after a successful arm section and
+                    // before the write lets the probe's Ctrl+G reach this
+                    // generation's own PTY master; a successor has its own
+                    // master and writer thread. It releases no held typing:
+                    // the retired gate refuses what it held, `exited`. The
+                    // arm page keeps the count the section published
+                    // (retirement drops the records, so `Seam::sync` has no
+                    // count to publish, and the file stays while this daemon
+                    // runs), so a helper the retiring agent runs for that
+                    // byte reads the arm present and takes the armed path:
+                    // it opens no editor, and prints its one notice into the
+                    // dying pane. Closing the window would hold the gate's
+                    // lock across a PTY write that can block; the decision
+                    // and the helper's branch are in
+                    // docs/develop/doorbell-admission.md (Accepted
+                    // residuals).
+                    // PRD #1666 part 3 (Q35-15, core §8.1): a held op
+                    // released before its generation retired or its target
+                    // exited, and reached after, ends unwritten: refused
+                    // once, its connection told (R-U2-02/03).
+                    if let Some(released) = &released
+                        && (recorder.retired.load(Ordering::SeqCst)
+                            || released.exited.load(Ordering::SeqCst))
+                    {
+                        if part.as_ref().is_none_or(|part| part.tell_once()) {
+                            released.tell("exited");
+                        }
+                        if let Some(ticket) = ticket {
+                            match &part {
+                                Some(part) if part.accepted() > 0 => ticket.settle_written(
+                                    part.len,
+                                    part.accepted(),
+                                    Some(std::io::ErrorKind::BrokenPipe),
+                                ),
+                                _ => ticket.settle_refused("exited"),
+                            }
+                        }
+                        thread_in_flight.leave();
+                        continue;
+                    }
+                    // PRD #1666 part 3 (Q35-16, core §4.3): an earlier sub-op
+                    // of the same cut op failed, so this one ends `Gone`,
+                    // unwritten; the ticket, which this last sub-op carries,
+                    // is refused once with that failure.
+                    if let Some(part) = &part
+                        && let Some(kind) = part.failed()
+                    {
+                        if let Some(ticket) = ticket {
+                            ticket.settle_written(part.len, part.accepted(), Some(kind));
+                        }
+                        thread_in_flight.leave();
+                        continue;
+                    }
+                    let mut tracking = Tracking {
+                        tracker: &mut tracker,
+                        physical: &thread_physical,
+                        natives,
+                        input: &thread_input,
+                    };
+                    let len = op.len();
+                    #[cfg(any(test, feature = "e2e"))]
+                    thread_controls.begin_job(matches!(op, PtyOp::Answer(..)));
+                    let done = match op {
+                        #[cfg(test)]
                         PtyOp::Write(buf, source) => {
-                            match write_once_recorded(inner.as_mut(), &buf, &recorder, source) {
+                            match write_once_recorded(
+                                inner.as_mut(),
+                                &buf,
+                                &recorder,
+                                source,
+                                &mut tracking,
+                            ) {
                                 Ok(n) => PtyJobDone {
                                     accepted: n,
                                     result: Ok(()),
@@ -4343,8 +6596,13 @@ impl PtyWriterThread {
                             }
                         }
                         PtyOp::WriteAll(buf, source, flush) => {
-                            let mut done =
-                                write_all_recorded(inner.as_mut(), &buf, &recorder, source);
+                            let mut done = write_all_recorded(
+                                inner.as_mut(),
+                                &buf,
+                                &recorder,
+                                source,
+                                &mut tracking,
+                            );
                             if flush {
                                 done.flushed = Some(inner.flush());
                             }
@@ -4357,6 +6615,7 @@ impl PtyWriterThread {
                                     &buf,
                                     &recorder,
                                     ByteSource::Answer,
+                                    &mut tracking,
                                 );
                                 done.flushed = Some(inner.flush());
                                 done
@@ -4368,6 +6627,7 @@ impl PtyWriterThread {
                                 }
                             }
                         }
+                        #[cfg(test)]
                         PtyOp::Flush => PtyJobDone {
                             accepted: 0,
                             result: inner.flush(),
@@ -4376,17 +6636,61 @@ impl PtyWriterThread {
                         #[cfg(test)]
                         PtyOp::Surrender(back) => {
                             thread_in_flight.leave();
+                            // The queue goes before the writer is handed
+                            // back, so a job sent once the caller has it
+                            // finds no reader at once, rather than waiting
+                            // in the queue until this thread's return drops
+                            // it (the gone-writer tests' setup race).
+                            drop(queue);
                             let _ = back.send((inner, recorder));
                             return;
                         }
                     };
+                    // PRD #1666 part 3 (Q35-15 fix, R-U2-03): a released
+                    // write has no caller awaiting it, so when the PTY fails
+                    // it, in part or whole, its connection is told, without
+                    // claiming the agent exited unless it did (fix 2,
+                    // R-U2-01); its ticket says how much went in, below,
+                    // once.
+                    if let Some(released) = &released
+                        && done.result.is_err()
+                        && part.as_ref().is_none_or(|part| part.tell_once())
+                    {
+                        released.tell_failed(recorder.retired.load(Ordering::SeqCst));
+                    }
+                    // PRD #1666 part 3 (Q35-16): a sub-op adds what it took
+                    // to its op, and a failure ends the op's later sub-ops.
+                    let (len, accepted) = match &part {
+                        Some(part) => {
+                            part.took(
+                                done.accepted,
+                                done.result.as_ref().err().map(std::io::Error::kind),
+                            );
+                            (part.len, part.accepted())
+                        }
+                        None => (len, done.accepted),
+                    };
+                    // PRD #1666 part 3, round 5-wake: the human operation's
+                    // ticket settles with what the PTY took. A voice answer
+                    // superseded before its keys were written wrote nothing.
+                    if let Some(ticket) = ticket {
+                        let error = done.result.as_ref().err();
+                        if error.is_some_and(|e| {
+                            e.get_ref().is_some_and(|i| i.is::<AnswerSuperseded>())
+                        }) {
+                            ticket.settle_cancelled();
+                        } else {
+                            ticket.settle_written(len, accepted, error.map(std::io::Error::kind));
+                        }
+                    }
                     // Answered BEFORE it counts as finished, so a caller whose
                     // bound runs out in between finds the answer rather than
                     // reporting a finished write as stalled.
-                    match job.reply {
+                    match reply {
                         PtyReply::Async(tx) => {
                             let _ = tx.send(done);
                         }
+                        #[cfg(test)]
                         PtyReply::Blocking(tx) => {
                             let _ = tx.send(done);
                         }
@@ -4395,7 +6699,12 @@ impl PtyWriterThread {
                 }
             })
             .expect("spawn an agent's PTY writer thread");
-        Self { jobs, in_flight }
+        Self {
+            jobs,
+            in_flight,
+            input,
+            physical,
+        }
     }
 
     fn gone() -> std::io::Error {
@@ -4405,43 +6714,231 @@ impl PtyWriterThread {
         )
     }
 
-    fn submit(&self, op: PtyOp, reply: PtyReply) -> Option<Arc<AtomicU8>> {
-        let state = Arc::new(AtomicU8::new(PTY_JOB_QUEUED));
-        self.in_flight.count.fetch_add(1, Ordering::SeqCst);
-        let job = PtyJob {
-            op,
-            state: state.clone(),
-            reply,
+    #[cfg(test)]
+    fn submit(&self, op: PtyOp, reply: PtyReply) -> Option<Arc<crate::doorbell_txn::JobClaim>> {
+        self.submit_claimed(op, reply, None, Arc::default())
+            .map(|(state, _)| state)
+    }
+
+    /// `submit`, carrying a human operation's ticket: its ownership
+    /// moves into the job, and the ledger's job mark with it, in one hold of
+    /// the ledger around the queueing (PRD #1666 part 3, round 5-wake).
+    fn submit_ticketed(
+        &self,
+        op: PtyOp,
+        reply: PtyReply,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> Option<(
+        Arc<crate::doorbell_txn::JobClaim>,
+        Option<crate::ingress_ledger::TicketHandle>,
+    )> {
+        self.submit_claimed(op, reply, ticket, Arc::default())
+    }
+
+    /// [`Self::submit_ticketed`] with the job's claim word supplied by the
+    /// caller: a doorbell transaction queues its job under the claim it
+    /// already holds, so its take-back and the writer's start move one word
+    /// (Q24).
+    fn submit_claimed(
+        &self,
+        op: PtyOp,
+        reply: PtyReply,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        state: Arc<crate::doorbell_txn::JobClaim>,
+    ) -> Option<(
+        Arc<crate::doorbell_txn::JobClaim>,
+        Option<crate::ingress_ledger::TicketHandle>,
+    )> {
+        self.submit_job(op, reply, ticket, state, Acceptance::Now, None)
+    }
+
+    /// PRD #1666 part 3 (Q35-15): submit an op a fence held. It moved the
+    /// epoch and entered the in-flight count when it was accepted, so it does
+    /// neither again; nobody awaits it but a held voice answer's handler
+    /// (Q35-17), and the writer checks its generation
+    /// and `exited`, its target's exit token, before writing it. Its frame's
+    /// notice goes with it, so a refusal or a failed write on the thread
+    /// reaches its connection (R-U2-03).
+    fn submit_released(&self, frame: UserFrame, exited: Arc<AtomicBool>) {
+        // Q35-17: a voice answer is written as one, under its gate, and its
+        // outcome goes to whoever awaits it.
+        let (op, tx) = match frame.answer {
+            Some(answer) => (PtyOp::Answer(frame.bytes, answer.gate), answer.reply),
+            None => (
+                PtyOp::WriteAll(frame.bytes, ByteSource::User, true),
+                oneshot::channel().0,
+            ),
         };
-        if self.jobs.send(job).is_err() {
-            self.in_flight.leave();
-            return None;
+        let _ = self.submit_job(
+            op,
+            PtyReply::Async(tx),
+            frame.ticket,
+            Arc::default(),
+            Acceptance::Released(
+                Released {
+                    exited,
+                    notice: frame.notice,
+                },
+                frame.part.as_ref().map(SubOps::run),
+            ),
+            None,
+        );
+    }
+
+    fn submit_job(
+        &self,
+        op: PtyOp,
+        reply: PtyReply,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        state: Arc<crate::doorbell_txn::JobClaim>,
+        acceptance: Acceptance,
+        start: Option<StartCheck>,
+    ) -> Option<(
+        Arc<crate::doorbell_txn::JobClaim>,
+        Option<crate::ingress_ledger::TicketHandle>,
+    )> {
+        debug_assert_eq!(
+            state.state(),
+            crate::doorbell_txn::ClaimState::Queued,
+            "a claim is queued once"
+        );
+        let accept_now = matches!(acceptance, Acceptance::Now);
+        let (released, part, planned) = match acceptance {
+            Acceptance::Released(released, part) => (Some(released), part, None),
+            Acceptance::Planned(natives) => {
+                self.in_flight.count.fetch_add(1, Ordering::SeqCst);
+                (None, None, natives)
+            }
+            Acceptance::Now | Acceptance::PassedAhead => {
+                self.in_flight.count.fetch_add(1, Ordering::SeqCst);
+                (None, None, None)
+            }
+        };
+        let prior = part
+            .as_ref()
+            .map(|part: &SubOpRun| Arc::clone(&part.accepted));
+        let queue = |ticket: Option<crate::ingress_ledger::JobTicket>| {
+            let handle = ticket
+                .as_ref()
+                .map(crate::ingress_ledger::JobTicket::handle);
+            // PRD #1666 part 3 (Q35-06, Q35-15): the epoch moves at
+            // acceptance, which for a job submitted now is here, before the
+            // job is sent, so the thread can't start a job whose move isn't
+            // visible. Under the ledger's lock on the ticketed branch
+            // (ledger, then the epoch's leaf lock), alone on the other. A
+            // released job moved it when its fence held it, a reply that
+            // passed ahead was accepted, exempt, by the gate's decision, and
+            // a planned one by the planner as the gate let it through.
+            //
+            // Q35-16: a person's op written now around the gate is the
+            // planner's too, which numbers its native candidates in the same
+            // hold; nothing around the gate can be cut.
+            let mut natives = planned;
+            if accept_now && let Some((writer, bytes)) = op.epoch_writer() {
+                use crate::composer_probe::epoch::{Plan, Writer};
+                if matches!(writer, Writer::Human | Writer::Answer) {
+                    natives = self
+                        .input
+                        .enqueue_planned(writer, bytes, Plan::Bypass)
+                        .natives;
+                } else {
+                    self.input.enqueue(writer, bytes);
+                }
+                self.input.accepted_parks();
+            }
+            // A2 §4.4: the last native number is on the arm page before the
+            // job can reach the writer. The page's own lock is taken here,
+            // under the ledger's on the ticketed branch, and takes nothing of
+            // the ledger's.
+            if let Some(natives) = &natives {
+                self.input.publish_native(natives.last);
+            }
+            let job = PtyJob {
+                op,
+                state: state.clone(),
+                reply,
+                ticket,
+                released,
+                start,
+                natives: natives.map(crate::composer_probe::planner::Natives::run),
+                part,
+            };
+            if let Err(std::sync::mpsc::SendError(job)) = self.jobs.send(job) {
+                // Q35-15 fix 2 (R-U2-02): nobody awaits a released job, so
+                // its connection is told here; dropping the job leaves its
+                // ticket to this enqueue's hold, which settles it once.
+                if let Some(released) = &job.released
+                    && job.part.as_ref().is_none_or(|part| part.tell_once())
+                {
+                    released.tell_failed(false);
+                }
+                self.in_flight.leave();
+                return None;
+            }
+            Some((state.clone(), handle))
+        };
+        match ticket {
+            // Q35-16 fix (Q3516-A-U3-02): the last sub-op's ticket knows
+            // what the earlier ones took, for its failure paths.
+            Some(ticket) => ticket.into_job_after(prior, |job| queue(Some(job))),
+            None => queue(None),
         }
-        Some(state)
     }
 
     /// Hand `op` to the thread and wait for it, at most `bound` when one is
     /// given. Dropping the returned future withdraws the job if it has not
     /// started.
+    #[cfg(test)]
     async fn run(&self, op: PtyOp, bound: Option<Duration>) -> PtyJobOutcome {
+        self.run_ticketed(op, bound, None).await
+    }
+
+    /// [`Self::run`] for a human operation's bytes, whose ticket the job
+    /// takes over.
+    #[cfg(test)]
+    async fn run_ticketed(
+        &self,
+        op: PtyOp,
+        bound: Option<Duration>,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> PtyJobOutcome {
+        self.run_accepted(op, bound, ticket, Acceptance::Now).await
+    }
+
+    /// [`Self::run_ticketed`] for a job whose acceptance is `acceptance`.
+    async fn run_accepted(
+        &self,
+        op: PtyOp,
+        bound: Option<Duration>,
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+        acceptance: Acceptance,
+    ) -> PtyJobOutcome {
         let (tx, mut rx) = oneshot::channel();
-        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
+        let Some((state, handle)) = self.submit_job(
+            op,
+            PtyReply::Async(tx),
+            ticket,
+            Arc::default(),
+            acceptance,
+            None,
+        ) else {
             return PtyJobOutcome::Gone;
         };
         let mut guard = WithdrawUnlessAnswered {
             in_flight: &self.in_flight,
             state: &state,
             armed: true,
+            ticket: handle,
         };
         let outcome = match bound {
             None => match (&mut rx).await {
                 Ok(done) => PtyJobOutcome::Done(done),
-                Err(_) => PtyJobOutcome::Gone,
+                Err(_) => guard.gone(),
             },
             Some(bound) => match within_real_time(bound, &mut rx).await {
                 Some(Ok(done)) => PtyJobOutcome::Done(done),
-                Some(Err(_)) => PtyJobOutcome::Gone,
-                None if self.in_flight.withdraw(&state) => PtyJobOutcome::Withdrawn,
+                Some(Err(_)) => guard.gone(),
+                None if guard.withdraw() => PtyJobOutcome::Withdrawn,
                 // Started: it may have finished in the instant since the
                 // alarm rang, in which case its answer is the truth.
                 None => match rx.try_recv() {
@@ -4464,9 +6961,14 @@ impl PtyWriterThread {
     /// key re-checks its question on the thread ([`AnswerGate`], PRD #1631
     /// audit T1). A job still queued when the caller is dropped is withdrawn,
     /// as [`Self::run`]'s is, and so never written.
-    async fn run_queued(&self, op: PtyOp, queued: impl FnOnce()) -> PtyJobOutcome {
+    async fn run_queued(
+        &self,
+        op: PtyOp,
+        queued: impl FnOnce(),
+        ticket: Option<crate::ingress_ledger::TicketGuard>,
+    ) -> PtyJobOutcome {
         let (tx, rx) = oneshot::channel();
-        let Some(state) = self.submit(op, PtyReply::Async(tx)) else {
+        let Some((state, handle)) = self.submit_ticketed(op, PtyReply::Async(tx), ticket) else {
             queued();
             return PtyJobOutcome::Gone;
         };
@@ -4475,17 +6977,20 @@ impl PtyWriterThread {
             in_flight: &self.in_flight,
             state: &state,
             armed: true,
+            ticket: handle,
         };
         let outcome = match rx.await {
             Ok(done) => PtyJobOutcome::Done(done),
-            Err(_) => PtyJobOutcome::Gone,
+            Err(_) => guard.gone(),
         };
         guard.armed = false;
         outcome
     }
 
-    /// The blocking counterpart of [`Self::run`], for [`std::io::Write`]: no
+    /// The blocking counterpart of [`Self::run`], for the test build's
+    /// [`std::io::Write`]: no
     /// bound, and the calling thread waits as it did when it wrote itself.
+    #[cfg(test)]
     fn run_blocking(&self, op: PtyOp) -> Option<PtyJobDone> {
         let (tx, rx) = std::sync::mpsc::sync_channel(1);
         self.submit(op, PtyReply::Blocking(tx))?;
@@ -4581,30 +7086,47 @@ fn real_time_alarm(after: Duration) -> oneshot::Receiver<()> {
 }
 
 /// Issue #525: one `write` call into the PTY, whose accepted bytes `recorder`
-/// records as `source`'s before this returns.
-///
-/// PRD #1666 (r8k R8G-02): the pane's turn count is read after the write
-/// returns, for THIS write's bytes alone, and handed to the record — so an
-/// agent's Idle ingested while the write was in progress or before the bytes
-/// were recorded is ordered against these bytes, not against the job they
-/// belong to. See [`PaneInputState::settle_written_bytes`] for the rule and
-/// the side its ambiguous window is decided towards.
+/// records as `source`'s before this returns, each write's bytes on their own.
 fn write_once_recorded(
     w: &mut (dyn std::io::Write + Send),
     buf: &[u8],
     recorder: &InputRecorder,
     source: ByteSource,
+    tracking: &mut Tracking<'_>,
 ) -> std::io::Result<usize> {
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::BeforeWrite);
     let n = w.write(buf)?;
+    tracking.written(&buf[..n.min(buf.len())]);
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::AfterWrite);
-    let turns = recorder.turns_after_write();
     #[cfg(test)]
     recorder.pause_at(PtyWritePause::BeforeRecord);
-    recorder.record(source, &buf[..n], turns);
+    recorder.record(source, &buf[..n]);
     Ok(n)
+}
+
+/// PRD #1666 part 3 (Q35-16, I-6 without its timestamp): what the writer
+/// thread does with each `write(2)` return besides recording it: the physical
+/// tracker reads the bytes the PTY took and publishes its boundary, and the
+/// job's native candidates the planner numbered enter the hazard FIFO as the
+/// PTY takes each one, by the planner's reading, replayed.
+struct Tracking<'a> {
+    tracker: &'a mut crate::composer_probe::planner::PhysicalTracker,
+    physical: &'a crate::composer_probe::planner::Physical,
+    natives: Option<crate::composer_probe::planner::NativeRun>,
+    input: &'a crate::composer_probe::epoch::GenerationInput,
+}
+
+impl Tracking<'_> {
+    fn written(&mut self, written: &[u8]) {
+        self.tracker
+            .written_as(written, self.physical, self.input.input_grammar());
+        if let Some(natives) = self.natives.as_mut() {
+            let input = self.input;
+            natives.written(written, |seq| input.enter_native(seq, Instant::now()));
+        }
+    }
 }
 
 /// Issue #525: [`write_all_tracked`]'s loop, recording each accepted slice as
@@ -4615,10 +7137,11 @@ fn write_all_recorded(
     buf: &[u8],
     recorder: &InputRecorder,
     source: ByteSource,
+    tracking: &mut Tracking<'_>,
 ) -> PtyJobDone {
     let mut written = 0usize;
     while written < buf.len() {
-        match write_once_recorded(w, &buf[written..], recorder, source) {
+        match write_once_recorded(w, &buf[written..], recorder, source, tracking) {
             Ok(0) => {
                 return PtyJobDone {
                     accepted: written,
@@ -4647,102 +7170,35 @@ fn write_all_recorded(
     }
 }
 
-/// Issue #525: where a guarded delivery's bytes go. Production writes through
-/// [`DeckSink`], which awaits [`PtyWriterThread`]; any [`std::io::Write`] is a
-/// sink too, written inline, which is what the fault-injecting writers in the
-/// tests below are.
-trait PtySink {
-    /// Write all of `buf`, reporting how far it got — see [`WriteProgress`].
-    fn write_tracked(
-        &mut self,
-        buf: &[u8],
-    ) -> impl std::future::Future<Output = WriteProgress> + Send;
-    fn flush_tracked(&mut self) -> impl std::future::Future<Output = std::io::Result<()>> + Send;
-}
-
-impl<W: std::io::Write + Send> PtySink for W {
-    async fn write_tracked(&mut self, buf: &[u8]) -> WriteProgress {
-        write_all_tracked(self, buf)
-    }
-
-    async fn flush_tracked(&mut self) -> std::io::Result<()> {
-        self.flush()
-    }
-}
-
-/// Issue #544 (PR #1398 finding #16): [`PaneWriter::daemon`]'s view of the
-/// writer. Each write goes to the PTY and then, for exactly the bytes the PTY
-/// ACCEPTED, into the pane's input stream as the deck's
-/// ([`PaneInputState::note_deck_bytes`]) — recorded by the writer's thread
-/// before it answers, so no user byte can land between the write and its
-/// record.
-///
-/// "Accepted" is the only count there is: a partial write feeds the prefix
-/// that went in. Accepted is not proven delivered — a later flush can fail —
-/// so for those bytes the stream can run ahead of the PTY. Deck bytes never set
-/// the draft bit, so what that can cost is framing or a clear: a paste our
-/// partial write opened reads as open, or a CR the writer accepted and the PTY
-/// never received reads as a submit. Nothing after `write` tells an accepted
-/// one-byte CR from a delivered one.
-///
-/// Issue #525: a write the PTY has not finished taking after `stall` is left
-/// to the thread and reported [`WriteProgress::Stalled`]; its bytes are
-/// recorded as and when the PTY takes them.
-struct DeckSink<'a> {
-    writer: &'a PaneWriter,
-    stall: Duration,
-    /// The flush the last write ran in its own job, which the next
-    /// [`PtySink::flush_tracked`] reports instead of sending one of its own.
-    flushed: Option<std::io::Result<()>>,
-}
-
-impl PtySink for DeckSink<'_> {
-    async fn write_tracked(&mut self, buf: &[u8]) -> WriteProgress {
-        let op = PtyOp::WriteAll(buf.to_vec(), ByteSource::Deck, true);
-        self.flushed = None;
-        match self.writer.pty.run(op, Some(self.stall)).await {
-            PtyJobOutcome::Done(PtyJobDone {
-                accepted,
-                result,
-                flushed,
-            }) => {
-                self.flushed = flushed;
-                match result {
-                    Ok(()) => WriteProgress::Complete,
-                    Err(_) if accepted == 0 => WriteProgress::NothingWritten,
-                    Err(_) => WriteProgress::Partial,
-                }
-            }
-            PtyJobOutcome::Withdrawn => WriteProgress::NothingWritten,
-            PtyJobOutcome::Stalled => WriteProgress::Stalled,
-            PtyJobOutcome::Gone => WriteProgress::NothingWritten,
-        }
-    }
-
-    async fn flush_tracked(&mut self) -> std::io::Result<()> {
-        // The write before this one already flushed, in its own job.
-        if let Some(flushed) = self.flushed.take() {
-            return flushed;
-        }
-        match self.writer.pty.run(PtyOp::Flush, Some(self.stall)).await {
-            PtyJobOutcome::Done(done) => done.result,
-            PtyJobOutcome::Withdrawn | PtyJobOutcome::Stalled => Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the PTY did not take a flush in time",
-            )),
-            PtyJobOutcome::Gone => Err(PtyWriterThread::gone()),
-        }
-    }
-}
-
 /// Every byte written through this impl is a user's — see [`PaneWriter`]. It
 /// blocks the calling thread until the PTY answers, as a direct write did;
 /// async code takes [`PaneWriter::write_user`] instead (issue #525).
+///
+/// PRD #1666 part 3 (Q35-16, core §4.3): while a check is open or a liability
+/// is out, a Ctrl+G candidate cuts a write: it hands the PTY the bytes
+/// through the candidate and returns that short count, which
+/// [`std::io::Write`] allows, and the caller's next call carries the rest,
+/// which the planner reads then, once. Nothing cuts otherwise.
+///
+/// Test-only (Q16-2): it writes past the fence gate, so no production path
+/// may type through it. A person's bytes reach the PTY through
+/// [`PaneWriter::accept`] (the attach loop, `write_user_bytes`) or
+/// [`PaneWriter::write_answer`], both of which pass the gate.
+#[cfg(test)]
 impl std::io::Write for PaneWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let cut = self
+            .pty
+            .input
+            .would_cut(
+                crate::composer_probe::epoch::Writer::Human,
+                buf,
+                self.gate.gate.status().fenced,
+            )
+            .unwrap_or(buf.len());
         let done = self
             .pty
-            .run_blocking(PtyOp::Write(buf.to_vec(), ByteSource::User))
+            .run_blocking(PtyOp::Write(buf[..cut].to_vec(), ByteSource::User))
             .ok_or_else(PtyWriterThread::gone)?;
         done.result.map(|()| done.accepted)
     }
@@ -4770,7 +7226,7 @@ enum Admission<'a> {
     Fresh,
     /// Holding the ticket is the proof the respawn is counted in flight.
     Respawn {
-        _ticket: &'a RespawnTicket<'a>,
+        ticket: &'a RespawnTicket<'a>,
         /// PRD #1666 part 3, round 5 (plan D7): the replacement this respawn
         /// is, when it replaces a dispatched unit's terminal generation.
         replacement: Option<&'a ReplacementTicket>,
@@ -4780,6 +7236,13 @@ enum Admission<'a> {
 impl<'a> Admission<'a> {
     fn is_admitted_respawn(&self) -> bool {
         matches!(self, Self::Respawn { .. })
+    }
+
+    fn respawn_ticket(&self) -> Option<&'a RespawnTicket<'a>> {
+        match self {
+            Self::Respawn { ticket, .. } => Some(*ticket),
+            Self::Fresh => None,
+        }
     }
 
     fn replacement(&self) -> Option<&'a ReplacementTicket> {
@@ -5095,6 +7558,16 @@ impl HeldQuestions {
 ///
 /// - **One question transition at a time per pane** — the question lifecycle
 ///   ([`Self::lock_lifecycle`]), below.
+/// - **An accepted answer's reservation** (PRD #1666 part 3, Q35-17, core
+///   §8.4). A key a fence holds is accepted, and the handler drops the
+///   writer and the lifecycle there and awaits its outcome outside them. The
+///   key carries a reservation ([`Self::reserve`]) keyed by the pane, the
+///   generation, the question and its revision, and an acceptance number; it
+///   clears when the key's job ends or the key is dropped unwritten, not
+///   when the handler stops waiting, and clears only the reservation it
+///   names. While one is set for the agent, another answer is refused
+///   [`crate::question::AnswerRefusal::AnswerInProgress`], as a held slot
+///   refuses it ([`Self::answer_reserved`]).
 ///
 /// # The question lifecycle (audit R1–R3)
 ///
@@ -5115,8 +7588,10 @@ impl HeldQuestions {
 /// - **the keyboard-only mark** on a question the deck typed part of an
 ///   answer into;
 /// - **delivery** of an answer: a held reply from its revalidation to the
-///   deck's clearing event, and each key from its revalidation until the write
-///   is queued on the pane's PTY thread. The lifecycle is not held across the
+///   deck's clearing event, and each key from its revalidation until it is
+///   accepted: queued on the pane's PTY thread, or held by a fence (Q35-17),
+///   in which case the question's `answer_queued` is set before the lifecycle
+///   is released. The lifecycle is not held across the
 ///   write itself, so the thread checks the key's question again before
 ///   writing it ([`AnswerGate`], audit T1) — against the record
 ///   [`Self::note_pending`] keeps, updated wherever the daemon changes which
@@ -5139,8 +7614,53 @@ pub struct QuestionAnswers {
     /// Shared with every [`AnswerGate`], which reads it on a PTY thread.
     raised: Arc<Mutex<HashMap<String, RaisedQuestion>>>,
     answered: Mutex<HashMap<String, AnsweredMark>>,
+    /// PRD #1666 part 3 (Q35-17): per pane, the accepted answer key that
+    /// holds the reservation ([`Self::reserve`]).
+    reserved: Arc<Mutex<HashMap<String, Reserved>>>,
+    acceptances: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     barriers: Mutex<HashMap<&'static str, QuestionBarrier>>,
+}
+
+/// The accepted answer key holding a pane's reservation
+/// ([`QuestionAnswers::reserve`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reserved {
+    generation: String,
+    question_id: String,
+    revision: Option<u64>,
+    acceptance: u64,
+}
+
+/// PRD #1666 part 3 (Q35-17, core §8.4): an accepted answer key's
+/// reservation. Dropping it clears the pane's reservation when it is still
+/// this one, and nothing otherwise: a late end of an earlier key never
+/// clears a newer key's reservation.
+#[derive(Debug)]
+pub(crate) struct AnswerReservation {
+    reserved: Arc<Mutex<HashMap<String, Reserved>>>,
+    pane_id: String,
+    acceptance: u64,
+}
+
+impl Drop for AnswerReservation {
+    fn drop(&mut self) {
+        let mut reserved = self.reserved.lock().unwrap_or_else(|e| e.into_inner());
+        if reserved
+            .get(&self.pane_id)
+            .is_some_and(|held| held.acceptance == self.acceptance)
+            && let Some(held) = reserved.remove(&self.pane_id)
+        {
+            tracing::debug!(
+                pane_id = %self.pane_id,
+                generation = %held.generation,
+                question_id = %held.question_id,
+                revision = ?held.revision,
+                acceptance = held.acceptance,
+                "question: an accepted answer key settled; its reservation cleared"
+            );
+        }
+    }
 }
 
 /// See [`QuestionAnswers::arm_barrier`]: the "reached" sender and the
@@ -5183,6 +7703,11 @@ pub(crate) struct AnswerGate {
     pane_id: String,
     question_id: String,
     revision: Option<u64>,
+    /// PRD #1666 part 3 (Q35-17, core §8.4): the answer's reservation, which
+    /// clears when this gate is dropped: when the writer thread has checked
+    /// it and written the keys or not, or when they are dropped unwritten.
+    /// So it outlives a handler that stopped waiting for them.
+    reservation: Option<AnswerReservation>,
     /// Test seam: the PTY thread stops here before its check — see
     /// [`QuestionAnswers::arm_barrier`] and [`ANSWER_KEY_ON_PTY_THREAD`].
     #[cfg(test)]
@@ -5214,7 +7739,117 @@ pub(crate) enum AnswerWrite {
     /// The question changed while the keys were queued: nothing was written
     /// (audit T1).
     Superseded,
+    /// PRD #1666 part 3 (Q35-16, core §4.3): the keys hold a Ctrl+G candidate
+    /// while a check is open or a liability is out, so they were refused at
+    /// acceptance: splitting them would break the answer's all-or-nothing
+    /// write. Nothing was written.
+    Refused,
+    /// PRD #1666 part 3 (Q35-17): a fence holds input, and the keys are held
+    /// behind it: their outcome comes later ([`HeldAnswerWrite::settled`]).
+    Held(HeldAnswerWrite),
+    /// The generation retired before the keys were accepted: nothing was
+    /// written.
+    Exited,
+    /// PRD #1666 part 3 (Q35-17): a fence holds input and has no room left
+    /// for the keys: refused, nothing written.
+    Full,
 }
+
+/// PRD #1666 part 3 (Q35-17, core §8.4): a voice answer's keys a fence
+/// accepted and holds.
+pub(crate) struct HeldAnswerWrite {
+    /// The human-input sequence number at their acceptance.
+    at: u64,
+    done: oneshot::Receiver<PtyJobDone>,
+}
+
+/// How a [`HeldAnswerWrite`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldAnswerOutcome {
+    /// Written in full, after a release.
+    Written,
+    /// The question changed before the keys were reached: nothing written.
+    Superseded,
+    /// The PTY failed the write, after taking `accepted` bytes of it.
+    Failed { accepted: usize },
+    /// Dropped unwritten: the generation retired, or the release found its
+    /// target no longer writable.
+    Gone,
+}
+
+impl HeldAnswerWrite {
+    /// The human-input sequence number at the keys' acceptance.
+    pub(crate) fn at(&self) -> u64 {
+        self.at
+    }
+
+    /// Await the keys' physical outcome, holding nothing.
+    pub(crate) async fn settled(self) -> HeldAnswerOutcome {
+        match self.done.await {
+            Ok(PtyJobDone { result: Ok(()), .. }) => HeldAnswerOutcome::Written,
+            Ok(PtyJobDone {
+                result: Err(e),
+                accepted,
+                ..
+            }) => {
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<AnswerSuperseded>())
+                {
+                    HeldAnswerOutcome::Superseded
+                } else {
+                    HeldAnswerOutcome::Failed { accepted }
+                }
+            }
+            Err(_) => HeldAnswerOutcome::Gone,
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-17): why a voice answer was refused when a fence
+/// holding input had no room for its keys.
+pub(crate) const ANSWER_INPUT_FULL: &str =
+    "the deck is holding the agent's input and has no room for the answer";
+
+/// Why a voice answer's key wasn't typed: its question changed first.
+pub(crate) const ANSWER_QUESTION_CHANGED: &str = "the question changed before the keys were typed";
+
+/// Why a voice answer's key wasn't typed: the PTY failed the write.
+pub(crate) const ANSWER_WRITE_FAILED: &str = "writing to the agent's terminal failed";
+
+/// A voice answer's key the PTY took ([`AgentPtyRegistry::write_answer_keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyWritten {
+    /// The human-input sequence number it was committed at: the one when it
+    /// was written, or when a fence accepted it (Q35-17).
+    pub(crate) at: u64,
+    /// A fence held it before it was written.
+    pub(crate) held: bool,
+}
+
+/// A voice answer's key that wasn't typed, in full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyNotWritten {
+    pub(crate) detail: &'static str,
+    /// A fence held it first (Q35-17).
+    pub(crate) held: bool,
+    /// What it comes to as an answer's physical outcome, were it the first
+    /// key ([`crate::question::SettlementOutcome`]).
+    pub(crate) outcome: crate::question::SettlementOutcome,
+}
+
+impl KeyNotWritten {
+    fn now(detail: &'static str, outcome: crate::question::SettlementOutcome) -> Self {
+        Self {
+            detail,
+            held: false,
+            outcome,
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-16, core §4.3): why a voice answer whose keys hold a
+/// Ctrl+G candidate is refused while a check is open or a liability is out.
+pub(crate) const ANSWER_HOLDS_CTRL_G: &str = "the answer contains a key the deck can't hold safely";
 
 /// The error a PTY thread reports for an answer whose [`AnswerGate`] no longer
 /// held — told apart from a failed write by its type.
@@ -5274,6 +7909,48 @@ impl QuestionAnswers {
             pane_id: pane_id.to_string(),
             _held: lock.lock_owned().await,
         }
+    }
+
+    /// PRD #1666 part 3 (Q35-17, core §8.4): reserve `pane_id` for the answer
+    /// key `generation` is about to accept for `question_id` at `revision`,
+    /// replacing any reservation there. Taken under the pane's lifecycle, with
+    /// the agent's slot held.
+    pub(crate) fn reserve(
+        &self,
+        pane_id: &str,
+        generation: &str,
+        question_id: &str,
+        revision: Option<u64>,
+    ) -> AnswerReservation {
+        let acceptance = self.acceptances.fetch_add(1, Ordering::SeqCst) + 1;
+        self.reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                pane_id.to_string(),
+                Reserved {
+                    generation: generation.to_string(),
+                    question_id: question_id.to_string(),
+                    revision,
+                    acceptance,
+                },
+            );
+        AnswerReservation {
+            reserved: Arc::clone(&self.reserved),
+            pane_id: pane_id.to_string(),
+            acceptance,
+        }
+    }
+
+    /// Whether an accepted answer key of `generation` still holds `pane_id`'s
+    /// reservation. A predecessor's on the same pane doesn't count: its key
+    /// can't reach the successor ([`PaneGate::retire`]).
+    pub fn answer_reserved(&self, pane_id: &str, generation: &str) -> bool {
+        self.reserved
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(pane_id)
+            .is_some_and(|held| held.generation == generation)
     }
 
     /// `agent_id`'s answer lock.
@@ -5430,6 +8107,7 @@ impl QuestionAnswers {
             pane_id: pane_id.to_string(),
             question_id: question_id.to_string(),
             revision,
+            reservation: None,
             #[cfg(test)]
             pause: self
                 .barriers
@@ -5595,7 +8273,8 @@ pub struct AgentPtyRegistry {
     admission_frozen: AtomicBool,
     /// Issue #424 F1 + PRD #1631: what each pane's input box is holding — the
     /// human-input sequence [`Self::user_typed_since_question`] reads, and each
-    /// pane's input stream, whose draft bit [`Self::draft_pending`] reports.
+    /// pane's input stream, whose paste framing and turn clock
+    /// [`Self::pane_input_hold`] reports.
     /// Both are recorded by the daemon from the bytes it writes, never asserted
     /// by a producer.
     ///
@@ -5603,14 +8282,11 @@ pub struct AgentPtyRegistry {
     /// is what makes the record atomic with respect to writer handoff (H1). See
     /// [`PaneInputState`].
     pane_input: Arc<Mutex<PaneInputState>>,
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): per pane, the human attach
-    /// frames that have arrived and not yet finished with the pane's writer
-    /// ([`Self::human_frame_arriving`]). A frame counts from before it waits
-    /// for the writer, so a doorbell holding the writer between its steps sees
-    /// the keystroke queued behind it, which [`Self::draft_pending`] cannot
-    /// until the frame is written. A pane is in the map only while one of
-    /// its frames is in flight.
-    human_frames_in_flight: Arc<Mutex<HashMap<String, usize>>>,
+    /// PRD #1666 part 3 (Q35-20e): told by every published generation's fence
+    /// gate when what its card shows of held typing may have changed, and by
+    /// each retirement; the display watcher waits on it
+    /// ([`crate::agent_pty::watch_input_held`]).
+    held_display: Arc<Notify>,
     /// Issue #525: how long a guarded delivery waits on one PTY write before
     /// it stops waiting — [`PTY_WRITE_STALL_BOUND`], lowered by tests. In
     /// milliseconds so a test can change it through the `Arc` every caller
@@ -5620,6 +8296,38 @@ pub struct AgentPtyRegistry {
     /// ([`AgentPtyRegistry::nudge_repaint`]), each mapped to whether another
     /// was asked for while it ran.
     repaint_nudges: Mutex<HashMap<String, bool>>,
+    /// PRD #1666 part 3, round 5-wake: agents whose writer a doorbell
+    /// transaction holds ([`AgentPtyRegistry::doorbell_txn_begin`]), each
+    /// mapped to whether a repaint nudge was deferred meanwhile.
+    doorbell_txns: Mutex<HashMap<String, bool>>,
+    /// PRD #1666 part 3, round 5-wake (plan §2.3): per pane, the channel a
+    /// prompt hook's ring evidence reaches a waiting doorbell transaction on.
+    doorbell_evidence: Mutex<HashMap<String, broadcast::Sender<RingEvidence>>>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′): the re-projection
+    /// publisher's requests, once it runs.
+    doorbell_publisher:
+        std::sync::OnceLock<tokio::sync::mpsc::UnboundedSender<doorbell_ring::Reprojection>>,
+    /// One re-projection at a time, the publisher's or a spawn's own, so two
+    /// never finish in the reverse of the order they read in.
+    doorbell_publishing: Mutex<()>,
+    /// Test seam: holds the publisher before each run while set.
+    #[cfg(test)]
+    publisher_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// Test seam: run once by the next ring, holding the writer, after its
+    /// ledger drained and before admission reads the ledger.
+    #[cfg(test)]
+    ring_admission_seam: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Test seam: the first-ring settle window every typed generation gets
+    /// while set, in place of the one its agent's facts give
+    /// (`inbox/doorbell/041`).
+    #[cfg(test)]
+    doorbell_settle_for_test: Mutex<Option<Duration>>,
+    /// Test seam: re-projections wait between their reads and their hub
+    /// write while the flag is set; the bool says one reached it.
+    #[cfg(test)]
+    publisher_write_gate: Arc<(Mutex<bool>, AtomicBool)>,
+    #[cfg(test)]
+    publisher_write_released: std::sync::Condvar,
     /// PRD #1666 S8: how long a repaint nudge keeps the PTY one column
     /// narrower, in milliseconds ([`REPAINT_NUDGE_GAP`], or
     /// [`ENV_REPAINT_NUDGE_GAP_MS`]).
@@ -5751,6 +8459,23 @@ pub struct AgentPtyRegistry {
     /// only once the test lets it — see [`Self::hold_exit_cleanup_for_test`].
     #[cfg(test)]
     exit_cleanup_holds: Mutex<HashMap<String, std::sync::mpsc::Receiver<()>>>,
+    /// PRD #1666 part 3, round 5-wake test seam: what each generation's
+    /// reader captured as its termination.
+    #[cfg(test)]
+    terminations: Mutex<HashMap<String, Termination>>,
+    /// Test-only pauses before a generation's termination observation starts.
+    #[cfg(test)]
+    termination_holds: Mutex<HashMap<String, StdPause>>,
+    /// Issue #2028 test seam: closes that wait after removing a generation's
+    /// record and before terminating and reaping its child — see
+    /// [`Self::hold_close_before_reap_for_test`].
+    #[cfg(test)]
+    close_reap_holds: Mutex<HashMap<String, StdPause>>,
+    /// Issue #2028 test seam: readers that wait, once their generation's exit
+    /// is published and before its telemetry run ends — see
+    /// [`Self::hold_exit_telemetry_for_test`].
+    #[cfg(test)]
+    exit_telemetry_holds: Mutex<HashMap<String, StdPause>>,
     /// PRD #1666 §2.8 test seam: panes whose next published generation waits
     /// before handing the inbox over — see [`Self::hold_next_handover_for_test`].
     #[cfg(test)]
@@ -5795,9 +8520,88 @@ mod replacement_tests;
 #[path = "agent_pty_report_tests.rs"]
 mod report_tests;
 
+/// PRD #1666 part 3 (Q35-06): the input epoch on the real writer, output hook
+/// and retirement paths.
+#[cfg(test)]
+#[path = "agent_pty_input_epoch_tests.rs"]
+mod input_epoch_tests;
+
+/// PRD #1666 part 3 (Q35-15): the fence gate on the real pane writer.
+#[cfg(test)]
+#[path = "agent_pty_fence_tests.rs"]
+mod fence_tests;
+
+/// PRD #1666 part 3 (Q35-20e review): the not-delivered notice over real
+/// generations sharing a pane.
+#[cfg(all(test, unix))]
+#[path = "agent_pty_discard_tests.rs"]
+mod discard_tests;
+
+/// PRD #1666 part 3 (Q35-16): the planner and the physical tracker on the
+/// real pane writer.
+#[cfg(test)]
+#[path = "agent_pty_planner_tests.rs"]
+mod planner_tests;
+
+/// PRD #1666 part 3 (Q35-18a): the redraw estimate and `B` at profile
+/// adoption on the real bus and registry.
+#[cfg(test)]
+#[path = "agent_pty_query_wait_tests.rs"]
+mod query_wait_tests;
+
+/// PRD #1666 part 3 (Q35-20a): the Linux reader, which takes drain
+/// frontiers.
+#[cfg(target_os = "linux")]
+#[path = "agent_pty_frontier.rs"]
+mod frontier_reader;
+
+/// PRD #1666 part 3 (Q35-20a): the frontier reader's fail-closed table, on
+/// scripted polls and reads and the real bus.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "agent_pty_frontier_tests.rs"]
+mod frontier_reader_tests;
+
+/// PRD #1666 part 3 (Q35-20a): the frontier reader's throughput and latency
+/// against the blocking loop, measured by hand on a real PTY.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "agent_pty_frontier_throughput.rs"]
+mod frontier_throughput;
+
+/// PRD #1666 part 3, round 5-wake (plan §1.1, §3.4′): the doorbell's ring on
+/// the real writer, and the re-projection publisher.
+#[path = "agent_pty_doorbell.rs"]
+mod doorbell_ring;
+
+/// PRD #1666 part 3 (Q35-20): an installed generation's segments in the
+/// live gate: the probe job and the release driver.
+#[path = "agent_pty_segments.rs"]
+mod segment_driver;
+
+/// PRD #1666 part 3 (Q35-20b, plan §3.7, X-3): the release-authority oracle
+/// on the production driver.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "agent_pty_release_oracle_tests.rs"]
+mod release_oracle_tests;
+pub use doorbell_ring::{RingOutcome, RingReport};
+pub use segment_driver::watch_input_held;
+#[cfg(feature = "e2e")]
+pub(crate) use segment_driver::{ProbeAsk, ProbeOutcome};
+
+/// PRD #1666 part 3, round 5-wake (plan §9.1): the release scanner's budget,
+/// measured by hand on the real push path.
+#[cfg(all(test, unix))]
+#[path = "agent_pty_scanner_budget.rs"]
+mod scanner_budget;
+
 #[cfg(all(test, unix))]
 #[path = "agent_pty_terminal_tests.rs"]
 mod terminal_tests;
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): a generation's captured
+/// termination, through the real reader and capture.
+#[cfg(all(test, unix))]
+#[path = "agent_pty_termination_tests.rs"]
+mod termination_tests;
 
 /// PRD #1666 part 3, round 5: the synchronous pause in a respawn's
 /// replacement window, after the replacement's spawn returned and before the
@@ -5935,10 +8739,18 @@ pub struct RespawnsInFlight;
 struct RespawnTicket<'a> {
     registry: &'a AgentPtyRegistry,
     agent_id: String,
+    /// PRD #1666 part 3, round 5-wake: the old generation's removal evidence,
+    /// which says whether this respawn published a successor once it returns.
+    removal: Arc<RemovalEvidence>,
 }
 
 impl Drop for RespawnTicket<'_> {
     fn drop(&mut self) {
+        // PRD #1666 part 3, round 5-wake: a respawn that returns without having
+        // published a successor failed to replace the generation, which the
+        // generation's capture reads. Before the lock, which a rank violation
+        // skips below.
+        self.removal.respawn_returned();
         // PRD #1666 part 3, round 5 (C4b): recovers a poisoned lock, as it
         // always has, and skips a rank violation instead of panicking in an
         // unwind (`crate::lock_rank::RankedMutex::lock_in_drop`).
@@ -7238,6 +10050,18 @@ struct RegistryInner {
     /// Tokio clock a polling task's `sleep` would let the runtime's
     /// auto-advance move that clock underneath the test.
     exit_waiters: HashMap<String, Vec<oneshot::Sender<()>>>,
+    /// PRD #1666 part 3 (Q35-20e): typing a pane's retired generation still
+    /// held when it retired, by pane, for its successor's card. Replaced only
+    /// by a later generation's retirement that held typing too (R-E-U2-01:
+    /// a retirement that held nothing, and an older or already-retired
+    /// record's cleanup, leave it), and shown until a person's keystroke
+    /// reaches the pane after it, when it is pruned (see
+    /// [`AgentPtyRegistry::input_discarded`]). At most [`MAX_PANE_DISCARDS`].
+    input_discarded: HashMap<String, PaneDiscard>,
+    /// Review U3-d: how many notices [`Self::input_discarded`] has recorded,
+    /// each one's [`PaneDiscard::retired_seq`]. Bumped under the registry
+    /// lock, so it orders retirements as they happened.
+    discard_seq: u64,
 }
 
 /// Issue #454: RAII holder for a [`RegistryInner::pending_spawns`] entry.
@@ -7724,6 +10548,8 @@ impl AgentPtyRegistry {
                 respawning_members: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
+                input_discarded: HashMap::new(),
+                discard_seq: 0,
             }),
             dispatch_mutexes: Mutex::new(HashMap::new()),
             dispatch_order_mutexes: Mutex::new(HashMap::new()),
@@ -7734,9 +10560,23 @@ impl AgentPtyRegistry {
             shutting_down: AtomicBool::new(false),
             admission_frozen: AtomicBool::new(false),
             pane_input: Arc::new(Mutex::new(PaneInputState::default())),
-            human_frames_in_flight: Arc::default(),
+            held_display: Arc::new(Notify::new()),
             pty_write_stall_bound_ms: AtomicU64::new(PTY_WRITE_STALL_BOUND.as_millis() as u64),
             repaint_nudges: Mutex::new(HashMap::new()),
+            doorbell_txns: Mutex::new(HashMap::new()),
+            doorbell_evidence: Mutex::new(HashMap::new()),
+            doorbell_publisher: std::sync::OnceLock::new(),
+            doorbell_publishing: Mutex::new(()),
+            #[cfg(test)]
+            publisher_gate: Mutex::new(None),
+            #[cfg(test)]
+            ring_admission_seam: Mutex::new(None),
+            #[cfg(test)]
+            doorbell_settle_for_test: Mutex::new(None),
+            #[cfg(test)]
+            publisher_write_gate: Arc::new((Mutex::new(false), AtomicBool::new(false))),
+            #[cfg(test)]
+            publisher_write_released: std::sync::Condvar::new(),
             repaint_nudge_gap_ms: AtomicU64::new(
                 std::env::var(ENV_REPAINT_NUDGE_GAP_MS)
                     .ok()
@@ -7775,6 +10615,14 @@ impl AgentPtyRegistry {
             respawn_settle: Mutex::new(None),
             #[cfg(test)]
             exit_cleanup_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            terminations: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            termination_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            close_reap_holds: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            exit_telemetry_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
             handover_holds: Mutex::new(HashMap::new()),
             #[cfg(test)]
@@ -7861,7 +10709,18 @@ impl AgentPtyRegistry {
     /// ingested after that check is not stopped: the key is already going to
     /// the PTY, and only the next key's check detects the change. A redraw the
     /// agent makes with no hook is detected by neither check.
-    pub async fn write_answer_keys<Fut>(
+    ///
+    /// **Through a fence (PRD #1666 part 3, Q35-17, core §8.4).** While a
+    /// fence holds the pane's input, the key is accepted and held: the writer
+    /// is dropped, `held` runs under the lifecycle (the daemon marks the
+    /// question `answer_queued`), the lifecycle is dropped, and the outcome is
+    /// awaited outside every lock, so the pane's events, a question-clearing
+    /// one included, are ingested meanwhile and a release can take the writer.
+    /// The key carries the answer's reservation ([`QuestionAnswers::reserve`])
+    /// until its job ends. With no fence, nothing changes: acceptance is the
+    /// queueing, just before the write, and `held` doesn't run.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn write_answer_keys<Fut, HeldFut>(
         &self,
         agent_id: &str,
         pane_id: &str,
@@ -7869,34 +10728,107 @@ impl AgentPtyRegistry {
         revision: Option<u64>,
         keys: &[u8],
         revalidate: impl FnOnce() -> Fut,
-    ) -> Result<u64, &'static str>
+        held: impl FnOnce() -> HeldFut,
+    ) -> Result<KeyWritten, KeyNotWritten>
     where
         Fut: std::future::Future<Output = bool>,
+        HeldFut: std::future::Future<Output = ()>,
     {
-        let target = self
-            .writer_target_for_agent(agent_id)
-            .ok_or("the agent is not running")?;
+        use crate::question::SettlementOutcome;
+        // PRD #1666 part 3, round 5-wake: a voice answer's keys are a human
+        // operation on the agent's input, admitted before any await.
+        let ticket = self.admit_ingress(agent_id);
+        let refuse = |ticket: Option<crate::ingress_ledger::TicketGuard>,
+                      detail: &'static str,
+                      outcome: SettlementOutcome| {
+            if let Some(ticket) = ticket {
+                ticket.refuse(detail);
+            }
+            Err(KeyNotWritten::now(detail, outcome))
+        };
+        let Some(target) = self.writer_target_for_agent(agent_id) else {
+            return refuse(
+                ticket,
+                "the agent is not running",
+                SettlementOutcome::Retired,
+            );
+        };
         let writer = target.writer.lock().await;
         let lifecycle = self.question_answers.lock_lifecycle(pane_id).await;
         if target.exited.load(Ordering::SeqCst) {
-            return Err("the agent exited");
+            return refuse(ticket, "the agent exited", SettlementOutcome::Retired);
         }
         if !revalidate().await {
-            return Err("the question changed before the keys were typed");
+            return refuse(
+                ticket,
+                ANSWER_QUESTION_CHANGED,
+                SettlementOutcome::Superseded,
+            );
         }
         self.question_answers
             .barrier("answer_keys:revalidated")
             .await;
-        let gate = self
+        let mut gate = self
             .question_answers
             .answer_gate(pane_id, question_id, revision);
-        match writer
-            .write_answer(keys, gate, move || drop(lifecycle))
-            .await
-        {
-            Ok(AnswerWrite::Written(at)) => Ok(at),
-            Ok(AnswerWrite::Superseded) => Err("the question changed before the keys were typed"),
-            Err(_) => Err("writing to the agent's terminal failed"),
+        gate.reservation =
+            Some(
+                self.question_answers
+                    .reserve(pane_id, agent_id, question_id, revision),
+            );
+        let mut lifecycle = Some(lifecycle);
+        let wrote = writer
+            .write_answer(keys, gate, || drop(lifecycle.take()), ticket)
+            .await;
+        let failed = |detail| KeyNotWritten::now(detail, SettlementOutcome::WriteFailed);
+        let pending = match wrote {
+            Ok(AnswerWrite::Written(at)) => return Ok(KeyWritten { at, held: false }),
+            Ok(AnswerWrite::Superseded) => {
+                return Err(KeyNotWritten::now(
+                    ANSWER_QUESTION_CHANGED,
+                    SettlementOutcome::Superseded,
+                ));
+            }
+            Ok(AnswerWrite::Refused) => return Err(failed(ANSWER_HOLDS_CTRL_G)),
+            Ok(AnswerWrite::Full) => return Err(failed(ANSWER_INPUT_FULL)),
+            Ok(AnswerWrite::Exited) => {
+                return Err(KeyNotWritten::now(
+                    "the agent exited",
+                    SettlementOutcome::Retired,
+                ));
+            }
+            Err(_) => return Err(failed(ANSWER_WRITE_FAILED)),
+            Ok(AnswerWrite::Held(pending)) => pending,
+        };
+        // Q35-17 (core §8.4): accepted and held. A release needs the writer,
+        // and the pane's events need the lifecycle, so neither is kept across
+        // the wait; the question is marked queued first, under the lifecycle.
+        drop(writer);
+        held().await;
+        drop(lifecycle);
+        self.question_answers.barrier("answer_keys:held").await;
+        let at = pending.at();
+        let not_written = |detail, outcome| {
+            Err(KeyNotWritten {
+                detail,
+                held: true,
+                outcome,
+            })
+        };
+        match pending.settled().await {
+            HeldAnswerOutcome::Written => Ok(KeyWritten { at, held: true }),
+            HeldAnswerOutcome::Superseded => {
+                not_written(ANSWER_QUESTION_CHANGED, SettlementOutcome::Superseded)
+            }
+            HeldAnswerOutcome::Failed { accepted } => not_written(
+                ANSWER_WRITE_FAILED,
+                if accepted > 0 {
+                    SettlementOutcome::Partial
+                } else {
+                    SettlementOutcome::WriteFailed
+                },
+            ),
+            HeldAnswerOutcome::Gone => not_written("the agent exited", SettlementOutcome::Retired),
         }
     }
 
@@ -9805,21 +12737,25 @@ impl AgentPtyRegistry {
         self.inner.lock().agents.contains_key(agent_id)
     }
 
-    /// Marks `agent_id`'s entry as crashed if it is still registered — a
-    /// no-op if the entry has already been removed (a deliberate
-    /// `close_agent`/`respawn_agent_for_pane` teardown, which removes the
-    /// entry before its own kill completes, same as
+    /// Marks `agent_id`'s entry as crashed if it is still registered, runs
+    /// `registered` in the same lock hold, and says whether it was — a no-op
+    /// if the entry has already been removed
+    /// (a deliberate `close_agent`/`respawn_agent_for_pane` teardown, which
+    /// removes the entry before its own kill completes, same as
     /// `is_agent_still_registered`'s own doc explains). Folds the
     /// check-and-set into a single lock acquisition so there is no
     /// TOCTOU gap between "is this still a natural exit" and "mark it" —
     /// deliberately NOT implemented as a separate `is_agent_still_registered`
     /// call followed by a second locked mutation, which would reopen exactly
     /// the race this method exists to avoid.
-    fn mark_agent_crashed(&self, agent_id: &str) {
+    fn mark_agent_crashed(&self, agent_id: &str, registered: impl FnOnce()) -> bool {
         let mut inner = self.inner.lock();
-        if let Some(agent) = inner.agents.get_mut(agent_id) {
-            agent.crashed = Some(true);
-        }
+        let Some(agent) = inner.agents.get_mut(agent_id) else {
+            return false;
+        };
+        agent.crashed = Some(true);
+        registered();
+        true
     }
 
     /// Deliver the "worker exited without work-done" report for
@@ -9927,38 +12863,556 @@ impl AgentPtyRegistry {
         self.pane_input.lock().unwrap().note_user_input(pane_id_env);
     }
 
-    /// Issue #544: has the user sent input into `pane_id_env` since their last
-    /// submit or clear — the draft an automatic first write waits for? See
-    /// [`crate::draft_deferral::DraftTracker`] for what sets and clears it.
-    pub fn draft_pending(&self, pane_id_env: &str) -> bool {
-        self.pane_input.lock().unwrap().draft_pending(pane_id_env)
+    /// PRD #1666 part 3 (Q35-21, R3 §3.6): whether generation `agent_id`'s
+    /// input box is touched: something entered it since a check last read it
+    /// empty or the deck's own line was taken from it
+    /// ([`crate::composer_probe::epoch::InputEpoch::touched`]). `false` for a
+    /// generation that is gone.
+    pub fn input_touched(&self, agent_id: &str) -> bool {
+        let input = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(agent.bus.input()))
+        };
+        input.is_some_and(|input| input.touched())
     }
 
-    /// PRD #1666 part 2 (`inbox/doorbell/031`): a human attach frame for
-    /// `pane_id_env` has arrived and is about to wait for the pane's writer.
-    /// It counts as in flight until the returned guard drops, which the
-    /// caller does once the frame is written or refused.
-    pub fn human_frame_arriving(&self, pane_id_env: &str) -> HumanFrameInFlight {
-        *self
-            .human_frames_in_flight
+    /// PRD #1666 part 3 (plan §5.1, Q35-21): the pane's open paste, whether
+    /// generation `agent_id`'s box is touched and whether the deck can check
+    /// it, and how many of its agent's turns have ended, for the doorbell's
+    /// hold reason and episode ([`PaneInputHold::of`]). A generation that is
+    /// gone reads as untouched.
+    pub fn pane_input_hold(&self, pane_id_env: &str, agent_id: &str) -> PaneInputHold {
+        let (input, permission) = {
+            let inner = self.inner.lock();
+            match inner.agents.get(agent_id) {
+                Some(agent) => (
+                    Some(Arc::clone(agent.bus.input())),
+                    Self::permission_of(agent),
+                ),
+                None => (None, None),
+            }
+        };
+        let touched = input.is_some_and(|input| input.touched());
+        self.pane_input
             .lock()
             .unwrap()
-            .entry(pane_id_env.to_string())
-            .or_default() += 1;
-        HumanFrameInFlight {
-            counts: Arc::clone(&self.human_frames_in_flight),
-            pane_id_env: pane_id_env.to_string(),
+            .input_hold(pane_id_env, touched, permission)
+    }
+
+    /// The permission of `agent`'s observer, `None` with no observer: on
+    /// Linux only an installed generation has one; elsewhere none does.
+    fn permission_of(agent: &RunningAgent) -> Option<crate::composer_probe::Permission> {
+        #[cfg(target_os = "linux")]
+        {
+            agent
+                .composer
+                .as_ref()
+                .map(|observer| observer.permission())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = agent;
+            None
         }
     }
 
-    /// Whether a human attach frame for `pane_id_env` is in flight
-    /// ([`Self::human_frame_arriving`]): read by the doorbell under the pane's
-    /// writer, where an in-flight frame is one queued behind it.
-    pub fn human_frame_in_flight(&self, pane_id_env: &str) -> bool {
-        self.human_frames_in_flight
+    /// Type `bytes` into `pane_id` as a user would, while `agent_id` is the
+    /// pane's live generation: one human operation admitted to its ledger,
+    /// the generation checked again under its writer before the write, and
+    /// nothing written for any other. Answers how far it got.
+    ///
+    /// PRD #1666 part 3 (Q16-2): the bytes pass the generation's fence gate
+    /// as an attach frame does ([`PaneWriter::accept`]): written now with no
+    /// fence, cut by the planner while a liability is out, and held while a
+    /// fence holds input, in which case this answers `Ok` once the gate owns
+    /// them, as the attach loop reads on. With no room behind the fence it
+    /// waits for its place with the writer's lock dropped, checking the
+    /// generation again before each offer.
+    ///
+    /// **`Ok` means accepted, not written** (the audit's U3-1): the bytes may
+    /// still be held behind a fence, to be written by a later release or
+    /// dropped unwritten if the generation retires first. A caller that
+    /// needs the PTY to have taken them must not read `Ok` as that.
+    pub async fn write_user_bytes(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        bytes: &[u8],
+    ) -> Result<(), &'static str> {
+        let ticket = self.admit_ingress(agent_id);
+        let owner = |target: &PaneWriterTarget| {
+            target.agent_id == agent_id && !target.exited.load(Ordering::SeqCst)
+        };
+        let mut frame = UserFrame::new(bytes.to_vec(), ticket, None);
+        let mut waiter = None;
+        let mut noted = false;
+        loop {
+            let Some(target) = self.writer_target_for_pane(pane_id).filter(owner) else {
+                frame.refuse("not the pane's generation");
+                return Err("not the pane's generation");
+            };
+            let w = target.writer.lock().await;
+            if !self
+                .writer_target_for_pane(pane_id)
+                .is_some_and(|t| owner(&t))
+            {
+                drop(w);
+                frame.refuse("not the pane's generation");
+                return Err("not the pane's generation");
+            }
+            if !noted {
+                w.note_user_input(pane_id);
+                noted = true;
+            }
+            match w.accept(frame, waiter.take()).await {
+                Accepted::Written(result) => return result.map_err(|_| "the write failed"),
+                Accepted::Held => return Ok(()),
+                Accepted::Full(back, mut place) => {
+                    drop(w);
+                    place.changed().await;
+                    frame = back;
+                    waiter = Some(place);
+                }
+                Accepted::Retired(back) => {
+                    drop(w);
+                    back.refuse("exited");
+                    return Err("not the pane's generation");
+                }
+            }
+        }
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §2.1′): admit one human operation
+    /// on `agent_id`'s input to its generation's ledger, before any await. The
+    /// returned guard owns the ticket until the operation's bytes are handed to
+    /// a PTY job; `None` when the generation is not in the registry.
+    pub fn admit_ingress(&self, agent_id: &str) -> Option<crate::ingress_ledger::TicketGuard> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.ingress.admit())
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §4.6): `agent_id`'s first
+    /// `UserPromptSubmit` closes its header window.
+    pub fn close_release_window(&self, agent_id: &str) {
+        let bus = {
+            let inner = self.inner.lock();
+            inner
+                .agents
+                .get(agent_id)
+                .map(|agent| Arc::clone(&agent.bus))
+        };
+        if let Some(bus) = bus {
+            bus.close_release(crate::release_scanner::WindowClose::FirstPrompt);
+        }
+    }
+
+    /// `agent_id`'s release capture ([`AgentBus::release`]).
+    pub fn release_capture(
+        &self,
+        agent_id: &str,
+    ) -> Option<(
+        crate::release_scanner::ScanLatch,
+        Option<crate::release_scanner::WindowClose>,
+        bool,
+    )> {
+        let inner = self.inner.lock();
+        inner.agents.get(agent_id).map(|agent| agent.bus.release())
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §1.3): store a wrapper's input-mode
+    /// sample for `agent_id`, the generation the report's token attests, from
+    /// `peer`, the process at the other end of the connection. Accepted only
+    /// from a peer in the session the generation's PTY child leads, the
+    /// pane's outer session: the wrapper's, and any other process there that
+    /// holds the generation's token. That is the same-user boundary the deck
+    /// accepts, not proof that the sender holds the pane's inner PTY. Then on
+    /// the daemon's clock (Linux: the same time namespace), and as
+    /// [`crate::input_mode::InputModeStore::accept`] decides.
+    pub fn accept_input_mode(
+        &self,
+        agent_id: &str,
+        peer: crate::input_mode::Observer,
+        sample: crate::input_mode::ModeSample,
+    ) -> Result<crate::input_mode::Stored, &'static str> {
+        self.accept_input_mode_with(agent_id, peer, sample, &InputModeLookups::PLATFORM)
+    }
+
+    /// [`Self::accept_input_mode`] with the process lookups injected. A
+    /// report that leaves the generation held by a sticky clause for the
+    /// first time asks for its re-projection (Q18): the clause now holds the
+    /// typed doorbell for the rest of the generation, which WAKE reports.
+    pub(crate) fn accept_input_mode_with(
+        &self,
+        agent_id: &str,
+        peer: crate::input_mode::Observer,
+        sample: crate::input_mode::ModeSample,
+        lookups: &InputModeLookups,
+    ) -> Result<crate::input_mode::Stored, &'static str> {
+        let sticky = || {
+            let inner = self.inner.lock();
+            inner.agents.get(agent_id).map(|agent| {
+                (
+                    agent.pane_id_env.clone(),
+                    agent.input_mode.lock().unwrap().sticky().is_some(),
+                )
+            })
+        };
+        let before = sticky().is_some_and(|(_, held)| held);
+        let stored = self.store_input_mode(agent_id, peer, sample, lookups);
+        if !before && let Some((Some(pane), true)) = sticky() {
+            self.request_reprojection(&pane, agent_id);
+        }
+        stored
+    }
+
+    fn store_input_mode(
+        &self,
+        agent_id: &str,
+        peer: crate::input_mode::Observer,
+        sample: crate::input_mode::ModeSample,
+        lookups: &InputModeLookups,
+    ) -> Result<crate::input_mode::Stored, &'static str> {
+        let (leader, store) = {
+            let inner = self.inner.lock();
+            let agent = inner.agents.get(agent_id).ok_or("unknown_generation")?;
+            (agent.child.process_id(), Arc::clone(&agent.input_mode))
+        };
+        let leader = leader.ok_or("peer_session")?;
+        if (lookups.session_of)(peer.pid) != Some(leader) {
+            tracing::debug!(target: "pane_input_mode", agent_id, peer = peer.pid, "pane input mode refused: peer_session");
+            return Err("peer_session");
+        }
+        if (lookups.started)(peer.pid) != Some(peer.start) {
+            return Err("peer_gone");
+        }
+        if let Err(clause) = crate::input_mode::namespace_verdict(
+            &(lookups.own_namespace)(),
+            &(lookups.namespace_of)(peer.pid),
+        ) {
+            let mut store = store.lock().unwrap();
+            // Logged once, when it first holds the generation; every later
+            // report is refused the same way, about once a second.
+            if store.sticky().is_none() {
+                tracing::info!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = clause.as_str(), "pane input mode refused");
+            } else {
+                tracing::debug!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = clause.as_str(), "pane input mode refused");
+            }
+            store.hold(clause);
+            return Err(clause.as_str());
+        }
+        let now = (lookups.now)().ok_or("clock_unreadable")?;
+        let mut store = store.lock().unwrap();
+        let first_anchor = store.anchor().is_none();
+        let stored = store.accept(peer, sample, now).map_err(|refusal| {
+            // A generation already held refuses every later report the same
+            // way: logged when it was first held, not again.
+            if matches!(refusal, crate::input_mode::Refusal::Held(_)) {
+                tracing::debug!(target: "pane_input_mode", agent_id, peer = peer.pid, refusal = refusal.code(), "pane input mode refused");
+            } else {
+                tracing::info!(
+                    target: "pane_input_mode",
+                    agent_id,
+                    peer = peer.pid,
+                    peer_start = peer.start,
+                    refusal = refusal.code(),
+                    conflict = ?store.conflict(),
+                    "pane input mode refused"
+                );
+            }
+            refusal.code()
+        })?;
+        if first_anchor && let Some(anchor) = store.anchor() {
+            tracing::info!(target: "pane_input_mode", agent_id, anchor, "pane input mode settle anchor");
+        }
+        tracing::debug!(
+            target: "pane_input_mode",
+            agent_id,
+            observer = peer.pid,
+            observer_start = peer.start,
+            seq = sample.seq,
+            icanon = sample.icanon,
+            echo = sample.echo,
+            stored = ?stored,
+            duplicates = store.duplicates,
+            regressions = store.regressions,
+            "pane input mode"
+        );
+        Ok(stored)
+    }
+
+    /// `agent_id`'s input-mode evidence, while it is in the registry.
+    pub fn input_mode_store(&self, agent_id: &str) -> Option<crate::input_mode::InputModeStore> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| agent.input_mode.lock().unwrap().clone())
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §2.3): subscribe to `pane_id`'s
+    /// ring evidence; a doorbell transaction waits on it for its token.
+    pub fn subscribe_doorbell_evidence(&self, pane_id: &str) -> broadcast::Receiver<RingEvidence> {
+        self.doorbell_evidence
             .lock()
             .unwrap()
-            .contains_key(pane_id_env)
+            .entry(pane_id.to_string())
+            .or_insert_with(|| broadcast::channel(RING_EVIDENCE_CAPACITY).0)
+            .subscribe()
+    }
+
+    /// A prompt hook reported `evidence`: applied to the attested
+    /// generation's latch cell on receipt (plan §3.4′), so the cell never
+    /// depends on a transaction draining its channel; then handed to whoever
+    /// waits on its pane, and logged.
+    pub fn note_doorbell_evidence(&self, evidence: RingEvidence) {
+        tracing::info!(
+            target: "doorbell",
+            pane_id = %evidence.pane_id,
+            agent_id = %evidence.agent_id,
+            message_id = evidence.message_id.as_deref().unwrap_or("<none>"),
+            shape = ?evidence.shape,
+            "doorbell evidence"
+        );
+        if let Some(doorbell) = self.generation_doorbell(&evidence.agent_id) {
+            let before = doorbell.cell().load();
+            let exact = evidence.shape == crate::event::PromptShape::Exact;
+            match doorbell.evidence(&evidence.token, exact) {
+                Some(after) => tracing::info!(
+                    target: "doorbell",
+                    pane_id = %evidence.pane_id,
+                    agent_id = %evidence.agent_id,
+                    event = "hook_evidence",
+                    from = ?before,
+                    to = ?after,
+                    "doorbell latch"
+                ),
+                None => tracing::info!(
+                    target: "doorbell",
+                    pane_id = %evidence.pane_id,
+                    agent_id = %evidence.agent_id,
+                    event = "hook_evidence",
+                    exact,
+                    current = ?before,
+                    "doorbell latch: no move"
+                ),
+            }
+        }
+        let mut channels = self.doorbell_evidence.lock().unwrap();
+        if let Some(tx) = channels.get(&evidence.pane_id) {
+            if tx.receiver_count() == 0 {
+                channels.remove(&evidence.pane_id);
+            } else {
+                let _ = tx.send(evidence);
+            }
+        }
+    }
+
+    /// `agent_id`'s doorbell state (PRD #1666 part 3, round 5-wake), while
+    /// it is in the registry.
+    pub fn generation_doorbell(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::doorbell_generation::GenerationDoorbell>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(&agent.doorbell))
+    }
+
+    /// `agent_id`'s ingress ledger, while it is in the registry.
+    pub fn ingress_ledger(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::ingress_ledger::IngressLedger>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(&agent.ingress))
+    }
+
+    /// Issue #2028: generation `agent_id`'s child's exit status, for its
+    /// reader's telemetry: the record's while the registry holds it, and once
+    /// a close or respawn removed it, the status that removal found, in the
+    /// same lock hold, or later reaped. Read under the registry lock, so a
+    /// child that had exited by its removal is never missed in between.
+    fn exit_status_after_eof(
+        &self,
+        agent_id: &str,
+        removal: &RemovalEvidence,
+    ) -> Option<portable_pty::ExitStatus> {
+        let mut inner = self.inner.lock();
+        match inner.agents.get_mut(agent_id) {
+            Some(agent) => agent.child.try_wait().ok().flatten(),
+            None => removal.reaped(),
+        }
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what ended
+    /// `agent_id`'s output. A generation the registry still held at its EOF
+    /// (`registered_at_eof`) ended on its own: its child's status, polled for
+    /// up to [`TERMINATION_WAIT`], or the stream's end when the child has not
+    /// exited by then. A removed one says what its own `removal` evidence
+    /// records: replaced, closed, or a replacement pending or failed; and
+    /// unknown when nothing recorded removing it.
+    fn capture_termination(
+        &self,
+        agent_id: &str,
+        removal: &RemovalEvidence,
+        registered_at_eof: bool,
+        read_end: ReadEnd,
+    ) -> Termination {
+        #[cfg(test)]
+        {
+            let hold = self.termination_holds.lock().unwrap().remove(agent_id);
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
+        let termination = self.observe_termination(agent_id, removal, registered_at_eof, read_end);
+        #[cfg(test)]
+        self.terminations
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), termination.clone());
+        termination
+    }
+
+    /// [`Self::capture_termination`]'s observation. A generation the registry
+    /// still held when its stream ended is polled for up to
+    /// [`TERMINATION_WAIT`]: a wrapper's report of the command it ran wins
+    /// over the wrapper's own status, which is used, as the deck's, only when
+    /// no report came by the bound; a pane command's status is the deck's.
+    /// Neither by the bound is the connection ending. A close or respawn
+    /// that removes such a generation, before the poll or during it, changes
+    /// none of this (issue #2028): what the record knew of its child at the
+    /// removal, and the status the removal found or reaped, stand in for the
+    /// record. A generation removed before its stream ended was replaced when
+    /// the respawn that removed it published its successor, closed when a
+    /// close or shutdown removed it, pending while the respawn has done
+    /// neither by the bound, and failed once it returned without a successor;
+    /// so is one that ended by itself and that a shutdown drain then removed.
+    /// The bound is one [`TERMINATION_WAIT`] for the whole capture, removal
+    /// included.
+    fn observe_termination(
+        &self,
+        agent_id: &str,
+        removal: &RemovalEvidence,
+        registered_at_eof: bool,
+        read_end: ReadEnd,
+    ) -> Termination {
+        use crate::inbox_display::TerminationSource;
+        let deadline = Instant::now() + TERMINATION_WAIT;
+        if registered_at_eof {
+            let mut exited: Option<u32> = None;
+            loop {
+                let seen = {
+                    let mut inner = self.inner.lock();
+                    inner.agents.get_mut(agent_id).map(|agent| {
+                        let status = if exited.is_none() {
+                            agent.child.try_wait().ok().flatten()
+                        } else {
+                            None
+                        };
+                        (status, agent.child_role, agent.wrapper_child_exit.clone())
+                    })
+                };
+                // Removed after its own end: the removal's account of the
+                // child (written in the hold that removed the record, so it
+                // is there once the record is not). Only a shutdown drain
+                // removes a record without one, and it reads as closed below.
+                let seen = seen.or_else(|| {
+                    removal.child_at_removal().map(|child| {
+                        let status = exited.is_none().then(|| removal.reaped()).flatten();
+                        (status, child.role, child.report)
+                    })
+                });
+                let Some((status, role, report)) = seen else {
+                    break;
+                };
+                if let Some(status) = status {
+                    exited = Some(status.exit_code());
+                }
+                let reported = report
+                    .as_deref()
+                    .and_then(|report| report.parse::<u32>().ok());
+                match (role, reported, exited) {
+                    (ChildRole::Wrapper, Some(code), _) => {
+                        return Termination::PaneCommandExited {
+                            code,
+                            role,
+                            reported_by: TerminationSource::Wrapper,
+                        };
+                    }
+                    (ChildRole::PaneCommand, _, Some(code)) => {
+                        return Termination::PaneCommandExited {
+                            code,
+                            role,
+                            reported_by: TerminationSource::Deck,
+                        };
+                    }
+                    _ if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    (_, _, Some(code)) => {
+                        return Termination::PaneCommandExited {
+                            code,
+                            role,
+                            reported_by: TerminationSource::Deck,
+                        };
+                    }
+                    (_, _, None) => return Termination::ConnectionEnded { read_end },
+                }
+            }
+        }
+        // The evidence is written under the lock hold that removed the record,
+        // which `registered_at_eof` read after, so a removed generation's is
+        // already there; only a respawn's outcome can still be to come.
+        loop {
+            match removal.get() {
+                Some(Removal::Replaced) => return Termination::Replaced,
+                Some(Removal::Closed) => return Termination::Closed,
+                Some(Removal::ReplacementFailed) => return Termination::ReplacementFailed,
+                None => return Termination::Unknown,
+                Some(Removal::Respawning) if Instant::now() >= deadline => {
+                    return Termination::ReplacementPending;
+                }
+                Some(Removal::Respawning) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): generation `agent_id`'s
+    /// wrapper on `pane_id_env` reported how the command it ran exited
+    /// (`ended`: the code, `signal:N`, or `unknown`). Kept for a wrapped
+    /// generation of that pane only, and only its first report.
+    pub(crate) fn note_wrapper_child_exit(&self, pane_id_env: &str, agent_id: &str, ended: &str) {
+        let mut inner = self.inner.lock();
+        if let Some(agent) = inner.agents.get_mut(agent_id)
+            && agent.pane_id_env.as_deref() == Some(pane_id_env)
+            && agent.child_role == ChildRole::Wrapper
+            && agent.wrapper_child_exit.is_none()
+        {
+            agent.wrapper_child_exit = Some(ended.to_string());
+        }
+    }
+
+    /// Test seam: treat `agent_id`'s child as the deck's wrapper, and read
+    /// back the report [`Self::note_wrapper_child_exit`] kept for it.
+    #[cfg(test)]
+    pub(crate) fn wrapper_report_for_test(&self, agent_id: &str) -> Option<String> {
+        let mut inner = self.inner.lock();
+        let agent = inner.agents.get_mut(agent_id)?;
+        agent.child_role = ChildRole::Wrapper;
+        agent.wrapper_child_exit.clone()
     }
 
     /// PRD #1666: generation `agent_id` reported `edge` of a turn on
@@ -10060,6 +13514,142 @@ impl AgentPtyRegistry {
     /// it can only refuse the newcomer's first delivery.
     fn forget_pane_input(&self, pane_id_env: &str) {
         self.pane_input.lock().unwrap().forget_pane(pane_id_env);
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): `retired_id`, `pane`'s generation, was
+    /// retired under `inner`, and `retired` is what that retirement discarded:
+    /// `None` when its gate had already retired, so this call retired nothing.
+    /// Takes the pane-input lock inside the registry's, the order
+    /// [`Self::forget_pane_input`] takes.
+    ///
+    /// R-E-U2-01: only a first retirement that held typing writes the pane's
+    /// notice, and only over a notice from an older generation; nothing here
+    /// clears one, so cleaning up an already-retired or older record, in
+    /// whatever order a publish visits the pane's records, can't erase a
+    /// newer generation's notice. A retirement that held nothing leaves an
+    /// earlier notice standing until a keystroke ends it (auditor U3-1). A
+    /// notice a keystroke already ended is pruned here (R-E-U3-02).
+    fn note_discard(
+        &self,
+        inner: &mut RegistryInner,
+        pane: &str,
+        retired_id: &str,
+        retired: Option<(usize, usize)>,
+    ) {
+        let input = self.pane_input.lock().unwrap();
+        let typed = input.human_input_seq(pane);
+        let input_seq = input.input_seq;
+        drop(input);
+        let mut changed = false;
+        if inner
+            .input_discarded
+            .get(pane)
+            .is_some_and(|discard| typed > discard.input_seq)
+        {
+            inner.input_discarded.remove(pane);
+            changed = true;
+        }
+        if let (Some(generation), Some((ops, bytes))) = (retired_id.parse::<u64>().ok(), retired)
+            && ops > 0
+            && inner
+                .input_discarded
+                .get(pane)
+                .is_none_or(|discard| discard.shown.generation < generation)
+        {
+            let at_ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            inner.discard_seq += 1;
+            let retired_seq = inner.discard_seq;
+            inner.input_discarded.insert(
+                pane.to_string(),
+                PaneDiscard {
+                    shown: crate::inbox_display::InputDiscarded {
+                        generation,
+                        held_ops: u32::try_from(ops).unwrap_or(u32::MAX),
+                        held_bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+                        at_ms,
+                    },
+                    input_seq,
+                    retired_seq,
+                },
+            );
+            while inner.input_discarded.len() > MAX_PANE_DISCARDS {
+                // Oldest first: by the keystroke count at retirement, then by
+                // the registry's own count of retirements. Retirements with no
+                // keystroke between them share `input_seq`; the generation is
+                // not retirement order, and the wall clock ties within a
+                // millisecond and can step back, so either would let a notice
+                // just recorded go first (review U3-d).
+                let oldest = inner
+                    .input_discarded
+                    .iter()
+                    .min_by_key(|(_, discard)| (discard.input_seq, discard.retired_seq))
+                    .map(|(pane, _)| pane.clone());
+                match oldest {
+                    Some(oldest) => inner.input_discarded.remove(&oldest),
+                    None => break,
+                };
+            }
+            changed = true;
+        }
+        if changed {
+            self.held_display.notify_one();
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): what `agent_id`'s card says of typing one
+    /// of its pane's earlier generations held when it retired: shown on the
+    /// pane's current, later generation until a person's keystroke reaches
+    /// the pane after the retirement, when it is pruned (R-E-U3-02). A
+    /// retirement that held nothing doesn't end it, so the generation it
+    /// names can be two or more back (efix review U3-e). Display only.
+    pub(crate) fn input_discarded(
+        &self,
+        agent_id: &str,
+    ) -> Option<crate::inbox_display::InputDiscarded> {
+        let generation = agent_id.parse::<u64>().ok()?;
+        let (pane, discard) = {
+            let inner = self.inner.lock();
+            let agent = inner.agents.get(agent_id)?;
+            if agent.pane_retired.load(Ordering::SeqCst) {
+                return None;
+            }
+            let pane = agent.pane_id_env.clone()?;
+            let discard = inner.input_discarded.get(&pane)?.clone();
+            (pane, discard)
+        };
+        if discard.shown.generation >= generation {
+            return None;
+        }
+        let typed = self.pane_input.lock().unwrap().human_input_seq(&pane);
+        if typed > discard.input_seq {
+            // Ended: prune it, unless a later retirement replaced it meanwhile.
+            let mut inner = self.inner.lock();
+            if inner.input_discarded.get(&pane).is_some_and(|now| {
+                now.input_seq == discard.input_seq
+                    && now.shown.generation == discard.shown.generation
+            }) {
+                inner.input_discarded.remove(&pane);
+            }
+            return None;
+        }
+        Some(discard.shown)
+    }
+
+    /// PRD #1666 part 3 (R-E-U3-02): the panes holding a not-delivered
+    /// notice, for the lifetime tests.
+    #[cfg(test)]
+    pub(crate) fn discard_panes(&self) -> Vec<String> {
+        let mut panes: Vec<String> = self.inner.lock().input_discarded.keys().cloned().collect();
+        panes.sort();
+        panes
+    }
+
+    /// PRD #1666 part 3 (Q35-20e): told whenever a card's held typing may
+    /// have changed; see [`crate::agent_pty::watch_input_held`].
+    pub(crate) fn held_display(&self) -> Arc<Notify> {
+        Arc::clone(&self.held_display)
     }
 
     /// PRD #1487 audit A2 test seam: park the next spawn after its child is
@@ -10873,14 +14463,100 @@ impl AgentPtyRegistry {
         } else {
             None
         };
-        let opts = match standalone_command.as_deref() {
+        // PRD #2050: an OpenCode 2 started directly runs with `--standalone`
+        // added, so its pane has its own server.
+        let mut opts = match standalone_command.as_deref() {
             Some(command) => SpawnOptions {
                 command: Some(command),
                 ..opts
             },
             None => opts,
         };
+        // PRD #1666 part 3 (Q35-13, plan §1.2): installation eligibility,
+        // decided before the spawn from the command class and the rollout,
+        // never from a release. After the captures above, so `spawn_env` and
+        // `spawn_command` stay what the caller asked for and a respawn's new
+        // generation is decided afresh; and after the `--standalone` rewrite
+        // (PRD #2050), so the helper's arguments are appended to the command
+        // the pane actually runs. Off the executor: the first installed
+        // spawn copies the daemon's binary into its instance.
+        // PRD #1666 part 3: the per-agent doorbell switch, read from the
+        // deck's config now, so this generation keeps the value it started
+        // with; off, its agent gets no helper and no doorbell.
+        let (doorbell_switch, composer_install) = crate::inbox_hub::off_the_executor(|| {
+            let switch = crate::doorbell_switch::at_spawn();
+            let installation = crate::composer_probe::install::at_spawn(
+                opts.command,
+                opts.agent_type.as_ref(),
+                &preallocated_id,
+                &opts.env,
+                &switch,
+            );
+            (switch, installation)
+        });
+        let composer_install = match composer_install {
+            Ok(installation) => {
+                tracing::info!(
+                    target: "composer_probe",
+                    agent_id = %preallocated_id,
+                    class = ?installation.class(),
+                    "editor helper installed"
+                );
+                Some(installation)
+            }
+            Err(crate::composer_probe::install::NotInstalled::HelperSetup(cause)) => {
+                tracing::warn!(
+                    target: "composer_probe",
+                    agent_id = %preallocated_id,
+                    ?cause,
+                    "editor helper not installed: setup failed"
+                );
+                None
+            }
+            Err(why) => {
+                tracing::debug!(
+                    target: "composer_probe",
+                    agent_id = %preallocated_id,
+                    ?why,
+                    "editor helper not installed"
+                );
+                None
+            }
+        };
+        let installed_command = composer_install
+            .as_ref()
+            .and_then(|installation| installation.command(opts.command));
+        if let Some(installation) = &composer_install {
+            installation.apply_env(&mut opts.env);
+        }
+        // PRD #1666 part 3 (A-20d-1b): the generation's key-binding sources,
+        // read before the child exists, as the command it runs will see
+        // them: what the observer compares every later read with. Off the
+        // executor: it is file I/O.
+        #[cfg(target_os = "linux")]
+        let composer_install = composer_install.map(|mut installation| {
+            let command = installed_command.as_deref().or(opts.command);
+            let (env, cwd) = (&opts.env, opts.cwd);
+            crate::inbox_hub::off_the_executor(|| {
+                installation.read_keymap_baseline(command, env, cwd);
+                // Q35-22 (Q102b): the agent executables, pinned now, from
+                // the PATH the child gets, before it exists.
+                installation.pin_natives(command, env);
+            });
+            installation
+        });
+        let opts = SpawnOptions {
+            command: installed_command.as_deref().or(opts.command),
+            ..opts
+        };
         let guard = PtyGuard::new(spawn_with_dir(opts, dir)?);
+        // PRD #1666 part 3, round 5-wake: before anything can reap the child,
+        // so the pid is still its own, and outside the registry lock.
+        let child_started = guard
+            .pty
+            .as_ref()
+            .and_then(|pty| pty.child.process_id())
+            .and_then(crate::platform::proc::process_start_of);
         #[cfg(test)]
         {
             let pause = self.publish_pause.lock().unwrap().take();
@@ -11014,10 +14690,40 @@ impl AgentPtyRegistry {
             // before it exited and records only now would otherwise land in
             // this agent's fresh stream and settle it against the
             // predecessor's turn count, releasing this agent's Escapes.
-            for agent in inner.agents.values() {
+            let mut retired_discards = Vec::new();
+            for (retired_id, agent) in inner.agents.iter() {
                 if agent.pane_id_env.as_deref() == Some(claimed.as_str()) {
                     agent.pane_retired.store(true, Ordering::SeqCst);
+                    // PRD #1666 part 3, round 5-wake: the retired generation's
+                    // ledger and doorbell cell.
+                    agent.ingress.close();
+                    // PRD #1666 part 3 (Q35-15): and its fence gate, whose
+                    // held frames are refused once.
+                    let discarded = agent.gate.retire();
+                    retired_discards.push((retired_id.clone(), discarded));
+                    // PRD #1666 part 3 (Q35-06): and its input epoch's
+                    // structures; with its invocation records, M-FIRST's
+                    // event is taken in the same section (Q35-14b).
+                    if let Some(stop) = agent
+                        .bus
+                        .input()
+                        .retire_taking_first_stop(std::time::Instant::now())
+                    {
+                        log_first_stop(&agent.bus.label, &stop);
+                    }
+                    #[cfg(target_os = "linux")]
+                    if let Some(observer) = &agent.composer {
+                        observer.stop();
+                    }
+                    agent.doorbell.retire();
+                    agent
+                        .bus
+                        .close_release(crate::release_scanner::WindowClose::Retired);
                 }
+            }
+            // Q35-20e: what a predecessor still held, for this successor's card.
+            for (retired_id, discarded) in retired_discards {
+                self.note_discard(&mut inner, claimed, &retired_id, discarded);
             }
             self.forget_pane_input(claimed);
             if busy_before_publication {
@@ -11047,12 +14753,47 @@ impl AgentPtyRegistry {
             writer,
             reader,
             process_group,
+            argv,
+            #[cfg(target_os = "linux")]
+            opened,
         } = pty;
+        // PRD #1666 part 3 (Q84): what the deck executed, for the observer's
+        // binding of `A`.
+        #[cfg(target_os = "linux")]
+        let composer_install = composer_install.map(|mut installation| {
+            installation.set_launch(argv);
+            installation
+        });
+        #[cfg(not(target_os = "linux"))]
+        drop(argv);
 
-        let bus = Arc::new(AgentBus::new());
+        // PRD #1666 part 3, round 5-wake: the evidence state tracks the spawn
+        // type's measured screen, and the release scanner reads the header,
+        // from the generation's first byte. The e2e build's stand-in editor
+        // has a profile of its own, chosen only by its explicit selector and
+        // executable path.
+        #[cfg(feature = "e2e")]
+        let standin = crate::doorbell_screen::standin_selected_profile(
+            &captured_env,
+            spawn_command.as_deref(),
+        )
+        .or_else(|| {
+            crate::doorbell_screen::standin_from_daemon_env()
+                .map(|binary| (binary, &crate::doorbell_screen::STANDIN_PROFILE))
+        });
+        let profile = crate::doorbell_screen::profile_for_agent(spawn_agent_type.as_ref());
+        // A pane that names a stand-in wants it, whatever type it starts as.
+        #[cfg(feature = "e2e")]
+        let profile = standin.as_ref().map(|(_, profile)| *profile).or(profile);
+        let bus = Arc::new(
+            AgentBus::for_generation(&preallocated_id, profile, captured_rows, captured_cols)
+                .spawned_as(spawn_agent_type.clone()),
+        );
         let bus_for_thread = bus.clone();
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_thread = exited.clone();
+        let removal = Arc::new(RemovalEvidence::default());
+        let removal_for_thread = Arc::clone(&removal);
         let notify_for_thread = self.change_notify.clone();
         // The reader thread needs a registry handle, its own
         // agent id, and the pane's id so its EOF branch can retire any armed
@@ -11084,25 +14825,80 @@ impl AgentPtyRegistry {
         // On exit, pump_reader sets `exited` and signals `change_notify` so
         // the idle monitor learns about the death immediately instead of
         // waiting for the next poll cycle.
+        // PRD #1666 part 3 (Q35-20a): the reader's frontier wake and its
+        // duplicate of the master, attached before the reader starts.
+        #[cfg(target_os = "linux")]
+        let frontier = frontier_reader::Frontier::setup(
+            &bus,
+            &preallocated_id,
+            master.as_raw_fd(),
+            opened,
+            &captured_env,
+        );
+        #[cfg(feature = "e2e")]
+        let exit_gate = ExitGate::from_env(&captured_env);
         std::thread::spawn(move || {
             pump_reader(
                 reader,
                 bus_for_thread,
                 exited_for_thread,
+                removal_for_thread,
                 notify_for_thread,
                 registry_for_thread,
                 agent_id_for_thread,
                 pane_id_env_for_thread,
                 runtime_handle_for_thread,
+                #[cfg(target_os = "linux")]
+                frontier,
+                #[cfg(feature = "e2e")]
+                exit_gate,
             )
         });
 
         let pane_retired = Arc::new(AtomicBool::new(false));
+        let child_role = match spawn_command.as_deref() {
+            Some(command)
+                if crate::wrap::launches_wrapper(
+                    command,
+                    &spawn_agent_type
+                        .clone()
+                        .or_else(|| AgentType::from_command(Some(command)))
+                        .unwrap_or(AgentType::None),
+                ) =>
+            {
+                ChildRole::Wrapper
+            }
+            _ => ChildRole::PaneCommand,
+        };
+        // PRD #1666 part 3, round 5-wake: the generation's doorbell state.
+        // The wrapper reports the agent's input mode itself; any other pane's
+        // PTY slave is the agent's terminal, read from the master.
+        let doorbell = crate::doorbell_generation::GenerationDoorbell::new(
+            child_role == ChildRole::Wrapper,
+            #[cfg(unix)]
+            master.as_raw_fd(),
+        )
+        .with_switch(doorbell_switch);
+        #[cfg(feature = "e2e")]
+        let doorbell = doorbell.with_standin(standin);
+        let doorbell = Arc::new(doorbell);
+        if let Some(pane) = pane_id_env.clone() {
+            let registry = Arc::downgrade(self);
+            let id = preallocated_id.clone();
+            doorbell.on_moved(move || {
+                if let Some(registry) = registry.upgrade() {
+                    registry.request_reprojection(&pane, &id);
+                }
+            });
+        }
         let pane_writer = PaneWriter::new(
             writer,
             pane_id_env.clone(),
             self.pane_input.clone(),
             pane_retired.clone(),
+            exited.clone(),
+            Some(Arc::clone(&doorbell)),
+            Arc::clone(bus.input()),
         );
         let agent = RunningAgent {
             child,
@@ -11111,9 +14907,17 @@ impl AgentPtyRegistry {
             // Issue #424 H1: every byte anyone other than the daemon writes to
             // this PTY is a user keystroke, and the clock recording it has to
             // move under the same lock the write takes — see [`PaneWriter`].
+            gate: pane_writer.gate(),
             writer: Arc::new(AsyncMutex::new(pane_writer)),
             pane_retired,
             bus,
+            child_role,
+            child_started,
+            wrapper_child_exit: None,
+            removal,
+            input_mode: Arc::default(),
+            ingress: crate::ingress_ledger::IngressLedger::new(),
+            doorbell,
             pane_id_env,
             display_name,
             cwd: cwd_stored,
@@ -11152,6 +14956,9 @@ impl AgentPtyRegistry {
             // PRD #1666 part 3, round 5: moved from the reservation, under
             // the lock that publishes the record.
             attest_facts,
+            composer_install,
+            #[cfg(target_os = "linux")]
+            composer: None,
         };
 
         // Use the id we pre-allocated above (before spawn) and injected
@@ -11175,7 +14982,18 @@ impl AgentPtyRegistry {
             agent.spawn_command.clone(),
             agent.spawn_env.clone(),
         );
+        // PRD #1666 part 3 (Q35-20e): its card follows its held typing, and
+        // the display watcher looks at it now: it may carry a predecessor's
+        // discarded typing.
+        agent.gate.watch_display(Arc::clone(&self.held_display));
         inner.agents.insert(id.clone(), agent);
+        self.held_display.notify_one();
+        // PRD #1666 part 3, round 5-wake: a respawn's successor is published,
+        // so the generation it lifted out was replaced, under the lock hold
+        // that publishes it.
+        if let Some(ticket) = admission.respawn_ticket() {
+            ticket.removal.replaced();
+        }
         // PRD #1741: under the lock that published the agent, so its reader's
         // EOF, which checks registration under it, is ordered after this.
         crate::telemetry::commit_spawn(telemetry_run);
@@ -11187,6 +15005,12 @@ impl AgentPtyRegistry {
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
+        // PRD #1666 part 3 (Q35-14b): an installed generation's observer,
+        // started with the registry lock released.
+        #[cfg(target_os = "linux")]
+        self.start_composer_observer(&id);
+        #[cfg(target_os = "linux")]
+        self.start_segment_driver(&id);
         // PRD #1666 §2.8 (auditor R9S-A01): every generation published on a
         // pane — a first start, a respawn, a re-created pane — hands the pane's
         // inbox over to it, before anything the spawn owes that inbox below. A
@@ -11196,10 +15020,130 @@ impl AgentPtyRegistry {
             self.hold_handover(pane);
             hub.hand_over(pane, &id, || self.publication_owns_pane(pane, &id));
         }
+        // PRD #1666 part 3, round 5-wake (plan §5.3, Q16): the generation's
+        // card and WAKE, unlatched until its start-up header is read:
+        // published before the spawn returns. Not atomically with the
+        // registration: a status read between the two can still see the
+        // route as it was before this verdict.
+        if let Some(pane) = inbox_spawn.0.as_deref()
+            && self.doorbell_publisher.get().is_some()
+        {
+            self.reproject(pane, &id);
+        }
         if let (Some(pane), Some((integration, refresh))) = (inbox_spawn.0, inbox_refresh) {
             self.note_inbox_spawn(&pane, &id, integration, refresh, &inbox_spawn.2);
         }
         Ok(id)
+    }
+
+    /// PRD #1666 part 3 (Q35-14b): start generation `id`'s observer from its
+    /// installation, if it was installed: the record's facts read under the
+    /// registry lock, the observer started with it released (it opens the
+    /// instance directory and starts a thread), and kept on the record if
+    /// the record is still there.
+    #[cfg(target_os = "linux")]
+    fn start_composer_observer(&self, id: &str) {
+        let taken = {
+            let mut inner = self.inner.lock();
+            let Some(agent) = inner.agents.get_mut(id) else {
+                return;
+            };
+            let Some(installation) = agent.composer_install.take() else {
+                return;
+            };
+            (
+                installation,
+                Arc::clone(&agent.bus),
+                agent
+                    .spawn_agent_type
+                    .clone()
+                    .or_else(|| agent.agent_type.clone()),
+                agent.spawn_env.clone(),
+                agent.child.process_id().zip(agent.child_started),
+            )
+        };
+        let (installation, bus, agent, env, child) = taken;
+        let weak = Arc::downgrade(&bus);
+        let spawned = crate::composer_probe::observe::Spawned {
+            agent_id: id.to_string(),
+            agent,
+            env,
+            child,
+            input: Arc::clone(bus.input()),
+            latch: Box::new(move |agent| match weak.upgrade() {
+                Some(bus) => bus.latched_for(agent),
+                None => crate::doorbell_activation::LatchedRelease::Unseen,
+            }),
+            assumed: crate::composer_probe::install::captured_assumption(),
+        };
+        let Some(observer) = crate::composer_probe::observe::Observer::start(
+            installation,
+            spawned,
+            &bus.composer_bell,
+        ) else {
+            tracing::warn!(
+                target: "composer_probe",
+                agent_id = %id,
+                "editor helper installed but not observed"
+            );
+            return;
+        };
+        let mut inner = self.inner.lock();
+        match inner.agents.get_mut(id) {
+            Some(agent) => agent.composer = Some(observer),
+            None => observer.stop(),
+        }
+    }
+
+    /// Test seam for PRD #1666 part 3 (Q85): `observer` as agent `id`'s
+    /// generation's, as [`Self::start_composer_observer`] keeps one, for a
+    /// hook loop test that builds the observer over an instance of its own.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_composer_observer_for_test(
+        &self,
+        id: &str,
+        observer: Arc<crate::composer_probe::observe::Observer>,
+    ) {
+        self.inner
+            .lock()
+            .agents
+            .get_mut(id)
+            .expect("a spawned agent")
+            .composer = Some(observer);
+    }
+
+    /// PRD #1666 part 3 (Q35-15): a generation's fence gate and its writer,
+    /// by its agent id, for the `e2e` build's control verb and the tests.
+    #[cfg(any(test, feature = "e2e"))]
+    pub(crate) fn composer_fence(
+        &self,
+        agent_id: &str,
+    ) -> Option<(Arc<PaneGate>, Arc<AsyncMutex<PaneWriter>>)> {
+        let inner = self.inner.lock();
+        let agent = inner.agents.get(agent_id)?;
+        Some((Arc::clone(&agent.gate), agent.writer.clone()))
+    }
+
+    /// PRD #1666 part 3 (Q35-20a): a generation's input, which holds its
+    /// drain-frontier queue, by its agent id.
+    #[cfg(any(test, feature = "e2e"))]
+    pub(crate) fn composer_input(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::composer_probe::epoch::GenerationInput>> {
+        Some(Arc::clone(
+            self.inner.lock().agents.get(agent_id)?.bus.input(),
+        ))
+    }
+
+    /// PRD #1666 part 3 (Q35-14b): an installed generation's observer, by
+    /// its agent id.
+    #[cfg(target_os = "linux")]
+    pub fn composer_observer(
+        &self,
+        agent_id: &str,
+    ) -> Option<Arc<crate::composer_probe::observe::Observer>> {
+        self.inner.lock().agents.get(agent_id)?.composer.clone()
     }
 
     /// PRD #1666 §11: what an OpenCode or Pi generation's start owes its
@@ -11399,252 +15343,6 @@ impl AgentPtyRegistry {
             })
     }
 
-    /// PRD #1666 S4: the doorbell's write — the one automatic writer the inbox
-    /// keeps. Writes, in order and under one hold of the pane's writer: a bare
-    /// `\r` when `pre_cr` (submitting a ring a previous write may have left in
-    /// the box), then `line` encoded as a single line followed by
-    /// [`SUBMIT_DELAY`] and `\r`. A `pre_cr` followed by a line waits
-    /// [`SUBMIT_DELAY`] between them.
-    ///
-    /// Guards, all re-checked under the writer, so nothing typed or respawned
-    /// between the caller's decision and the write slips through:
-    ///
-    /// * **identity** — `expected_agent_id` must still own `pane_id` and run;
-    /// * **draft** — no ring while the user has an unsent draft in the pane
-    ///   ([`Self::draft_pending`]). There is deliberately NO cap: the doorbell
-    ///   waits for the user however long they take, and the caller re-asks on
-    ///   its next tick.
-    ///
-    /// * **composer** — an agent whose spec names a composer recogniser is
-    ///   written to only while the recogniser finds that composer EMPTY on the
-    ///   pane's screen, before and after the agent's first own hook (PRD #1666
-    ///   S7, decision A; decision 2 for a draft the agent kept after an Enter).
-    ///   The exception is a composer showing `stranded` — the line the
-    ///   doorbell last typed into this pane — unsubmitted, with the agent's
-    ///   cursor where the recogniser expects it after an Enter that was not
-    ///   taken: a write that starts with a CR sends that CR alone, which
-    ///   submits the line, and types nothing after it
-    ///   ([`DoorbellWrite::Flushed`]). With `stranded` `None` there is no
-    ///   exception. The match reads the screen, which proves neither where its
-    ///   text came from nor who owns the input: see
-    ///   [`crate::agent_registry::codex_composer_holds_doorbell_line`].
-    ///
-    /// No echo wait and no retry: whether the message arrived is the inbox's
-    /// to say, not the screen's. The screen is read only for the composer gate,
-    /// which can only withhold bytes.
-    pub async fn write_doorbell<F, Fut>(
-        &self,
-        pane_id: &str,
-        expected_agent_id: &str,
-        pre_cr: bool,
-        stranded: Option<&str>,
-        line: Option<&str>,
-        still_admitted: F,
-    ) -> DoorbellWrite
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        self.write_doorbell_when_ready(
-            pane_id,
-            expected_agent_id,
-            DoorbellReady::Ready,
-            pre_cr,
-            stranded,
-            line,
-            still_admitted,
-        )
-        .await
-    }
-
-    /// [`Self::write_doorbell`] for a generation whose readiness is `ready`
-    /// (PRD #1666 part 2, `inbox/doorbell/008`): one not yet ready by its own
-    /// hooks gets no byte unless the screen shows it is ([`DoorbellReady`]).
-    #[allow(clippy::too_many_arguments)]
-    pub async fn write_doorbell_when_ready<F, Fut>(
-        &self,
-        pane_id: &str,
-        expected_agent_id: &str,
-        ready: DoorbellReady,
-        pre_cr: bool,
-        stranded: Option<&str>,
-        line: Option<&str>,
-        still_admitted: F,
-    ) -> DoorbellWrite
-    where
-        F: Fn() -> Fut,
-        Fut: std::future::Future<Output = bool>,
-    {
-        let owner = |target: &PaneWriterTarget| {
-            target.agent_id == expected_agent_id && !target.exited.load(Ordering::SeqCst)
-        };
-        let Some(target) = self.writer_target_for_pane(pane_id) else {
-            return DoorbellWrite::NotOwner;
-        };
-        if !owner(&target) {
-            return DoorbellWrite::NotOwner;
-        }
-        if self.draft_pending(pane_id) {
-            return DoorbellWrite::DraftPending;
-        }
-        let payload = match line.map(encode_pane_payload).transpose() {
-            Ok(payload) => payload,
-            Err(error) => {
-                tracing::warn!(%error, pane_id = %pane_id, "doorbell line could not be encoded");
-                return DoorbellWrite::Failed;
-            }
-        };
-        let stall = self.pty_write_stall_bound();
-        let Some(w) = within_real_time(stall, target.writer.lock()).await else {
-            return DoorbellWrite::NotReading;
-        };
-        if within_real_time(stall, w.until_idle()).await.is_none() {
-            return DoorbellWrite::NotReading;
-        }
-        // Under the writer: user bytes are recorded while it is held, so these
-        // reads cannot miss a keystroke already in the PTY.
-        match self.writer_target_for_pane(pane_id) {
-            Some(current) if owner(&current) && current.agent_id == target.agent_id => {}
-            _ => return DoorbellWrite::NotOwner,
-        }
-        if self.draft_pending(pane_id) {
-            return DoorbellWrite::DraftPending;
-        }
-        // PRD #1666 S7 (decision A): a wrapped agent's screen may be a start
-        // dialog, where any byte — the line, a pre-ring CR or a cleanup CR —
-        // can answer it, or a composer holding a draft the input tracker
-        // believes was submitted (decision 2). So every write waits for the
-        // empty composer, read under the writer.
-        //
-        // The one non-empty composer a write may go to is one showing the
-        // exact line the doorbell last typed here, left there when its Enter
-        // was not taken: dropped, with the cursor right after it (live Codex
-        // 0.160.0, `codex/worker/001`), or turned into a newline, with the
-        // cursor on the empty row below it (`inbox/load/004`). The flushing CR
-        // is what submits it, so it goes alone, and no second line is typed
-        // on top.
-        let mut flush_only = false;
-        let gate = self.doorbell_composer_gate(expected_agent_id);
-        // PRD #1666 part 2 (`inbox/doorbell/008`): a generation not yet ready
-        // by its own hooks gets no byte unless the screen shows it is: its
-        // agent's prompt for one that only started, its composer gate below
-        // for one with no report at all, and nothing for an agent with
-        // neither. Read under the writer before the first step; the prompt is
-        // read again before each step (below).
-        match ready {
-            DoorbellReady::Ready => {}
-            DoorbellReady::Screen(prompt) => match self.screen_rows(expected_agent_id).await {
-                Some((rows, _)) if prompt(&rows) => {}
-                _ => return DoorbellWrite::NoComposer,
-            },
-            DoorbellReady::Unproven if gate.is_some() => {}
-            DoorbellReady::Unproven => return DoorbellWrite::NoComposer,
-        }
-        if let Some((empty, recognise)) = gate {
-            match self.screen_rows(expected_agent_id).await {
-                Some((rows, _)) if empty(&rows) => {}
-                Some((rows, cursor))
-                    if pre_cr
-                        && stranded
-                            .zip(recognise)
-                            .is_some_and(|(typed, recognise)| recognise(&rows, cursor, typed)) =>
-                {
-                    flush_only = true;
-                }
-                _ => return DoorbellWrite::NoComposer,
-            }
-        }
-        let withheld = flush_only && payload.is_some();
-        let mut steps: Vec<&[u8]> = Vec::with_capacity(3);
-        if pre_cr {
-            steps.push(b"\r");
-        }
-        // The step after which the ring's line is in the box.
-        let line_step = steps.len();
-        if let Some(payload) = payload.as_deref().filter(|_| !flush_only) {
-            steps.push(payload);
-            steps.push(b"\r");
-        }
-        let mut sink = w.daemon(stall);
-        // What withholding the steps from `n` on leaves behind.
-        let withdrawn = |n: usize| {
-            if n == 0 {
-                DoorbellWrite::NotAdmitted
-            } else {
-                DoorbellWrite::Cancelled {
-                    steps_written: u8::try_from(n).unwrap_or(u8::MAX),
-                    line_typed: payload.is_some() && !flush_only && n > line_step,
-                }
-            }
-        };
-        for (n, bytes) in steps.into_iter().enumerate() {
-            #[cfg(feature = "e2e")]
-            if pre_cr && line.is_some() && n == 1 {
-                crate::doorbell::pause_rering_for_test(pane_id, "after-pre-cr").await;
-            }
-            if n > 0 {
-                tokio::time::sleep(SUBMIT_DELAY).await;
-            }
-            #[cfg(feature = "e2e")]
-            if pre_cr && line.is_some() {
-                let phase = match n {
-                    0 => "before-pre-cr",
-                    1 => "after-delay",
-                    _ => "before-submit",
-                };
-                crate::doorbell::pause_rering_for_test(pane_id, phase).await;
-            }
-            // PRD #1666 hardening H3: the admission the doorbell decided on
-            // is asked for again under the writer before EVERY step — the
-            // pre-ring CR, the line, its submit and a cleanup CR — and after
-            // the wait between steps, so a dialog or a turn that started, or
-            // (part 2, `inbox/doorbell/031`) the ring's own message leaving the
-            // queue, stops what is left.
-            if !still_admitted().await {
-                return withdrawn(n);
-            }
-            // PR #1817 review 4348580010: a generation admitted on its screen
-            // is admitted on it again before every step. Its agent can replace
-            // the prompt with a dialog and report nothing, which the admission
-            // above does not see.
-            if let DoorbellReady::Screen(prompt) = ready
-                && !self
-                    .screen_rows(expected_agent_id)
-                    .await
-                    .is_some_and(|(rows, _)| prompt(&rows))
-            {
-                return withdrawn(n);
-            }
-            // A human frame that arrived while this write holds the writer is
-            // queued behind it: the keystroke is not in the draft tracker yet,
-            // so it is asked for separately, and the remaining steps are left
-            // to the user. Asked last, with nothing awaited between it and the
-            // write (review 4348580021), so a frame that arrived during the
-            // awaits above is seen.
-            if self.human_frame_in_flight(pane_id) || self.draft_pending(pane_id) {
-                return withdrawn(n);
-            }
-            match sink.write_tracked(bytes).await {
-                WriteProgress::Complete => {}
-                _ => {
-                    tracing::warn!(
-                        pane_id = %pane_id,
-                        agent_id = %expected_agent_id,
-                        step = n,
-                        "doorbell write did not complete"
-                    );
-                    return DoorbellWrite::Failed;
-                }
-            }
-            let _ = sink.flush_tracked().await;
-        }
-        if withheld {
-            DoorbellWrite::Flushed
-        } else {
-            DoorbellWrite::Written
-        }
-    }
-
     /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
     /// streaming subscribers will observe their broadcast receiver close
     /// shortly after (once the reader thread sees EOF and drops its bus
@@ -11688,12 +15386,33 @@ impl AgentPtyRegistry {
         let mut closed_pane = None;
         let mut agent = {
             let mut inner = self.inner.lock();
-            let agent = inner
+            let mut agent = inner
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+            agent.removal.closed();
+            // Issue #2028 (review): in the removing hold, so a reader that no
+            // longer finds the record finds what it knew of its child.
+            let report = agent.wrapper_child_exit.clone();
+            agent
+                .removal
+                .note_child_at_removal(&mut agent.child, agent.child_role, report);
             // Before the pane-state lock below — see [`PaneWriter::retired`].
             agent.pane_retired.store(true, Ordering::SeqCst);
+            // PRD #1666 part 3, round 5-wake: the retired generation's ledger
+            // and doorbell cell.
+            agent.ingress.close();
+            // PRD #1666 part 3 (Q35-15): and its fence gate.
+            let discarded = agent.gate.retire();
+            if let Some(pane) = agent.pane_id_env.as_deref() {
+                self.note_discard(&mut inner, pane, id, discarded);
+            }
+            // PRD #1666 part 3 (Q35-06): and its input epoch's structures.
+            agent.bus.input().retire();
+            agent.doorbell.retire();
+            agent
+                .bus
+                .close_release(crate::release_scanner::WindowClose::Retired);
             if let Some(pane) = agent.pane_id_env.as_deref() {
                 let still_claimed = inner
                     .agents
@@ -11711,11 +15430,20 @@ impl AgentPtyRegistry {
         if let Some(pane) = closed_pane {
             self.inbox().forget_pane_history(&pane);
         }
+        #[cfg(test)]
+        {
+            let hold = self.close_reap_holds.lock().unwrap().remove(id);
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
         crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
             &agent.process_group,
         );
+        agent.removal.record_reaped(&mut agent.child);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
         // sees EOF from the kill, but doing it here makes the
@@ -11987,17 +15715,39 @@ impl AgentPtyRegistry {
             if inner.closing_generations.contains(&agent_id) {
                 return Err(AgentPtyError::Spawn(GENERATION_CLOSING_REASON.into()));
             }
-            let removed = inner
+            let mut removed = inner
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
             let removed_record = Self::cleanup_record(&agent_id, &removed);
+            // PRD #1666 part 3, round 5-wake: under the lock hold that lifts the
+            // record out; the ticket settles it.
+            removed.removal.respawning();
+            // Issue #2028 (review): and what the record knew of its child.
+            let report = removed.wrapper_child_exit.clone();
+            removed
+                .removal
+                .note_child_at_removal(&mut removed.child, removed.child_role, report);
             // Issue #542: the old generation's launcher standing leaves with
             // it. The pane-keyed clocks stay — the pane is not going away, and
             // `spawn_agent` resets what a new occupant must not inherit. The
             // old generation's writer is retired all the same, so a write it is
             // still finishing cannot record into the successor's input box.
             removed.pane_retired.store(true, Ordering::SeqCst);
+            // PRD #1666 part 3, round 5-wake: the retired generation's ledger
+            // and doorbell cell.
+            removed.ingress.close();
+            // PRD #1666 part 3 (Q35-15): and its fence gate.
+            let discarded = removed.gate.retire();
+            if let Some(pane) = removed.pane_id_env.as_deref() {
+                self.note_discard(&mut inner, pane, &agent_id, discarded);
+            }
+            // PRD #1666 part 3 (Q35-06): and its input epoch's structures.
+            removed.bus.input().retire();
+            removed.doorbell.retire();
+            removed
+                .bus
+                .close_release(crate::release_scanner::WindowClose::Retired);
             // Issue #1612: the pane keeps its working directory in use while it
             // has neither a record nor a reservation. Released with the ticket.
             let dirs = removed.rooted_dirs().collect();
@@ -12021,6 +15771,7 @@ impl AgentPtyRegistry {
         let in_flight = RespawnTicket {
             registry: self,
             agent_id,
+            removal: Arc::clone(&removed.removal),
         };
         #[cfg(test)]
         {
@@ -12091,11 +15842,31 @@ impl AgentPtyRegistry {
             // as the same orchestration seat. Its `unit` is set when the
             // replacement is published, never copied.
             attest_facts: previous_facts,
+            // PRD #1666 part 3 (Q35-13): the replacement is a new generation,
+            // installed or not at its own spawn; the old one's page is unmapped
+            // with it.
+            composer_install: _,
+            #[cfg(target_os = "linux")]
+                composer: _,
             // Issue #454: the OLD record is being removed outright, so its
             // handover flag has nothing left to disown. The fresh generation
             // starts `false` and takes the pane over in `spawn_agent`.
             pane_handed_over: _,
             pane_retired: _,
+            gate: _,
+            // Closed where the record was removed, above.
+            ingress: _,
+            // Retired where the record was removed, above; the replacement
+            // starts its own.
+            doorbell: _,
+            child_role: _,
+            child_started: _,
+            // The replacement's wrapper reports its own child's exit.
+            wrapper_child_exit: _,
+            // Held by the ticket above, which settles it.
+            removal: _,
+            // The replacement's evidence starts empty.
+            input_mode: _,
             // PRD #745 M11: deliberately dropped rather than carried over. The
             // fresh child is a fresh spawn, and `spawn_agent` stamps it — which
             // is what makes a restarted worker report its CURRENT iteration
@@ -12152,6 +15923,7 @@ impl AgentPtyRegistry {
         // the same worker. Same shape `daemon_protocol.rs` uses for
         // `close_agent`.
         let mut child = child;
+        let removal = Arc::clone(&in_flight.removal);
         // The process group moves onto the blocking task too — it is what the
         // teardown's force phase reaps the descendant tree through (PRD #163 M3),
         // and it is dropped there once the old child is gone.
@@ -12161,6 +15933,7 @@ impl AgentPtyRegistry {
                 AGENT_TERMINATE_GRACE,
                 &process_group,
             );
+            removal.record_reaped(&mut child);
         })
         .await;
         if let Err(join_err) = join {
@@ -12266,7 +16039,7 @@ impl AgentPtyRegistry {
                 opts,
                 verified_dir.as_ref(),
                 Admission::Respawn {
-                    _ticket: &in_flight,
+                    ticket: &in_flight,
                     replacement: replacement.as_ref(),
                 },
             )?;
@@ -13392,7 +17165,7 @@ impl AgentPtyRegistry {
         let master = &agent.master;
         agent
             .bus
-            .resize_and_clear(|| {
+            .resize_and_clear(rows, cols, || {
                 master.resize(PtySize {
                     rows,
                     cols,
@@ -13506,6 +17279,11 @@ impl AgentPtyRegistry {
     /// real resize during the gap wins. Coalesced per agent: a request while
     /// one runs schedules at most one more after it, one gap after its restore.
     pub fn nudge_repaint(self: &Arc<Self>, agent_id: &str) {
+        if let Some(deferred) = self.doorbell_txns.lock().unwrap().get_mut(agent_id) {
+            *deferred = true;
+            tracing::debug!(target: "pane_layout", agent_id, "pane layout nudge deferred");
+            return;
+        }
         if !self.nudge_begin(agent_id) {
             return;
         }
@@ -13577,14 +17355,24 @@ impl AgentPtyRegistry {
         if agent.pty_cols < 2 || agent.exited.load(Ordering::SeqCst) {
             return false;
         }
+        // PRD #1666 part 3, round 5-wake: under the bus lock, so the edge sits
+        // at its place in the stream (the registry lock, then the bus's).
+        let (rows, cols) = (agent.pty_rows, agent.pty_cols - 1);
         agent
-            .master
-            .resize(PtySize {
-                rows: agent.pty_rows,
-                cols: agent.pty_cols - 1,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
+            .bus
+            .resize_and_mark_edge(
+                crate::evidence_state::EdgeReason::NudgeShrink,
+                rows,
+                cols,
+                || {
+                    agent.master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                },
+            )
             .is_ok()
     }
 
@@ -13592,62 +17380,41 @@ impl AgentPtyRegistry {
     fn nudge_restore(&self, agent_id: &str) {
         let inner = self.inner.lock();
         if let Some(agent) = inner.agents.get(agent_id) {
-            let _ = agent.master.resize(PtySize {
-                rows: agent.pty_rows,
-                cols: agent.pty_cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            });
+            let (rows, cols) = (agent.pty_rows, agent.pty_cols);
+            let _ = agent.bus.resize_and_mark_edge(
+                crate::evidence_state::EdgeReason::NudgeRestore,
+                rows,
+                cols,
+                || {
+                    agent.master.resize(PtySize {
+                        rows,
+                        cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                },
+            );
         }
     }
 
-    /// PRD #1666 part 2: whether `agent_id`'s doorbell writes go through a
-    /// composer gate ([`Self::write_doorbell`]), the one way a generation with
-    /// no readiness of its own may be rung.
-    pub fn has_doorbell_composer(&self, agent_id: &str) -> bool {
-        self.doorbell_composer_gate(agent_id).is_some()
+    /// PRD #1666 part 3, round 5-wake (plan §2.2): a doorbell transaction now
+    /// holds `agent_id`'s writer. A repaint nudge asked for meanwhile waits
+    /// for [`Self::doorbell_txn_end`] instead of moving the layout under it.
+    pub fn doorbell_txn_begin(&self, agent_id: &str) {
+        self.doorbell_txns
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), false);
     }
 
-    /// PRD #1666 S7: the composer recogniser the doorbell must satisfy before
-    /// it writes to `agent_id`, or `None` when its spec names none. It applies
-    /// for the agent's whole life, not only until its first own hook: an
-    /// agent that has reported can still show a draft it kept, or a screen
-    /// the recogniser does not know (decision 2).
-    /// The agent's empty-composer and stranded-line recognisers
-    /// ([`crate::agent_registry::AgentSpec::doorbell_composer`]), or `None`
-    /// where the doorbell needs no screen to write.
-    #[allow(clippy::type_complexity)]
-    fn doorbell_composer_gate(
-        &self,
-        agent_id: &str,
-    ) -> Option<(
-        fn(&[String]) -> bool,
-        Option<crate::agent_registry::StrandedLineRecogniser>,
-    )> {
-        let inner = self.inner.lock();
-        let agent = inner.agents.get(agent_id)?;
-        let spec = crate::agent_registry::spec(agent.spawn_agent_type.as_ref()?);
-        Some((spec.doorbell_composer?, spec.doorbell_stranded_line))
-    }
-
-    /// The screen `agent_id`'s pane shows, one trimmed row each, with its
-    /// cursor, or `None` when it cannot be read
-    /// ([`crate::pane_screen_text::visible_rows_and_cursor`]).
-    async fn screen_rows(
-        &self,
-        agent_id: &str,
-    ) -> Option<(Vec<String>, crate::pane_screen_text::ScreenCursor)> {
-        let (bus, rows, cols) = {
-            let inner = self.inner.lock();
-            let agent = inner.agents.get(agent_id)?;
-            (Arc::clone(&agent.bus), agent.pty_rows, agent.pty_cols)
-        };
-        tokio::task::spawn_blocking(move || {
-            crate::pane_screen_text::visible_rows_and_cursor(&bus.snapshot(), rows, cols)
-        })
-        .await
-        .ok()
-        .flatten()
+    /// The transaction [`Self::doorbell_txn_begin`] marked has released the
+    /// writer: a nudge deferred meanwhile starts now.
+    pub fn doorbell_txn_end(self: &Arc<Self>, agent_id: &str) {
+        let deferred = self.doorbell_txns.lock().unwrap().remove(agent_id);
+        if deferred == Some(true) {
+            tracing::debug!(target: "pane_layout", agent_id, "pane layout deferred nudge starts");
+            self.nudge_repaint(agent_id);
+        }
     }
 
     pub fn note_quota_block(&self, pane_id: &str, agent_id: &str) -> Option<u64> {
@@ -14005,6 +17772,17 @@ impl AgentPtyRegistry {
         inner.agents.get(id).and_then(|a| a.child.process_id())
     }
 
+    /// PRD #1666 part 3, round 5-wake: the pid of `id`'s child and when that
+    /// child started, read as it was spawned ([`RunningAgent::child_started`]),
+    /// so a caller can tell the child from a later process reusing its pid.
+    pub(crate) fn child_identity(&self, id: &str) -> Option<(u32, Option<u64>)> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(id)
+            .and_then(|a| Some((a.child.process_id()?, a.child_started)))
+    }
+
     /// All currently-owned agent ids, sorted ascending.
     pub fn agent_ids(&self) -> Vec<String> {
         self.agent_records().into_iter().map(|r| r.id).collect()
@@ -14102,6 +17880,8 @@ impl AgentPtyRegistry {
             orchestrator_context_path: None,
             authoring_kind: agent.authoring_kind,
             inbox: None,
+            input_held: None,
+            input_discarded: None,
         }
     }
 
@@ -14483,6 +18263,8 @@ impl AgentPtyRegistry {
                 orchestrator_context_path: None,
                 authoring_kind: agent.authoring_kind,
                 inbox: None,
+                input_held: None,
+                input_discarded: None,
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
@@ -14748,7 +18530,10 @@ impl AgentPtyRegistry {
             .expect("the displaced writer's thread is running");
         let (displaced, recorder) = rx.await.expect("the displaced writer comes back");
         let in_flight = guard.pty.in_flight.clone();
-        guard.pty = PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight);
+        let input = guard.pty.input.clone();
+        let physical = guard.pty.physical.clone();
+        guard.pty =
+            PtyWriterThread::spawn_reporting_to(inner, recorder, in_flight, input, physical);
         displaced
     }
 
@@ -14845,8 +18630,17 @@ impl AgentPtyRegistry {
         inner.next_id += 1;
         let id = format!("test-agent-{}", inner.next_id);
         let pane_retired = Arc::new(AtomicBool::new(false));
-        let pane_writer =
-            PaneWriter::new(writer, None, self.pane_input.clone(), pane_retired.clone());
+        let exited = Arc::new(AtomicBool::new(false));
+        let bus = Arc::new(AgentBus::new());
+        let pane_writer = PaneWriter::new(
+            writer,
+            None,
+            self.pane_input.clone(),
+            pane_retired.clone(),
+            exited.clone(),
+            None,
+            Arc::clone(bus.input()),
+        );
         inner.agents.insert(
             id.clone(),
             RunningAgent {
@@ -14860,9 +18654,21 @@ impl AgentPtyRegistry {
                 // their documented `Child::kill` fallback here.
                 process_group: crate::platform::proc::AgentProcessGroup::adopt(None),
                 master,
+                gate: pane_writer.gate(),
                 writer: Arc::new(AsyncMutex::new(pane_writer)),
                 pane_retired,
-                bus: Arc::new(AgentBus::new()),
+                bus,
+                child_role: ChildRole::PaneCommand,
+                child_started: None,
+                wrapper_child_exit: None,
+                removal: Arc::default(),
+                input_mode: Arc::default(),
+                ingress: crate::ingress_ledger::IngressLedger::new(),
+                doorbell: Arc::new(crate::doorbell_generation::GenerationDoorbell::new(
+                    false,
+                    #[cfg(unix)]
+                    None,
+                )),
                 pane_id_env: pane_id_env.map(str::to_string),
                 display_name: None,
                 cwd: None,
@@ -14882,7 +18688,7 @@ impl AgentPtyRegistry {
                 hook_token: crate::hook_provenance::mint(),
                 pty_rows: 24,
                 pty_cols: 80,
-                exited: Arc::new(AtomicBool::new(false)),
+                exited,
                 // Issue #454: `false` is the birth value — the flag latches to
                 // `true` only when a *successor* takes this record's pane, and
                 // nothing here spawns one: this seam inserts a record directly
@@ -14900,6 +18706,9 @@ impl AgentPtyRegistry {
                 quota_block: None,
                 authoring_kind: None,
                 attest_facts: crate::hook_provenance::AttestFacts::default(),
+                composer_install: None,
+                #[cfg(target_os = "linux")]
+                composer: None,
             },
         );
         id
@@ -15091,11 +18900,43 @@ impl AgentPtyRegistry {
                 }
             }
         };
-        if let Some(agent) = target.and_then(|id| inner.agents.get_mut(&id))
+        if let Some(id) = target
+            && let Some(agent) = inner.agents.get_mut(&id)
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
             agent.badge_command = agent.spawn_command.clone();
+            // PRD #1666 part 3, round 5-wake: the effective type's profile, for
+            // a generation spawned without a type (registry, then bus lock),
+            // and its card and WAKE for the type it now has.
+            if agent.spawn_agent_type.is_none()
+                && let Some(profile) = crate::doorbell_screen::profile_for_agent(Some(agent_type))
+            {
+                agent.bus.adopt_profile(profile);
+            }
+            self.request_reprojection(pane_id_env, &id);
+            #[cfg(target_os = "linux")]
+            let observer = agent.composer.clone();
+            drop(inner);
+            #[cfg(target_os = "linux")]
+            self.learn_composer_agent(&id, observer, agent_type);
+        }
+    }
+
+    /// PRD #1666 part 3 (Q35-22): an undeclared wrapper's observer learns
+    /// the agent its own hooks reported, with the registry lock released,
+    /// and the segments that attached for it get their driver.
+    #[cfg(target_os = "linux")]
+    fn learn_composer_agent(
+        &self,
+        id: &str,
+        observer: Option<Arc<crate::composer_probe::observe::Observer>>,
+        agent_type: &AgentType,
+    ) {
+        if let Some(observer) = observer
+            && observer.learn(agent_type)
+        {
+            self.start_segment_driver(id);
         }
     }
 
@@ -15104,14 +18945,25 @@ impl AgentPtyRegistry {
             return;
         }
         let mut inner = self.inner.lock();
-        if let Some(agent) = inner
+        if let Some((id, agent)) = inner
             .agents
-            .values_mut()
-            .find(|a| a.pane_id_env.as_deref() == Some(pane_id_env))
+            .iter_mut()
+            .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
             && agent.agent_type.is_none()
         {
             agent.agent_type = Some(agent_type.clone());
             agent.badge_command = agent.spawn_command.clone();
+            if agent.spawn_agent_type.is_none()
+                && let Some(profile) = crate::doorbell_screen::profile_for_agent(Some(agent_type))
+            {
+                agent.bus.adopt_profile(profile);
+            }
+            self.request_reprojection(pane_id_env, id);
+            #[cfg(target_os = "linux")]
+            let learned = (id.clone(), agent.composer.clone());
+            drop(inner);
+            #[cfg(target_os = "linux")]
+            self.learn_composer_agent(&learned.0, learned.1, agent_type);
         }
     }
 
@@ -16164,6 +20016,42 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// Issue #2028 test seam: the next close of `agent_id` reports (on the
+    /// returned receiver) once it removed the record and released the
+    /// registry lock, then waits for the returned sender to send or drop
+    /// before it terminates and reaps the child.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_close_before_reap_for_test(
+        &self,
+        agent_id: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.close_reap_holds
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Issue #2028 test seam, the unit tests' counterpart of the e2e exit
+    /// gate: `agent_id`'s reader, once its exit is published and before its
+    /// telemetry run ends, reports on the returned receiver and waits for the
+    /// returned sender to send or drop. It holds no registry lock meanwhile.
+    #[cfg(all(test, unix))]
+    pub(crate) fn hold_exit_telemetry_for_test(
+        &self,
+        agent_id: &str,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (reached_tx, reached_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.exit_telemetry_holds
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), (reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
     /// PRD #1666 §2.8 (auditor R9S-A01) test seam: when `agent_id`'s reader
     /// reaches its end, it waits for the returned sender to send or drop
     /// before it tells the inbox the generation exited, so a test can land
@@ -16419,7 +20307,14 @@ impl AgentPtyRegistry {
     pub fn shutdown_all(&self) {
         let agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock();
-            inner.agents.drain().map(|(_, a)| a).collect()
+            inner
+                .agents
+                .drain()
+                .map(|(_, agent)| {
+                    agent.removal.closed();
+                    agent
+                })
+                .collect()
         };
         Self::force_kill_and_reap_all(agents);
         // Wake the idle monitor if it's parked on `change_notify` — the
@@ -16448,7 +20343,14 @@ impl AgentPtyRegistry {
         }
         let mut agents: Vec<RunningAgent> = {
             let mut inner = self.inner.lock();
-            inner.agents.drain().map(|(_, a)| a).collect()
+            inner
+                .agents
+                .drain()
+                .map(|(_, agent)| {
+                    agent.removal.closed();
+                    agent
+                })
+                .collect()
         };
 
         // Phase 1: SIGTERM each child's process group. Some shells
@@ -16639,30 +20541,6 @@ mod tests {
                 "idle member {id} holds a PTY master"
             );
         }
-    }
-
-    /// Qodo on PR #1817 (finding 17): a pane's human-frame count is kept only
-    /// while a frame for it is in flight, so a long-lived daemon holds none for
-    /// the panes it has finished with.
-    #[test]
-    fn a_pane_with_no_human_frame_in_flight_holds_no_count() {
-        let registry = AgentPtyRegistry::new();
-        let first = registry.human_frame_arriving("pane-a");
-        let second = registry.human_frame_arriving("pane-a");
-        let other = registry.human_frame_arriving("pane-b");
-        drop(first);
-        assert!(
-            registry.human_frame_in_flight("pane-a"),
-            "one frame is left"
-        );
-        drop(second);
-        drop(other);
-        assert!(!registry.human_frame_in_flight("pane-a"));
-        assert!(!registry.human_frame_in_flight("pane-b"));
-        assert!(
-            registry.human_frames_in_flight.lock().unwrap().is_empty(),
-            "a pane with no frame in flight keeps its count"
-        );
     }
 
     /// Issue #714 (review): a blocked-worker notice task is cancellable only
@@ -20065,6 +23943,7 @@ mod spawn_tests {
             writer,
             mut reader,
             process_group,
+            ..
         } = pty;
         // Detached: on Linux the read ends in `EIO` once the slave is gone, but
         // nothing here depends on when, so it is never joined.
@@ -21158,6 +25037,8 @@ mod spawn_tests {
         live_type: Option<Option<AgentType>>,
     ) -> AgentRecord {
         AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: "1".into(),
             pane_id_env: None,
             display_name: None,
@@ -21185,6 +25066,8 @@ mod spawn_tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -21194,6 +25077,58 @@ mod spawn_tests {
             authoring_kind: None,
             inbox: None,
         }
+    }
+
+    /// Scenario: Two generations' records are stamped from the real hub: one whose typed fallback is available but which has reported no status, and one that reports a status, first with the fallback available and then refused. The first reads none through the record boundary's own rule; the second reads doorbell, then none once refused, then doorbell again when it is available again.
+    #[spec("inbox/doorbell/057")]
+    #[test]
+    fn doorbell_057_the_record_boundary_keeps_none_for_no_status() {
+        let registry = AgentPtyRegistry::new();
+        let seed = |agent: &str| crate::inbox::Content {
+            from: crate::inbox::Sender::Deck {
+                reason: "seed".to_string(),
+            },
+            subject: "s".to_string(),
+            body: format!("for {agent}"),
+            body_trust: crate::inbox::BodyTrust::Trusted,
+            spill_path: None,
+            id: None,
+            preface: None,
+            provenance: None,
+        };
+        for agent in ["1", "2"] {
+            registry
+                .inbox()
+                .post_direct(crate::inbox::Recipient::bound("p", agent), seed(agent))
+                .unwrap();
+        }
+        let wakes = |registry: &AgentPtyRegistry| {
+            let mut records = vec![
+                AgentRecord {
+                    id: "1".into(),
+                    pane_id_env: Some("p".into()),
+                    ..typed_record(None, None)
+                },
+                AgentRecord {
+                    id: "2".into(),
+                    pane_id_env: Some("p".into()),
+                    ..typed_record(None, Some(None))
+                },
+            ];
+            attach_inbox_summaries(registry, &mut records);
+            records
+                .iter()
+                .map(|r| r.inbox.as_ref().unwrap().wake)
+                .collect::<Vec<_>>()
+        };
+        use crate::inbox_hub::WakePath;
+        assert_eq!(wakes(&registry), [WakePath::None, WakePath::Doorbell]);
+        registry
+            .inbox()
+            .set_typed_fallback("p", "2", Some("agent_not_supported"));
+        assert_eq!(wakes(&registry), [WakePath::None, WakePath::None]);
+        registry.inbox().set_typed_fallback("p", "2", None);
+        assert_eq!(wakes(&registry), [WakePath::None, WakePath::Doorbell]);
     }
 
     /// PRD #1666 S3: a record with a pane gets its generation's summary; one
@@ -21352,6 +25287,8 @@ mod spawn_tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
+            input_discarded: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -21579,98 +25516,3779 @@ mod spawn_tests {
         );
     }
 
-    /// Scenario: a `cat` pane shows Claude Code's empty prompt box, and a doorbell for a generation that has only started (so it waits for that box on screen) types its line; before its Enter, the pane's screen is replaced by a start dialog with no hook event. The Enter is withheld and the write reports its line typed but not submitted; with the box left in place, the same write submits (control).
-    #[spec("inbox/doorbell/033")]
+    /// A Claude Code frame at `cols`: the full-width rules around an empty
+    /// composer, preceded by Claude Code's full-redraw marker.
+    fn claude_frame(cols: u16) -> Vec<u8> {
+        let rule = "─".repeat(cols as usize);
+        format!("\x1b[2J\x1b[H\x1b[20;1H{rule}\x1b[21;1H❯\u{a0}\x1b[22;1H{rule}\x1b[23;3Hstatus\x1b[21;3H")
+            .into_bytes()
+    }
+
+    fn evidence(bus: &AgentBus) -> crate::evidence_state::EvidenceStatus {
+        bus.evidence().0
+    }
+
+    /// Scenario: Feed a Claude Code-profiled bus a frame, then move its layout the way a nudge does (shrink one column, restore) and the way a resize does, pushing the agent's bytes between and after the edges: frames drawn for the old width with and without the redraw marker, a marker split across two pushes, and a failed restore. The state is Clean only after a marker followed by a frame drawn for the width in force; bytes before the marker are never parsed, a redraw for the old width leaves it pending, a failed restore leaves the width unknown until the next resize, and an unprofiled bus tracks nothing.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_layout_edges_order_the_evidence() {
+        use crate::evidence_state::{EdgeReason, EvidenceStatus};
+        let profile = Some(&crate::doorbell_screen::CLAUDE_PROFILE);
+        let bus = AgentBus::profiled(profile, 24, 80);
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Pending {
+                after_edge: None,
+                ..
+            }
+        ));
+        bus.push(claude_frame(80));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Clean { since_seq: 0 }
+        ));
+        assert!(bus.clean_frame().is_some());
+
+        // A nudge: shrink, the agent's bytes for 79, restore.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Dirty {
+                reason: EdgeReason::NudgeShrink,
+                ..
+            }
+        ));
+        assert!(bus.clean_frame().is_none());
+        bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 24, 80, || Ok::<(), ()>(()))
+            .unwrap();
+        // Bytes the agent wrote for the old width, without a marker: never parsed,
+        // even though their rules would be a witness at 80 if they were.
+        let mut old = claude_frame(80);
+        old.drain(..b"\x1b[2J\x1b[H".len());
+        bus.push(old);
+        assert!(matches!(evidence(&bus), EvidenceStatus::Dirty { .. }));
+        // A full redraw drawn for the shrunk width: pending, not Clean.
+        bus.push(claude_frame(79));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Pending {
+                after_edge: Some(_),
+                ..
+            }
+        ));
+        // The redraw for the width in force, its marker split across pushes.
+        let frame = claude_frame(80);
+        bus.push(frame[..3].to_vec());
+        bus.push(frame[3..].to_vec());
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+
+        // A real resize inside a nudge's gap: the geometry in force is the
+        // resize's, and only a frame drawn for it is a witness.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+        bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 30, 100, || Ok::<(), ()>(()))
+            .unwrap();
+        bus.push(claude_frame(80));
+        assert!(!matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        bus.push(claude_frame(100));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        let epoch = bus.evidence().1;
+
+        // A failed restore: the width is unknown until the next resize.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 30, 99, || Ok::<(), ()>(()))
+            .unwrap();
+        let _ = bus.resize_and_mark_edge(EdgeReason::NudgeRestore, 30, 100, || Err(()));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::GeometryUnknown { .. }
+        ));
+        bus.push(claude_frame(100));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::GeometryUnknown { .. }
+        ));
+        bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+        bus.push(claude_frame(100));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        assert_eq!(
+            bus.evidence().1,
+            epoch + 3,
+            "each edge moves the layout epoch"
+        );
+
+        // A failed shrink moves nothing.
+        let before = bus.evidence();
+        let _ = bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 30, 99, || Err(()));
+        assert_eq!(bus.evidence().0, before.0);
+
+        // An unprofiled bus tracks nothing.
+        let plain = AgentBus::new();
+        plain.push(claude_frame(80));
+        plain
+            .resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        assert_eq!(evidence(&plain), EvidenceStatus::Unprofiled);
+    }
+
+    /// A Codex redraw for a terminal `cols` wide: its full-redraw marker, a
+    /// dialog's highlighted choice padded to the edge, and the next choice,
+    /// whose cursor move ends the padded row as in Codex's recorded frames.
+    fn codex_choice_frame(cols: u16) -> Vec<u8> {
+        let text = "› 1. Trust and continue";
+        format!(
+            "\x1b[?2026h\x1b[1;1H\x1b[J\x1b[8;1H\x1b[1;7m{text}{}\x1b[0m\x1b[9;3H2. Back",
+            " ".repeat(cols as usize - text.chars().count())
+        )
+        .into_bytes()
+    }
+
+    /// Scenario: A Codex-profiled bus is started at 4096 × 4096 and fed a full redraw: it builds no evidence parser, recognises nothing and its release scanner refuses the geometry too. Resized to 50 × 200 it runs a parser again and a redraw for that width turns it Clean; resized to exactly the cell budget it runs one, and one row more drops it again.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_the_evidence_parser_keeps_the_scanner_budget() {
+        use crate::evidence_state::{EVIDENCE_CELLS_MAX, EvidenceStatus};
+        let bus = AgentBus::profiled(Some(&crate::doorbell_screen::CODEX_PROFILE), 4096, 4096);
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        bus.push(codex_choice_frame(4096));
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        assert!(bus.clean_frame().is_none());
+        assert_eq!(
+            bus.release().1,
+            Some(crate::release_scanner::WindowClose::Geometry)
+        );
+
+        bus.resize_and_clear(50, 200, || Ok::<(), ()>(())).unwrap();
+        assert!(matches!(evidence(&bus), EvidenceStatus::Dirty { .. }));
+        bus.push(codex_choice_frame(200));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 50 * 200);
+
+        bus.resize_and_clear(512, 512, || Ok::<(), ()>(())).unwrap();
+        bus.push(codex_choice_frame(512));
+        assert_eq!(bus.evidence_parser_cells(), EVIDENCE_CELLS_MAX);
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        bus.resize_and_clear(513, 512, || Ok::<(), ()>(())).unwrap();
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(evidence(&bus), EvidenceStatus::OverBudget { .. }));
+        assert_eq!(bus.evidence_parser_cells(), 0);
+    }
+
+    /// Scenario: A `cat` generation's doorbell is suspended on an attempt. The deck writes its own Enter into the pane, then the user types a word and presses Enter, then the generation is closed. The deck's Enter lifts nothing; the user's own submit resolves the attempt as the user's; closing retires the cell for good.
+    #[spec("inbox/doorbell/046")]
     #[tokio::test]
-    async fn doorbell_033_a_dialog_replacing_the_prompt_between_steps_withholds_the_rest() {
-        const FRAME: &str = "────────\r\n❯\r\n────────\r\n";
-        const DIALOG: &[u8] =
-            b"\x1b[2J\x1b[HDo you trust the files in this folder?\r\n> 1. Yes\r\n";
-        for replaced in [true, false] {
-            let pane = format!("pane-doorbell-screen-{replaced}");
-            let registry = Arc::new(AgentPtyRegistry::new());
+    async fn doorbell_046_the_users_own_submit_lifts_a_suspension_and_the_decks_does_not() {
+        use crate::doorbell_txn::{Cause, Latch, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, _) = ledger_pane(&registry, "pane-user-clear");
+        let doorbell = registry.generation_doorbell(&id).expect("its doorbell");
+        let attempt = doorbell.counter().allocate().unwrap();
+        doorbell.cell().open(attempt).unwrap();
+        doorbell
+            .cell()
+            .suspend(attempt, Cause::NoSubmitEvidence)
+            .unwrap();
+        let writer = registry.agent_writer(&id).expect("the writer");
+        {
+            let w = writer.lock().await;
+            let mut job = w
+                .queue_deck_job(b"\r".to_vec(), Arc::default())
+                .expect("the writer thread runs");
+            assert_eq!(job.done().await, Some((1, true)), "the deck's own Enter");
+        }
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Suspended(attempt, Cause::NoSubmitEvidence),
+            "the deck's own Enter"
+        );
+        writer
+            .lock()
+            .await
+            .write_user(b"done\r")
+            .await
+            .expect("the user's keys");
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Resolved(attempt, Resolution::User)
+        );
+        registry.close_agent(&id).expect("close the generation");
+        assert_eq!(doorbell.cell().load(), Latch::Retired);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A generation spawned with no agent type has an unprofiled evidence state; its hooks then report Claude Code, and the agent redraws its screen. The state takes up Claude Code's profile as a layout edge, Dirty until the redraw marker, and the redraw for the width in force turns it Clean; a generation that has a profile keeps it.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_a_profile_learned_from_hooks_is_taken_up_as_an_edge() {
+        use crate::evidence_state::{EdgeReason, EvidenceStatus};
+        let bus = AgentBus::profiled(None, 24, 80);
+        bus.push(claude_frame(80));
+        assert_eq!(evidence(&bus), EvidenceStatus::Unprofiled);
+        let epoch = bus.evidence().1;
+        bus.adopt_profile(&crate::doorbell_screen::CLAUDE_PROFILE);
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::Dirty {
+                reason: EdgeReason::ProfileLearned,
+                ..
+            }
+        ));
+        assert_eq!(bus.evidence().1, epoch + 1);
+        bus.push(claude_frame(80));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        bus.adopt_profile(&crate::doorbell_screen::CODEX_PROFILE);
+        assert!(
+            matches!(evidence(&bus), EvidenceStatus::Clean { .. }),
+            "a profiled state keeps its profile"
+        );
+    }
+
+    /// Scenario: A doorbell transaction marks a `cat` pane's writer as held, and a repaint nudge is asked for meanwhile; then the transaction ends. The nudge does not start while the transaction holds the writer, and starts once it has ended.
+    #[spec("inbox/doorbell/044")]
+    #[tokio::test]
+    async fn doorbell_044_a_nudge_waits_for_the_doorbell_transaction() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, _) = ledger_pane(&registry, "pane-nudge-deferred");
+        registry.doorbell_txn_begin(&id);
+        registry.nudge_repaint(&id);
+        assert!(
+            !registry.repaint_nudges.lock().unwrap().contains_key(&id),
+            "a nudge started under the transaction"
+        );
+        registry.doorbell_txn_end(&id);
+        assert!(
+            registry.repaint_nudges.lock().unwrap().contains_key(&id),
+            "the deferred nudge did not start once the transaction ended"
+        );
+        // Without a transaction, a nudge starts at once.
+        let (other, _) = ledger_pane(&registry, "pane-nudge-free");
+        registry.nudge_repaint(&other);
+        assert!(registry.repaint_nudges.lock().unwrap().contains_key(&other));
+        registry.shutdown_all();
+    }
+
+    /// Codex's start-up header for `version`, drawn the way Codex 0.164.0
+    /// draws it: `OpenAI` at row 1, column 5.
+    fn codex_header(version: &str) -> Vec<u8> {
+        format!("\x1b[2;3H>_ \x1b[1mOpenAI Codex\x1b[22m\x1b[2m (v{version})\x1b[22m").into_bytes()
+    }
+
+    fn latch(bus: &AgentBus) -> crate::release_scanner::ScanLatch {
+        bus.release().0
+    }
+
+    fn latched_release(bus: &AgentBus) -> Option<semver::Version> {
+        match latch(bus) {
+            crate::release_scanner::ScanLatch::Latched { release, .. } => Some(release),
+            _ => None,
+        }
+    }
+
+    const V164: semver::Version = semver::Version::new(0, 164, 0);
+
+    /// Scenario: Feed a generation's bus its start-up header and then 200 lines that scroll it away, header-like text in another shape, a header after the window closed at the first prompt, two different headers, and a header overwritten in place. The release latches when the header is drawn and stays latched after it scrolls away; another shape latches nothing; nothing after the window's close counts; two headers are a conflict; a header redrawn in place over another is read as drawn.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_latch_reads_the_header_once_and_keeps_it() {
+        use crate::release_scanner::{ScanLatch, WindowClose};
+        // (a) drawn, then scrolled away.
+        let bus = AgentBus::for_generation("g-a", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        bus.push(b"\x1b[24;1H".to_vec());
+        bus.push(b"line\r\n".repeat(200));
+        assert_eq!(latched_release(&bus), Some(V164));
+        // (e) another shape.
+        let bus = AgentBus::for_generation("g-e", None, 24, 80);
+        bus.push(b"\x1b[2;6HOpenAI Codex v0.164.0\r\n".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+        // (b), (f) the window closed at the first prompt: unseen, and a
+        // header after it is ignored.
+        bus.close_release(WindowClose::FirstPrompt);
+        bus.push(codex_header("0.164.0"));
+        let (seen, closed, alive) = bus.release();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, Some(WindowClose::FirstPrompt));
+        assert!(!alive, "the scanner is dropped at the window's close");
+        // (f) a header starting past the byte limit is ignored. The filler
+        // is pushed at the PTY reader's largest read, as the reader would.
+        let bus = AgentBus::for_generation("g-f", None, 24, 80);
+        let filler = vec![b'x'; crate::release_scanner::RELEASE_WINDOW_BYTES as usize - 4];
+        for chunk in filler.chunks(8192) {
+            bus.push(chunk.to_vec());
+        }
+        bus.push(codex_header("0.164.0"));
+        let (seen, closed, _) = bus.release();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, Some(WindowClose::ByteLimit));
+        // (g) two different headers inside the window.
+        let bus = AgentBus::for_generation("g-g", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        bus.push(codex_header("0.165.0"));
+        assert!(matches!(latch(&bus), ScanLatch::Conflict { .. }));
+        // (j) a header overwritten in place after a carriage return.
+        let bus = AgentBus::for_generation("g-j", None, 24, 80);
+        let mut bytes = b"\x1b[2;6HOpenAI Codex (vX.Y.Z)\r".to_vec();
+        bytes.extend(codex_header("0.164.0"));
+        bus.push(bytes);
+        assert_eq!(latched_release(&bus), Some(V164));
+    }
+
+    /// Scenario: Push one raw trace — a complete header, then an erase-display and a redraw that leaves only a composer — as one push, split right after the header, inside the header's escape sequences, inside a multibyte glyph, and one byte per push; then the same with two different headers and a redraw. Every split latches the same release, though the screen after the single push holds no header, and every split of the second trace is a conflict.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_latch_is_independent_of_how_the_bytes_were_split() {
+        use crate::release_scanner::ScanLatch;
+        let mut trace = codex_header("0.164.0");
+        let header_end = trace.len();
+        trace.extend("\x1b[2J\x1b[H\x1b[20;1H› Ask Codex to do anything ✓".as_bytes());
+        let glyph = trace.len() - 2;
+        let escape = 4;
+        let splits: Vec<Vec<usize>> = vec![
+            vec![],
+            vec![header_end],
+            vec![escape],
+            vec![glyph],
+            (1..trace.len()).collect(),
+        ];
+        let latch_with = |trace: &[u8], cuts: &[usize]| {
+            let bus = AgentBus::for_generation("g-h", None, 24, 80);
+            let mut from = 0;
+            for &cut in cuts.iter().chain(std::iter::once(&trace.len())) {
+                bus.push(trace[from..cut].to_vec());
+                from = cut;
+            }
+            latch(&bus)
+        };
+        // The header completes with its `)`.
+        let closing = trace.iter().position(|&b| b == b')').unwrap() as u64 + 1;
+        for cuts in &splits {
+            assert_eq!(
+                latch_with(&trace, cuts),
+                ScanLatch::Latched {
+                    agent: AgentType::Codex,
+                    release: V164,
+                    at: closing
+                },
+                "{cuts:?}"
+            );
+        }
+        // The screen after the single push no longer shows the header.
+        let shown = crate::doorbell_screen::Grid::parse(&trace, 24, 80);
+        assert!(!shown.row_text(1).contains("OpenAI Codex"));
+        let mut two = codex_header("0.164.0");
+        two.extend(codex_header("0.165.0"));
+        two.extend(b"\x1b[2J\x1b[H".to_vec());
+        for cuts in [
+            vec![],
+            vec![10],
+            vec![30],
+            (1..two.len()).collect::<Vec<_>>(),
+        ] {
+            assert!(
+                matches!(latch_with(&two, &cuts), ScanLatch::Conflict { .. }),
+                "{cuts:?}"
+            );
+        }
+    }
+
+    /// Claude Code's start-up header for `version`, drawn where Claude Code
+    /// 2.1.310 draws it: `Claude Code` at row 1, column 11.
+    fn claude_header(version: &str) -> Vec<u8> {
+        format!("\x1b[2;12HClaude Code v{version}\r").into_bytes()
+    }
+
+    /// Scenario: Feed generations' buses Claude Code 2.1.310's header. One spawned as Claude Code reads its input with the measured grammar from the push that latched it; one spawned as Codex, and one of no known agent, stay strict. Then a Claude Code generation is fed 2.1.310's header followed by 2.1.312's, as one push, split after the first header, and one byte per push: every split ends in a conflict and the strict grammar, so the writer's tracker reads the user's `ESC [` then Ctrl+U as still inside the CSI.
+    #[spec("inbox/probe/076")]
+    #[test]
+    fn probe_076_the_input_grammar_follows_the_generations_own_latch() {
+        use crate::composer_probe::planner::{Boundary, InputGrammar, Physical, PhysicalTracker};
+        use crate::release_scanner::ScanLatch;
+        let claude = Some(AgentType::ClaudeCode);
+        let grammar = |bus: &AgentBus| bus.input().input_grammar();
+        let bus = AgentBus::for_generation("g-q83-a", None, 24, 80).spawned_as(claude.clone());
+        assert_eq!(grammar(&bus), InputGrammar::Strict, "before a header");
+        bus.push(claude_header("2.1.310"));
+        assert_eq!(grammar(&bus), InputGrammar::ClaudeMeasured);
+        for other in [Some(AgentType::Codex), None] {
+            let bus = AgentBus::for_generation("g-q83-b", None, 24, 80).spawned_as(other.clone());
+            bus.push(claude_header("2.1.310"));
+            assert!(matches!(latch(&bus), ScanLatch::Latched { .. }));
+            assert_eq!(grammar(&bus), InputGrammar::Strict, "{other:?}");
+        }
+        let first = claude_header("2.1.310");
+        let trace = [
+            first.as_slice(),
+            b"\x1b[2J".as_slice(),
+            &claude_header("2.1.312"),
+        ]
+        .concat();
+        for cuts in [
+            vec![],
+            vec![first.len()],
+            (1..trace.len()).collect::<Vec<_>>(),
+        ] {
+            let bus = AgentBus::for_generation("g-q83-c", None, 24, 80).spawned_as(claude.clone());
+            let mut from = 0;
+            for &cut in cuts.iter().chain(std::iter::once(&trace.len())) {
+                bus.push(trace[from..cut].to_vec());
+                from = cut;
+                if cut == first.len() {
+                    assert_eq!(grammar(&bus), InputGrammar::ClaudeMeasured, "{cuts:?}");
+                }
+            }
+            assert!(
+                matches!(latch(&bus), ScanLatch::Conflict { .. }),
+                "{cuts:?}"
+            );
+            assert_eq!(grammar(&bus), InputGrammar::Strict, "{cuts:?}");
+            let physical = Physical::default();
+            let mut tracker = PhysicalTracker::default();
+            tracker.written_as(b"\x1b[\x15", &physical, grammar(&bus));
+            assert_eq!(physical.boundary(), Boundary::Inside, "{cuts:?}");
+        }
+    }
+
+    /// Scenario: Replay commit 1's recorded launches of Codex 0.164.0, 0.160.0 and Claude Code 2.1.310 through a generation's bus at pseudo-random splits. Each latches exactly what feeding the bytes one at a time latches.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_recorded_launches_latch_at_any_split() {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        for stem in [
+            "codex-inbox/r5wake/codex-0.164.0-deck-tester-fresh-46x130",
+            "codex-inbox/r5wake/codex-0.160.0-deck-tester-respawn-46x130",
+            "codex-inbox/r5wake/codex-0.164.0-start-update-50x200",
+            "claude-inbox/r5wake/claude-2.1.310-start-50x200",
+        ] {
+            let bytes = std::fs::read(base.join(format!("{stem}.bin"))).unwrap();
+            let index: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(base.join(format!("{stem}.json"))).unwrap())
+                    .unwrap();
+            let (rows, cols) = (
+                index["rows"].as_u64().unwrap() as u16,
+                index["cols"].as_u64().unwrap() as u16,
+            );
+            let reference =
+                crate::release_scanner::latch_byte_at_a_time(&bytes, rows, cols).unwrap();
+            assert!(matches!(
+                reference,
+                crate::release_scanner::ScanLatch::Latched { .. }
+            ));
+            let mut seed: u64 = 0x5eed_0055;
+            for _ in 0..6 {
+                let bus = AgentBus::for_generation("g-k", None, rows, cols);
+                let mut pos = 0;
+                while pos < bytes.len() {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let end = (pos + 1 + (seed >> 33) as usize % 900).min(bytes.len());
+                    bus.push(bytes[pos..end].to_vec());
+                    pos = end;
+                }
+                assert_eq!(latch(&bus), reference, "{stem}");
+            }
+        }
+    }
+
+    /// Scenario: Feed a Codex-profiled bus its header before any width witness, then across layout edges: a header before the state was ever Clean, a header followed by an edge that leaves the state Dirty, and a header drawn while Dirty after an edge at the new width. Each latches, whatever the evidence state.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_latch_does_not_wait_for_clean_evidence() {
+        use crate::evidence_state::{EdgeReason, EvidenceStatus};
+        let profile = Some(&crate::doorbell_screen::CODEX_PROFILE);
+        // (l) never Clean.
+        let bus = AgentBus::for_generation("g-l", profile, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        assert!(!matches!(bus.evidence().0, EvidenceStatus::Clean { .. }));
+        assert_eq!(latched_release(&bus), Some(V164));
+        // (m) the header, then an edge that leaves the state Dirty.
+        bus.resize_and_mark_edge(EdgeReason::NudgeShrink, 24, 79, || Ok::<(), ()>(()))
+            .unwrap();
+        assert!(matches!(bus.evidence().0, EvidenceStatus::Dirty { .. }));
+        assert_eq!(latched_release(&bus), Some(V164));
+        // A header drawn while Dirty after an edge, at the new width.
+        let bus = AgentBus::for_generation("g-m", profile, 24, 80);
+        bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap();
+        assert!(matches!(bus.evidence().0, EvidenceStatus::Dirty { .. }));
+        bus.push(codex_header("0.164.0"));
+        assert_eq!(latched_release(&bus), Some(V164));
+    }
+
+    /// Scenario: Feed headers through the operations the scanner's argument covers: painted right to left one character per cursor move, printed and then moved by scroll-up, insert-line and reverse-index with the cursor left elsewhere, a header-like row completed by erasing a disqualifying cell, and a header whose last digit a repeat writes across a wrap. The painted header latches at its last character, the moved one latches once at its print and a non-matching row moved the same way latches nothing, the erase completes a match, and the repeat leaves the release unseen.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_operations_on_the_cursors_row() {
+        use crate::release_scanner::ScanLatch;
+        // (n) right to left, one CUP per character.
+        let text = "OpenAI Codex (v0.164.0)";
+        let mut painted = Vec::new();
+        for (i, c) in text.char_indices().rev() {
+            painted.extend(format!("\x1b[2;{}H{c}", 6 + i).into_bytes());
+        }
+        let bus = AgentBus::for_generation("g-n", None, 24, 80);
+        bus.push(painted.clone());
+        assert!(matches!(
+            latch(&bus),
+            ScanLatch::Latched { at, .. } if at == painted.len() as u64
+        ));
+        // (o) printed, then moved; and a non-matching row moved the same way.
+        let bus = AgentBus::for_generation("g-o", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        let at = match latch(&bus) {
+            ScanLatch::Latched { at, .. } => at,
+            other => panic!("{other:?}"),
+        };
+        bus.push(b"\x1b[10;1H\x1b[S\x1b[5;1H\x1b[L\x1b[1;1H\x1bM\x1b[12;1H".to_vec());
+        assert!(matches!(latch(&bus), ScanLatch::Latched { at: same, .. } if same == at));
+        let bus = AgentBus::for_generation("g-o2", None, 24, 80);
+        bus.push(b"\x1b[4;6HOpenAI Codex (v0.164.0)\x1b[10;1H".to_vec());
+        bus.push(b"\x1b[1;1H\x1bM\x1b[1;1H\x1bM\x1b[3;1H\x1b[S\x1b[S\x1b[12;1H".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+        // (p) an erase completes the match: the blank inside the span.
+        let bus = AgentBus::for_generation("g-p", None, 24, 80);
+        bus.push(b"\x1b[2;6HOpenAIXCodex (v0.164.0)".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+        bus.push(b"\x1b[2;12H\x1b[1X\x1b[10;1H".to_vec());
+        assert_eq!(latched_release(&bus), Some(V164));
+        // (q) the residual: a repeat that writes the last digit across a wrap.
+        // With the measured shapes a repeat cannot complete a header (Codex's
+        // ends in `)`, Claude Code's needs a blank after its version on the
+        // same row), so this stays unseen.
+        let bus = AgentBus::for_generation("g-q", None, 24, 31);
+        bus.push(b"\x1b[2;12HClaude Code v2.1.31\x1b[2b\x1b[10;1H".to_vec());
+        assert_eq!(latch(&bus), ScanLatch::Pending);
+    }
+
+    /// Scenario: Start a generation larger than the scanner's cell budget, and resize latched and unlatched generations over it. An oversized start has no scanner and reads as scanner_geometry; a resize over the budget drops the scanner and keeps a latch already made, and leaves an unlatched generation scanner_geometry; the scanner keeps no scrollback.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_scanner_stays_within_its_cell_budget() {
+        use crate::doorbell_activation::LatchedRelease;
+        use crate::release_scanner::{ReleaseCapture, WindowClose};
+        let big = ReleaseCapture::start(1024, 1024);
+        assert!(!big.scanner_alive());
+        assert_eq!(
+            big.latched_for(&AgentType::Codex),
+            LatchedRelease::ScannerGeometry
+        );
+        let fits = ReleaseCapture::start(512, 512);
+        assert!(fits.scanner_alive());
+        assert_eq!(fits.scanner_scrollback(), Some(0));
+        let bus = AgentBus::for_generation("g-r", None, 24, 80);
+        bus.push(codex_header("0.164.0"));
+        bus.resize_and_clear(1024, 1024, || Ok::<(), ()>(()))
+            .unwrap();
+        let (seen, closed, alive) = bus.release();
+        assert!(!alive);
+        assert_eq!(closed, Some(WindowClose::Geometry));
+        assert!(matches!(
+            seen,
+            crate::release_scanner::ScanLatch::Latched { .. }
+        ));
+        let bus = AgentBus::for_generation("g-r2", None, 24, 80);
+        bus.resize_and_clear(1024, 1024, || Ok::<(), ()>(()))
+            .unwrap();
+        let state = bus.state.lock().unwrap();
+        assert_eq!(
+            state.release.latched_for(&AgentType::Codex),
+            LatchedRelease::ScannerGeometry
+        );
+    }
+
+    /// 8192 bytes of erase-display at 512 × 512, one PTY read's worth: over
+    /// the per-push work limit of both the scanner and the evidence parser.
+    fn erase_storm() -> Vec<u8> {
+        b"\x1b[2J".repeat(2048)
+    }
+
+    /// Scenario: Feed generations at 512 × 512 one read of erase-display, then a run of reads each under the per-push limit that add up past the per-generation limit, then a header after a trip, and a latched generation the same erase-display. An unlatched generation's scanner is dropped at the first byte over either limit and reads as scanner_budget, which the activation table holds; nothing after a trip is read; a release latched before a trip stays latched.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_the_scanner_works_to_a_budget() {
+        use crate::doorbell_activation::{AGENT_FACTS, Activation, LatchedRelease, NoGo};
+        use crate::release_scanner::{ScanLatch, WindowClose, WorkLimit};
+        let over = |bus: &AgentBus| bus.state.lock().unwrap().release.cost().over;
+        let latched_for = |bus: &AgentBus| {
+            bus.state
+                .lock()
+                .unwrap()
+                .release
+                .latched_for(&AgentType::Codex)
+        };
+        // One read over the per-push limit.
+        let bus = AgentBus::for_generation("g-s", None, 512, 512);
+        bus.push(erase_storm());
+        let (seen, closed, alive) = bus.release();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, Some(WindowClose::WorkBudget));
+        assert!(!alive, "the scanner is dropped at its budget");
+        assert_eq!(over(&bus), Some(WorkLimit::Push));
+        assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
+        assert_eq!(
+            crate::doorbell_activation::activation(
+                &AGENT_FACTS,
+                &AgentType::Codex,
+                &latched_for(&bus),
+            ),
+            Activation::NoGo(NoGo::ScannerBudget)
+        );
+        assert_eq!(NoGo::ScannerBudget.clause(), "scanner_budget");
+        // Nothing after the trip is read, a header included.
+        bus.push(codex_header("0.164.0"));
+        assert_eq!(bus.release().0, ScanLatch::Pending);
+        assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
+
+        // Reads each under the per-push limit, past the generation's.
+        let bus = AgentBus::for_generation("g-t", None, 512, 512);
+        let read = b"\r\x1b[K".repeat(2048);
+        let mut reads = 0;
+        while bus.release().2 {
+            bus.push(read.clone());
+            reads += 1;
+            assert!(reads < 64, "the scanner outlived its total budget");
+        }
+        assert!(
+            reads > 1,
+            "one read of erase-in-line is under the per-push limit"
+        );
+        assert_eq!(over(&bus), Some(WorkLimit::Total));
+        assert_eq!(bus.release().1, Some(WindowClose::WorkBudget));
+        assert_eq!(latched_for(&bus), LatchedRelease::ScannerBudget);
+
+        // A release latched before a trip stays latched.
+        let bus = AgentBus::for_generation("g-u", None, 512, 512);
+        bus.push(codex_header("0.164.0"));
+        bus.push(erase_storm());
+        let (seen, closed, alive) = bus.release();
+        assert!(matches!(seen, ScanLatch::Latched { ref release, .. } if *release == V164));
+        assert_eq!(closed, Some(WindowClose::WorkBudget));
+        assert!(!alive);
+        assert_eq!(latched_for(&bus), LatchedRelease::Known(V164));
+    }
+
+    /// Scenario: Replay every recorded launch through the real push path at its recorded read sizes, at 50 × 200 and 80 × 300. No launch takes the release scanner past either work limit: each window closes at its byte limit or stays open, never at the budget, and the most work any one read gives the scanner is well inside the per-push limit.
+    #[spec("inbox/doorbell/055")]
+    #[test]
+    fn doorbell_055_recorded_launches_stay_within_the_scanner_budget() {
+        use crate::release_scanner::{SCANNER_WORK_PER_PUSH, SCANNER_WORK_TOTAL, WindowClose};
+        for (rows, cols) in [(50u16, 200u16), (80, 300)] {
+            for trace in super::scanner_budget::traces() {
+                let bus = AgentBus::for_generation(&trace.name, None, rows, cols);
+                for chunk in super::scanner_budget::chunks(&trace.bytes, &trace.read_lens) {
+                    bus.push(chunk.to_vec());
+                }
+                let cost = bus.state.lock().unwrap().release.cost();
+                assert_eq!(cost.over, None, "{} at {rows}x{cols}", trace.name);
+                assert_ne!(bus.release().1, Some(WindowClose::WorkBudget));
+                // Margins the calibration measured: a launch's largest read
+                // and its whole window use under a fifth and a sixth.
+                assert!(
+                    cost.push_work_max < SCANNER_WORK_PER_PUSH / 5,
+                    "{} at {rows}x{cols}: {} units in one read",
+                    trace.name,
+                    cost.push_work_max
+                );
+                assert!(
+                    cost.work < SCANNER_WORK_TOTAL / 6,
+                    "{} at {rows}x{cols}: {} units",
+                    trace.name,
+                    cost.work
+                );
+            }
+        }
+    }
+
+    /// Scenario: A Codex-profiled bus at 512 × 512 turns Clean on a redraw, then is fed one read of erase-display. The evidence parser is dropped at the first byte over its per-push limit and the state reads work_over_budget, with no frame to read; later reads, a full redraw included, leave it there; the next layout edge starts the evidence over, and a redraw turns it Clean again.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_the_evidence_parser_works_to_a_per_push_bound() {
+        use crate::evidence_state::EvidenceStatus;
+        let bus = AgentBus::profiled(Some(&crate::doorbell_screen::CODEX_PROFILE), 512, 512);
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        let at = bus.evidence().2;
+        bus.push(erase_storm());
+        let status = evidence(&bus);
+        let EvidenceStatus::WorkOverBudget { since_seq } = status else {
+            panic!("the storm left the state {status:?}");
+        };
+        assert!(
+            since_seq > at && since_seq < at + 8192,
+            "dropped inside the read"
+        );
+        assert_eq!(status.as_str(), "work_over_budget");
+        assert!(bus.clean_frame().is_none());
+        assert_eq!(bus.evidence_parser_cells(), 0);
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::WorkOverBudget { .. }
+        ));
+        assert!(bus.clean_frame().is_none());
+
+        // The next edge resets it.
+        bus.resize_and_mark_edge(
+            crate::evidence_state::EdgeReason::NudgeShrink,
+            512,
+            511,
+            || Ok::<(), ()>(()),
+        )
+        .unwrap();
+        assert!(matches!(evidence(&bus), EvidenceStatus::Dirty { .. }));
+        bus.resize_and_clear(512, 512, || Ok::<(), ()>(())).unwrap();
+        bus.push(codex_choice_frame(512));
+        assert!(matches!(evidence(&bus), EvidenceStatus::Clean { .. }));
+        assert!(bus.clean_frame().is_some());
+
+        // A redraw marker followed in the same read by the storm drops the
+        // parser it starts.
+        bus.resize_and_clear(512, 512, || Ok::<(), ()>(())).unwrap();
+        let mut read = codex_choice_frame(512);
+        read.extend(erase_storm());
+        bus.push(read);
+        assert!(matches!(
+            evidence(&bus),
+            EvidenceStatus::WorkOverBudget { .. }
+        ));
+    }
+
+    /// Scenario: Replay every recorded launch through a bus profiled for its agent, at its recorded read sizes, at 50 × 200 and 80 × 300. No read of any launch takes the evidence parser past its per-push limit.
+    #[spec("inbox/doorbell/044")]
+    #[test]
+    fn doorbell_044_recorded_launches_stay_within_the_evidence_bound() {
+        use crate::evidence_state::EvidenceStatus;
+        for (rows, cols) in [(50u16, 200u16), (80, 300)] {
+            for trace in super::scanner_budget::traces() {
+                let bus = AgentBus::for_generation(&trace.name, Some(trace.profile), rows, cols);
+                for chunk in super::scanner_budget::chunks(&trace.bytes, &trace.read_lens) {
+                    bus.push(chunk.to_vec());
+                    assert!(
+                        !matches!(evidence(&bus), EvidenceStatus::WorkOverBudget { .. }),
+                        "{} at {rows}x{cols}",
+                        trace.name
+                    );
+                }
+            }
+        }
+    }
+
+    /// Scenario: Latch a `cat` generation's release, attach to it and detach, start the window's first-prompt close through the registry, restart the pane, close a generation, and let a generation's PTY reach its end. Attaching changes nothing; the respawned generation starts with an empty latch and reads as unseen with no header of its own; closing or retiring a generation and its reader's end each drop its scanner.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test]
+    async fn doorbell_055_the_latch_lives_with_its_generation() {
+        use crate::doorbell_activation::LatchedRelease;
+        use crate::release_scanner::{ScanLatch, WindowClose};
+        const PANE: &str = "pane-release-latch";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, _) = ledger_pane(&registry, PANE);
+        let bus = registry.inner.lock().agents[&id].bus.clone();
+        bus.push(codex_header("0.164.0"));
+        let latched = latch(&bus);
+        assert!(matches!(latched, ScanLatch::Latched { .. }));
+        // (d) attach, detach, reattach.
+        let (_, rx) = bus.subscribe();
+        drop(rx);
+        let (_, rx) = bus.subscribe();
+        assert_eq!(latch(&bus), latched);
+        drop(rx);
+        // The first prompt closes the window; the latch stays.
+        registry.close_release_window(&id);
+        let (seen, closed, alive) = registry.release_capture(&id).unwrap();
+        assert_eq!(seen, latched);
+        assert_eq!(closed, Some(WindowClose::FirstPrompt));
+        assert!(!alive);
+        // (c) respawn: the successor starts empty, unseen without a header.
+        let successor = registry
+            .respawn_agent_for_pane(PANE, "/bin/cat")
+            .await
+            .expect("respawn the pane");
+        assert_ne!(successor, id);
+        let (seen, closed, alive) = registry.release_capture(&successor).unwrap();
+        assert_eq!(seen, ScanLatch::Pending);
+        assert_eq!(closed, None);
+        assert!(alive);
+        let successor_bus = registry.inner.lock().agents[&successor].bus.clone();
+        successor_bus.close_release(WindowClose::FirstPrompt);
+        assert_eq!(
+            successor_bus
+                .state
+                .lock()
+                .unwrap()
+                .release
+                .latched_for(&AgentType::Codex),
+            LatchedRelease::Unseen
+        );
+        // Retirement drops the scanner.
+        let (other, _) = ledger_pane(&registry, "pane-release-close");
+        let other_bus = registry.inner.lock().agents[&other].bus.clone();
+        registry.close_agent(&other).expect("close");
+        let (_, closed, alive) = other_bus.release();
+        assert!(!alive);
+        assert_eq!(closed, Some(WindowClose::Retired));
+        // The reader's end drops it.
+        let (ended, _) = ledger_pane(&registry, "pane-release-exit");
+        let ended_bus = registry.inner.lock().agents[&ended].bus.clone();
+        let writer = registry.agent_writer(&ended).expect("writer");
+        writer
+            .lock()
+            .await
+            .write_user(b"\x04")
+            .await
+            .expect("EOF to cat");
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while ended_bus.release().2 {
+            assert!(Instant::now() < deadline, "the reader never ended");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(ended_bus.release().1, Some(WindowClose::AgentExit));
+        registry.shutdown_all();
+    }
+
+    /// 051's injected process table: what each lookup answers, per test thread.
+    #[derive(Clone)]
+    struct FakeProcs {
+        session: Option<u32>,
+        started: Option<u64>,
+        own: crate::input_mode::NamespaceRead,
+        peer: crate::input_mode::NamespaceRead,
+    }
+
+    thread_local! {
+        static FAKE_PROCS: std::cell::RefCell<Option<FakeProcs>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    fn fake() -> FakeProcs {
+        FAKE_PROCS.with(|f| f.borrow().clone().expect("fake process table set"))
+    }
+
+    const FAKE_LOOKUPS: InputModeLookups = InputModeLookups {
+        session_of: |_| fake().session,
+        started: |_| fake().started,
+        own_namespace: || fake().own,
+        namespace_of: |_| fake().peer,
+        now: crate::input_mode::monotonic_ns,
+    };
+
+    /// A `cat` generation for 051's unit cases, and its session leader.
+    fn mode_generation(registry: &Arc<AgentPtyRegistry>, pane: &str) -> (String, u32) {
+        let (id, _) = ledger_pane(registry, pane);
+        let leader = registry.inner.lock().agents[&id]
+            .child
+            .process_id()
+            .expect("the child's pid");
+        (id, leader)
+    }
+
+    fn fresh_raw(seq: u64) -> crate::input_mode::ModeSample {
+        let at = crate::input_mode::monotonic_ns().unwrap();
+        crate::input_mode::ModeSample {
+            seq,
+            icanon: false,
+            echo: false,
+            // The done stamp is the clock read itself: a later read can equal it
+            // (macOS's monotonic clock ticks in microseconds), never precede it.
+            sampled_mono_ns: at.saturating_sub(1),
+            sample_done_mono_ns: at,
+        }
+    }
+
+    fn set_fake(procs: FakeProcs) {
+        FAKE_PROCS.with(|f| *f.borrow_mut() = Some(procs));
+    }
+
+    /// Scenario: With the process table injected, a report binds a generation to a process, and then the same pid reports with a different start time, as a reused pid would; on another generation, the reporting process's start time cannot be read. The reused pid is a second observer, so the generation is held as `input_mode_conflict` and never treated as the bound process; the unreadable start time is refused and stores nothing.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_an_observer_is_its_pid_and_start_time() {
+        use crate::input_mode::{ModeClause, NamespaceRead, Observer};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, leader) = mode_generation(&registry, "pane-mode-reuse");
+        let first = Observer {
+            pid: 4242,
+            start: 100,
+        };
+        let procs = FakeProcs {
+            session: Some(leader),
+            started: Some(100),
+            own: NamespaceRead::NotFound,
+            peer: NamespaceRead::NotFound,
+        };
+        set_fake(procs.clone());
+        assert!(
+            registry
+                .accept_input_mode_with(&id, first, fresh_raw(1), &FAKE_LOOKUPS)
+                .is_ok()
+        );
+        let reused = Observer {
+            pid: 4242,
+            start: 200,
+        };
+        set_fake(FakeProcs {
+            started: Some(200),
+            ..procs.clone()
+        });
+        assert_eq!(
+            registry.accept_input_mode_with(&id, reused, fresh_raw(2), &FAKE_LOOKUPS),
+            Err("input_mode_conflict")
+        );
+        let store = registry.input_mode_store(&id).unwrap();
+        assert_eq!(store.conflict(), Some((first, reused)));
+        assert_eq!(store.sticky(), Some(ModeClause::Conflict));
+        assert_eq!(store.latest().map(|s| s.seq), Some(1));
+
+        let (other, leader) = mode_generation(&registry, "pane-mode-unreadable");
+        set_fake(FakeProcs {
+            session: Some(leader),
+            started: None,
+            ..procs
+        });
+        assert!(
+            registry
+                .accept_input_mode_with(&other, first, fresh_raw(1), &FAKE_LOOKUPS)
+                .is_err()
+        );
+        let store = registry.input_mode_store(&other).unwrap();
+        assert!(store.observer().is_none() && store.latest().is_none());
+        registry.shutdown_all();
+    }
+
+    /// Scenario: With the time-namespace links injected, reports reach fresh generations from a peer in another namespace, with no namespaces on either side, with the daemon's own link unreadable, and with the daemon's link present while the peer's read fails with no such file, no such process and permission denied. Only the no-namespaces case is stored; another namespace and each failed peer read are refused as `clock_namespace`, an unreadable own link refuses every report as `clock_namespace_unreadable`, and a generation refused for its clock stays refused when a later report's namespace matches.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_a_peer_must_share_the_daemons_clock() {
+        use crate::input_mode::{ModeClause, NamespaceRead, Observer};
+        let peer = Observer {
+            pid: 4242,
+            start: 100,
+        };
+        let link = |n: &str| NamespaceRead::Link(std::path::PathBuf::from(format!("time:[{n}]")));
+        let os = |code| NamespaceRead::of(Err(std::io::Error::from_raw_os_error(code)));
+        assert_eq!(os(libc::ENOENT), NamespaceRead::NotFound);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let cases = [
+            (
+                "another namespace",
+                link("1"),
+                link("2"),
+                Err("clock_namespace"),
+            ),
+            (
+                "no namespaces",
+                NamespaceRead::NotFound,
+                NamespaceRead::NotFound,
+                Ok(()),
+            ),
+            ("the same namespace", link("1"), link("1"), Ok(())),
+            (
+                "own link unreadable",
+                os(libc::EACCES),
+                NamespaceRead::NotFound,
+                Err("clock_namespace_unreadable"),
+            ),
+            (
+                "own link unreadable, peer's present",
+                os(libc::EACCES),
+                link("1"),
+                Err("clock_namespace_unreadable"),
+            ),
+            (
+                "peer's link absent",
+                link("1"),
+                os(libc::ENOENT),
+                Err("clock_namespace"),
+            ),
+            (
+                "peer gone",
+                link("1"),
+                os(libc::ESRCH),
+                Err("clock_namespace"),
+            ),
+            (
+                "peer's link denied",
+                link("1"),
+                os(libc::EACCES),
+                Err("clock_namespace"),
+            ),
+        ];
+        for (i, (what, own, peer_ns, want)) in cases.into_iter().enumerate() {
+            let (id, leader) = mode_generation(&registry, &format!("pane-mode-ns-{i}"));
+            set_fake(FakeProcs {
+                session: Some(leader),
+                started: Some(100),
+                own: own.clone(),
+                peer: peer_ns,
+            });
+            let got = registry
+                .accept_input_mode_with(&id, peer, fresh_raw(1), &FAKE_LOOKUPS)
+                .map(|_| ());
+            assert_eq!(got, want, "{what}");
+            let store = registry.input_mode_store(&id).unwrap();
+            match want {
+                Ok(()) => assert_eq!(store.observer(), Some(peer), "{what}"),
+                Err(clause) => {
+                    assert!(store.latest().is_none(), "{what}");
+                    assert_eq!(
+                        store.sticky().map(ModeClause::as_str),
+                        Some(clause),
+                        "{what}"
+                    );
+                    // Held for the generation: a matching namespace later
+                    // does not lift it.
+                    set_fake(FakeProcs {
+                        session: Some(leader),
+                        started: Some(100),
+                        own: NamespaceRead::NotFound,
+                        peer: NamespaceRead::NotFound,
+                    });
+                    assert_eq!(
+                        registry
+                            .accept_input_mode_with(&id, peer, fresh_raw(2), &FAKE_LOOKUPS)
+                            .map(|_| ()),
+                        Err(clause),
+                        "{what}: held"
+                    );
+                }
+            }
+        }
+        registry.shutdown_all();
+    }
+
+    /// A `cat` pane for the ledger tests, its id and its ledger.
+    fn ledger_pane(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+    ) -> (String, Arc<crate::ingress_ledger::IngressLedger>) {
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the ledger's pane");
+        let ledger = registry
+            .ingress_ledger(&id)
+            .expect("the generation's ledger");
+        (id, ledger)
+    }
+
+    /// Wait (bounded) until `ledger` has settled `ticket`.
+    async fn settled_as(
+        ledger: &crate::ingress_ledger::IngressLedger,
+        ticket: u64,
+    ) -> crate::ingress_ledger::Settlement {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            if let Some((_, how)) = ledger.settled().into_iter().find(|(t, _)| *t == ticket) {
+                return how;
+            }
+            assert!(Instant::now() < deadline, "ticket {ticket} never settled");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// What a [`ModelEditor`]'s agent does with the deck's Enter.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum OnEnter {
+        /// Submit the composer: its text becomes a user message in the
+        /// transcript, and the agent's prompt hook reports a ring token it
+        /// carried.
+        Submit,
+        /// Submit without a hook report: only the transcript shows it.
+        SubmitSilently,
+        /// Drop the Enter: the composer keeps its text.
+        Drop,
+    }
+
+    /// How a [`ModelEditor`] draws.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Drawing {
+        /// Claude Code's ready screen, the composer as it holds.
+        Composer,
+        /// Claude Code's numbered-choice screen in place of the composer.
+        Dialog,
+        /// Nothing new: keystrokes are taken without a redraw.
+        Frozen,
+    }
+
+    /// The model editor's state the test can change while it runs.
+    struct EditorControl {
+        on_enter: OnEnter,
+        drawing: Drawing,
+        /// Model the agent recovering its parser and empty prompt without
+        /// another user byte (a parser abort or incomplete-escape timer).
+        recover_empty_input: Option<usize>,
+        /// Draw a dialog once the composer holds this many characters.
+        dialog_at: Option<usize>,
+        /// The width the agent draws for.
+        cols: usize,
+    }
+
+    /// PRD #1666 part 3, round 5-wake: a pane whose agent is the test. A raw
+    /// `cat` (`stty raw -echo`, so the deck's master reads both bits clear)
+    /// writes whatever reaches the PTY to a file, and a thread reads it and
+    /// draws Claude Code 2.1.310's screen into the generation's bus for it:
+    /// its start-up header, a full-width rule above and below the composer,
+    /// the composer holding what was typed (its dim suggestion when empty),
+    /// and the user messages it submitted. The deck's line, its Enter and
+    /// its deletes therefore move a real transaction on the real writer.
+    struct ModelEditor {
+        registry: Arc<AgentPtyRegistry>,
+        id: String,
+        pane: String,
+        bus: Arc<AgentBus>,
+        typed: std::path::PathBuf,
+        control: Arc<Mutex<EditorControl>>,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+        _dir: tempfile::TempDir,
+    }
+
+    const EDITOR_ROWS: u16 = 30;
+    const EDITOR_COLS: u16 = 200;
+
+    /// Claude Code's screen at [`EDITOR_ROWS`] rows and `cols` columns.
+    fn claude_screen(composer: &str, transcript: &[String], dialog: bool, cols: usize) -> Vec<u8> {
+        claude_screen_at(composer, composer.chars().count(), transcript, dialog, cols)
+    }
+
+    /// [`claude_screen`] with the cursor `cursor` characters into the
+    /// composer. A composer of blanks draws no character, as Claude Code
+    /// 2.1.310 draws typed spaces: it only moves the cursor (measured
+    /// 2026-10-26).
+    fn claude_screen_at(
+        composer: &str,
+        cursor: usize,
+        transcript: &[String],
+        dialog: bool,
+        cols: usize,
+    ) -> Vec<u8> {
+        let rule = "─".repeat(cols);
+        let mut out = String::from("\x1b[2J\x1b[H\x1b[2;12HClaude Code v2.1.310\r");
+        for (i, message) in transcript.iter().enumerate() {
+            out.push_str(&format!(
+                "\x1b[{};1H\x1b[48;5;237m❯ {message}\x1b[0m",
+                4 + i * 2
+            ));
+        }
+        if dialog {
+            out.push_str("\x1b[20;1HDo you want to proceed?\x1b[22;1H❯ 1. Yes\x1b[23;1H  2. No");
+            return out.into_bytes();
+        }
+        out.push_str(&format!("\x1b[25;1H{rule}\x1b[26;1H❯\u{a0}"));
+        if composer.is_empty() {
+            out.push_str("\x1b[2mTry \"fix the bug\"\x1b[22m");
+        } else if !composer.trim().is_empty() {
+            out.push_str(composer);
+        }
+        out.push_str(&format!(
+            "\x1b[27;1H{rule}\x1b[28;3H? for shortcuts\x1b[26;{}H",
+            3 + cursor
+        ));
+        out.into_bytes()
+    }
+
+    impl ModelEditor {
+        fn spawn(registry: &Arc<AgentPtyRegistry>, pane: &str, on_enter: OnEnter) -> Self {
+            Self::spawn_as(registry, pane, on_enter, false)
+        }
+
+        /// A Claude Code editor that never draws its start-up header: it
+        /// shows only its empty composer, and redraws nothing.
+        fn spawn_headless(registry: &Arc<AgentPtyRegistry>, pane: &str) -> Self {
+            let editor = Self::spawn_drawing(registry, pane, OnEnter::Submit, false, false);
+            editor.control.lock().unwrap().drawing = Drawing::Frozen;
+            editor
+        }
+
+        /// [`Self::spawn`], with `wrapped` launching it the way the deck's
+        /// wrapper is launched (`dot-agent-deck wrap -- …`), by a stand-in
+        /// for an older wrapper that never reports the input mode.
+        fn spawn_as(
+            registry: &Arc<AgentPtyRegistry>,
+            pane: &str,
+            on_enter: OnEnter,
+            wrapped: bool,
+        ) -> Self {
+            Self::spawn_drawing(registry, pane, on_enter, wrapped, true)
+        }
+
+        /// [`Self::spawn_as`], its first screen drawn with the start-up
+        /// header or without it.
+        fn spawn_drawing(
+            registry: &Arc<AgentPtyRegistry>,
+            pane: &str,
+            on_enter: OnEnter,
+            wrapped: bool,
+            header: bool,
+        ) -> Self {
+            let dir = tempfile::tempdir().expect("a scratch directory");
+            let typed = dir.path().join("typed");
+            std::fs::write(&typed, b"").unwrap();
+            let raw_cat = format!(
+                "stty raw -echo && exec cat > '{}'",
+                typed.to_string_lossy().replace('\'', "'\\''")
+            );
+            let command = if wrapped {
+                let wrapper = dir.path().join(crate::platform::paths::DEFAULT_BINARY_NAME);
+                crate::test_isolation::write_script(&wrapper, format!("#!/bin/sh\n{raw_cat}\n"))
+                    .unwrap();
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+                format!("{} wrap --agent claude -- claude", wrapper.display())
+            } else {
+                raw_cat
+            };
             let id = registry
                 .spawn_agent(SpawnOptions {
-                    command: Some("/bin/cat"),
+                    command: Some(&command),
+                    rows: EDITOR_ROWS,
+                    cols: EDITOR_COLS,
+                    agent_type: Some(AgentType::ClaudeCode),
                     env: crate::test_isolation::pin_unreachable_endpoints(vec![(
                         DOT_AGENT_DECK_PANE_ID.to_string(),
-                        pane.clone(),
+                        pane.to_string(),
                     )]),
                     ..SpawnOptions::default()
                 })
-                .expect("spawn the doorbell's pane");
+                .expect("spawn the model editor's pane");
             let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
-            bus.push(FRAME.as_bytes().to_vec());
-            let checks = std::sync::atomic::AtomicUsize::new(0);
-            let outcome = registry
-                .write_doorbell_when_ready(
-                    &pane,
-                    &id,
-                    DoorbellReady::Screen(crate::agent_registry::claude_prompt_on_screen),
-                    false,
-                    None,
-                    Some("RING"),
-                    || async {
-                        // The second step's re-check: the line is in, its
-                        // Enter is next.
-                        if replaced && checks.fetch_add(1, Ordering::SeqCst) == 1 {
-                            bus.push(DIALOG.to_vec());
-                        }
-                        true
-                    },
-                )
-                .await;
-            let expected = if replaced {
-                DoorbellWrite::Cancelled {
-                    steps_written: 1,
-                    line_typed: true,
-                }
+            let doorbell = registry.generation_doorbell(&id).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(8);
+            // A wrapped generation's mode is its wrapper's to report; the
+            // stand-in's `stty` is given a moment instead.
+            if wrapped {
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            while !wrapped && doorbell.unwrapped_mode().is_err() {
+                assert!(Instant::now() < deadline, "the pane never went raw");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            if header {
+                bus.push(claude_screen("", &[], false, EDITOR_COLS as usize));
+                // The header latched its release: re-projected, as the
+                // pane's reader asks when its push latches one.
+                registry.request_reprojection(pane, &id);
             } else {
-                DoorbellWrite::Written
+                bus.push(claude_composer_only(EDITOR_COLS as usize));
+            }
+            let control = Arc::new(Mutex::new(EditorControl {
+                on_enter,
+                drawing: Drawing::Composer,
+                recover_empty_input: None,
+                dialog_at: None,
+                cols: EDITOR_COLS as usize,
+            }));
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (registry, bus, typed, control, stop) = (
+                    Arc::clone(registry),
+                    Arc::clone(&bus),
+                    typed.clone(),
+                    Arc::clone(&control),
+                    Arc::clone(&stop),
+                );
+                let (pane, id) = (pane.to_string(), id.clone());
+                std::thread::spawn(move || {
+                    let mut seen = 0usize;
+                    let mut composer = String::new();
+                    // The cursor, in characters into the composer, and how
+                    // much of an `ESC [ C`/`ESC [ D` arrow has arrived.
+                    let mut cursor = 0usize;
+                    let mut arrow = 0u8;
+                    let mut transcript: Vec<String> = Vec::new();
+                    while !stop.load(Ordering::SeqCst) {
+                        let recovered = {
+                            let mut control = control.lock().unwrap();
+                            if control
+                                .recover_empty_input
+                                .is_some_and(|through| seen >= through)
+                            {
+                                control.recover_empty_input.take();
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if recovered {
+                            composer.clear();
+                            cursor = 0;
+                            arrow = 0;
+                            bus.push(claude_screen("", &transcript, false, EDITOR_COLS as usize));
+                        }
+                        let bytes = std::fs::read(&typed).unwrap_or_default();
+                        if bytes.len() > seen {
+                            let (on_enter, mut drawing, dialog_at, cols) = {
+                                let c = control.lock().unwrap();
+                                (c.on_enter, c.drawing, c.dialog_at, c.cols)
+                            };
+                            for &b in &bytes[seen..] {
+                                let at = |cursor: usize, composer: &str| {
+                                    composer
+                                        .char_indices()
+                                        .nth(cursor)
+                                        .map_or(composer.len(), |(i, _)| i)
+                                };
+                                match (arrow, b) {
+                                    (0, 0x1b) | (1, b'[') => {
+                                        arrow += 1;
+                                        continue;
+                                    }
+                                    (2, b'D') => {
+                                        arrow = 0;
+                                        cursor = cursor.saturating_sub(1);
+                                        continue;
+                                    }
+                                    (2, b'C') => {
+                                        arrow = 0;
+                                        cursor = (cursor + 1).min(composer.chars().count());
+                                        continue;
+                                    }
+                                    // Any other CSI sequence edits nothing.
+                                    (2, 0x40..=0x7e) => {
+                                        arrow = 0;
+                                        continue;
+                                    }
+                                    (2, _) => continue,
+                                    (0, _) => {}
+                                    _ => arrow = 0,
+                                }
+                                match b {
+                                    b'\r' if on_enter != OnEnter::Drop => {
+                                        cursor = 0;
+                                        let line = std::mem::take(&mut composer);
+                                        if on_enter == OnEnter::Submit
+                                            && let Some(token) = line
+                                                .strip_prefix('(')
+                                                .and_then(|rest| rest.get(..6))
+                                        {
+                                            registry.note_doorbell_evidence(RingEvidence {
+                                                pane_id: pane.clone(),
+                                                agent_id: id.clone(),
+                                                message_id: None,
+                                                token: token.to_string(),
+                                                shape: crate::event::PromptShape::Exact,
+                                            });
+                                        }
+                                        transcript.push(line);
+                                    }
+                                    b'\r' => {}
+                                    0x7f if cursor > 0 => {
+                                        cursor -= 1;
+                                        composer.remove(at(cursor, &composer));
+                                    }
+                                    0x7f => {}
+                                    // Ctrl+U kills what is before the cursor.
+                                    0x15 => {
+                                        composer.replace_range(..at(cursor, &composer), "");
+                                        cursor = 0;
+                                    }
+                                    // Ctrl+C empties the whole box.
+                                    0x03 => {
+                                        composer.clear();
+                                        cursor = 0;
+                                    }
+                                    0x01 => cursor = 0,
+                                    0x05 => cursor = composer.chars().count(),
+                                    b if b >= 0x20 => {
+                                        composer.insert(at(cursor, &composer), char::from(b));
+                                        cursor += 1;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            seen = bytes.len();
+                            if dialog_at.is_some_and(|at| composer.chars().count() >= at) {
+                                drawing = Drawing::Dialog;
+                                control.lock().unwrap().drawing = Drawing::Dialog;
+                            }
+                            match drawing {
+                                Drawing::Composer => bus.push(claude_screen_at(
+                                    &composer,
+                                    cursor,
+                                    &transcript,
+                                    false,
+                                    cols,
+                                )),
+                                Drawing::Dialog => bus.push(claude_screen_at(
+                                    &composer,
+                                    cursor,
+                                    &transcript,
+                                    true,
+                                    cols,
+                                )),
+                                Drawing::Frozen => {}
+                            }
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                })
             };
-            assert_eq!(outcome, expected, "replaced={replaced}");
+            let editor = Self {
+                registry: Arc::clone(registry),
+                id,
+                pane: pane.to_string(),
+                bus,
+                typed,
+                control,
+                stop,
+                thread: Some(thread),
+                _dir: dir,
+            };
+            editor.wait_clean();
+            editor
+        }
+
+        /// Wait (bounded) until the screen the evidence state reads shows the
+        /// composer holding `text` (empty for none).
+        fn wait_drawn(&self, text: &str) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            loop {
+                let shown = self.bus.clean_frame().map(|grid| {
+                    crate::doorbell_screen::frame(
+                        &crate::doorbell_screen::CLAUDE_PROFILE,
+                        &grid,
+                        0,
+                        true,
+                        None,
+                    )
+                });
+                let held = shown.as_ref().and_then(|f| f.composer.as_ref()).map(|c| {
+                    if c.placeholder {
+                        String::new()
+                    } else {
+                        c.text.clone()
+                    }
+                });
+                if held.as_deref() == Some(text) {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "never drawn {text:?}: {held:?}");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// What reached the PTY.
+        fn typed(&self) -> Vec<u8> {
+            std::fs::read(&self.typed).unwrap_or_default()
+        }
+
+        /// PRD #1666 part 3 (Q35-21): a check read the editor's box empty,
+        /// as an activated observer's probe would settle it, so a ring after
+        /// a person's keys is admitted. For tests about what a ring does
+        /// once the box is empty (its ticket, the framing it waits for, its
+        /// order against human frames), not about how the box is observed:
+        /// the model editor has no observer, and that is S-21's to assert.
+        fn checked_empty(&self) {
+            self.bus.input().observe_empty_for_test();
+        }
+
+        fn wait_clean(&self) {
+            let deadline = Instant::now() + Duration::from_secs(8);
+            while !matches!(
+                self.bus.evidence().0,
+                crate::evidence_state::EvidenceStatus::Clean { .. }
+            ) {
+                assert!(
+                    Instant::now() < deadline,
+                    "the editor's screen never turned Clean"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Ring for a fresh message id, the prompt hook live.
+        async fn ring(&self) -> RingReport {
+            self.ring_with(|| async { true }).await
+        }
+
+        async fn ring_with<F, Fut>(&self, still: F) -> RingReport
+        where
+            F: Fn() -> Fut + Send + Sync + 'static,
+            Fut: std::future::Future<Output = bool> + Send,
+        {
+            self.registry
+                .ring_doorbell(
+                    &self.pane,
+                    &self.id,
+                    crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                    true,
+                    still,
+                )
+                .await
+        }
+
+        fn cell(&self) -> crate::doorbell_txn::Latch {
+            self.registry
+                .generation_doorbell(&self.id)
+                .map_or(crate::doorbell_txn::Latch::Retired, |d| d.cell().load())
+        }
+    }
+
+    impl Drop for ModelEditor {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    /// The token-led line in `typed`, the bytes that reached a pane, if any.
+    fn typed_line(typed: &[u8]) -> Option<String> {
+        let text = String::from_utf8_lossy(typed);
+        let at = text.find('(')?;
+        let end = text[at..].find("inbox fetch")? + at + "inbox fetch".len();
+        Some(text[at..end].to_string())
+    }
+
+    /// Scenario: A Claude Code 2.1.310 model editor shows its empty composer and its prompt hook is live; the deck rings, then rings again with the hook reporting nothing, the transcript alone showing the submit. The first ring types exactly its token-led line and one Enter and ends Submitted on the hook's token, the cell resolved as submitted; the second ends Submitted on the transcript; nothing else reaches the pane.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_a_ring_on_the_real_writer_submits_its_line_and_nothing_else() {
+        use crate::doorbell_txn::{Latch, Outcome, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-submit", OnEnter::Submit);
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert!(
+            line.ends_with(" dot-agent-deck: message m-abcdefgh-0123456789abcdef waiting, run: dot-agent-deck inbox fetch"),
+            "{line}"
+        );
+        assert_eq!(
+            typed,
+            format!("{line}\r").into_bytes(),
+            "the line and one Enter"
+        );
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, Resolution::Submitted)
+        ));
+        editor.control.lock().unwrap().on_enter = OnEnter::SubmitSilently;
+        let second = editor.ring().await;
+        assert_eq!(
+            second.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{second:?}"
+        );
+        assert_eq!(
+            typed_line(&editor.typed()[typed.len()..]).map(|l| l.len()),
+            Some(line.len())
+        );
+        registry.shutdown_all();
+    }
+
+    /// A raw `cat` pane, like [`ModelEditor`]'s, whose screen is a recorded
+    /// Claude Code capture replayed up to `point` and then left as it is:
+    /// the deck reads the real frame, and whatever it types lands in the
+    /// returned file. The capture's header latches its release.
+    fn recorded_claude_pane(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+        stem: &str,
+        point: &str,
+    ) -> (String, std::path::PathBuf, tempfile::TempDir) {
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let bytes = std::fs::read(base.join(format!("{stem}.bin"))).unwrap();
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(base.join(format!("{stem}.json"))).unwrap())
+                .unwrap();
+        let (rows, cols) = (
+            index["rows"].as_u64().unwrap() as u16,
+            index["cols"].as_u64().unwrap() as u16,
+        );
+        let upto = index["points"][point].as_u64().unwrap() as usize;
+        let dir = tempfile::tempdir().expect("a scratch directory");
+        let typed = dir.path().join("typed");
+        std::fs::write(&typed, b"").unwrap();
+        let command = format!(
+            "stty raw -echo && exec cat > '{}'",
+            typed.to_string_lossy().replace('\'', "'\\''")
+        );
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&command),
+                rows,
+                cols,
+                agent_type: Some(AgentType::ClaudeCode),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the recorded pane");
+        let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
+        let doorbell = registry.generation_doorbell(&id).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while doorbell.unwrapped_mode().is_err() {
+            assert!(Instant::now() < deadline, "the pane never went raw");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        bus.push(bytes[..upto].to_vec());
+        registry.request_reprojection(pane, &id);
+        while !matches!(
+            bus.evidence().0,
+            crate::evidence_state::EvidenceStatus::Clean { .. }
+        ) {
+            assert!(
+                Instant::now() < deadline,
+                "the recorded screen never turned Clean"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        (id, typed, dir)
+    }
+
+    /// Scenario: Replay Claude Code 2.1.310's and 2.1.312's recorded screens at 50×200, 24×80 and 40×120 into a raw pane: the empty main composer, then the same composer with `Press Ctrl-C again to exit` in its status row after a first Ctrl+C, and at 24×80 and 40×120 also the empty composer under the quota notice that starts left of the midpoint. The deck rings each. On the empty composers the ring is admitted and types; on the exit-warning screen, whose composer still shows the ordinary placeholder, nothing reaches the pane.
+    #[spec("inbox/doorbell/036")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_036_a_ring_on_the_recorded_exit_warning_types_nothing() {
+        for (release, size) in [
+            ("2.1.310", "50x200"),
+            ("2.1.312", "50x200"),
+            ("2.1.310", "24x80"),
+            ("2.1.312", "24x80"),
+            ("2.1.310", "40x120"),
+            ("2.1.312", "40x120"),
+        ] {
+            let label = format!("{release} {size}");
+            let stem = format!("claude-inbox/r5wake/claude-{release}-menus-{size}");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let ring = |id: String, pane: &'static str| {
+                let registry = Arc::clone(&registry);
+                async move {
+                    registry
+                        .ring_doorbell(
+                            pane,
+                            &id,
+                            crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                            true,
+                            || async { true },
+                        )
+                        .await
+                }
+            };
+            let (id, typed, _dir) =
+                recorded_claude_pane(&registry, "pane-recorded-empty", &stem, "empty");
+            let control = ring(id, "pane-recorded-empty").await;
+            assert!(
+                control.attempt.is_some() && !std::fs::read(&typed).unwrap().is_empty(),
+                "{label}: the empty composer admits the ring: {control:?}"
+            );
+            if size != "50x200" {
+                // The quota notice starts left of the midpoint at these widths.
+                let (id, typed, _dir) = recorded_claude_pane(
+                    &registry,
+                    "pane-recorded-notice",
+                    &stem,
+                    "transcript-quotation",
+                );
+                let notice = ring(id, "pane-recorded-notice").await;
+                assert!(
+                    notice.attempt.is_some() && !std::fs::read(&typed).unwrap().is_empty(),
+                    "{label}: the composer under the quota notice admits the ring: {notice:?}"
+                );
+            }
+            let (id, typed, _dir) =
+                recorded_claude_pane(&registry, "pane-recorded-exit", &stem, "exit-warning");
+            let report = ring(id, "pane-recorded-exit").await;
+            assert!(
+                report.attempt.is_none() && !report.cr_reached,
+                "{label}: the exit warning refuses the ring: {report:?}"
+            );
+            assert!(
+                std::fs::read(&typed).unwrap().is_empty(),
+                "{label}: nothing reaches the pane"
+            );
             registry.shutdown_all();
         }
     }
 
-    /// Scenario: a `cat` pane plays a Claude Code generation that has only started, and a resize moves its PTY; the prompt box the agent repaints on that SIGWINCH reaches the pane's output between the resize's ioctl and the clearing of the old-size output. The doorbell's first line, which waits for that box on screen, is written and submitted.
-    #[spec("inbox/doorbell/034")]
-    #[tokio::test]
-    async fn doorbell_034_a_repaint_racing_the_resize_clear_survives_for_the_first_ring() {
-        const PANE: &str = "pane-doorbell-resize-repaint";
-        const FRAME: &str = "────────\r\n❯\r\n────────\r\n";
+    /// Scenario: Q19, the ledger as the doorbell's input: a human operation is admitted to the model editor's generation and held, then the deck rings; then, with nothing outstanding, the deck rings again while a human operation is admitted between admission and its first byte. Both rings end with nothing written (human input), the pane receives no deck byte, and once nothing is outstanding the next ring is admitted and submitted.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_a_human_operation_before_the_first_byte_ends_the_ring_with_nothing_written()
+     {
+        use crate::doorbell_txn::{NotTyped, Outcome};
         let registry = Arc::new(AgentPtyRegistry::new());
-        let id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                rows: 24,
-                cols: 80,
-                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    PANE.to_string(),
-                )]),
-                ..SpawnOptions::default()
+        let editor = ModelEditor::spawn(&registry, "pane-ring-human", OnEnter::Submit);
+        let held = registry.admit_ingress(&editor.id).expect("admitted");
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::HumanInput)),
+            "an outstanding human operation holds admission"
+        );
+        drop(held);
+        // (h) admitted between the admission and the first byte: the
+        // admission re-check runs after the ledger was read.
+        let registry2 = Arc::clone(&registry);
+        let id = editor.id.clone();
+        let admitted = Arc::new(Mutex::new(None));
+        let slot = Arc::clone(&admitted);
+        let report = editor
+            .ring_with(move || {
+                let registry = Arc::clone(&registry2);
+                let id = id.clone();
+                let slot = Arc::clone(&slot);
+                async move {
+                    let mut slot = slot.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = registry.admit_ingress(&id);
+                    }
+                    true
+                }
             })
-            .expect("spawn the doorbell's pane");
-        let bus = Arc::clone(&registry.inner.lock().agents[&id].bus);
-        // The repaint is pushed from another thread, as the reader pushes it.
-        // The resize gives that push half a second to land before it clears:
-        // it lands at once unless the resize holds the ring meanwhile.
-        let repaint = Arc::new(std::sync::Mutex::new(None));
+            .await;
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::NothingWritten(_))),
+            "{report:?}"
+        );
+        assert!(
+            editor.typed().is_empty(),
+            "no deck byte: {:?}",
+            editor.typed()
+        );
+        drop(admitted.lock().unwrap().take());
+        let control = editor.ring().await;
+        assert_eq!(
+            control.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "control"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Close a live generation's fence and type a person's keys through the registry's `write_user_bytes`, as the deck's test paths do. The keys are held behind the fence, ticket and all, and nothing reaches the pane; once the fence is released they are written once, in order (Q16-2: no path writes a person's bytes past the gate).
+    #[spec("inbox/probe/011")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_011_typing_through_the_registry_waits_behind_a_closed_fence() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-registry-typing-fenced", OnEnter::Submit);
+        let (gate, writer) = registry
+            .composer_fence(&editor.id)
+            .expect("the generation's gate");
+        assert!(gate.fence());
+        let ledger = registry.ingress_ledger(&editor.id).unwrap();
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"HELD")
+            .await
+            .expect("accepted");
+        let status = gate.status();
+        assert_eq!(
+            (status.held_ops, status.held_bytes),
+            (1, 4),
+            "the gate holds the keys"
+        );
+        assert!(ledger.any_outstanding(), "its ticket stays with the gate");
+        assert!(
+            editor.typed().is_empty(),
+            "nothing past the fence: {:?}",
+            String::from_utf8_lossy(&editor.typed())
+        );
+        assert_eq!(writer.lock().await.release_fence(Ok(())), 1);
+        typed_until(&editor, |typed| typed == b"HELD").await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Q19's admission snapshot: the deck rings the model editor while nothing is outstanding, and once the ring holds the writer and has seen the generation's earlier writes drained, a human write arrives, its operation admitted and waiting for the writer, before admission reads the ledger. The ring ends with nothing written (human input), no deck byte reaches the pane, and the human's text is written first; the next ring follows it. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_ticket_outstanding_at_the_admission_snapshot_refuses_the_ring() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-ticket-snapshot", OnEnter::Submit);
+        let ledger = registry.ingress_ledger(&editor.id).unwrap();
+        let human = Arc::new(Mutex::new(None));
         {
-            let pusher = Arc::clone(&bus);
+            let (registry, human, ledger) = (
+                Arc::clone(&registry),
+                Arc::clone(&human),
+                Arc::clone(&ledger),
+            );
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            registry.clone().set_ring_admission_seam(move || {
+                let before = ledger.marks().watermark;
+                // Spawned from outside the runtime's workers, so it is not queued
+                // behind the ring on the worker this seam blocks.
+                let runtime = tokio::runtime::Handle::current();
+                *human.lock().unwrap() = Some(
+                    std::thread::spawn(move || {
+                        runtime.spawn(async move {
+                            registry.write_user_bytes(&pane, &id, b"HUMAN").await
+                        })
+                    })
+                    .join()
+                    .unwrap(),
+                );
+                // Its ticket is taken as the write arrives, before it waits.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while ledger.marks().watermark == before {
+                    assert!(Instant::now() < deadline, "the human write never arrived");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            });
+        }
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::HumanInput)),
+            "{report:?}"
+        );
+        let human = human.lock().unwrap().take().expect("the seam ran");
+        human.await.unwrap().expect("the human write");
+        typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+        assert_eq!(editor.typed(), b"HUMAN", "no deck byte, the human's first");
+        editor.wait_drawn("HUMAN");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        editor.checked_empty();
+        assert_eq!(
+            editor.ring().await.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "control"
+        );
+        let typed = editor.typed();
+        assert!(
+            typed.starts_with(b"HUMAN\x15("),
+            "{:?}",
+            String::from_utf8_lossy(&typed)
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Plan §2.3's one deadline over the whole hold of the writer. The deck rings the model editor (a) while a test thread holds the generation's output lock, (b) while it holds the input-mode store's lock, both from before the ring and past its deadline, (c) while the admission's last check never answers, and (d) while that check answers once and then never again, after the line is typed. Each ring returns by its deadline with the writer free: (a) to (c) with nothing written (deadline) and no byte in the pane, (d) unresolved with the cell suspended, the line in the pane and no Enter after it.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_blocked_admission_reads_and_answers_release_the_writer_by_the_deadline() {
+        use crate::doorbell_txn::{Latch, NotTyped, Outcome, TXN_MAX};
+        let bound = TXN_MAX + Duration::from_millis(500);
+        /// Ring, the admission's check answering `true` on the calls `still`
+        /// picks and never on the others; how it ended, and how long the
+        /// ring held on.
+        async fn ring_within(
+            editor: &ModelEditor,
+            still: impl Fn(usize) -> bool + Send + Sync + 'static,
+        ) -> (RingReport, Duration) {
+            let still = Arc::new(still);
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let started = Instant::now();
+            let ring = editor.ring_with(move || {
+                let (still, calls) = (Arc::clone(&still), Arc::clone(&calls));
+                async move {
+                    if still(calls.fetch_add(1, Ordering::SeqCst)) {
+                        true
+                    } else {
+                        std::future::pending::<bool>().await
+                    }
+                }
+            });
+            let report = tokio::time::timeout(TXN_MAX + Duration::from_secs(5), ring)
+                .await
+                .expect("the ring hung past its deadline");
+            (report, started.elapsed())
+        }
+        for which in ["bus", "mode"] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let editor = ModelEditor::spawn(
+                &registry,
+                &format!("pane-ring-blocked-{which}"),
+                OnEnter::Submit,
+            );
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let holder = {
+                let bus = Arc::clone(&editor.bus);
+                let mode = Arc::clone(&registry.inner.lock().agents[&editor.id].input_mode);
+                let which = which.to_string();
+                std::thread::spawn(move || {
+                    let hold = TXN_MAX + Duration::from_millis(1500);
+                    if which == "bus" {
+                        let _guard = bus.state.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    } else {
+                        let _guard = mode.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    }
+                })
+            };
+            held_rx.recv().unwrap();
+            let (report, took) = ring_within(&editor, |_| true).await;
+            assert_eq!(
+                report.outcome,
+                RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Deadline)),
+                "{which}: {report:?}"
+            );
+            assert!(took <= bound, "{which}: the writer was held for {took:?}");
+            assert!(
+                registry
+                    .agent_writer(&editor.id)
+                    .unwrap()
+                    .try_lock()
+                    .is_ok(),
+                "{which}: the writer is free"
+            );
+            assert!(editor.typed().is_empty(), "{which}: {:?}", editor.typed());
+            holder.join().unwrap();
+            registry.shutdown_all();
+        }
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-silent-admission", OnEnter::Submit);
+        let (report, took) = ring_within(&editor, |_| false).await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Deadline)),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        );
+        assert!(editor.typed().is_empty(), "{:?}", editor.typed());
+
+        // Answered at admission, then never again: the line is in.
+        let (report, took) = ring_within(&editor, |call| call == 0).await;
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "{:?}",
+            editor.cell()
+        );
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert_eq!(typed, line.into_bytes(), "no Enter after the line");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The user types three spaces into a Claude Code 2.1.310 model editor's empty composer while a message waits and the agent is Idle, so the composer shows no text but its cursor sits past the spaces. The deck types nothing into it, whether the tick rings or the deck rings directly (nothing written: no empty composer), and, with no observer to check the touched box, the card says the agent needs to fetch its messages itself. The screen is the model editor's, drawn as the profile measured; no session typing spaces into the real agent was recorded.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_spaces_only_draft_is_not_an_empty_composer() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-spaces", OnEnter::Submit);
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"   ")
+            .await
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            let composer = editor
+                .bus
+                .clean_frame()
+                .and_then(|grid| (crate::doorbell_screen::CLAUDE_PROFILE.composer)(&grid));
+            if composer.is_some_and(|c| c.text.is_empty() && !c.cursor_at_end) {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the spaces were never drawn");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::AwaitingPrompt)),
+            "{report:?}"
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        // Q35-21: no observer checks this generation's box, so the card
+        // names the route that still delivers (Claude's own fetch).
+        until("needs_fetch", || {
+            shown_hold(&editor) == Some(WakeHold::NeedsFetch)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        bell.abort();
+        assert_eq!(
+            editor.typed(),
+            b"   ",
+            "only the user's spaces reached the pane"
+        );
+        registry.shutdown_all();
+    }
+
+    /// The doorbell tick's own admission check for the model editor's queued
+    /// message, as the tick builds it, and the message it names.
+    async fn production_check(
+        editor: &ModelEditor,
+        state: &crate::state::SharedState,
+    ) -> (
+        impl Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        + Send
+        + Sync
+        + 'static,
+        crate::inbox::MessageId,
+    ) {
+        let selected = editor
+            .registry
+            .inbox()
+            .doorbell_facts(&editor.pane, &editor.id)
+            .queued
+            .first()
+            .cloned()
+            .expect("a message waits");
+        let admission = state
+            .read()
+            .await
+            .doorbell_admission(&editor.id, &editor.pane);
+        assert!(admission.is_some(), "the pane is admitted");
+        let check = crate::doorbell::ring_admission_check(
+            Arc::clone(state),
+            Arc::clone(&editor.registry),
+            &editor.pane,
+            &editor.id,
+            &tick_config(Duration::from_secs(60)),
+            &selected,
+            admission,
+        );
+        (check, crate::inbox::MessageId::parse(&selected).unwrap())
+    }
+
+    /// Hold the inbox hub's lock from another OS thread for `hold`, from
+    /// before this returns.
+    fn hold_hub(registry: &Arc<AgentPtyRegistry>, hold: Duration) -> std::thread::JoinHandle<()> {
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let registry = Arc::clone(registry);
+        let holder = std::thread::spawn(move || {
+            registry.inbox().with_state_held_for_test(|| {
+                held_tx.send(()).unwrap();
+                std::thread::sleep(hold);
+            });
+        });
+        held_rx.recv().unwrap();
+        holder
+    }
+
+    /// Scenario: Plan §2.3's deadline with the doorbell tick's real admission check, the one that reads the inbox. A test thread holds the inbox hub's lock (a) from before the ring until past its deadline, and (b) from just after the ring's line is typed into a model editor that stops drawing until past its deadline. Each ring returns by the deadline with the writer free while the hub is still held: (a) with nothing written (deadline) and no byte in the pane, (b) unresolved with the cell suspended, the line in the pane and no Enter after it. (c) A hold released well before the deadline lets the ring submit. (d) A hold during which the agent reports working refuses the ring once the hub is free (not admitted), nothing written.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_the_real_admission_check_never_holds_the_writer_on_the_hub() {
+        use crate::doorbell_txn::{Latch, NotTyped, Outcome, TXN_MAX};
+        let bound = TXN_MAX + Duration::from_millis(500);
+        let hold = TXN_MAX + Duration::from_millis(1500);
+        let writer_free = |registry: &Arc<AgentPtyRegistry>, editor: &ModelEditor| {
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok()
+        };
+        let ring = |editor: &ModelEditor, check, message| {
+            let registry = Arc::clone(&editor.registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                let started = Instant::now();
+                let report = registry
+                    .ring_doorbell(&pane, &id, message, true, check)
+                    .await;
+                (report, started.elapsed())
+            })
+        };
+
+        // (a) The hub held from before the ring.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-before", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        let holder = hold_hub(&registry, hold);
+        let (report, took) = tokio::time::timeout(
+            TXN_MAX + Duration::from_secs(5),
+            ring(&editor, check, message),
+        )
+        .await
+        .expect("the ring hung past its deadline")
+        .unwrap();
+        assert!(!holder.is_finished(), "the hub is still held");
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::Deadline)),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(writer_free(&registry, &editor), "the writer is free");
+        assert!(editor.typed().is_empty(), "{:?}", editor.typed());
+        holder.join().unwrap();
+        registry.shutdown_all();
+
+        // (b) The hub held from just after the line.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-after", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let pending = ring(&editor, check, message);
+        typed_until(&editor, line_in).await;
+        let holder = hold_hub(&registry, hold);
+        let (report, took) = tokio::time::timeout(TXN_MAX + Duration::from_secs(5), pending)
+            .await
+            .expect("the ring hung past its deadline")
+            .unwrap();
+        assert!(!holder.is_finished(), "the hub is still held");
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{report:?}"
+        );
+        assert!(took <= bound, "the writer was held for {took:?}");
+        assert!(writer_free(&registry, &editor), "the writer is free");
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "{:?}",
+            editor.cell()
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).expect("the line was typed");
+        assert_eq!(typed, line.into_bytes(), "no Enter after the line");
+        holder.join().unwrap();
+        registry.shutdown_all();
+
+        // (c) A short hold: the check asks again and the ring goes.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-short", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        let holder = hold_hub(&registry, Duration::from_millis(300));
+        let (report, _) = ring(&editor, check, message).await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        holder.join().unwrap();
+        registry.shutdown_all();
+
+        // (d) The pane changes while the hub is held: asked again, the app
+        // state refuses the ring.
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-hub-changed", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let (check, message) = production_check(&editor, &state).await;
+        let holder = hold_hub(&registry, Duration::from_millis(600));
+        let pending = ring(&editor, check, message);
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        state.write().await.apply_event(crate::event::AgentEvent {
+            session_id: format!("{}-session", editor.pane),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            event_type: crate::event::EventType::Thinking,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(editor.pane.clone()),
+            agent_id: Some(editor.id.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        });
+        let (report, _) = pending.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::NotAdmitted)),
+            "{report:?}"
+        );
+        assert!(editor.typed().is_empty(), "{:?}", editor.typed());
+        holder.join().unwrap();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor stops drawing, so the deck's line is typed and never echoed and the attempt will end suspended; while that ring holds the writer, a second ring for the same generation is started and waits for the writer. Once the first ring releases the writer with the cell suspended, the second is not admitted (suspended) and types nothing: the pane holds only the first line.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_ring_queued_behind_a_suspension_is_not_admitted() {
+        use crate::doorbell_txn::{Latch, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-queued-suspended", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let ring = |registry: &Arc<AgentPtyRegistry>| {
+            let registry = Arc::clone(registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        let first = ring(&registry);
+        typed_until(&editor, line_in).await;
+        assert!(!editor.registry.doorbell_suspended(&editor.id));
+        let second = ring(&registry);
+        let first = first.await.unwrap();
+        assert!(
+            matches!(first.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{first:?}"
+        );
+        let second = second.await.unwrap();
+        assert_eq!(second.outcome, RingOutcome::Suspended, "{second:?}");
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(1, _)),
+            "{:?}",
+            editor.cell()
+        );
+        let typed = editor.typed();
+        let line = typed_line(&typed).unwrap();
+        assert_eq!(typed, line.into_bytes(), "one line, nothing after it");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The user types an unfinished escape sequence (`ESC [`) into the model editor, then a ring starts. The ring waits for the sequence to finish rather than typing into it, writing nothing; once its bound passes it ends with nothing written, the pane holding only the user's bytes. The user finishes the sequence (`C`, cursor right), the editor redraws its empty composer, and the next ring types and submits its line after them. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_ring_waits_for_the_users_escape_sequence_to_finish() {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-off-ground", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x1b[")
+            .await
+            .unwrap();
+        typed_until(&editor, |t| t == b"\x1b[").await;
+        let started = Instant::now();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300), "it waited");
+        assert_eq!(editor.typed(), b"\x1b[", "nothing typed into the sequence");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"C")
+            .await
+            .unwrap();
+        typed_until(&editor, |t| t == b"\x1b[C").await;
+        editor
+            .bus
+            .push(claude_screen("", &[], false, EDITOR_COLS as usize));
+        editor.wait_clean();
+        editor.checked_empty();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        assert!(typed.starts_with(b"\x1b[C"), "{typed:?}");
+        assert!(typed_line(&typed[3..]).is_some(), "{typed:?}");
+        registry.shutdown_all();
+    }
+
+    /// Wait (bounded) until the model editor's input reads with `grammar`.
+    async fn grammar_until(
+        editor: &ModelEditor,
+        grammar: crate::composer_probe::planner::InputGrammar,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while editor.bus.input().input_grammar() != grammar {
+            assert!(
+                Instant::now() < deadline,
+                "the grammar never became {grammar:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    /// Past Claude Code's own waits for an unfinished sequence (50 ms, and
+    /// 2 s for one that may be a terminal's reply), with room to spare.
+    const PAST_THE_AGENTS_WAITS: Duration = Duration::from_millis(2500);
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar. The user types an unfinished DCS (`ESC P`) and Ctrl+U, which stays inside it, and the editor shows its empty composer. 2.5 s later, past Claude Code's own waits for an unfinished sequence, a ring still waits its bound, writes nothing and ends with nothing written. The user's BEL ends the string, as the measured grammar reads it, and the next ring types and submits its line after the user's bytes. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_measured_release_holds_an_unfinished_string_until_a_key_ends_it() {
+        use crate::composer_probe::planner::InputGrammar;
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-held-string", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        grammar_until(&editor, InputGrammar::ClaudeMeasured).await;
+        let keys = b"\x1bP\x15";
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, keys)
+            .await
+            .unwrap();
+        let written = Instant::now();
+        typed_until(&editor, |t| t == keys).await;
+        editor.wait_drawn("");
+        editor.wait_clean();
+        tokio::time::sleep_until((written + PAST_THE_AGENTS_WAITS).into()).await;
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), keys, "nothing typed into the string");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x07")
+            .await
+            .unwrap();
+        let ended = [keys.as_slice(), b"\x07"].concat();
+        typed_until(&editor, |t| t == ended).await;
+        editor.wait_clean();
+        editor.checked_empty();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        assert!(typed.starts_with(&ended), "{typed:?}");
+        assert!(typed_line(&typed[ended.len()..]).is_some(), "{typed:?}");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, then draws 2.1.312's header too: the conflict puts its input back on the strict grammar. The user types `ESC [` and Ctrl+U, which the measured grammar would end at once but the strict one keeps inside the CSI, and the editor shows its empty composer. 2.5 s later a ring still waits its bound, writes nothing and ends with nothing written. The user's `C` finishes the CSI, and the next ring gets past that wait, stopping only at the release conflict, since the deck types into no release whose header conflicts.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_strict_release_holds_a_csi_until_a_key_ends_it() {
+        use crate::composer_probe::planner::InputGrammar;
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-held-csi", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        grammar_until(&editor, InputGrammar::ClaudeMeasured).await;
+        editor.bus.push(claude_header("2.1.312"));
+        grammar_until(&editor, InputGrammar::Strict).await;
+        editor
+            .bus
+            .push(claude_screen("", &[], false, EDITOR_COLS as usize));
+        editor.wait_clean();
+        let keys = b"\x1b[\x15";
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, keys)
+            .await
+            .unwrap();
+        let written = Instant::now();
+        typed_until(&editor, |t| t == keys).await;
+        editor.wait_drawn("");
+        editor.wait_clean();
+        tokio::time::sleep_until((written + PAST_THE_AGENTS_WAITS).into()).await;
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), keys, "nothing typed into the CSI");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"C")
+            .await
+            .unwrap();
+        let ended = [keys.as_slice(), b"C"].concat();
+        typed_until(&editor, |t| t == ended).await;
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::CannotType(
+                "release_conflict"
+            ))),
+            "past the wait, only the release stops it: {report:?}"
+        );
+        assert_eq!(editor.typed(), ended);
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor latches Claude Code 2.1.310, so its input is read with the measured grammar, and the user types `ESC [`. The editor then draws 2.1.312's header, and the push that turns the capture into a conflict is paused as soon as its output is published; inside that pause the user types Ctrl+U. The writer reads it with the strict grammar the conflict left, so the CSI stays open, and a ring after the push finishes waits its bound and writes nothing.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_a_write_inside_a_conflicting_push_reads_the_strict_grammar() {
+        use crate::composer_probe::planner::{Boundary, InputGrammar};
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-conflict-window", OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+        grammar_until(&editor, InputGrammar::ClaudeMeasured).await;
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x1b[")
+            .await
+            .unwrap();
+        typed_until(&editor, |t| t == b"\x1b[").await;
+        let (reached_tx, reached) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (release, release_rx) = std::sync::mpsc::channel::<()>();
+        *editor.bus.after_latch_published.lock().unwrap() = Some(Box::new(move |pushed| {
+            let _ = reached_tx.send(pushed.to_vec());
+            let _ = release_rx.recv();
+        }));
+        let bus = Arc::clone(&editor.bus);
+        let pushing = std::thread::spawn(move || bus.push(claude_header("2.1.312")));
+        let pushed =
+            tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(5)))
+                .await
+                .unwrap()
+                .expect("the conflicting push never reached its pause");
+        assert_eq!(pushed, claude_header("2.1.312"), "the paused push");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        let keys = b"\x1b[\x15";
+        typed_until(&editor, |t| t == keys).await;
+        let boundary = registry
+            .writer_target_for_pane(&editor.pane)
+            .unwrap()
+            .writer
+            .lock()
+            .await
+            .physical_boundary();
+        assert_eq!(boundary, Boundary::Inside, "Ctrl+U read strictly");
+        release.send(()).unwrap();
+        pushing.join().unwrap();
+        assert!(matches!(
+            latch(&editor.bus),
+            crate::release_scanner::ScanLatch::Conflict { .. }
+        ));
+        assert_eq!(editor.bus.input().input_grammar(), InputGrammar::Strict);
+        editor
+            .bus
+            .push(claude_screen("", &[], false, EDITOR_COLS as usize));
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+            "{report:?}"
+        );
+        assert_eq!(editor.typed(), keys, "no deck byte written");
+        registry.shutdown_all();
+    }
+
+    /// CSI recovery needs no further user key: the measured tokenizer
+    /// aborts the sequence on C0.
+    async fn ring_after_agent_input_recovery(case: &str, keys: &[u8]) {
+        ring_after_agent_input_recovery_then_key(case, keys, b"").await;
+    }
+
+    /// Model an agent recovering its empty prompt, without running Claude.
+    /// An OSC still holds the deck after that redraw and past the agent's
+    /// waits; its line may be delivered after the user supplies `ending`.
+    async fn ring_after_agent_input_recovery_then_key(case: &str, keys: &[u8], ending: &[u8]) {
+        use crate::doorbell_txn::{NotTyped, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, case, OnEnter::Submit);
+        registry.set_pty_write_stall_bound_for_test(Duration::from_millis(300));
+
+        // The same registry/editor can deliver before the unfinished input.
+        let control = editor.ring().await;
+        assert_eq!(control.outcome, RingOutcome::Txn(Outcome::Submitted));
+        let before = editor.typed();
+        assert!(before.ends_with(b"\r"), "control must submit its line");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, keys)
+            .await
+            .unwrap();
+        let written = Instant::now();
+        let mut expected = [before.as_slice(), keys].concat();
+        typed_until(&editor, |typed| typed == expected).await;
+
+        // The fixture consumes all the user's bytes before recovering its
+        // parser and redrawing. This is agent output, not a physical input
+        // reset, hook, timer in the deck, or synthetic finishing keystroke.
+        editor.control.lock().unwrap().recover_empty_input = Some(expected.len());
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while editor.control.lock().unwrap().recover_empty_input.is_some() {
+            assert!(Instant::now() < deadline, "model agent never recovered");
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        editor.wait_drawn("");
+        editor.wait_clean();
+
+        if !ending.is_empty() {
+            tokio::time::sleep_until((written + PAST_THE_AGENTS_WAITS).into()).await;
+            let held = editor.ring().await;
+            assert_eq!(
+                held.outcome,
+                RingOutcome::Txn(Outcome::NothingWritten(NotTyped::OffGround)),
+                "{case}: an empty redraw and elapsed time must leave the OSC held: {held:?}"
+            );
+            assert_eq!(
+                editor.typed(),
+                expected,
+                "{case}: nothing typed into the OSC"
+            );
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, ending)
+                .await
+                .unwrap();
+            expected.extend_from_slice(ending);
+            typed_until(&editor, |typed| typed == expected).await;
+            editor.wait_drawn("");
+            editor.wait_clean();
+        }
+
+        editor.checked_empty();
+        let mut reports = Vec::new();
+        for _ in 0..3 {
+            let report = editor.ring().await;
+            reports.push(report);
+            if report.outcome == RingOutcome::Txn(Outcome::Submitted) {
+                break;
+            }
+        }
+        let typed = editor.typed();
+        let after = typed.strip_prefix(expected.as_slice()).unwrap();
+        registry.shutdown_all();
+        assert!(
+            typed_line(after).is_some() && after.ends_with(b"\r"),
+            "{case}: recovered empty agent must receive a submitted doorbell after the required ending; attempts={reports:?}; user suffix={keys:?}; ending={ending:?}; automatic bytes={after:?}"
+        );
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC [ and Ctrl+U into the model editor. After the agent recovers its parser and redraws an empty prompt, a doorbell must be typed and submitted within three attempt bounds without another user key. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_csi_ctrl_u_recovery_releases_delivery() {
+        ring_after_agent_input_recovery("csi-ctrl-u", b"\x1b[\x15").await;
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC [ and Enter into the model editor. Once the agent recovers and shows its empty prompt, the waiting doorbell must submit within three attempt bounds with no finishing key from the user. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_csi_enter_recovery_releases_delivery() {
+        ring_after_agent_input_recovery("csi-enter", b"\x1b[\r").await;
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC ] and Ctrl+U into the model editor and restore its empty prompt. After 2.5 seconds, a new doorbell stays held and writes nothing; the user's BEL ends the OSC, and the next doorbell is typed and submitted within three attempt bounds. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_osc_ctrl_u_recovery_releases_delivery() {
+        ring_after_agent_input_recovery_then_key("osc-ctrl-u", b"\x1b]\x15", b"\x07").await;
+    }
+
+    /// Scenario: Deliver a control doorbell, then type ESC ] and Enter into the model editor and restore its empty prompt. After 2.5 seconds, a new doorbell stays held and writes nothing; the user's BEL ends the OSC, and the next doorbell is typed and submitted within three attempt bounds. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/probe/076")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn probe_076_osc_enter_recovery_releases_delivery() {
+        ring_after_agent_input_recovery_then_key("osc-enter", b"\x1b]\r", b"\x07").await;
+    }
+
+    /// Wait (bounded) until the model editor has been typed something that
+    /// satisfies `done`.
+    async fn typed_until(editor: &ModelEditor, done: impl Fn(&[u8]) -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !done(&editor.typed()) {
+            assert!(
+                Instant::now() < deadline,
+                "the pane never took what was awaited: {:?}",
+                String::from_utf8_lossy(&editor.typed())
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    fn line_in(typed: &[u8]) -> bool {
+        typed_line(typed).is_some()
+    }
+
+    /// Scenario: (a) While the deck's line is in the model editor's composer and its Enter not yet sent, a test thread holds the generation's output lock past the transaction's deadline and the ring's caller is dropped. The writer is free for a human write within the deadline plus 50 ms, no Enter or later byte is written, the attempt is suspended before the writer is released, and the human's bytes follow the line. (b) The same with the input-mode store's lock held.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_a_lock_held_past_the_deadline_never_blocks_the_writer() {
+        use crate::doorbell_txn::{Latch, TXN_MAX};
+        for which in ["bus", "mode"] {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let pane = format!("pane-ring-held-{which}");
+            let editor = ModelEditor::spawn(&registry, &pane, OnEnter::Submit);
+            let started = Instant::now();
+            let ring = {
+                let registry = Arc::clone(&registry);
+                let (pane, id) = (editor.pane.clone(), editor.id.clone());
+                tokio::spawn(async move {
+                    registry
+                        .ring_doorbell(
+                            &pane,
+                            &id,
+                            crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                            true,
+                            || async { true },
+                        )
+                        .await
+                })
+            };
+            typed_until(&editor, line_in).await;
+            // Hold the lock from another thread across the deadline.
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let holder = {
+                let bus = Arc::clone(&editor.bus);
+                let mode = Arc::clone(&registry.inner.lock().agents[&editor.id].input_mode);
+                let which = which.to_string();
+                std::thread::spawn(move || {
+                    let hold = TXN_MAX + Duration::from_millis(500);
+                    if which == "bus" {
+                        let _guard = bus.state.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    } else {
+                        let _guard = mode.lock().unwrap();
+                        let _ = held_tx.send(());
+                        std::thread::sleep(hold);
+                    }
+                })
+            };
+            held_rx.recv().unwrap();
+            ring.abort();
+            registry
+                .write_user_bytes(&editor.pane, &editor.id, b"HUMAN")
+                .await
+                .expect("the human write goes in");
+            assert!(
+                started.elapsed() <= TXN_MAX + Duration::from_millis(50) + Duration::from_secs(1),
+                "{which}: the writer was held past its deadline: {:?}",
+                started.elapsed()
+            );
+            assert!(
+                matches!(editor.cell(), Latch::Suspended(..)),
+                "{which}: suspended before the release: {:?}",
+                editor.cell()
+            );
+            holder.join().unwrap();
+            typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+            let typed = editor.typed();
+            let line = typed_line(&typed).unwrap();
+            assert_eq!(
+                typed,
+                format!("{line}HUMAN").into_bytes(),
+                "{which}: no Enter or later deck byte"
+            );
+            registry.shutdown_all();
+        }
+    }
+
+    /// Scenario: (c) The model editor stops drawing, so the deck's line is typed and never echoed, and the generation is closed while the transaction waits for the echo; a successor is then spawned in the same pane. The transaction ends at once, retired, well before its deadline, and the successor receives no byte of the deck's.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_retirement_during_the_hold_unwinds_and_spares_the_successor() {
+        use crate::doorbell_txn::{Outcome, TXN_MAX};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-retire", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let started = Instant::now();
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, line_in).await;
+        registry
+            .close_agent(&editor.id)
+            .expect("close the generation");
+        let report = ring.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Retired),
+            "{report:?}"
+        );
+        assert!(started.elapsed() < TXN_MAX, "{:?}", started.elapsed());
+        let successor = ModelEditor::spawn(&registry, "pane-ring-retire", OnEnter::Submit);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(successor.typed().is_empty(), "{:?}", successor.typed());
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (d) The ring's caller is dropped as soon as the deck's line reaches the model editor, with nothing contending. The transaction carries on to its end on the writer it owns: the line's Enter is sent and the attempt resolves as submitted.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_050_a_dropped_caller_does_not_end_the_transaction() {
+        use crate::doorbell_txn::{Latch, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-dropped", OnEnter::Submit);
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, line_in).await;
+        ring.abort();
+        typed_until(&editor, |t| t.ends_with(b"\r")).await;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(editor.cell(), Latch::Resolved(_, Resolution::Submitted)) {
+            assert!(Instant::now() < deadline, "{:?}", editor.cell());
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (e) A human writes into the model editor's pane after the deck's line is typed and before its Enter, the human's operation admitted while the transaction holds the writer. The Enter still goes, the ring is submitted, and the human's bytes are written after the release, in order: the line, the Enter, then the human's text. (g) A second human write waits for the writer and its caller is dropped: its operation settles cancelled, the transaction is unaffected, and the next ring is admitted. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_human_frames_after_the_line_wait_and_follow_in_order() {
+        use crate::doorbell_txn::Outcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-queued-human", OnEnter::Submit);
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, line_in).await;
+        let human = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move { registry.write_user_bytes(&pane, &id, b"HUMAN").await })
+        };
+        // (g) another, dropped while it waits.
+        let ledger = registry.ingress_ledger(&editor.id).unwrap();
+        let dropped = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move { registry.write_user_bytes(&pane, &id, b"NEVER").await })
+        };
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        dropped.abort();
+        let report = ring.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        human.await.unwrap().expect("the human write");
+        typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+        let typed = editor.typed();
+        let line = typed_line(&typed).unwrap();
+        assert_eq!(typed, format!("{line}\rHUMAN").into_bytes());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while ledger.any_outstanding() {
+            assert!(
+                Instant::now() < deadline,
+                "a dropped frame stranded the ledger"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            ledger
+                .settled()
+                .iter()
+                .any(|(_, how)| *how == crate::ingress_ledger::Settlement::Cancelled),
+            "{:?}",
+            ledger.settled()
+        );
+        // The human's text is in the composer: cleared, and a check read it
+        // empty, the next ring is admitted.
+        editor.wait_drawn("HUMAN");
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        editor.checked_empty();
+        assert_eq!(
+            editor.ring().await.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "the next admission is not stranded"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (f) The model editor drops the deck's Enter, so the line stays in its composer, and a human writes while the transaction waits for submit evidence. Claude Code has no placeholder to confirm a withdrawal, so the deck deletes nothing: the attempt ends unresolved (withdrawal refused), the cell is suspended, no byte follows the Enter, and the human's text is written after the release.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_an_enter_not_taken_on_claude_is_refused_a_withdrawal() {
+        use crate::doorbell_txn::{Cause, Latch, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-not-taken", OnEnter::Drop);
+        let ring = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move {
+                registry
+                    .ring_doorbell(
+                        &pane,
+                        &id,
+                        crate::inbox::MessageId::parse("m-abcdefgh-0123456789abcdef").unwrap(),
+                        true,
+                        || async { true },
+                    )
+                    .await
+            })
+        };
+        typed_until(&editor, |t| t.ends_with(b"\r")).await;
+        let human = {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            tokio::spawn(async move { registry.write_user_bytes(&pane, &id, b"HUMAN").await })
+        };
+        let report = ring.await.unwrap();
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Unresolved(Cause::WithdrawalRefused)),
+            "{report:?}"
+        );
+        assert!(report.cr_reached);
+        assert!(matches!(editor.cell(), Latch::Suspended(..)));
+        human.await.unwrap().expect("the human write");
+        typed_until(&editor, |t| t.ends_with(b"HUMAN")).await;
+        let typed = editor.typed();
+        let line = typed_line(&typed).unwrap();
+        assert_eq!(typed, format!("{line}\rHUMAN").into_bytes(), "no delete");
+        registry.shutdown_all();
+    }
+
+    /// The model editor's card, from the real hub.
+    fn shown_hold(editor: &ModelEditor) -> Option<crate::inbox_display::WakeHold> {
+        editor
+            .registry
+            .inbox()
+            .summary(&editor.pane, &editor.id)
+            .wake_hold
+    }
+
+    /// Scenario: (m) With the re-projection publisher running, a ring ends unresolved: the card shows uncertain_input and one wake update carries it; the user's own Enter then clears it. (i) With the publisher held at a gate, a ring ends unresolved and the user clears before the gate opens: once it runs, the cell is the user's, the card shows nothing and no update ever carried uncertain_input. (l) Held again, a ring ends unresolved, the generation is closed and a successor starts in the pane: the old request touches nothing of the successor's. A check reading the box empty is simulated before the ring that follows the user's keys (`checked_empty()`), since the model editor has no observer.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_publication_shows_the_cell_as_it_is_when_it_runs() {
+        use crate::doorbell_txn::{Latch, Resolution};
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (tx, mut rx) = broadcast::channel(256);
+        registry.inbox().set_broadcast(tx);
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-ring-publish", OnEnter::Drop);
+        let carried = |rx: &mut broadcast::Receiver<crate::event::BroadcastMsg>| {
+            let mut holds = Vec::new();
+            while let Ok(message) = rx.try_recv() {
+                if let crate::event::BroadcastMsg::Inbox(notice) = message
+                    && notice.wake_update
+                {
+                    holds.push(notice.wake_hold);
+                }
+            }
+            holds
+        };
+        // (m)
+        let report = editor.ring().await;
+        assert!(matches!(
+            report.outcome,
+            RingOutcome::Txn(crate::doorbell_txn::Outcome::Unresolved(_))
+        ));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while shown_hold(&editor) != Some(WakeHold::UncertainInput) {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let holds = carried(&mut rx);
+        assert_eq!(
+            holds
+                .iter()
+                .filter(|h| **h == Some(WakeHold::UncertainInput))
+                .count(),
+            1,
+            "{holds:?}"
+        );
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        while shown_hold(&editor).is_some() {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // (i) the user clears while the publisher is held. (Q35-21: the
+        // deck's untaken line and the user's clear touched the box; a check
+        // reads it empty before each ring.)
+        let _ = carried(&mut rx);
+        registry.hold_publisher(true);
+        editor.checked_empty();
+        let report = editor.ring().await;
+        assert!(
+            matches!(
+                report.outcome,
+                RingOutcome::Txn(crate::doorbell_txn::Outcome::Unresolved(_))
+            ),
+            "{report:?}"
+        );
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"\x15")
+            .await
+            .unwrap();
+        editor.wait_drawn("");
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, Resolution::User)
+        ));
+        registry.hold_publisher(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(shown_hold(&editor), None);
+        assert!(
+            !carried(&mut rx).contains(&Some(WakeHold::UncertainInput)),
+            "a delayed request shows the current state"
+        );
+        // (l) retirement and a successor while held.
+        registry.hold_publisher(true);
+        editor.checked_empty();
+        let report = editor.ring().await;
+        assert!(
+            matches!(
+                report.outcome,
+                RingOutcome::Txn(crate::doorbell_txn::Outcome::Unresolved(_))
+            ),
+            "{report:?}"
+        );
+        registry.close_agent(&editor.id).unwrap();
+        let successor = ModelEditor::spawn(&registry, "pane-ring-publish", OnEnter::Submit);
+        registry.hold_publisher(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            shown_hold(&successor),
+            None,
+            "the successor's card is untouched"
+        );
+        assert!(!matches!(successor.cell(), Latch::Suspended(..)));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: (n) The model editor drops the deck's Enter, and just before the attempt's suspension the agent's prompt hook reports the ring's token exact through the real hook arm. The arm resolves the attempt on receipt, the suspension is refused, the ring ends submitted, and uncertain_input is never shown.
+    #[spec("inbox/doorbell/050")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_050_evidence_at_the_suspension_wins() {
+        use crate::doorbell_txn::{Latch, Outcome, Resolution};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-ring-cas", OnEnter::Drop);
+        {
+            let registry = Arc::clone(&registry);
+            let (pane, id) = (editor.pane.clone(), editor.id.clone());
+            let typed = editor.typed.clone();
+            registry
+                .generation_doorbell(&editor.id)
+                .unwrap()
+                .cell()
+                .before_next_suspend(move || {
+                    let line = typed_line(&std::fs::read(&typed).unwrap()).unwrap();
+                    registry.note_doorbell_evidence(RingEvidence {
+                        pane_id: pane,
+                        agent_id: id,
+                        message_id: None,
+                        token: line[1..7].to_string(),
+                        shape: crate::event::PromptShape::Exact,
+                    });
+                });
+        }
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{report:?}"
+        );
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, Resolution::Submitted)
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(shown_hold(&editor), None);
+        registry.shutdown_all();
+    }
+
+    /// The app state of a model editor whose own hooks reported its start
+    /// and its Idle, and a message waiting for it.
+    async fn idle_with_mail(editor: &ModelEditor) -> crate::state::SharedState {
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        for event_type in [
+            crate::event::EventType::SessionStart,
+            crate::event::EventType::Idle,
+        ] {
+            state.write().await.apply_event(crate::event::AgentEvent {
+                session_id: format!("{}-session", editor.pane),
+                agent_type: crate::event::AgentType::ClaudeCode,
+                event_type,
+                tool_name: None,
+                tool_detail: None,
+                cwd: None,
+                timestamp: chrono::Utc::now(),
+                user_prompt: None,
+                metadata: Default::default(),
+                pane_id: Some(editor.pane.clone()),
+                agent_id: Some(editor.id.clone()),
+                agent_version: None,
+                schema_version: None,
+                live_target: None,
+                background: None,
+                background_revision: None,
+            });
+        }
+        editor
+            .registry
+            .inbox()
+            .post_direct(
+                crate::inbox::Recipient::bound(&editor.pane, &editor.id),
+                crate::inbox::Content::from_deck("seed", "task", "do it"),
+            )
+            .unwrap();
+        state
+    }
+
+    fn tick_config(wake_stall_after: Duration) -> crate::doorbell::DoorbellConfig {
+        crate::doorbell::DoorbellConfig {
+            tick: Duration::from_millis(20),
+            schedule: vec![Duration::from_secs(60)],
+            arm_grace: Duration::from_millis(1),
+            wake_stall_after,
+        }
+    }
+
+    /// Scenario: A Claude Code 2.1.310 model editor shows its empty composer and a message waits, with a 600 ms first-ring settle window and a 150 ms stall window, while the editor redraws the same frame every 20 ms. Inside the window the tick types nothing and the inbox names no hold, the hold clock paused; the redraws do not move the window's start, so the doorbell rings once it ends.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_041_the_settle_window_pauses_the_hold_and_then_the_ring_goes() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_doorbell_settle_for_test(Some(Duration::from_millis(600)));
+        let editor = ModelEditor::spawn(&registry, "pane-041-settle", OnEnter::Submit);
+        let state = idle_with_mail(&editor).await;
+        let started = Instant::now();
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        let redraw = {
+            let bus = Arc::clone(&editor.bus);
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = Arc::clone(&stop);
+            let thread = std::thread::spawn(move || {
+                while !stopped.load(Ordering::SeqCst) {
+                    bus.push(claude_screen("", &[], false, EDITOR_COLS as usize));
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            });
+            (stop, thread)
+        };
+        while started.elapsed() < Duration::from_millis(450) {
+            assert!(editor.typed().is_empty(), "typed inside the settle window");
+            assert_eq!(shown_hold(&editor), None, "a hold shown inside the window");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while typed_line(&editor.typed()).is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the ring never went after the window; the redraws moved its start"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.elapsed() >= Duration::from_millis(550));
+        redraw.0.store(true, Ordering::SeqCst);
+        redraw.1.join().unwrap();
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A model editor's pane is resized while a message waits and the editor never redraws, so its screen stays Dirty and nothing is typed. The tick sends one refresh nudge for the episode (one shrink and one restore), then the inbox names awaiting_prompt; resizing it again to the geometry it has adds no nudge, and nothing reaches the pane.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_041_a_screen_left_dirty_gets_one_refresh_nudge_per_episode() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-041-dirty", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let cols = EDITOR_COLS - 20;
+        registry.resize(&editor.id, EDITOR_ROWS, cols).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !registry.doorbell_evidence_dirty(&editor.id) {
+            assert!(
+                Instant::now() < deadline,
+                "the resize never left the screen Dirty"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let edges_before = editor.bus.evidence().1;
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        while shown_hold(&editor) != Some(WakeHold::AwaitingPrompt) {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        while !registry.repaint_nudges.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "the nudge never finished");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let after_nudge = editor.bus.evidence().1;
+        assert_eq!(
+            after_nudge,
+            edges_before + 2,
+            "one nudge: a shrink and a restore"
+        );
+        for _ in 0..3 {
+            registry.resize(&editor.id, EDITOR_ROWS, cols).unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            editor.bus.evidence().1,
+            after_nudge,
+            "same-geometry resizes add no edge and no nudge"
+        );
+        assert!(editor.typed().is_empty(), "nothing reaches a Dirty pane");
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The doorbell tick rings a model editor that drops the deck's Enter, with a 60-second stall window. The ring ends unresolved and the inbox names uncertain_input at once, without waiting out the stall window.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_041_an_unresolved_ring_shows_uncertain_input_at_once() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-041-uncertain", OnEnter::Drop);
+        let state = idle_with_mail(&editor).await;
+        let started = Instant::now();
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_secs(60)),
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while shown_hold(&editor) != Some(WakeHold::UncertainInput) {
+            assert!(Instant::now() < deadline, "{:?}", shown_hold(&editor));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "shown well inside the 60-second stall window"
+        );
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/046 through the real adapter: a model editor drops the deck's Enter, so the ring ends unresolved and the doorbell is suspended with uncertain_input shown, while the user has a draft of their own in the tracker. An older attempt's token reported exact by the prompt hook moves nothing; this attempt's token reported exact afterwards resolves the attempt late, lifts the suspension and clears the card, and leaves the user's draft bit as it was.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_046_late_exact_evidence_resolves_only_its_attempt_through_the_hook_arm() {
+        use crate::doorbell_txn::{Latch, Outcome, Resolution};
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-046-late", OnEnter::Submit);
+        let first = editor.ring().await;
+        assert_eq!(
+            first.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "{first:?}"
+        );
+        let old_token = typed_line(&editor.typed()).unwrap()[1..7].to_string();
+        editor.control.lock().unwrap().on_enter = OnEnter::Drop;
+        let typed_before = editor.typed().len();
+        let report = editor.ring().await;
+        assert!(
+            matches!(report.outcome, RingOutcome::Txn(Outcome::Unresolved(_))),
+            "{report:?}"
+        );
+        until("uncertain_input", || {
+            shown_hold(&editor) == Some(WakeHold::UncertainInput)
+        })
+        .await;
+        registry
+            .write_user_bytes(&editor.pane, &editor.id, b"x")
+            .await
+            .unwrap();
+        assert!(
+            registry.input_touched(&editor.id),
+            "the user's key is a draft"
+        );
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "a key is no submit or clear"
+        );
+        let token = typed_line(&editor.typed()[typed_before..]).unwrap()[1..7].to_string();
+        let evidence = |token: &str| RingEvidence {
+            pane_id: editor.pane.clone(),
+            agent_id: editor.id.clone(),
+            message_id: None,
+            token: token.to_string(),
+            shape: crate::event::PromptShape::Exact,
+        };
+        registry.note_doorbell_evidence(evidence(&old_token));
+        assert!(
+            matches!(editor.cell(), Latch::Suspended(..)),
+            "an older attempt's token moves nothing: {:?}",
+            editor.cell()
+        );
+        registry.note_doorbell_evidence(evidence(&token));
+        assert!(
+            matches!(editor.cell(), Latch::Resolved(_, Resolution::LateExact)),
+            "{:?}",
+            editor.cell()
+        );
+        assert!(!registry.doorbell_suspended(&editor.id));
+        until("the card clears", || shown_hold(&editor).is_none()).await;
+        assert!(
+            registry.input_touched(&editor.id),
+            "late evidence never clears the user's draft"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Hold `editor`'s generation as `input_mode_conflict`: a process in its
+    /// session reports its mode, then the same pid with another start time.
+    fn conflict(editor: &ModelEditor) {
+        use crate::input_mode::{NamespaceRead, Observer};
+        let leader = editor.registry.inner.lock().agents[&editor.id]
+            .child
+            .process_id()
+            .expect("the child's pid");
+        let procs = FakeProcs {
+            session: Some(leader),
+            started: Some(100),
+            own: NamespaceRead::NotFound,
+            peer: NamespaceRead::NotFound,
+        };
+        set_fake(procs.clone());
+        let observer = |start| Observer { pid: 4242, start };
+        assert!(
+            editor
+                .registry
+                .accept_input_mode_with(&editor.id, observer(100), fresh_raw(1), &FAKE_LOOKUPS)
+                .is_ok()
+        );
+        set_fake(FakeProcs {
+            started: Some(200),
+            ..procs
+        });
+        assert_eq!(
+            editor.registry.accept_input_mode_with(
+                &editor.id,
+                observer(200),
+                fresh_raw(2),
+                &FAKE_LOOKUPS
+            ),
+            Err("input_mode_conflict")
+        );
+    }
+
+    fn wake(editor: &ModelEditor) -> crate::inbox_hub::WakePath {
+        editor
+            .registry
+            .inbox()
+            .summary(&editor.pane, &editor.id)
+            .wake
+    }
+
+    async fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !done() {
+            assert!(Instant::now() < deadline, "never: {what}");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    /// Scenario: inbox/doorbell/051's activated half: a measured Claude Code generation is held as input_mode_conflict by two processes reporting its input mode, and a message waits for it while it is Idle. The tick types nothing into it, and the inbox names cannot_type, the reason both clients show.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_051_a_conflicted_generation_is_held_as_cannot_type() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-051-conflict", OnEnter::Submit);
+        conflict(&editor);
+        assert_eq!(
+            registry.doorbell_refusal(&editor.pane, &editor.id, true),
+            Some("input_mode_conflict")
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type", || {
+            shown_hold(&editor) == Some(WakeHold::CannotType)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            editor.typed().is_empty(),
+            "nothing typed into a conflicted generation"
+        );
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/052's activated half (f′): a measured Claude Code generation launched through a wrapper from before the input-mode reports, which never reports, so its evidence reads input_mode_unverified, while a message waits for it and it is Idle. The tick types nothing into it, and the inbox names cannot_type.
+    #[spec("inbox/doorbell/052")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_052_an_older_wrapper_is_held_as_cannot_type() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn_as(&registry, "pane-052-older", OnEnter::Submit, true);
+        assert!(
+            registry
+                .generation_doorbell(&editor.id)
+                .is_some_and(|doorbell| doorbell.wrapped()),
+            "launched as a wrapped generation"
+        );
+        assert_eq!(
+            registry.doorbell_refusal(&editor.pane, &editor.id, true),
+            Some("input_mode_unverified")
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type", || {
+            shown_hold(&editor) == Some(WakeHold::CannotType)
+        })
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            editor.typed().is_empty(),
+            "nothing typed through an older wrapper"
+        );
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: Q18 with the real publisher: a measured Claude Code generation reads doorbell; two processes then report its input mode, holding it as input_mode_conflict for the rest of its life, and its WAKE turns none with that clause. A second generation spends its last attempt number on a ring that submits, and turns none with attempt_exhausted; its next ring types nothing. Each refusal is published because the mode store or the counter changed, with nothing else asking.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_057_sticky_refusals_reach_wake_through_the_publisher() {
+        use crate::inbox_hub::WakePath;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-057-sticky", OnEnter::Submit);
+        until("doorbell once the header latched", || {
+            wake(&editor) == WakePath::Doorbell
+        })
+        .await;
+        conflict(&editor);
+        until("input_mode_conflict published", || {
+            registry
+                .inbox()
+                .wake_projection_for_test(&editor.pane, &editor.id)
+                .1
+                == Some("input_mode_conflict")
+        })
+        .await;
+        assert_eq!(wake(&editor), WakePath::None);
+
+        let last = ModelEditor::spawn(&registry, "pane-057-exhausted", OnEnter::Submit);
+        until("doorbell once the header latched", || {
+            wake(&last) == WakePath::Doorbell
+        })
+        .await;
+        registry
+            .generation_doorbell(&last.id)
+            .unwrap()
+            .counter()
+            .set_next_for_test(crate::doorbell_txn::ATTEMPT_RESERVED - 1);
+        let report = last.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(crate::doorbell_txn::Outcome::Submitted),
+            "{report:?}"
+        );
+        until("attempt_exhausted published", || {
+            registry
+                .inbox()
+                .wake_projection_for_test(&last.pane, &last.id)
+                .1
+                == Some("attempt_exhausted")
+        })
+        .await;
+        assert_eq!(wake(&last), WakePath::None);
+        let typed = last.typed();
+        let report = last.ring().await;
+        assert!(
+            matches!(
+                report.outcome,
+                RingOutcome::Txn(crate::doorbell_txn::Outcome::NothingWritten(_))
+            ),
+            "{report:?}"
+        );
+        assert_eq!(
+            last.typed(),
+            typed,
+            "an exhausted generation is not typed into"
+        );
+        // The card agrees with WAKE: the tick holds it as cannot_type.
+        assert_eq!(
+            registry.doorbell_refusal(&last.pane, &last.id, true),
+            Some("attempt_exhausted")
+        );
+        let state = idle_with_mail(&last).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type on the card", || {
+            shown_hold(&last) == Some(crate::inbox_display::WakeHold::CannotType)
+        })
+        .await;
+        bell.abort();
+        assert_eq!(last.typed(), typed, "nor by the tick");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/057 (i): with the publisher held at its gate, a generation's inputs change (two processes report its input mode) and a second request for it is queued. Nothing is published while held; once the gate opens, the hub holds the verdict for the newer inputs.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_057_a_held_publisher_publishes_the_newer_inputs() {
+        use crate::inbox_hub::WakePath;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-057-gate", OnEnter::Submit);
+        until("doorbell once the header latched", || {
+            wake(&editor) == WakePath::Doorbell
+        })
+        .await;
+        registry.hold_publisher(true);
+        conflict(&editor);
+        registry.request_reprojection(&editor.pane, &editor.id);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            wake(&editor),
+            WakePath::Doorbell,
+            "nothing published while held"
+        );
+        registry.hold_publisher(false);
+        until("the newer verdict", || wake(&editor) == WakePath::None).await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The publisher's run for a generation reads its inputs and is held just before its hub write; meanwhile the generation exits and its hub entries go. Released, the run writes nothing back for the retired generation, and a successor in the pane reads its own route.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_057_a_run_held_past_the_exit_puts_nothing_back() {
+        use crate::inbox_hub::WakePath;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let _publisher = registry.spawn_doorbell_publisher().expect("the publisher");
+        let editor = ModelEditor::spawn(&registry, "pane-057-fence", OnEnter::Submit);
+        conflict(&editor);
+        let projection = |id: &str| {
+            registry
+                .inbox()
+                .wake_projection_for_test("pane-057-fence", id)
+        };
+        until("the refusal published", || {
+            projection(&editor.id).1.is_some()
+        })
+        .await;
+        registry.hold_publisher_write(true);
+        registry.request_reprojection(&editor.pane, &editor.id);
+        until("the run read its inputs", || {
+            registry.publisher_write_reached()
+        })
+        .await;
+        let old = editor.id.clone();
+        registry.close_agent(&old).unwrap();
+        until("the exit cleared the entry", || {
+            projection(&old) == (None, None)
+        })
+        .await;
+        registry.hold_publisher_write(false);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            projection(&old),
+            (None, None),
+            "nothing put back for the retired generation"
+        );
+        drop(editor);
+        let successor = ModelEditor::spawn(&registry, "pane-057-fence", OnEnter::Submit);
+        until("the successor's own route", || {
+            wake(&successor) == WakePath::Doorbell
+        })
+        .await;
+        assert_eq!(projection(&old), (None, None));
+        registry.shutdown_all();
+    }
+
+    /// What a test thread logs, for the `doorbell attempt` line.
+    #[derive(Clone, Default)]
+    struct AttemptLog(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for AttemptLog {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for AttemptLog {
+        type Writer = AttemptLog;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Claude Code 2.1.310's empty composer with no header on the screen.
+    fn claude_composer_only(cols: usize) -> Vec<u8> {
+        let rule = "─".repeat(cols);
+        format!(
+            "\x1b[2J\x1b[H\x1b[25;1H{rule}\x1b[26;1H❯\u{a0}\x1b[2mTry \"fix the bug\"\x1b[22m\x1b[27;1H{rule}\x1b[28;3H? for shortcuts\x1b[26;3H"
+        )
+        .into_bytes()
+    }
+
+    /// Scenario: inbox/doorbell/055 (a′): a Claude Code 2.1.310 model editor's header is scrolled off by 200 lines and its screen redrawn without it before a ring. The admission uses the release latched from the header, and the `doorbell attempt` line names that release, that it came from the header, and the activation verdict.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test]
+    async fn doorbell_055_an_admission_after_the_header_scrolled_away_uses_the_latch() {
+        let log = AttemptLog::default();
+        let _capture = crate::test_isolation::capture_tracing_on_this_thread(
+            tracing_subscriber::fmt()
+                .with_writer(log.clone())
+                .with_max_level(tracing_subscriber::filter::LevelFilter::INFO)
+                .with_ansi(false)
+                .finish(),
+        );
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-055-scrolled", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        editor.bus.push(b"scrolled\r\n".repeat(200));
+        editor.bus.push(claude_composer_only(EDITOR_COLS as usize));
+        editor.wait_clean();
+        let report = editor.ring().await;
+        assert!(
+            report.attempt.is_some(),
+            "admitted on the latch: {report:?}"
+        );
+        let text = String::from_utf8_lossy(&log.0.lock().unwrap()).into_owned();
+        let attempt = text
+            .lines()
+            .find(|line| line.contains("doorbell attempt") && !line.contains("not admitted"))
+            .unwrap_or_else(|| panic!("no attempt line in {text}"));
+        assert!(attempt.contains("release=\"2.1.310\""), "{attempt}");
+        assert!(attempt.contains("release_source=\"header\""), "{attempt}");
+        assert!(attempt.contains("activation=Go"), "{attempt}");
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/055 (b′): a Claude Code model editor that never draws its start-up header shows its empty composer while a message waits and it is Idle. No release is latched, so the tick types nothing, the inbox names cannot_type with the words both clients show, and the message stays queued until a fetch takes it.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_055_no_header_holds_the_doorbell_as_cannot_type() {
+        use crate::inbox_display::WakeHold;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn_headless(&registry, "pane-055-headless");
+        assert_eq!(
+            registry.doorbell_refusal(&editor.pane, &editor.id, true),
+            Some("unknown_release")
+        );
+        let state = idle_with_mail(&editor).await;
+        let bell = crate::doorbell::spawn(
+            registry.clone(),
+            state,
+            tick_config(Duration::from_millis(150)),
+        );
+        until("cannot_type", || {
+            shown_hold(&editor) == Some(WakeHold::CannotType)
+        })
+        .await;
+        assert_eq!(
+            WakeHold::CannotType.words(),
+            Some(crate::inbox_display::WAKE_HOLD_CANNOT_TYPE)
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            editor.typed().is_empty(),
+            "nothing typed with no release latched"
+        );
+        let facts = registry.inbox().doorbell_facts(&editor.pane, &editor.id);
+        assert_eq!(facts.queued.len(), 1, "the message stays queued");
+        let fetched = registry
+            .inbox()
+            .test_hook_fetch(&editor.pane, &editor.id, None);
+        assert_eq!(fetched.deliveries.len(), 1, "a fetch takes it");
+        bell.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: inbox/doorbell/037's PTY half: the model editor draws the deck's line only part-way and then stops, so the composer never holds the whole line. The deck waits out its echo window and sends no Enter: the attempt ends unresolved (echo mismatch) with no byte after the line.
+    #[spec("inbox/doorbell/037")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_037_no_echo_of_the_whole_line_sends_no_enter_on_the_real_writer() {
+        use crate::doorbell_txn::{Cause, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-no-echo", OnEnter::Submit);
+        editor.control.lock().unwrap().drawing = Drawing::Frozen;
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Unresolved(Cause::EchoMismatch)),
+            "{report:?}"
+        );
+        let typed = editor.typed();
+        assert!(
+            !typed.contains(&b'\r'),
+            "{:?}",
+            String::from_utf8_lossy(&typed)
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The line's write is parked inside the PTY so the writer started it and has not answered. Past the 200 ms write cap the transaction calls it stalled: the attempt ends unresolved (write stalled) with the cell suspended, the writer is released by the deadline, and once the write is let go its bytes land, with no Enter after them.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn doorbell_049_a_write_past_its_cap_is_stalled_and_the_writer_released() {
+        use crate::doorbell_txn::{Cause, Latch, Outcome, TXN_MAX};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-stalled", OnEnter::Submit);
+        let (reached, release) =
+            registry.pause_next_pty_write_for_test(&editor.pane, PtyWritePause::BeforeWrite);
+        let started = Instant::now();
+        let report = editor.ring().await;
+        assert_eq!(
+            report.outcome,
+            RingOutcome::Txn(Outcome::Unresolved(Cause::WriteStalled)),
+            "{report:?}"
+        );
+        assert!(started.elapsed() < TXN_MAX + Duration::from_millis(500));
+        assert!(matches!(editor.cell(), Latch::Suspended(..)));
+        reached
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the write was parked");
+        release.send(()).unwrap();
+        typed_until(&editor, line_in).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!editor.typed().contains(&b'\r'));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: The model editor's screen is replaced by a dialog once the deck's line is half typed, so the composer never shows the whole line. The deck sends no Enter: the attempt ends Unresolved for a dialog, the cell is suspended, and the next ring is refused while it stays so; the user's own Enter lifts it.
+    #[spec("inbox/doorbell/033")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_033_a_dialog_mid_attempt_gets_no_enter_and_suspends_the_doorbell() {
+        use crate::doorbell_txn::{Latch, Outcome};
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-dialog", OnEnter::Submit);
+        editor.control.lock().unwrap().dialog_at = Some(10);
+        let report = editor.ring().await;
+        let RingOutcome::Txn(Outcome::Unresolved(cause)) = report.outcome else {
+            panic!("{report:?}");
+        };
+        assert!(cause.is_dialog(), "{cause:?}");
+        assert!(
+            !editor.typed().contains(&b'\r'),
+            "no Enter: {:?}",
+            editor.typed()
+        );
+        assert!(matches!(editor.cell(), Latch::Suspended(..)));
+        assert_eq!(editor.ring().await.outcome, RingOutcome::Suspended);
+        let writer = registry.agent_writer(&editor.id).unwrap();
+        writer.lock().await.write_user(b"\r").await.unwrap();
+        assert!(matches!(
+            editor.cell(),
+            Latch::Resolved(_, crate::doorbell_txn::Resolution::User)
+        ));
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A resize moves the model editor's PTY and the agent redraws its prompt for the new size between the resize's ioctl and the clearing of the old-size output. The doorbell's first ring after it is admitted on that redraw and submitted.
+    #[spec("inbox/doorbell/034")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn doorbell_034_a_repaint_racing_the_resize_clear_survives_for_the_first_ring() {
+        use crate::doorbell_txn::Outcome;
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let editor = ModelEditor::spawn(&registry, "pane-ring-resize", OnEnter::Submit);
+        let repaint = Arc::new(std::sync::Mutex::new(None));
+        const NARROWER: u16 = EDITOR_COLS - 10;
+        editor.control.lock().unwrap().cols = NARROWER as usize;
+        {
+            let pusher = Arc::clone(&editor.bus);
             let repaint = Arc::clone(&repaint);
-            *bus.between_resize_and_clear.lock().unwrap() = Some(Box::new(move || {
+            *editor.bus.between_resize_and_clear.lock().unwrap() = Some(Box::new(move || {
                 let (pushed_tx, pushed_rx) = std::sync::mpsc::channel();
                 let push = std::thread::spawn(move || {
-                    pusher.push(FRAME.as_bytes().to_vec());
+                    pusher.push(claude_screen("", &[], false, NARROWER as usize));
                     let _ = pushed_tx.send(());
                 });
                 let _ = pushed_rx.recv_timeout(Duration::from_millis(500));
                 *repaint.lock().unwrap() = Some(push);
             }));
         }
-        registry.resize(&id, 30, 100).expect("resize the pane");
+        registry
+            .resize(&editor.id, EDITOR_ROWS, NARROWER)
+            .expect("resize the pane");
         repaint
             .lock()
             .unwrap()
@@ -21678,68 +29296,207 @@ mod spawn_tests {
             .expect("test prerequisite: the repaint ran between the ioctl and the clear")
             .join()
             .expect("the repaint's push");
-        let outcome = registry
-            .write_doorbell_when_ready(
-                PANE,
-                &id,
-                DoorbellReady::Screen(crate::agent_registry::claude_prompt_on_screen),
-                false,
-                None,
-                Some("RING"),
-                || async { true },
-            )
-            .await;
+        editor.wait_clean();
+        let report = editor.ring().await;
         assert_eq!(
-            outcome,
-            DoorbellWrite::Written,
-            "the prompt the agent repainted for the resize must still be on screen for the doorbell"
+            report.outcome,
+            RingOutcome::Txn(Outcome::Submitted),
+            "the redraw for the resize must still be the frame the ring is admitted on"
         );
         registry.shutdown_all();
     }
 
-    /// Scenario: a doorbell writes its line into a `cat` pane, and a human input frame for that pane arrives while the doorbell awaits its admission re-check for the first step. The doorbell writes nothing and reports itself not admitted; once the frame is gone, the next doorbell is written (control).
-    #[spec("inbox/doorbell/032")]
+    /// Scenario: Admit human operations to a `cat` pane's ledger and end them every way they can end: refused, dropped by their caller, and written through the pane's writer; then let the deck write its own bytes. Each ticket settles once with its outcome, the watermark moves for every admission (so an operation already settled still shows), the job mark moves only when a ticket's bytes are queued for the PTY, and the deck's own bytes move neither.
+    #[spec("inbox/doorbell/035")]
     #[tokio::test]
-    async fn doorbell_032_a_human_frame_during_the_admission_recheck_withholds_the_step() {
-        const PANE: &str = "pane-doorbell-human";
+    async fn doorbell_035_tickets_settle_once_and_marks_move_as_specified() {
+        use crate::ingress_ledger::Settlement;
+        const PANE: &str = "pane-ledger-marks";
         let registry = Arc::new(AgentPtyRegistry::new());
-        let id = registry
-            .spawn_agent(SpawnOptions {
-                command: Some("/bin/cat"),
-                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
-                    DOT_AGENT_DECK_PANE_ID.to_string(),
-                    PANE.to_string(),
-                )]),
-                ..SpawnOptions::default()
-            })
-            .expect("spawn the doorbell's pane");
-        let arrived = std::sync::Mutex::new(None);
-        let outcome = registry
-            .write_doorbell(PANE, &id, false, None, Some("TYPEDAHEAD"), || async {
-                let mut arrived = arrived.lock().unwrap();
-                if arrived.is_none() {
-                    *arrived = Some(registry.human_frame_arriving(PANE));
-                }
-                true
-            })
-            .await;
+        let (id, ledger) = ledger_pane(&registry, PANE);
+        // The deck's own bytes take no ticket and move no mark.
+        {
+            let writer = registry.agent_writer(&id).expect("the pane's writer");
+            let w = writer.lock().await;
+            let mut job = w
+                .queue_deck_job(b"DECKLINE".to_vec(), Arc::default())
+                .expect("the writer thread runs");
+            assert_eq!(job.done().await, Some((8, true)));
+        }
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"DECKLINE").await;
+        let w0 = ledger.marks();
+        assert_eq!((w0.watermark, w0.job_mark, w0.outstanding), (0, 0, 0));
+
+        let refused = registry.admit_ingress(&id).expect("admitted");
+        let refused_ticket = refused.ticket();
+        assert_eq!(ledger.marks().outstanding, 1);
+        assert!(ledger.any_outstanding(), "an admitted frame is outstanding");
+        refused.refuse("history-only");
         assert_eq!(
-            outcome,
-            DoorbellWrite::NotAdmitted,
-            "a human frame that arrived during the re-check must stop the step"
+            settled_as(&ledger, refused_ticket).await,
+            Settlement::Refused("history-only")
         );
-        drop(arrived);
-        let control = registry
-            .write_doorbell(PANE, &id, false, None, Some("CONTROL"), || async { true })
-            .await;
-        assert_eq!(control, DoorbellWrite::Written, "control");
-        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"CONTROL").await;
+        let after_refusal = ledger.marks();
+        assert_eq!(after_refusal.outstanding, 0);
+        assert!(!ledger.any_outstanding());
+        // ABA: nothing outstanding, but the watermark says something arrived.
+        assert_eq!(after_refusal.watermark, w0.watermark + 1);
+        assert_eq!(after_refusal.job_mark, w0.job_mark);
+
+        let dropped = registry.admit_ingress(&id).expect("admitted");
+        let dropped_ticket = dropped.ticket();
+        drop(dropped);
+        assert_eq!(
+            settled_as(&ledger, dropped_ticket).await,
+            Settlement::Cancelled
+        );
+
+        let written = registry.admit_ingress(&id).expect("admitted");
+        let written_ticket = written.ticket();
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        writer
+            .lock()
+            .await
+            .write_user_ticketed(b"typed", Some(written))
+            .await
+            .expect("the frame reaches the pane");
+        assert_eq!(
+            settled_as(&ledger, written_ticket).await,
+            Settlement::Written { bytes: 5 }
+        );
+        let after_write = ledger.marks();
+        assert_eq!(after_write.watermark, w0.watermark + 3);
+        assert_eq!(after_write.job_mark, w0.job_mark + 1, "one job queued");
+        assert_eq!(after_write.outstanding, 0);
+
+        // Two operations admitted together are two tickets.
+        let first = registry.admit_ingress(&id).expect("admitted");
+        let second = registry.admit_ingress(&id).expect("admitted");
+        assert_ne!(first.ticket(), second.ticket());
+        assert_eq!(ledger.marks().outstanding, 2);
+        drop(first);
+        drop(second);
+
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A human frame's job is parked inside the PTY write and its caller is dropped; then a second frame is queued behind it and its caller is dropped too. The started frame keeps its ticket outstanding (so a doorbell admission would wait) until its bytes are written, and then settles as written; the queued one is taken back, settles as cancelled at once, and its bytes never reach the pane.
+    #[spec("inbox/doorbell/035")]
+    #[tokio::test]
+    async fn doorbell_035_a_started_job_keeps_its_ticket_and_a_withdrawn_one_cancels() {
+        use crate::ingress_ledger::Settlement;
+        const PANE: &str = "pane-ledger-jobs";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, ledger) = ledger_pane(&registry, PANE);
+        let writer = registry.agent_writer(&id).expect("the pane's writer");
+        let (reached, release) =
+            registry.pause_next_pty_write_for_test(PANE, PtyWritePause::BeforeWrite);
+        let started = registry.admit_ingress(&id).expect("admitted");
+        let started_ticket = started.ticket();
+        let first = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                let w = writer.lock().await;
+                let _ = w.write_user_ticketed(b"LATEFRAME", Some(started)).await;
+            }
+        });
+        tokio::task::spawn_blocking(move || reached.recv_timeout(Duration::from_secs(8)))
+            .await
+            .unwrap()
+            .expect("the first job reaches the PTY write");
+        first.abort();
+        let _ = first.await;
+        assert!(
+            ledger.any_outstanding(),
+            "a started job keeps its ticket after its caller is gone"
+        );
+
+        let queued = registry.admit_ingress(&id).expect("admitted");
+        let queued_ticket = queued.ticket();
+        let job_mark = ledger.marks().job_mark;
+        let second = tokio::spawn({
+            let writer = writer.clone();
+            async move {
+                let w = writer.lock().await;
+                let _ = w.write_user_ticketed(b"NEVERWRITTEN", Some(queued)).await;
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while ledger.marks().job_mark == job_mark {
+            assert!(Instant::now() < deadline, "the second job was never queued");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        second.abort();
+        let _ = second.await;
+        assert_eq!(
+            settled_as(&ledger, queued_ticket).await,
+            Settlement::Cancelled
+        );
+        assert!(
+            ledger.any_outstanding(),
+            "the started job is still outstanding"
+        );
+
+        release.send(()).expect("release the parked write");
+        assert_eq!(
+            settled_as(&ledger, started_ticket).await,
+            Settlement::Written { bytes: 9 }
+        );
+        assert!(!ledger.any_outstanding());
+        crate::test_pty_wait::wait_for_echo_bytes(&registry, &id, b"LATEFRAME").await;
         let snapshot = registry.snapshot(&id).expect("pane snapshot");
         assert!(
-            !String::from_utf8_lossy(&snapshot).contains("TYPEDAHEAD"),
-            "the doorbell typed ahead of the human frame: {:?}",
-            String::from_utf8_lossy(&snapshot)
+            !String::from_utf8_lossy(&snapshot).contains("NEVERWRITTEN"),
+            "a withdrawn job's bytes reached the pane"
         );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A ticket is outstanding when its generation is closed, its guard is dropped afterwards, and a successor is started on the same pane. The closed generation's ledger records the ticket as retired, leaves nothing outstanding and stays closed; its log then records the guard's end as well; the successor's ledger starts empty and a frame admitted to it is its own.
+    #[spec("inbox/doorbell/035")]
+    #[tokio::test]
+    async fn doorbell_035_retirement_closes_the_ledger_and_touches_no_successor() {
+        use crate::ingress_ledger::Settlement;
+        const PANE: &str = "pane-ledger-retire";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (id, ledger) = ledger_pane(&registry, PANE);
+        let outstanding = registry.admit_ingress(&id).expect("admitted");
+        let ticket = outstanding.ticket();
+        registry.close_agent(&id).expect("close the generation");
+        assert!(ledger.is_closed());
+        assert_eq!(ledger.marks().outstanding, 0);
+        assert!(
+            ledger
+                .settled()
+                .iter()
+                .any(|(t, how)| *t == ticket && *how == Settlement::Retired)
+        );
+        drop(outstanding);
+        assert_eq!(ledger.marks().outstanding, 0);
+        assert_eq!(
+            ledger
+                .settled()
+                .into_iter()
+                .filter(|(t, _)| *t == ticket)
+                .map(|(_, how)| how)
+                .collect::<Vec<_>>(),
+            vec![Settlement::Retired, Settlement::Cancelled],
+            "the log records the retirement and then the guard's end"
+        );
+        let (successor, fresh) = ledger_pane(&registry, PANE);
+        assert_ne!(successor, id);
+        assert_eq!(fresh.marks().watermark, 0);
+        assert!(!fresh.any_outstanding());
+        let theirs = registry
+            .admit_ingress(&successor)
+            .expect("the successor admits");
+        assert_eq!(fresh.marks().outstanding, 1);
+        assert_eq!(
+            ledger.marks().outstanding,
+            0,
+            "nothing reaches the closed ledger"
+        );
+        drop(theirs);
         registry.shutdown_all();
     }
 
@@ -22721,6 +30478,59 @@ mod spawn_tests {
         );
     }
 
+    /// The replay [`probe_004_the_output_hook_changes_no_published_or_replayed_byte`]
+    /// gets, recorded with the hook's one call in `push_timed` removed (the push
+    /// path as it was at `78a4652c`): the preamble for the modes in force at the
+    /// clear, which carries no mode 2004, then the ring.
+    const PROBE_004_GOLDEN_REPLAY: &[u8] = b"\x1b[?1049h\x1b[?1006h\x1b[2J\x1b[Hredrawn\x1b[?2004l\x1b[?2004h more\x1bcreset\r\n\x1b[?2004hlast";
+
+    /// Scenario: Push an agent's output that turns the alternate screen and bracketed paste on with the sequence split across two pushes, puts `?2004l` as text in an OSC title, and then, across a ring clear, a resize edge and a nudge edge, turns bracketed paste off and on and resets the terminal. Every push reaches a subscriber byte for byte, the replay snapshot is the one recorded before the output hook existed, and the hook's tracker follows mode 2004 as `vt100` does over the whole stream, across the edges.
+    #[spec("inbox/probe/004")]
+    #[test]
+    fn probe_004_the_output_hook_changes_no_published_or_replayed_byte() {
+        let pushes: [&[u8]; 7] = [
+            b"\x1b[?1049h\x1b[?20",
+            b"04h\x1b[?1006hprompt> ",
+            b"\x1b]0;?2004l in a title\x07typed",
+            b"\x1b[2J\x1b[Hredrawn\x1b[?2004l",
+            b"\x1b[?2004h more",
+            b"\x1bcreset\r\n",
+            b"\x1b[?2004hlast",
+        ];
+        let bus = AgentBus::new();
+        let (initial, mut rx) = bus.subscribe();
+        assert!(initial.is_empty());
+        let mut reference = crate::vt_grid::parser(24, 80, 0);
+        let mut seen_on = false;
+        for (i, push) in pushes.iter().enumerate() {
+            bus.push(push.to_vec());
+            reference.process(push);
+            assert_eq!(&rx.try_recv().unwrap()[..], *push, "push {i}");
+            let on = bus.state.lock().unwrap().output_hook.paste_mode().on();
+            assert_eq!(on, reference.screen().bracketed_paste(), "push {i}");
+            seen_on |= on;
+            match i {
+                2 => bus.resize_and_clear(30, 100, || Ok::<(), ()>(())).unwrap(),
+                4 => bus
+                    .resize_and_mark_edge(
+                        crate::evidence_state::EdgeReason::NudgeShrink,
+                        30,
+                        99,
+                        || Ok::<(), ()>(()),
+                    )
+                    .unwrap(),
+                _ => {}
+            }
+        }
+        assert!(seen_on && bus.state.lock().unwrap().output_hook.paste_mode().on());
+        assert!(rx.try_recv().is_err(), "one publish per push, nothing more");
+        assert_eq!(
+            String::from_utf8_lossy(&bus.snapshot()),
+            String::from_utf8_lossy(PROBE_004_GOLDEN_REPLAY)
+        );
+        assert_eq!(bus.snapshot(), PROBE_004_GOLDEN_REPLAY);
+    }
+
     #[test]
     fn replay_of_an_agent_that_left_the_alternate_screen_adds_nothing() {
         let bus = AgentBus::new();
@@ -22809,6 +30619,8 @@ mod spawn_tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
+            input_discarded: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -23028,6 +30840,118 @@ mod spawn_tests {
         );
     }
 
+    /// Scenario: Run the real doorbell tick, with a 150 ms window, over a pane whose agent reports it waits for input while a message waits for it. The deck's inbox then says the doorbell holds because the agent may be waiting at a prompt, still so once a paste opens in the pane; once the agent is idle it says the paste is unfinished, once the paste closes it gives the generation's own reason (it can't be typed into, and no check can read its box), while the agent works it says nothing, and once the message is taken it says nothing either, the draft still there. The summary both clients read carries the same reason, and no doorbell byte reaches the pane.
+    #[spec("inbox/doorbell/041")]
+    #[tokio::test]
+    async fn doorbell_041_the_tick_tells_the_inbox_why_it_holds() {
+        use crate::inbox_display::WakeHold;
+        const PANE: &str = "round5wake-041-pane";
+        // A real pane, so the input it records is keyed by its pane id.
+        let (registry, agent, gate, log, _notices, _displaced) = gated_pane(PANE, true).await;
+        gate.release();
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let event = |event_type| crate::event::AgentEvent {
+            session_id: "r5w-041-session".into(),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: chrono::Utc::now(),
+            user_prompt: None,
+            metadata: Default::default(),
+            pane_id: Some(PANE.into()),
+            agent_id: Some(agent.clone()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        };
+        for kind in [
+            crate::event::EventType::SessionStart,
+            crate::event::EventType::WaitingForInput,
+        ] {
+            state.write().await.apply_event(event(kind));
+        }
+        registry
+            .inbox()
+            .post_direct(
+                crate::inbox::Recipient::bound(PANE, &agent),
+                crate::inbox::Content::from_deck("seed", "task", "do it"),
+            )
+            .unwrap();
+        let config = crate::doorbell::DoorbellConfig {
+            tick: Duration::from_millis(20),
+            schedule: vec![Duration::from_secs(60)],
+            arm_grace: Duration::from_millis(1),
+            wake_stall_after: Duration::from_millis(150),
+        };
+        let bell = crate::doorbell::spawn(registry.clone(), state.clone(), config);
+        let held = |want: Option<WakeHold>| {
+            let registry = registry.clone();
+            let agent = agent.clone();
+            async move {
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                while registry.inbox().wake_hold(PANE, &agent) != want {
+                    assert!(
+                        tokio::time::Instant::now() < deadline,
+                        "the inbox never said {want:?}; it says {:?}, the pane's input {:?}, its queue {:?}",
+                        registry.inbox().wake_hold(PANE, &agent),
+                        registry.pane_input_hold(PANE, &agent),
+                        registry.inbox().doorbell_facts(PANE, &agent),
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                assert_eq!(registry.inbox().summary(PANE, &agent).wake_hold, want);
+            }
+        };
+        held(Some(WakeHold::AwaitingPrompt)).await;
+
+        // The paste opens while the agent still waits for input, so no ring
+        // can go in before it once the agent is idle.
+        let writer = registry.agent_writer(&agent).unwrap();
+        writer
+            .lock()
+            .await
+            .write_user(b"\x1b[200~half a paste")
+            .await
+            .unwrap();
+        held(Some(WakeHold::AwaitingPrompt)).await;
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::Idle));
+        held(Some(WakeHold::PasteOpen)).await;
+        writer.lock().await.write_user(b"\x1b[201~").await.unwrap();
+        // Q35-21: `possible_draft` only for a box the deck can check; this
+        // generation's typed doorbell is refused, and its clause shows.
+        held(Some(WakeHold::CannotType)).await;
+
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::Thinking));
+        held(None).await;
+        state
+            .write()
+            .await
+            .apply_event(event(crate::event::EventType::Idle));
+        held(Some(WakeHold::CannotType)).await;
+
+        let hook = registry.inbox().test_hook_fetch(PANE, &agent, None);
+        assert_eq!(hook.deliveries.len(), 1);
+        held(None).await;
+        assert!(registry.input_touched(&agent), "the draft is still there");
+        bell.abort();
+        assert_eq!(
+            String::from_utf8_lossy(&log.lock().unwrap()),
+            "\x1b[200~half a paste\x1b[201~",
+            "only the user's bytes reached the pane"
+        );
+    }
+
     /// Issue #525: a job still queued behind a write the PTY has not taken is
     /// withdrawn when its caller's bound runs out, or when its caller is
     /// dropped, and then never written — which is what lets a caller that
@@ -23045,7 +30969,9 @@ mod spawn_tests {
                 pane_id_env: None,
                 state: Arc::new(Mutex::new(PaneInputState::default())),
                 retired: Arc::new(AtomicBool::new(false)),
+                doorbell: None,
             },
+            Arc::default(),
         ));
         let first = {
             let pty = pty.clone();
@@ -23191,6 +31117,164 @@ mod spawn_tests {
         assert!(!registry.pane_input_tracks(PANE));
     }
 
+    /// A PTY writer whose writes block until the test lets each one through,
+    /// recording what it took.
+    struct ClaimGatedWriter {
+        gate: std::sync::mpsc::Receiver<()>,
+        entered: std::sync::mpsc::Sender<()>,
+        taken: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl std::io::Write for ClaimGatedWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            let _ = self.gate.recv();
+            self.taken.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A writer over a [`ClaimGatedWriter`]: the writer, the gate that lets
+    /// one write through, the signal that a write has begun, and the bytes
+    /// taken.
+    type ClaimGated = (
+        PaneWriter,
+        std::sync::mpsc::Sender<()>,
+        std::sync::mpsc::Receiver<()>,
+        Arc<Mutex<Vec<u8>>>,
+    );
+
+    fn claim_gated_writer() -> ClaimGated {
+        let (open, gate) = std::sync::mpsc::channel();
+        let (entered, entering) = std::sync::mpsc::channel();
+        let taken = Arc::new(Mutex::new(Vec::new()));
+        let writer = PaneWriter::new(
+            Box::new(ClaimGatedWriter {
+                gate,
+                entered,
+                taken: Arc::clone(&taken),
+            }),
+            Some("q24-pane".to_string()),
+            Arc::new(Mutex::new(PaneInputState::default())),
+            Arc::new(AtomicBool::new(false)),
+            Arc::default(),
+            None,
+            Arc::default(),
+        );
+        (writer, open, entering, taken)
+    }
+
+    fn in_flight(writer: &PaneWriter) -> usize {
+        writer.pty.in_flight.count.load(Ordering::SeqCst)
+    }
+
+    /// Scenario: Queue a doorbell transaction's line behind a human write the PTY is still taking, take the line back through the transaction's own claim, and let the human write finish. The writer skips the line without writing a byte of it; the take-back leaves the in-flight count once however often it is accounted, so the pane goes idle and nothing is counted twice.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test]
+    async fn doorbell_049_a_taken_back_transaction_job_is_never_written_and_leaves_once() {
+        let (writer, open, entering, taken) = claim_gated_writer();
+        let human = std::thread::spawn({
+            let pty_jobs = writer.pty.jobs.clone();
+            let in_flight = Arc::clone(&writer.pty.in_flight);
+            let input = Arc::clone(&writer.pty.input);
+            move || {
+                let thread = PtyWriterThread {
+                    jobs: pty_jobs,
+                    in_flight,
+                    input,
+                    physical: Arc::default(),
+                };
+                thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
+            }
+        });
+        entering.recv().unwrap();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let mut job = writer
+            .queue_deck_job(b"(abcdfg) line".to_vec(), Arc::clone(&claim))
+            .expect("the writer thread runs");
+        assert_eq!(in_flight(&writer), 2);
+        assert!(!job.started());
+        assert!(
+            claim.withdraw(),
+            "the transaction's take-back wins while queued"
+        );
+        assert!(job.reconcile_take_back());
+        assert!(job.reconcile_take_back(), "accounted again");
+        assert_eq!(in_flight(&writer), 1, "the take-back left the count once");
+        open.send(()).unwrap();
+        human.join().unwrap().expect("the human write is answered");
+        writer.until_idle().await;
+        assert_eq!(in_flight(&writer), 0);
+        assert_eq!(&*taken.lock().unwrap(), b"human", "no byte of the line");
+        assert!(job.done().await.is_none(), "a job taken back never answers");
+        drop(job);
+        assert_eq!(in_flight(&writer), 0, "dropping it leaves nothing more");
+    }
+
+    /// Scenario: Queue a doorbell transaction's line on an idle writer, let the writer start it, then try to take it back, and let the PTY finish the write only later. The take-back loses and accounts nothing; the job's late answer still arrives, correlated to it, with what the PTY took; the writer leaves the count once, so the pane goes idle.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test]
+    async fn doorbell_049_a_started_transaction_job_answers_late_and_leaves_once() {
+        let (writer, open, entering, taken) = claim_gated_writer();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let mut job = writer
+            .queue_deck_job(b"(abcdfg) line".to_vec(), Arc::clone(&claim))
+            .expect("the writer thread runs");
+        entering.recv().unwrap();
+        assert!(job.started());
+        assert!(!claim.withdraw(), "the writer claimed it first");
+        assert!(!job.reconcile_take_back());
+        assert_eq!(in_flight(&writer), 1);
+        assert!(job.try_done().is_none(), "still inside the PTY");
+        open.send(()).unwrap();
+        assert_eq!(job.done().await, Some((13, true)));
+        writer.until_idle().await;
+        assert_eq!(in_flight(&writer), 0);
+        assert_eq!(&*taken.lock().unwrap(), b"(abcdfg) line");
+    }
+
+    /// Scenario: Queue a doorbell transaction's line behind a human write, then drop its job handle without the transaction having taken it back, as a torn-down driver would. The drop takes the still-queued line back and leaves the count once: the line is never written and the pane goes idle.
+    #[spec("inbox/doorbell/049")]
+    #[tokio::test]
+    async fn doorbell_049_a_dropped_transaction_job_still_queued_is_taken_back_once() {
+        let (writer, open, entering, taken) = claim_gated_writer();
+        let human = std::thread::spawn({
+            let pty_jobs = writer.pty.jobs.clone();
+            let in_flight = Arc::clone(&writer.pty.in_flight);
+            let input = Arc::clone(&writer.pty.input);
+            move || {
+                let thread = PtyWriterThread {
+                    jobs: pty_jobs,
+                    in_flight,
+                    input,
+                    physical: Arc::default(),
+                };
+                thread.run_blocking(PtyOp::WriteAll(b"human".to_vec(), ByteSource::User, true))
+            }
+        });
+        entering.recv().unwrap();
+        let claim = Arc::new(crate::doorbell_txn::JobClaim::default());
+        let job = writer
+            .queue_deck_job(b"(abcdfg) line".to_vec(), Arc::clone(&claim))
+            .expect("the writer thread runs");
+        drop(job);
+        assert_eq!(
+            claim.state(),
+            crate::doorbell_txn::ClaimState::Withdrawn,
+            "taken back by the drop"
+        );
+        assert_eq!(in_flight(&writer), 1);
+        open.send(()).unwrap();
+        human.join().unwrap().expect("the human write is answered");
+        writer.until_idle().await;
+        assert_eq!(in_flight(&writer), 0);
+        assert_eq!(&*taken.lock().unwrap(), b"human");
+    }
+
     /// Issue #542: the user-byte stamp inside `PaneWriter`'s `Write` impl
     /// honours the retired flag too — that is the path an attach stream's bytes
     /// take, and it stamps before `note_user_input` does.
@@ -23205,6 +31289,9 @@ mod spawn_tests {
             Some(PANE.to_string()),
             state.clone(),
             retired.clone(),
+            Arc::default(),
+            None,
+            Arc::default(),
         );
         writer.write_all(b"typed").expect("write to sink");
         assert!(state.lock().unwrap().tracks_pane(PANE), "the control");
@@ -23215,108 +31302,116 @@ mod spawn_tests {
         assert!(!state.lock().unwrap().tracks_pane(PANE));
     }
 
-    /// Issue #544: the draft bit rides the same stream state as the submit
-    /// drain, so paste framing and the report classifier cannot confuse each
-    /// other — including when a marker or a report is split across writes.
+    /// Issue #544: the user's submits and clears ride the same stream as the
+    /// submit drain, so paste framing and reports cannot confuse them —
+    /// including when a marker or a report is split across writes. (Q35-21:
+    /// the draft bit this pinned went with the keystroke model; the recovery count
+    /// reads the stream now.)
     #[test]
-    fn draft_bit_shares_the_stream_with_paste_framing() {
+    fn submits_and_clears_share_the_stream_with_paste_framing() {
         let mut stream = PaneInputStream::default();
         assert!(
             !stream.feed(b"\x1b[<64;10;5M\x1b[I"),
             "reports submit nothing"
         );
-        assert!(!stream.draft.pending(), "reports are not a draft");
+        assert_eq!(stream.recovery.clears(), 0, "reports clear nothing");
 
         // A paste split mid-marker: its newlines neither submit nor clear.
         assert!(!stream.feed(b"\x1b[20"));
         assert!(!stream.feed(b"0~line one\r"));
         assert!(!stream.feed(b"line two\x1b[201~"));
-        assert!(stream.draft.pending(), "pasted text is a draft");
         // A Ctrl+U INSIDE a paste is content, not a clear.
         assert!(!stream.feed(b"\x1b[200~\x15\x1b[201~"));
-        assert!(stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 0, "nothing pasted clears");
 
-        // Out of the paste, a report after the draft leaves it pending, and
-        // Enter clears it.
+        // Out of the paste, a report clears nothing, and Enter submits.
         assert!(!stream.feed(b"\x1b[10;5R"));
-        assert!(stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 0);
         assert!(stream.feed(b"\r"));
-        assert!(!stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 1);
     }
 
     /// Issue #544 (PR #1398 re-review): a literal `ESC[200~` pasted into an
     /// empty box is content. The stream's paste framing stays in the paste
-    /// across it — a paste cannot nest — and the draft bit, reading the same
-    /// framing, counts it: the two agree that only `ESC[201~` ends the paste.
+    /// across it — a paste cannot nest — so only `ESC[201~` ends the paste.
+    /// (Q35-21: the draft bit that read the same framing went with
+    /// keystroke model; what the box holds is the input epoch's.)
     #[test]
-    fn a_pasted_opening_marker_is_a_draft_and_leaves_the_paste_open() {
+    fn a_pasted_opening_marker_leaves_the_paste_open() {
         let mut stream = PaneInputStream::default();
         assert!(!stream.feed(b"\x1b[200~\x1b[200~"));
         assert!(stream.in_paste, "a nested opening marker left the paste");
-        assert!(stream.draft.pending(), "a pasted ESC[200~ is not a draft");
         // Still in the paste, so this newline is content, not a submit.
         assert!(!stream.feed(b"\r"));
         assert!(!stream.feed(b"\x1b[201~"));
         assert!(!stream.in_paste);
-        assert!(stream.draft.pending());
+        assert_eq!(stream.recovery.clears(), 0, "nothing was submitted");
     }
 
-    /// Issue #544: a pane that changes hands, or closes, starts with no draft.
+    /// Issue #544: a pane that changes hands, or closes, starts with a fresh
+    /// input stream: no paste open and no submit or clear counted.
     #[test]
-    fn draft_bit_is_reset_by_forget_pane_and_forget_closed_pane() {
+    fn the_input_stream_is_reset_by_forget_pane_and_forget_closed_pane() {
         const PANE: &str = "issue-544-forget";
         let mut state = PaneInputState::default();
-        state.note_user_bytes(PANE, b"draft");
-        assert!(state.draft_pending(PANE), "the control");
+        state.note_user_bytes(PANE, b"\x1b[200~draft\x15");
+        assert!(state.in_paste(PANE), "the control");
         state.forget_pane(PANE);
-        assert!(!state.draft_pending(PANE), "forget_pane");
+        assert!(!state.in_paste(PANE), "forget_pane");
+        assert!(!state.input.contains_key(PANE), "forget_pane");
 
-        state.note_user_bytes(PANE, b"draft");
+        state.note_user_bytes(PANE, b"\x1b[200~draft");
         state.forget_closed_pane(PANE);
-        assert!(!state.draft_pending(PANE), "forget_closed_pane");
+        assert!(!state.in_paste(PANE), "forget_closed_pane");
+        assert!(!state.tracks_pane(PANE), "forget_closed_pane");
 
         // Sentinel ids never hold one.
-        state.note_user_bytes("<no-pane>", b"draft");
-        assert!(!state.draft_pending("<no-pane>"));
+        state.note_user_bytes("<no-pane>", b"\x1b[200~draft");
+        assert!(!state.in_paste("<no-pane>"));
     }
 
     /// PR #1398 finding #14: a paste whose opening marker and content arrive
-    /// as separate writes is a draft from the marker on. A first write checking
-    /// in between must wait, or it lands in the middle of the paste. An empty
-    /// paste still leaves nothing pending once it closes.
+    /// as separate writes is open from the marker on, so a first write
+    /// checking in between waits rather than landing in the middle of it. An
+    /// empty paste leaves nothing open once it closes.
     #[test]
-    fn an_open_paste_is_a_pending_draft_before_its_content_arrives() {
+    fn an_open_paste_is_open_before_its_content_arrives() {
         const PANE: &str = "issue-544-split-paste";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~");
         assert!(
-            state.draft_pending(PANE),
-            "an open paste with no content yet is not pending"
+            state.in_paste(PANE),
+            "an open paste with no content yet is not open"
         );
         state.note_user_bytes(PANE, b"pasted");
+        assert!(state.in_paste(PANE), "the pasted text");
         state.note_user_bytes(PANE, b"\x1b[201~");
-        assert!(state.draft_pending(PANE), "the pasted text");
+        assert!(!state.in_paste(PANE), "the paste closed");
 
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~");
         state.note_user_bytes(PANE, b"\x1b[201~");
-        assert!(!state.draft_pending(PANE), "an empty paste");
+        assert!(!state.in_paste(PANE), "an empty paste");
     }
 
     /// Sweep (PR #1398 #15's class): a CR of ours written into a paste the
-    /// user still has open is paste CONTENT — it submits nothing — so the draft
-    /// the paste already holds is still in the box afterwards.
+    /// user still has open is paste CONTENT — it submits nothing and the
+    /// paste stays open — and the user's Enter after they close it is theirs.
     #[test]
-    fn a_daemon_submit_inside_an_open_paste_does_not_clear_the_draft() {
+    fn a_daemon_submit_inside_an_open_paste_submits_nothing() {
         const PANE: &str = "issue-544-submit-in-paste";
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~abc");
         state.note_deck_bytes(PANE, b"PAYLOAD\r");
+        assert!(state.in_paste(PANE), "a daemon CR inside a paste closed it");
         state.note_user_bytes(PANE, b"\x1b[201~");
-        assert!(
-            state.draft_pending(PANE),
-            "a daemon CR inside a paste cleared the pasted draft"
+        assert_eq!(
+            state.user_clears(PANE),
+            0,
+            "nothing of the user's submitted"
         );
+        state.note_user_bytes(PANE, b"\r");
+        assert_eq!(state.user_clears(PANE), 1, "the user's Enter submits");
     }
 
     /// Sweep (PR #1398 #15's class): after a daemon submit the byte before the
@@ -23325,13 +31420,11 @@ mod spawn_tests {
     /// submits — not the `Alt+Enter` the stale predecessor would make it.
     #[test]
     fn a_daemon_submit_ends_the_users_esc_prefix_for_the_submit_scan() {
-        const PANE: &str = "issue-544-esc-then-submit";
-        let mut state = PaneInputState::default();
-        state.note_user_bytes(PANE, b"\x1b");
-        state.note_deck_bytes(PANE, b"PAYLOAD\r");
-        state.note_user_bytes(PANE, b"\r");
+        let mut stream = PaneInputStream::default();
+        assert!(!stream.feed(b"\x1b"));
+        assert!(stream.feed_as(b"PAYLOAD\r", crate::composer_probe::recovery::Origin::Deck));
         assert!(
-            !state.draft_pending(PANE),
+            stream.feed(b"\r"),
             "the user's Enter after our submit was read as Alt+Enter"
         );
     }
@@ -23347,8 +31440,10 @@ mod spawn_tests {
         state.note_user_bytes(PANE, b"\x1b[20");
         state.note_deck_bytes(PANE, b"PAYLOAD\r");
         state.note_user_bytes(PANE, b"0~abc\r");
-        assert!(
-            !state.draft_pending(PANE),
+        assert!(!state.in_paste(PANE), "a paste nobody opened");
+        assert_eq!(
+            state.user_clears(PANE),
+            1,
             "the user's Enter was read as a newline inside a paste nobody opened"
         );
     }
@@ -23365,27 +31460,28 @@ mod spawn_tests {
         state.note_deck_bytes(PANE, b"PAYLOAD\r");
         assert!(state.input[PANE].in_paste, "our CR is paste content");
         state.note_user_bytes(PANE, b"def\x1b[201~");
-        assert!(state.draft_pending(PANE), "the paste is still in the box");
+        assert_eq!(state.user_clears(PANE), 0, "nothing was submitted");
         state.note_user_bytes(PANE, b"\r");
-        assert!(!state.draft_pending(PANE), "the user's Enter submits it");
+        assert_eq!(state.user_clears(PANE), 1, "the user's Enter submits it");
 
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~abc");
         state.note_deck_bytes(PANE, b"\x1b[200~one\ntwo\x1b[201~\n");
         assert!(!state.input[PANE].in_paste, "our closing marker ended it");
-        assert!(state.draft_pending(PANE), "a notice submits nothing");
+        assert_eq!(state.user_clears(PANE), 0, "a notice submits nothing");
         state.note_user_bytes(PANE, b"\r");
-        assert!(
-            !state.draft_pending(PANE),
+        assert_eq!(
+            state.user_clears(PANE),
+            1,
             "the user's Enter after our notice closed the paste is a submit"
         );
     }
 
     /// PR #1398 finding #16, one stream: a deck write right after a lone user
-    /// `ESC`. A lone Escape keypress is not a draft, so neither a multi-line
-    /// submit nor a multi-line notice written after it leaves one; the
-    /// notice's paste is closed by its own marker; and the user's typing
-    /// afterwards is read afresh.
+    /// `ESC`. Neither a multi-line submit nor a multi-line notice written
+    /// after it leaves a paste open, the notice's paste is closed by its own
+    /// marker, and the user's typing afterwards is read afresh: their Enter
+    /// submits.
     #[test]
     fn deck_writes_after_a_lone_user_escape() {
         const PANE: &str = "issue-544-deck-after-esc";
@@ -23398,22 +31494,18 @@ mod spawn_tests {
             state.note_user_bytes(PANE, b"\x1b");
             state.note_deck_bytes(PANE, deck);
             assert!(!state.input[PANE].in_paste, "{why}: paste left open");
-            assert!(
-                !state.draft_pending(PANE),
-                "{why}: a lone Escape is a draft"
-            );
             state.note_user_bytes(PANE, b"]abc");
-            assert!(state.draft_pending(PANE), "{why}: later typing is a draft");
+            assert_eq!(state.user_clears(PANE), 0, "{why}: nothing submitted yet");
             state.note_user_bytes(PANE, b"\r");
-            assert!(!state.draft_pending(PANE), "{why}: the Enter submits");
+            assert_eq!(state.user_clears(PANE), 1, "{why}: the Enter submits");
         }
     }
 
     /// PR #1398 finding #16, one stream: user bytes split around a deck write.
-    /// The PTY sees them in that order, so the model does too — a draft typed
-    /// around our notice is one draft, a user CSI completed by our byte is a
-    /// key, and a paste marker our partial write left half-sent is completed
-    /// by the user's next bytes exactly as the agent's parser completes it.
+    /// The PTY sees them in that order, so the framing does too — a paste
+    /// around our notice is one paste, and a paste marker our partial write
+    /// left half-sent is completed by the user's next bytes exactly as the
+    /// agent's parser completes it, so their Enter inside it is content.
     #[test]
     fn user_bytes_split_around_a_deck_write() {
         const PANE: &str = "issue-544-split-around-deck";
@@ -23421,34 +31513,26 @@ mod spawn_tests {
         state.note_user_bytes(PANE, b"dra");
         state.note_deck_bytes(PANE, b"NOTICE\n");
         state.note_user_bytes(PANE, b"ft");
-        assert!(state.draft_pending(PANE), "the draft around our notice");
         state.note_user_bytes(PANE, b"\r");
-        assert!(!state.draft_pending(PANE));
+        assert_eq!(state.user_clears(PANE), 1, "the user's Enter submits");
 
         let mut state = PaneInputState::default();
         state.note_user_bytes(PANE, b"\x1b[200~ab");
         state.note_deck_bytes(PANE, b"NOTICE\n");
+        assert!(state.input[PANE].in_paste, "the paste around our notice");
         state.note_user_bytes(PANE, b"c\x1b[201~");
         assert!(!state.input[PANE].in_paste);
-        assert!(state.draft_pending(PANE), "the paste around our notice");
-
-        let mut state = PaneInputState::default();
-        state.note_user_bytes(PANE, b"\x1b[");
-        state.note_deck_bytes(PANE, b"NOTICE\n");
-        assert!(
-            state.draft_pending(PANE),
-            "the user's half-sent key, completed by our byte, is an edit"
-        );
 
         // An ambiguous write of ours that stopped inside its own opening
         // marker: the user's next bytes complete it.
         let mut state = PaneInputState::default();
         state.note_deck_bytes(PANE, b"\x1b[20");
-        assert!(!state.draft_pending(PANE));
+        assert!(!state.in_paste(PANE));
         state.note_user_bytes(PANE, b"0~abc\r");
         assert!(state.input[PANE].in_paste, "the marker completed");
-        assert!(
-            state.draft_pending(PANE),
+        assert_eq!(
+            state.user_clears(PANE),
+            0,
             "the user's Enter inside the paste is content"
         );
     }
@@ -23944,6 +32028,191 @@ mod spawn_tests {
             .delegation_idle_clock("worker", second.seq)
             .expect("armed");
         assert!(!clock.pointer_queued && clock.pointer_in_progress);
+    }
+
+    /// Issue #2028: the reader takes its exit verdict from
+    /// `mark_agent_crashed`'s lock hold, and a close that removes an already
+    /// exited generation afterwards leaves the status it reaped in the
+    /// generation's removal evidence, so neither the verdict nor the code
+    /// depends on the record outliving the EOF.
+    #[tokio::test]
+    async fn a_close_after_natural_exit_keeps_the_eof_verdict_and_the_reaped_code() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let id = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'exit 7'"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && registry.live_count() > 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            registry.live_count(),
+            0,
+            "test prerequisite: the agent exited"
+        );
+        let removal = Arc::clone(&registry.inner.lock().agents[&id].removal);
+        assert!(
+            registry.mark_agent_crashed(&id, || {}),
+            "a generation nothing removed is the reader's natural exit"
+        );
+        assert!(removal.reaped().is_none(), "nothing has removed it yet");
+        registry.close_agent(&id).expect("close the exited agent");
+        assert!(
+            !registry.mark_agent_crashed(&id, || panic!("not registered")),
+            "a removed generation is not a natural exit"
+        );
+        assert_eq!(
+            removal.reaped().map(|status| status.exit_code()),
+            Some(7),
+            "the close must keep the code of the exit it reaped"
+        );
+    }
+
+    /// Issue #2028 (review U2): spawn `sh -c 'sleep 1; exit 7'` on `pane`
+    /// with telemetry capturing, and hold its reader once its exit is
+    /// published and before its telemetry run ends. Returns the agent, its
+    /// removal evidence, and the hold's release, once the reader reached it.
+    async fn natural_exit_held_before_telemetry(
+        registry: &Arc<AgentPtyRegistry>,
+        pane: &str,
+    ) -> (String, Arc<RemovalEvidence>, std::sync::mpsc::Sender<()>) {
+        let agent = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sh -c 'sleep 1; exit 7'"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a naturally-exiting agent");
+        let (reached, release) = registry.hold_exit_telemetry_for_test(&agent);
+        let removal = Arc::clone(&registry.inner.lock().agents[&agent].removal);
+        tokio::task::spawn_blocking(move || {
+            reached
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the reader reached its exit telemetry")
+        })
+        .await
+        .unwrap();
+        assert!(
+            registry.is_agent_still_registered(&agent),
+            "test prerequisite: the generation ended by itself"
+        );
+        (agent, removal, release)
+    }
+
+    /// How the first run to end on `pane` ended, once one has.
+    async fn first_run_end(
+        telemetry: &crate::telemetry::Telemetry,
+        spans: &mut crate::telemetry::exporter::CapturedSpans,
+        pane: &str,
+    ) -> (String, Option<i64>) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            telemetry.settled().await;
+            if let Some(end) = spans.run_ends(pane).into_iter().next() {
+                return end;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no run ended on {pane}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Scenario: An agent exits with code 7 by itself, and a close removes its pane while the agent's reader is still on its way to ending the telemetry run. The close is held after it removed the agent and before it terminates and reaps the child, past the reader's exit-code wait; the run must still end as exited with code 7.
+    #[spec("telemetry/otlp/010")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_010_a_close_held_before_its_reap_keeps_the_exit_code() {
+        let config = tempfile::tempdir().expect("telemetry config dir");
+        let (telemetry, mut spans) =
+            crate::telemetry::exporter::capturing_for_test(config.path().to_path_buf());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_telemetry(Arc::clone(&telemetry));
+        let pane = "exit-code-close-pane";
+        let (agent, removal, release_reader) =
+            natural_exit_held_before_telemetry(&registry, pane).await;
+        let (close_reached, release_close) = registry.hold_close_before_reap_for_test(&agent);
+        let closer = std::thread::spawn({
+            let registry = Arc::clone(&registry);
+            let agent = agent.clone();
+            move || registry.close_agent(&agent)
+        });
+        tokio::task::spawn_blocking(move || {
+            close_reached
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the close removed the record")
+        })
+        .await
+        .unwrap();
+        assert!(!registry.is_agent_still_registered(&agent));
+        let looked_up = registry
+            .exit_status_after_eof(&agent, &removal)
+            .map(|status| status.exit_code());
+        release_reader.send(()).expect("release the reader");
+        let end = first_run_end(&telemetry, &mut spans, pane).await;
+        release_close.send(()).expect("release the close");
+        closer.join().unwrap().expect("close");
+        assert_eq!(end, ("exited".to_string(), Some(7)));
+        assert_eq!(
+            looked_up,
+            Some(7),
+            "the removal itself keeps the status of a child that had exited"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: An agent exits with code 7 by itself, and a respawn of its pane removes it before its reader ends the telemetry run. Once with the respawn held after the removal and before it terminates and reaps the old child, and once with the respawn finished and the successor's run open first; the old run must end as exited with code 7 either way.
+    #[spec("telemetry/otlp/010")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn otlp_010_a_respawn_after_a_natural_exit_keeps_the_exit_code() {
+        let config = tempfile::tempdir().expect("telemetry config dir");
+        let (telemetry, mut spans) =
+            crate::telemetry::exporter::capturing_for_test(config.path().to_path_buf());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.set_telemetry(Arc::clone(&telemetry));
+
+        // Held between the removal and the reap.
+        let pane = "exit-code-respawn-held-pane";
+        let (agent, removal, release_reader) =
+            natural_exit_held_before_telemetry(&registry, pane).await;
+        let (respawn_reached, release_respawn) = registry.pause_next_respawn_for_test();
+        let respawn = tokio::spawn({
+            let registry = Arc::clone(&registry);
+            async move { registry.respawn_agent_for_pane(pane, "sleep 30").await }
+        });
+        respawn_reached
+            .await
+            .expect("the respawn removed the record");
+        assert!(!registry.is_agent_still_registered(&agent));
+        let looked_up = registry
+            .exit_status_after_eof(&agent, &removal)
+            .map(|status| status.exit_code());
+        release_reader.send(()).expect("release the reader");
+        let end = first_run_end(&telemetry, &mut spans, pane).await;
+        release_respawn.send(()).expect("release the respawn");
+        let successor = respawn.await.unwrap().expect("respawn");
+        assert_ne!(successor, agent);
+        assert_eq!(end, ("exited".to_string(), Some(7)));
+        assert_eq!(looked_up, Some(7));
+
+        // Finished first: the old run is replaced when its own end comes.
+        let pane = "exit-code-respawn-done-pane";
+        let (agent, _removal, release_reader) =
+            natural_exit_held_before_telemetry(&registry, pane).await;
+        let successor = registry
+            .respawn_agent_for_pane(pane, "sleep 30")
+            .await
+            .expect("respawn");
+        assert_ne!(successor, agent);
+        release_reader.send(()).expect("release the reader");
+        assert_eq!(
+            first_run_end(&telemetry, &mut spans, pane).await,
+            ("exited".to_string(), Some(7))
+        );
+        registry.shutdown_all();
     }
 
     /// `is_agent_still_registered` is `pump_reader`'s only way to tell a

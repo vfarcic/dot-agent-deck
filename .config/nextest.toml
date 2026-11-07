@@ -194,6 +194,20 @@ fail-fast = false
 [profile.default.junit]
 path = "junit.xml"
 
+# Show which export-chain branch ran in CI even when this synthetic control
+# passes. Keep successful output storage in JUnit at its default of false.
+[[profile.default.overrides]]
+filter = 'test(=probe_026_empty_settlement_and_read_only_epoch_control)'
+success-output = "immediate"
+
+# The same for `inbox/probe/046`, whose supported-export branch runs only on a
+# supported temp filesystem (GitHub Actions' lane 1, and RWX's under
+# scripts/rwx-export-root.sh), so a passing run shows
+# which branch it passed.
+[[profile.default.overrides]]
+filter = 'test(=probe_046_attached_dashboard_shows_clears_and_retires_held_typing)'
+success-output = "immediate"
+
 # `orchestration/delegate/012` compares a 650 ms stand-in readiness window
 # against a 1000 ms buffer, with a strict 500–900 ms measurement precondition.
 # A contended fast run observed 2.895 s with 88% I/O starvation; the same
@@ -237,6 +251,42 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 [[profile.default.overrides]]
 filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# Eighteen sequential menu recordings (two pinned releases; three dark sizes,
+# indexed light and five 50x200 palettes) took about 160s for the eight
+# size/theme recordings and 210s for the ten palette recordings, run apart.
+# A third release (2.1.317, 2026-11-03) makes twenty-seven, about 560s at
+# that rate, so the window is 900s.
+[[profile.default.overrides]]
+filter = 'test(doorbell_036_live_release_menu_frames)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
+# One release's nine menu recordings on its own (2.1.318, 2026-11-04), about
+# 190s at the rate above, and the history-recall acquisition: four recordings
+# (2.1.317 and 2.1.318 at 50x200 and 24x80), 178s in the run that recorded
+# its fixtures. Both are past the 180s default, so each gets 480s.
+[[profile.default.overrides]]
+filter = 'test(doorbell_036_live_release_318_menu_frames) | test(doorbell_036_live_release_history_recall_frames)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+# Q143b (2026-11-04): each `doorbell_036_live_release_31[78]_history_submit_*`
+# test takes twenty recordings (five trials at each of two sizes, with one
+# and with four Ctrl+U presses), each a history-recall walk of about 45s at
+# the history acquisition's rate above, so about 900s; each gets 1800s.
+[[profile.default.overrides]]
+filter = 'test(/^doorbell_036_live_release_31[78]_history_submit_/)'
+slow-timeout = { period = "60s", terminate-after = 30 }
+
+# Q147b (2026-11-04): `doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running`
+# repeats a held task, a check and a Ctrl+C inside it until twenty Ctrl+C
+# presses have landed (at most thirty-two trials, four to a deck, since a test
+# deck's daemon stops after 300s), each trial a Haiku turn of about 40s plus
+# about 40s to start each deck: the 180s default stopped its first lane-2 run
+# after four trials. Thirty-two trials on eight decks are about 1600s, so it
+# gets 2400s.
+[[profile.default.overrides]]
+filter = 'test(=doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running)'
+slow-timeout = { period = "60s", terminate-after = 40 }
 
 # PRD #1631: `codex/hooks/001` drives one real interactive Codex turn, behind
 # `check_codex_available`'s preflight. In that PRD's lane-2 run, on a box with
@@ -285,6 +335,15 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 [[profile.default.overrides]]
 filter = 'binary(e2e_inbox_opencode_live)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# PRD #1666 part 3: `tests/e2e_inbox_load.rs` gives each real agent an absolute
+# window (240s native, 300s Codex) under CPU pressure and asks for a timeout
+# above 360s. `load_002` (OpenCode) was killed at the default 3 x 60s with its
+# work done (it passed in 298.66s when run alone, 2026-10-31). Binary-wide, as
+# the file asks, so the other three load scenarios get the same window.
+[[profile.default.overrides]]
+filter = 'binary(e2e_inbox_load)'
+slow-timeout = { period = "60s", terminate-after = 7 }
 
 # Issue #1094: the real-Claude `pane restart` / `pane spawn` tests boot up to
 # two interactive Claude generations and run one delegated turn in sequential
@@ -651,6 +710,17 @@ slow-timeout = { period = "60s", terminate-after = 9 }
 filter = 'test(voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
+# `voice_desktop_phrases_006_a_named_start_target_is_read_by_the_real_judge`
+# (same file) sends 16 sentences x 10 pairs x 2 votes = 320 requests to the
+# real backend, two in flight. Measured 2026-11-04 on `gpt-5-mini`: ~238 of
+# them in the default 3 x 60s, every vote so far correct, so the default
+# killed a run that was passing (twice, in two runs). Like 001 above it
+# reaches a model only with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and a key, and
+# 8 x 60s stays bounded. The filter tracks the TEST FUNCTION name.
+[[profile.default.overrides]]
+filter = 'test(voice_desktop_phrases_006_a_named_start_target_is_read_by_the_real_judge)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # `codex/worker/001` drives a REAL Codex orchestration worker through a
 # delegated task and its `work-done`. Alone it takes 26-110s; beside other
 # real-agent tests it was killed at the default 3 x 60s with no diagnostics (met
@@ -748,3 +818,86 @@ slow-timeout = { period = "60s", terminate-after = 12 }
 [[profile.default.overrides]]
 filter = 'test(question_live_006_pi_extension_select_without_model)'
 slow-timeout = { period = "60s", terminate-after = 6 }
+
+# PRD #1666 part 3 (A-20d-7): the screen-freshness measurement watches a
+# real Claude Code idle for a minute, then asks 75 probes one at a time, each
+# after the last one's redraws stopped and a random wait of up to 2.5 s;
+# measured at about 250 s. Its daemon's self-exit cap is 900 s, above this
+# 840 s window.
+[[profile.default.overrides]]
+filter = 'test(probe_083_claude_idle_screen_freshness_refusal_rate)'
+slow-timeout = { period = "60s", terminate-after = 14 }
+
+# PRD #1666 part 3, activation: the editor-probe measurements of a pinned
+# Claude Code release (`tests/e2e_claude_editor_measure.rs`, lane 2). The
+# ten-minute keymap sample and the wire-form catalog (six states, twelve
+# forms, whole and split, plus paste cells) are the long ones; the rest
+# launch Claude a few times each.
+[[profile.default.overrides]]
+filter = 'test(/^probe_088_live_claude_31[78]_/)'
+slow-timeout = { period = "60s", terminate-after = 16 }
+
+[[profile.default.overrides]]
+filter = 'test(/^probe_089_live_claude_31[78]_ctrl_g_forms$/)'
+slow-timeout = { period = "60s", terminate-after = 28 }
+
+# PRD #1666 part 3, U4: Codex 0.164.0's editor-probe, E1F and M58r
+# measurements (`tests/e2e_codex_editor_measure.rs`, lane 2), measured at
+# about 1 min (editor), 25 s (start-up), 2.5 min (E1F, 60 presses), 2 min
+# (nineteen keymap launches) and 4.5 min (the wire-form catalog).
+[[profile.default.overrides]]
+filter = 'test(/^probe_09[234]_live_codex_164_/)'
+slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The Codex M59 cells (`tests/e2e_codex_helper_alarm.rs`, lane 2): the
+# unarmed cell's eleven eight-second edits measured at about 160 s.
+[[profile.default.overrides]]
+filter = 'test(/^probe_095_live_codex_164_/)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+# PRD #1666 part 3, Codex Go: Codex 0.164.0's `head_echo`
+# (`tests/e2e_codex_release_measure.rs`, lane 2). Each run is one harness deck
+# (300 s cap) whose recorder waits at most 280 s; five staged rings with their
+# real model turns measured at about 100–200 s.
+[[profile.default.overrides]]
+filter = 'test(/^doorbell_036_live_codex_164_head_echo_/)'
+slow-timeout = { period = "60s", terminate-after = 6 }
+
+# M59 (`tests/e2e_claude_helper_alarm.rs`, lane 2): ten Ctrl+G trials per
+# cell on a real Claude Code, the unarmed cell's editor sleeping 8 s each.
+[[profile.default.overrides]]
+filter = 'test(/^probe_090_live_claude_31[78]_/)'
+slow-timeout = { period = "60s", terminate-after = 9 }
+
+# PRD #1666 part 3, Q35-28's lane-2 gates on a real installed Claude Code
+# (`tests/e2e_composer_check_claude_live.rs`, `tests/e2e_editor_installation_claude_live.rs`).
+# `040` launches a fresh deck per trial (20 by default; the late-helper path
+# holds each check 11 s); each deck's daemon has its own 300 s cap. `042` and
+# `044` run one deck each, inside that cap.
+[[profile.default.overrides]]
+filter = 'test(/^probe_040_live_/)'
+slow-timeout = { period = "60s", terminate-after = 20 }
+
+[[profile.default.overrides]]
+filter = 'test(/^probe_04[24]_live_/)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# PRD #1666 part 3, Q35-29's lane-2 gates on a real installed Codex
+# (`tests/e2e_composer_check_codex_live.rs`, `tests/e2e_chain_smoke_codex.rs`):
+# `041` launches a fresh deck per trial as `040` does (Codex starts slower,
+# and the late-helper path holds each check 11 s); `043` and
+# `chain-smoke/codex/001` run one deck each, inside its daemon's 300 s cap.
+[[profile.default.overrides]]
+filter = 'test(/^probe_041_live_/)'
+slow-timeout = { period = "60s", terminate-after = 30 }
+
+[[profile.default.overrides]]
+filter = 'test(/^probe_043_live_/) | test(codex_001_touched_box_checked_then_delegate_delivered_once)'
+slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The five `inbox/doorbell/010` live cases re-oracled to the installed pane's
+# checks (`tests/e2e_inbox_claude_live.rs`): each waits for a check before its
+# five-second hold, and the kept-draft case runs three decks in turn.
+[[profile.default.overrides]]
+filter = 'test(/^doorbell_010_live_(kept_draft|spaces_only|spaces_moved_back|blanks_enter|reviewer_sequence)/)'
+slow-timeout = { period = "60s", terminate-after = 5 }

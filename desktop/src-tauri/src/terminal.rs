@@ -727,12 +727,10 @@ fn rejection_notice(reason: &[u8]) -> Vec<u8> {
             }
         })
         .collect::<String>();
-    let reason = if reason.trim().is_empty() {
-        "the daemon refused terminal input"
-    } else {
-        reason.trim()
-    };
-    format!("\r\n[agent-deck] terminal input rejected: {reason}\r\n").into_bytes()
+    // The TUI's words for the same refusal (PRD #1666 part 3 Q15-2,
+    // CLAUDE.md rule 22); an unknown reason is shown after it, made safe above.
+    let words = dot_agent_deck::inbox_display::input_rejected(&reason);
+    format!("\r\n[agent-deck] {words}\r\n").into_bytes()
 }
 
 /// What [`establish`] hands [`attach`].
@@ -1520,13 +1518,35 @@ mod tests {
 
     #[test]
     fn stream_rejection_notice_is_bounded_sanitized_and_non_ansi() {
-        let notice = rejection_notice(b"history-only\n\x1b[31m");
+        let notice = rejection_notice(b"newer-reason\n\x1b[31m");
         let notice = String::from_utf8(notice).unwrap();
         assert_eq!(
             notice,
-            "\r\n[agent-deck] terminal input rejected: history-only [31m\r\n"
+            "\r\n[agent-deck] Input not delivered (newer-reason [31m)\r\n"
         );
         assert!(!notice.contains('\u{1b}'));
+    }
+
+    /// Scenario: Turn each refusal reason the daemon sends for typed input
+    /// into the desktop's in-tile notice, and compare it with the shared
+    /// fixture's `inputRejected` words, which the TUI's status line shows
+    /// too. `exited` and `write-failed` read the same in both clients, and a
+    /// refusal naming no reason still says the input was not delivered.
+    #[test]
+    fn stream_rejection_notice_uses_the_words_the_tui_shows() {
+        let words: serde_json::Value =
+            serde_json::from_str(include_str!("../../../tests/fixtures/inbox-display.json"))
+                .unwrap();
+        let reasons = words["inputRejected"].as_object().unwrap();
+        assert!(reasons.contains_key("exited") && reasons.contains_key("write-failed"));
+        for (reason, expected) in reasons {
+            let notice = String::from_utf8(rejection_notice(reason.as_bytes())).unwrap();
+            assert_eq!(
+                notice,
+                format!("\r\n[agent-deck] {}\r\n", expected.as_str().unwrap()),
+                "{reason:?}"
+            );
+        }
     }
 
     #[tokio::test]

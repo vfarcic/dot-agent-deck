@@ -1,0 +1,1058 @@
+//! PRD #1666 part 3 (Q35-13; plan §1.2): installation eligibility, decided
+//! before a spawn from facts known before it, and what an installed spawn
+//! gets.
+//!
+//! **The decision** ([`at_spawn`]) reads the platform, the pane's command
+//! class ([`pane_class`]) and the rollout, never a release: no basename,
+//! `PATH` lookup or version subprocess stands in for one, and the release a
+//! generation's header later reports decides only whether the deck may arm
+//! it ([`super::permission`]). The rollout is [`INSTALL_ROLLOUT`]
+//! (`Direct(Claude)` since the Claude activation; `Direct(Codex)` and
+//! `Launcher(Codex)` since the Codex activation), plus, in the `e2e` build
+//! only, the classes of the agents the e2e assumption names
+//! ([`assumed_classes`], Claude Code's alone). That assumption is read
+//! once, at daemon start ([`capture_assumption`]), where an unknown entry
+//! refuses the whole list and the daemon goes on with no assumption, so no
+//! generation is installed or armed by it; nothing reads the variable again.
+//! A production build reads no variable.
+//!
+//! **An installed spawn** gets the instance's private helper
+//! ([`super::instance`]) as `VISUAL` and `EDITOR`; the editor values it would
+//! otherwise have had, saved for the helper ([`SAVED_VISUAL_ENV`],
+//! [`SAVED_EDITOR_ENV`], each present only when the value was set, so unset
+//! and exported-empty stay apart); its generation's name
+//! ([`GENERATION_ENV`]); for a Claude-style class, `CLAUDE_ENV_FILE` naming a
+//! file that restores those values for Claude's Bash tool, then sources the
+//! user's own `CLAUDE_ENV_FILE` ([`env_file`]); and for a direct Codex,
+//! `-c shell_environment_policy.set.VISUAL=…` and `…EDITOR=…` appended to its
+//! command for the set values only, never an `exclude`, which would replace
+//! the user's own list ([`codex_policy_args`]). Shells are never installed.
+//! Any failure to set the helper up is [`NotInstalled::HelperSetup`], and the
+//! pane spawns exactly as it would without installation.
+
+use std::ffi::OsString;
+use std::path::Path;
+use std::sync::OnceLock;
+
+use semver::Version;
+
+use crate::doorbell_activation::EditorProbe;
+use crate::event::AgentType;
+
+#[cfg(target_os = "linux")]
+use super::instance::{GenerationFiles, Instance};
+
+/// Why an instance or one of its files couldn't be made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupError {
+    /// Every root's path holds a character outside `[A-Za-z0-9._/-]`, so an
+    /// agent splitting `VISUAL` on spaces couldn't run the helper there.
+    PathCharacters,
+    /// A directory on the way down from `/` is one another user could
+    /// change (see [`super::instance::open_root`]), or isn't a directory (a
+    /// symlink among them).
+    UntrustedDirectory,
+    /// The instance directory already exists: one is never reused.
+    InstanceExists,
+    /// The helper copy doesn't read as the executable it was copied from.
+    CopyMismatch,
+    /// A generation's name isn't one the instance files can carry.
+    GenerationName,
+    /// A file this generation needs exists already.
+    GenerationExists,
+    /// A value the spawn environment can't carry (not UTF-8).
+    NotUtf8,
+    /// An identity's install root doesn't read as the directory recorded.
+    InstallRoot,
+    /// A class that is never installed (a shell, an agent the probe doesn't
+    /// cover) was asked to be.
+    NotInstallable,
+    /// Something else failed, with its errno when there is one.
+    Io(Option<i32>),
+}
+
+impl From<std::io::Error> for SetupError {
+    fn from(error: std::io::Error) -> Self {
+        SetupError::Io(error.raw_os_error())
+    }
+}
+
+/// An agent the composer probe covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeAgent {
+    Claude,
+    Codex,
+}
+
+impl ProbeAgent {
+    /// The probe's agent for `agent`, if it covers it.
+    pub fn of(agent: &AgentType) -> Option<ProbeAgent> {
+        match agent {
+            AgentType::ClaudeCode => Some(ProbeAgent::Claude),
+            AgentType::Codex => Some(ProbeAgent::Codex),
+            _ => None,
+        }
+    }
+}
+
+/// A pane's command class, from its configuration and command alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PaneClass {
+    /// The command's own argv is the agent's: its first word is the agent's
+    /// executable, and it is a plain argv a shell runs as written.
+    Direct(ProbeAgent),
+    /// The agent, declared or recognised, runs below something else.
+    Launcher(ProbeAgent),
+    /// An undeclared command that isn't a shell and that no agent is
+    /// recognised in (R5 §10.3).
+    Wrapper,
+    /// An agent the probe doesn't cover (OpenCode, Pi, Devin).
+    Unprobed,
+    /// A shell, or no command at all (the user's shell). Never installed.
+    Shell,
+}
+
+/// The shells a pane's first word is never installed under, by basename.
+pub const SHELLS: &[&str] = &["bash", "zsh", "fish", "sh", "dash", "nu", "pwsh"];
+
+/// The classes installation has rolled out to. The Claude activation
+/// (Q35-28) added `Direct(Claude)` only; the Codex activation (Q35-29) added
+/// `Direct(Codex)` and `Launcher(Codex)`. Q35-22 gave every class its
+/// binding (the shared discovery, [`super::discovery`]); `Launcher(Claude)`
+/// and `Wrapper` wait for their own rollout
+/// (`docs/develop/doorbell-admission.md`). A launched Codex gets the helper
+/// and the export directory's preparation ([`prepare_codex_export`]) but not
+/// the shell tool's policy arguments, which only a direct Codex's own argv
+/// can take, and its
+/// key-binding baseline is read from the launcher's arguments: where the
+/// native's launch differs, the generation is held, never checked.
+/// Installation is Linux-only whatever this holds: [`at_spawn`] returns
+/// [`NotInstalled::Platform`] on any other host.
+pub const INSTALL_ROLLOUT: &[PaneClass] = &[
+    PaneClass::Direct(ProbeAgent::Claude),
+    PaneClass::Direct(ProbeAgent::Codex),
+    PaneClass::Launcher(ProbeAgent::Codex),
+];
+
+/// The class of a pane running `command`, its agent declared as `declared`.
+pub fn pane_class(command: Option<&str>, declared: Option<&AgentType>) -> PaneClass {
+    let Some(command) = command.map(str::trim).filter(|c| !c.is_empty()) else {
+        return PaneClass::Shell;
+    };
+    let tokens = crate::event::tokenize_command(command);
+    let Some(first) = tokens.iter().find(|t| !crate::event::is_env_assignment(t)) else {
+        return PaneClass::Shell;
+    };
+    let basename = Path::new(first)
+        .file_name()
+        .and_then(|b| b.to_str())
+        .unwrap_or_default();
+    if SHELLS.contains(&basename) {
+        return PaneClass::Shell;
+    }
+    let agent = declared
+        .filter(|a| **a != AgentType::None)
+        .cloned()
+        .or_else(|| AgentType::from_command(Some(command)));
+    let Some(agent) = agent.filter(|a| *a != AgentType::None) else {
+        return PaneClass::Wrapper;
+    };
+    let Some(probe) = ProbeAgent::of(&agent) else {
+        return PaneClass::Unprobed;
+    };
+    let own = crate::agent_registry::spec(&agent)
+        .detect_basenames
+        .contains(&basename);
+    if own && first == &tokens[0] && plain_argv(command) {
+        PaneClass::Direct(probe)
+    } else {
+        PaneClass::Launcher(probe)
+    }
+}
+
+/// Whether a shell runs `command` as one argv that ends where the command
+/// does, so arguments appended to it reach its program: no control operator,
+/// grouping, redirection, comment, substitution or newline.
+fn plain_argv(command: &str) -> bool {
+    !command.contains(['\n', ';', '&', '|', '(', ')', '<', '>', '#', '`', '\\'])
+        && !command.contains("$(")
+}
+
+/// The classes the e2e assumption's agents roll out to: Claude Code's
+/// launcher and wrapper classes, which no activation has rolled out yet.
+/// Codex's are in [`INSTALL_ROLLOUT`] since the Codex activation, so the
+/// assumption names no Codex release and adds none.
+pub fn assumed_classes(assumed: &[(AgentType, Version, EditorProbe<'_>)]) -> Vec<PaneClass> {
+    let mut classes = Vec::new();
+    for (agent, _, _) in assumed {
+        let more: &[PaneClass] = match ProbeAgent::of(agent) {
+            Some(ProbeAgent::Claude) => &[
+                PaneClass::Direct(ProbeAgent::Claude),
+                PaneClass::Launcher(ProbeAgent::Claude),
+                PaneClass::Wrapper,
+            ],
+            Some(ProbeAgent::Codex) | None => &[],
+        };
+        for class in more {
+            if !classes.contains(class) {
+                classes.push(*class);
+            }
+        }
+    }
+    classes
+}
+
+type Assumption = Vec<(AgentType, Version, EditorProbe<'static>)>;
+
+static ASSUMPTION: OnceLock<Assumption> = OnceLock::new();
+
+/// Read the e2e assumption once, at daemon start, through
+/// [`crate::doorbell_activation::assumed_editor_probes`], which logs
+/// `editor probe assumption refused` and assumes nothing for a list with an
+/// unknown entry. Later calls return what the first read.
+pub fn capture_assumption() -> &'static [(AgentType, Version, EditorProbe<'static>)] {
+    ASSUMPTION.get_or_init(crate::doorbell_activation::assumed_editor_probes)
+}
+
+/// What [`capture_assumption`] read, or nothing when it hasn't run.
+pub fn captured_assumption() -> &'static [(AgentType, Version, EditorProbe<'static>)] {
+    ASSUMPTION.get().map_or(&[], Vec::as_slice)
+}
+
+/// Why a spawn isn't installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotInstalled {
+    /// Shells never are.
+    Shell,
+    /// The class isn't in the rollout.
+    Rollout,
+    /// Not on this platform yet.
+    Platform,
+    /// The helper couldn't be set up.
+    HelperSetup(SetupError),
+    /// The user turned the doorbell off for the pane's agent
+    /// ([`crate::doorbell_switch`]); an undeclared wrapper, whose agent is not
+    /// known yet, while either agent's is off.
+    TurnedOff,
+}
+
+/// Whether `switch` leaves `class` installable: the class's agent's switch
+/// on, and for an undeclared wrapper, both.
+pub fn switched_on(
+    class: PaneClass,
+    switch: &crate::doorbell_switch::DoorbellSwitch,
+) -> Result<(), NotInstalled> {
+    let on = match class {
+        PaneClass::Direct(ProbeAgent::Claude) | PaneClass::Launcher(ProbeAgent::Claude) => {
+            switch.claude
+        }
+        PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex) => {
+            switch.codex
+        }
+        PaneClass::Wrapper => switch.claude && switch.codex,
+        PaneClass::Unprobed | PaneClass::Shell => true,
+    };
+    if on {
+        Ok(())
+    } else {
+        Err(NotInstalled::TurnedOff)
+    }
+}
+
+/// Whether `class` is installed under `rollout`.
+pub fn eligible(class: PaneClass, rollout: &[PaneClass]) -> Result<(), NotInstalled> {
+    match class {
+        PaneClass::Shell => Err(NotInstalled::Shell),
+        _ if rollout.contains(&class) => Ok(()),
+        _ => Err(NotInstalled::Rollout),
+    }
+}
+
+/// The variable naming an installed spawn's generation.
+pub const GENERATION_ENV: &str = "DOT_AGENT_DECK_EDITOR_GEN";
+/// The spawn's own `VISUAL`, present only when it was set.
+pub const SAVED_VISUAL_ENV: &str = "DOT_AGENT_DECK_EDITOR_USER_VISUAL";
+/// The spawn's own `EDITOR`, present only when it was set.
+pub const SAVED_EDITOR_ENV: &str = "DOT_AGENT_DECK_EDITOR_USER_EDITOR";
+/// The helper's variables, which every spawn's child starts without, so one
+/// left in the daemon's environment never names another daemon's instance.
+pub const HELPER_ENV: [&str; 3] = [GENERATION_ENV, SAVED_VISUAL_ENV, SAVED_EDITOR_ENV];
+/// The prefix reserved for the helper's variables: a spawn's child inherits
+/// none from the daemon, whatever the rest of the name (see [`HELPER_ENV`]).
+pub const HELPER_ENV_PREFIX: &str = "DOT_AGENT_DECK_EDITOR_";
+
+/// Whether `name` is reserved for the helper ([`HELPER_ENV_PREFIX`]).
+pub fn helper_reserved(name: &std::ffi::OsStr) -> bool {
+    name.as_encoded_bytes()
+        .starts_with(HELPER_ENV_PREFIX.as_bytes())
+}
+
+/// The editor settings a spawn would have had without installation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Originals {
+    pub visual: Option<String>,
+    pub editor: Option<String>,
+    pub claude_env_file: Option<String>,
+}
+
+impl Originals {
+    /// What the child would see: the spawn's own value (the last, as the
+    /// spawn applies them in order), else the one `inherited` gives.
+    pub fn resolve(
+        env: &[(String, String)],
+        inherited: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Originals, SetupError> {
+        let value = |name: &str| match env.iter().rev().find(|(k, _)| k == name) {
+            Some((_, v)) => Ok(Some(v.clone())),
+            None => inherited(name)
+                .map(|v| v.into_string().map_err(|_| SetupError::NotUtf8))
+                .transpose(),
+        };
+        Ok(Originals {
+            visual: value("VISUAL")?,
+            editor: value("EDITOR")?,
+            claude_env_file: value("CLAUDE_ENV_FILE")?,
+        })
+    }
+}
+
+/// The editor settings the helper restores, read from its environment.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SavedEditor {
+    pub visual: Option<OsString>,
+    pub editor: Option<OsString>,
+}
+
+/// The saved editor settings in an environment `get` reads.
+pub fn saved_editor(get: impl Fn(&str) -> Option<OsString>) -> SavedEditor {
+    SavedEditor {
+        visual: get(SAVED_VISUAL_ENV),
+        editor: get(SAVED_EDITOR_ENV),
+    }
+}
+
+/// `s` quoted for a POSIX shell: in single quotes, each `'` as `'\''`.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// `s` as a TOML basic string.
+fn toml_string(s: &str) -> String {
+    let mut out = String::from('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04X}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The `CLAUDE_ENV_FILE` of a Claude-style generation: `VISUAL` and `EDITOR`
+/// back as they were (exported, exported empty, or unset), then the user's
+/// own `CLAUDE_ENV_FILE`, if they had one, sourced after, so what it sets
+/// still wins.
+pub fn env_file(originals: &Originals) -> Vec<u8> {
+    let mut s = String::from("# dot-agent-deck: the editor settings this agent started with.\n");
+    for (name, value) in [("VISUAL", &originals.visual), ("EDITOR", &originals.editor)] {
+        match value {
+            Some(v) => s.push_str(&format!("export {name}={}\n", shell_quote(v))),
+            None => s.push_str(&format!("unset {name}\n")),
+        }
+    }
+    if let Some(theirs) = originals
+        .claude_env_file
+        .as_deref()
+        .filter(|p| !p.is_empty())
+    {
+        s.push_str(&format!(". {}\n", shell_quote(theirs)));
+    }
+    s.into_bytes()
+}
+
+/// A direct Codex's arguments giving its shell tool the set editor values.
+pub fn codex_policy_args(originals: &Originals) -> Vec<String> {
+    [("VISUAL", &originals.visual), ("EDITOR", &originals.editor)]
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let value = value.as_deref()?;
+            Some([
+                "-c".to_string(),
+                format!("shell_environment_policy.set.{name}={}", toml_string(value)),
+            ])
+        })
+        .flatten()
+        .collect()
+}
+
+/// `command` with `args` appended, each quoted.
+pub fn with_args(command: &str, args: &[String]) -> String {
+    let mut out = command.to_string();
+    for arg in args {
+        out.push(' ');
+        out.push_str(&shell_quote(arg));
+    }
+    out
+}
+
+/// What installation gives a spawn, and the generation's files while it
+/// lives.
+#[derive(Debug)]
+pub struct Installation {
+    class: PaneClass,
+    env: Vec<(String, String)>,
+    args: Vec<String>,
+    #[cfg(target_os = "linux")]
+    files: GenerationFiles,
+    /// The instance directory and its helper copy's `(dev, ino)`, for the
+    /// daemon's observer (Q35-14b).
+    #[cfg(target_os = "linux")]
+    instance_dir: std::path::PathBuf,
+    #[cfg(target_os = "linux")]
+    helper_id: super::classifier::FileId,
+    /// The argv the deck executed as the generation's PTY child, once it
+    /// spawned: the launch provenance that binds `A` (Q84).
+    #[cfg(target_os = "linux")]
+    launch: Vec<OsString>,
+    /// The generation's key-binding sources as read before its spawn
+    /// (A-20d-1b): what the observer compares each later read with.
+    #[cfg(target_os = "linux")]
+    keymap_baseline: Option<super::keymap::KeymapBaseline>,
+    /// Q35-27: why Codex's export directory was refused before the spawn
+    /// ([`prepare_codex_export`]), as the card shows it.
+    export_hold: Option<crate::inbox_display::HoldDetail>,
+    /// The agent executables pinned at spawn (Q35-22, Q102b): what the
+    /// observer's discovery compares a candidate with.
+    #[cfg(target_os = "linux")]
+    pins: super::discovery::Pins,
+    /// A test's stand-in for the bound agent's `/proc/<pid>/environ`
+    /// (reva21 U1-1): the test binds `A` to its own process, whose
+    /// environment is the test runner's, not the one the deck's spawn gave.
+    #[cfg(all(test, target_os = "linux"))]
+    bound_environ: Option<Vec<(OsString, OsString)>>,
+}
+
+impl Installation {
+    /// The class installed.
+    pub fn class(&self) -> PaneClass {
+        self.class
+    }
+
+    /// The variables the spawn gets.
+    pub fn env(&self) -> &[(String, String)] {
+        &self.env
+    }
+
+    /// The arguments appended to the spawn's command.
+    pub fn args(&self) -> &[String] {
+        &self.args
+    }
+
+    /// The generation's files.
+    #[cfg(target_os = "linux")]
+    pub fn files(&mut self) -> &mut GenerationFiles {
+        &mut self.files
+    }
+
+    /// The instance directory the generation's files are in.
+    #[cfg(target_os = "linux")]
+    pub fn instance_dir(&self) -> &Path {
+        &self.instance_dir
+    }
+
+    /// The helper copy's `(dev, ino)`: what an agent's helper runs.
+    #[cfg(target_os = "linux")]
+    pub fn helper_id(&self) -> super::classifier::FileId {
+        self.helper_id
+    }
+
+    /// Record the argv the deck executed as the generation's PTY child.
+    #[cfg(target_os = "linux")]
+    pub fn set_launch(&mut self, argv: Vec<OsString>) {
+        self.launch = argv;
+    }
+
+    /// The argv the deck executed as the PTY child; empty before the spawn.
+    #[cfg(target_os = "linux")]
+    pub fn launch(&self) -> &[OsString] {
+        &self.launch
+    }
+
+    /// Read the generation's key-binding sources now, before its spawn
+    /// (A-20d-1b), for the agents its class may run: the spawn's own
+    /// variables `env` over the daemon's, the arguments of `command` (the
+    /// command the pane will run, this installation's arguments included)
+    /// and the directory the child starts in ([`spawn_start_dir`]: `cwd`,
+    /// or the child's `HOME` when `cwd` is `None` or isn't a directory).
+    /// File I/O: call it off the executor, with no lock held.
+    #[cfg(target_os = "linux")]
+    pub fn read_keymap_baseline(
+        &mut self,
+        command: Option<&str>,
+        env: &[(String, String)],
+        cwd: Option<&str>,
+    ) {
+        let (claude, codex) = match self.class {
+            PaneClass::Direct(ProbeAgent::Claude) | PaneClass::Launcher(ProbeAgent::Claude) => {
+                (true, false)
+            }
+            PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex) => {
+                (false, true)
+            }
+            PaneClass::Wrapper => (true, true),
+            PaneClass::Unprobed | PaneClass::Shell => (false, false),
+        };
+        let args: Vec<OsString> = command
+            .and_then(super::observe::shell_words)
+            .map(|words| words.into_iter().skip(1).map(OsString::from).collect())
+            .unwrap_or_default();
+        let lookup = |name: &str| {
+            env.iter()
+                .rev()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| OsString::from(v))
+                .or_else(|| std::env::var_os(name))
+        };
+        let here = std::env::current_dir().unwrap_or_default();
+        let cwd = spawn_start_dir(cwd, lookup, &here);
+        // Q35-22 (loc10's window): the daemon's own startup trust write may
+        // still be writing a Codex source; the baseline is read after it,
+        // since a write after the baseline refuses every check of the
+        // generation. Bounded: past it the baseline is read anyway.
+        if codex && !crate::codex_hooks_manage::await_startup_trust() {
+            tracing::info!(
+                target: "composer_probe",
+                "Codex's startup trust write outlasted its wait; the key-binding baseline is read now"
+            );
+        }
+        self.keymap_baseline = Some(super::keymap::KeymapBaseline::at_spawn(
+            claude, codex, lookup, &args, &cwd,
+        ));
+    }
+
+    /// Pin, now, before the spawn (Q35-22, Q102b), the agent executables the
+    /// generation's class may run, from the `PATH` its PTY child gets: the
+    /// spawn's own over the daemon's ([`super::discovery::pin_at_spawn`]).
+    /// `command` is the command the pane will run. File I/O: call it off
+    /// the executor, with no lock held.
+    #[cfg(target_os = "linux")]
+    pub fn pin_natives(&mut self, command: Option<&str>, env: &[(String, String)]) {
+        let path = env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| OsString::from(v))
+            .or_else(|| std::env::var_os("PATH"));
+        self.pins = super::discovery::pin_at_spawn(self.class, command, path.as_deref());
+    }
+
+    /// The pins taken at spawn, taken by the observer.
+    #[cfg(target_os = "linux")]
+    pub fn take_pins(&mut self) -> super::discovery::Pins {
+        std::mem::take(&mut self.pins)
+    }
+
+    /// Set the pins the spawn path takes ([`Self::pin_natives`]), for a test
+    /// that builds an installation without spawning.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn set_pins(&mut self, pins: super::discovery::Pins) {
+        self.pins = pins;
+    }
+
+    /// Set the baseline the spawn path reads ([`Self::read_keymap_baseline`]),
+    /// for a test that builds an installation without spawning.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn set_keymap_baseline(&mut self, baseline: super::keymap::KeymapBaseline) {
+        self.keymap_baseline = Some(baseline);
+    }
+
+    /// Read `environ` as the bound agent's environment rather than its
+    /// `/proc/<pid>/environ`, for a test whose `A` is its own process.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn set_bound_environ_for_test(&mut self, environ: Vec<(OsString, OsString)>) {
+        self.bound_environ = Some(environ);
+    }
+
+    /// The test's stand-in environment, taken by the observer.
+    #[cfg(all(test, target_os = "linux"))]
+    pub fn take_bound_environ_for_test(&mut self) -> Option<Vec<(OsString, OsString)>> {
+        self.bound_environ.take()
+    }
+
+    /// Q35-27: why Codex's export directory was refused before the spawn
+    /// ([`prepare_codex_export`]); `None` when it wasn't, or when this class
+    /// doesn't prepare it.
+    pub fn export_hold(&self) -> Option<&crate::inbox_display::HoldDetail> {
+        self.export_hold.as_ref()
+    }
+
+    /// The refusal [`Self::export_hold`] reads, taken by the observer.
+    pub fn take_export_hold(&mut self) -> Option<crate::inbox_display::HoldDetail> {
+        self.export_hold.take()
+    }
+
+    /// Set [`Self::export_hold`], for a test that builds an installation
+    /// without spawning.
+    #[cfg(test)]
+    pub fn set_export_hold_for_test(&mut self, hold: crate::inbox_display::HoldDetail) {
+        self.export_hold = Some(hold);
+    }
+
+    /// The baseline read before the spawn, taken by the observer.
+    #[cfg(target_os = "linux")]
+    pub fn take_keymap_baseline(&mut self) -> Option<super::keymap::KeymapBaseline> {
+        self.keymap_baseline.take()
+    }
+
+    /// `env` with the editor variables replaced by this installation's.
+    pub fn apply_env(&self, env: &mut Vec<(String, String)>) {
+        env.retain(|(k, _)| {
+            !self.env.iter().any(|(set, _)| set == k) && !HELPER_ENV.contains(&k.as_str())
+        });
+        env.extend(self.env.iter().cloned());
+    }
+
+    /// `command` with this installation's arguments, when it has any.
+    ///
+    /// A direct Codex's command also gets Codex's embedded-mode pair
+    /// (`crate::wrap::CODEX_EMBEDDED_ARGS`) right after its executable,
+    /// unless its own arguments already open with it, so every launch shape
+    /// carries one argv: the wrapper's plain launch finds the pair there and
+    /// adds no second one, and a value holding shell syntax, which sends the
+    /// command through the wrapper's shell, where the wrapper adds nothing,
+    /// still carries it. The pair stays ahead of the editor settings, which a
+    /// later override at the same path would otherwise be replaced by.
+    pub fn command(&self, command: Option<&str>) -> Option<String> {
+        if self.args.is_empty() {
+            return None;
+        }
+        let command = command?;
+        if self.class == PaneClass::Direct(ProbeAgent::Codex)
+            && let Some(end) = first_word_end(command)
+        {
+            let tokens = crate::event::tokenize_command(command);
+            if !crate::wrap::opens_with_codex_embedded_args(tokens.get(1..).unwrap_or_default()) {
+                let pair: Vec<String> = crate::wrap::CODEX_EMBEDDED_ARGS
+                    .iter()
+                    .map(|arg| arg.to_string())
+                    .collect();
+                let head = with_args(&command[..end], &pair);
+                return Some(with_args(&format!("{head}{}", &command[end..]), &self.args));
+            }
+        }
+        Some(with_args(command, &self.args))
+    }
+
+    /// The generation's files, for the daemon's observer to hold for the
+    /// generation's life (Q35-14b).
+    #[cfg(target_os = "linux")]
+    pub fn into_files(self) -> GenerationFiles {
+        self.files
+    }
+}
+
+/// Where `command`'s first word ends, as a shell splits a command
+/// [`pane_class`] calls a direct agent's: blanks separate words, and quotes
+/// keep blanks inside a word. No backslash is read, since such a command
+/// has none. `None` for an empty command or an unterminated quote.
+fn first_word_end(command: &str) -> Option<usize> {
+    let bytes = command.as_bytes();
+    let mut i = bytes.iter().position(|b| !b.is_ascii_whitespace())?;
+    let mut quote = None;
+    while i < bytes.len() {
+        match (quote, bytes[i]) {
+            (None, b) if b.is_ascii_whitespace() => break,
+            (None, q @ (b'\'' | b'"')) => quote = Some(q),
+            (Some(q), b) if b == q => quote = None,
+            _ => {}
+        }
+        i += 1;
+    }
+    quote.is_none().then_some(i)
+}
+
+/// Install generation `generation`, of class `class`, in `instance`: its
+/// files, and the variables and arguments its spawn gets.
+#[cfg(target_os = "linux")]
+pub fn install(
+    instance: &Instance,
+    class: PaneClass,
+    generation: &str,
+    originals: &Originals,
+) -> Result<Installation, SetupError> {
+    let (kind, claude_style) = match class {
+        PaneClass::Direct(agent) | PaneClass::Launcher(agent) => {
+            (Some(agent), agent == ProbeAgent::Claude)
+        }
+        PaneClass::Wrapper => (None, true),
+        PaneClass::Unprobed | PaneClass::Shell => return Err(SetupError::NotInstallable),
+    };
+    let env_contents = claude_style.then(|| env_file(originals));
+    let files = instance.generation(generation, kind, env_contents.as_deref())?;
+    let helper = instance
+        .helper()
+        .to_str()
+        .ok_or(SetupError::NotUtf8)?
+        .to_string();
+    let mut env = vec![
+        ("VISUAL".to_string(), helper.clone()),
+        ("EDITOR".to_string(), helper),
+        (GENERATION_ENV.to_string(), generation.to_string()),
+    ];
+    for (name, value) in [
+        (SAVED_VISUAL_ENV, &originals.visual),
+        (SAVED_EDITOR_ENV, &originals.editor),
+    ] {
+        if let Some(value) = value {
+            env.push((name.to_string(), value.clone()));
+        }
+    }
+    if let Some(path) = files.env_file() {
+        let path = path.to_str().ok_or(SetupError::NotUtf8)?;
+        env.push(("CLAUDE_ENV_FILE".to_string(), path.to_string()));
+    }
+    let args = match class {
+        PaneClass::Direct(ProbeAgent::Codex) => codex_policy_args(originals),
+        _ => Vec::new(),
+    };
+    Ok(Installation {
+        class,
+        env,
+        args,
+        files,
+        instance_dir: instance.dir().to_path_buf(),
+        helper_id: instance.helper_id(),
+        launch: Vec::new(),
+        keymap_baseline: None,
+        export_hold: None,
+        pins: Default::default(),
+        #[cfg(all(test, target_os = "linux"))]
+        bound_environ: None,
+    })
+}
+
+/// Option P with option C (Q35-27; R6 §6.6, core §6.2) for a direct Codex,
+/// before its spawn: Codex's export directory, `editor` in its home
+/// (`$CODEX_HOME`, else `$HOME/.codex`, as `lookup` gives the spawn's
+/// variables over the daemon's), created 0700 when absent, and checked by
+/// the export path rule when present. `None` when the rule passes it, when
+/// Codex's home doesn't exist yet (nothing is created then), or when the
+/// home can't be resolved as Codex would (`super::keymap::codex_home`): the
+/// export is then left to the rule when it is read; so it is, after a log
+/// line, when the rule refuses Codex's home or a directory above it, where
+/// nothing is created. `Some` is a refusal of `editor` itself, as the card
+/// shows it, and the generation is held.
+///
+/// A direct or a launched Codex (the revcxact review's MEDIUM-1). A launcher
+/// may give Codex another home, which the deck can't see before the spawn,
+/// but such a generation is never checked: its settlement compares the
+/// key-binding sources under the home the bound native's own environment
+/// names with the spawn's (`KeymapBaseline::codex_bound`), so another home
+/// holds `Keymap(Changed)`. What this prepares is then either the directory
+/// the checked Codex uses or an empty 0700 one nothing reads; without it, a
+/// launched Codex's first check made Codex create `editor` itself, 0775
+/// under a umask of 0002, which the path rule refuses.
+#[cfg(target_os = "linux")]
+pub fn prepare_codex_export(
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Option<crate::inbox_display::HoldDetail> {
+    let Some(home) = super::keymap::codex_home(&lookup) else {
+        tracing::info!(
+            target: "composer_probe",
+            "codex editor directory not prepared: codex home not resolved"
+        );
+        return None;
+    };
+    // PRD #1487: the one write into another program's configuration, so a
+    // test process that didn't isolate the agent's home writes nothing.
+    let dir = home.join(super::path_rule::CODEX_EDITOR_DIR);
+    if let Err(refused) = crate::config_write_guard::ensure_config_write_allowed(&dir) {
+        tracing::warn!(
+            target: "composer_probe",
+            dir = %dir.display(),
+            error = %refused,
+            "codex editor directory not prepared: the write isn't allowed here"
+        );
+        return None;
+    }
+    // SAFETY: getuid can't fail.
+    let uid = unsafe { libc::getuid() };
+    prepare_codex_export_at(
+        &mut crate::platform::fsperm::fs_view::LinuxFsView,
+        &home,
+        uid,
+    )
+}
+
+/// [`prepare_codex_export`] for Codex's home `home` through `view`, as user
+/// `uid`, logging what it found or did; a refusal's line names the
+/// directory and the exact remedy.
+pub fn prepare_codex_export_at<V: super::path_rule::MakeDir>(
+    view: &mut V,
+    home: &Path,
+    uid: u32,
+) -> Option<crate::inbox_display::HoldDetail> {
+    use super::path_rule::Prepared;
+    let dir = home.join(super::path_rule::CODEX_EDITOR_DIR);
+    match super::path_rule::prepare_codex_editor(view, home, uid) {
+        Ok(Prepared::Created) => {
+            tracing::info!(
+                target: "composer_probe",
+                dir = %dir.display(),
+                "codex editor directory created, mode 0700"
+            );
+            None
+        }
+        Ok(Prepared::Existing) => {
+            tracing::debug!(
+                target: "composer_probe",
+                dir = %dir.display(),
+                "codex editor directory passes"
+            );
+            None
+        }
+        Ok(Prepared::HomeAbsent) => {
+            tracing::info!(
+                target: "composer_probe",
+                home = %home.display(),
+                "codex editor directory not created: codex home doesn't exist yet"
+            );
+            None
+        }
+        Ok(Prepared::HomeRefused(refusal)) => {
+            tracing::warn!(
+                target: "composer_probe",
+                dir = %refusal.at.display(),
+                cause = ?refusal.cause,
+                remedy = %remedy_text(&refusal, uid),
+                "codex editor directory not created: codex home isn't one the check can read"
+            );
+            None
+        }
+        Err(refusal) => {
+            tracing::warn!(
+                target: "composer_probe",
+                dir = %refusal.at.display(),
+                cause = ?refusal.cause,
+                remedy = %remedy_text(&refusal, uid),
+                "codex editor directory held: the deck can't check this agent's input box"
+            );
+            Some(refusal.hold_detail(uid))
+        }
+    }
+}
+
+/// The log's remedy for `refusal`: the exact `chmod` for the user's own
+/// writable directory, then a restart; otherwise core §6.3's relocation.
+fn remedy_text(refusal: &super::path_rule::Refusal, uid: u32) -> String {
+    use super::path_rule::Remedy;
+    let remedy = refusal.remedy(uid);
+    match (remedy, remedy.chmod()) {
+        (Remedy::RemoveWrite { .. }, Some(mode)) => format!(
+            "chmod {mode} {}, then restart the agent",
+            shell_quote(&refusal.at.to_string_lossy())
+        ),
+        _ => crate::inbox_display::HOLD_REMEDY_RELOCATE.to_string(),
+    }
+}
+
+/// The directory a spawn's child starts in, as the PTY builder picks it
+/// (portable-pty 0.8.1, `CommandBuilder::as_command`; the reva21 review's
+/// U2-1): `cwd` when it names a directory, relative to the daemon's own
+/// `here`; otherwise the child's `HOME` (`lookup`: the spawn's variables
+/// over the daemon's) when it is UTF-8, otherwise the daemon user's home
+/// from the account database (as the builder's `get_home_dir` looks it up,
+/// never the daemon's own `HOME`; the revb21 review's U3-3), otherwise `/`.
+/// As the kernel names it (what Codex's
+/// `getcwd` and the bound agent's `/proc/<pid>/cwd` read), so a symlink in
+/// the path isn't a different project chain.
+#[cfg(target_os = "linux")]
+pub(crate) fn spawn_start_dir(
+    cwd: Option<&str>,
+    lookup: impl Fn(&str) -> Option<OsString>,
+    here: &Path,
+) -> std::path::PathBuf {
+    let dir = cwd
+        .map(|dir| here.join(dir))
+        .filter(|dir| dir.is_dir())
+        .unwrap_or_else(|| {
+            lookup("HOME")
+                .filter(|home| home.to_str().is_some())
+                .or_else(|| {
+                    // SAFETY: getuid can't fail.
+                    crate::platform::paths::passwd_home(unsafe { libc::getuid() })
+                })
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/"))
+        });
+    std::fs::canonicalize(&dir).unwrap_or(dir)
+}
+
+/// The daemon's instance, made by the first installed spawn.
+#[cfg(target_os = "linux")]
+fn daemon_instance() -> Result<&'static Instance, SetupError> {
+    use super::instance::{DaemonId, candidate_roots};
+    static INSTANCE: OnceLock<Result<Instance, SetupError>> = OnceLock::new();
+    INSTANCE
+        .get_or_init(|| {
+            let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
+            let roots = candidate_roots(&crate::config::state_dir(), runtime.as_deref());
+            let mut exe = std::fs::File::open("/proc/self/exe")?;
+            let size = exe.metadata().map(|m| m.len()).unwrap_or_default();
+            let daemon = DaemonId::this_process()?;
+            // A root whose path another user could change is passed over for
+            // the next; any other failure is the instance's.
+            let mut created = Err(SetupError::PathCharacters);
+            for root in roots {
+                created = Instance::create(&root, daemon.clone(), &mut exe);
+                if !matches!(created, Err(SetupError::UntrustedDirectory)) {
+                    break;
+                }
+                tracing::info!(
+                    target: "composer_probe",
+                    root = %root.display(),
+                    "editor helper root passed over: its path isn't trusted"
+                );
+            }
+            let instance = created?;
+            let swept = instance.swept();
+            tracing::info!(
+                target: "composer_probe",
+                dir = %instance.dir().display(),
+                helper_bytes = size,
+                removed = swept.removed.len(),
+                kept = swept.kept,
+                scan_error = ?swept.scan_error,
+                unknown = swept.unknown,
+                "editor helper instance created"
+            );
+            Ok(instance)
+        })
+        .as_ref()
+        .map_err(|e| *e)
+}
+
+/// The installation decision for a spawn of generation `generation` running
+/// `command`, declared as `declared`, with `env` its own variables, under the
+/// doorbell `switch` the daemon read for it: whether it is installed, and if
+/// so, everything it gets.
+pub fn at_spawn(
+    command: Option<&str>,
+    declared: Option<&AgentType>,
+    generation: &str,
+    env: &[(String, String)],
+    switch: &crate::doorbell_switch::DoorbellSwitch,
+) -> Result<Installation, NotInstalled> {
+    let class = pane_class(command, declared);
+    let mut rollout = INSTALL_ROLLOUT.to_vec();
+    rollout.extend(assumed_classes(captured_assumption()));
+    eligible(class, &rollout)?;
+    switched_on(class, switch)?;
+    #[cfg(target_os = "linux")]
+    {
+        let setup = || {
+            let originals = Originals::resolve(env, |name| std::env::var_os(name))?;
+            let mut installation = install(daemon_instance()?, class, generation, &originals)?;
+            if matches!(
+                class,
+                PaneClass::Direct(ProbeAgent::Codex) | PaneClass::Launcher(ProbeAgent::Codex)
+            ) {
+                installation.export_hold = prepare_codex_export(|name| {
+                    env.iter()
+                        .rev()
+                        .find(|(k, _)| k == name)
+                        .map(|(_, v)| OsString::from(v))
+                        .or_else(|| std::env::var_os(name))
+                });
+            }
+            Ok(installation)
+        };
+        setup().map_err(NotInstalled::HelperSetup)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (generation, env);
+        Err(NotInstalled::Platform)
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::spawn_start_dir;
+    use spec::spec;
+    use std::ffi::OsString;
+
+    /// Scenario: Work out where a spawn's child starts, for the key-binding baseline read before it (Codex's project files are its directory's chain). A spawn naming a directory starts there, relative to the daemon's own; one naming none, or naming something that isn't a directory, starts in the child's `HOME` (the spawn's over the daemon's), as the PTY builder starts it, not in the daemon's directory (the reva21 review's U2-1).
+    #[spec("inbox/probe/014")]
+    #[test]
+    fn probe_014_a_spawn_with_no_directory_starts_in_its_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let (home, daemon, repo) = (root.join("home"), root.join("daemon"), root.join("repo"));
+        for d in [&home, &daemon, &repo] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(root.join("file"), "").unwrap();
+        let lookup = |name: &str| (name == "HOME").then(|| OsString::from(&home));
+        assert_eq!(spawn_start_dir(Some("../repo"), lookup, &daemon), repo);
+        assert_eq!(
+            spawn_start_dir(Some(repo.to_str().unwrap()), lookup, &daemon),
+            repo
+        );
+        assert_eq!(
+            spawn_start_dir(None, lookup, &daemon),
+            home,
+            "no directory: the child's HOME"
+        );
+        assert_eq!(
+            spawn_start_dir(Some("../file"), lookup, &daemon),
+            home,
+            "not a directory: the child's HOME"
+        );
+    }
+
+    /// Scenario: Work out where a spawn with no directory starts when the child's `HOME` isn't UTF-8, with the daemon's own `HOME` naming another directory. The PTY builder then goes straight to the password database, so the start directory is the account's passwd home, not the daemon's `HOME` (the revb21 review's U3-3).
+    #[spec("inbox/probe/014")]
+    #[test]
+    fn probe_014_a_non_utf8_home_starts_in_the_passwd_home() {
+        use std::os::unix::ffi::OsStringExt;
+        struct Restore(Option<OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: `STATE_DIR_ENV_LOCK` is held for this guard's life.
+                unsafe {
+                    match self.0.take() {
+                        Some(home) => std::env::set_var("HOME", home),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+        // SAFETY: getuid can't fail.
+        let uid = unsafe { libc::getuid() };
+        let Some(passwd) = crate::platform::paths::passwd_home(uid) else {
+            eprintln!("SKIP: no passwd entry for uid {uid}");
+            return;
+        };
+        let passwd = std::path::PathBuf::from(passwd);
+        let dir = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(dir.path()).unwrap();
+        let daemon_home = root.join("daemon-home");
+        std::fs::create_dir_all(&daemon_home).unwrap();
+        let _lock = crate::config::STATE_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let _restore = Restore(std::env::var_os("HOME"));
+        // SAFETY: `STATE_DIR_ENV_LOCK` held; `_restore` puts it back.
+        unsafe { std::env::set_var("HOME", &daemon_home) };
+        let lookup = |name: &str| (name == "HOME").then(|| OsString::from_vec(b"/h\xff".to_vec()));
+        assert_eq!(
+            spawn_start_dir(None, lookup, &root),
+            std::fs::canonicalize(&passwd).unwrap_or(passwd),
+            "a non-UTF-8 HOME: the passwd home, not the daemon's HOME"
+        );
+    }
+}

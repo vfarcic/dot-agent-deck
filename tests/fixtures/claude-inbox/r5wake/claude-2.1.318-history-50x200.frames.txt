@@ -1,0 +1,2385 @@
+2.1.318 50x200 empty@1882: composer=Some(("Try \"how do I log an error?\"", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "how do I log an error?"
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+2.1.318 50x200 typed-1@1956: composer=Some(("HISTORYBLOCKEDgolf", true, false)) ready=true empty_and_ready=false dialog=None
+cursor=(47, 20)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYBLOCKEDgolf
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 restored-1@2770: composer=Some(("HISTORYBLOCKEDgolf", true, false)) ready=true empty_and_ready=false dialog=None
+cursor=(47, 20)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYBLOCKEDgolf
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 cleared-1@2910: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+2.1.318 50x200 up-1@3011: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 up-2@3146: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                              ctrl+r to search history
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 up-3@3215: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 18)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                              ctrl+r to search history
+─── History 4/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFOURdelta
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 down-1@3285: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                              ctrl+r to search history
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 down-2@3358: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                              ctrl+r to search history
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 down-3@3601: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+2.1.318 50x200 recall-escape-1@3702: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 recalled-before-escape@3702: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 after-escape@3857: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 reset-after-escape@4012: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 recall-ctrl-u-1@4098: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 recalled-before-ctrl-u@4098: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 after-ctrl-u@4204: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 reset-after-ctrl-u@4204: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 recall-ctrl-c-1@4291: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 18)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 4/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFOURdelta
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 recalled-before-ctrl-c@4291: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 18)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 4/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFOURdelta
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 after-ctrl-c@4557: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 reset-after-ctrl-c@4644: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 draft@4694: composer=Some(("DRAFThotel", true, false)) ready=true empty_and_ready=false dialog=None
+cursor=(47, 12)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ DRAFThotel
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 draft-up@4782: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 draft-up-down@4898: composer=Some(("DRAFThotel", false, false)) ready=true empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ DRAFThotel
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+2.1.318 50x200 mode-0@4974: composer=Some(("DRAFThotel", false, false)) ready=true empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ DRAFThotel
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 recall-manual-mode-1@5062: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 recalled-before-manual-mode@5062: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 reset-after-manual-mode@5262: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 recall-enter-1@5361: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 recalled-before-enter@5361: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 after-enter@6380: composer=Some(("HISTORYFIVEecho", true, false)) ready=true empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 after-enter-cleared@6467: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 recall-slot-1@6568: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 recalled-before-slot@6568: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 19)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYSIXfoxtrot
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 slot-cleared@6719: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 slot-up-1@6818: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 slot-down-1@6925: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 slot-down-2@7019: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 slot-up-2@7080: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                          Ctrl+Y to paste deleted text
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 slot-up-3@7256: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 17)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 5/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ HISTORYFIVEecho
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on
+
+2.1.318 50x200 slot-down-3@7363: composer=None ready=false empty_and_ready=false dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+─── History 6/6 ────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 end@7457: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 slot-down-4@7457: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
+2.1.318 50x200 slot-down-5@7457: composer=Some(("", true, false)) ready=true empty_and_ready=true dialog=None
+cursor=(47, 2)
+
+ ▐▛███▛█   Claude Code v2.1.318
+▝▜██████▀  Haiku 5.5 · Claude Team
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1537618-Lu7Rpg/.tmplFlEx7
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYBLOCKEDgolf
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: HISTORYFIVEecho
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts
+
