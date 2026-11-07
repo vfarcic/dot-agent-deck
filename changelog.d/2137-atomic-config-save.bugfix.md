@@ -1,3 +1,3 @@
-## `config set` no longer leaves a half-written `config.toml` for a moment
+## `config set` saves `config.toml` without a half-written moment where it can
 
-An agent the deck starts while `dot-agent-deck config set` is saving can no longer read an empty or half-written `config.toml` and start with default settings, such as the doorbell on after you had turned it off: it sees either the old settings or the new ones. When the folder that holds `config.toml` is not writable, or the file is mounted on its own (a single-file bind mount), the save works as before, without that protection.
+An agent the deck starts while you run `dot-agent-deck config set` reads the old settings or the new ones, not an empty or half-written `config.toml` that would start it with default settings, such as the doorbell on after you had turned it off. When `config.toml` cannot be replaced in its folder, for example a folder you cannot write or a single-file bind mount, the save works as before, without that protection.
