@@ -823,7 +823,7 @@ fn recovery_018_an_unsupported_rename_stops_the_transfer() {
     assert!(runs_root(root.path()).join(lock_name(&a_run)).exists());
 }
 
-/// Scenario: With MAX_FILES 64, 64 tiny reports with maximum-length ids are accepted and the 65th is refused with the file-count cause though the bytes are far below the budget. A new run with MAX_FILES 8 reads the predecessor's inventory from its header, adopts all 64 and charges each one's size; a second restart keeps their names and charges each once. An inventory of 65,536 entries with maximum-length names and every optional field is read back whole, every line within 256 bytes, and the writer refuses a count over its max_files.
+/// Scenario: With MAX_FILES 64, 64 tiny reports with maximum-length ids are accepted and the 65th is refused with the file-count cause though the bytes are far below the budget. A new run with MAX_FILES 8 reads the predecessor's inventory from its header, adopts all 64 and charges each one's size; a second restart keeps their names and charges each once. An inventory of 65,536 entries with maximum-length names and every optional field is read back whole, every line within 256 bytes, and a count over its max_files is refused: by the writer's debug check in a debug build, by the reader in a release build.
 #[spec("inbox/recovery/019")]
 #[test]
 fn recovery_019_the_inventory_writer_and_reader_agree_at_the_boundary() {
@@ -868,10 +868,20 @@ fn recovery_019_the_inventory_writer_and_reader_agree_at_the_boundary() {
     assert!(text.lines().all(|l| l.len() <= INVENTORY_LINE_MAX));
     let (max, back) = read_inventory(text.as_bytes(), "run-x").unwrap();
     assert_eq!((max, back.len()), (HARD_MAX_FILES, HARD_MAX_FILES as usize));
+    // The writer's refusal is a debug check. A release build logs and writes
+    // the full list instead, and the count over max_files makes the reader
+    // refuse it rather than take it as a complete inventory.
+    #[cfg(debug_assertions)]
     assert!(
         std::panic::catch_unwind(|| write_inventory_text("run-x", 1, &entries[..2])).is_err(),
         "the writer refuses a count over its max_files"
     );
+    #[cfg(not(debug_assertions))]
+    {
+        let over = write_inventory_text("run-x", 1, &entries[..2]);
+        assert_eq!(over.lines().count(), 3, "the header and the full list");
+        assert!(read_inventory(over.as_bytes(), "run-x").is_err());
+    }
 }
 
 /// Scenario: Durability and dead-source cleanup. A failed parent sync of this run's new directory leaves the store unusable. A failed sync of a dead run's directory after the moves leaves it unretired, its lock and inventory in place, and the next start retires it. An expired file whose unlink fails in the dead run's directory is moved here under its past suffix, charged but holding no slot and in no inventory, and removed by the next sweep once the unlink succeeds; with the move failing too, it stays and the dead run is not retired.
