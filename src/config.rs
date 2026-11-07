@@ -613,6 +613,11 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
 ///   target's exact permissions before any byte is written; a new file gets
 ///   `0666 & !umask`, which is what `std::fs::write` created.
 /// * **A config the user cannot write is still refused**, with the same error.
+/// * **The file keeps its owner and its hard links.** On unix, when the swap
+///   would give `config.toml` another owner or group (`config set` run as root
+///   with the user's `HOME`, a file owned by someone else in the user's
+///   folder) or the file has more than one hard link,
+///   [`swap_keeps_owner_and_links`] sends the save to the in-place write.
 ///
 /// The temp file is opened with `create_new` (`O_EXCL`), so a pre-planted entry
 /// at its name — a symlink included — is never followed or truncated, only
@@ -664,6 +669,50 @@ fn falls_back_to_in_place_write(step: AtomicSaveStep, err: &std::io::Error) -> b
     }
 }
 
+/// Who owns a file and how many names it has, for
+/// [`swap_keeps_owner_and_links`].
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug)]
+struct FileOwnership {
+    uid: u32,
+    gid: u32,
+    nlink: u64,
+}
+
+#[cfg(unix)]
+impl FileOwnership {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt as _;
+        Self {
+            uid: meta.uid(),
+            gid: meta.gid(),
+            nlink: meta.nlink(),
+        }
+    }
+}
+
+/// Issue #2137 (PR #2142 review): whether renaming the temp file
+/// (`replacement`) over `target` leaves the config owned as before and keeps
+/// its other names. A missing target has neither, so the swap is fine.
+///
+/// The renamed config takes the temp file's owner and group, so those are
+/// compared with the target's directly rather than predicted from
+/// `geteuid`/`getegid`: on macOS, and in a setgid folder on Linux, a new file
+/// takes its folder's group, not the process's.
+///
+/// When this is false the save is the in-place write, which keeps the owner
+/// and the links: `config set` run as root with the user's `HOME` (`sudo -E`,
+/// or macOS `sudo`) would otherwise leave the user a root-owned config they
+/// cannot save (and, if it is `0600`, the daemon cannot read), and a
+/// hard-linked config would be split from its other names.
+#[cfg(unix)]
+fn swap_keeps_owner_and_links(target: Option<FileOwnership>, replacement: FileOwnership) -> bool {
+    match target {
+        None => true,
+        Some(t) => t.uid == replacement.uid && t.gid == replacement.gid && t.nlink <= 1,
+    }
+}
+
 /// [`write_config_atomically`] with the body write and sync supplied, so a test
 /// can make them fail.
 fn write_config_atomically_with(
@@ -681,7 +730,8 @@ fn write_config_atomically_with(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e),
     }
-    let target_perms = std::fs::metadata(&target).ok().map(|m| m.permissions());
+    let target_meta = std::fs::metadata(&target).ok();
+    let target_perms = target_meta.as_ref().map(|m| m.permissions());
 
     let (mut file, tmp) = match create_temp_beside(&target, target_perms.as_ref()) {
         Ok(created) => created,
@@ -690,6 +740,25 @@ fn write_config_atomically_with(
         }
         Err(e) => return Err(e),
     };
+
+    // A swap that would change who owns the config, or split it from its
+    // other hard links, is not made: the save is the in-place write instead.
+    #[cfg(unix)]
+    match file.metadata() {
+        Ok(replacement)
+            if swap_keeps_owner_and_links(
+                target_meta.as_ref().map(FileOwnership::of),
+                FileOwnership::of(&replacement),
+            ) => {}
+        other => {
+            drop(file);
+            let _ = std::fs::remove_file(&tmp);
+            return match other {
+                Ok(_) => std::fs::write(&target, bytes),
+                Err(e) => Err(e),
+            };
+        }
+    }
 
     let written = (|| {
         if let Some(perms) = &target_perms {
@@ -2582,6 +2651,145 @@ mod tests {
             std::fs::metadata(&reference).unwrap().permissions().mode() & 0o777,
             "a new config must get the mode std::fs::write gives a new file"
         );
+    }
+
+    /// Issue #2137 (PR #2142 review): the swap is used only when it leaves the
+    /// config owned as before and with no other name. `replacement` is the
+    /// temp file the save made, whose owner is what the renamed config gets.
+    /// A different owner needs root to produce on a real file, so the decision
+    /// is tested on its inputs.
+    #[cfg(unix)]
+    #[test]
+    fn the_swap_is_used_only_when_it_keeps_the_owner_and_the_links() {
+        let me = FileOwnership {
+            uid: 1000,
+            gid: 1000,
+            nlink: 1,
+        };
+        let root = FileOwnership {
+            uid: 0,
+            gid: 0,
+            nlink: 1,
+        };
+        let cases = [
+            ("missing target", None, me, true),
+            ("same owner, one link", Some(me), me, true),
+            (
+                "uid differs",
+                Some(FileOwnership { uid: 0, ..me }),
+                me,
+                false,
+            ),
+            (
+                "gid differs",
+                Some(FileOwnership { gid: 20, ..me }),
+                me,
+                false,
+            ),
+            (
+                "two links",
+                Some(FileOwnership { nlink: 2, ..me }),
+                me,
+                false,
+            ),
+            ("root saving the user's file", Some(me), root, false),
+            ("root saving root's file", Some(root), root, true),
+        ];
+        for (name, target, replacement, want) in cases {
+            assert_eq!(
+                swap_keeps_owner_and_links(target, replacement),
+                want,
+                "{name}"
+            );
+        }
+    }
+
+    /// Issue #2137 (PR #2142 review of 85f6a8c9): the owner/group check is wired
+    /// to the real target, not only correct on its inputs. Scenario: give a
+    /// config one of this user's supplementary groups, save it, and expect the
+    /// same inode, the group kept and the new content written in place. A
+    /// different owner (uid) needs root to produce and is not tested here.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_keeps_a_config_whose_group_was_changed() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+
+        // SAFETY: `getgroups(0, NULL)` only returns the count, and the second
+        // call writes at most `groups.len()` entries into the buffer.
+        let mut groups: Vec<libc::gid_t> =
+            vec![0; unsafe { libc::getgroups(0, std::ptr::null_mut()) }.max(0) as usize];
+        let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+        groups.truncate(n.max(0) as usize);
+        // A usable group is one `chown` accepts: listed is not always enough
+        // (macOS lists groups it will not hand a file to).
+        let Some(gid) = groups
+            .into_iter()
+            .filter(|&g| g != before.gid())
+            .find(|&g| std::os::unix::fs::chown(&path, None, Some(g)).is_ok())
+        else {
+            eprintln!(
+                "SKIP: this user has no supplementary group other than the file's \
+                 that chown accepts, so a config with a changed group cannot be made here"
+            );
+            return;
+        };
+        assert_eq!(std::fs::metadata(&path).unwrap().gid(), gid);
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        config.save_to(&path).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap();
+        assert_eq!(
+            after.ino(),
+            before.ino(),
+            "a config whose group the swap would change must be saved in place"
+        );
+        assert_eq!(after.gid(), gid, "the config must keep its group");
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_command = \"new\"")
+        );
+        assert!(temp_files_in(dir.path()).is_empty());
+    }
+
+    /// Issue #2137 (PR #2142 review): `std::fs::write` wrote into the file, so
+    /// every hard link to `config.toml` saw the new content. A rename would
+    /// give `config.toml` a new inode and leave the other name on the old one,
+    /// so a config with more than one link must be saved in place.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_keeps_a_hard_linked_config_one_file() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let other = dir.path().join("dotfiles-config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+        std::fs::hard_link(&path, &other).unwrap();
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        config.save_to(&path).unwrap();
+
+        for name in [&path, &other] {
+            assert!(
+                std::fs::read_to_string(name)
+                    .unwrap()
+                    .contains("default_command = \"new\""),
+                "{} must show the new content",
+                name.display()
+            );
+        }
+        assert!(temp_files_in(dir.path()).is_empty());
     }
 
     /// Issue #2137: which errors send the save to the old in-place write.
