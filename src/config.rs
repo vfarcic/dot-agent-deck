@@ -616,8 +616,60 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
 /// The temp file is opened with `create_new` (`O_EXCL`), so a pre-planted entry
 /// at its name — a symlink included — is never followed or truncated, only
 /// skipped for the next name.
+///
+/// **Where the folder cannot take the swap, the save is the old in-place
+/// write.** When [`falls_back_to_in_place_write`] says the temp file or the
+/// rename failed for a reason in the environment — a writable `config.toml` in
+/// a folder the user cannot write, a single-file bind mount — this removes any
+/// temp file it made and does exactly what `std::fs::write` did, without the
+/// protection. Any other failure (the write, the sync, a full disk) leaves the
+/// old file as it was and is reported.
 fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
+    write_config_atomically_with(path, bytes, |file, bytes| {
+        use std::io::Write as _;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// Which step of the atomic save failed, for [`falls_back_to_in_place_write`].
+#[derive(Clone, Copy, Debug)]
+enum AtomicSaveStep {
+    CreateTemp,
+    Rename,
+}
+
+/// Issue #2137: whether an error at `step` means the swap cannot be done in
+/// this place — so the save falls back to the in-place write `config set`
+/// always did — rather than that the save itself failed.
+fn falls_back_to_in_place_write(step: AtomicSaveStep, err: &std::io::Error) -> bool {
+    use std::io::ErrorKind as K;
+    match step {
+        // The folder cannot take a new entry: the user cannot write it
+        // (EACCES/EPERM), or it is on a read-only filesystem while the file
+        // itself is writable, such as a file bind-mounted into a read-only
+        // container (EROFS). The probe already found the file writable.
+        AtomicSaveStep::CreateTemp => {
+            matches!(err.kind(), K::PermissionDenied | K::ReadOnlyFilesystem)
+        }
+        // The entry cannot be replaced by a rename: it is a mount point, as a
+        // single-file bind mount (docker `-v file:file`, a k8s `subPath`) is
+        // (EBUSY); it sits on another mount than its folder (EXDEV); or the
+        // folder is sticky and the user does not own the file (EPERM).
+        AtomicSaveStep::Rename => matches!(
+            err.kind(),
+            K::ResourceBusy | K::CrossesDevices | K::PermissionDenied
+        ),
+    }
+}
+
+/// [`write_config_atomically`] with the body write and sync supplied, so a test
+/// can make them fail.
+fn write_config_atomically_with(
+    path: &Path,
+    bytes: &[u8],
+    write_body: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -657,6 +709,9 @@ fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 16 => {
                 attempt += 1;
             }
+            Err(e) if falls_back_to_in_place_write(AtomicSaveStep::CreateTemp, &e) => {
+                return std::fs::write(&target, bytes);
+            }
             Err(e) => return Err(e),
         }
     };
@@ -665,15 +720,24 @@ fn write_config_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         if let Ok(meta) = std::fs::metadata(&target) {
             file.set_permissions(meta.permissions())?;
         }
-        file.write_all(bytes)?;
-        file.sync_all()
+        write_body(&mut file, bytes)
     })();
     drop(file);
-    let published = written.and_then(|()| std::fs::rename(&tmp, &target));
-    if published.is_err() {
+    if let Err(e) = written {
         let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    published
+    match std::fs::rename(&tmp, &target) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp);
+            if falls_back_to_in_place_write(AtomicSaveStep::Rename, &e) {
+                std::fs::write(&target, bytes)
+            } else {
+                Err(e)
+            }
+        }
+    }
 }
 
 /// Follow `path` through any symlinks to the entry a write through it would
@@ -2173,7 +2237,9 @@ mod tests {
                 torn
             })
         };
-        for _ in 0..3000 {
+        // 200 saves: the old truncate-then-write tears most reads in this loop,
+        // so this is plenty to go red on it, and each save pays a real fsync.
+        for _ in 0..200 {
             config.save_to(&path).unwrap();
         }
         done.store(true, Ordering::Relaxed);
@@ -2272,6 +2338,123 @@ mod tests {
             std::fs::read_to_string(&path).unwrap(),
             "default_command = \"old\"\n"
         );
+    }
+
+    fn temp_files_in(dir: &Path) -> Vec<std::ffi::OsString> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n.to_string_lossy().ends_with(".tmp"))
+            .collect()
+    }
+
+    /// Issue #2137: `std::fs::write` saved a writable `config.toml` that sits
+    /// in a folder the user cannot write. The atomic save cannot make its temp
+    /// file there, so it must fall back to that in-place write rather than
+    /// refuse a save that used to work.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_still_saves_a_writable_config_in_a_read_only_folder() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = crate::test_temp::tempdir().unwrap();
+        let folder = dir.path().join("locked");
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // Put the folder back however the test ends, so the tempdir can go.
+        struct Unlock<'a>(&'a Path);
+        impl Drop for Unlock<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(self.0, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+        let _unlock = Unlock(&folder);
+        if std::fs::File::create(folder.join("probe")).is_ok() {
+            eprintln!("SKIP: this process can write a 0555 folder (running as root)");
+            return;
+        }
+
+        let config = DashboardConfig {
+            default_command: "new".to_string(),
+            ..DashboardConfig::default()
+        };
+        config.save_to(&path).unwrap();
+
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("default_command = \"new\"")
+        );
+        assert!(temp_files_in(&folder).is_empty());
+    }
+
+    /// Issue #2137: the fallback is for a place the swap cannot happen, not
+    /// for a save that failed. A write that fails part-way must leave the old
+    /// `config.toml` exactly as it was, report the error, and leave no temp
+    /// file behind — the in-place write would have left a torn file.
+    #[test]
+    fn a_failed_config_write_leaves_the_old_file_and_no_temp_file() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "default_command = \"old\"\n").unwrap();
+
+        let err = write_config_atomically_with(&path, b"default_command = \"new\"\n", |f, b| {
+            use std::io::Write as _;
+            f.write_all(&b[..b.len() / 2])?;
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull))
+        })
+        .unwrap_err();
+
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "default_command = \"old\"\n"
+        );
+        assert!(temp_files_in(dir.path()).is_empty());
+    }
+
+    /// Issue #2137: which errors send the save to the old in-place write.
+    /// EBUSY (a single-file bind mount) and EXDEV cannot be produced here
+    /// without root, so the decision is tested on the errno itself.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_place_that_cannot_take_the_swap_falls_back_to_the_in_place_write() {
+        use AtomicSaveStep::{CreateTemp, Rename};
+        let errno = std::io::Error::from_raw_os_error;
+
+        for (step, code) in [
+            (CreateTemp, libc::EACCES),
+            (CreateTemp, libc::EPERM),
+            (CreateTemp, libc::EROFS),
+            (Rename, libc::EBUSY),
+            (Rename, libc::EXDEV),
+            (Rename, libc::EPERM),
+            (Rename, libc::EACCES),
+        ] {
+            assert!(
+                falls_back_to_in_place_write(step, &errno(code)),
+                "{step:?} errno {code} must fall back"
+            );
+        }
+        for (step, code) in [
+            (CreateTemp, libc::ENOSPC),
+            (CreateTemp, libc::EDQUOT),
+            (CreateTemp, libc::EIO),
+            (CreateTemp, libc::ENOENT),
+            (CreateTemp, libc::EBUSY),
+            (Rename, libc::ENOSPC),
+            (Rename, libc::EIO),
+            (Rename, libc::ENOENT),
+            (Rename, libc::EISDIR),
+            (Rename, libc::EROFS),
+        ] {
+            assert!(
+                !falls_back_to_in_place_write(step, &errno(code)),
+                "{step:?} errno {code} must fail, not fall back"
+            );
+        }
     }
 
     /// PRD #1258 (PR #1672 review): the reporting read hands back every warning
