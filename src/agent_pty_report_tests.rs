@@ -1868,7 +1868,7 @@ pub(super) fn adopted_after_restart(deck: &Deck) -> Vec<String> {
     store_files(&next)
 }
 
-/// Scenario: (a) in full: a save task panics before its write, or after its report's file was written and before staging. The connection reads `report_save_failed`, and the attempt leaves nothing: the store's files, bytes, reservations and slots are what they were before the report. A retry is accepted, and a restart adopts exactly the retry's report. When the attempt's file cannot be removed, it stays charged as an orphaned attempt, and a restart adopts it as orphaned, never as a report. A write that unwinds before it creates its file returns its room once.
+/// Scenario: (a) in full: a save task panics before its write, or after its report's file was written and before staging. The connection reads `report_save_failed`, and the attempt leaves nothing: the store's files, bytes, reservations and slots are what they were before the report. A retry is accepted, and a restart adopts exactly the retry's report. When the attempt's file cannot be removed, it stays charged as an orphaned attempt, and a restart adopts it as orphaned, never as a report. In a debug build, a write that unwinds before it creates its file returns its room once.
 #[spec("orchestration/work-done/053")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn work_done_053_a_a_failed_attempt_leaves_no_report_behind() {
@@ -1940,21 +1940,26 @@ async fn work_done_053_a_a_failed_attempt_leaves_no_report_behind() {
     }
     // A write that unwinds before it creates its file (here its debug check
     // of the report id) returns its room once. An unwind after the create is
-    // not driven: no production panic source is known in that interval.
-    let deck = deck();
-    let before = deck.store.counts().unwrap();
-    let room = deck.store.reserve(64).unwrap();
-    let store = Arc::clone(&deck.store);
-    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = store.write(
-            room,
-            "not a report id",
-            b"x",
-            crate::retained_store::Now::current(),
-        );
-    }));
-    assert!(unwound.is_err(), "the write's debug check fires");
-    assert_eq!(deck.store.counts().unwrap(), before);
+    // not driven: no production panic source is known in that interval. The
+    // debug check is the only unwind source here, so a release build has
+    // nothing to drive: every production caller passes a minted id.
+    #[cfg(debug_assertions)]
+    {
+        let deck = deck();
+        let before = deck.store.counts().unwrap();
+        let room = deck.store.reserve(64).unwrap();
+        let store = Arc::clone(&deck.store);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = store.write(
+                room,
+                "not a report id",
+                b"x",
+                crate::retained_store::Now::current(),
+            );
+        }));
+        assert!(unwound.is_err(), "the write's debug check fires");
+        assert_eq!(deck.store.counts().unwrap(), before);
+    }
 }
 
 /// Scenario: (d) the commit panics inside its section, after the report's post and before its tombstone. The supervisor's task ends without panicking, the reporting connection reads no answer (unconfirmed), the report state stays torn, the inserted message is the only one, the report's file is on disk, and a repeat is refused `deck_unavailable`. (g) a failure asked for a staged claim refuses and changes nothing.
