@@ -10415,6 +10415,21 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests), the daemon log's warning text, an unreadable or non-regular file (same failed branch, not exercised here), or what a card shows for the held agent (`inbox/doorbell/056`).
 - **Platform coverage:** all.
 
+##### inbox/doorbell/061 — A `config.toml` that is a link to a missing file holds the doorbell off, like any config that is there but can't be used.
+- **Layer:** Fast (`src/doorbell_switch.rs`, `src/config.rs`), temp files and symlinks.
+- **Agent:** none.
+- **Asserts:** the daemon's bounded config read reports a path with nothing at it (no link either), and a path inside a config folder that does not exist (a fresh install), as absent, with no warning, and both agents on; a link to a readable file as read, saying what the file says; and a link whose target is missing (absolute, relative, or reached through a second link), a link to a folder and a link loop each as failed with one warning, holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CLAUDE=on` still turns Claude Code back on over it and leaves Codex off.
+- **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests; `inbox/doorbell/062` covers it through the daemon), the warning's text, a dangling link at the config folder rather than at the file (it still reads as absent), or `config get` / `config set` through such a link.
+- **Platform coverage:** unix (the test creates symlinks).
+
+##### inbox/doorbell/062 — A Claude Code started while the deck's `config.toml` is a link to a missing file is held off, and with nothing at the path it is rung.
+- **Layer:** L2 lane 1 (`tests/e2e_claude_doorbell_turned_off.rs`), PTY-attached real TUI, its lazy-spawned daemon, the deck's `config.toml` in its sandbox `HOME` as a symlink to a path that does not exist, `daemon status --json`, and the deck's log.
+- **Agent:** none (`tests/support/claude_composer.py`, the scripted Claude Code screen `inbox/doorbell/056` uses, drawing the header of Claude Code 2.1.399, a release nobody measured; no model or credential).
+- **Asserts:** with the config path a dangling link, a scripted Claude Code started under the daemon and Idle at its empty composer with a message queued is held: the agent record names `cannot_type`, the card on the screen shows the cannot_type words, `daemon status` shows WAKE `none`, over 1.5 s nothing reaches the pane, no `doorbell rang` is logged, the log carries the config read's `it is a link whose target is missing` warning and a `doorbell off` line naming `turned_off`, and the message stays queued. With the link removed so nothing is at the path, a second worker started afterwards with the same header shows WAKE `doorbell`, is rung once, and its message is fetched and acknowledged, while the held pane still received nothing. Red under either mutation: the daemon's `doorbell_switch::at_spawn` returning the default switch, or the config read treating a dangling link as absent.
+- **Does not assert:** Codex (the same switch read, `inbox/doorbell/061`), a real Claude Code, a prompt recovering the held worker (`inbox/doorbell/056`), or a dangling link at the config folder rather than at the file.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
 #### inbox/probe
 
 The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an agent's input box through the agent's own Ctrl+G, and holding what a user types while a check runs. It is built a commit at a time: the daemon feeds the output hook every byte an agent writes (inbox/probe/004), moves the input epoch at the PTY writer's enqueue and notes the output's queries into it (inbox/probe/001, 045, 060), and nothing in the daemon reads what the probe computes or calls the rest of it yet.
