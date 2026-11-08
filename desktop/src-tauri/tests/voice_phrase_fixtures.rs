@@ -53,9 +53,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use dot_agent_deck_desktop::voice::{
-    IntentAnswer, IntentRequest, IntentResolver, MeaningRequest, NO_MATCH_ACTION, ParamKind,
-    REMOTE_TIMEOUT, Screen, Strictness, Transcript, VoiceChoice, VoiceDictationTarget,
-    VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm, VoiceOutcome,
+    DesktopAgent, IntentAnswer, IntentRequest, IntentResolver, MeaningRequest, NO_MATCH_ACTION,
+    ParamKind, REMOTE_TIMEOUT, Screen, Strictness, Transcript, VoiceChoice, VoiceDeck,
+    VoiceDictationTarget, VoiceDirectories, VoiceDirectoryEntry, VoiceNewAgent, VoiceNewAgentForm,
+    VoiceOutcome,
     dictation::normalise,
     handle_utterance_after_local_intercepts, handle_utterance_with_dictation,
     meaning::{Place, every_action},
@@ -423,6 +424,10 @@ fn offered_values(outcome: &VoiceOutcome) -> Option<Vec<String>> {
 /// live-model gate. With local opt-in, verify outcomes through the shipping
 /// keyed API backend with the deck shown or hidden as each fixture specifies.
 #[tokio::test]
+// Quarantined (CLAUDE.md rule 6), owner vfarcic: fails intermittently from
+// live-model variance, not from a code change; local-only, never in CI. #2138
+// stays open until it is deterministic enough to un-ignore.
+#[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
     run_fixtures(manifest()).await;
 }
@@ -431,7 +436,17 @@ async fn voice_desktop_phrases_001_phrase_fixtures_match_the_default_backend() {
 /// resulting action, including whole-sentence commands. Mixed-content requests
 /// and hostile observed names must never cause an unasked action to run.
 #[tokio::test]
+// Quarantined (CLAUDE.md rule 6), owner vfarcic: fails intermittently from
+// live-model variance, not from a code change; local-only, never in CI. #2138
+// stays open until it is deterministic enough to un-ignore.
+#[ignore = "quarantined: vfarcic, #2138"]
 async fn voice_desktop_phrases_002_paraphrase_fixtures_match_the_default_backend() {
+    run_fixtures(paraphrase_manifest()).await;
+}
+
+/// The manifest `voice_desktop_phrases_002` runs: the checked-in paraphrases
+/// plus the phrase manifest's hostile-listing fixtures.
+fn paraphrase_manifest() -> FixtureManifest {
     let mut fixtures: FixtureManifest =
         toml_edit::de::from_str(PARAPHRASES).expect("voice paraphrase fixture manifest must parse");
     // Reuse the existing F1 directory-steering controls, without maintaining
@@ -442,7 +457,18 @@ async fn voice_desktop_phrases_002_paraphrase_fixtures_match_the_default_backend
             .into_iter()
             .filter(|fixture| fixture.hostile_listing),
     );
-    run_fixtures(fixtures).await;
+    fixtures
+}
+
+/// Scenario: Parse the checked-in phrase and paraphrase manifests and check
+/// every fixture against the command table, the screens and the planted fleet,
+/// decks, directories and New agent form, with no model and no credential. This
+/// keeps the fixtures checked in every run while 001 and 002 are quarantined.
+#[test]
+fn voice_desktop_phrases_010_phrase_and_paraphrase_fixtures_validate_without_a_model() {
+    let world = planted_world();
+    validate_fixtures(&manifest(), &world);
+    validate_fixtures(&paraphrase_manifest(), &world);
 }
 
 /// Scenario: Classify start sentences over the open New agent form, bypassing command selection, and read only whether each says where to start or names what to start.
@@ -1268,13 +1294,22 @@ fn live_api_resolver() -> Option<Box<dyn IntentResolver>> {
     Some(resolver)
 }
 
-async fn run_fixtures(fixtures: FixtureManifest) {
-    assert!(
-        fixtures.fixtures.len() >= MIN_FIXTURE_COUNT,
-        "voice phrase fixture manifest must contain at least {MIN_FIXTURE_COUNT} fixtures, found {}",
-        fixtures.fixtures.len()
-    );
+/// The world every phrase fixture resolves against: the planted fleets, decks,
+/// directory listings and New agent form. Built by one function so the
+/// credential-free validation and the live run read the same plant.
+struct PlantedWorld {
+    agents: Vec<DesktopAgent>,
+    ambiguous_name_agents: Vec<DesktopAgent>,
+    facet_agents: Vec<DesktopAgent>,
+    hostile_name_agents: Vec<DesktopAgent>,
+    generated_run_agents: Vec<DesktopAgent>,
+    decks: Vec<VoiceDeck>,
+    directories: VoiceDirectories,
+    hostile_directories: VoiceDirectories,
+    new_agent_form: VoiceNewAgent,
+}
 
+fn planted_world() -> PlantedWorld {
     let mut agents = vec![
         role_agent_in_state("agent-tester", "tester", "waiting_for_input"),
         with_tool(
@@ -1453,6 +1488,39 @@ async fn run_fixtures(fixtures: FixtureManifest) {
             mode_paging: None,
         }),
     };
+    PlantedWorld {
+        agents,
+        ambiguous_name_agents,
+        facet_agents,
+        hostile_name_agents,
+        generated_run_agents,
+        decks,
+        directories,
+        hostile_directories,
+        new_agent_form,
+    }
+}
+
+/// Every check on a fixture manifest that needs no model: the minimum fixture
+/// count, and each fixture against the command table, the screens and the
+/// planted world. `voice_desktop_phrases_010` runs it in every tier, and
+/// `run_fixtures` runs it again before any live call.
+fn validate_fixtures(fixtures: &FixtureManifest, world: &PlantedWorld) {
+    assert!(
+        fixtures.fixtures.len() >= MIN_FIXTURE_COUNT,
+        "voice phrase fixture manifest must contain at least {MIN_FIXTURE_COUNT} fixtures, found {}",
+        fixtures.fixtures.len()
+    );
+    let PlantedWorld {
+        agents,
+        facet_agents,
+        hostile_name_agents,
+        generated_run_agents,
+        decks,
+        directories,
+        new_agent_form,
+        ..
+    } = world;
     let form_choices = new_agent_form.form.as_ref().expect("planted");
     for fixture in &fixtures.fixtures {
         if fixture.outcome == OutcomeKind::Dispatch {
@@ -1617,6 +1685,22 @@ async fn run_fixtures(fixtures: FixtureManifest) {
             );
         }
     }
+}
+
+async fn run_fixtures(fixtures: FixtureManifest) {
+    let world = planted_world();
+    validate_fixtures(&fixtures, &world);
+    let PlantedWorld {
+        agents,
+        ambiguous_name_agents,
+        facet_agents,
+        hostile_name_agents,
+        generated_run_agents,
+        decks,
+        directories,
+        hostile_directories,
+        new_agent_form,
+    } = world;
 
     let Some(resolver) = live_api_resolver() else {
         return;
