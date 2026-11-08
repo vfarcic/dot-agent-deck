@@ -4,7 +4,7 @@
 usage: claude_history_submit_export.py [--check] <test-log> <fixture-dir>
 
 The test log is the `--no-capture` output of the
-`doorbell_036_live_release_31[78]_history_submit_*` tests; each
+`doorbell_036_live_release_history_submit_*` tests (once per release recorded); each
 `history-submit outcome:` line names its capture. For each trial this writes
 `<release>/<case>-x<presses>-<rows>x<cols>-t<trial>.bin` (the raw PTY bytes)
 and `.json` (the recorder's index, which the fast tests' `fixture()` loader

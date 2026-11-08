@@ -39,16 +39,17 @@ import select
 import shutil
 import signal
 import struct
+import subprocess
 import sys
 import termios
 import time
 
-# The measured release's native executable, by SHA-256: the official
-# `@openai/codex@0.164.0-linux-x64` package (tarball sha512 XLAoaWsG…l5Mg==),
-# byte-identical to the one the host's npm install of 0.164.0 runs.
-PINS = {
-    '0.164.0': 'b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306',
-}
+# A run measures whichever Codex `codex` resolves to on the pane's PATH
+# (issue #2146): it reads the native executable's release from `--version`,
+# records its SHA-256, and checks that the running Codex is that executable
+# and that it did not change during the run. The captures committed under
+# `tests/fixtures/codex-inbox/release-0.164.0/` keep 0.164.0's hash as the
+# reference (`tests/codex_head_echo_evidence.rs`).
 TOKEN_ALPHABET = 'abcdfgimoprtvwxz'
 ID_ALPHABET = 'abcdefghijklmnopqrstuvwxyz234567'
 PREFIX, SUFFIX = ' dot-agent-deck: message ', ' waiting, run: dot-agent-deck inbox fetch'
@@ -88,7 +89,8 @@ def running_codex(root, pin):
     (the native binary, behind the wrapper and any launcher), with the SHA-256
     of the executable the process is running (`/proc/<pid>/exe`, so a file
     replaced or resolved differently after the start is not what is hashed).
-    Fails unless there is at least one and each is the pinned executable."""
+    Fails unless there is at least one and each is the executable this run
+    resolved and hashed at start."""
     parents = {}
     for entry in Path('/proc').iterdir():
         if not entry.name.isdigit():
@@ -114,7 +116,7 @@ def running_codex(root, pin):
                 digest = hashlib.sha256(running.read()).hexdigest()
             found.append({'pid': child, 'exe': exe, 'sha256': digest})
     if not found or any(f['sha256'] != pin for f in found):
-        raise RuntimeError('running Codex is not the pinned executable: %s' % found)
+        raise RuntimeError('running Codex is not the resolved executable: %s' % found)
     return found
 
 
@@ -456,8 +458,8 @@ class Recorder:
         # The executable the composer belongs to, from the running process.
         self.running = running_codex(self.child, self.pin)
         assert self.modes[-1]['bits'] == [False, False], self.modes
-        # The deck's first ring waits out the release's settle window (6.03 s
-        # for 0.164.0) from the generation's first empty ready frame.
+        # The deck's first ring waits out Codex's settle window (6.03 s,
+        # measured on 0.164.0) from the generation's first empty ready frame.
         self.pump(6.5)
         self.snap('settled')
         if self.launcher:
@@ -585,8 +587,8 @@ def main():
     assert codex_home.parent == home, 'requires a CODEX_HOME inside the private HOME'
     launcher, native = native_codex()
     digest = hashlib.sha256(native.read_bytes()).hexdigest()
-    release = next((r for r, pin in PINS.items() if pin == digest), None)
-    assert release is not None, 'executable pin changed: %s %s' % (native, digest)
+    # `codex-cli <release>`, from the native executable the run starts.
+    release = subprocess.check_output([str(native), '--version'], text=True).split()[-1]
     recorder = Recorder(out, rows, cols)
     recorder.launcher = kind.endswith('-launcher')
     codex = ['--model', model, '--sandbox', 'workspace-write', '--ask-for-approval', 'never',
@@ -638,7 +640,7 @@ def main():
                 break
             time.sleep(.02)
         os.close(fd)
-        assert hashlib.sha256(native.read_bytes()).hexdigest() == digest, 'executable pin changed'
+        assert hashlib.sha256(native.read_bytes()).hexdigest() == digest, 'the executable changed during the run'
         meta['load_end'] = load()
         meta['running_executables'] = recorder.running
         global DEBUG_OUT
