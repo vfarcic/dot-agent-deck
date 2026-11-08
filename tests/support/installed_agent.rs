@@ -7,11 +7,16 @@
 //!
 //! Each test runs its agent's credential preflight first
 //! (`skip_unless!(common::check_claude_available())` or the Codex one), then
-//! [`or_skip`] over [`claude`] or [`codex`]: no executable on the `PATH`, or
-//! one whose `--version` names no release, prints `SKIP: [e2e] …` and the
-//! test returns; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that into a
-//! failure (CLAUDE.md rule 5).
+//! [`or_skip`] over [`claude`] or [`codex`]: no executable on the `PATH`,
+//! one whose `--version` names no release, or one whose release carries a
+//! pre-release or build tag (which the deck's release scanner cannot latch,
+//! [`installed_release`]), prints `SKIP: [e2e] …` and the test returns;
+//! `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that into a failure (CLAUDE.md
+//! rule 5).
 #![allow(dead_code)] // Each test file uses its own subset.
+
+#[path = "installed_release.rs"]
+pub mod installed_release;
 
 use crate::common;
 use std::io::Read;
@@ -95,12 +100,12 @@ impl Installed {
 
 /// The installed Claude Code: `claude --version` prints `<release> (Claude Code)`.
 pub fn claude() -> Result<Installed, String> {
-    installed("claude", |text| text.split_whitespace().next())
+    installed("claude")
 }
 
 /// The installed Codex: `codex --version` prints `codex-cli <release>`.
 pub fn codex() -> Result<Installed, String> {
-    installed("codex", |text| text.split_whitespace().last())
+    installed("codex")
 }
 
 /// The installed agent, or `None` after reporting why it cannot be measured
@@ -115,10 +120,7 @@ pub fn or_skip(found: Result<Installed, String>) -> Option<Installed> {
     }
 }
 
-fn installed(
-    program: &'static str,
-    release_in: fn(&str) -> Option<&str>,
-) -> Result<Installed, String> {
+fn installed(program: &'static str) -> Result<Installed, String> {
     let path = common::path_with_binary_dir();
     let executable = std::env::split_paths(&path)
         .map(|dir| dir.join(program))
@@ -132,15 +134,21 @@ fn installed(
         .output()
         .map_err(|e| format!("`{} --version` did not run: {e}", executable.display()))?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
-    let release = release_in(&text)
-        .filter(|release| semver::Version::parse(release).is_ok())
-        .map(str::to_string)
-        .ok_or_else(|| {
-            format!(
+    let release = match installed_release::version_shape(program, &text) {
+        installed_release::VersionShape::Release(release) => release,
+        installed_release::VersionShape::Tagged(version) => {
+            return Err(format!(
+                "{program} {version} is a pre-release or build-tagged build the deck does \
+                 not support: nothing measured"
+            ));
+        }
+        installed_release::VersionShape::NoRelease => {
+            return Err(format!(
                 "`{} --version` printed no release: {text:?}",
                 executable.display()
-            )
-        })?;
+            ));
+        }
+    };
     eprintln!(
         "INSTALLED-RELEASE: {program} {release} at {}",
         executable.display()
