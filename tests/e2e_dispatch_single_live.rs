@@ -180,7 +180,28 @@ fn dispatch_single_004_a_real_unit_runs_the_chosen_command_and_does_its_task() {
         DISPATCHER_READY_WAIT.as_secs(),
         deck.snapshot_grid()
     );
-    std::thread::sleep(Duration::from_secs(5));
+    // Let the seed turn finish painting before typing the directive, as
+    // `dispatch/return/006` does. Non-fatal: the seed's acknowledgement above
+    // is the hard fact, and a busy host can keep a spinner repainting.
+    let dispatcher_ids: Vec<String> = inbox_view::all_messages(deck.attach_socket_path())
+        .into_iter()
+        .filter(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(DISPATCHER_SEED_OPENING))
+        })
+        .filter_map(|message| message.bind_agent)
+        .collect();
+    if !common::wait_until_panes_settled(
+        deck.attach_socket_path(),
+        &dispatcher_ids,
+        Duration::from_millis(1500),
+        Duration::from_secs(8),
+        Duration::from_secs(90),
+    ) {
+        eprintln!("warning: the dispatcher pane did not settle within 90s; proceeding anyway");
+    }
 
     // The dispatcher, not this test, runs the real CLI.
     let directive = format!(
