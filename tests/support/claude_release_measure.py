@@ -23,18 +23,11 @@ import sys
 import termios
 import time
 
-# Each measured release's executable, by SHA-256. A run measures whichever
-# pinned release `claude` resolves to, and refuses any other executable.
-PINS = {
-    '2.1.310': 'b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56',
-    '2.1.312': '4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d',
-    # Official @anthropic-ai/claude-code-linux-x64@2.1.317 (tarball sha512
-    # u19fYJ4l...XBlSA==), byte-identical to the installed 2.1.317.
-    '2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
-    # Official @anthropic-ai/claude-code-linux-x64@2.1.318 (tarball sha512
-    # GX+7CUng...6NV2A==), byte-identical to the installed 2.1.318.
-    '2.1.318': '708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd',
-}
+# A run measures whichever Claude Code `claude` resolves to on the pane's
+# PATH (issue #2146): it records the executable's release (`--version`) and
+# SHA-256, and fails if the executable changed during the run. The hashes of
+# the releases the committed captures were recorded on are checked in the
+# fast tier (`doorbell_036_committed_claude_captures_name_their_recorded_executable`).
 H, E, L, R, BS, D, K = '\x1b[H', '\x1b[F', '\x1b[D', '\x1b[C', '\x7f', '\x1b[3~', '\x15'
 CASES = [
     ('reviewer', ['ab', '\n', '  ', H, K, H, BS, D, D, K]),
@@ -466,11 +459,8 @@ def main():
     assert home.name == 'home' and home.parent == Path.cwd().resolve(), 'requires TuiDeck private HOME'
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
-    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert digest in PINS.values(), 'executable pin changed'
+    expected = hashlib.sha256(binary.read_bytes()).hexdigest()
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    expected = PINS[release]
-    assert digest == expected, 'executable pin changed'
     recorder = Recorder(out, rows, cols)
     recorder.executable = str(binary)
     recorder.release, recorder.sha256 = release, expected
@@ -542,7 +532,7 @@ def main():
                 break
             time.sleep(.02)
         os.close(fd)
-        assert hashlib.sha256(binary.read_bytes()).hexdigest() == expected, 'executable pin changed'
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == expected, 'the executable changed during the run'
         recorder.save(child, error)
 
 
