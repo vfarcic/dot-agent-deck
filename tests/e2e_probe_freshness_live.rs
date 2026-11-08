@@ -11,9 +11,10 @@
 //! only freshness can have taken it away. A refusal when scheduled has no
 //! `Admission(` wrapper and is counted apart.
 //!
-//! The test runs a recorded Claude Code release (2.1.312 unless
-//! `DAD_PROBE_FRESHNESS_RELEASE` names another), in the harness'
-//! own HOME, never the host's config, under the `e2e` build's editor-probe assumption,
+//! The test runs the Claude Code installed on the harness's `PATH` (issue
+//! #2146; it was measured on 2.1.312, 2.1.317 and 2.1.318), in the harness'
+//! own HOME, never the host's config, under the `e2e` build's editor-probe
+//! assumption for the installed release,
 //! and asks for probes through `e2e-composer-control`'s `probe-request`, the
 //! live tick's own scheduling, writer and arm path. Nothing is submitted, so
 //! no model turn starts: a probe's Ctrl+G opens the deck's helper, which
@@ -35,33 +36,24 @@
 //! `wrap` never becomes armable in the `e2e` build (its permission stays
 //! `Pending`), while the native stand-in does; real Codex binding is Q35-22's.
 //!
-//! The executable is `DAD_PROBE_FRESHNESS_BINARY` when set, else the host's
-//! `~/.local/share/claude/versions/<release>`.
-//!
 //! `DAD_PROBE_FRESHNESS_OUT` names a file the summary is appended to as one
 //! JSON line; the summary is printed either way.
 
 mod common;
+#[path = "support/installed_agent.rs"]
+mod installed;
 
 use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP, KIND_STREAM_OUT};
 use serde_json::{Value, json};
 use spec::spec;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const PANE: &str = "probe-freshness";
-/// The release measured when `DAD_PROBE_FRESHNESS_RELEASE` names none. The
-/// `e2e` build treats it as probe-capable, which it accepts only for a
-/// release with a record of its own.
-const DEFAULT_RELEASE: &str = "2.1.312";
-
-fn release() -> String {
-    std::env::var("DAD_PROBE_FRESHNESS_RELEASE").unwrap_or_else(|_| DEFAULT_RELEASE.to_string())
-}
 /// The `scheduled` barrier's root, one component under the deck's HOME.
 const GATE: &str = "probe-gate";
 const BUDGET: Duration = Duration::from_secs(120);
@@ -77,26 +69,6 @@ const PROBES_CONTROL: usize = 5;
 const CONTROL_MS: u64 = 1000;
 /// The output quiet that counts as the agent idle again after a probe.
 const QUIET: Duration = Duration::from_millis(750);
-
-/// The pinned Claude Code release: `DAD_PROBE_FRESHNESS_BINARY`, else the
-/// host's own versions directory.
-fn claude_release_binary() -> Result<PathBuf, String> {
-    let release = release();
-    let path = match std::env::var_os("DAD_PROBE_FRESHNESS_BINARY") {
-        Some(path) => PathBuf::from(path),
-        None => Path::new(&std::env::var_os("HOME").ok_or("no HOME")?)
-            .join(".local/share/claude/versions")
-            .join(&release),
-    };
-    if path.is_file() {
-        return Ok(path);
-    }
-    Err(format!(
-        "Claude Code {release} is not at the pinned path {}: set DAD_PROBE_FRESHNESS_BINARY \
-         to the {release} executable (DAD_PROBE_FRESHNESS_RELEASE names another release)",
-        path.display()
-    ))
-}
 
 /// One attach request with a bound wide enough for a widened probe.
 fn request(socket: &Path, req: Value) -> Value {
@@ -249,6 +221,8 @@ struct Run {
     agent: String,
     generation: u64,
     kind: &'static str,
+    /// The installed release the pane runs.
+    release: String,
 }
 
 impl Run {
@@ -276,7 +250,7 @@ impl Run {
         parser.screen().contents()
     }
 
-    fn start(kind: &'static str, deck: common::TuiDeck, command: String) -> Self {
+    fn start(kind: &'static str, deck: common::TuiDeck, command: String, release: &str) -> Self {
         let reply = request(
             deck.attach_socket_path(),
             json!({"op":"start-agent", "command":command,
@@ -292,6 +266,7 @@ impl Run {
             agent,
             generation,
             kind,
+            release: release.to_string(),
         }
     }
 }
@@ -515,7 +490,7 @@ fn measure(run: Run) {
         conditions.push(tally);
     }
     let summary = json!({
-        "agent": run.kind, "release": release(),
+        "agent": run.kind, "release": run.release,
         // The deck build measured: the library this test links is built
         // from the same tree in the same cargo run as the binary it drives,
         // so a summary names the commit (and `-dirty`) its numbers belong to.
@@ -556,12 +531,12 @@ fn measure(run: Run) {
     }
 }
 
-fn deck() -> common::TuiDeckBuilder {
+fn deck(release: &str) -> common::TuiDeckBuilder {
     common::TuiDeck::builder()
         .with_pty_size(180, 50)
         .with_env(
             "DOT_AGENT_DECK_E2E_ASSUME_EDITOR_PROBE",
-            format!("claude@{}", release()),
+            format!("claude@{release}"),
         )
         .with_env("DOT_AGENT_DECK_E2E_PROBE_GATE", GATE)
         .with_env("DOT_AGENT_DECK_LOG", "probe-freshness.log")
@@ -569,38 +544,37 @@ fn deck() -> common::TuiDeckBuilder {
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
 }
 
-/// Scenario: Start the recorded Claude Code release in a deck pane and leave it idle at its empty composer, record its output for a minute, then ask for probes one at a time, each after the last one's redraws stopped and a random wait, first at the writer's own interval, then with the writer held 100 ms and 1 s after the frame was read, and last held 1 s while the test resizes the pane. The test reports how many probes the writer refused because the screen moved since its frame, and fails unless the resized probes are refused that way.
+/// Scenario: Start the installed Claude Code in a deck pane and leave it idle at its empty composer, record its output for a minute, then ask for probes one at a time, each after the last one's redraws stopped and a random wait, first at the writer's own interval, then with the writer held 100 ms and 1 s after the frame was read, and last held 1 s while the test resizes the pane. The test reports how many probes the writer refused because the screen moved since its frame, and fails unless the resized probes are refused that way.
 #[spec("inbox/probe/083")]
 #[test]
 fn probe_083_claude_idle_screen_freshness_refusal_rate() {
     skip_unless!(common::check_claude_available());
-    let binary = match claude_release_binary() {
-        Ok(b) => b,
-        Err(why) => {
-            skip_unless!(Err(why));
-            return;
-        }
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
     };
-    let deck = deck()
+    let release = claude.release.as_str();
+    // The file the installed `claude` resolves to now, so the run measures
+    // one executable even if the installed link moves meanwhile.
+    let binary = std::fs::canonicalize(&claude.executable).unwrap();
+    let deck = deck(release)
         .with_imported_claude_credentials()
         .with_claude_trust_workdir()
         .launch_with_fixture("minimal");
     assert!(deck.wait_for_grid_string_within("No active agents", BUDGET));
     // The pane's class is read from its command's basename.
-    let bin = deck.home_dir().join("pinned");
+    let bin = deck.home_dir().join("installed");
     std::fs::create_dir_all(&bin).unwrap();
     std::os::unix::fs::symlink(&binary, bin.join("claude")).unwrap();
     let command = format!(
         "{} --model claude-haiku-4-5-20251001",
         bin.join("claude").display()
     );
-    let run = Run::start("claude", deck, command);
+    let run = Run::start("claude", deck, command, release);
     assert!(
         common::wait_until(BUDGET, || run
             .screen()
-            .contains(&format!("Claude Code v{}", release()))),
-        "Claude Code {} must start; {}",
-        release(),
+            .contains(&format!("Claude Code v{release}"))),
+        "Claude Code {release} must start; {}",
         run.screen()
     );
     measure(run);
