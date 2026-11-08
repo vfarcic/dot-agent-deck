@@ -27,7 +27,14 @@
 //! (a refusal, an uncertain or lapsed check) the next waits [`BACKOFF`]'s
 //! step, then every [`BACKOFF_LAST`]. A refusal at the writer only because
 //! the screen moved since scheduling counts as a failure only once
-//! [`MOVED_PER_FAILURE`] of them come in a row ([`Schedule::moved`]). After [`BROKEN_AFTER`] failures in a
+//! [`MOVED_PER_FAILURE`] of them come in a row ([`Schedule::moved`]). A
+//! refusal when scheduled only because the frame didn't show the composer
+//! (admission's `Surface`, every earlier conjunct having passed) makes the
+//! next attempt due after [`SURFACE_RECHECK`], and counts as a failure only
+//! once [`SURFACE_PER_FAILURE`] of them come in a row ([`Schedule::surface`],
+//! #2147): the agent is usually still drawing after a person's key, and a
+//! full backoff step there delayed the check by 30 s and made a later lapse
+//! the second failure. After [`BROKEN_AFTER`] failures in a
 //! row the generation's observer is broken, which its caller shows and logs;
 //! the waits go on as above, and a person's op makes one fresh attempt due
 //! at once, so a repaired daemon or a transient failure recovers. R2 §6.8's
@@ -92,6 +99,20 @@ pub const BROKEN_AFTER: u32 = 3;
 /// agent asked at every doorbell tick for as long as it draws.
 pub const MOVED_PER_FAILURE: u32 = 4;
 
+/// How long after a refusal when scheduled for the screen alone
+/// ([`Schedule::surface`]) the next attempt is due. Inside the doorbell's
+/// first re-ring (15 s) with room for the [`SURFACE_PER_FAILURE`] rechecks,
+/// and ten doorbell ticks, so a screen that stays refused is asked no more
+/// often than every 2 s.
+pub const SURFACE_RECHECK: Duration = Duration::from_secs(2);
+
+/// How many refusals in a row when scheduled for the screen alone count as
+/// one failure ([`Schedule::surface`]): the last of them backs the schedule
+/// off as any failure does, so a screen that never shows the composer (a
+/// dialog left open, a kept draft) still walks the backoff steps, each
+/// after `SURFACE_PER_FAILURE - 1` rechecks that write nothing.
+pub const SURFACE_PER_FAILURE: u32 = 4;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Wait {
     /// Due now.
@@ -113,6 +134,9 @@ pub struct Schedule {
     /// Writer refusals for the screen alone since the last failure or read
     /// ([`Self::moved`]).
     moved: u32,
+    /// Refusals when scheduled for the screen alone since the last failure
+    /// or read ([`Self::surface`]).
+    surface: u32,
 }
 
 impl Default for Schedule {
@@ -122,6 +146,7 @@ impl Default for Schedule {
             failures: 0,
             broken: false,
             moved: 0,
+            surface: 0,
         }
     }
 }
@@ -147,6 +172,31 @@ impl Schedule {
         self.failures
     }
 
+    /// Whether the last attempt failed or was refused for the screen, so
+    /// the box can't be checked until the next: what the card shows.
+    pub fn failing(&self) -> bool {
+        self.failures > 0 || self.surface > 0
+    }
+
+    /// Admission refused an attempt at `now` when it was scheduled only
+    /// because the frame didn't show the composer (#2147): the next attempt
+    /// is due after [`SURFACE_RECHECK`] and nothing counts, unless it is the
+    /// [`SURFACE_PER_FAILURE`]th such refusal since the last failure or
+    /// read, which counts as one ([`Self::failed`]). Whether it counted.
+    /// Only the wait moves: the attempt it makes due is asked of admission
+    /// again, screen included.
+    pub fn surface(&mut self, now: Instant) -> bool {
+        self.surface = self.surface.saturating_add(1);
+        if self.surface >= SURFACE_PER_FAILURE {
+            self.failed(now);
+            return true;
+        }
+        self.wait = now
+            .checked_add(SURFACE_RECHECK)
+            .map_or(Wait::Never, Wait::Until);
+        false
+    }
+
     /// The writer refused an attempt at `now` only because the screen moved
     /// since its scheduling (A-20d-11): nothing counts, and the schedule
     /// stays as it was, unless it is the [`MOVED_PER_FAILURE`]th such
@@ -164,6 +214,7 @@ impl Schedule {
     /// An attempt failed at `now`: refused, uncertain, or lapsed.
     pub fn failed(&mut self, now: Instant) {
         self.moved = 0;
+        self.surface = 0;
         self.failures = self.failures.saturating_add(1);
         if self.failures >= BROKEN_AFTER {
             self.broken = true;
@@ -179,6 +230,7 @@ impl Schedule {
     /// A probe read the box non-empty at `now`, with the epoch at `epoch`.
     pub fn non_empty(&mut self, now: Instant, epoch: u64) {
         self.moved = 0;
+        self.surface = 0;
         self.failures = 0;
         self.broken = false;
         self.wait = now
@@ -626,6 +678,53 @@ mod tests {
         assert!(!far.due(end, 0), "past the clock's range");
     }
 
+    /// Scenario: Refuse a schedule's attempts for the screen alone. The first three make the next attempt due two seconds later, count no failure and leave the card saying the box can't be checked; the fourth counts one failure with the first backoff step, and after it the count starts again. A failure clears the run, and so does a read, empty or non-empty, which also stops the card saying the box can't be checked (#2147).
+    #[spec("inbox/probe/101")]
+    #[test]
+    fn probe_101_screen_refusals_recheck_soon_and_count_every_fourth() {
+        assert_eq!(SURFACE_RECHECK.as_secs(), 2);
+        assert_eq!(SURFACE_PER_FAILURE, 4);
+        let ms = Duration::from_millis;
+        let t = Instant::now();
+        let mut s = Schedule::default();
+        let mut at = t;
+        for n in 1..SURFACE_PER_FAILURE {
+            assert!(!s.surface(at), "refusal {n} counts nothing");
+            assert_eq!(s.failures(), 0, "refusal {n}");
+            assert!(s.failing(), "refusal {n}: the card holds");
+            assert!(!s.due(at + SURFACE_RECHECK - ms(1), 0), "refusal {n}");
+            assert!(s.due(at + SURFACE_RECHECK, 0), "refusal {n}");
+            at += SURFACE_RECHECK;
+        }
+        assert!(s.surface(at), "the fourth in a row counts");
+        assert_eq!(s.failures(), 1);
+        assert!(!s.due(at + BACKOFF[0] - ms(1), 0));
+        assert!(s.due(at + BACKOFF[0], 0));
+        at += BACKOFF[0];
+        assert!(!s.surface(at), "a failure starts the run again");
+        assert_eq!(s.failures(), 1, "and keeps the failures");
+
+        // A failure of another kind clears the run too.
+        let mut s = Schedule::default();
+        for _ in 1..SURFACE_PER_FAILURE {
+            s.surface(t);
+        }
+        s.failed(t);
+        assert!(!s.surface(t + BACKOFF[0]), "the run started again");
+
+        // A read clears it, and the card with it.
+        let mut s = Schedule::default();
+        s.surface(t);
+        s.non_empty(t, 3);
+        assert!(!s.failing(), "a non-empty read: the card says a draft");
+        for _ in 1..SURFACE_PER_FAILURE {
+            assert!(!s.surface(t), "the run started again after the read");
+        }
+        s.empty();
+        assert!(!s.failing());
+        assert_eq!(s, Schedule::default());
+    }
+
     /// Q105b.2: the e2e clock offset moves only the pending wait, `Until`
     /// and `Epoch` alike, by exactly what it is given; the failures,
     /// `broken`, an epoch wait's epoch and the other waits stay as they are.
@@ -667,6 +766,7 @@ mod tests {
                 failures: 2,
                 broken: false,
                 moved: 0,
+                surface: 0,
             };
             other.advance(BACKOFF_LAST);
             assert_eq!(other.wait, wait, "{wait:?} is no pending instant");
