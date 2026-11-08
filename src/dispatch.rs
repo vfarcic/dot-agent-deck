@@ -247,6 +247,8 @@ fn quote_choice(value: &str) -> String {
 ///   reason a role behind `devbox run <script>` declares one (issue #1243), and
 ///   `--agent` is required. Inferring when it can keeps the common case short.
 /// - `--agent` alone runs that agent's default command (`opencode`).
+/// - A `--command` that only opens a shell (`bash`, `devbox shell`) is refused
+///   with or without `--agent`: nothing in it would read the unit's task.
 /// - With both, the declaration wins over what the command looks like, as it
 ///   does for a role ([`crate::project_config::OrchestrationRoleConfig::resolved_agent_type`]).
 pub fn resolve_chosen_launch(choice: LaunchChoice<'_>) -> Result<Option<ChosenLaunch>, String> {
@@ -264,6 +266,22 @@ pub fn resolve_chosen_launch(choice: LaunchChoice<'_>) -> Result<Option<ChosenLa
             }
         },
     };
+    // A command that only opens a shell (`bash`, `devbox shell`) would give the
+    // unit no agent to read its task, whatever `--agent` says: the task would
+    // sit in the inbox of a shell. The rule the dispatcher's own command is
+    // held to ([`opens_an_interactive_shell`]), refused here rather than
+    // skipped, since the caller is present to correct it (Qodo, PR #2176).
+    if let Some(command) = choice.command.map(str::trim)
+        && !command.is_empty()
+        && opens_an_interactive_shell(command)
+    {
+        return Err(format!(
+            "--command '{}' only opens a shell, so the unit would have no agent to give its \
+             task to; give the command that starts the agent (for example `devbox run <script>` \
+             rather than `devbox shell`)",
+            quote_choice(command)
+        ));
+    }
     match (choice.command.map(str::trim), declared) {
         (None, None) => Ok(None),
         (Some(""), _) => {
@@ -2116,6 +2134,21 @@ mod tests {
                 .unwrap_err()
                 .contains("--agent is empty")
         );
+        // Qodo, PR #2176: a shell is refused even when --agent names an agent,
+        // since nothing in it would read the task.
+        for shell in ["bash", "/bin/zsh -l", "devbox shell", "nix develop"] {
+            for agent in [None, Some("claude")] {
+                let refused = resolve_chosen_launch(choice(Some(shell), agent)).unwrap_err();
+                assert!(
+                    refused.contains("only opens a shell"),
+                    "{shell:?} with {agent:?}: {refused}"
+                );
+            }
+        }
+        assert!(
+            resolve_chosen_launch(choice(Some("bash -lc 'claude'"), Some("claude"))).is_ok(),
+            "a shell that runs a command is not an interactive shell"
+        );
         let long = "x".repeat(10_000);
         let bounded = resolve_chosen_launch(choice(None, Some(&long))).unwrap_err();
         assert!(
@@ -3441,6 +3474,12 @@ mod tests {
                 None,
                 choice(Some("devbox run x"), None),
                 "--agent",
+            ),
+            (
+                "bare-shell",
+                Some(&crate::event::DispatchShape::SingleAgent),
+                choice(Some("bash"), Some("claude")),
+                "only opens a shell",
             ),
             (
                 "with-a-team",

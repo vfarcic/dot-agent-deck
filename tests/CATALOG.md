@@ -5835,6 +5835,13 @@ without depending on the config struct API.
 - **Does not assert:** a real previous-release daemon (the `cross-version` CI job runs one, without the new flags); the gated sender's timing and refusal cases (`hook::gated_send_tests`); that the real daemon advertises the capability (`daemon::…::the_daemon_confirms_a_dispatchs_chosen_launch`).
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; Unix socket stand-in).
 
+##### dispatch/single/004 — A real dispatcher told to dispatch with `--command <launcher> --agent claude` gets a real unit that runs that launcher and does its task (issue #2172).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatch_single_live.rs`, `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]`): a real interactive dispatcher opened through the new-pane form, which runs the real `dispatch` CLI itself.
+- **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree. Not marked `[reel]`.
+- **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's record is Claude Code.
+- **Does not assert:** a unit on a different agent from its dispatcher (that is `dispatch/single/002`, with stand-ins, because the harness runs only Claude Code headless); the dispatcher choosing the flags from a request in plain words (the directive gives it the command line); the completion report back to the dispatcher (`dispatch/return/006`).
+- **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
+
 #### orchestration/roles
 
 ##### orchestration/roles/001 — Discover orchestrators and workers across folders through the roles CLI.
