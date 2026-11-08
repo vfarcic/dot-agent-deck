@@ -2,6 +2,8 @@
 
 Measured on 2026-11-04 for PRD #1666 part 3's Claude activation, answering revt318's finding U2-1. After a person recalls a prompt with Up and clears it with Ctrl+U, Claude Code draws the plain empty composer, but it keeps its history position (the next Up recalls the next-older entry). The production profile reads that drawing as empty and ready, so the doorbell may type its line there and press Enter. This folder records what that does, on real Claude Code 2.1.317 and 2.1.318.
 
+**Re-running (issue #2146).** The four tests named below are now two, `doorbell_036_live_release_history_submit_{plain,labelled}`, which measure the Claude Code installed on the harness's `PATH` (40 trials a run) instead of a pinned executable; the recorder no longer refuses an unpinned one, and the executable hashes below are checked on these captures by `doorbell_036_committed_claude_captures_name_their_recorded_executable` (`tests/doorbell_screen_profiles.rs`). [`docs/develop/lane2-installed-release-map.md`](../../../../docs/develop/lane2-installed-release-map.md) maps each test.
+
 **Outcome: benign, 80 of 80 trials.** In every trial the hook received one submission whose prompt was the deck-shaped line alone. The recalled entry's text never leaked into it, no dialog appeared, and afterwards the history held all six seeded entries intact and in order, the cleared slot's text included. That holds from the plain-drawn state and from the cleared slot under its History label alike.
 
 ## How it was measured
