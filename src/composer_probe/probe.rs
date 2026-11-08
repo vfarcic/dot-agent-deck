@@ -102,8 +102,11 @@ pub const MOVED_PER_FAILURE: u32 = 4;
 /// How long after a refusal when scheduled for the screen alone
 /// ([`Schedule::surface`]) the next attempt is due. Inside the doorbell's
 /// first re-ring (15 s) with room for the [`SURFACE_PER_FAILURE`] rechecks,
-/// and ten doorbell ticks, so a screen that stays refused is asked no more
-/// often than every 2 s.
+/// and ten doorbell ticks, so while nobody types a screen that stays refused
+/// is asked no more often than every 2 s. Once the observer is broken, a
+/// person's key makes the next attempt due at once ([`Schedule::person`]),
+/// so while someone types a check can be asked at every doorbell tick
+/// (200 ms), as it could before #2147.
 pub const SURFACE_RECHECK: Duration = Duration::from_secs(2);
 
 /// How many refusals in a row when scheduled for the screen alone count as

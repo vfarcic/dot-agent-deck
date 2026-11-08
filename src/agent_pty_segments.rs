@@ -2250,7 +2250,7 @@ mod tests {
         }
     }
 
-    /// Scenario: The frame never shows the input box (a dialog stays open over it, or a kept draft hides Codex's placeholder), so every check the tick asks is refused when scheduled. Nothing is ever written, the card says the deck can't check the box throughout, no two checks come closer than two seconds apart, and the long waits still grow through the backoff steps (30 s, 2 min, 10 min), with the observer reported broken after the third failure.
+    /// Scenario: The frame never shows the input box (a dialog stays open over it, or a kept draft hides Codex's placeholder), so every check the tick asks is refused when scheduled, and nobody types. Nothing is ever written, the card says the deck can't check the box throughout, no two checks come closer than two seconds apart, and the long waits still grow through the backoff steps (30 s, 2 min, 10 min), with the observer reported broken after the third failure.
     #[cfg(target_os = "linux")]
     #[spec("inbox/probe/101")]
     #[test]
