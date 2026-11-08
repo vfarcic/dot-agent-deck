@@ -57,9 +57,20 @@ fn main() {
             escape_for_cargo_warning(raw)
         );
     }
+    // A valid injection wins over the tag, so ask git for one only when
+    // there is none (issue #2072: an injected build runs no git command).
+    let tag = if injected_version
+        .as_deref()
+        .and_then(normalize_version)
+        .is_some()
+    {
+        None
+    } else {
+        git_tag()
+    };
     let version = resolve_version(
         injected_version.as_deref(),
-        git_tag().as_deref(),
+        tag.as_deref(),
         env!("CARGO_PKG_VERSION"),
     );
     if version.source == VersionSource::Placeholder {
@@ -129,8 +140,13 @@ fn main() {
     // Issue #2072: `git_watch_names` documents which file catches what, and
     // why a path that does not exist is not emitted.
     if use_git {
-        for name in git_watch_names(parse_head_ref_path().as_deref()) {
-            emit_rerun_if_changed_git_path(&name);
+        let head_ref = parse_head_ref_path();
+        for name in git_watch_names(head_ref.as_deref()) {
+            // A branch whose loose ref file does not exist yet (a packed
+            // branch, or one with no commit) gets that file on its next
+            // commit or reset: watch the directory it will appear in.
+            let parent_if_missing = head_ref.as_deref() == Some(name.as_str());
+            emit_rerun_if_changed_git_path(&name, parent_if_missing);
         }
     }
 }
@@ -235,7 +251,9 @@ fn emit_rustc_env(name: &str, value: &str) {
 /// Emits nothing for a path that does not exist (issue #2072): cargo treats a
 /// missing `rerun-if-changed` path as changed on every build, so watching one
 /// re-ran this script, and rebuilt the root crate, on every `cargo` command.
-fn emit_rerun_if_changed_git_path(relative: &str) {
+/// With `parent_if_missing`, a missing path's parent directory is watched
+/// instead when that exists (cargo then reruns on any change beneath it).
+fn emit_rerun_if_changed_git_path(relative: &str, parent_if_missing: bool) {
     let resolved = Command::new("git")
         .args(["rev-parse", "--git-path", relative])
         .output()
@@ -259,10 +277,12 @@ fn emit_rerun_if_changed_git_path(relative: &str) {
         // stale-build-id risk; emitting it is a directive-injection one.
         return;
     }
-    if !Path::new(&resolved).exists() {
-        return;
+    let path = Path::new(&resolved);
+    if path.exists() {
+        println!("cargo:rerun-if-changed={resolved}");
+    } else if parent_if_missing && let Some(parent) = path.parent().filter(|p| p.is_dir()) {
+        emit_rerun_if_changed_path(parent);
     }
-    println!("cargo:rerun-if-changed={resolved}");
 }
 
 /// Read `name` from the build environment, treating unset, empty and

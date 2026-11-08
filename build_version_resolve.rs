@@ -254,6 +254,9 @@ pub fn build_needs_git(version_source: VersionSource, injected_build_id: Option<
 /// `build.rs` emits only the ones that exist: cargo treats a missing
 /// `rerun-if-changed` path as changed on *every* build, so a clone without
 /// `packed-refs` (the RWX sandbox's) rebuilt the root crate on every command.
+/// A missing branch ref file is the one exception: `build.rs` watches the
+/// directory it will appear in, so its creation by a commit or a reset is
+/// caught even without a reflog.
 pub fn git_watch_names(head_ref: Option<&str>) -> Vec<String> {
     let mut names: Vec<String> = ["HEAD", "logs/HEAD", "index", "packed-refs"]
         .into_iter()
