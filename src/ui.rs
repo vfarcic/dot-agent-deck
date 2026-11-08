@@ -22610,8 +22610,8 @@ fn render_session_card(
     // the same row — and `truncate_styled_segments` now spends it as one. The
     // badge is measured with `UnicodeWidthStr` for that reason rather than by
     // `char`; the two agree on every badge this renders today (ASCII labels, and
-    // `flash_dot`'s `●` is ambiguous-width, so one column), so the budget is
-    // unchanged and no card snapshot moves.
+    // `flash_dot`'s `●` is ambiguous-width, so one column), so measuring in
+    // columns left this budget as it was.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
     // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
     // tile's word — ends the title when the whole title still fits beside it.
@@ -23022,6 +23022,18 @@ const CARD_DIR_LABEL_WIDTH: usize = 6;
 /// line on the `Dir:` row.
 const CARD_DIR_INBOX_GAP: usize = 1;
 
+/// Issue #2143: `cwd` as a `Dir:` row draws it beside the inbox line. The
+/// directory's name is the producer's: a hook event names it, or a clone's own
+/// subdirectory does. Beside the line it must not be able to pass for it, nor
+/// to bend the row around it, so control and bidi characters are dropped
+/// ([`crate::untrusted_text::strip_control_and_bidi`]) and the envelope glyph
+/// the line opens with, [`crate::inbox_display::GLYPH`], is shown as `?`. The
+/// glyph is one column either way, so no width moves.
+fn dir_text_beside_inbox_line(cwd: &str) -> String {
+    crate::untrusted_text::strip_control_and_bidi(cwd, false)
+        .replace(crate::inbox_display::GLYPH, "?")
+}
+
 /// Issue #2143: the inbox text a card's `Dir:` row of `inner_width` columns can
 /// carry at its right edge beside the directory `cwd`, trailing space included:
 /// the full line, else the pending count alone, else `None`, which leaves the
@@ -23029,16 +23041,20 @@ const CARD_DIR_INBOX_GAP: usize = 1;
 ///
 /// The line has priority over the directory, which is cut to make room. What
 /// must fit is the `Dir:  ` label, a [`CARD_DIR_INBOX_GAP`], the line and the
-/// least of the directory: its first character and the `…` that says the rest
-/// was cut, or the whole of it when that is shorter.
+/// least of the directory: its first visible character and the `…` that says
+/// the rest was cut, or the whole of it when that is shorter.
 fn card_dir_row_inbox(
     inbox: &crate::inbox_display::CardInbox,
     inner_width: usize,
     cwd: &str,
 ) -> Option<String> {
-    let span = Span::raw(cwd);
-    let first = drawn_clusters(&span).next().map_or(0, |(_, width)| width);
-    let kept = drawn_width(cwd).min(first.saturating_add(1));
+    let cwd = dir_text_beside_inbox_line(cwd);
+    let span = Span::raw(cwd.as_str());
+    let first = drawn_clusters(&span)
+        .map(|(_, width)| width)
+        .find(|width| *width > 0)
+        .unwrap_or(0);
+    let kept = drawn_width(&cwd).min(first.saturating_add(1));
     let fits = |text: &str| {
         CARD_DIR_LABEL_WIDTH
             .saturating_add(kept)
@@ -23060,7 +23076,10 @@ fn card_dir_row_inbox(
 ///
 /// Every width here is in drawn columns, and the directory is cut by
 /// [`truncate_styled_segments`] on the same measure, so the row is never wider
-/// than `inner_width` and the line is never what loses a column.
+/// than `inner_width` and the line is never what loses a column. The line is
+/// bold, which nothing else on the row is, and the directory is drawn through
+/// [`dir_text_beside_inbox_line`], so the line cannot be mistaken for text the
+/// directory's name carries.
 fn card_dir_line(cwd: &str, inner_width: usize, inbox: Option<&str>) -> Line<'static> {
     let label = Span::styled(CARD_DIR_LABEL, text_primary());
     let Some(inbox) = inbox else {
@@ -23078,7 +23097,10 @@ fn card_dir_line(cwd: &str, inner_width: usize, inbox: Option<&str>) -> Line<'st
             .saturating_add(CARD_DIR_INBOX_GAP)
             .saturating_add(inbox_width),
     );
-    let dir = truncate_styled_segments(vec![(cwd.to_string(), Style::default())], budget);
+    let dir = truncate_styled_segments(
+        vec![(dir_text_beside_inbox_line(cwd), Style::default())],
+        budget,
+    );
     let dir_width: usize = dir
         .iter()
         .flat_map(|span| drawn_clusters(span))
@@ -23092,7 +23114,10 @@ fn card_dir_line(cwd: &str, inner_width: usize, inbox: Option<&str>) -> Line<'st
     let mut spans = vec![label];
     spans.extend(dir);
     spans.push(Span::raw(" ".repeat(pad)));
-    spans.push(Span::styled(inbox.to_string(), text_primary()));
+    spans.push(Span::styled(
+        inbox.to_string(),
+        text_primary().add_modifier(Modifier::BOLD),
+    ));
     Line::from(spans)
 }
 
@@ -36036,6 +36061,79 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Scenario: draw cards with a queued, a delivered, a stalled and an
+    /// uncertain inbox line, in an Idle and in a Blocked status, for the seat or
+    /// not, with a short and a long name, at every density and every width from 5
+    /// to 90 columns. Wherever the line the top border
+    /// carried before issue #2143 (`card_inbox_badge`) would have shown, the card
+    /// shows a line somewhere, in the top border or on the `Dir:` row.
+    #[test]
+    #[spec("inbox/status/043")]
+    fn status_043_a_line_the_top_border_showed_is_still_shown_somewhere() {
+        let inboxes = [
+            crate::inbox_display::CardInbox {
+                pending: 2,
+                ..Default::default()
+            },
+            crate::inbox_display::CardInbox {
+                delivered: true,
+                ..Default::default()
+            },
+            crate::inbox_display::CardInbox {
+                pending: 1,
+                stalled: true,
+                ..Default::default()
+            },
+            crate::inbox_display::CardInbox {
+                uncertain: 1,
+                ..Default::default()
+            },
+        ];
+        let mut shown_before = 0usize;
+        for inbox in &inboxes {
+            for status in [SessionStatus::Idle, SessionStatus::Blocked] {
+                // The badge text the card builds for this status at tick 0.
+                let status_text =
+                    format!(" {} {} ", flash_dot(&status, 0), status_style(&status).0);
+                // One directory: the row keeps the same two columns of any.
+                for cwd in ["/work/dot-agent-deck-worktree-name"] {
+                    let mut session = session_with_inbox(status.clone(), inbox);
+                    session.cwd = Some(cwd.to_string());
+                    for name in ["lead", "orchestrator-with-a-very-long-role-name"] {
+                        for is_orchestrator in [false, true] {
+                            for density in [
+                                CardDensity::Minimal,
+                                CardDensity::Compact,
+                                CardDensity::Normal,
+                                CardDensity::Spacious,
+                            ] {
+                                for width in 5..=90u16 {
+                                    if card_inbox_badge(inbox, &status_text, usize::from(width))
+                                        .is_none()
+                                    {
+                                        continue;
+                                    }
+                                    shown_before += 1;
+                                    let drawn =
+                                        card_rows(&session, name, width, density, is_orchestrator)
+                                            .join("\n");
+                                    assert!(
+                                        drawn.contains('✉'),
+                                        "{inbox:?} {status:?} {name} {width} columns, {density:?}, \
+                                         seat {is_orchestrator}: a line the top border showed \
+                                         is gone:\n{drawn}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The sweep is not vacuous: it covered thousands of cards with a line.
+        assert!(shown_before > 3_000, "{shown_before}");
     }
 
     /// An OpenCode card carrying the daemon's agent notice `notice` (beside a

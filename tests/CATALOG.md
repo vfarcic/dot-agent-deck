@@ -11992,6 +11992,20 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** which of those cards moved the line, which `inbox/status/037` to `040` pin.
 - **Platform coverage:** all.
 
+##### inbox/status/042 — A directory's name cannot pass for the inbox line on the Dir row.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render, 40 columns, with the cells' styles read.
+- **Agent:** none.
+- **Asserts:** on the Dir row the line is bold and the label, the directory and the padding are not; a directory named like the line shows `?` for the envelope glyph and the card shows one glyph; each bidi formatting character in a directory name is dropped from the row; where the line stays in the top border (80 columns), the directory is drawn as it is.
+- **Does not assert:** look-alike glyphs other than the envelope, or the directory text on a Dir row with no inbox line.
+- **Platform coverage:** all.
+
+##### inbox/status/043 — A line the top border showed before it could move to the Dir row is still shown somewhere.
+- **Layer:** Fast (`src/ui.rs`), the card renderer against `card_inbox_badge`, every density, widths 5 to 90.
+- **Agent:** none.
+- **Asserts:** for queued, delivered, stalled and uncertain lines, in Idle and Blocked, for the seat or not, with a short and a long name, every card whose top border would have carried a line carries one in the top border or on the Dir row.
+- **Does not assert:** where the line is (`inbox/status/037` to `040`), or that a line hidden before now shows.
+- **Platform coverage:** all.
+
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
 - **Layer:** Fast CLI (`tests/inbox_claude.rs`), isolated HOME and version stub, no daemon or credential.
 - **Agent:** none.

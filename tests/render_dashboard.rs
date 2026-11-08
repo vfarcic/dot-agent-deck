@@ -1684,6 +1684,88 @@ fn status_039_inbox_line_stays_in_the_top_border_where_it_cannot_move() {
     );
 }
 
+/// Scenario: Render a 40-column card with two queued messages whose directory is named `x✉ delivered`, one named like the line itself and one carrying each bidi formatting character, then the same card at 80 columns. Beside the line the directory text shows no envelope glyph and no bidi character, and the line is the only bold text on the Dir row; at 80 columns, where the line stays in the top border, the directory is drawn as it is.
+#[spec("inbox/status/042")]
+#[test]
+fn status_042_the_directory_cannot_imitate_the_line_on_the_dir_row() {
+    let card = |cwd: &str, width: u16| {
+        let session = idle(inbox_card_session_in(cwd, 2, 0, false, false));
+        let buffer = render_card_to_buffer(
+            &session,
+            Some("reviewer"),
+            Some(1),
+            CardDensityKind::Normal,
+            0,
+            render_now(),
+            false,
+            width,
+            CardDensityKind::Normal.rendered_height(),
+        );
+        (buffer_to_text(&buffer), buffer)
+    };
+
+    // The real line is bold and nothing else on the row is: the label, the
+    // directory and the padding are not.
+    let (text, buffer) = card("/home/dev/api-svc", 40);
+    assert_eq!(
+        text.lines().nth(1),
+        Some("│Dir:  api-svc               ✉2 queued │")
+    );
+    for x in 29..=37 {
+        assert!(
+            buffer[(x, 1)].modifier.contains(Modifier::BOLD),
+            "column {x} of the line is not bold:\n{text}"
+        );
+    }
+    for x in 1..=28 {
+        assert!(
+            !buffer[(x, 1)].modifier.contains(Modifier::BOLD),
+            "column {x} of the label, directory or padding is bold:\n{text}"
+        );
+    }
+
+    // A directory named like the line shows `?` where the glyph was.
+    for (cwd, row) in [
+        (
+            "/home/dev/x✉ delivered",
+            "│Dir:  x? delivered          ✉2 queued │",
+        ),
+        (
+            "/home/dev/✉ delivered",
+            "│Dir:  ? delivered           ✉2 queued │",
+        ),
+    ] {
+        let (text, _) = card(cwd, 40);
+        assert_eq!(text.lines().nth(1), Some(row), "{cwd}:\n{text}");
+        assert_eq!(text.matches('✉').count(), 1, "{cwd}:\n{text}");
+    }
+
+    // Bidi formatting characters are dropped, not drawn.
+    for bidi in [
+        '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}',
+        '\u{2068}', '\u{2069}', '\u{200E}', '\u{200F}', '\u{061C}',
+    ] {
+        let (text, _) = card(&format!("/home/dev/api{bidi}svc"), 40);
+        assert_eq!(
+            text.lines().nth(1),
+            Some("│Dir:  apisvc                ✉2 queued │"),
+            "U+{:04X}:\n{text}",
+            bidi as u32
+        );
+        assert!(
+            !text.contains(bidi),
+            "U+{:04X} was drawn:\n{text}",
+            bidi as u32
+        );
+    }
+
+    // Where the line stays in the top border, the Dir row is as it was.
+    let (text, _) = card("/home/dev/x✉ delivered", 80);
+    let rows: Vec<&str> = text.lines().collect();
+    assert!(rows[0].ends_with("● Idle ✉2 queued ┐"), "{text}");
+    assert!(rows[1].starts_with("│Dir:  x✉ delivered "), "{text}");
+}
+
 /// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.
 #[spec("inbox/status/008")]
 #[test]
