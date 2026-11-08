@@ -651,7 +651,24 @@ fn inbox_card_session_with(
     acknowledged: bool,
     wake_stalled: bool,
 ) -> SessionState {
-    let session = card_stats_session("/home/dev/api-svc");
+    inbox_card_session_in(
+        "/home/dev/api-svc",
+        queued,
+        fetched,
+        acknowledged,
+        wake_stalled,
+    )
+}
+
+/// [`inbox_card_session_with`] for an agent working in `cwd`.
+fn inbox_card_session_in(
+    cwd: &str,
+    queued: usize,
+    fetched: usize,
+    acknowledged: bool,
+    wake_stalled: bool,
+) -> SessionState {
+    let session = card_stats_session(cwd);
     let record: dot_agent_deck::agent_pty::AgentRecord =
         serde_json::from_value(serde_json::json!({
             "id": "agent-card-stats", "pane_id_env": "pane-card-stats",
@@ -1447,7 +1464,7 @@ fn status_023_card_says_a_message_may_not_have_reached_the_agent() {
     );
 }
 
-/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must fit beside Thinking without removing the tools counter or overrunning either border.
+/// Scenario: Render a pending-message card at the existing 20-column Compact snapshot budget. The envelope count must stay visible, at the right end of the Dir row, with Thinking in the top border, the title keeping every column the status leaves it, and the tools counter and both borders untouched.
 #[spec("inbox/status/007")]
 #[test]
 fn status_007_narrow_card_keeps_inbox_status_and_stats() {
@@ -1483,7 +1500,188 @@ fn status_007_narrow_card_keeps_inbox_status_and_stats() {
             "narrow card overran its width:\n{rendered}"
         );
     }
+    // Issue #2143: the count rides the Dir row, so the top border keeps the
+    // status alone and the title all the columns the status leaves it.
+    let rows: Vec<&str> = rendered.lines().collect();
+    assert!(
+        rows[1].ends_with("✉2 │"),
+        "the count belongs at the right end of the Dir row:\n{rendered}"
+    );
+    assert!(
+        !rows[0].contains('✉'),
+        "the count must not cut the title row:\n{rendered}"
+    );
     insta::assert_snapshot!(rendered);
+}
+
+/// `session` with the Idle status, whose ` ● Idle ` top-border chip leaves a
+/// long name room on a 40-column card.
+fn idle(mut session: SessionState) -> SessionState {
+    session.status = SessionStatus::Idle;
+    session
+}
+
+/// The rows of `session`'s card, number 1 and named `name`, drawn `width`
+/// columns wide at `density` and not selected.
+fn inbox_card_rows(
+    session: &SessionState,
+    name: &str,
+    density: CardDensityKind,
+    width: u16,
+) -> Vec<String> {
+    let buffer = render_card_to_buffer(
+        session,
+        Some(name),
+        Some(1),
+        density,
+        0,
+        render_now(),
+        false,
+        width,
+        density.rendered_height(),
+    );
+    buffer_to_text(&buffer)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+/// Scenario: Render a 40-column card for a worker named `reviewer` and one named `orchestrator`, each with no inbox line, with a delivered message and with two queued messages, at every density. The title row is the same in all three and the status chip carries no inbox line; the line sits at the right end of the Dir row, and no card gains or loses a row.
+#[spec("inbox/status/037")]
+#[test]
+fn status_037_inbox_line_rides_the_dir_row_and_leaves_the_title_whole() {
+    let names = [
+        ("reviewer", "┌ 1 ClaudeCode · reviewer ───── ● Idle ┐"),
+        ("orchestrator", "┌ 1 ClaudeCode · orchestrator ─ ● Idle ┐"),
+    ];
+    let lines = [
+        ("delivered", "│Dir:  api-svc             ✉ delivered │"),
+        ("queued", "│Dir:  api-svc               ✉2 queued │"),
+    ];
+    for density in [
+        CardDensityKind::Minimal,
+        CardDensityKind::Compact,
+        CardDensityKind::Normal,
+        CardDensityKind::Spacious,
+    ] {
+        for (name, title) in names {
+            let bare = inbox_card_rows(&idle(inbox_card_session(0, 0, false)), name, density, 40);
+            assert_eq!(bare[0], title, "{name} with no inbox line, {density:?}");
+            for (line, dir_row) in lines {
+                let session = match line {
+                    "delivered" => inbox_card_session(0, 0, true),
+                    _ => inbox_card_session(2, 0, false),
+                };
+                let rows = inbox_card_rows(&idle(session), name, density, 40);
+                let drawn = rows.join("\n");
+                assert_eq!(
+                    rows[0], title,
+                    "{name}, {line}, {density:?}: the inbox line must not touch the title row:\n{drawn}"
+                );
+                assert_eq!(
+                    rows[1], dir_row,
+                    "{name}, {line}, {density:?}: the line belongs at the right end of the Dir row:\n{drawn}"
+                );
+                assert_eq!(
+                    rows.len(),
+                    bare.len(),
+                    "{name}, {line}, {density:?}: the card must keep its height:\n{drawn}"
+                );
+                assert_eq!(
+                    rows[2..],
+                    bare[2..],
+                    "{name}, {line}, {density:?}: no row below the Dir row may change:\n{drawn}"
+                );
+            }
+        }
+    }
+}
+
+/// Scenario: Render a card whose directory name is longer than the Dir row's room beside a delivered message, at 40 columns, then the same card with two queued messages at 24, 18, 13 and 12 columns. The directory is cut with an ellipsis before the inbox line loses a word; as the card narrows the line gives its words for the bare count on the Dir row, then, when not even the count fits beside the Dir label, it stays in the top border as before, and where it never fitted it still shows nowhere.
+#[spec("inbox/status/038")]
+#[test]
+fn status_038_dir_is_cut_before_the_inbox_line_and_the_line_degrades() {
+    let cwd = "/home/dev/dot-agent-deck-worktree-name";
+    let card = |session: SessionState, width: u16| {
+        inbox_card_rows(&idle(session), "reviewer", CardDensityKind::Normal, width)
+    };
+
+    let rows = card(inbox_card_session_in(cwd, 0, 0, true, false), 40);
+    assert_eq!(rows[0], "┌ 1 ClaudeCode · reviewer ───── ● Idle ┐");
+    assert_eq!(
+        rows[1],
+        "│Dir:  dot-agent-deck-wor… ✉ delivered │",
+        "the directory is what gives way, and keeps its label:\n{}",
+        rows.join("\n")
+    );
+
+    // The full words, the bare count beside the label, the top border, and
+    // where nothing ever fitted, nowhere.
+    for (width, top, dir) in [
+        (24, "┌ 1 ClaudeCode… ● Idle ┐", "│Dir:  dot-… ✉2 queued │"),
+        (18, "┌ 1 Clau… ● Idle ┐", "│Dir:  dot-a… ✉2 │"),
+        (13, "┌ ● Idle ✉2 ┐", "│Dir:  dot-…│"),
+        (12, "┌ … ● Idle ┐", "│Dir:  dot…│"),
+    ] {
+        let rows = card(inbox_card_session_in(cwd, 2, 0, false, false), width);
+        let drawn = rows.join("\n");
+        assert_eq!(rows[0], top, "{width} columns:\n{drawn}");
+        assert_eq!(rows[1], dir, "{width} columns:\n{drawn}");
+        for row in &rows {
+            assert_eq!(UnicodeWidthStr::width(row.as_str()), usize::from(width));
+        }
+    }
+}
+
+/// Scenario: Render a card with two queued messages where the inbox line has no Dir row to move to or no reason to: 80 columns wide, where the whole title fits beside it, in a Minimal card whose Blocked reason takes the Dir row's place at 40 columns, and as a placeholder card that has no agent. The first two keep the line in the top border exactly as before, with the title cut by it only in the Blocked card, and the placeholder draws no line.
+#[spec("inbox/status/039")]
+#[test]
+fn status_039_inbox_line_stays_in_the_top_border_where_it_cannot_move() {
+    let rows = inbox_card_rows(
+        &idle(inbox_card_session(2, 0, false)),
+        "reviewer",
+        CardDensityKind::Normal,
+        80,
+    );
+    assert_eq!(
+        rows[0],
+        "┌ 1 ClaudeCode · reviewer ─────────────────────────────────── ● Idle ✉2 queued ┐"
+    );
+    assert_eq!(
+        rows[1],
+        "│Dir:  api-svc                                                                 │"
+    );
+
+    let mut blocked = inbox_card_session(2, 0, false);
+    blocked.status = SessionStatus::Blocked;
+    blocked.blocked = Some(BlockedReason {
+        kind: BlockedKind::CreditsDepleted,
+        detected_at_ms: render_now().timestamp_millis(),
+        detail: None,
+        resets_at_ms: None,
+    });
+    let rows = inbox_card_rows(&blocked, "reviewer", CardDensityKind::Minimal, 40);
+    let drawn = rows.join("\n");
+    assert_eq!(
+        rows[0], "┌ 1 ClaudeCode · … ● Blocked ✉2 queued ┐",
+        "no Dir row, so the line cuts the title as it always did:\n{drawn}"
+    );
+    assert!(
+        rows[1].starts_with("│⚠"),
+        "the reason has the row:\n{drawn}"
+    );
+    assert!(!drawn.contains("Dir:"), "{drawn}");
+    assert_eq!(drawn.matches('✉').count(), 1, "{drawn}");
+
+    let mut placeholder = inbox_card_session(2, 0, false);
+    placeholder.agent_type = AgentType::None;
+    let rows = inbox_card_rows(&idle(placeholder), "reviewer", CardDensityKind::Normal, 40);
+    let drawn = rows.join("\n");
+    assert!(drawn.contains("No agent"), "{drawn}");
+    assert!(
+        !drawn.contains('✉'),
+        "a card with no agent has no inbox:\n{drawn}"
+    );
 }
 
 /// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.

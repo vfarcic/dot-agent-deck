@@ -7367,6 +7367,12 @@ fn truncate_styled_segments(
     out
 }
 
+/// The cells `text` occupies as ratatui draws it ([`drawn_clusters`]).
+fn drawn_width(text: &str) -> usize {
+    let span = Span::raw(text);
+    drawn_clusters(&span).map(|(_, width)| width).sum()
+}
+
 /// The grapheme clusters ratatui draws for `span`, each with the cells it
 /// occupies — `Span::styled_graphemes` for the segmentation and the
 /// control-character filter, and `CellWidth` for the width, which are the two
@@ -22578,26 +22584,34 @@ fn render_session_card(
     let status_text = format!(" {} {} ", dot, status_label);
     // PRD #1666 §2.8: the inbox line rides the status badge — `✉2 queued` /
     // `✉ delivered` where the title keeps room, the pending count alone on a
-    // narrow card, and nothing where even that does not fit.
-    let inbox_text = if is_placeholder {
+    // narrow card, and nothing where even that does not fit. Issue #2143: this
+    // is the line's place only while it leaves the title whole. Where it would
+    // cut the title and the card draws a `Dir:` row, the line moves to the right
+    // end of that row, and the badge keeps the status alone — decided below,
+    // once the card's rows are known.
+    let inbox = if is_placeholder {
         None
     } else {
-        session
-            .card_inbox()
-            .and_then(|inbox| card_inbox_badge(&inbox, &status_text, area.width as usize))
+        session.card_inbox()
     };
-    let badge_width = unicode_width::UnicodeWidthStr::width(status_text.as_str())
-        + inbox_text
+    let chip_inbox = inbox
+        .as_ref()
+        .and_then(|inbox| card_inbox_badge(inbox, &status_text, area.width as usize));
+    let status_width = unicode_width::UnicodeWidthStr::width(status_text.as_str());
+    let badge_width = status_width
+        + chip_inbox
             .as_deref()
             .map(unicode_width::UnicodeWidthStr::width)
             .unwrap_or(0);
     // What is left of the card's width once the right-hand status badge and the
-    // two border cells are paid for. Issue #357: this is a COLUMN budget — both
-    // terms it subtracts are cells on the same row — and `truncate_styled_segments`
-    // now spends it as one. The badge is measured with `UnicodeWidthStr` for that
-    // reason rather than by `char`; the two agree on every badge this renders
-    // today (ASCII labels, and `flash_dot`'s `●` is ambiguous-width, so one
-    // column), so the budget is unchanged and no card snapshot moves.
+    // two border cells are paid for — with the inbox line in the badge, as this
+    // is the budget the decisions below are first made against (issue #2143).
+    // Issue #357: this is a COLUMN budget — both terms it subtracts are cells on
+    // the same row — and `truncate_styled_segments` now spends it as one. The
+    // badge is measured with `UnicodeWidthStr` for that reason rather than by
+    // `char`; the two agree on every badge this renders today (ASCII labels, and
+    // `flash_dot`'s `●` is ambiguous-width, so one column), so the budget is
+    // unchanged and no card snapshot moves.
     let max_title = (area.width as usize).saturating_sub(badge_width + 2);
     // Issue #1947: the orchestrator seat's ORCHESTRATOR badge — the desktop
     // tile's word — ends the title when the whole title still fits beside it.
@@ -22617,7 +22631,6 @@ fn render_session_card(
     if seat_in_title {
         title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
     }
-    let title_spans = truncate_styled_segments(title_segments, max_title);
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
     // agent recedes and a working one reads green. A SELECTED card's border
@@ -22660,19 +22673,15 @@ fn render_session_card(
         session.tool_count as usize,
     );
 
+    // The title row's two titles are added after the rows are planned below,
+    // since where the inbox line goes decides how wide the title may be
+    // (issue #2143). The inner area never depends on them: `Borders::ALL`
+    // takes the same cells with or without a title.
     let mut block = Block::default()
         .borders(Borders::ALL)
         .border_type(border_type)
         .border_style(border_style)
-        .title(Line::from(title_spans))
-        .title_alignment(ratatui::layout::Alignment::Left)
-        .title({
-            let mut badge = vec![Span::styled(status_text, status_style)];
-            if let Some(inbox) = inbox_text {
-                badge.push(Span::styled(inbox, text_primary()));
-            }
-            Line::from(badge).alignment(ratatui::layout::Alignment::Right)
-        });
+        .title_alignment(ratatui::layout::Alignment::Left);
     if let Some(badge) = pr_badge {
         block = block.title_bottom(Line::from(badge).alignment(ratatui::layout::Alignment::Left));
     }
@@ -22690,7 +22699,6 @@ fn render_session_card(
     // and stays terminal-relative (no absolute `selected_bg` tint).
 
     let inner = block.inner(area);
-    frame.render_widget(block, area);
 
     let w = inner.width as usize;
 
@@ -22700,18 +22708,6 @@ fn render_session_card(
         .and_then(|p| std::path::Path::new(p).file_name())
         .map(|n| n.to_string_lossy())
         .unwrap_or_else(|| "—".into());
-
-    // PRD #339: with the counters on the border, `Dir:` gets the whole inner
-    // width at every card width — one un-branched form, always ellipsized (the
-    // old narrow branch bare-clipped the path with no `…`).
-    let dir_label_len = 6; // "Dir:  "
-    let dir_line = Line::from(vec![
-        Span::styled("Dir:  ", text_primary()),
-        Span::raw(truncate_with_ellipsis(
-            cwd_display.as_ref(),
-            w.saturating_sub(dir_label_len),
-        )),
-    ]);
 
     // Issue #1368: the conditional rows below (`Orphaned`, the Blocked reason)
     // are NOT part of `CardDensity::card_height` — every card in a grid row
@@ -22895,9 +22891,54 @@ fn render_session_card(
         density.has_separator(),
         tool_lines.len(),
     );
+
+    // Issue #2143: where the inbox line goes. It stays in the badge, as it
+    // always has, while the whole title fits beside it. Where it would cut the
+    // title, it moves to the right end of the `Dir:` row, which costs no row
+    // since the card draws that row anyway, and the badge keeps the status
+    // alone, so the title is as wide as it would be with no inbox line.
+    //
+    // The line never disappears for this: where the card draws no `Dir:` row (a
+    // status row took its place, or the card is too short), or the row has no
+    // room for even the pending count beside its label and a character of the
+    // directory, the line stays in the badge and cuts the title as before.
+    //
+    // The decision comes last on purpose. It moves a string and widens the
+    // title, and it moves no row: the ORCHESTRATOR badge, the status rows and
+    // the `Dir:` row were all settled above with the line in the badge, so the
+    // placement cannot feed back into them. A title the line cuts has no room
+    // for the ORCHESTRATOR badge beside it, so that badge has a row of its own,
+    // and keeps it when the title has room for it once the line has moved.
+    let dir_inbox = if plan.dir && chip_inbox.is_some() && title_width > max_title {
+        inbox
+            .as_ref()
+            .and_then(|inbox| card_dir_row_inbox(inbox, w, cwd_display.as_ref()))
+    } else {
+        None
+    };
+    let (chip_inbox, title_budget) = if dir_inbox.is_some() {
+        (None, (area.width as usize).saturating_sub(status_width + 2))
+    } else {
+        (chip_inbox, max_title)
+    };
+
+    let title_spans = truncate_styled_segments(title_segments, title_budget);
+    block = block.title(Line::from(title_spans)).title({
+        let mut badge = vec![Span::styled(status_text, status_style)];
+        if let Some(inbox) = chip_inbox {
+            badge.push(Span::styled(inbox, text_primary()));
+        }
+        Line::from(badge).alignment(ratatui::layout::Alignment::Right)
+    });
+    frame.render_widget(block, area);
+
     let mut lines: Vec<Line<'_>> = Vec::new();
     if plan.dir {
-        lines.push(dir_line);
+        // PRD #339: with the counters on the border, `Dir:` gets the whole
+        // inner width at every card width — one un-branched form, always
+        // ellipsized (the old narrow branch bare-clipped the path with no
+        // `…`) — less the inbox line when it has moved here (issue #2143).
+        lines.push(card_dir_line(cwd_display.as_ref(), w, dir_inbox.as_deref()));
     }
     lines.extend(status_lines);
     let skip_prompts = prompts.len() - plan.prompts;
@@ -22971,6 +23012,88 @@ fn card_inbox_badge(
         .short_text()
         .map(|text| format!("{text} "))
         .filter(|short| fits(short, 0))
+}
+
+/// Issue #2143: the label a card's `Dir:` row opens with, and its columns.
+const CARD_DIR_LABEL: &str = "Dir:  ";
+const CARD_DIR_LABEL_WIDTH: usize = 6;
+
+/// Issue #2143: the columns kept clear between the directory and the inbox
+/// line on the `Dir:` row.
+const CARD_DIR_INBOX_GAP: usize = 1;
+
+/// Issue #2143: the inbox text a card's `Dir:` row of `inner_width` columns can
+/// carry at its right edge beside the directory `cwd`, trailing space included:
+/// the full line, else the pending count alone, else `None`, which leaves the
+/// line in the status badge ([`card_inbox_badge`]).
+///
+/// The line has priority over the directory, which is cut to make room. What
+/// must fit is the `Dir:  ` label, a [`CARD_DIR_INBOX_GAP`], the line and the
+/// least of the directory: its first character and the `…` that says the rest
+/// was cut, or the whole of it when that is shorter.
+fn card_dir_row_inbox(
+    inbox: &crate::inbox_display::CardInbox,
+    inner_width: usize,
+    cwd: &str,
+) -> Option<String> {
+    let span = Span::raw(cwd);
+    let first = drawn_clusters(&span).next().map_or(0, |(_, width)| width);
+    let kept = drawn_width(cwd).min(first.saturating_add(1));
+    let fits = |text: &str| {
+        CARD_DIR_LABEL_WIDTH
+            .saturating_add(kept)
+            .saturating_add(CARD_DIR_INBOX_GAP)
+            .saturating_add(unicode_width::UnicodeWidthStr::width(text))
+            <= inner_width
+    };
+    [inbox.full_text(), inbox.short_text()]
+        .into_iter()
+        .flatten()
+        .map(|text| format!("{text} "))
+        .find(|text| fits(text))
+}
+
+/// Issue #2143: a card's `Dir:` row, `inner_width` columns wide — the label and
+/// the directory, cut with `…` when it does not fit, and with `inbox` (the text
+/// [`card_dir_row_inbox`] chose) the line at the row's right edge, the directory
+/// cut to leave it a [`CARD_DIR_INBOX_GAP`].
+///
+/// Every width here is in drawn columns, and the directory is cut by
+/// [`truncate_styled_segments`] on the same measure, so the row is never wider
+/// than `inner_width` and the line is never what loses a column.
+fn card_dir_line(cwd: &str, inner_width: usize, inbox: Option<&str>) -> Line<'static> {
+    let label = Span::styled(CARD_DIR_LABEL, text_primary());
+    let Some(inbox) = inbox else {
+        return Line::from(vec![
+            label,
+            Span::raw(truncate_with_ellipsis(
+                cwd,
+                inner_width.saturating_sub(CARD_DIR_LABEL_WIDTH),
+            )),
+        ]);
+    };
+    let inbox_width = drawn_width(inbox);
+    let budget = inner_width.saturating_sub(
+        CARD_DIR_LABEL_WIDTH
+            .saturating_add(CARD_DIR_INBOX_GAP)
+            .saturating_add(inbox_width),
+    );
+    let dir = truncate_styled_segments(vec![(cwd.to_string(), Style::default())], budget);
+    let dir_width: usize = dir
+        .iter()
+        .flat_map(|span| drawn_clusters(span))
+        .map(|(_, width)| width)
+        .sum();
+    let pad = inner_width.saturating_sub(
+        CARD_DIR_LABEL_WIDTH
+            .saturating_add(dir_width)
+            .saturating_add(inbox_width),
+    );
+    let mut spans = vec![label];
+    spans.extend(dir);
+    spans.push(Span::raw(" ".repeat(pad)));
+    spans.push(Span::styled(inbox.to_string(), text_primary()));
+    Line::from(spans)
 }
 
 /// Issue #1678: a Minimal card's one content row when it has both a status
@@ -35589,9 +35712,16 @@ mod tests {
             let card = render(&busy, long, width, true);
             let title = card.lines().next().unwrap();
             assert!(title.contains("Working"), "{width}: {card}");
-            assert!(title.contains("queued"), "{width}: {card}");
+            // Issue #2143: the queued line would cut the title, so it sits at
+            // the right end of the `Dir:` row and the title keeps the columns.
+            assert!(!title.contains("queued"), "{width}: {card}");
+            assert!(
+                card.lines().nth(1).unwrap().ends_with("✉1 queued │"),
+                "{width}: {card}"
+            );
             // The title has no room for the word, so it takes a row of its
-            // own, whole, and the title cuts only what it cut before.
+            // own, whole, and the title is cut as a card that is not the
+            // seat's is.
             assert!(!title.contains("ORCHESTRATOR"), "{width}: {card}");
             assert_eq!(
                 title,
@@ -35616,6 +35746,296 @@ mod tests {
         assert!(title.contains(" · coordinator "), "{card}");
         assert!(!title.contains('…'), "{card}");
         assert!(card.contains("│ORCHESTRATOR "), "{card}");
+    }
+
+    /// A session in `status` whose card shows `inbox`, as one the deck has
+    /// heard an inbox summary for.
+    fn session_with_inbox(
+        status: SessionStatus,
+        inbox: &crate::inbox_display::CardInbox,
+    ) -> SessionState {
+        let mut session = make_session(status);
+        let notice: AgentEvent = serde_json::from_value(serde_json::json!({
+            "session_id": "",
+            "agent_type": "claude_code",
+            "event_type": "notification",
+            "timestamp": Utc::now(),
+            "metadata": { crate::inbox_display::CARD_INBOX_METADATA_KEY: inbox.encode() },
+        }))
+        .unwrap();
+        session.recent_events.push_back(notice);
+        session
+    }
+
+    /// The rows of a card number 1 named `name`, drawn `width` columns wide
+    /// and as tall as `density` makes it, for the orchestrator seat or not.
+    fn card_rows(
+        session: &SessionState,
+        name: &str,
+        width: u16,
+        density: CardDensity,
+        is_orchestrator: bool,
+    ) -> Vec<String> {
+        let name = name.to_string();
+        let backend = ratatui::backend::TestBackend::new(width, density.card_height());
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                render_session_card(
+                    frame,
+                    frame.area(),
+                    session,
+                    0,
+                    false,
+                    Some(&name),
+                    Some(1),
+                    density,
+                    UiMode::Normal,
+                    None,
+                    Utc::now(),
+                    is_orchestrator,
+                );
+            })
+            .unwrap();
+        buffer_to_string(terminal.backend().buffer())
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Scenario: draw the orchestrator seat's 40-column card in its three
+    /// situations while a queued message waits, as the issue #2143 inbox line
+    /// moves or stays: the title and the word both fit beside the line in a wide
+    /// card, so nothing moves; the line would cut the title, so it moves to the
+    /// `Dir:` row while ORCHESTRATOR keeps its row; and a Minimal card whose one
+    /// row ORCHESTRATOR takes keeps the line in the top border.
+    #[test]
+    #[spec("inbox/status/040")]
+    fn status_040_the_orchestrator_seat_and_the_inbox_line_each_keep_the_row_they_had() {
+        let queued = session_with_inbox(
+            SessionStatus::Working,
+            &crate::inbox_display::CardInbox {
+                pending: 1,
+                ..Default::default()
+            },
+        );
+
+        // Room for the title, the word and the line: nothing moves.
+        let rows = card_rows(&queued, "lead", 80, CardDensity::Compact, true);
+        assert_eq!(
+            rows[0],
+            "┌ 1 ClaudeCode · lead ORCHESTRATOR──────────────────────── ● Working ✉1 queued ┐"
+        );
+        assert_eq!(
+            rows[1],
+            "│Dir:  —                                                                       │"
+        );
+
+        // The line would cut the title, so it takes the right end of the
+        // `Dir:` row, the title is whole, and the word keeps its own row.
+        let rows = card_rows(&queued, "reviewer", 40, CardDensity::Compact, true);
+        assert_eq!(rows[0], "┌ 1 ClaudeCode · reviewer ── ● Working ┐");
+        assert_eq!(rows[1], "│Dir:  —                     ✉1 queued │");
+        assert_eq!(rows[2], "│ORCHESTRATOR                          │");
+        assert_eq!(rows.len(), usize::from(CardDensity::Compact.card_height()));
+
+        // The word's row is the Minimal card's only row, so there is no `Dir:`
+        // row to take the line and it stays in the top border, cutting the
+        // title as it always did.
+        let rows = card_rows(&queued, "reviewer", 40, CardDensity::Minimal, true);
+        assert_eq!(rows[0], "┌ 1 ClaudeCode · … ● Working ✉1 queued ┐");
+        assert_eq!(rows[1], "│ORCHESTRATOR                          │");
+        assert_eq!(rows.len(), 3);
+    }
+
+    /// Scenario: draw the orchestrator seat's card at 66 columns while its wake
+    /// is stalled, with a short name. Moving the long stalled line off the top
+    /// border leaves the title room for the ORCHESTRATOR word, but the card's
+    /// rows are settled with the line in the border, so the word keeps the row
+    /// it had and the card has the same rows it would have with the line still
+    /// in the border.
+    #[test]
+    #[spec("inbox/status/040")]
+    fn status_040_moving_the_inbox_line_off_the_title_row_never_changes_the_cards_rows() {
+        let stalled = session_with_inbox(
+            SessionStatus::Idle,
+            &crate::inbox_display::CardInbox {
+                pending: 1,
+                stalled: true,
+                ..Default::default()
+            },
+        );
+        let rows = card_rows(&stalled, "lead", 66, CardDensity::Compact, true);
+        let drawn = rows.join("\n");
+        assert!(rows[0].contains(" · lead ─"), "{drawn}");
+        assert!(!rows[0].contains("ORCHESTRATOR"), "{drawn}");
+        assert!(rows[1].contains("Dir:  —"), "{drawn}");
+        assert!(
+            rows[1].ends_with("✉1 waiting to wake: send it a prompt │"),
+            "{drawn}"
+        );
+        assert!(rows[2].starts_with("│ORCHESTRATOR "), "{drawn}");
+        assert_eq!(drawn.matches('✉').count(), 1, "{drawn}");
+    }
+
+    /// Scenario: draw cards with an inbox line, for the orchestrator seat and
+    /// not, with a long name, a wide-character directory and a plain one, at
+    /// every density and every width from 0 to 90 columns. Nothing panics, and
+    /// the line is drawn at most once, never both in the top border and on the
+    /// `Dir:` row.
+    #[test]
+    #[spec("inbox/status/041")]
+    fn status_041_an_inbox_line_on_any_card_size_never_panics_and_is_drawn_once() {
+        let inboxes = [
+            crate::inbox_display::CardInbox {
+                pending: 2,
+                ..Default::default()
+            },
+            crate::inbox_display::CardInbox {
+                delivered: true,
+                ..Default::default()
+            },
+            crate::inbox_display::CardInbox {
+                pending: 1,
+                stalled: true,
+                ..Default::default()
+            },
+        ];
+        let cwds = [
+            None,
+            Some("/work/日本語のディレクトリ"),
+            Some("/work/api-svc"),
+        ];
+        for inbox in &inboxes {
+            for cwd in cwds {
+                let mut session = session_with_inbox(SessionStatus::Working, inbox);
+                session.cwd = cwd.map(str::to_string);
+                for density in [
+                    CardDensity::Minimal,
+                    CardDensity::Compact,
+                    CardDensity::Normal,
+                    CardDensity::Spacious,
+                ] {
+                    for is_orchestrator in [false, true] {
+                        for width in 0..=90u16 {
+                            let rows = card_rows(
+                                &session,
+                                "orchestrator-with-a-very-long-role-name",
+                                width,
+                                density,
+                                is_orchestrator,
+                            );
+                            let drawn = rows.join("\n");
+                            assert!(
+                                drawn.matches('✉').count() <= 1,
+                                "{width} columns, {density:?}:\n{drawn}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Scenario: ask which inbox line a `Dir:` row can carry, for a plain
+    /// directory, a one-character one, an empty one and a wide-character one, as
+    /// the row narrows through the widths where the full words, the bare count
+    /// and nothing fit, and for rows too narrow to hold even the label.
+    #[test]
+    #[spec("inbox/status/041")]
+    fn status_041_the_dir_row_carries_the_full_line_then_the_count_then_nothing() {
+        let queued = crate::inbox_display::CardInbox {
+            pending: 2,
+            ..Default::default()
+        };
+        let delivered = crate::inbox_display::CardInbox {
+            delivered: true,
+            ..Default::default()
+        };
+        let ask = card_dir_row_inbox;
+        // The label (6), a character of `api-svc` and the `…` (2), the gap (1)
+        // and the line (10): 19 columns for the words, 12 for the count.
+        assert_eq!(ask(&queued, 19, "api-svc").as_deref(), Some("✉2 queued "));
+        assert_eq!(ask(&queued, 18, "api-svc").as_deref(), Some("✉2 "));
+        assert_eq!(ask(&queued, 12, "api-svc").as_deref(), Some("✉2 "));
+        assert_eq!(ask(&queued, 11, "api-svc"), None);
+        // `✉ delivered` has no count to fall back to.
+        assert_eq!(
+            ask(&delivered, 21, "api-svc").as_deref(),
+            Some("✉ delivered ")
+        );
+        assert_eq!(ask(&delivered, 20, "api-svc"), None);
+        // A directory shorter than two columns keeps all of itself, no `…`.
+        assert_eq!(ask(&queued, 18, "a").as_deref(), Some("✉2 queued "));
+        assert_eq!(ask(&queued, 17, "").as_deref(), Some("✉2 queued "));
+        assert_eq!(ask(&queued, 16, "").as_deref(), Some("✉2 "));
+        // A wide first character needs its two columns and the `…`.
+        assert_eq!(ask(&queued, 20, "日本語").as_deref(), Some("✉2 queued "));
+        assert_eq!(ask(&queued, 19, "日本語").as_deref(), Some("✉2 "));
+        for width in 0..=4 {
+            assert_eq!(ask(&queued, width, "api-svc"), None);
+            assert_eq!(ask(&delivered, width, "api-svc"), None);
+        }
+        assert_eq!(
+            ask(&crate::inbox_display::CardInbox::default(), 80, "api-svc"),
+            None
+        );
+    }
+
+    /// Scenario: lay out a `Dir:` row with and without an inbox line, for a
+    /// directory that fits, one that has to be cut, a wide-character one and
+    /// rows narrower than the label. The line ends the row, the directory is cut
+    /// with `…` to leave a column before it, and no row is wider than asked.
+    #[test]
+    #[spec("inbox/status/041")]
+    fn status_041_the_dir_row_ends_with_the_line_and_never_overruns() {
+        let text = |line: &Line<'_>| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let row =
+            |cwd: &str, width: usize, inbox: Option<&str>| text(&card_dir_line(cwd, width, inbox));
+        assert_eq!(row("api-svc", 18, Some("✉2 ")), "Dir:  api-svc  ✉2 ");
+        assert_eq!(row("api-svc", 18, None), "Dir:  api-svc");
+        assert_eq!(
+            row("dot-agent-deck-worktree-name", 22, Some("✉2 queued ")),
+            "Dir:  dot-… ✉2 queued "
+        );
+        assert_eq!(
+            row("dot-agent-deck-worktree-name", 22, None),
+            "Dir:  dot-agent-deck-…"
+        );
+        // A wide character is cut whole: two columns of `日` and the `…`.
+        assert_eq!(
+            row("日本語日本語", 20, Some("✉2 queued ")),
+            "Dir:  日… ✉2 queued "
+        );
+        for cwd in [
+            "api-svc",
+            "dot-agent-deck-worktree-name",
+            "日本語日本語",
+            "",
+            "e\u{301}e\u{301}e\u{301}",
+        ] {
+            for width in 0..=40 {
+                for inbox in [None, Some("✉2 "), Some("✉2 queued ")] {
+                    let drawn = drawn_width(&row(cwd, width, inbox));
+                    // The label, and with a line the gap and the line, are
+                    // whole whatever the row's width, so a row narrower than
+                    // those is as wide as they are.
+                    let fixed = match inbox {
+                        Some(line) => CARD_DIR_LABEL_WIDTH + CARD_DIR_INBOX_GAP + drawn_width(line),
+                        None => CARD_DIR_LABEL_WIDTH,
+                    };
+                    assert!(
+                        drawn <= width.max(fixed),
+                        "{cwd:?} in {width} with {inbox:?}: {drawn}"
+                    );
+                }
+            }
+        }
     }
 
     /// An OpenCode card carrying the daemon's agent notice `notice` (beside a

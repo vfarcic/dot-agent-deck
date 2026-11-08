@@ -87,7 +87,7 @@ If Blocked never appears for Claude Code or OpenCode, the hook or plugin that re
 
 ## Message delivery
 
-Both the TUI card and desktop tile show `✉N queued` for messages awaiting acknowledgement and `✉ delivered` when the agent has received them and none remain pending. Narrow TUI cards shorten the count to `✉N`. A message that cannot be delivered shows **Error** (desktop **error**) and a `not delivered: …` notice. The desktop overview still counts error agents under **FAILED**.
+Both the TUI card and desktop tile show `✉N queued` for messages awaiting acknowledgement and `✉ delivered` when the agent has received them and none remain pending. On a TUI card this line sits in the top border beside the status. Where it would cut the agent's type and name short there, it moves to the right end of the card's `Dir:` row instead, and the directory is what gives way, so the title keeps the room it has without the line. A card that draws no `Dir:` row, such as a Minimal card whose Blocked reason takes that row's place, keeps the line in the top border. Narrow TUI cards shorten the line to the count, `✉N`, which does not say whether the messages are queued or the wake has stalled; where there is no count to show (`✉ delivered`) or not even the count fits, the card leaves the line out. A message that cannot be delivered shows **Error** (desktop **error**) and a `not delivered: …` notice. The desktop overview still counts error agents under **FAILED**.
 
 The `Prmt:` line on a TUI card shows `✉ <subject>` for a deck message. Its `Sent by:` line is visible in the agent's pane in both clients. Delivery means receipt, not that the task has finished. See [Orchestration → Delivery](orchestration.md#delivery-in-the-tui-and-desktop-app) for agent support and the inbox commands.
 
@@ -103,8 +103,8 @@ When the deck cannot tell whether a Claude Code, OpenCode or Pi agent got a mess
 
 *This section is about the TUI. The desktop app's rows and columns are described on [Desktop app → Dashboard](desktop/dashboard.md#rows-and-columns).*
 
-- **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status.
-- **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit.
+- **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status. The inbox line (`✉2 queued`, `✉ delivered`) follows the status while the whole title still fits beside it; see [Message delivery](#message-delivery) for where it goes otherwise.
+- **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit, including to leave room for the inbox line at the right end of the row when that line has moved here.
 - **`Background:`**: commands and subagents the agent left running after its turn ended, and for how long; see [Work left running after a turn](#work-left-running-after-a-turn).
 - **`Prmt:`**: the most recent prompt or prompts.
 - **Recent tool calls**: the last commands the agent ran.
