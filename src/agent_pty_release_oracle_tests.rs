@@ -133,7 +133,8 @@
 
 use super::segment_driver::{
     PROBE_WRITE_FAILED, ProbeAsk, ProbeEnd, ProbeOutcome, ProbeRefusal, drive_segments,
-    end_probe_segment, probe_ended, probe_section, scheduling_reads, writer_facts,
+    end_probe_segment, probe_ended, probe_section, scheduling_reads, scheduling_refused,
+    writer_facts,
 };
 use super::*;
 use crate::composer_probe::epoch::GenerationInput;
@@ -528,7 +529,9 @@ impl Rig {
         let now = Instant::now();
         let scheduled = outside(&w, shows_composer(marked.map(|(grid, _)| grid)), now);
         if let Err(refusal) = self.input.admit_probe(&scheduled, now) {
-            self.input.probe_failed(now);
+            // As `composer_probe` counts it: a refusal for the screen alone
+            // makes the next attempt due soon (#2147), any other counts.
+            scheduling_refused(&self.input, refusal, ProbeAsk::First, now);
             return ProbeOutcome::Refused(format!("{refusal:?}"));
         }
         between(self);
