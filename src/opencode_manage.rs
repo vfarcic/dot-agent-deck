@@ -8864,6 +8864,17 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
     #[cfg(unix)]
     fn opencode_named_shell(dir: &Path) -> PathBuf {
         let shell = dir.join("opencode");
+        // macOS SIGKILLs a copy of a platform binary such as `/bin/sh`
+        // (measured on Darwin 25: exit 137, no output), and the plugin reads
+        // a parent's name there from its `ps` arguments, which name the path
+        // it was started by, so a symlink serves. Linux resolves
+        // `/proc/<pid>/exe` through a symlink, so it keeps the copy.
+        #[cfg(target_os = "macos")]
+        if !shell.exists() {
+            std::os::unix::fs::symlink("/bin/sh", &shell)
+                .unwrap_or_else(|e| panic!("link /bin/sh to {}: {e}", shell.display()));
+        }
+        #[cfg(not(target_os = "macos"))]
         if !shell.exists() {
             let status = std::process::Command::new("cp")
                 .arg("/bin/sh")
