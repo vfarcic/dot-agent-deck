@@ -148,22 +148,25 @@ fn m59(cell: &str, armed: bool) -> Option<(std::path::PathBuf, Value)> {
     assert!(
         common::wait_until(Duration::from_secs(480), || out
             .join("result.json")
-            .exists()),
+            .exists()
+            || root.join("launcher-error.json").exists()),
         "M59 {cell} did not finish; {}\n{}",
         out.display(),
         deck.snapshot_grid()
+    );
+    // The recorder fails without a `result.json` when the executable changed
+    // during the run, and reports why in `launcher-error.json`.
+    assert!(
+        !root.join("launcher-error.json").exists(),
+        "M59 {cell} recorder failed: {}",
+        std::fs::read_to_string(root.join("launcher-error.json")).unwrap_or_default()
     );
     let result: Value =
         serde_json::from_slice(&std::fs::read(out.join("result.json")).unwrap()).unwrap();
     eprintln!("M59 {cell} evidence: {}", out.display());
     drop(deck);
     drop(generation);
-    assert_eq!(
-        result["release"],
-        claude.release.as_str(),
-        "the recorder ran another Claude Code than the installed one selected; {}",
-        out.display()
-    );
+    claude.assert_recorded(&result, &out);
     assert!(
         result["error"].is_null(),
         "M59 {cell}: {}; {}",

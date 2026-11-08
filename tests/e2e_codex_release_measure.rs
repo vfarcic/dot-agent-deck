@@ -152,12 +152,7 @@ fn record(
         capture.result["load_start"]["loadavg"],
         capture.result["load_end"]["loadavg"],
     );
-    assert_eq!(
-        capture.result["release"],
-        codex.release.as_str(),
-        "the recorder ran another Codex than the installed one selected; {}",
-        output.display()
-    );
+    codex.assert_recorded(&capture.result, &output);
     assert!(
         capture.result["error"].is_null(),
         "measurement premise differed: {}; {}",

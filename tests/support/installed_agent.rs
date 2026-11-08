@@ -14,6 +14,7 @@
 #![allow(dead_code)] // Each test file uses its own subset.
 
 use crate::common;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
@@ -30,6 +31,66 @@ pub struct Installed {
     /// measurement gives its deck this `PATH`, so the recorder in the pane
     /// resolves the same executable.
     pub path: String,
+    /// The SHA-256 of the canonical executable, computed on the first
+    /// [`Installed::assert_recorded`] that needs it and kept for the rest.
+    sha256: std::sync::OnceLock<String>,
+}
+
+impl Installed {
+    /// Asserts that a recorder's `result.json` reports this agent: the
+    /// release [`Installed::release`] names, and the executable
+    /// [`Installed::executable`] resolves to, both paths canonicalized, so a
+    /// recorder that measured another executable of the same release fails
+    /// too. Claude Code's recorders hash the executable they ran
+    /// (`executable`, `sha256`), so the hash is compared as well. Codex's
+    /// head-echo recorder reports the `codex` it resolved as `launcher` and
+    /// hashes the native executable that launcher starts (`executable`), so
+    /// its hash is compared only when the two are the same file.
+    pub fn assert_recorded(&self, result: &serde_json::Value, evidence: &Path) {
+        let agent = match self.program {
+            "claude" => "Claude Code",
+            _ => "Codex",
+        };
+        assert_eq!(
+            result["release"],
+            self.release.as_str(),
+            "the recorder ran another {agent} than the installed one selected; {}",
+            evidence.display()
+        );
+        let resolved_key = match self.program {
+            "claude" => "executable",
+            _ => "launcher",
+        };
+        let installed = self.executable.canonicalize().unwrap_or_else(|e| {
+            panic!(
+                "the installed `{}` at {} no longer resolves: {e}",
+                self.program,
+                self.executable.display()
+            )
+        });
+        let resolved = result[resolved_key].as_str().unwrap_or_else(|| {
+            panic!(
+                "the recorder reported no `{resolved_key}`; {}",
+                evidence.display()
+            )
+        });
+        assert_eq!(
+            Path::new(resolved).canonicalize().ok().as_deref(),
+            Some(installed.as_path()),
+            "the recorder ran {resolved}, not the installed {} the deck was given; {}",
+            installed.display(),
+            evidence.display()
+        );
+        if result["executable"].as_str() == Some(resolved) {
+            assert_eq!(
+                result["sha256"].as_str(),
+                Some(self.sha256.get_or_init(|| sha256_of(&installed)).as_str()),
+                "the executable the recorder hashed is not the installed {}; {}",
+                installed.display(),
+                evidence.display()
+            );
+        }
+    }
 }
 
 /// The installed Claude Code: `claude --version` prints `<release> (Claude Code)`.
@@ -89,7 +150,32 @@ fn installed(
         release,
         executable,
         path,
+        sha256: std::sync::OnceLock::new(),
     })
+}
+
+/// The lowercase hex SHA-256 of the file at `path`, read in chunks: an
+/// installed Claude Code is a few hundred MB.
+fn sha256_of(path: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)
+        .unwrap_or_else(|e| panic!("cannot read {} to hash it: {e}", path.display()));
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .unwrap_or_else(|e| panic!("cannot read {} to hash it: {e}", path.display()));
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn is_executable(candidate: &Path) -> bool {

@@ -351,12 +351,7 @@ fn record(
         result["error"],
         output.display()
     );
-    assert_eq!(
-        result["release"],
-        claude.release.as_str(),
-        "the recorder ran another Claude Code than the installed one selected; {}",
-        output.display()
-    );
+    claude.assert_recorded(&result, &output);
     let capture = Capture {
         release: result["release"].as_str().unwrap().to_string(),
         index: read_json("index.json"),

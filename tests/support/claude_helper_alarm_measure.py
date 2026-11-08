@@ -299,8 +299,10 @@ def main():
     except Exception as exc:
         error = repr(exc)
     finally:
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == digest, 'the executable changed during the run'
         (out / 'result.json').write_text(json.dumps(
-            {'cell': cell, 'release': release, 'sha256': digest, 'error': error, 'claude_pid': getattr(run, 'child', None),
+            {'cell': cell, 'release': release, 'sha256': digest, 'executable': str(binary), 'error': error,
+             'claude_pid': getattr(run, 'child', None),
              'trials': run.trials,
              'recorder_sha256': hashlib.sha256(Path(__file__).read_bytes()).hexdigest()},
             indent=1, ensure_ascii=False))

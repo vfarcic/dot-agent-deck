@@ -100,12 +100,7 @@ fn measure(mode: &str, wait: Duration) -> Option<Capture> {
         result["release"].as_str().unwrap(),
         output.display()
     );
-    assert_eq!(
-        result["release"],
-        claude.release.as_str(),
-        "the recorder ran another Claude Code than the installed one selected; {}",
-        output.display()
-    );
+    claude.assert_recorded(&result, &output);
     assert!(
         result["error"].is_null(),
         "measurement premise differed: {}; {}",
