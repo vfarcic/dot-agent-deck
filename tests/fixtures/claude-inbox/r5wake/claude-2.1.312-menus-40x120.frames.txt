@@ -1,0 +1,321 @@
+2.1.312 empty offset=1489 cursor=(37, 2)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "create a util logging.py that..."
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents
+
+row 36: "─" fg=Idx(244) bg=Default
+row 37: "❯" fg=Default bg=Default
+row 38: "─" fg=Idx(244) bg=Default
+
+2.1.312 slash offset=2048 cursor=(37, 3)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ❯ /loop                             Repeat a prompt or command on an interval (e.g. /loop 5m /foo)
+    /add-dir                          Add a new working directory
+    /advisor                          Let Claude consult a stronger model at key moments
+    /artifacts                        Browse your published and shared artifacts
+    /auto-mode-setup                  Teach auto mode about your environment, plus optional rule tweaks
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ /
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 36: "─" fg=Idx(244) bg=Default
+row 37: "❯" fg=Default bg=Default
+row 38: "─" fg=Idx(244) bg=Default
+
+2.1.312 at offset=2633 cursor=(37, 3)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+    + .dot-agent-deck.toml
+    + .git/
+    + attach.sock
+    + session.toml
+    + hook.sock
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ @
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 36: "─" fg=Idx(244) bg=Default
+row 37: "❯" fg=Default bg=Default
+row 38: "─" fg=Idx(244) bg=Default
+
+2.1.312 bang offset=3718 cursor=(37, 2)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+! Try "create a util logging.py that..."
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ! for shell mode
+
+row 36: "─" fg=Idx(211) bg=Default
+row 37: "!" fg=Idx(211) bg=Default
+row 38: "─" fg=Idx(211) bg=Default
+
+2.1.312 exit-warning offset=4693 cursor=(37, 2)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                    ◐ medium · /effort
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Try "create a util logging.py that..."
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  Press Ctrl-C again to exit
+
+row 36: "─" fg=Idx(244) bg=Default
+row 37: "❯" fg=Default bg=Default
+row 38: "─" fg=Idx(244) bg=Default
+
+2.1.312 transcript-quotation offset=15421 cursor=(37, 2)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  Haiku 5.5 · Claude Max
+ ▝▝   ▝▝   /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+
+
+● UserPromptSubmit operation blocked by hook:
+  release measurement; no model turn
+
+  Original prompt: Quoted UI phrases: Your conversation moved to the background; describe a task for a new
+  session; Press Ctrl-C again to exit; /help; @file; ! shell mode.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+                                                        You've used 78% of your weekly limit · resets Nov 2, 9pm (UTC)
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode on (shift+tab to cycle)
+
+row 36: "─" fg=Idx(244) bg=Default
+row 37: "❯" fg=Default bg=Default
+row 38: "─" fg=Idx(244) bg=Default
+
+2.1.312 overview offset=18317 cursor=(37, 2)
+
+ ▐▛███▛█   Claude Code v2.1.312
+▝▜██████▀  New sessions: Opus 5.5 · high effort · /var/tmp/dad-e2e-1000/dad-tests-1723195-wsJzoF/.tmpKgNrIL
+ ▝▝   ▝▝   1 awaiting input · 0 working · 0 completed
+
+Your conversation moved to the background — enter opens it · esc returns to it · ctrl+c twice quits
+
+Needs input
+ Sessions that have a question or need your decision land here
+ ✻ current session  .tmpKgNrIL                                                                                        0s
+
+Working
+ Sessions Claude is actively working on — they keep running even if you close the terminal
+
+Completed
+ Finished sessions wait here for you to review
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+ A different way to work with Claude: hand off a bigger task than you would chat through, and Claude organizes it in the
+ sections above so you know when it needs you.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ describe a task for a new session
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ auto mode · enter to return · space to reply · ctrl+x to delete · ? for shortcuts
+
+row 36: "─" fg=Default bg=Default
+row 37: "❯" fg=Idx(246) bg=Default
+row 38: "─" fg=Default bg=Default

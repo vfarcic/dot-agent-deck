@@ -1,0 +1,220 @@
+{
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "mode": "startup",
+ "error": null,
+ "size": [
+  50,
+  200
+ ],
+ "term": "xterm-256color",
+ "colorterm": "truecolor",
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "setup": "nollm: dummy key, loopback Responses server, bwrap --unshare-net, tmpfs /home /root /tmp /run/user",
+ "recorder_sha256": "1bb22be75acc1823a61dd808202a7dea6609ac44b40f5828d01a97024136fd81",
+ "rows": [
+  {
+   "cell": "startup",
+   "launch": 1,
+   "ready_after_first_output_s": 0.313724746,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.040475348,
+     "sent_after_first_output_s": 0.354200094,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.731756423,
+     "sent_after_first_output_s": 1.045481169,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 1.415862408,
+     "sent_after_first_output_s": 1.729587154,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 2,
+   "ready_after_first_output_s": 0.294820341,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.047146996,
+     "sent_after_first_output_s": 0.341967337,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.727306977,
+     "sent_after_first_output_s": 1.022127318,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 3,
+   "ready_after_first_output_s": 0.306123241,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.094383242,
+     "sent_after_first_output_s": 0.400506483,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.782020852,
+     "sent_after_first_output_s": 1.088144093,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 4,
+   "ready_after_first_output_s": 0.314394168,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.105393739,
+     "sent_after_first_output_s": 0.419787907,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.786908461,
+     "sent_after_first_output_s": 1.101302629,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 5,
+   "ready_after_first_output_s": 0.302880671,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.117551663,
+     "sent_after_first_output_s": 0.420432334,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.799528263,
+     "sent_after_first_output_s": 1.102408934,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 6,
+   "ready_after_first_output_s": 0.306214444,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.088013423,
+     "sent_after_first_output_s": 0.394227867,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.776380982,
+     "sent_after_first_output_s": 1.082595426,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 7,
+   "ready_after_first_output_s": 0.306294423,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.095001297,
+     "sent_after_first_output_s": 0.40129572,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.77079013,
+     "sent_after_first_output_s": 1.077084553,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 8,
+   "ready_after_first_output_s": 0.303687627,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.048120081,
+     "sent_after_first_output_s": 0.351807708,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.734363434,
+     "sent_after_first_output_s": 1.038051061,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 9,
+   "ready_after_first_output_s": 0.320147611,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.103464361,
+     "sent_after_first_output_s": 0.423611972,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.794477774,
+     "sent_after_first_output_s": 1.114625385,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  },
+  {
+   "cell": "startup",
+   "launch": 10,
+   "ready_after_first_output_s": 0.311926878,
+   "tries": [
+    {
+     "sent_after_ready_s": 0.093422413,
+     "sent_after_first_output_s": 0.405349291,
+     "opened": false,
+     "error_line": null
+    },
+    {
+     "sent_after_ready_s": 0.776368363,
+     "sent_after_first_output_s": 1.088295241,
+     "opened": true,
+     "error_line": null
+    }
+   ]
+  }
+ ]
+}

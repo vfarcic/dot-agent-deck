@@ -2028,6 +2028,8 @@ impl DaemonClient {
                 .unwrap_or_default()
                 .into_iter()
                 .map(|id| AgentRecord {
+                    input_held: None,
+                    input_discarded: None,
                     id,
                     pane_id_env: None,
                     display_name: None,
@@ -3090,13 +3092,42 @@ impl DaemonClient {
         answers: Vec<crate::question::QuestionAnswer>,
         confirmed_always: bool,
     ) -> Result<AnswerReport, ClientError> {
-        if !self
-            .capabilities()
-            .await?
-            .supports(crate::daemon_protocol::CAP_ANSWER_QUESTION)
-        {
+        self.answer_question_with_token_while(
+            still_wanted,
+            agent_id,
+            question_id,
+            revision,
+            answers,
+            confirmed_always,
+            None,
+        )
+        .await
+    }
+
+    /// PRD #1666 part 3 (Q35): [`Self::answer_question_while`], naming the
+    /// answer by `client_token`, so a client whose own request timed out can
+    /// read what became of it from the snapshot's
+    /// [`crate::question::AnswerSettlement`] naming that token. The token is
+    /// sent only to a daemon that advertises
+    /// [`crate::daemon_protocol::CAP_ANSWER_SETTLEMENT`]; an older one is
+    /// sent the same request without it, and reports no settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn answer_question_with_token_while(
+        &self,
+        still_wanted: impl Fn() -> bool,
+        agent_id: &str,
+        question_id: &str,
+        revision: Option<u64>,
+        answers: Vec<crate::question::QuestionAnswer>,
+        confirmed_always: bool,
+        client_token: Option<u64>,
+    ) -> Result<AnswerReport, ClientError> {
+        let capabilities = self.capabilities().await?;
+        if !capabilities.supports(crate::daemon_protocol::CAP_ANSWER_QUESTION) {
             return Ok(AnswerReport::Withheld);
         }
+        let client_token = client_token
+            .filter(|_| capabilities.supports(crate::daemon_protocol::CAP_ANSWER_SETTLEMENT));
         // Admitted first, then `still_wanted`: the wait for the gate's `Hello`
         // is part of the window a cancelled answer must still be dropped in.
         let (mut rd, mut wr) = self.admitted_connect().await?;
@@ -3112,6 +3143,7 @@ impl DaemonClient {
                 answers,
                 confirmed_always,
                 revision,
+                client_token,
             },
         )
         .await?;
@@ -8450,6 +8482,8 @@ start = true
         // prefers that map over the session's own name — and it was the one
         // string on this record with no scrub here at all.
         let mut rec = AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: "9".into(),
             pane_id_env: None,
             display_name: Some(format!("de\x1bplo\u{202e}yer\0 {}", "\u{3bc}".repeat(400))),
@@ -8515,6 +8549,8 @@ start = true
         // TUI's bucketing / tracing never sees control bytes — the
         // agent is still real and lands on the dashboard.
         let mut rec = AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: "7".into(),
             pane_id_env: None,
             display_name: None,
@@ -8539,6 +8575,8 @@ start = true
 
         // And a valid record round-trips untouched.
         let mut ok = AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: "8".into(),
             pane_id_env: None,
             display_name: None,
@@ -8695,6 +8733,99 @@ start = true
                     .unwrap(),
                 AnswerReport::Refused(crate::question::AnswerRefusal::AgentNotFound)
             );
+        });
+    }
+
+    /// Scenario: the client answers a question naming the answer by token 42,
+    /// once against a daemon that advertises `answer-question` and
+    /// `answer-settlement` and once against one that advertises only
+    /// `answer-question`. The first daemon receives the request with
+    /// `client_token: 42`; the second receives the same request with no
+    /// `client_token` key at all, and both report the answer as answered.
+    #[cfg(unix)]
+    #[spec("question/answer/025")]
+    #[test]
+    fn question_answer_025_the_answer_token_is_sent_only_with_answer_settlement() {
+        use crate::daemon_protocol::{CAP_ANSWER_QUESTION, CAP_ANSWER_SETTLEMENT};
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build runtime");
+        runtime.block_on(async {
+            for (advertised, expected) in [
+                (
+                    &[CAP_ANSWER_QUESTION, CAP_ANSWER_SETTLEMENT][..],
+                    Some(serde_json::json!(42)),
+                ),
+                (&[CAP_ANSWER_QUESTION][..], None),
+            ] {
+                let (dir, path, listener) = {
+                    let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+                    let dir = tempfile::tempdir().unwrap();
+                    let path = dir.path().join("answer-daemon.sock");
+                    let listener = bind_attach_listener(&path).expect("bind answer daemon");
+                    (dir, path, listener)
+                };
+                let answers = Arc::new(std::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+                let recorded = answers.clone();
+                let server = tokio::spawn(async move {
+                    while let Ok(Ok(mut stream)) = tokio::time::timeout(
+                        std::time::Duration::from_millis(500),
+                        listener.accept(),
+                    )
+                    .await
+                    {
+                        let Some((KIND_REQ, payload)) = read_frame(&mut stream).await.unwrap()
+                        else {
+                            continue;
+                        };
+                        let request: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+                        let response = if request["op"] == "hello" {
+                            AttachResponse {
+                                capabilities: Some(
+                                    advertised.iter().map(|c| c.to_string()).collect(),
+                                ),
+                                ..AttachResponse::hello(PROTOCOL_VERSION)
+                            }
+                        } else {
+                            recorded.lock().unwrap().push(request);
+                            AttachResponse::ok()
+                        };
+                        crate::daemon_protocol::write_resp(&mut stream, &response)
+                            .await
+                            .unwrap();
+                    }
+                });
+                let client = DaemonClient::new(path);
+                let report = client
+                    .answer_question_with_token_while(
+                        || true,
+                        "1",
+                        "q-1",
+                        Some(7),
+                        Vec::new(),
+                        false,
+                        Some(42),
+                    )
+                    .await
+                    .expect("the answer reaches the daemon");
+                assert_eq!(report, AnswerReport::Answered, "advertised {advertised:?}");
+                drop(client);
+                server.await.unwrap();
+                let answers = answers.lock().unwrap();
+                assert_eq!(answers.len(), 1, "advertised {advertised:?}: {answers:?}");
+                let request = answers[0].as_object().expect("a request object");
+                assert_eq!(request["op"], "answer-question");
+                assert_eq!(request["question_id"], "q-1");
+                assert_eq!(request["revision"], 7);
+                assert_eq!(
+                    request.get("client_token").cloned(),
+                    expected,
+                    "advertised {advertised:?}"
+                );
+                drop(dir);
+            }
         });
     }
 }

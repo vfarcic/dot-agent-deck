@@ -91,7 +91,9 @@ import { offPageNamed, offPageSentence, type VoicePager } from "../lib/voicePage
 import { READING_ALREADY_OFF, READING_ALREADY_ON, READING_NOTICE_VOICE_KEY, readingNotice, type ReadingAgent } from "../lib/reading";
 import { useReadingMode } from "../hooks/useReadingMode";
 import type { VoicePaneAgent } from "../lib/promptKeys";
-import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, questionOptionsToSay, saysCancel, saysConfirm, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
+import { QUESTION_ALWAYS_DECLINED, QUESTION_ANSWER_CANCELLED, QUESTION_CANCEL_FAILED, QUESTION_COUNTDOWN_STOPPED, QUESTION_MOVED_ON, QUESTION_SAY_CONFIRM, questionLost, questionLostSentence, questionOptionsToSay, saysCancel, saysConfirm, settlementSentence, type PendingQuestionDto, type QuestionSelectionDto, type QuestionTextSlotDto, type VoiceQuestionTarget } from "../lib/voiceQuestion";
+import { INBOX_WORDS, inputHeldText } from "../lib/inboxWords";
+import type { AnswerSettlement, InputHeldCause } from "../types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { desktopFeaturesOf, type AgentTarget, type DeckFleet, type DeckRuntimeState } from "../types";
 import { agentKey, boundAgentKey, sameIncarnation } from "../lib/agentKey";
@@ -1272,8 +1274,41 @@ function choiceRefusal(lost: Lost): string {
 /**
  * `questionLabel`: what a sentence about `question` calls the agent
  * ({@link questionAgentName}, issue #1668); `label` when absent.
+ *
+ * PRD #1666 part 3 (Q35): `inputHeld`, why the deck holds what was typed into
+ * the pane, shown beside a queued answer; `answerSettlements`, what became of
+ * the pane's held answers, read only for the panel's own token.
  */
-export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string; incarnation?: string } & VoicePaneAgent;
+export type VoicePane = { deckId: string; agentId: string; label: string; inputBlocked?: string; spawnedAtMs?: number; terminalHidden?: boolean; question?: PendingQuestionDto; questionLabel?: string; incarnation?: string; inputHeld?: InputHeldCause; answerSettlements?: AnswerSettlement[] } & VoicePaneAgent;
+
+/**
+ * PRD #1666 part 3 (Q35): an answer Rust reported unconfirmed — its request
+ * went and nothing said what became of it — waiting for a settlement naming
+ * its own token, question, revision and agent generation (`spawnedAtMs` and
+ * the daemon `incarnation`). `lease` is the answer whose report only such a
+ * settlement replaces ({@link AnswerReport}).
+ */
+type UnsettledAnswer = {
+  lease: string;
+  token: number;
+  deckId: string;
+  agentId: string;
+  spawnedAtMs?: number;
+  incarnation?: string;
+  questionId: string;
+  revision?: number;
+  agent: string;
+  question: PendingQuestionDto;
+  form: QuestionSelectionDto[];
+};
+
+/**
+ * PRD #1666 part 3 (Q35-10 review): what the row says about one answer, by
+ * its lease — the outcome (the send's, or a settlement's that replaced it)
+ * and whether its cancel failed to reach Rust. The two reporters each change
+ * their own half, so neither drops the other's whichever arrives first.
+ */
+type AnswerReport = { lease: string; outcome: string; cancelFailed: boolean };
 
 /**
  * PRD #1260 — the voice panel's state, the one model #1260, #1261 and #1184
@@ -1689,7 +1724,22 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const [known, setKnown] = useState(() => voiceStatus === undefined);
   /** A refusal, an instruction, or one of this file's own sentences. */
-  const [problem, setProblem] = useState<string>();
+  const [problem, setProblemState] = useState<string>();
+  /**
+   * PRD #1666 part 3 (Q35-10 review): the lease of the answer whose report
+   * the row's sentence is, or `undefined` once anything else wrote it — so a
+   * late cancel failure or settlement amends that answer's row and no other.
+   */
+  const problemLease = useRef<string | undefined>(undefined);
+  const setProblem = useCallback((sentence?: string) => {
+    problemLease.current = undefined;
+    setProblemState(sentence);
+  }, []);
+  /** Write `report` to the row as the sentence its answer owns. */
+  const showAnswerReport = useCallback((report: AnswerReport) => {
+    problemLease.current = report.lease;
+    setProblemState(report.cancelFailed ? `${report.outcome} ${QUESTION_CANCEL_FAILED}` : report.outcome);
+  }, []);
   /**
    * The transcription stage's own sentence — what was heard, or why nothing
    * was — and, when something was heard, the transcript it quotes. The
@@ -2169,23 +2219,29 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
   const answerTimer = useRef<number | undefined>(undefined);
   /** The lease whose cancel failed to reach Rust before its outcome arrived, so the outcome says the cancel could not stop it (audit A8). */
   const cancelFailedLease = useRef<string | undefined>(undefined);
-  /** The outcome last written to the row for a lease whose cancel has not failed yet — amended if it fails later (audit R5). */
-  const reportedOutcome = useRef<{ lease: string; sentence: string } | undefined>(undefined);
+  /** The report last written for an answer's outcome — amended if its cancel fails later (audit R5) or a settlement replaces its outcome (Q35). */
+  const answerReport = useRef<AnswerReport | undefined>(undefined);
+  /**
+   * PRD #1666 part 3 (Q35): the last answer reported unconfirmed, until a
+   * settlement of its own token says what became of it. State rather than a
+   * ref, so a settlement the pane already carries when the send returns is
+   * reconciled then, not at the next pane update (Q35-10 review).
+   */
+  const [unsettledAnswer, setUnsettledAnswer] = useState<UnsettledAnswer>();
   /**
    * A cancel that never reached Rust, reported whichever arrives first
    * (audit R5): before the answer's outcome, the outcome carries it when it
    * comes; after, the row that outcome wrote is amended — if it still shows it.
    */
   const reportCancelFailed = useCallback((lease: string) => {
-    const reported = reportedOutcome.current;
+    const reported = answerReport.current;
     if (reported?.lease !== lease) {
       cancelFailedLease.current = lease;
       return;
     }
-    reportedOutcome.current = undefined;
-    const amended = `${reported.sentence} ${QUESTION_CANCEL_FAILED}`;
-    setProblem((shown) => (shown === reported.sentence ? amended : shown));
-  }, []);
+    answerReport.current = { ...reported, cancelFailed: true };
+    if (problemLease.current === lease) showAnswerReport(answerReport.current);
+  }, [showAnswerReport]);
   /** Bumped by every stop of the countdown, so a tick or a send that outlived it acts on nothing. */
   const answerEpoch = useRef(0);
   /** Bumped by every drop of the answer, so words worked out across one do not bring it back (PR #1764 review). */
@@ -2264,24 +2320,59 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     }
     stopAnswerCountdown();
     const lease = newAnswerLease();
+    const question = paneRef.current?.question;
+    setUnsettledAnswer(undefined);
     setQuestionForm({ ...held, sending: true, lease, stopped: false });
     let sentence: string;
+    let unconfirmed = false;
     try {
-      sentence = (await sendVoiceAnswer(held.target, held.form, held.confirmedAlways, lease)).sentence;
+      const outcome = await sendVoiceAnswer(held.target, held.form, held.confirmedAlways, lease);
+      sentence = outcome.sentence;
+      unconfirmed = outcome.kind === "unconfirmed";
     } catch (cause) {
       sentence = sentenceOf(cause);
     }
-    if (cancelFailedLease.current === lease) {
-      cancelFailedLease.current = undefined;
-      reportedOutcome.current = undefined;
-      sentence = `${sentence} ${QUESTION_CANCEL_FAILED}`;
-    } else {
-      reportedOutcome.current = { lease, sentence };
-    }
+
+    const cancelFailed = cancelFailedLease.current === lease;
+    if (cancelFailed) cancelFailedLease.current = undefined;
+    answerReport.current = { lease, outcome: sentence, cancelFailed };
+    // PRD #1666 part 3 (Q35): the lease is the token the request carried, so
+    // a later snapshot's settlement naming it reports this answer and no other.
+    const token = Number(lease);
+    setUnsettledAnswer(unconfirmed && question && Number.isSafeInteger(token)
+      ? { lease, token, deckId: held.target.deckId, agentId: held.target.agentId, spawnedAtMs: held.spawnedAtMs, incarnation: held.target.incarnation, questionId: held.target.questionId, revision: held.target.revision, agent: held.target.agent, question, form: held.form }
+      : undefined);
     if (questionFormRef.current?.lease === lease) setQuestionForm(undefined);
     setResult(undefined);
-    setProblem(sentence);
-  }, [answerLost, dropQuestion, sendVoiceAnswer, setQuestionForm, stopAnswerCountdown]);
+    showAnswerReport(answerReport.current);
+  }, [answerLost, dropQuestion, sendVoiceAnswer, setQuestionForm, showAnswerReport, stopAnswerCountdown]);
+  /**
+   * PRD #1666 part 3 (Q35): a snapshot's settlement for the answer last
+   * reported unconfirmed — its own token, question and revision, from the
+   * same agent generation and daemon process — replaces that report's
+   * outcome with what became of it, keeping a failed cancel's words, and
+   * rewrites the row if the row still shows that answer. Nothing else does:
+   * the question disappearing or its queued flag clearing confirms nothing,
+   * and neither does an outcome this build does not know. Run when either the
+   * pane or the waiting answer changes, so a settlement that arrived while
+   * the send was still pending counts once the send reports unconfirmed.
+   */
+  useEffect(() => {
+    const waiting = unsettledAnswer;
+    if (!waiting || !pane) return;
+    if (pane.deckId !== waiting.deckId || pane.agentId !== waiting.agentId || pane.spawnedAtMs !== waiting.spawnedAtMs) return;
+    if (!sameIncarnation(waiting.incarnation, pane.incarnation)) return;
+    const settled = pane.answerSettlements?.find((settlement) => settlement.clientToken === waiting.token
+      && settlement.questionId === waiting.questionId
+      && settlement.revision === waiting.revision);
+    const sentence = settled && settlementSentence(settled.outcome, waiting.agent, waiting.question, waiting.form);
+    if (sentence === undefined) return;
+    setUnsettledAnswer(undefined);
+    const reported = answerReport.current;
+    if (reported?.lease !== waiting.lease) return;
+    answerReport.current = { ...reported, outcome: sentence };
+    if (problemLease.current === waiting.lease) showAnswerReport(answerReport.current);
+  }, [pane, unsettledAnswer, showAnswerReport]);
   /** Start the visible countdown to sending the answer — `armSend`'s five seconds, for the same reason. */
   const armAnswer = useCallback(() => {
     stopAnswerCountdown();
@@ -4711,6 +4802,26 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
      keeps it, because then it is the only place the words are. */
   const captureShown = capture !== undefined
     && !(result !== undefined && capture.transcript !== undefined && result.outcome.sentence.includes(`“${capture.transcript}”`));
+  /*
+    PRD #1666 part 3 (Q35, core §7): the daemon holds the answer being sent
+    until it can write it — the question it answers says so — and why it
+    holds, in the words the card uses. Queued is not answered: the outcome
+    still comes from the send, or from a settlement of its own token. The
+    question is the one answered only at the answer's own revision, as
+    `questionLost` reads it: a queued marker on a newer registration of the
+    same id is not this answer's.
+  */
+  const questionQueued = questionForm?.sending === true && !questionForm.cancelling
+    && pane?.question?.id === questionForm.target.questionId
+    && (questionForm.target.revision === undefined || pane.question.revision === questionForm.target.revision)
+    && pane.question.answerQueued === true;
+  /*
+    Without `inputDiscarded` on purpose (auditor U3-5): these words only say
+    why the answer being sent is queued, and the typing an earlier agent
+    generation held and lost is no reason for that. The card and the tile
+    carry the not-delivered notice, as the TUI card does.
+  */
+  const heldWords = inputHeldText(pane?.inputHeld);
   const emptyState = indicator === "on" && dictating === undefined && choice === undefined && pending === undefined && problem === undefined && capture === undefined && result === undefined && questionForm === undefined;
   const reporting = note !== undefined || dictating !== undefined || choice !== undefined || pending !== undefined || problem !== undefined || capture !== undefined || result !== undefined || questionForm !== undefined;
 
@@ -4941,6 +5052,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
                       : questionForm.confirming
                         ? " — waiting for your confirmation."
                         : questionForm.stopped ? QUESTION_COUNTDOWN_STOPPED : ""}
+                {questionQueued && ` Answer ${INBOX_WORDS.queued}${heldWords ? `: ${heldWords}` : "."}`}
                 {(answerIn !== undefined || (questionForm.sending && !questionForm.cancelling)) && (
                   <button type="button" className="button secondary compact" data-testid="voice-question-cancel" onClick={() => dropQuestion(QUESTION_ANSWER_CANCELLED)}>
                     <X size={13} /> Cancel

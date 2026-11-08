@@ -1520,8 +1520,13 @@ fn is_retired_delivery_id(id: &str) -> bool {
 }
 
 fn main() -> ExitCode {
-    // PRD #1741: the telemetry PATH shim, first, so the agent's arguments it
-    // carries are never read as the deck's.
+    // PRD #1666 part 3 (Q35-12): invoked as an agent's editor through the
+    // daemon's private helper copy, the binary is the editor helper, before
+    // anything else runs, so the helper stays single-threaded.
+    #[cfg(target_os = "linux")]
+    dot_agent_deck::composer_probe::helper::run_if_invoked();
+    // PRD #1741: the telemetry PATH shim, first among the commands, so the
+    // agent's arguments it carries are never read as the deck's.
     if let Some(code) = dot_agent_deck::telemetry::shim::run_if_invoked() {
         return code;
     }
@@ -1576,11 +1581,14 @@ fn main() -> ExitCode {
             // reaches the user only as an exit 0 with nothing said.
             //
             // Safe for a CLI whose stdout is the documented output.
-            // `init_logging_from_env` installs a subscriber ONLY when
-            // `DOT_AGENT_DECK_LOG` is set, and the subscriber it installs writes
-            // only to that file — so this command's own stdout is unchanged
-            // whether logging is on or off, and nothing a hook installer logs
-            // can end up in what a caller parses.
+            // `init_logging_from_env` installs a subscriber when
+            // `DOT_AGENT_DECK_LOG` is set or an OTLP logs destination is
+            // configured (#2021). Neither layer writes to stdout: the file layer
+            // writes to that file, and the OTLP layer only queues records, which
+            // nothing in this process exports (only daemon startup starts the
+            // exporter) — so this command's own stdout is unchanged whether
+            // logging is on or off, and nothing a hook installer logs can end up
+            // in what a caller parses.
             init_logging_from_env();
             // PRD #20 finding #15: dispatch through the SPEC's own handler rather
             // than a strategy-keyed hardcoded incumbent. Behaviour is unchanged
@@ -2623,11 +2631,13 @@ fn main() -> ExitCode {
             // Diagnosing a Codex delegate that never got its prompt meant
             // reading the wire.
             //
-            // Safe in a pane. `init_logging_from_env` installs a subscriber ONLY
-            // when `DOT_AGENT_DECK_LOG` is set, and that subscriber only ever
-            // writes to that file — never to stdout or stderr — so a wrapper
-            // whose descriptors ARE the agent's terminal cannot paint a LOG LINE
-            // into it. (The setup itself has exactly one stderr line, `Warning:
+            // Safe in a pane. `init_logging_from_env` installs a subscriber when
+            // `DOT_AGENT_DECK_LOG` is set or an OTLP logs destination is
+            // configured (#2021), and neither layer writes to stdout or stderr:
+            // the file layer writes to that file, and the OTLP layer only queues
+            // records, which nothing in the wrapper exports (only daemon startup
+            // starts the exporter) — so a wrapper whose descriptors ARE the
+            // agent's terminal cannot paint a LOG LINE into it. (The setup itself has exactly one stderr line, `Warning:
             // failed to open log file …`, on a log path it cannot open; so the
             // claim is about the log stream, not about the call being incapable
             // of writing to the terminal at all. Narrowed under issue #730's
@@ -4106,6 +4116,11 @@ async fn run_daemon_serve_cli(
     // inherits the launching TUI's directory and the two agree on the file by
     // construction.
     dot_agent_deck::features::init_and_watch(&launch_project_dir());
+    // PRD #1666 part 3 (Q35-13): the e2e editor-probe assumption is read once,
+    // here, before any endpoint is served; a list it refuses is logged now
+    // and assumes nothing for this daemon's life. A production build reads no
+    // variable.
+    dot_agent_deck::composer_probe::install::capture_assumption();
     let mut initial = AppState::default();
     initial.hook_binaries = hook_binaries;
     let state = Arc::new(RwLock::new(initial));

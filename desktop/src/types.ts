@@ -70,6 +70,16 @@ export type AgentInbox = {
   component?: string;
   /** PR #1735 fifth review (R5): nothing has woken the agent for its waiting messages. */
   wakeStalled?: boolean;
+  /**
+   * PRD #1666 part 3, round 5-wake: why the deck holds the doorbell for the
+   * waiting messages; `unknown` for a reason a newer deck names.
+   */
+  wakeHold?: WakeHold;
+  /**
+   * PRD #1666 part 3 (Q35): why the deck can't check the agent's input box,
+   * beside `wakeHold: "cannot_check"` and replaced with it.
+   */
+  holdDetail?: HoldDetail;
   /** PRD #1666 §6.5: the deck messages waiting on the user's Retry or Cancel. */
   attention?: InboxAttentionItem[];
   /** PRD #1666 §11: why the agent's integration takes no deck messages yet. */
@@ -88,6 +98,51 @@ export type AgentInbox = {
    * card prints.
    */
   agentNotice?: string;
+};
+/** PRD #1666 part 3, round 5-wake: the daemon's `WakeHold` wire values. */
+export type WakeHold =
+  | "possible_draft"
+  | "awaiting_prompt"
+  | "paste_open"
+  | "cannot_type"
+  | "not_taken"
+  | "uncertain_input"
+  | "dialog_during_ring"
+  | "needs_fetch"
+  | "cannot_check"
+  | "unknown";
+/**
+ * PRD #1666 part 3 (Q35): the daemon's `HoldDetail` — what stopped the check
+ * of an agent's input box. `pathComponent` and `filesystem` are display text
+ * from the daemon, shown escaped and never run; `unknown` for a cause a newer
+ * deck names.
+ */
+export type HoldDetail = {
+  cause: HoldCause;
+  pathComponent?: string;
+  filesystem?: string;
+};
+/** PRD #1666 part 3 (Q35): the daemon's `HoldCause` wire values. */
+export type HoldCause = "filesystem" | "writable_directory" | "foreign_owner" | "acl" | "export_file" | "io" | "unknown";
+/** PRD #1666 part 3 (Q35, core §7): the daemon's `InputHeldCause` wire values. */
+export type InputHeldCause =
+  | "checking"
+  | "check_not_opened"
+  | "check_not_returned"
+  | "after_your_ctrl_g"
+  | "queue_full"
+  | "check_blocked"
+  | "unknown";
+/**
+ * PRD #1666 part 3 (Q35): what became of an answer the daemon held, named by
+ * the client token its request carried; `unknown` for an outcome a newer deck
+ * names, which confirms nothing.
+ */
+export type AnswerSettlement = {
+  questionId: string;
+  revision: number;
+  clientToken: number;
+  outcome: "written" | "partial" | "superseded" | "retired" | "write_failed" | "unknown";
 };
 /**
  * PRD #1666 §6.4: one deck message an agent card lists for the user to decide
@@ -989,6 +1044,24 @@ export interface AgentSession {
    */
   pendingQuestion?: import("./lib/voiceQuestion").PendingQuestionDto;
   /**
+   * HONEST. PRD #1666 part 3 (Q35): the deck holds what the user typed into
+   * this agent's pane, and why (`SessionSnapshot.input_held`). Absent while it
+   * holds nothing, and from a daemon predating the field.
+   */
+  inputHeld?: InputHeldCause;
+  /**
+   * HONEST. PRD #1666 part 3 (Q35-20e): typing the deck held for this pane's
+   * previous agent generation was discarded when it retired
+   * (`AgentRecord.input_discarded`). Absent while there is none to report.
+   */
+  inputDiscarded?: boolean;
+  /**
+   * HONEST. PRD #1666 part 3 (Q35): the outcomes of this agent's recently held
+   * answers that carried a client token (`SessionSnapshot.answer_settlements`).
+   * The voice panel reads only the one naming its own token.
+   */
+  answerSettlements?: AnswerSettlement[];
+  /**
    * HONEST. PRD #1401 — the pull request the daemon found for the branch this
    * agent works on (`SessionSnapshot.pull_request`), shown as the tile's badge.
    * Absent when the daemon knows of none, has no `gh` login, or predates the
@@ -1344,19 +1417,6 @@ export interface DeckActionResult {
    * is not the agent this start made.
    */
   agentIncarnation?: string;
-}
-
-/** Operator-facing explanation of a non-delivered outcome. */
-export function sendResultReason(result: SendResult | undefined): string {
-  switch (result) {
-    case "stale": return "the daemon's view of that pane had already moved on";
-    case "wrong-session": return "the pane handle no longer maps to that agent's session";
-    case "history-only": return "the agent has no live pane — only its history remains";
-    case "no-live-target": return "there is nothing live to write to";
-    case "ambiguous": return "the write started but did not complete; some of it may already have landed, so it was not retried";
-    case "unknown": return "the daemon reported an outcome this build does not recognise";
-    default: return "the daemon did not confirm delivery";
-  }
 }
 
 export interface OrchestrationLaunchRole {

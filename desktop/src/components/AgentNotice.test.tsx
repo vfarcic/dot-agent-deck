@@ -54,4 +54,16 @@ describe("an OpenCode agent the deck cannot fully support (PRD #2050)", () => {
     card = tile(mapDesktopSnapshot(snapshot({ agentNotice: "   " })).agents[0]);
     expect(card.queryByTestId("inbox-notice-9")).toBeNull();
   });
+
+  /// Scenario: The daemon reports the notice beside two waiting messages whose doorbell it holds; the tile's notice row shows the notice and its inbox badge keeps the queued words rather than the bare count, as the TUI card does (inbox/status/035). Without the notice, the row says why the doorbell holds and the badge keeps the count.
+  it("inbox/status/035: leaves the held doorbell's words on the badge", () => {
+    const held = { queued: 2, wake: "doorbell", wakeHold: "cannot_type" };
+    let card = tile(mapDesktopSnapshot(snapshot({ ...held, agentNotice: SHARED_SERVICE })).agents[0]);
+    expect(card.getByTestId("inbox-notice-9")).toHaveTextContent(SHARED_SERVICE);
+    expect(card.getByTestId("inbox-badge-9").textContent).toBe(`${words.glyph}2 ${words.queued}`);
+    document.body.innerHTML = "";
+    card = tile(mapDesktopSnapshot(snapshot(held)).agents[0]);
+    expect(card.getByTestId("inbox-notice-9")).toHaveTextContent(`${words.glyph}2 ${words.wakeHolds.cannot_type}`);
+    expect(card.getByTestId("inbox-badge-9").textContent).toBe(`${words.glyph}2`);
+  });
 });

@@ -3408,8 +3408,24 @@ async fn boundary_035_a_lapsed_pi_offer_is_never_returned_from_a_lapse() {
     let handed = pi.handout().await;
     pi.send(serde_json::json!({"possess": {"seq": 1, "seen": attempt(&handed[0]).d, "held": []}}))
         .await;
+    // The lapse runs at least 600 ms, and until the message reads uncertain,
+    // after which no automatic attempt is issued: the not-handed report below
+    // then names every attempt. It can read uncertain with repeats still
+    // unused, so the wait is for that state, not for the repeats. A slow
+    // runner issues the last repeat later, and one left out of the report
+    // rightly keeps the offer from its pool.
+    let uncertain = || {
+        hub.lock().receipts.gens[&("pi".to_string(), "b".to_string())]
+            .model
+            .delivery(id.as_str())
+            .is_some_and(|d| matches!(d.state, crate::inbox_attempts::MessageState::Uncertain(_)))
+    };
     let started = Instant::now();
-    while started.elapsed() < Duration::from_millis(600) {
+    while started.elapsed() < Duration::from_millis(600) || !uncertain() {
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "timed out waiting for the message to read uncertain"
+        );
         hub.tick();
         assert!(
             !hub.lock().inbox.unassigned_offers().contains(&id),
@@ -5575,6 +5591,7 @@ fn codex_hand_overs() -> Vec<(
                     component: InboxComponent::CodexHooks,
                     consumer,
                     rung: None,
+                    ring: None,
                     envelope: &envelope,
                     framing: AGENT_FRAMING,
                 },

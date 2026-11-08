@@ -769,6 +769,17 @@ pub const CAP_FOCUS_GAINED: &str = "focus-gained";
 /// `#[cfg]`-gated.
 pub const CAP_ANSWER_QUESTION: &str = "answer-question";
 
+/// Capability string for [`AttachRequest::AnswerQuestion`]'s `client_token`
+/// and the snapshot's [`crate::question::AnswerSettlement`]s (PRD #1666 part
+/// 3, Q35): this daemon settles a tokened answer it held into the snapshot.
+///
+/// Names a FEATURE, like [`CAP_AUTHORING_KIND`] names a field: an older daemon
+/// drops the token silently and never reports a settlement, so a client
+/// sends the token only to a daemon whose `Hello` reply names this. Advertised
+/// since Q35-17, on both platform lists: the `AnswerQuestion` arm that reads
+/// the token isn't platform-gated.
+pub const CAP_ANSWER_SETTLEMENT: &str = "answer-settlement";
+
 /// Capability string for [`AttachRequest::RecordOrchestratorContext`] (issue
 /// #1445).
 ///
@@ -1313,6 +1324,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_PREPARE_DEADLINE,
     CAP_LAST_COMMAND,
     CAP_ANSWER_QUESTION,
+    CAP_ANSWER_SETTLEMENT,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
@@ -1338,6 +1350,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_LIST_DIRECTORIES_OPTIONS,
     CAP_LAST_COMMAND,
     CAP_ANSWER_QUESTION,
+    CAP_ANSWER_SETTLEMENT,
     CAP_RECORD_ORCHESTRATOR_CONTEXT,
     CAP_SUBSCRIBE_EVENTS_WITH_SNAPSHOT,
     CAP_RESTART_DAEMON,
@@ -2818,6 +2831,14 @@ pub enum AttachRequest {
         /// question the daemon stamped no revision on can still be named.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         revision: Option<u64>,
+        /// PRD #1666 part 3 (Q35): the client's own name for this answer, so
+        /// it can find the answer's outcome among the snapshot's
+        /// [`crate::question::AnswerSettlement`]s after its request timed
+        /// out. Sent only to a daemon advertising [`CAP_ANSWER_SETTLEMENT`];
+        /// an older daemon drops the unknown key (this enum does not deny
+        /// unknown fields). The desktop's voice answer sends it (Q35-10).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_token: Option<u64>,
     },
     /// Issue #1445: "the orchestrator in `pane_id` has just been re-armed from
     /// `context_path`" — a TUI's compaction or `/clear` re-arm published a new
@@ -3109,6 +3130,26 @@ pub enum AttachRequest {
     ///
     /// Its own short-lived connection: one request, one response, close.
     HostMetrics,
+    /// PRD #1666 part 3 (Q35-14b, OQ10): the `e2e` build's control of an
+    /// installed generation's arm page: `operation` `publish` or `withdraw`
+    /// puts up or takes back its one test liability through the records and
+    /// page a probe uses, writing no byte to the agent, and only for the
+    /// generation the request names while it is the pane's current one and
+    /// may be armed ([`crate::composer_probe::observe::Seam::control`]).
+    /// Q35-15 adds `fence`, `release` and `fence-status`: close that
+    /// generation's fence gate at its output offset as of now, writing
+    /// nothing; open it through the release path, which re-checks the
+    /// captured target and submits what it held in order; and read its
+    /// counts (`composer_fence` in the response). Each is refused for any
+    /// generation but the pane's current one.
+    /// A build without `e2e` neither compiles nor dispatches it, and refuses
+    /// it as a request it doesn't know; it is never advertised.
+    #[cfg(feature = "e2e")]
+    E2eComposerControl {
+        pane_id: String,
+        generation: u64,
+        operation: String,
+    },
 }
 
 /// PRD #1487: who starts the daemon that replaces one answering
@@ -3976,6 +4017,49 @@ pub struct AttachResponse {
     /// it answers is capability-gated, so neither moves [`PROTOCOL_VERSION`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_metrics: Option<HostMetrics>,
+    /// PRD #1666 part 3 (Q35-15): the `e2e` build's answer to
+    /// [`AttachRequest::E2eComposerControl`]'s `fence-status`. Compiled into
+    /// that build alone, which is the only one that can ask for it.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_fence: Option<ComposerFenceStatus>,
+    /// PRD #1666 part 3 (Q35-20a): the `e2e` build's answer to
+    /// [`AttachRequest::E2eComposerControl`]'s `frontier-enqueue` and
+    /// `frontier-status`. Compiled into that build alone.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_frontier: Option<ComposerFrontierStatus>,
+    /// PRD #1666 part 3 (Q35-20): the `e2e` build's answer to
+    /// [`AttachRequest::E2eComposerControl`]'s read-only `epoch`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_epoch: Option<ComposerEpochStatus>,
+    /// PRD #1666 part 3 (Q35-20): the `e2e` build's answer to the read-only
+    /// `observer-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_observer: Option<ComposerObserverStatus>,
+    /// PRD #1666 part 3 (Q35-20): the `e2e` build's answer to
+    /// `probe-request[:retry|:lapse]`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_probe: Option<ComposerProbeStatus>,
+    /// PRD #1666 part 3 (Q35-22): the `e2e` build's
+    /// [`AttachRequest::E2eComposerControl`] answer to `binding-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_binding: Option<ComposerBindingStatus>,
+    /// PRD #1666 part 3 (Q105b.2): the `e2e` build's answer to the writer
+    /// controls, `writer-hold`, `writer-go`, `writer-fault:…` and
+    /// `writer-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_writer: Option<ComposerWriterStatus>,
+    /// PRD #1666 part 3 (Q105b.2): the `e2e` build's answer to
+    /// `schedule-advance:<ms>` and `schedule-status`.
+    #[cfg(feature = "e2e")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_schedule: Option<ComposerScheduleStatus>,
     /// PRD #1589: the answer to [`AttachRequest::CloseAgents`]. `None` on every
     /// other response. A refusal is a report, answered `ok: true`; `ok: false`
     /// is reserved for a request the daemon could not process at all. Additive
@@ -4575,6 +4659,676 @@ pub async fn run_attach_server_with_counter(
         dummy_worktrees,
     )
     .await
+}
+
+/// PRD #1666 part 3 (Q35-15): a fence's counts, the `e2e` build's
+/// `fence-status` answer.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerFenceStatus {
+    pub fenced: bool,
+    pub held_ops: usize,
+    pub held_bytes: usize,
+    pub full_waiters: usize,
+}
+
+/// PRD #1666 part 3 (Q35-20): a generation's input epoch, the `e2e` build's
+/// read-only `epoch` answer (R3 §3.1's numbers).
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerEpochStatus {
+    pub epoch: u64,
+    pub observed: u64,
+    pub last_foreign: u64,
+}
+
+/// PRD #1666 part 3 (Q35-20): a generation's observer, the `e2e` build's
+/// read-only `observer-status` answer, and `observer-hold`'s and
+/// `observer-go`'s: its writer scope, `pending`, `closed` or `open`, and
+/// (Q105b.2) its records and pass barrier. The records' fields are read in
+/// one hold of their lock, the barrier's in one hold of its own.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerObserverStatus {
+    pub scope: String,
+    /// Q105b.2: whether `observer-hold` holds the observer's passes.
+    #[serde(default)]
+    pub passes_held: bool,
+    /// Q105b.2: how many passes the observer thread has finished.
+    #[serde(default)]
+    pub passes: u64,
+    /// Q105b.2: whether a pass is running now. Held and not running: the
+    /// observer is quiet, and no pass can start until `observer-go`.
+    #[serde(default)]
+    pub pass_running: bool,
+    /// Q105b.2: the records' EC policy, `hold` or `authority`.
+    #[serde(default)]
+    pub records_policy: String,
+    /// Q105b.2: the most records kept.
+    #[serde(default)]
+    pub records_cap: usize,
+    /// Q105b.2: the records kept now.
+    #[serde(default)]
+    pub records_retained: usize,
+    /// Q105b.2: whether any observation ever reached the records; once it
+    /// has, `records-policy` and `records-cap` are refused for good.
+    #[serde(default)]
+    pub records_observed: bool,
+    /// Q105b.2: observations the record cap dropped, by their decision.
+    #[serde(default)]
+    pub cap_dropped: ComposerCapDrops,
+    /// How many records' exit drains have run (each record's first drain,
+    /// complete or given up), read in the same hold as the records.
+    #[serde(default)]
+    pub drains: u64,
+    /// The latest exit drains (at most `record::DRAINS_KEPT`), oldest first:
+    /// a test waits for its helper's entry here, not for a finished pass,
+    /// to know that record drained (the S-20e follow-up review's U2-1).
+    #[serde(default)]
+    pub drained: Vec<ComposerDrained>,
+}
+
+/// One record's exit drain in [`ComposerObserverStatus::drained`]: the
+/// helper's pid and start ticks, whether every channel was read, its
+/// decision and report as the drain read them, and whether the segments
+/// read the ending as `WaitUnknown`. The drain and the segments' settlement
+/// of it are one hold of the generation's lock, so an entry here is a
+/// settled drain.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerDrained {
+    pub pid: u32,
+    pub start: u64,
+    pub complete: bool,
+    /// `armed`, `unarmed`, `tool`, `unknown`, or `none`.
+    pub decision: String,
+    /// `none`, `done-clean`, `done-survivors`, `done-unknown`,
+    /// `spawn-failed` or `unrecognised`.
+    pub report: String,
+    /// The ending reads as `WaitUnknown`; it doesn't show that a cut-off
+    /// was applied to anything held.
+    pub wait_unknown: bool,
+}
+
+/// PRD #1666 part 3 (Q105b.2): observations a generation's record cap
+/// dropped, counted by the decision each named; `undecided` named none.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerCapDrops {
+    pub undecided: u64,
+    pub armed: u64,
+    pub unarmed: u64,
+    pub tool: u64,
+    pub unknown: u64,
+}
+
+/// How long `observer-hold` waits for a pass already running to finish
+/// before answering that it hasn't (Q105b.2).
+#[cfg(feature = "e2e")]
+const OBSERVER_HOLD_BOUND: Duration = Duration::from_secs(30);
+
+/// PRD #1666 part 3 (Q105b.2): `agent`'s observer status, read and
+/// changing nothing; `None` with no records attached or once retired.
+#[cfg(feature = "e2e")]
+fn composer_observer_status(
+    registry: &Arc<AgentPtyRegistry>,
+    agent: &str,
+) -> Option<ComposerObserverStatus> {
+    use crate::composer_probe::record::{Decision, EcPolicy, Report, ScopeState, Tree};
+    let records = registry
+        .composer_input(agent)
+        .and_then(|input| input.records_for_e2e())?;
+    #[cfg(target_os = "linux")]
+    let passes = registry
+        .composer_observer(agent)
+        .map(|observer| observer.passes_for_e2e())
+        .unwrap_or_default();
+    #[cfg(target_os = "linux")]
+    let (passes_held, pass_running, passes) = (passes.held, passes.running, passes.finished);
+    #[cfg(not(target_os = "linux"))]
+    let (passes_held, pass_running, passes) = (false, false, 0);
+    let w = records.witness;
+    Some(ComposerObserverStatus {
+        scope: match records.scope {
+            ScopeState::Closed => "closed",
+            ScopeState::Pending => "pending",
+            ScopeState::Open(_) => "open",
+        }
+        .to_string(),
+        passes_held,
+        passes,
+        pass_running,
+        records_policy: match records.policy {
+            EcPolicy::Hold => "hold",
+            EcPolicy::Authority => "authority",
+        }
+        .to_string(),
+        records_cap: records.cap,
+        records_retained: records.retained,
+        records_observed: w.observed,
+        cap_dropped: ComposerCapDrops {
+            undecided: w.cap_dropped_undecided,
+            armed: w.cap_dropped_armed,
+            unarmed: w.cap_dropped_unarmed,
+            tool: w.cap_dropped_tool,
+            unknown: w.cap_dropped_unknown,
+        },
+        drains: w.drains,
+        drained: w
+            .drained()
+            .map(|d| ComposerDrained {
+                pid: d.key.pid,
+                start: d.key.start,
+                complete: d.complete,
+                decision: match d.decision {
+                    Some(Decision::Armed) => "armed",
+                    Some(Decision::Unarmed) => "unarmed",
+                    Some(Decision::Tool) => "tool",
+                    Some(Decision::Unknown) => "unknown",
+                    None => "none",
+                }
+                .to_string(),
+                report: match d.report {
+                    Report::None => "none",
+                    Report::Done(Tree::Clean) => "done-clean",
+                    Report::Done(Tree::Survivors) => "done-survivors",
+                    Report::Done(Tree::Unknown) => "done-unknown",
+                    Report::SpawnFailed { .. } => "spawn-failed",
+                    Report::Unrecognised => "unrecognised",
+                }
+                .to_string(),
+                wait_unknown: d.wait_unknown,
+            })
+            .collect(),
+    })
+}
+
+/// The status as an `ok` answer, or the refusal.
+#[cfg(feature = "e2e")]
+fn composer_observer_answer(registry: &Arc<AgentPtyRegistry>, agent: &str) -> AttachResponse {
+    match composer_observer_status(registry, agent) {
+        Some(status) => AttachResponse {
+            ok: true,
+            composer_observer: Some(status),
+            ..Default::default()
+        },
+        None => AttachResponse::err("e2e-composer-control: no observer on that pane"),
+    }
+}
+
+/// PRD #1666 part 3 (Q105b.2): a generation's PTY writer thread under the
+/// `e2e` build's controls. `held`: `writer-hold` is in force; `parked`: the
+/// thread is waiting at it with a job dequeued; `dequeued`: jobs the thread
+/// has taken off its queue; `failed_writes`: writes the fault plan failed.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerWriterStatus {
+    pub held: bool,
+    pub parked: bool,
+    pub dequeued: u64,
+    pub failed_writes: usize,
+}
+
+/// PRD #1666 part 3 (Q105b.2): a generation's probe schedule, the `e2e`
+/// build's `schedule-advance` and `schedule-status` answer, read at the
+/// answer: whether an attempt is due, the failures in a row and `broken`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerScheduleStatus {
+    pub due: bool,
+    pub failures: u32,
+    pub broken: bool,
+}
+
+/// PRD #1666 part 3 (Q35-20): what a probe request did, the `e2e` build's
+/// `probe-request` answer: `not_due`, `refused`, `written` or `taken_back`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerProbeStatus {
+    pub outcome: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// PRD #1666 part 3 (Q35-22): a generation's binding, the `e2e` build's
+/// read-only `binding-status` answer: its permission as settled so far
+/// (`pending`, `armable` or `inert`) and why discovery refused its
+/// candidate, if it did. Reading it settles nothing.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerBindingStatus {
+    pub generation: u64,
+    pub permission: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+/// PRD #1666 part 3 (Q35-20a): a drain-frontier request, the `e2e` build's
+/// `frontier-enqueue` and `frontier-status` answer. `state` is `pending`,
+/// `taken` or `missing`; `offset` is set when it is `taken`.
+#[cfg(feature = "e2e")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposerFrontierStatus {
+    pub request_id: u64,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<u64>,
+}
+
+#[cfg(feature = "e2e")]
+impl ComposerFrontierStatus {
+    fn of(request: &crate::composer_probe::frontier::Request) -> Self {
+        use crate::composer_probe::record::FrontierOutcome;
+        let (state, offset) = match request.outcome() {
+            None => ("pending", None),
+            Some(FrontierOutcome::Taken { offset }) => ("taken", Some(offset)),
+            Some(FrontierOutcome::Missing) => ("missing", None),
+        };
+        Self {
+            request_id: request.id(),
+            state: state.to_string(),
+            offset,
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-14b, Q35-15): answer
+/// [`AttachRequest::E2eComposerControl`] for `pane_id`'s current
+/// generation. `fence` closes the generation's fence gate at its output
+/// offset as of now, writing nothing; `release` re-checks the captured target
+/// as a release does and submits what the fence held, in order; `fence-status`
+/// reads its counts. Each is refused unless `generation` is the pane's
+/// current one, so a retired generation can't release its successor.
+/// `publish` and `withdraw` go to the generation's observer.
+/// `frontier-enqueue` asks the generation's reader for a drain frontier
+/// through the queue a `Clean` report uses, and `frontier-status:<id>` reads
+/// one back, writing nothing (Q35-20a).
+#[cfg(feature = "e2e")]
+async fn e2e_composer_control(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    if operation == "frontier-enqueue" || operation.starts_with("frontier-status:") {
+        return e2e_composer_frontier(registry, pane_id, generation, operation);
+    }
+    if operation.starts_with("writer-")
+        || operation.starts_with("schedule-")
+        || operation.starts_with("records-")
+        || operation.starts_with("attach-")
+    {
+        return e2e_composer_q105b_control(registry, pane_id, generation, operation);
+    }
+    if matches!(operation, "epoch" | "observer-status" | "binding-status")
+        || operation.starts_with("probe-request")
+    {
+        return e2e_composer_probe_control(registry, pane_id, generation, operation).await;
+    }
+    if !matches!(operation, "fence" | "release" | "fence-status") {
+        return e2e_composer_observer_control(registry, pane_id, generation, operation).await;
+    }
+    let Some(agent) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    let Some((gate, writer)) = registry.composer_fence(&agent) else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    match operation {
+        "fence" => {
+            if gate.fence() {
+                AttachResponse::ok()
+            } else {
+                AttachResponse::err("e2e-composer-control: the generation retired")
+            }
+        }
+        "release" => {
+            let w = writer.lock().await;
+            // Core §8.1: the captured target is still the pane's live owner
+            // and writable, checked under the writer as the attach loop's
+            // re-validation is. Its exit is checked first, by
+            // `release_fence` itself, for this caller and any other (Q35-15
+            // fix, R-U2-02).
+            let owner = registry.pane_current_agent_id(pane_id).as_deref() == Some(agent.as_str());
+            let target = if !owner {
+                Err("stale")
+            } else if state.read().await.pane_writable(pane_id) != crate::event::Writable::Live {
+                Err("history-only")
+            } else {
+                Ok(())
+            };
+            w.release_fence(target);
+            AttachResponse::ok()
+        }
+        _ => {
+            let status = gate.status();
+            AttachResponse {
+                ok: true,
+                composer_fence: Some(ComposerFenceStatus {
+                    fenced: status.fenced,
+                    held_ops: status.held_ops,
+                    held_bytes: status.held_bytes,
+                    full_waiters: status.full_waiters,
+                }),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20a): the frontier half of
+/// [`e2e_composer_control`], refused unless `generation` is the pane's
+/// current one.
+#[cfg(feature = "e2e")]
+fn e2e_composer_frontier(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    let Some(input) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+        .and_then(|agent| registry.composer_input(&agent))
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    let request = match operation.strip_prefix("frontier-status:") {
+        None => input.request_frontier(generation, None),
+        Some(id) => match id.parse().ok().and_then(|id| input.frontier().get(id)) {
+            Some(request) => request,
+            None => return AttachResponse::err("e2e-composer-control: no such frontier request"),
+        },
+    };
+    AttachResponse {
+        ok: true,
+        composer_frontier: Some(ComposerFrontierStatus::of(&request)),
+        ..Default::default()
+    }
+}
+
+/// PRD #1666 part 3 (Q105b.2): the controls S-20b and S-20c asked for, each
+/// refused unless `generation` is the pane's current one. None writes a byte,
+/// arms, releases or completes anything itself. The writer and attach
+/// controls withhold, fail or reorder what the production path does
+/// ([`crate::e2e_controls`]); `schedule-advance` makes the schedule's own
+/// tick due sooner, and the attempt it then starts goes through admission as
+/// any does; `records-policy:authority` selects a policy production does not
+/// run, so what a generation does under it is not production behaviour.
+///
+/// - `writer-hold` / `writer-go`: park the generation's PTY writer thread
+///   before its next job, and let it go on; `writer-status` reads it.
+/// - `writer-fault:jobs=<any|answer>,skip=<K>,accept=<N>`: after `K`
+///   matching jobs (an answer is one job per key entry it writes), the PTY
+///   takes `N` more bytes of matching jobs, counted by what it took, and then
+///   fails each matching write; `writer-fault:off` clears it.
+/// - `schedule-advance:<ms>`: the probe schedule's pending wait ends `ms`
+///   earlier, as if that much time passed; `schedule-status` reads it.
+/// - `records-policy:<hold|authority>`, `records-cap:<n>`: this generation's
+///   EC policy and record cap, only before any observation ever reached its
+///   records; `observer-status` reads them back.
+/// - `attach-degrade-peer-watch:<client_id>`, `attach-end-output:<client_id>`:
+///   that client's attach connections stop watching their peer, and their
+///   output tasks end (Q15-1).
+#[cfg(feature = "e2e")]
+fn e2e_composer_q105b_control(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    let Some(input) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+        .and_then(|agent| registry.composer_input(&agent))
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    let writer = || {
+        let w = input.writer_e2e();
+        AttachResponse {
+            ok: true,
+            composer_writer: Some(ComposerWriterStatus {
+                held: w.is_held(),
+                parked: w.parked(),
+                dequeued: w.dequeued(),
+                failed_writes: w.failed_writes(),
+            }),
+            ..Default::default()
+        }
+    };
+    let unknown = || AttachResponse::err("e2e-composer-control: unknown operation");
+    let (op, arg) = operation.split_once(':').unwrap_or((operation, ""));
+    match op {
+        "writer-hold" => {
+            input.writer_e2e().hold();
+            writer()
+        }
+        "writer-go" => {
+            input.writer_e2e().go();
+            writer()
+        }
+        "writer-status" => writer(),
+        "writer-fault" => {
+            let plan = if arg == "off" {
+                None
+            } else {
+                match crate::e2e_controls::FaultPlan::parse(arg) {
+                    Some(plan) => Some(plan),
+                    None => return unknown(),
+                }
+            };
+            input.writer_e2e().set_faults(plan);
+            writer()
+        }
+        "schedule-advance" | "schedule-status" => {
+            let by = if op == "schedule-advance" {
+                match arg.parse() {
+                    Ok(ms) => Duration::from_millis(ms),
+                    Err(_) => return unknown(),
+                }
+            } else {
+                Duration::ZERO
+            };
+            match input.advance_schedule_for_e2e(by, std::time::Instant::now()) {
+                Some((due, failures, broken)) => AttachResponse {
+                    ok: true,
+                    composer_schedule: Some(ComposerScheduleStatus {
+                        due,
+                        failures,
+                        broken,
+                    }),
+                    ..Default::default()
+                },
+                None => AttachResponse::err("e2e-composer-control: no probe schedule"),
+            }
+        }
+        "records-policy" | "records-cap" => {
+            use crate::composer_probe::record::EcPolicy;
+            let result = if op == "records-policy" {
+                let policy = match arg {
+                    "hold" => EcPolicy::Hold,
+                    "authority" => EcPolicy::Authority,
+                    _ => return unknown(),
+                };
+                input.configure_records_for_e2e(Some(policy), None)
+            } else {
+                match arg.parse() {
+                    Ok(cap) => input.configure_records_for_e2e(None, Some(cap)),
+                    Err(_) => return unknown(),
+                }
+            };
+            match result {
+                Ok(()) => AttachResponse::ok(),
+                Err(why) => AttachResponse::err(format!("e2e-composer-control: {why}")),
+            }
+        }
+        "attach-degrade-peer-watch" | "attach-end-output" if !arg.is_empty() => {
+            let control = crate::e2e_controls::attach_control(arg);
+            if op == "attach-end-output" {
+                control.end_output();
+            } else {
+                control.degrade_peer_watch();
+            }
+            AttachResponse::ok()
+        }
+        _ => unknown(),
+    }
+}
+
+/// PRD #1666 part 3 (Q35-20): the probe half of [`e2e_composer_control`],
+/// refused unless `generation` is the pane's current one. `epoch` and
+/// `observer-status` read and change nothing. `probe-request`, with
+/// `:retry` or `:lapse`, asks the production probe path
+/// ([`AgentPtyRegistry::composer_probe`]): the generation's own schedule,
+/// admission when scheduled and at the writer's arm section, the claim, the
+/// arm and its undo. It manufactures no record, ignores no permission and
+/// publishes or fences nothing itself.
+#[cfg(feature = "e2e")]
+async fn e2e_composer_probe_control(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    let Some(agent) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| *agent == generation.to_string())
+    else {
+        return AttachResponse::err("e2e-composer-control: not the pane's current generation");
+    };
+    match operation {
+        "epoch" => {
+            let Some(input) = registry.composer_input(&agent) else {
+                return AttachResponse::err(
+                    "e2e-composer-control: not the pane's current generation",
+                );
+            };
+            let epoch = input.epoch();
+            AttachResponse {
+                ok: true,
+                composer_epoch: Some(ComposerEpochStatus {
+                    epoch: epoch.epoch(),
+                    observed: epoch.observed(),
+                    last_foreign: epoch.last_foreign(),
+                }),
+                ..Default::default()
+            }
+        }
+        "observer-status" => composer_observer_answer(registry, &agent),
+        #[cfg(not(target_os = "linux"))]
+        "binding-status" => AttachResponse::err("e2e-composer-control: no observer on that pane"),
+        #[cfg(target_os = "linux")]
+        "binding-status" => match registry.composer_observer(&agent) {
+            Some(observer) => {
+                use crate::composer_probe::Permission;
+                let (permission, reason) = observer.binding_status_for_e2e();
+                AttachResponse {
+                    ok: true,
+                    composer_binding: Some(ComposerBindingStatus {
+                        generation,
+                        permission: match permission {
+                            Permission::Pending => "pending",
+                            Permission::Armable => "armable",
+                            Permission::Inert(_) => "inert",
+                        }
+                        .to_string(),
+                        reason,
+                    }),
+                    ..Default::default()
+                }
+            }
+            None => AttachResponse::err("e2e-composer-control: no observer on that pane"),
+        },
+        _ => {
+            use crate::agent_pty::{ProbeAsk, ProbeOutcome};
+            let ask = match operation {
+                "probe-request" => ProbeAsk::First,
+                "probe-request:retry" => ProbeAsk::Retry,
+                "probe-request:lapse" => ProbeAsk::Lapse,
+                _ => return AttachResponse::err("e2e-composer-control: unknown operation"),
+            };
+            let (outcome, reason) = match registry.composer_probe(pane_id, &agent, ask).await {
+                ProbeOutcome::NotDue => ("not_due", None),
+                ProbeOutcome::Refused(why) => ("refused", Some(why)),
+                ProbeOutcome::Written => ("written", None),
+                ProbeOutcome::TakenBack => ("taken_back", None),
+                ProbeOutcome::Unavailable => {
+                    return AttachResponse::err(
+                        "e2e-composer-control: no probe-capable generation on that pane",
+                    );
+                }
+            };
+            AttachResponse {
+                ok: true,
+                composer_probe: Some(ComposerProbeStatus {
+                    outcome: outcome.to_string(),
+                    reason,
+                }),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// PRD #1666 part 3 (Q35-14b): the observer half of
+/// [`e2e_composer_control`], off the executor.
+#[cfg(all(feature = "e2e", target_os = "linux"))]
+async fn e2e_composer_observer_control(
+    registry: &Arc<AgentPtyRegistry>,
+    pane_id: &str,
+    generation: u64,
+    operation: &str,
+) -> AttachResponse {
+    use crate::composer_probe::observe::ControlOp;
+    let op = match operation {
+        "publish" => Some(ControlOp::Publish),
+        "withdraw" => Some(ControlOp::Withdraw),
+        "observer-hold" | "observer-go" => None,
+        _ => return AttachResponse::err("e2e-composer-control: unknown operation"),
+    };
+    let Some((agent, observer)) = registry
+        .pane_current_agent_id(pane_id)
+        .filter(|agent| op.is_some() || *agent == generation.to_string())
+        .and_then(|agent| Some((agent.clone(), registry.composer_observer(&agent)?)))
+    else {
+        return AttachResponse::err("e2e-composer-control: no installed generation on that pane");
+    };
+    // Q105b.2: the observer's pass barrier, for the generation named only.
+    // A hold answers once no pass is running, so none can run until a go.
+    let Some(op) = op else {
+        let hold = operation == "observer-hold";
+        let held = tokio::task::spawn_blocking(move || {
+            observer.hold_passes_for_e2e(hold, OBSERVER_HOLD_BOUND)
+        })
+        .await;
+        return match held {
+            Ok(Ok(_)) => composer_observer_answer(registry, &agent),
+            Ok(Err(_)) => AttachResponse::err(
+                "e2e-composer-control: a pass still running past the hold's bound",
+            ),
+            Err(_) => AttachResponse::err("e2e-composer-control: the control failed"),
+        };
+    };
+    match tokio::task::spawn_blocking(move || observer.control(generation, op)).await {
+        Ok(Ok(_count)) => AttachResponse::ok(),
+        Ok(Err(refusal)) => AttachResponse::err(format!("e2e-composer-control: {refusal:?}")),
+        Err(_) => AttachResponse::err("e2e-composer-control: the control failed"),
+    }
+}
+
+#[cfg(all(feature = "e2e", not(target_os = "linux")))]
+async fn e2e_composer_observer_control(
+    _registry: &Arc<AgentPtyRegistry>,
+    _pane_id: &str,
+    _generation: u64,
+    _operation: &str,
+) -> AttachResponse {
+    AttachResponse::err("e2e-composer-control: no editor helper on this platform")
 }
 
 /// PRD #1258: answer [`AttachRequest::HostMetrics`] from `cache`.
@@ -5567,6 +6321,9 @@ async fn handle_connection(
             // PRD #1666 S3: each agent's inbox, after the live join, which
             // decides whether the doorbell can reach it.
             crate::agent_pty::attach_inbox_summaries(&registry, &mut records);
+            // PRD #1666 part 3 (Q35-20): held typing, after the live join,
+            // whose snapshot carries it too.
+            crate::agent_pty::attach_input_held(&registry, &mut records);
             let mut resp = AttachResponse::agent_records(records);
             resp.orchestration_roles = Some(orchestration_roles);
             // Issue #887: the client's only observable of the schedule seed the
@@ -6811,19 +7568,34 @@ async fn handle_connection(
             answers,
             confirmed_always,
             revision,
+            client_token,
         } => {
-            let resp = match answer_question_at(
-                &registry,
-                &state,
-                &event_tx,
-                &agent_id,
-                &question_id,
-                revision,
-                &answers,
-                confirmed_always,
-            )
-            .await
-            {
+            // PRD #1666 part 3 (Q35-17): on a task of its own, so an answer a
+            // fence holds settles, and its settlement is recorded, even when
+            // this connection goes before it does.
+            let answering = {
+                let (registry, state, event_tx) =
+                    (Arc::clone(&registry), state.clone(), event_tx.clone());
+                tokio::spawn(async move {
+                    answer_question_tokened_at(
+                        &registry,
+                        &state,
+                        &event_tx,
+                        &agent_id,
+                        &question_id,
+                        revision,
+                        &answers,
+                        confirmed_always,
+                        client_token,
+                    )
+                    .await
+                })
+            };
+            let resp = match answering.await.unwrap_or_else(|_| {
+                Err(crate::question::AnswerRefusal::WriteFailed {
+                    detail: "the deck's answer task ended".into(),
+                })
+            }) {
                 Ok(()) => AttachResponse::ok(),
                 Err(refusal) => AttachResponse {
                     ok: false,
@@ -6836,6 +7608,16 @@ async fn handle_connection(
         }
         AttachRequest::HostMetrics => {
             write_resp(&mut stream, &host_metrics_response(host_metrics).await).await?
+        }
+        #[cfg(feature = "e2e")]
+        AttachRequest::E2eComposerControl {
+            pane_id,
+            generation,
+            operation,
+        } => {
+            let resp =
+                e2e_composer_control(&registry, &state, &pane_id, generation, &operation).await;
+            write_resp(&mut stream, &resp).await?
         }
         AttachRequest::RecordOrchestratorContext {
             pane_id,
@@ -7815,6 +8597,63 @@ pub(crate) async fn answer_question(
     .await
 }
 
+/// PRD #1666 part 3 (Q35-17, OQ6): settle an answer a fence held: name its
+/// physical `outcome` by the request's `client_token`, when it carried one,
+/// among `agent_id`'s settlements, and clear the question's `answer_queued`,
+/// in one state write so no snapshot shows the flag gone without the outcome.
+async fn settle_held_answer(
+    state: &SharedState,
+    agent_id: &str,
+    pane_id: &str,
+    question_id: &str,
+    revision: Option<u64>,
+    client_token: Option<u64>,
+    outcome: crate::question::SettlementOutcome,
+) {
+    let mut guard = state.write().await;
+    if let (Some(client_token), Some(revision)) = (client_token, revision) {
+        guard.push_answer_settlement(
+            agent_id,
+            crate::question::AnswerSettlement {
+                question_id: question_id.to_string(),
+                revision,
+                client_token,
+                outcome,
+            },
+            std::time::Instant::now(),
+        );
+    }
+    guard.set_answer_queued(pane_id, question_id, revision, false);
+}
+
+/// [`answer_question_tokened_at`] for a request with no client token, as
+/// every request before Q35-17 was.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn answer_question_at(
+    registry: &Arc<AgentPtyRegistry>,
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    agent_id: &str,
+    question_id: &str,
+    requested_revision: Option<u64>,
+    answers: &[crate::question::QuestionAnswer],
+    confirmed_always: bool,
+) -> Result<(), crate::question::AnswerRefusal> {
+    answer_question_tokened_at(
+        registry,
+        state,
+        event_tx,
+        agent_id,
+        question_id,
+        requested_revision,
+        answers,
+        confirmed_always,
+        None,
+    )
+    .await
+}
+
 /// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler.
 ///
 /// Refusal order: the agent, a pending question, the id and the revision the
@@ -7875,8 +8714,26 @@ pub(crate) async fn answer_question(
 /// before every key, against the sequence number the deck's previous key was
 /// committed at. When a write fails after some keys went in, the question is
 /// left pending but marked keyboard-only.
+///
+/// **A request that carried `client_token`** (PRD #1666 part 3, Q35-17, OQ6).
+///
+/// **Through a fence.** A key a fence holds is accepted: the question is
+/// marked `answer_queued`, the writer and the lifecycle are released, and the
+/// key's physical outcome is awaited outside them
+/// ([`AgentPtyRegistry::write_answer_keys`]). The reply still reports the
+/// actual outcome, as before. While the key is held another answer to the
+/// agent is refused [`AnswerRefusal::AnswerInProgress`], by its slot or, past
+/// a handler that stopped waiting, by its reservation.
+///
+/// **The settlement.** When any key of the answer was held, the answer's
+/// outcome — `Written`, `Partial`, `Superseded`, `Retired` or
+/// `WriteFailed` — is pushed to the agent's settlements, named by
+/// `client_token`, in the same state write that clears `answer_queued`, and
+/// before the deck's own event clears the question, so no snapshot shows the
+/// flag gone without the outcome. A request with no token settles as before,
+/// with no entry; an answer no fence held makes no entry either.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn answer_question_at(
+pub(crate) async fn answer_question_tokened_at(
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -7885,8 +8742,11 @@ pub(crate) async fn answer_question_at(
     requested_revision: Option<u64>,
     answers: &[crate::question::QuestionAnswer],
     confirmed_always: bool,
+    client_token: Option<u64>,
 ) -> Result<(), crate::question::AnswerRefusal> {
-    use crate::question::{AnswerChannel, AnswerRefusal, OptionRole, QuestionReply};
+    use crate::question::{
+        AnswerChannel, AnswerRefusal, OptionRole, QuestionReply, SettlementOutcome,
+    };
     let record = registry
         .agent_records()
         .into_iter()
@@ -7900,6 +8760,11 @@ pub(crate) async fn answer_question_at(
     let _answering = slot
         .try_lock()
         .map_err(|_| AnswerRefusal::AnswerInProgress)?;
+    // Q35-17: a key a fence holds keeps the agent reserved until its job
+    // ends, even past a handler that stopped waiting for it.
+    if registry.question_answers().answer_reserved(pane, agent_id) {
+        return Err(AnswerRefusal::AnswerInProgress);
+    }
     let (session_id, agent_type, question) = {
         let guard = state.read().await;
         let (session_id, question) = guard
@@ -8004,6 +8869,20 @@ pub(crate) async fn answer_question_at(
             // The human-input sequence number the deck's own last key was
             // committed at (audit N1); `None` until one is.
             let mut committed: Option<u64> = None;
+            // Q35-17: a fence held one of the answer's keys, so its outcome
+            // is settled for the client that sent it.
+            let mut held_any = false;
+            let settle = |outcome: SettlementOutcome| {
+                settle_held_answer(
+                    state,
+                    agent_id,
+                    pane,
+                    &question.id,
+                    revision,
+                    client_token,
+                    outcome,
+                )
+            };
             // The mark this answer made covers the whole id from here, unless a
             // same-id replacement registered while the keys were being typed is
             // what is pending: that one was never answered (Qodo #1561). Asked
@@ -8037,6 +8916,14 @@ pub(crate) async fn answer_question_at(
                             .pending_question_for(agent_id, pane_id.as_deref())
                             .is_some_and(|(_, q)| q.id == question.id && q.revision == revision)
                 };
+                // Q35-17: a key a fence holds marks the question queued,
+                // under the lifecycle, before the lifecycle is released.
+                let queued = || async {
+                    state
+                        .write()
+                        .await
+                        .set_answer_queued(pane, &question.id, revision, true);
+                };
                 match registry
                     .write_answer_keys(
                         agent_id,
@@ -8045,20 +8932,32 @@ pub(crate) async fn answer_question_at(
                         revision,
                         key.as_bytes(),
                         still_ours,
+                        queued,
                     )
                     .await
                 {
-                    Ok(at) => {
+                    Ok(written) => {
+                        held_any |= written.held;
                         registry
                             .question_answers()
                             .barrier("answer_question:key_written")
                             .await;
-                        committed = Some(at);
+                        committed = Some(written.at);
                         registry
                             .question_answers()
                             .mark_answered(pane, &question.id, revision);
                     }
-                    Err(detail) => {
+                    Err(failure) => {
+                        held_any |= failure.held;
+                        let detail = failure.detail;
+                        if held_any {
+                            settle(if typed > 0 {
+                                SettlementOutcome::Partial
+                            } else {
+                                failure.outcome
+                            })
+                            .await;
+                        }
                         // Audit T1: with nothing typed, a question that is no
                         // longer this revision — registered again under its
                         // id, replaced, or cleared, before the key's check or
@@ -8155,6 +9054,11 @@ pub(crate) async fn answer_question_at(
                         return Err(refusal);
                     }
                 }
+            }
+            // Q35-17: every key is in; the settlement goes before the deck's
+            // own event below clears the question with its flag.
+            if held_any {
+                settle(SettlementOutcome::Written).await;
             }
         }
         AnswerChannel::Unsupported | AnswerChannel::Unknown => {
@@ -8374,6 +9278,14 @@ async fn handle_subscribe_events_with_snapshot(
     .await
     .map_err(io::Error::other)?;
     crate::agent_pty::attach_cli_names(&mut records);
+    // PRD #1666 part 3 (Q35-20e): held typing, so a client attaching while
+    // typing is held shows it at once. Read after the receiver opened: a
+    // change the watcher broadcast before this read is in the reply as well.
+    // A word the watcher read before this one and sent after it lands over
+    // it; the watcher sends again only on a later display change, or in the
+    // repeat 30 s after a pass a display notice woke, which corrects it
+    // (R-E-U3-03, auditor U3-8).
+    crate::agent_pty::attach_input_held(registry, &mut records);
     let mut resp = AttachResponse::agent_records(records);
     // Issue #1637: read under the same guard as the receiver, so a notice
     // change is either in this reply or on the stream.
@@ -8557,6 +9469,47 @@ fn enqueue_reject(tx: &tokio::sync::mpsc::Sender<Vec<u8>>, reason: &'static [u8]
     }
 }
 
+/// PRD #1666 part 3 (Q105b.2, Q15-1): an attach connection's test and `e2e`
+/// controls, found by the client id its `attach-stream` carried
+/// ([`crate::e2e_controls::AttachControl`]). Compiled only into a test or
+/// `e2e` build: a release build's attach loop calls the platform's peer
+/// watch and runs its output task as it always did, with no extra arm.
+#[cfg(any(test, feature = "e2e"))]
+#[derive(Clone)]
+struct AttachE2e {
+    control: Option<Arc<crate::e2e_controls::AttachControl>>,
+}
+
+#[cfg(any(test, feature = "e2e"))]
+impl AttachE2e {
+    fn of(client_id: Option<&str>) -> Self {
+        Self {
+            control: client_id.map(crate::e2e_controls::attach_control),
+        }
+    }
+
+    /// Resolves when a test ends this connection's output task.
+    async fn output_ended(&self) {
+        match &self.control {
+            Some(control) => control.output_ended().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+
+    /// The input loop's peer watch: the platform's, unless a test degraded
+    /// it, when it never resolves.
+    async fn peer_closed(&self, rd: &crate::platform::ipc::IpcReadHalf) {
+        if self
+            .control
+            .as_ref()
+            .is_some_and(|c| c.peer_watch_degraded())
+        {
+            std::future::pending::<()>().await;
+        }
+        crate::platform::ipc::peer_closed(rd).await;
+    }
+}
+
 async fn handle_attach_stream(
     stream: IpcStream,
     registry: Arc<AgentPtyRegistry>,
@@ -8698,7 +9651,9 @@ async fn handle_attach_stream(
     // read it as end-of-stream. A legacy attach gets a receiver that is never
     // ready, which parks that arm forever without affecting the others.
     let mut geometry_rx = handle.geometry_rx;
-    let output_task = tokio::spawn(async move {
+    #[cfg(any(test, feature = "e2e"))]
+    let attach_e2e = AttachE2e::of(client_id.as_deref());
+    let output_loop = async move {
         loop {
             tokio::select! {
                 // Bias toward output so heavy PTY traffic isn't starved by
@@ -8791,173 +9746,267 @@ async fn handle_attach_stream(
                 },
             }
         }
-    });
+    };
+    // PRD #1666 part 3 (Q105b.2, Q15-1): in a test or `e2e` build a test can
+    // end this output task, as a broken socket would; first, so output can't
+    // starve it. A release build spawns the loop alone.
+    #[cfg(any(test, feature = "e2e"))]
+    let output_loop = {
+        let output_e2e = attach_e2e.clone();
+        async move {
+            tokio::select! {
+                biased;
+                () = output_e2e.output_ended() => {}
+                () = output_loop => {}
+            }
+        }
+    };
+    let mut output_task = tokio::spawn(output_loop);
 
     // Input loop: STREAM_IN bytes are forwarded to the shared PTY writer;
     // DETACH (or unknown frame / EOF) ends the loop.
-    loop {
+    'frames: loop {
         match read_frame(&mut rd).await {
             Ok(Some((KIND_STREAM_IN, bytes))) => {
-                // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
-                // just in the UI. If the focused session became non-live (a
-                // wrapped Codex pane that declared `history-only`, or a
-                // view-only target), REJECT the key / bracketed-paste frame
-                // rather than forwarding it to the PTY — a UI-only gate can't
-                // close the race where a pane goes non-live while a stream is
-                // already open, nor protect an older/stale client. A pane with
-                // no non-live declaration stays `Live` (the historical default),
-                // so native PTY panes are unaffected. The connection stays open
-                // (the client remains attached, seeing output) — only the write
-                // is dropped.
-                // PRD #20 R20-008: reject frames to a target that has exited
-                // (its reader thread saw EOF) even if the registry entry hasn't
-                // been reaped yet — the cached writer points at a dead PTY.
-                //
-                // PRD #20 R20-007 (finding #10): a rejection is no longer a
-                // silent debug-only drop. Send a TYPED, NON-terminal
-                // `KIND_STREAM_REJECT` frame (via the output task) so the client
-                // can surface honest feedback and leave its input mode for BOTH
-                // key and paste, while the stream stays open.
-                if exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    tracing::debug!(
-                        target: "pane_write",
-                        agent_id = %id,
-                        pane_id = %pane_id,
-                        payload_len = bytes.len(),
-                        "STREAM_IN rejected — target agent has exited"
-                    );
-                    enqueue_reject(&reject_tx, b"exited");
-                    continue;
-                }
-                // Finding #3: resolve by agent identity for a paneless target, by
-                // pane otherwise. Both default to `Live` when nothing is declared,
-                // so an ordinary shell is unaffected; a declared non-live target
-                // (paneless or paned) fails closed.
-                let pre_lock_writable = {
-                    let guard = state.read().await;
-                    if is_paneless {
-                        guard.agent_writable(&id)
-                    } else {
-                        guard.pane_writable(&pane_id)
-                    }
-                };
-                if pre_lock_writable != crate::event::Writable::Live {
-                    tracing::debug!(
-                        target: "pane_write",
-                        agent_id = %id,
-                        pane_id = %pane_id,
-                        payload_len = bytes.len(),
-                        "STREAM_IN rejected — target is not live (history-only / view-only)"
-                    );
-                    enqueue_reject(&reject_tx, b"history-only");
-                    continue;
-                }
-                // PRD #1666 part 2 (`inbox/doorbell/031`): counted in flight
-                // from before it waits for the writer until it is written or
-                // refused, so a doorbell holding the writer between its steps
-                // withholds the rest rather than typing ahead of it.
-                let _in_flight = registry.human_frame_arriving(&pane_id);
-                #[cfg(feature = "e2e")]
-                crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
-                let w = writer.lock().await;
-                // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
-                // immediately before writing. A close/respawn (registry removal),
-                // a liveness transition, or a rebind can land WHILE this frame
-                // waited for the writer lock — the pre-lock checks above cannot
-                // see that. Re-check exit, the pane's CURRENT live owner (it must
-                // still be THIS agent), and writability, holding the writer
-                // through the completed write, so no bytes reach a target already
-                // declared stale/removed/non-live. All rejections send the same
-                // typed frame and keep the stream open.
-                if exited.load(std::sync::atomic::Ordering::SeqCst) {
-                    drop(w);
-                    enqueue_reject(&reject_tx, b"exited");
-                    continue;
-                }
-                // The pane→agent ownership re-check only applies to an agent
-                // that actually carries a pane id: a daemon-side agent with no
-                // pane (`<no-pane>`) has no pane→agent mapping to re-resolve, and
-                // its stream is bound directly to the agent's own writer, so skip
-                // the check (it would spuriously find no owner and reject).
-                if !is_paneless {
-                    match registry.pane_current_agent_id(&pane_id) {
-                        Some(current) if current == id => {}
-                        Some(_) => {
-                            drop(w);
-                            enqueue_reject(&reject_tx, b"wrong-session");
-                            continue;
-                        }
-                        None => {
-                            drop(w);
-                            enqueue_reject(&reject_tx, b"stale");
-                            continue;
-                        }
-                    }
-                }
-                // Finding #3: re-validate writability under the held writer, by
-                // agent identity for a paneless target and by pane otherwise.
-                let post_lock_writable = {
-                    let guard = state.read().await;
-                    if is_paneless {
-                        guard.agent_writable(&id)
-                    } else {
-                        guard.pane_writable(&pane_id)
-                    }
-                };
-                if post_lock_writable != crate::event::Writable::Live {
-                    drop(w);
-                    enqueue_reject(&reject_tx, b"history-only");
-                    continue;
-                }
-                // PRD #128 (cherry-picked from PR #122): byte-level trace
-                // of STREAM_IN frames forwarded to the per-agent PTY
-                // writer. Useful for confirming that bytes the TUI
-                // queued arrived as distinct frames and that no other
-                // path interleaved a write on the same writer mutex
-                // between them. Gated by `RUST_LOG=trace`. Emitted
-                // INSIDE the writer mutex so trace order matches actual
-                // write order. Both `agent_id` and `pane_id` are
-                // emitted so the M1.4 diff against the daemon-initiated
-                // trace in `AgentPtyRegistry::write_to_pane_internal`
-                // can join on either key (`pane_id` is cached once per
-                // attach above).
-                tracing::trace!(
-                    target: "pane_write",
-                    source = "stream_in",
-                    agent_id = %id,
-                    pane_id = %pane_id,
-                    payload_len = bytes.len(),
-                    payload = %escape_bytes_for_log(&bytes),
-                    "STREAM_IN forwarded to PTY writer"
+                // PRD #1666 part 3, round 5-wake (plan §2.1′): the frame is a
+                // human operation on this generation's input from here, before
+                // any await, until it is refused or its PTY job ends. Q35-15
+                // (I-4): its ticket is made here and nowhere else, and travels
+                // with the frame to whichever path settles it.
+                let mut frame = crate::agent_pty::UserFrame::new(
+                    bytes,
+                    registry.admit_ingress(&id),
+                    Some(reject_tx.clone()),
                 );
-                // Issue #525: awaited, not written inline — the PTY is written
-                // by the pane writer's own thread, so a pane whose agent has
-                // stopped reading holds this task, never a runtime worker.
-                if w.write_user(&bytes).await.is_err() {
+                // PRD #1666 part 3 (Q35-15, R5 §4.3): a frame a closed fence
+                // has no room for comes back with its place in the fence's
+                // queue. This loop then waits for the fence to change,
+                // without the writer and without reading the socket (the
+                // client's next frames wait in it: backpressure), and runs
+                // every check below again before offering it once more. A
+                // connection that ends while it waits gives its place up
+                // (core §8.2, Q35-15 fix R-U2-01): see the `Full` arm.
+                let mut waiter: Option<crate::agent_pty::FrameWaiter> = None;
+                loop {
+                    // PRD #20 blocker-6: enforce liveness AUTHORITATIVELY here, not
+                    // just in the UI. If the focused session became non-live (a
+                    // wrapped Codex pane that declared `history-only`, or a
+                    // view-only target), REJECT the key / bracketed-paste frame
+                    // rather than forwarding it to the PTY — a UI-only gate can't
+                    // close the race where a pane goes non-live while a stream is
+                    // already open, nor protect an older/stale client. A pane with
+                    // no non-live declaration stays `Live` (the historical default),
+                    // so native PTY panes are unaffected. The connection stays open
+                    // (the client remains attached, seeing output) — only the write
+                    // is dropped.
+                    // PRD #20 R20-008: reject frames to a target that has exited
+                    // (its reader thread saw EOF) even if the registry entry hasn't
+                    // been reaped yet — the cached writer points at a dead PTY.
+                    //
+                    // PRD #20 R20-007 (finding #10): a rejection is no longer a
+                    // silent debug-only drop. Send a TYPED, NON-terminal
+                    // `KIND_STREAM_REJECT` frame (via the output task) so the client
+                    // can surface honest feedback and leave its input mode for BOTH
+                    // key and paste, while the stream stays open.
+                    if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                        tracing::debug!(
+                            target: "pane_write",
+                            agent_id = %id,
+                            pane_id = %pane_id,
+                            payload_len = frame.bytes().len(),
+                            "STREAM_IN rejected — target agent has exited"
+                        );
+                        frame.refuse("exited");
+                        enqueue_reject(&reject_tx, b"exited");
+                        continue 'frames;
+                    }
+                    // Finding #3: resolve by agent identity for a paneless target, by
+                    // pane otherwise. Both default to `Live` when nothing is declared,
+                    // so an ordinary shell is unaffected; a declared non-live target
+                    // (paneless or paned) fails closed.
+                    let pre_lock_writable = {
+                        let guard = state.read().await;
+                        if is_paneless {
+                            guard.agent_writable(&id)
+                        } else {
+                            guard.pane_writable(&pane_id)
+                        }
+                    };
+                    if pre_lock_writable != crate::event::Writable::Live {
+                        tracing::debug!(
+                            target: "pane_write",
+                            agent_id = %id,
+                            pane_id = %pane_id,
+                            payload_len = frame.bytes().len(),
+                            "STREAM_IN rejected — target is not live (history-only / view-only)"
+                        );
+                        frame.refuse("history-only");
+                        enqueue_reject(&reject_tx, b"history-only");
+                        continue 'frames;
+                    }
+                    // PRD #1666 part 3, round 5-wake (Q19): the ticket admitted
+                    // above is the doorbell's record of this frame from before it
+                    // waits for the writer: a ring not yet past its first byte
+                    // ends with nothing written, and one past it is not
+                    // disturbed and lets the frame follow its release.
+                    #[cfg(feature = "e2e")]
+                    if waiter.is_none() {
+                        crate::doorbell::record_for_test(&format!("human-arrived {pane_id}"));
+                    }
+                    let w = writer.lock().await;
+                    // PRD #20 R20-006 (finding #7): RE-VALIDATE under the held writer,
+                    // immediately before writing. A close/respawn (registry removal),
+                    // a liveness transition, or a rebind can land WHILE this frame
+                    // waited for the writer lock — the pre-lock checks above cannot
+                    // see that. Re-check exit, the pane's CURRENT live owner (it must
+                    // still be THIS agent), and writability, holding the writer
+                    // through the completed write, so no bytes reach a target already
+                    // declared stale/removed/non-live. All rejections send the same
+                    // typed frame and keep the stream open.
+                    if exited.load(std::sync::atomic::Ordering::SeqCst) {
+                        drop(w);
+                        frame.refuse("exited");
+                        enqueue_reject(&reject_tx, b"exited");
+                        continue 'frames;
+                    }
+                    // The pane→agent ownership re-check only applies to an agent
+                    // that actually carries a pane id: a daemon-side agent with no
+                    // pane (`<no-pane>`) has no pane→agent mapping to re-resolve, and
+                    // its stream is bound directly to the agent's own writer, so skip
+                    // the check (it would spuriously find no owner and reject).
+                    if !is_paneless {
+                        match registry.pane_current_agent_id(&pane_id) {
+                            Some(current) if current == id => {}
+                            Some(_) => {
+                                drop(w);
+                                frame.refuse("wrong-session");
+                                enqueue_reject(&reject_tx, b"wrong-session");
+                                continue 'frames;
+                            }
+                            None => {
+                                drop(w);
+                                frame.refuse("stale");
+                                enqueue_reject(&reject_tx, b"stale");
+                                continue 'frames;
+                            }
+                        }
+                    }
+                    // Finding #3: re-validate writability under the held writer, by
+                    // agent identity for a paneless target and by pane otherwise.
+                    let post_lock_writable = {
+                        let guard = state.read().await;
+                        if is_paneless {
+                            guard.agent_writable(&id)
+                        } else {
+                            guard.pane_writable(&pane_id)
+                        }
+                    };
+                    if post_lock_writable != crate::event::Writable::Live {
+                        drop(w);
+                        frame.refuse("history-only");
+                        enqueue_reject(&reject_tx, b"history-only");
+                        continue 'frames;
+                    }
+                    // PRD #128 (cherry-picked from PR #122): byte-level trace
+                    // of STREAM_IN frames forwarded to the per-agent PTY
+                    // writer. Useful for confirming that bytes the TUI
+                    // queued arrived as distinct frames and that no other
+                    // path interleaved a write on the same writer mutex
+                    // between them. Gated by `RUST_LOG=trace`. Emitted
+                    // INSIDE the writer mutex so trace order matches actual
+                    // write order. Both `agent_id` and `pane_id` are
+                    // emitted so the M1.4 diff against the daemon-initiated
+                    // trace in `AgentPtyRegistry::write_to_pane_internal`
+                    // can join on either key (`pane_id` is cached once per
+                    // attach above).
+                    tracing::trace!(
+                        target: "pane_write",
+                        source = "stream_in",
+                        agent_id = %id,
+                        pane_id = %pane_id,
+                        payload_len = frame.bytes().len(),
+                        payload = %escape_bytes_for_log(frame.bytes()),
+                        "STREAM_IN forwarded to PTY writer"
+                    );
+                    // Issue #525: awaited, not written inline — the PTY is
+                    // written by the pane writer's own thread, so a pane whose
+                    // agent has stopped reading holds this task, never a
+                    // runtime worker. PRD #1666 part 3 (Q35-15): handed to the
+                    // fence gate, which with no fence writes it and awaits it
+                    // as before, outcome and order included, for a generation
+                    // that is still live. One race ends differently (R-U3-02):
+                    // a generation retired between the checks above and this
+                    // acceptance is refused `exited` (`Accepted::Retired`),
+                    // where before the write was attempted.
+                    match w.accept(frame, waiter.take()).await {
+                        crate::agent_pty::Accepted::Written(Ok(())) => {}
+                        crate::agent_pty::Accepted::Written(Err(_)) => break 'frames,
+                        // Q35-15 (R5 §4.3): held or settled. It is the
+                        // fence's now, ticket and all, and this loop reads
+                        // on, which is what lets a reply on this same
+                        // connection be read while its keys are held.
+                        crate::agent_pty::Accepted::Held => {}
+                        crate::agent_pty::Accepted::Full(back, mut place) => {
+                            drop(w);
+                            // Core §8.2 (Q35-15 fix, R-U2-01): the wait also
+                            // ends when the connection does, whether the
+                            // client closed its end (seen without reading
+                            // the frames still queued behind this one) or
+                            // the output task ended on a broken or wedged
+                            // socket or the agent's end. Then the frame was
+                            // never accepted: dropping it settles its ticket
+                            // `Cancelled`, once, its place leaves the queue
+                            // and passes to the next waiter, and leaving the
+                            // loop releases this viewer.
+                            #[cfg(any(test, feature = "e2e"))]
+                            let peer_closed = attach_e2e.peer_closed(&rd);
+                            #[cfg(not(any(test, feature = "e2e")))]
+                            let peer_closed = crate::platform::ipc::peer_closed(&rd);
+                            let ended = tokio::select! {
+                                biased;
+                                () = peer_closed => true,
+                                _ = &mut output_task => true,
+                                () = place.changed() => false,
+                            };
+                            if ended {
+                                drop((back, place));
+                                break 'frames;
+                            }
+                            frame = back;
+                            waiter = Some(place);
+                            continue;
+                        }
+                        crate::agent_pty::Accepted::Retired(back) => {
+                            drop(w);
+                            back.refuse("exited");
+                            enqueue_reject(&reject_tx, b"exited");
+                            continue 'frames;
+                        }
+                    }
+                    // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
+                    // record it as the pane's human input, keyed by `pane_id_env`.
+                    // That record is what lets the deck refuse to type an answer
+                    // to an agent's question into a pane a human has typed into
+                    // since the question arrived
+                    // (`crate::agent_pty::AgentPtyRegistry::user_typed_since_question`,
+                    // PRD #1631).
+                    //
+                    // Issue #424 H1 (both reviewers): recorded BEFORE the writer is
+                    // released, and the `write_user` above records it too (the pane
+                    // writer observes every non-daemon byte — see
+                    // `crate::agent_pty::PaneWriter`), so whatever takes the writer
+                    // next sees this frame's input. This call keeps the frame-level
+                    // contract, including the zero-byte frame the auditor noted:
+                    // a frame counts as input even when it carries no byte.
+                    //
+                    // Issue #542: stamped THROUGH the held writer, which skips it
+                    // once this agent has been closed — a frame that passed the
+                    // re-validation above and finishes after the close must not
+                    // bring the closed pane's clock back.
+                    w.note_user_input(&pane_id);
+                    drop(w);
                     break;
                 }
-                // PRD #127 M2.2: a STREAM_IN frame is a *user* keystroke —
-                // record it as the pane's human input, keyed by `pane_id_env`.
-                // That record is what lets the deck refuse to type an answer
-                // to an agent's question into a pane a human has typed into
-                // since the question arrived
-                // (`crate::agent_pty::AgentPtyRegistry::user_typed_since_question`,
-                // PRD #1631).
-                //
-                // Issue #424 H1 (both reviewers): recorded BEFORE the writer is
-                // released, and the `write_user` above records it too (the pane
-                // writer observes every non-daemon byte — see
-                // `crate::agent_pty::PaneWriter`), so whatever takes the writer
-                // next sees this frame's input. This call keeps the frame-level
-                // contract, including the zero-byte frame the auditor noted:
-                // a frame counts as input even when it carries no byte.
-                //
-                // Issue #542: stamped THROUGH the held writer, which skips it
-                // once this agent has been closed — a frame that passed the
-                // re-validation above and finishes after the close must not
-                // bring the closed pane's clock back.
-                w.note_user_input(&pane_id);
-                drop(w);
             }
             Ok(Some((KIND_DETACH, _))) => {
                 // Explicit M2.5 detach: client signalled intent to leave the
@@ -8982,6 +10031,13 @@ async fn handle_attach_stream(
     output_task.abort();
     Ok(())
 }
+
+/// PRD #1666 part 3 (Q35-15): the attach loop's forced short and failed
+/// writes, through the private writer seam. Unix only: it attaches over a
+/// Unix socket, as the other attach tests do.
+#[cfg(all(test, unix))]
+#[path = "daemon_protocol_fence_tests.rs"]
+mod fence_tests;
 
 #[cfg(test)]
 mod tests {
@@ -11200,6 +12256,8 @@ mod tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
+            input_discarded: None,
         };
         let json = serde_json::to_string(&rec).unwrap();
         let back: AgentRecord = serde_json::from_str(&json).unwrap();
@@ -11225,6 +12283,8 @@ mod tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
+            input_discarded: None,
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).unwrap()).unwrap();
@@ -11361,6 +12421,8 @@ mod tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             };
             let json = serde_json::to_string(&snap).expect("SessionSnapshot serializes");
             let back: SessionSnapshot =
@@ -11379,6 +12441,8 @@ mod tests {
 
         // (b) An AgentRecord carrying a live snapshot round-trips with live == Some.
         let rec = AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: "9".into(),
             pane_id_env: Some("pane-9".into()),
             display_name: None,
@@ -11406,6 +12470,8 @@ mod tests {
                 pull_request_revision: None,
                 background: None,
                 background_revision: None,
+                answer_settlements: Vec::new(),
+                input_held: None,
             }),
             spawned_at_ms: None,
             cli_name: None,
@@ -11783,6 +12849,8 @@ mod tests {
             orchestrator_context_path: None,
             authoring_kind: None,
             inbox: None,
+            input_held: None,
+            input_discarded: None,
         };
         let value: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&rec).expect("serializes"))
@@ -13034,11 +14102,14 @@ mod tests {
             reason: Some(crate::inbox::UndeliverableReason::AgentExited),
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: false,
             notices: Default::default(),
             provenance: None,
+            termination: None,
         });
         let value = serde_json::to_value(&msg).unwrap();
         assert_eq!(
@@ -16374,6 +17445,426 @@ mod question_answer_tests {
         assert_eq!(broadcast.event_type, EventType::Unknown);
         assert_eq!(broadcast.resolved_question_id(), Some("q-bash"));
         assert!(broadcast.is_daemon_synthetic());
+    }
+
+    // ------------------------------------------------------------------
+    // PRD #1666 part 3 (Q35-17, core §8.4, OQ6): voice answers through a
+    // fence.
+
+    impl Fixture {
+        /// Close the agent's fence, as a probe will (Q35-20).
+        fn fence(&self) {
+            let (gate, _) = self.registry.composer_fence(&self.agent_id).unwrap();
+            assert!(gate.fence(), "the generation is live");
+        }
+
+        /// Open the fence and submit what it held.
+        async fn release(&self) {
+            let (_, writer) = self.registry.composer_fence(&self.agent_id).unwrap();
+            writer.lock().await.release_fence(Ok(()));
+        }
+
+        /// Wait until the fence holds `n` ops.
+        async fn until_held(&self, n: usize) {
+            let (gate, _) = self.registry.composer_fence(&self.agent_id).unwrap();
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while gate.status().held_ops != n {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the fence holds {} ops, not {n}",
+                    gate.status().held_ops
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        }
+
+        /// Answer `question_id` at its pending revision, naming
+        /// `client_token`, on a task of its own.
+        fn tokened_task(
+            &self,
+            question_id: &'static str,
+            answers: Vec<QuestionAnswer>,
+            client_token: Option<u64>,
+        ) -> tokio::task::JoinHandle<Result<(), AnswerRefusal>> {
+            let registry = self.registry.clone();
+            let state = self.state.clone();
+            let event_tx = self.event_tx.clone();
+            let agent_id = self.agent_id.clone();
+            tokio::spawn(async move {
+                let revision = state
+                    .read()
+                    .await
+                    .pending_question_for(&agent_id, Some(PANE))
+                    .and_then(|(_, q)| q.revision);
+                answer_question_tokened_at(
+                    &registry,
+                    &state,
+                    &event_tx,
+                    &agent_id,
+                    question_id,
+                    revision,
+                    &answers,
+                    false,
+                    client_token,
+                )
+                .await
+            })
+        }
+
+        /// The agent's settlements as its snapshot reports them.
+        async fn settlements(&self) -> Vec<crate::question::AnswerSettlement> {
+            self.state
+                .read()
+                .await
+                .live_session_for(&self.agent_id, Some(PANE))
+                .map(|live| live.answer_settlements)
+                .unwrap_or_default()
+        }
+
+        fn reserved(&self) -> bool {
+            self.registry
+                .question_answers()
+                .answer_reserved(PANE, &self.agent_id)
+        }
+
+        /// A tool starting: a status hook that leaves the question pending.
+        fn tool_start(&self) -> AgentEvent {
+            let mut event = self.event(EventType::ToolStart);
+            event.tool_name = Some("Bash".into());
+            event
+        }
+    }
+
+    fn settled(
+        question_id: &str,
+        revision: Option<u64>,
+        client_token: u64,
+        outcome: crate::question::SettlementOutcome,
+    ) -> crate::question::AnswerSettlement {
+        crate::question::AnswerSettlement {
+            question_id: question_id.into(),
+            revision: revision.expect("a stamped question"),
+            client_token,
+            outcome,
+        }
+    }
+
+    /// Scenario: The deck is checking a Codex agent's input box, so it holds
+    /// what is typed there, when a voice answer arrives: the answer is
+    /// queued, and the question shows it, also after the agent repeats the
+    /// question. The agent then moves on, clearing the question, which the
+    /// deck takes in at once rather than after the answer. When the deck stops
+    /// holding, the answer's digit is not typed; the answer is refused as
+    /// stale and its settlement says superseded.
+    #[spec("question/answer/019")]
+    #[tokio::test]
+    async fn question_answer_019_a_question_cleared_while_its_answer_is_held_ends_superseded() {
+        use crate::question::SettlementOutcome;
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_fenced", "Which colour?"))
+            .await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_fenced", vec![one(0, 2)], Some(19));
+        fx.until_held(1).await;
+        assert!(
+            fx.pending_question().await.unwrap().answer_queued,
+            "the held answer shows as queued"
+        );
+        // The agent repeating its question keeps it, and its queued mark.
+        fx.ask_ingested(&codex_single("call_fenced", "Which colour?"))
+            .await;
+        let repeated = fx.pending_question().await.unwrap();
+        assert_eq!(repeated.revision, revision, "a repeat isn't a new question");
+        assert!(repeated.answer_queued, "a repeat keeps the queued mark");
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.ingest_task(fx.event(EventType::Idle)),
+        )
+        .await
+        .expect("the clearing event isn't held behind the answer")
+        .unwrap();
+        assert_eq!(fx.pending_question().await, None);
+        fx.release().await;
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+        assert!(
+            !fx.screen_shows_within("2", Duration::from_millis(500))
+                .await,
+            "nothing was typed into the moved-on agent"
+        );
+        assert_eq!(
+            fx.settlements().await,
+            [settled(
+                "call_fenced",
+                revision,
+                19,
+                SettlementOutcome::Superseded
+            )]
+        );
+        assert!(!fx.reserved());
+    }
+
+    /// Scenario: While the deck holds a Codex agent's input and a voice
+    /// answer is queued behind it, the agent reports a tool starting, which
+    /// the card takes in at once; a second answer to the same agent is
+    /// refused at once as already being sent. The first answer's sender then
+    /// stops waiting, and a third answer is still refused, because the queued
+    /// answer still holds its place; once the deck stops holding, its digit
+    /// is typed once and the agent can be answered again.
+    #[spec("question/answer/020")]
+    #[tokio::test]
+    async fn question_answer_020_hooks_flow_and_a_repeat_is_refused_while_an_answer_is_held() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_held", "Which colour?"))
+            .await;
+        fx.fence();
+        let answering = fx.tokened_task("call_held", vec![one(0, 2)], None);
+        fx.until_held(1).await;
+        tokio::time::timeout(Duration::from_secs(2), fx.ingest_task(fx.tool_start()))
+            .await
+            .expect("a status hook isn't held behind the answer")
+            .unwrap();
+        let live = fx
+            .state
+            .read()
+            .await
+            .live_session_for(&fx.agent_id, Some(PANE))
+            .unwrap();
+        assert_eq!(
+            live.active_tool.map(|tool| tool.name).as_deref(),
+            Some("Bash"),
+            "the hook reached the card"
+        );
+        assert_eq!(fx.pending().await.as_deref(), Some("call_held"));
+        let repeat = tokio::time::timeout(
+            Duration::from_secs(2),
+            fx.answer("call_held", &[(0, &[1], None)], false),
+        )
+        .await
+        .expect("the repeat is refused at once, not queued behind the held answer");
+        assert_eq!(repeat, Err(AnswerRefusal::AnswerInProgress));
+        // The handler stops waiting: its slot goes, the key's reservation
+        // stays until the key's job ends.
+        answering.abort();
+        let _ = answering.await;
+        assert!(fx.reserved(), "the held key keeps the agent reserved");
+        assert_eq!(
+            fx.answer("call_held", &[(0, &[1], None)], false).await,
+            Err(AnswerRefusal::AnswerInProgress)
+        );
+        fx.release().await;
+        assert!(fx.screen_shows("2").await, "the held key was typed");
+        assert!(
+            !fx.screen_shows_within("1", Duration::from_millis(300))
+                .await,
+            "the refused answers typed nothing"
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while fx.reserved() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the reservation outlived the key's job"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        fx.ask_ingested(&codex_single("call_next", "Which shade?"))
+            .await;
+        assert_eq!(
+            fx.answer("call_next", &[(0, &[1], None)], false).await,
+            Ok(())
+        );
+        assert!(fx.screen_shows("21").await);
+    }
+
+    /// Scenario: Three voice answers wait behind the deck's check of a Codex
+    /// agent's input. The first is written when the check ends, and its
+    /// settlement says written, under its own token; while it waited, every
+    /// look at the agent showed it queued or showed its settlement, never
+    /// neither. The second answers a two-question form in a pane the person
+    /// typed in earlier, and both its keys are typed. The third's agent is
+    /// closed while it waits: nothing is
+    /// typed, the reservation clears, and its settlement says retired. A
+    /// late end of an earlier answer's place never frees a newer one's, and
+    /// the agent's list keeps its 8 newest settlements for 120 seconds.
+    #[spec("question/answer/021")]
+    #[tokio::test]
+    async fn question_answer_021_settlements_name_their_token_and_retirement_clears() {
+        use crate::question::{AnswerSettlement, SettlementOutcome};
+        // Written, watched throughout.
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_one", "Which colour?"))
+            .await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_one", vec![one(0, 2)], Some(5));
+        let watcher = {
+            let (state, agent_id) = (fx.state.clone(), fx.agent_id.clone());
+            tokio::spawn(async move {
+                let mut seen_queued = false;
+                loop {
+                    let live = state
+                        .read()
+                        .await
+                        .live_session_for(&agent_id, Some(PANE))
+                        .unwrap();
+                    let queued = live
+                        .pending_question
+                        .as_ref()
+                        .is_some_and(|q| q.answer_queued);
+                    let settled = live.answer_settlements.iter().any(|s| s.client_token == 5);
+                    seen_queued |= queued;
+                    assert!(
+                        !seen_queued || queued || settled,
+                        "a snapshot showed the queued flag gone without the outcome"
+                    );
+                    if settled {
+                        return seen_queued;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+        };
+        fx.until_held(1).await;
+        fx.release().await;
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(watcher.await.unwrap(), "the watcher saw the answer queued");
+        assert!(fx.screen_shows("2").await);
+        assert_eq!(
+            fx.settlements().await,
+            [settled("call_one", revision, 5, SettlementOutcome::Written)]
+        );
+
+        // A two-key answer held after the person typed in the pane: its next
+        // key is checked against the first key's acceptance, so both are
+        // typed.
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.registry.note_user_input(PANE);
+        fx.ask_ingested(&codex_form("call_form")).await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_form", vec![one(0, 2), one(1, 1)], Some(7));
+        fx.until_held(1).await;
+        fx.release().await;
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(fx.screen_shows("21").await, "both keys were typed");
+        assert_eq!(
+            fx.settlements().await,
+            [settled(
+                "call_form",
+                revision,
+                7,
+                SettlementOutcome::Written
+            )]
+        );
+
+        // Retired: the agent closes while its answer is held.
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_two", "Which colour?"))
+            .await;
+        let revision = fx.pending_question().await.unwrap().revision;
+        fx.fence();
+        let answering = fx.tokened_task("call_two", vec![one(0, 2)], Some(6));
+        fx.until_held(1).await;
+        assert!(fx.reserved());
+        fx.registry.close_agent(&fx.agent_id).unwrap();
+        assert!(
+            answering.await.unwrap().is_err(),
+            "a retired answer isn't reported written"
+        );
+        assert!(!fx.reserved(), "retirement cleared the reservation");
+        assert_eq!(
+            fx.settlements().await,
+            [settled("call_two", revision, 6, SettlementOutcome::Retired)]
+        );
+        assert!(!fx.pending_question().await.unwrap().answer_queued);
+
+        // A late end clears only its own reservation.
+        let answers = fx.registry.question_answers();
+        let older = answers.reserve(PANE, "g", "q", Some(1));
+        let newer = answers.reserve(PANE, "g", "q", Some(1));
+        drop(older);
+        assert!(answers.answer_reserved(PANE, "g"), "the newer one stays");
+        assert!(!answers.answer_reserved(PANE, "other-generation"));
+        drop(newer);
+        assert!(!answers.answer_reserved(PANE, "g"));
+
+        // Bounds: 8 per generation, newest first, for 120 seconds.
+        let mut state = crate::state::AppState::default();
+        let now = std::time::Instant::now();
+        let entry = |token| AnswerSettlement {
+            question_id: "q".into(),
+            revision: 1,
+            client_token: token,
+            outcome: SettlementOutcome::Written,
+        };
+        for token in 0..10 {
+            state.push_answer_settlement("g", entry(token), now);
+        }
+        let tokens = |kept: Vec<AnswerSettlement>| {
+            kept.into_iter().map(|s| s.client_token).collect::<Vec<_>>()
+        };
+        let newest: Vec<u64> = (2..10).rev().collect();
+        assert_eq!(tokens(state.answer_settlements_at("g", now)), newest);
+        assert!(state.answer_settlements_at("other", now).is_empty());
+        let retention = crate::question::ANSWER_SETTLEMENT_RETENTION;
+        assert_eq!(
+            tokens(state.answer_settlements_at("g", now + retention - Duration::from_secs(1))),
+            newest
+        );
+        assert!(state.answer_settlements_at("g", now + retention).is_empty());
+        state.push_answer_settlement("h", entry(42), now + retention);
+        assert_eq!(
+            tokens(state.answer_settlements_at("h", now + retention)),
+            [42]
+        );
+    }
+
+    /// Scenario: With no check holding a Codex agent's input, a voice answer
+    /// that names a client token is typed and reported as before; the
+    /// question never shows as queued, no settlement is recorded and nothing
+    /// stays reserved. An answer whose question changes while its key waits
+    /// for the terminal is refused as stale, as before, also with no
+    /// settlement.
+    #[spec("question/answer/022")]
+    #[tokio::test]
+    async fn question_answer_022_with_no_fence_an_answer_settles_as_before() {
+        let fx = Fixture::start(AgentType::Codex).await;
+        fx.ask_ingested(&codex_single("call_open", "Which colour?"))
+            .await;
+        let answering = fx.tokened_task("call_open", vec![one(0, 2)], Some(22));
+        assert_eq!(answering.await.unwrap(), Ok(()));
+        assert!(fx.screen_shows("2").await);
+        assert_eq!(fx.pending().await, None);
+        assert!(fx.settlements().await.is_empty());
+        assert!(!fx.reserved());
+
+        fx.ask_ingested(&codex_single("call_moved", "Which shade?"))
+            .await;
+        let (reached, resume) = fx
+            .registry
+            .question_answers()
+            .arm_barrier(crate::agent_pty::ANSWER_KEY_ON_PTY_THREAD);
+        let answering = fx.tokened_task("call_moved", vec![one(0, 1)], Some(23));
+        reached.await.expect("the key reached the PTY thread");
+        assert!(
+            !fx.pending_question().await.unwrap().answer_queued,
+            "an unheld answer never shows as queued"
+        );
+        fx.ingest_task(fx.event(EventType::Idle)).await.unwrap();
+        resume.send(()).unwrap();
+        assert_eq!(
+            answering.await.unwrap(),
+            Err(AnswerRefusal::Stale { current_id: None })
+        );
+        assert!(
+            !fx.screen_shows_within("21", Duration::from_millis(300))
+                .await
+        );
+        assert!(fx.settlements().await.is_empty());
+        assert!(!fx.reserved());
     }
 }
 

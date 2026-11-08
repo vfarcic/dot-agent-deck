@@ -1,0 +1,611 @@
+//! PRD #1666 part 3, round 5-wake (plan §1.3, §3.4′, §4.4, §4.6): one
+//! generation's doorbell state, and what the doorbell's admission reads from
+//! it.
+//!
+//! A generation (an agent id) owns its [`LatchCell`], its checked attempt
+//! numbers and its attempt ring for as long as it lives. The hook arm moves
+//! the cell on receipt of exact ring evidence ([`GenerationDoorbell::evidence`]),
+//! the user's own submit or clear lifts a suspension
+//! ([`GenerationDoorbell::user_cleared`]), and retirement makes the cell
+//! absorbing. A successor in the same pane is a new generation with its own.
+//!
+//! The admission's other inputs that belong to the generation are here too:
+//! the input-mode evidence of an unwrapped pane, read from the deck's own PTY
+//! master; the first-ring settle anchor; and the activation verdict for the
+//! generation's effective agent type and latched release, against the
+//! recorded measurements.
+
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use crate::doorbell_activation::{Activation, AgentFacts, LatchedRelease, NoGo, activation};
+use crate::doorbell_switch::DoorbellSwitch;
+use crate::doorbell_txn::{AttemptCounter, AttemptRing, Latch, LatchCell, RingToken};
+use crate::event::AgentType;
+
+/// The verdict for a generation of `agent` whose header latched `latch`
+/// (plan §4.6), under the generation's doorbell `switch`: with no effective
+/// agent type yet there is no profile to type under (`unknown_agent`); an
+/// agent the user turned the doorbell off for is `turned_off` whatever its
+/// screen shows; otherwise the activation table over the agents' facts.
+pub fn generation_activation<'a>(
+    facts: &[AgentFacts<'a>],
+    agent: Option<&AgentType>,
+    latch: &LatchedRelease,
+    switch: &DoorbellSwitch,
+) -> Activation<'a> {
+    let Some(agent) = agent.filter(|a| **a != AgentType::None) else {
+        return Activation::NoGo(NoGo::UnknownAgent);
+    };
+    if !switch.allows(agent) {
+        return Activation::NoGo(NoGo::TurnedOff);
+    }
+    activation(facts, agent, latch)
+}
+
+/// The clause a verdict holds a generation with, `None` for `Go`.
+pub fn refused_clause(verdict: &Activation<'_>) -> Option<&'static str> {
+    match verdict {
+        Activation::NoGo(no_go) => Some(no_go.clause()),
+        Activation::Go { .. } => None,
+    }
+}
+
+/// One generation's doorbell state. See the module documentation.
+pub struct GenerationDoorbell {
+    cell: LatchCell,
+    counter: AttemptCounter,
+    ring: AttemptRing,
+    /// The pane's child is the deck's wrapper, which reports the agent's
+    /// input mode itself: the master's own termios say nothing about it.
+    wrapped: bool,
+    /// A duplicate of the pane's PTY master, for an unwrapped pane's
+    /// input-mode reads (plan §1.3): the deck's PTY slave is the agent's
+    /// terminal, so the master's line discipline is the agent's.
+    #[cfg(unix)]
+    master: Option<std::os::fd::OwnedFd>,
+    /// An unwrapped generation's settle anchor: when its first Clean frame
+    /// showed the empty ready composer, `CLOCK_MONOTONIC` nanoseconds. Set
+    /// once.
+    unwrapped_anchor: OnceLock<u64>,
+    /// A first attempt was admitted: later rings do not wait for the settle
+    /// window (plan §4.4).
+    first_admitted: AtomicBool,
+    /// The e2e build's stand-in editor's executable and the stand-in profile
+    /// selected for this generation, when one was.
+    #[cfg(feature = "e2e")]
+    standin: Option<(
+        std::path::PathBuf,
+        &'static crate::doorbell_screen::ScreenProfile,
+    )>,
+    /// What to do when a move outside a transaction (the hook arm's
+    /// evidence, the user's own clear) changed the cell: the registry asks
+    /// for the generation's re-projection.
+    on_moved: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    /// The per-agent doorbell switch as the daemon read it when it started
+    /// this generation ([`crate::doorbell_switch::at_spawn`]).
+    switch: DoorbellSwitch,
+}
+
+impl std::fmt::Debug for GenerationDoorbell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GenerationDoorbell")
+            .field("cell", &self.cell.load())
+            .field("wrapped", &self.wrapped)
+            .field("unwrapped_anchor", &self.unwrapped_anchor.get())
+            .finish()
+    }
+}
+
+impl GenerationDoorbell {
+    /// A generation's state at spawn. `master` is the raw descriptor of the
+    /// pane's PTY master, duplicated here so a read never races the master's
+    /// close.
+    pub fn new(wrapped: bool, #[cfg(unix)] master: Option<std::os::fd::RawFd>) -> Self {
+        Self {
+            cell: LatchCell::default(),
+            counter: AttemptCounter::default(),
+            ring: AttemptRing::default(),
+            wrapped,
+            #[cfg(unix)]
+            master: master.and_then(duplicate),
+            unwrapped_anchor: OnceLock::new(),
+            first_admitted: AtomicBool::new(false),
+            #[cfg(feature = "e2e")]
+            standin: None,
+            on_moved: OnceLock::new(),
+            switch: DoorbellSwitch::default(),
+        }
+    }
+
+    /// This generation with the doorbell switch the daemon read at its spawn.
+    pub fn with_switch(mut self, switch: DoorbellSwitch) -> Self {
+        self.switch = switch;
+        self
+    }
+
+    /// The doorbell switch this generation was started under.
+    pub fn switch(&self) -> &DoorbellSwitch {
+        &self.switch
+    }
+
+    /// Call `moved` whenever the hook arm's evidence or the user's own clear
+    /// moves the cell. Set once.
+    pub fn on_moved(&self, moved: impl Fn() + Send + Sync + 'static) {
+        let _ = self.on_moved.set(Box::new(moved));
+    }
+
+    fn moved(&self) {
+        if let Some(moved) = self.on_moved.get() {
+            moved();
+        }
+    }
+
+    /// An e2e build's stand-in profile was selected for this generation,
+    /// for its executable.
+    #[cfg(feature = "e2e")]
+    pub fn with_standin(
+        self,
+        standin: Option<(
+            std::path::PathBuf,
+            &'static crate::doorbell_screen::ScreenProfile,
+        )>,
+    ) -> Self {
+        Self { standin, ..self }
+    }
+
+    /// The stand-in's executable, when a stand-in profile was selected.
+    #[cfg(feature = "e2e")]
+    pub fn standin(&self) -> Option<&std::path::Path> {
+        self.standin.as_ref().map(|(binary, _)| binary.as_path())
+    }
+
+    /// The stand-in profile selected, when one was.
+    #[cfg(feature = "e2e")]
+    pub fn standin_profile(&self) -> Option<&'static crate::doorbell_screen::ScreenProfile> {
+        self.standin.as_ref().map(|(_, profile)| *profile)
+    }
+
+    /// A generation whose attempt numbers start at `next` (tests reach the
+    /// reserved number).
+    #[cfg(test)]
+    pub fn starting_at(next: u32) -> Self {
+        Self {
+            counter: AttemptCounter::starting_at(next),
+            ..Self::new(
+                false,
+                #[cfg(unix)]
+                None,
+            )
+        }
+    }
+
+    pub fn cell(&self) -> &LatchCell {
+        &self.cell
+    }
+
+    pub fn counter(&self) -> &AttemptCounter {
+        &self.counter
+    }
+
+    pub fn ring(&self) -> &AttemptRing {
+        &self.ring
+    }
+
+    pub fn wrapped(&self) -> bool {
+        self.wrapped
+    }
+
+    /// Exact hook evidence for `token`, applied to the cell on receipt
+    /// (plan §3.4′): the ring maps the token to its attempt and the cell's
+    /// exact-attempt guard decides. `Some` with the cell's state when it
+    /// moved.
+    pub fn evidence(&self, token: &str, exact: bool) -> Option<Latch> {
+        let token = RingToken::parse(token)?;
+        let moved = crate::doorbell_txn::hook_evidence(&self.cell, &self.ring, token, exact)?;
+        self.moved();
+        Some(moved)
+    }
+
+    /// The user's own submit or clear, read from their bytes: a suspended
+    /// attempt is resolved as the user's. `Some` with the cell's state when
+    /// it moved.
+    pub fn user_cleared(&self) -> Option<Latch> {
+        self.cell.user_cleared().ok()?;
+        self.moved();
+        Some(self.cell.load())
+    }
+
+    /// The generation retired: its cell refuses every later move.
+    pub fn retire(&self) {
+        self.cell.retire();
+    }
+
+    /// Whether the doorbell is suspended for the generation (plan §3.4′).
+    pub fn suspended(&self) -> bool {
+        self.cell.load().suspended()
+    }
+
+    /// An unwrapped pane's input-mode evidence (plan §1.3): both `ICANON` and
+    /// `ECHO` clear on the deck's own PTY master, read now. A wrapped pane's
+    /// evidence comes from its wrapper's reports instead.
+    pub fn unwrapped_mode(&self) -> Result<(), &'static str> {
+        if self.wrapped {
+            return Err(crate::input_mode::ModeClause::Unverified.as_str());
+        }
+        #[cfg(unix)]
+        {
+            let Some(master) = &self.master else {
+                return Err(crate::input_mode::ModeClause::Unverified.as_str());
+            };
+            use std::os::fd::AsRawFd;
+            // SAFETY: zeroed `termios` is a valid out-parameter, and the
+            // descriptor is owned by this generation for the call.
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(master.as_raw_fd(), &mut termios) } != 0 {
+                return Err(crate::input_mode::ModeClause::Unverified.as_str());
+            }
+            if termios.c_lflag & (libc::ICANON | libc::ECHO) != 0 {
+                Err(crate::input_mode::ModeClause::Cooked.as_str())
+            } else {
+                Ok(())
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Err(crate::input_mode::ModeClause::Unverified.as_str())
+        }
+    }
+
+    /// PRD #1666 part 3 (Q160b, revact29 finding 1): whether the pane's
+    /// terminal is canonical (`ICANON` set) now, read from the deck's own
+    /// PTY master. A pty has one termios, so the master reads what the
+    /// slave's last `tcsetattr` set: Claude Code's cooked mode while it runs
+    /// an editor, or the raw mode a terminal editor it ran took
+    /// (`master_canonical_reads_the_slaves_termios` checks it on a real
+    /// pty). `None` for a wrapped pane, whose master is the wrapper's, with
+    /// no master, or when the read fails.
+    #[cfg(target_os = "linux")]
+    pub fn canonical(&self) -> Option<bool> {
+        use std::os::fd::AsRawFd;
+        if self.wrapped {
+            return None;
+        }
+        master_canonical(self.master.as_ref()?.as_raw_fd())
+    }
+
+    /// An unwrapped generation's first Clean frame showing the empty ready
+    /// composer, at `now_ns`: the settle anchor, set once.
+    pub fn note_ready_frame(&self, now_ns: u64) {
+        let _ = self.unwrapped_anchor.set(now_ns);
+    }
+
+    /// The settle anchor (plan §4.4): a wrapped generation's is its first
+    /// accepted both-clear sample's after-read stamp (`store_anchor`); an
+    /// unwrapped one's, its first Clean empty-composer frame.
+    pub fn settle_anchor(&self, store_anchor: Option<u64>) -> Option<u64> {
+        if self.wrapped {
+            store_anchor
+        } else {
+            store_anchor.or_else(|| self.unwrapped_anchor.get().copied())
+        }
+    }
+
+    /// Whether the first ring still waits for the settle window to end at
+    /// `now_ns`: before the anchor, or inside `settle` after it. Later rings
+    /// do not wait.
+    pub fn settling(
+        &self,
+        store_anchor: Option<u64>,
+        settle: std::time::Duration,
+        now_ns: u64,
+    ) -> bool {
+        if self.first_admitted.load(Ordering::Acquire) || settle.is_zero() {
+            return false;
+        }
+        match self.settle_anchor(store_anchor) {
+            None => true,
+            Some(anchor) => {
+                let end =
+                    anchor.saturating_add(u64::try_from(settle.as_nanos()).unwrap_or(u64::MAX));
+                now_ns < end
+            }
+        }
+    }
+
+    /// An attempt was admitted.
+    pub fn admitted(&self) {
+        self.first_admitted.store(true, Ordering::Release);
+    }
+}
+
+/// Whether the terminal behind PTY descriptor `fd` is canonical: its
+/// termios has `ICANON` set. `None` when the read fails.
+#[cfg(target_os = "linux")]
+fn master_canonical(fd: std::os::fd::RawFd) -> Option<bool> {
+    // SAFETY: zeroed `termios` is a valid out-parameter, and the caller
+    // holds the descriptor open for the call.
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(fd, &mut termios) } != 0 {
+        return None;
+    }
+    Some(termios.c_lflag & libc::ICANON != 0)
+}
+
+#[cfg(unix)]
+fn duplicate(fd: std::os::fd::RawFd) -> Option<std::os::fd::OwnedFd> {
+    use std::os::fd::BorrowedFd;
+    // SAFETY: the descriptor is the pane's PTY master, open for the duration
+    // of this call (the caller holds the master); the duplicate is owned here.
+    let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
+    borrowed.try_clone_to_owned().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::doorbell_txn::{Cause, Resolution};
+    use semver::Version;
+
+    #[test]
+    fn evidence_on_receipt_resolves_the_open_attempt_by_its_token() {
+        let generation = GenerationDoorbell::starting_at(1);
+        let token = RingToken::parse("abcdfg").unwrap();
+        let attempt = generation.counter().allocate().unwrap();
+        generation.ring().record(attempt, token);
+        generation.cell().open(attempt).unwrap();
+        assert_eq!(generation.evidence("abcdfg", false), None, "not exact");
+        assert_eq!(generation.evidence("zzzzzz", true), None, "another token");
+        assert_eq!(generation.evidence("ABCDFG", true), None, "not a token");
+        assert_eq!(
+            generation.evidence("abcdfg", true),
+            Some(Latch::Resolved(attempt, Resolution::Submitted))
+        );
+    }
+
+    #[test]
+    fn a_users_clear_lifts_only_a_suspension() {
+        let generation = GenerationDoorbell::starting_at(1);
+        assert_eq!(generation.user_cleared(), None, "nothing suspended");
+        let attempt = generation.counter().allocate().unwrap();
+        generation.cell().open(attempt).unwrap();
+        generation
+            .cell()
+            .suspend(attempt, Cause::NoSubmitEvidence)
+            .unwrap();
+        assert!(generation.suspended());
+        assert_eq!(
+            generation.user_cleared(),
+            Some(Latch::Resolved(attempt, Resolution::User))
+        );
+        assert!(!generation.suspended());
+        generation.retire();
+        assert_eq!(generation.cell().load(), Latch::Retired);
+        assert_eq!(generation.user_cleared(), None);
+    }
+
+    #[test]
+    fn the_first_ring_waits_out_the_window_and_later_ones_do_not() {
+        let generation = GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        );
+        let settle = std::time::Duration::from_secs(10);
+        assert!(generation.settling(None, settle, 5), "no anchor yet");
+        generation.note_ready_frame(1_000);
+        generation.note_ready_frame(9_000_000_000);
+        assert_eq!(generation.settle_anchor(None), Some(1_000), "set once");
+        assert!(generation.settling(None, settle, 1_000 + 9_999_999_999));
+        assert!(!generation.settling(None, settle, 1_000 + 10_000_000_000));
+        let wrapped = GenerationDoorbell::new(
+            true,
+            #[cfg(unix)]
+            None,
+        );
+        wrapped.note_ready_frame(1_000);
+        assert_eq!(
+            wrapped.settle_anchor(None),
+            None,
+            "a wrapper's report anchors it"
+        );
+        assert!(wrapped.settling(Some(5), settle, 6));
+        wrapped.admitted();
+        assert!(
+            !wrapped.settling(None, settle, 6),
+            "a later ring does not wait"
+        );
+    }
+
+    #[test]
+    fn a_wrapped_panes_master_is_no_evidence_and_no_master_is_unverified() {
+        let wrapped = GenerationDoorbell::new(
+            true,
+            #[cfg(unix)]
+            None,
+        );
+        assert_eq!(wrapped.unwrapped_mode(), Err("input_mode_unverified"));
+        let unwrapped = GenerationDoorbell::new(
+            false,
+            #[cfg(unix)]
+            None,
+        );
+        assert_eq!(unwrapped.unwrapped_mode(), Err("input_mode_unverified"));
+    }
+
+    /// Q160b: the release driver reads Claude's terminal mode from the
+    /// deck's PTY master, so this pins, on a real pty, that the master's
+    /// `tcgetattr` reads what the slave's `tcsetattr` set, raw and cooked,
+    /// through the generation's duplicate of the master; a wrapped pane's
+    /// master and a missing one read nothing.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn master_canonical_reads_the_slaves_termios() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let (mut master, mut slave) = (-1, -1);
+        // SAFETY: out-parameters for two descriptors, no name, termios or
+        // window size asked for.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        };
+        assert_eq!(opened, 0, "openpty");
+        // SAFETY: both descriptors were just opened and are owned here.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        let set_canonical = |on: bool| {
+            // SAFETY: as in `master_canonical`, on the slave held above.
+            let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+            assert_eq!(
+                unsafe { libc::tcgetattr(slave.as_raw_fd(), &mut termios) },
+                0
+            );
+            if on {
+                termios.c_lflag |= libc::ICANON;
+            } else {
+                termios.c_lflag &= !libc::ICANON;
+            }
+            assert_eq!(
+                unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &termios) },
+                0
+            );
+        };
+        let generation = GenerationDoorbell::new(false, Some(master.as_raw_fd()));
+        let wrapped = GenerationDoorbell::new(true, Some(master.as_raw_fd()));
+        drop(master);
+        set_canonical(true);
+        assert_eq!(generation.canonical(), Some(true), "a cooked slave");
+        set_canonical(false);
+        assert_eq!(generation.canonical(), Some(false), "a raw slave");
+        set_canonical(true);
+        assert_eq!(generation.canonical(), Some(true), "cooked again");
+        assert_eq!(wrapped.canonical(), None, "a wrapper's master");
+        assert_eq!(
+            GenerationDoorbell::new(false, None).canonical(),
+            None,
+            "no master"
+        );
+    }
+
+    #[test]
+    fn a_generation_with_no_agent_type_has_no_profile_to_type_under() {
+        let facts = &crate::doorbell_activation::AGENT_FACTS;
+        let on = DoorbellSwitch::default();
+        let latch = LatchedRelease::Known(Version::new(2, 1, 310));
+        assert_eq!(
+            refused_clause(&generation_activation(facts, None, &latch, &on)),
+            Some("unknown_agent")
+        );
+        assert_eq!(
+            refused_clause(&generation_activation(
+                facts,
+                Some(&AgentType::None),
+                &latch,
+                &on
+            )),
+            Some("unknown_agent")
+        );
+        assert_eq!(
+            refused_clause(&generation_activation(
+                facts,
+                Some(&AgentType::ClaudeCode),
+                &latch,
+                &on
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn an_agent_type_with_no_facts_is_not_supported_whatever_its_latch() {
+        let facts = &crate::doorbell_activation::AGENT_FACTS;
+        let on = DoorbellSwitch::default();
+        for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
+            for latch in [
+                LatchedRelease::Unseen,
+                LatchedRelease::Known(Version::new(1, 0, 0)),
+            ] {
+                assert_eq!(
+                    refused_clause(&generation_activation(facts, Some(&agent), &latch, &on)),
+                    Some("agent_not_supported"),
+                    "{agent:?} {latch:?}"
+                );
+            }
+        }
+        // An agent type with facts still reads an unseen header as such.
+        assert_eq!(
+            refused_clause(&generation_activation(
+                facts,
+                Some(&AgentType::ClaudeCode),
+                &LatchedRelease::Unseen,
+                &on
+            )),
+            Some("unknown_release")
+        );
+    }
+
+    /// Scenario: Ask a generation's verdict for Claude Code and Codex at a latched release no one measured, with the doorbell switch on, with each agent's switch off, and with both off. On, both are Go; an agent's switch off makes that agent `turned_off` whatever its latch, an unseen header included, and leaves the other agent's verdict alone; agents without a switch keep their own verdicts.
+    #[spec::spec("inbox/doorbell/059")]
+    #[test]
+    fn doorbell_059_a_switched_off_agent_is_turned_off_whatever_its_latch() {
+        let facts = &crate::doorbell_activation::AGENT_FACTS;
+        let unmeasured = |agent: &AgentType| match agent {
+            AgentType::Codex => Version::new(0, 199, 3),
+            _ => Version::new(2, 9, 1),
+        };
+        for (switch, off) in [
+            (DoorbellSwitch::default(), vec![]),
+            (
+                DoorbellSwitch {
+                    claude: false,
+                    codex: true,
+                },
+                vec![AgentType::ClaudeCode],
+            ),
+            (
+                DoorbellSwitch {
+                    claude: true,
+                    codex: false,
+                },
+                vec![AgentType::Codex],
+            ),
+            (
+                DoorbellSwitch {
+                    claude: false,
+                    codex: false,
+                },
+                vec![AgentType::ClaudeCode, AgentType::Codex],
+            ),
+        ] {
+            for agent in [AgentType::ClaudeCode, AgentType::Codex] {
+                let known = LatchedRelease::Known(unmeasured(&agent));
+                let verdict = generation_activation(facts, Some(&agent), &known, &switch);
+                let unseen =
+                    generation_activation(facts, Some(&agent), &LatchedRelease::Unseen, &switch);
+                if off.contains(&agent) {
+                    assert_eq!(refused_clause(&verdict), Some("turned_off"), "{agent:?}");
+                    assert_eq!(refused_clause(&unseen), Some("turned_off"), "{agent:?}");
+                } else {
+                    assert_eq!(refused_clause(&verdict), None, "{agent:?} {switch:?}");
+                    assert_eq!(refused_clause(&unseen), Some("unknown_release"));
+                }
+            }
+            for agent in [AgentType::OpenCode, AgentType::Pi, AgentType::Devin] {
+                assert_eq!(
+                    refused_clause(&generation_activation(
+                        facts,
+                        Some(&agent),
+                        &LatchedRelease::Known(Version::new(1, 0, 0)),
+                        &switch
+                    )),
+                    Some("agent_not_supported")
+                );
+            }
+        }
+    }
+}

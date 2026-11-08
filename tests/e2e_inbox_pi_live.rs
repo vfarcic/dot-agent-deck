@@ -268,6 +268,33 @@ fn pi_019_live_killed_watcher_retains_handed_followup_until_commit() {
     );
 }
 
+/// Scenario: Start real Pi with its watcher's registration reply held back, and delegate a sentinel task to it while it is Idle. The deck types into no Pi release: its log says so when the agent starts, no doorbell is attempted or typed while the task waits, and the task then reaches Pi through its own extension, which acts on it once.
+#[spec("inbox/pi/020")]
+#[test]
+fn pi_020_live_the_deck_types_nothing_into_pi() {
+    skip_unless!(live::available());
+    let pi = Pi::with_options(Options {
+        register_delay_ms: 4000,
+        ..Options::default()
+    });
+    assert!(
+        common::wait_until(BUDGET, || pi.log().lines().any(|line| line
+            .contains("doorbell off")
+            && line.contains("agent_not_supported"))),
+        "the deck says it types nothing into Pi; {}",
+        pi.evidence()
+    );
+    let name = "never-typed-41c7e2.txt";
+    let id = pi.append_task(name);
+    pi.done(&id, name);
+    let log = pi.log();
+    assert!(
+        !log.contains("doorbell attempt") && !log.contains("doorbell rang"),
+        "the deck typed into Pi; {}",
+        pi.evidence()
+    );
+}
+
 /// Scenario: Submit a deck doorbell line in real Pi while its watcher registration reply is delayed. A labelled --doorbell-only fixture fixes the hand-out route so in-place substitution can be observed; Pi must replace the input and execute the task once, without exercising the default boot route or asking the model to fetch it.
 #[spec("inbox/pi/020")]
 #[test]

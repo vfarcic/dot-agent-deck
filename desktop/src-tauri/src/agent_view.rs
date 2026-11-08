@@ -168,6 +168,11 @@ pub(crate) enum FetchReason {
     /// re-reads them — one `ListAgents` per coalescing window at most, as for
     /// any other mark.
     Inbox,
+    /// PRD #1666 part 3 (Q35-20e): what a pane's card shows of the typing the
+    /// deck holds for it changed. That rides the record
+    /// (`AgentRecord::input_held`, `AgentRecord::input_discarded`), as the
+    /// inbox counts do, so the next refresh re-reads it.
+    InputHeld,
     /// The periodic reconciliation, which is the only thing that catches a
     /// silent removal.
     Reconcile,
@@ -302,6 +307,9 @@ impl AgentView {
             BroadcastMsg::Inbox(_) | BroadcastMsg::InboxHandover(_) => {
                 self.mark(FetchReason::Inbox)
             }
+            // PRD #1666 part 3 (Q35-20e): the held-typing row rides the
+            // record; see `FetchReason::InputHeld`.
+            BroadcastMsg::InputHeld(_) => self.mark(FetchReason::InputHeld),
             // Issue #1637: the notices ride the `Hello` reply, which the held
             // link captured once; re-read it, and the list with it.
             BroadcastMsg::HookBinaryNotice(_) => {
@@ -511,6 +519,8 @@ mod tests {
 
     fn record(id: &str, pane_id: &str) -> AgentRecord {
         AgentRecord {
+            input_held: None,
+            input_discarded: None,
             id: id.into(),
             pane_id_env: Some(pane_id.into()),
             display_name: Some(format!("worker-{id}")),
@@ -589,6 +599,44 @@ mod tests {
         assert_eq!(view.fetch_count(), 1, "only the install fetched");
     }
 
+    /// Scenario: install one agent that has sent no hook, then receive the
+    /// daemon's word that its typing is held (PRD #1666 part 3, Q35-20e). The
+    /// word makes the next refresh fetch; installing the record that fetch
+    /// returns, the view serves it, and mapped for the webview it carries the
+    /// hold's cause as the tile's `inputHeld` (R-E-U3-01).
+    #[test]
+    fn a_held_typing_update_makes_the_record_carrying_it_fetched() {
+        let now = Instant::now();
+        let mut view = AgentView::default();
+        view.install(listing(vec![record("7", "pane-7")]), now);
+        assert_eq!(view.needs_fetch(now), None);
+        let held: dot_agent_deck::inbox_display::InputHeld =
+            serde_json::from_value(serde_json::json!({
+                "generation": 7, "cause": "checking", "held_ops": 1, "held_bytes": 2, "since_ms": 3
+            }))
+            .unwrap();
+        view.apply(&BroadcastMsg::InputHeld(
+            dot_agent_deck::event::InputHeldUpdate {
+                pane_id: "pane-7".into(),
+                agent_id: "7".into(),
+                input_held: Some(held.clone()),
+                input_discarded: None,
+            },
+        ));
+        assert_eq!(view.needs_fetch(now), Some(FetchReason::InputHeld));
+
+        let mut fetched = record("7", "pane-7");
+        fetched.input_held = Some(held);
+        view.install(listing(vec![fetched]), now);
+        let served = view
+            .records()
+            .into_iter()
+            .find(|record| record.id == "7")
+            .expect("the fetched record is served");
+        let tile = serde_json::to_value(crate::dto::map_agent(served)).unwrap();
+        assert_eq!(tile["inputHeld"]["cause"], "checking", "{tile}");
+    }
+
     /// Scenario: install one agent, then receive the daemon's inbox notice
     /// that a second agent's Pi extension could not be refreshed, raised while
     /// it spawned and before this view holds any record of it (inbox/pi/021's
@@ -616,10 +664,13 @@ mod tests {
             reason: None,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: true,
             requeued: false,
             provenance: None,
+            termination: None,
             notices: notices.clone(),
         }));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::Inbox));
@@ -634,6 +685,8 @@ mod tests {
             wake: dot_agent_deck::inbox_hub::WakePath::Doorbell,
             component: None,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             notices,
         });
         view.install(listing(vec![record("7", "pane-7"), spawned]), now);
@@ -859,6 +912,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
 
         let mut view = AgentView::default();
@@ -908,6 +963,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
 
         let mut view = AgentView::default();
@@ -954,6 +1011,8 @@ mod tests {
             pull_request_revision: None,
             background: None,
             background_revision: None,
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
 
         let mut view = AgentView::default();
@@ -1149,6 +1208,8 @@ mod tests {
             pull_request_revision: None,
             background: (!work.is_empty()).then_some(work),
             background_revision: Some(revision),
+            answer_settlements: Vec::new(),
+            input_held: None,
         });
         record
     }

@@ -1,0 +1,471 @@
+{
+ "cell": "armed-stall",
+ "release": "0.164.0",
+ "sha256": "b93f6811d3f653f0fb83be4050d857fb9abbb111dfa2ce160563327daff7f306",
+ "error": null,
+ "codex_pid": 1083201,
+ "trials": [
+  {
+   "trial": 1,
+   "draft": "M59_DRAFT_1",
+   "editor_rc_planned": 0,
+   "sent_t": 3598698135808511,
+   "helper_pid": 1083371,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598698207009668,
+   "helper_gone_t": 3598703160664174,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598698157028675,
+     "event": "start"
+    },
+    {
+     "t": 3598698158539011,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598698159063683,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598698159089677,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598698159102710,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.003635499,
+   "helper_life_from_branch_s": 5.002125163,
+   "helper_life_from_ctrl_g_s": 5.024855663,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 9631,
+   "end_off": 11782,
+   "done_off": 13963,
+   "composer_after": "M59_DRAFT_1"
+  },
+  {
+   "trial": 2,
+   "draft": "M59_DRAFT_2",
+   "editor_rc_planned": 0,
+   "sent_t": 3598706148136726,
+   "helper_pid": 1083553,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598706219785072,
+   "helper_gone_t": 3598711180307225,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598706174902832,
+     "event": "start"
+    },
+    {
+     "t": 3598706177682003,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598706178447531,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598706178491466,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598706178514480,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.005404393,
+   "helper_life_from_branch_s": 5.002625222,
+   "helper_life_from_ctrl_g_s": 5.032170499,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 14926,
+   "end_off": 17170,
+   "done_off": 19488,
+   "composer_after": "M59_DRAFT_2"
+  },
+  {
+   "trial": 3,
+   "draft": "M59_DRAFT_3",
+   "editor_rc_planned": 0,
+   "sent_t": 3598714189067147,
+   "helper_pid": 1083592,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598714259048869,
+   "helper_gone_t": 3598719222865013,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598714215945949,
+     "event": "start"
+    },
+    {
+     "t": 3598714218297228,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598714219097611,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598714219140353,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598714219344970,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.006919064,
+   "helper_life_from_branch_s": 5.004567785,
+   "helper_life_from_ctrl_g_s": 5.033797866,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 20451,
+   "end_off": 22788,
+   "done_off": 25203,
+   "composer_after": "M59_DRAFT_3"
+  },
+  {
+   "trial": 4,
+   "draft": "M59_DRAFT_4",
+   "editor_rc_planned": 0,
+   "sent_t": 3598722228039062,
+   "helper_pid": 1083645,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598722302741482,
+   "helper_gone_t": 3598727259257963,
+   "zombie_status": {
+    "code": null,
+    "signal": 14,
+    "raw": 14
+   },
+   "trace": [
+    {
+     "t": 3598722253265777,
+     "event": "start"
+    },
+    {
+     "t": 3598722255650523,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598722256418268,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598722256460965,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598722256483607,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.005992186,
+   "helper_life_from_branch_s": 5.00360744,
+   "helper_life_from_ctrl_g_s": 5.031218901,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 26166,
+   "end_off": 28612,
+   "done_off": 31056,
+   "composer_after": "M59_DRAFT_4"
+  },
+  {
+   "trial": 5,
+   "draft": "M59_DRAFT_5",
+   "editor_rc_planned": 0,
+   "sent_t": 3598730265132043,
+   "helper_pid": 1083698,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598730339071908,
+   "helper_gone_t": 3598735295875358,
+   "zombie_status": {
+    "code": null,
+    "signal": 14,
+    "raw": 14
+   },
+   "trace": [
+    {
+     "t": 3598730288612986,
+     "event": "start"
+    },
+    {
+     "t": 3598730290980385,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598730291724635,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598730291765200,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598730291787867,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.007262372,
+   "helper_life_from_branch_s": 5.004894973,
+   "helper_life_from_ctrl_g_s": 5.030743315,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 32019,
+   "end_off": 34566,
+   "done_off": 37183,
+   "composer_after": "M59_DRAFT_5"
+  },
+  {
+   "trial": 6,
+   "draft": "M59_DRAFT_6",
+   "editor_rc_planned": 0,
+   "sent_t": 3598738313292900,
+   "helper_pid": 1083776,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598738393884665,
+   "helper_gone_t": 3598743344521228,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598738337290907,
+     "event": "start"
+    },
+    {
+     "t": 3598738339434488,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598738340178777,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598738340225433,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598738340253069,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.007230321,
+   "helper_life_from_branch_s": 5.00508674,
+   "helper_life_from_ctrl_g_s": 5.031228328,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 38146,
+   "end_off": 40762,
+   "done_off": 43452,
+   "composer_after": "M59_DRAFT_6"
+  },
+  {
+   "trial": 7,
+   "draft": "M59_DRAFT_7",
+   "editor_rc_planned": 0,
+   "sent_t": 3598746363750493,
+   "helper_pid": 1083811,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598746441532821,
+   "helper_gone_t": 3598751392501760,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598746387590314,
+     "event": "start"
+    },
+    {
+     "t": 3598746389830736,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598746390552021,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598746390598749,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598746390626754,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.004911446,
+   "helper_life_from_branch_s": 5.002671024,
+   "helper_life_from_ctrl_g_s": 5.028751267,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 44459,
+   "end_off": 47176,
+   "done_off": 49951,
+   "composer_after": "M59_DRAFT_7"
+  },
+  {
+   "trial": 8,
+   "draft": "M59_DRAFT_8",
+   "editor_rc_planned": 0,
+   "sent_t": 3598754392341340,
+   "helper_pid": 1083876,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598754466340912,
+   "helper_gone_t": 3598759423662642,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598754419153536,
+     "event": "start"
+    },
+    {
+     "t": 3598754421388691,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598754422155733,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598754422205820,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598754422235959,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.004509106,
+   "helper_life_from_branch_s": 5.002273951,
+   "helper_life_from_ctrl_g_s": 5.031321302,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 50914,
+   "end_off": 53716,
+   "done_off": 56592,
+   "composer_after": "M59_DRAFT_8"
+  },
+  {
+   "trial": 9,
+   "draft": "M59_DRAFT_9",
+   "editor_rc_planned": 0,
+   "sent_t": 3598762428962545,
+   "helper_pid": 1083921,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598762510525583,
+   "helper_gone_t": 3598767465170796,
+   "zombie_status": {
+    "code": null,
+    "signal": 14,
+    "raw": 14
+   },
+   "trace": [
+    {
+     "t": 3598762456286496,
+     "event": "start"
+    },
+    {
+     "t": 3598762458632387,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598762459437439,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598762459487447,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598762459517687,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.0088843,
+   "helper_life_from_branch_s": 5.006538409,
+   "helper_life_from_ctrl_g_s": 5.036208251,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 57555,
+   "end_off": 60575,
+   "done_off": 63375,
+   "composer_after": "M59_DRAFT_9"
+  },
+  {
+   "trial": 10,
+   "draft": "M59_DRAFT_10",
+   "editor_rc_planned": 0,
+   "sent_t": 3598770463368185,
+   "helper_pid": 1084100,
+   "helper_parent_is_codex": true,
+   "helper_seen_t": 3598770538059583,
+   "helper_gone_t": 3598775494459368,
+   "zombie_status": null,
+   "trace": [
+    {
+     "t": 3598770490383655,
+     "event": "start"
+    },
+    {
+     "t": 3598770492635546,
+     "event": "branch Armed class Owned arm Present { seen: Some(Seen { seg: 17, native: 23 }) }"
+    },
+    {
+     "t": 3598770493359132,
+     "event": "poll 4 2000"
+    },
+    {
+     "t": 3598770493400718,
+     "event": "polled 1"
+    },
+    {
+     "t": 3598770493429891,
+     "event": "pause ready"
+    }
+   ],
+   "helper_life_from_start_s": 5.004075713,
+   "helper_life_from_branch_s": 5.001823822,
+   "helper_life_from_ctrl_g_s": 5.031091183,
+   "editor": [],
+   "notice_in_output": false,
+   "codex_error_line": "■ Failed to open editor: editor exited with status signal: 14 (SIGALRM)",
+   "codex_error_after_end": true,
+   "sent_off": 64339,
+   "end_off": 67328,
+   "done_off": 70347,
+   "composer_after": "M59_DRAFT_10"
+  }
+ ],
+ "env_names": [
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "PATH",
+  "PWD",
+  "TERM"
+ ],
+ "recorder_sha256": "49ccaf030dd113d37e8f2f405f6266422a85fd5b87ee619ffd1bc23a899f507e",
+ "editor_recorder_sha256": "1bb22be75acc1823a61dd808202a7dea6609ac44b40f5828d01a97024136fd81"
+}
