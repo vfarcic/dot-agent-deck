@@ -28,6 +28,7 @@ from pr_review_common import (  # noqa: E402
     pr_review_comments,
     pr_reviews,
     retry_budget_left,
+    retry_can_change_the_verdict,
     trusted_verdicts_at,
     unresolved_threads,
 )
@@ -239,6 +240,13 @@ def main():
                 # Idempotence: nothing to add for a head that already has a verdict.
                 skipped.append((number, f"already has a verdict for {sha[:8]}"))
                 continue
+            if not retry_can_change_the_verdict(author):
+                skipped.append((
+                    number,
+                    f"already has a verdict for {sha[:8]}; a retry would repeat the "
+                    f"INSUFFICIENT the integrity filter fixes for {author} (#1847)",
+                ))
+                continue
 
         # Issue #1754: the review pass computes independent coverage HERE, from
         # the unfiltered API, and hands it to the agent. The agent's own reads go
@@ -256,7 +264,7 @@ def main():
             )
 
         if verdicts_at_head is not None:
-            if not insufficient_retry_due(verdicts_at_head, evidence):
+            if not insufficient_retry_due(verdicts_at_head, evidence, author):
                 skipped.append((
                     number,
                     f"already has a verdict for {sha[:8]}; its INSUFFICIENT is retried "

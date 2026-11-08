@@ -1,3 +1,0 @@
-## `config set` avoids half-written `config.toml` files
-
-An agent the deck starts while you run `dot-agent-deck config set` reads the old settings or the new ones, not an empty or half-written `config.toml` that would start it with default settings, such as the doorbell on after you had turned it off. That protection applies when `config.toml` keeps its owner and group, has no other hard links and its folder lets it be replaced; otherwise, for example when you run `config set` with `sudo` on your own config, in a folder you cannot write or on a single-file bind mount, the save works as before and keeps the file's owner.

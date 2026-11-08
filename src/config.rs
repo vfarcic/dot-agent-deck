@@ -234,14 +234,19 @@ where
 /// the config path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFile {
-    /// No file: [`BoundedLoad::config`] is the defaults, as intended.
+    /// Opening the path found nothing, and an `lstat` right after it found
+    /// nothing either, not even a symlink: [`BoundedLoad::config`] is the
+    /// defaults, as intended.
     Absent,
     /// The file was read, and [`BoundedLoad::config`] is what it says.
     Read,
     /// There is a file, but it was not read (not a regular file, over
-    /// [`MAX_DASHBOARD_CONFIG_BYTES`], unreadable), is not valid TOML, or a
-    /// setting has the wrong type: [`BoundedLoad::config`] is the defaults,
-    /// which may not be what the user wrote.
+    /// [`MAX_DASHBOARD_CONFIG_BYTES`], unreadable, a link whose target is
+    /// missing, or something appeared at the path while it was being read), is
+    /// not valid TOML, or a setting has the wrong type; or the open found
+    /// nothing and the `lstat` after it failed for another reason than
+    /// `NotFound`: [`BoundedLoad::config`] is the defaults, which may not be
+    /// what the user wrote.
     Failed,
 }
 
@@ -572,6 +577,13 @@ pub const MAX_DASHBOARD_CONFIG_BYTES: u64 = crate::project_resolve::MAX_PROJECT_
 /// [`DashboardConfig::load_bounded`]'s read: `Ok(None)` when there is no file,
 /// `Err` with a short reason (no file content) when there is one that is not a
 /// regular file within [`MAX_DASHBOARD_CONFIG_BYTES`] or cannot be read.
+///
+/// Issue #2137 N2: a symlink at `path` whose target is missing (moved, or on a
+/// volume that is not mounted) is a file that cannot be read, not an absent
+/// one: the target may be the config that turned a doorbell off. `Ok(None)`
+/// means the open failed with `NotFound` and a following `lstat` of `path`
+/// failed with `NotFound` too; when the `lstat` finds anything (a link, or an
+/// entry that appeared after the open) or fails another way, the read fails.
 fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -582,7 +594,9 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
     }
     let file = match options.open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return after_open_not_found(std::fs::symlink_metadata(path).map(|m| m.file_type()));
+        }
         Err(e) => return Err(format!("open failed: {e}")),
     };
     let metadata = file.metadata().map_err(|e| format!("stat failed: {e}"))?;
@@ -595,6 +609,21 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
         ));
     }
     crate::bounded_read::read_capped(file, MAX_DASHBOARD_CONFIG_BYTES, "config file").map(Some)
+}
+
+/// [`read_dashboard_config_bounded`]'s verdict once the open failed with
+/// `NotFound`, from what `lstat` (`symlink_metadata`) then said about the path.
+/// `Ok(None)` only when `lstat` also says `NotFound`; anything else fails, so a
+/// change at the path between the two calls is never read as an absent config.
+fn after_open_not_found(
+    lstat: std::io::Result<std::fs::FileType>,
+) -> Result<Option<String>, String> {
+    match lstat {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Ok(kind) if kind.is_symlink() => Err("it is a link whose target is missing".into()),
+        Ok(_) => Err("it changed while it was being read".into()),
+        Err(e) => Err(format!("stat after a failed open failed: {e}")),
+    }
 }
 
 /// Issue #2137 N1: publish `config.toml` through a temp file and a rename, so
@@ -2969,6 +2998,49 @@ mod tests {
                     .unwrap_or_else(|_| panic!("{}: the bounded load blocked", path.display())),
                 ""
             );
+        }
+    }
+
+    /// Issue #2137 N2 review: once the open of `config.toml` fails with
+    /// `NotFound`, only an `lstat` that also says `NotFound` is an absent
+    /// config. Anything else at the path by then — a dangling link, or a file,
+    /// folder or link that appeared between the two calls — or an `lstat` that
+    /// fails another way is a failed read, so a race between the two calls
+    /// holds the doorbell off rather than reading a new file as absent.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_open_that_finds_nothing_is_absent_only_when_lstat_agrees() {
+        use std::io::{Error, ErrorKind};
+        let dir = crate::test_temp::tempdir().unwrap();
+        let file = dir.path().join("file.toml");
+        std::fs::write(&file, "").unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let link = dir.path().join("link.toml");
+        std::os::unix::fs::symlink(dir.path().join("missing.toml"), &link).unwrap();
+        let kind = |p: &Path| Ok(std::fs::symlink_metadata(p).unwrap().file_type());
+
+        assert_eq!(
+            after_open_not_found(Err(Error::from(ErrorKind::NotFound))),
+            Ok(None),
+            "lstat NotFound: nothing at the path"
+        );
+        let symlink = after_open_not_found(kind(&link));
+        assert_eq!(
+            symlink,
+            Err("it is a link whose target is missing".to_string())
+        );
+        for (name, lstat) in [
+            ("regular file", kind(&file)),
+            ("folder", kind(&folder)),
+            (
+                "lstat denied",
+                Err(Error::from(ErrorKind::PermissionDenied)),
+            ),
+            ("lstat other error", Err(Error::other("io error"))),
+        ] {
+            let verdict = after_open_not_found(lstat);
+            assert!(verdict.is_err(), "{name}: {verdict:?}");
         }
     }
 

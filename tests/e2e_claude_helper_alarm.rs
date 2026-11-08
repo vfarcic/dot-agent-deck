@@ -7,8 +7,9 @@
 //! The harness is the stand-in M59 names: no daemon. The test creates an
 //! instance whose helper is a copy of this build's deck binary, one Claude
 //! generation in it, and a socket the test process owns (the instance's
-//! recorded daemon) that accepts connections and never answers. A real
-//! pinned Claude Code runs on a PTY of its own inside a deck pane of the TUI
+//! recorded daemon) that accepts connections and never answers. The real
+//! Claude Code installed on the harness's `PATH` (issue #2146) runs on a PTY
+//! of its own inside a deck pane of the TUI
 //! harness, with its own HOME, `VISUAL`/`EDITOR` naming the helper and the
 //! user's editor (the helper restores it) a stand-in that sleeps, writes a
 //! sentinel and exits. Once Claude has started, the test writes its identity
@@ -23,6 +24,8 @@
 //! The capture root is printed and kept under `/var/tmp`.
 
 mod common;
+#[path = "support/installed_agent.rs"]
+mod installed;
 
 use dot_agent_deck::composer_probe::classifier::{FileId, Identity};
 use dot_agent_deck::composer_probe::install::ProbeAgent;
@@ -58,22 +61,13 @@ fn identity_of(pid: u32) -> Identity {
     }
 }
 
-fn m59(release: &str, cell: &str, armed: bool) -> Option<(std::path::PathBuf, Value)> {
-    let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
-    let Ok(binary) = std::env::var(&key) else {
-        common::_skip_if_err(Err(format!("set {key} to the pinned executable")));
+/// Runs one M59 cell on the installed Claude Code, or `None` after reporting
+/// why it cannot run (`SKIP:`).
+fn m59(cell: &str, armed: bool) -> Option<(std::path::PathBuf, Value)> {
+    if common::_skip_if_err(common::check_claude_available()) {
         return None;
-    };
-    let bin = tempfile::Builder::new()
-        .prefix("dad-m59-bin-")
-        .tempdir_in("/var/tmp")
-        .unwrap();
-    std::os::unix::fs::symlink(&binary, bin.path().join("claude")).unwrap();
-    let path = format!(
-        "{}:{}",
-        bin.path().display(),
-        std::env::var("PATH").unwrap()
-    );
+    }
+    let claude = installed::or_skip(installed::claude())?;
     let root = tempfile::Builder::new()
         .prefix("dad-m59-")
         .tempdir_in("/var/tmp")
@@ -120,7 +114,7 @@ fn m59(release: &str, cell: &str, armed: bool) -> Option<(std::path::PathBuf, Va
         quote(&editor),
     );
     let deck = common::TuiDeck::builder()
-        .with_env("PATH", path)
+        .with_env("PATH", claude.path.clone())
         .with_env(
             "PYTHONPATH",
             std::env::var("PYTHONPATH").unwrap_or_default(),
@@ -154,17 +148,25 @@ fn m59(release: &str, cell: &str, armed: bool) -> Option<(std::path::PathBuf, Va
     assert!(
         common::wait_until(Duration::from_secs(480), || out
             .join("result.json")
-            .exists()),
+            .exists()
+            || root.join("launcher-error.json").exists()),
         "M59 {cell} did not finish; {}\n{}",
         out.display(),
         deck.snapshot_grid()
+    );
+    // The recorder fails without a `result.json` when the executable changed
+    // during the run, and reports why in `launcher-error.json`.
+    assert!(
+        !root.join("launcher-error.json").exists(),
+        "M59 {cell} recorder failed: {}",
+        std::fs::read_to_string(root.join("launcher-error.json")).unwrap_or_default()
     );
     let result: Value =
         serde_json::from_slice(&std::fs::read(out.join("result.json")).unwrap()).unwrap();
     eprintln!("M59 {cell} evidence: {}", out.display());
     drop(deck);
     drop(generation);
-    assert_eq!(result["release"], release);
+    claude.assert_recorded(&result, &out);
     assert!(
         result["error"].is_null(),
         "M59 {cell}: {}; {}",
@@ -234,25 +236,16 @@ fn summary(trial: &Value) -> String {
     )
 }
 
-/// Scenario: Run pinned Claude Code 2.1.317 with the deck's editor helper as its editor, the arm present and the helper stalled at its first ready poll, and press Ctrl+G on a draft ten times. Each time the helper must end about five seconds after it chose the armed branch, by its alarm, with no editor run, and Claude must keep the draft.
+/// Scenario: Run the installed Claude Code with the deck's editor helper as its editor, the arm present and the helper stalled at its first ready poll, and press Ctrl+G on a draft ten times. Each time the helper must end about five seconds after it chose the armed branch, by its alarm, with no editor run, and Claude must keep the draft.
 #[spec("inbox/probe/090")]
 #[test]
-fn probe_090_live_claude_317_armed_helper_alarm_ends_a_stalled_exchange() {
-    skip_unless!(common::check_claude_available());
-    armed_helper_alarm_ends_a_stalled_exchange("2.1.317");
+fn probe_090_live_claude_armed_helper_alarm_ends_a_stalled_exchange() {
+    armed_helper_alarm_ends_a_stalled_exchange();
 }
 
-/// Scenario: Run pinned Claude Code 2.1.318 with the deck's editor helper as its editor, the arm present and the helper stalled at its first ready poll, and press Ctrl+G on a draft ten times. Each time the helper must end about five seconds after it chose the armed branch, by its alarm, with no editor run, and Claude must keep the draft.
-#[spec("inbox/probe/090")]
-#[test]
-fn probe_090_live_claude_318_armed_helper_alarm_ends_a_stalled_exchange() {
-    skip_unless!(common::check_claude_available());
-    armed_helper_alarm_ends_a_stalled_exchange("2.1.318");
-}
-
-/// The `probe_090_live_claude_*_armed_helper_alarm_ends_a_stalled_exchange` cell on one pinned release.
-fn armed_helper_alarm_ends_a_stalled_exchange(release: &str) {
-    let Some((out, result)) = m59(release, "armed-stall", true) else {
+/// The `probe_090_live_claude_armed_helper_alarm_ends_a_stalled_exchange` cell on the installed release.
+fn armed_helper_alarm_ends_a_stalled_exchange() {
+    let Some((out, result)) = m59("armed-stall", true) else {
         return;
     };
     assert_eq!(trials(&result).len(), 10);
@@ -331,25 +324,16 @@ fn armed_helper_alarm_ends_a_stalled_exchange(release: &str) {
     );
 }
 
-/// Scenario: Run pinned Claude Code 2.1.317 with the deck's editor helper as its editor and the arm present, with no stall, against the socket that never answers, and press Ctrl+G on a draft ten times. The helper's exchange runs out first; each time no editor runs, the helper's notice is written to the terminal, it ends before its alarm, and Claude keeps the draft.
+/// Scenario: Run the installed Claude Code with the deck's editor helper as its editor and the arm present, with no stall, against the socket that never answers, and press Ctrl+G on a draft ten times. The helper's exchange runs out first; each time no editor runs, the helper's notice is written to the terminal, it ends before its alarm, and Claude keeps the draft.
 #[spec("inbox/probe/090")]
 #[test]
-fn probe_090_live_claude_317_armed_helper_unanswered_exchange() {
-    skip_unless!(common::check_claude_available());
-    armed_helper_unanswered_exchange("2.1.317");
+fn probe_090_live_claude_armed_helper_unanswered_exchange() {
+    armed_helper_unanswered_exchange();
 }
 
-/// Scenario: Run pinned Claude Code 2.1.318 with the deck's editor helper as its editor and the arm present, with no stall, against the socket that never answers, and press Ctrl+G on a draft ten times. The helper's exchange runs out first; each time no editor runs, the helper's notice is written to the terminal, it ends before its alarm, and Claude keeps the draft.
-#[spec("inbox/probe/090")]
-#[test]
-fn probe_090_live_claude_318_armed_helper_unanswered_exchange() {
-    skip_unless!(common::check_claude_available());
-    armed_helper_unanswered_exchange("2.1.318");
-}
-
-/// The `probe_090_live_claude_*_armed_helper_unanswered_exchange` cell on one pinned release.
-fn armed_helper_unanswered_exchange(release: &str) {
-    let Some((out, result)) = m59(release, "armed-timeout", true) else {
+/// The `probe_090_live_claude_armed_helper_unanswered_exchange` cell on the installed release.
+fn armed_helper_unanswered_exchange() {
+    let Some((out, result)) = m59("armed-timeout", true) else {
         return;
     };
     assert_eq!(trials(&result).len(), 10);
@@ -401,25 +385,16 @@ fn armed_helper_unanswered_exchange(release: &str) {
     }
 }
 
-/// Scenario: Run pinned Claude Code 2.1.317 with the deck's editor helper as its editor and no arm, the user's editor a stand-in that sleeps eight seconds, writes a sentinel and exits, and press Ctrl+G on a draft ten times, then once more with the editor exiting 37. Each time the helper must take the unarmed branch, outlive its would-be alarm while the editor runs, and end with the editor's status; Claude must show the sentinel after the editor exits zero.
+/// Scenario: Run the installed Claude Code with the deck's editor helper as its editor and no arm, the user's editor a stand-in that sleeps eight seconds, writes a sentinel and exits, and press Ctrl+G on a draft ten times, then once more with the editor exiting 37. Each time the helper must take the unarmed branch, outlive its would-be alarm while the editor runs, and end with the editor's status; Claude must show the sentinel after the editor exits zero.
 #[spec("inbox/probe/090")]
 #[test]
-fn probe_090_live_claude_317_unarmed_helper_long_edit() {
-    skip_unless!(common::check_claude_available());
-    unarmed_helper_long_edit("2.1.317");
+fn probe_090_live_claude_unarmed_helper_long_edit() {
+    unarmed_helper_long_edit();
 }
 
-/// Scenario: Run pinned Claude Code 2.1.318 with the deck's editor helper as its editor and no arm, the user's editor a stand-in that sleeps eight seconds, writes a sentinel and exits, and press Ctrl+G on a draft ten times, then once more with the editor exiting 37. Each time the helper must take the unarmed branch, outlive its would-be alarm while the editor runs, and end with the editor's status; Claude must show the sentinel after the editor exits zero.
-#[spec("inbox/probe/090")]
-#[test]
-fn probe_090_live_claude_318_unarmed_helper_long_edit() {
-    skip_unless!(common::check_claude_available());
-    unarmed_helper_long_edit("2.1.318");
-}
-
-/// The `probe_090_live_claude_*_unarmed_helper_long_edit` cell on one pinned release.
-fn unarmed_helper_long_edit(release: &str) {
-    let Some((out, result)) = m59(release, "unarmed-long", false) else {
+/// The `probe_090_live_claude_unarmed_helper_long_edit` cell on the installed release.
+fn unarmed_helper_long_edit() {
+    let Some((out, result)) = m59("unarmed-long", false) else {
         return;
     };
     assert_eq!(trials(&result).len(), 11);
