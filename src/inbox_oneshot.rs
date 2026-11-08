@@ -1184,6 +1184,38 @@ pub const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 /// than in this process.
 pub const MAX_QUEUED_LINES: usize = 8;
 
+/// Issue #2126: how long a connection's reader thread waits in one read
+/// before it reads again. On macOS a read blocked with no timeout can miss
+/// the wakeup for the deck's half-close (`shutdown(SHUT_WR)` landing while
+/// XNU's `soreceive` has dropped its lock) and sleep until the deck drops the
+/// stream; a read that times out and reads again sees the end at once. It
+/// bounds that delay only: a timed-out read is never an error or an end, so
+/// every wait lasts exactly as long as it did.
+#[cfg(unix)]
+const READ_POLL: Duration = Duration::from_millis(100);
+
+/// A socket read with [`READ_POLL`] as its timeout, read again whenever that
+/// timeout ends a read, so it returns only bytes, the end of the stream or
+/// an error other than the timeout, as a read with no timeout does.
+#[cfg(unix)]
+struct Polled(std::os::unix::net::UnixStream);
+
+#[cfg(unix)]
+impl io::Read for Polled {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            match self.0.read(buf) {
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) => {}
+                read => return read,
+            }
+        }
+    }
+}
+
 /// A one-shot's side of its one connection to the deck (part 2 §2.5). A
 /// reader thread of its own reads every line through [`read_frame`] and
 /// hands it over parsed, queueing at most [`MAX_QUEUED_LINES`] (and holding a
@@ -1315,9 +1347,10 @@ impl Connection {
     /// The connection on `stream`, reading lines of at most `max` bytes.
     fn over(stream: std::os::unix::net::UnixStream, max: usize) -> io::Result<Connection> {
         let reading = stream.try_clone()?;
+        reading.set_read_timeout(Some(READ_POLL))?;
         let (tx, lines) = std::sync::mpsc::sync_channel(MAX_QUEUED_LINES);
         std::thread::spawn(move || {
-            let mut reader = io::BufReader::new(reading);
+            let mut reader = io::BufReader::new(Polled(reading));
             loop {
                 match read_frame(&mut reader, max) {
                     Frame::Line(line) => {
@@ -2500,6 +2533,66 @@ pub(crate) mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         worker.join().unwrap();
+    }
+
+    /// Issue #2126: the reader thread's reads end on a timeout and read
+    /// again, so a wakeup that XNU loses for the deck's half-close (see
+    /// `a_line_after_a_cut_one_is_read_whole`) costs at most one poll rather
+    /// than the wait until the deck drops the stream. The socket's own
+    /// receive timeout is the evidence on every platform; only a macOS run
+    /// can show the lost wakeup itself.
+    #[cfg(unix)]
+    #[test]
+    fn the_reader_thread_reads_with_a_timeout() {
+        let (connection, _deck) = connection_pair();
+        assert!(
+            connection.stream.read_timeout().unwrap().is_some(),
+            "the reader thread blocks in a read with no timeout"
+        );
+    }
+
+    /// Issue #2126: the reader's timeout is a poll, not a limit on the wait.
+    /// A deck silent for several polls is still read, its line is handed
+    /// over whole, and its half-close alone (the deck's end stays open) ends
+    /// the connection, so `next(None)` waits exactly as long as it did.
+    #[cfg(unix)]
+    #[test]
+    fn a_deck_silent_past_the_poll_is_still_read_then_ends() {
+        let (mut connection, mut deck) = connection_pair();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let first = connection.next(None);
+            let after = connection.next(None);
+            done_tx.send(()).unwrap();
+            (first, after, connection.ended())
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            !waiter.is_finished(),
+            "a silent deck ended the wait: the timeout is not read again"
+        );
+        let line = serde_json::to_string(&InboxWaitReply::keepalive()).unwrap();
+        // Written in two pieces with a silence between them, so a poll
+        // lands inside the line.
+        let (head, tail) = line.split_at(line.len() / 2);
+        deck.write_all(head.as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        deck.write_all(format!("{tail}\n").as_bytes()).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        deck.shutdown(std::net::Shutdown::Write).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the deck's half-close did not end the wait within 10 s");
+        let (first, after, ended) = waiter.join().unwrap();
+        assert!(
+            first.is_some_and(|reply| reply.keepalive),
+            "the line is read whole"
+        );
+        assert!(
+            after.is_none() && ended,
+            "the half-close ends the connection"
+        );
+        drop(deck);
     }
 
     /// Scenario: Read the deck's once line through the one-shot's reader:
