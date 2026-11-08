@@ -10414,6 +10414,13 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests), the daemon log's warning text, an unreadable or non-regular file (same failed branch, not exercised here), or what a card shows for the held agent (`inbox/doorbell/056`).
 - **Platform coverage:** all.
 
+##### inbox/doorbell/061 — A `config.toml` that is a link to a missing file holds the doorbell off, like any config that is there but can't be used.
+- **Layer:** Fast (`src/doorbell_switch.rs`, `src/config.rs`), temp files and symlinks.
+- **Agent:** none.
+- **Asserts:** the daemon's bounded config read reports a path with nothing at it (no link either), and a path inside a config folder that does not exist (a fresh install), as absent, with no warning, and both agents on; a link to a readable file as read, saying what the file says; and a link whose target is missing (absolute, relative, or reached through a second link), a link to a folder and a link loop each as failed with one warning, holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CLAUDE=on` still turns Claude Code back on over it and leaves Codex off.
+- **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests), the warning's text, a dangling link at the config folder rather than at the file (it still reads as absent), or `config get` / `config set` through such a link.
+- **Platform coverage:** unix (the test creates symlinks).
+
 #### inbox/probe
 
 The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an agent's input box through the agent's own Ctrl+G, and holding what a user types while a check runs. It is built a commit at a time: the daemon feeds the output hook every byte an agent writes (inbox/probe/004), moves the input epoch at the PTY writer's enqueue and notes the output's queries into it (inbox/probe/001, 045, 060), and nothing in the daemon reads what the probe computes or calls the rest of it yet.
