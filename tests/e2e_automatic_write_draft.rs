@@ -10,6 +10,7 @@ mod inbox;
 use common::TuiDeck;
 use inbox::*;
 use spec::spec;
+#[cfg(target_os = "linux")] // Its one user, `unchanged`, is Linux only.
 use std::time::Duration;
 
 fn launch_with(extra: &[(&str, &str)]) -> (TuiDeck, Pane) {
