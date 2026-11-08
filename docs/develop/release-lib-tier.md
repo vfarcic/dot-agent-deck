@@ -42,6 +42,10 @@ Tests that hold only with `debug_assertions` on are gated `#[cfg(debug_assertion
 
 The other four `orchestration/work-done/032` tests in `src/lock_rank.rs` run in both. Two of them, `work_done_032_try_lock_now_does_not_wait_for_another_thread` and `work_done_032_try_lock_now_answers_poison_and_rank_as_asked`, check `try_lock_now` refusing without waiting and its poison handling in both profiles, and wrap only their rank-stack and `RankViolation` assertions in `if cfg!(debug_assertions)`, so the release tier skips those assertions and nothing else. `tests/CATALOG.md`'s entry for that ID records the split.
 
+## The two release-only failures
+
+Issue #2134 listed two tests that failed in a release build only: `retained_store::tests::recovery_019_the_inventory_writer_and_reader_agree_at_the_boundary` and `agent_pty::report_tests::work_done_053_a_a_failed_attempt_leaves_no_report_behind`. Each ended on an assertion that expected a `debug_assert!` in production code to panic, and a release build compiles that check out. recovery_019 expected `write_inventory_text` (`src/retained_store.rs`) to refuse an entry count over its `max_files`. work_done_053_a expected `RetainedStore::write` to unwind on the report id `"not a report id"`. PR #2142 (`caca26bf`) changed the tests, not the product, and found no product defect behind either. `write_inventory_text` is documented to log and write the full list in a release build, so recovery_019's release arm now asserts that, and that `read_inventory` refuses the result. The id check is the only unwind source that block of work_done_053_a drives, and both production paths that reach `write` (`src/task_completion.rs` for a report, `src/dispatch_return.rs` for a dispatch result, through `save_held`) pass an id from `mint_report_id()`, so that block now runs in debug builds only. Both tests pass in this tier.
+
 ## Its cost
 
 Measured on 2026-11-08 on the branch that added it, each from a cold `target/`. Most of each wall time is the release build in front of the 5328 tests, whose run took 175 seconds on GitHub's 4 CPUs (48 seconds in a 16-CPU RWX sandbox).
