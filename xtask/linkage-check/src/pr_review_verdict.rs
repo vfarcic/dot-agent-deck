@@ -1275,7 +1275,20 @@ fn the_rubric_forbids_fetching_a_withheld_artefact_by_another_route() {
         // withheld comment on #1606 (run 37691901791).
         (
             ".github/pr-review-rubric.md",
-            "You read an independent review through these three reads and no others (on any pull request): `gh api repos/<repo>/issues/<n>/comments`, `gh api repos/<repo>/pulls/<n>/reviews` and `gh api repos/<repo>/pulls/<n>/comments`.",
+            "You read an independent review through these three reads and no others (on any pull request): `gh api repos/<repo>/issues/<n>/comments --paginate`, `gh api repos/<repo>/pulls/<n>/reviews --paginate` and `gh api repos/<repo>/pulls/<n>/comments --paginate`.",
+        ),
+        // Each list returns only its first page without `--paginate`, so on a
+        // busy pull request the reviewer judged "every finding answered" on
+        // partial data (Qodo on PR #2150). The flag is part of the sanctioned
+        // read, and saying so keeps a paginated read from reading as a fourth
+        // route under the "three reads and no others" rule.
+        (
+            ".github/pr-review-rubric.md",
+            "`--paginate` is part of each of those three reads, not a fourth route or a different one",
+        ),
+        (
+            ".github/pr-review-rubric.md",
+            "read every page they return before you conclude that a finding is unanswered or that an artefact is withheld",
         ),
         (
             ".github/pr-review-rubric.md",
@@ -1291,7 +1304,15 @@ fn the_rubric_forbids_fetching_a_withheld_artefact_by_another_route() {
         ),
         (
             ".github/workflows/pr-review.md",
-            "when the three reads the rubric's priority 1 names (`gh api` of this pull request's issue-comments, reviews and review-comments lists) do not return it, it is withheld",
+            "when the three reads the rubric's priority 1 names (`gh api --paginate` of this pull request's issue-comments, reviews and review-comments lists, every page of each) do not return it, it is withheld",
+        ),
+        (
+            ".github/workflows/pr-review.md",
+            "`--paginate` is part of each of those three reads, not another route",
+        ),
+        (
+            ".github/workflows/pr-review.md",
+            "read every page before you conclude that a finding is unanswered or that the artefact is withheld",
         ),
         (
             ".github/workflows/pr-review.md",
@@ -1301,6 +1322,23 @@ fn the_rubric_forbids_fetching_a_withheld_artefact_by_another_route() {
         assert!(
             flat(rel).contains(sentence),
             "{rel} no longer says {sentence:?}; issue #1847's no-fetch rule is gone from the reviewer's instructions"
+        );
+    }
+    // Pinning the list's sentence does not stop an unpaginated copy of one of
+    // the three reads coming back elsewhere in the rubric, where it would
+    // read as permission to stop at the first page.
+    let rubric = flat(".github/pr-review-rubric.md");
+    for path in [
+        "issues/<n>/comments",
+        "pulls/<n>/reviews",
+        "pulls/<n>/comments",
+    ] {
+        let named = format!("`gh api repos/<repo>/{path}");
+        let paginated = format!("`gh api repos/<repo>/{path} --paginate`");
+        assert_eq!(
+            rubric.matches(&named).count(),
+            rubric.matches(&paginated).count(),
+            "the rubric names {named}` without `--paginate`; that read returns only its first page"
         );
     }
     // The count went from four to three when the GraphQL read left the list;
