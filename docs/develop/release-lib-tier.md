@@ -37,12 +37,10 @@ Tests that hold only with `debug_assertions` on are gated `#[cfg(debug_assertion
 | --- | --- |
 | `lock_rank::tests::work_done_032_an_out_of_order_lock_panics_before_it_blocks` | rank checking, and the panic it asserts, exist only with debug assertions |
 | `lock_rank::tests::work_done_032_the_non_panicking_forms_answer_a_rank_violation` | same: a release build reports no `RankViolation` |
-| `lock_rank::tests::work_done_032_try_lock_now_does_not_wait_for_another_thread` | asserts the guard's entry on the thread's rank stack, which a release build does not keep |
-| `lock_rank::tests::work_done_032_try_lock_now_answers_poison_and_rank_as_asked` | asserts a `RankViolation` and the rank stack |
 | `lock_rank::tests::work_done_032_lock_in_drop_during_an_unwind_counts_and_does_not_log` | asserts a rank-violation skip inside a destructor during an unwind; in release the assertion fails there and aborts the test process |
 | `lock_rank::tests::work_done_032_a_guard_drop_with_the_stack_borrowed_does_not_panic` | borrows the rank stack (gated before issue #2134) |
 
-The other two `orchestration/work-done/032` tests, whose assertions also hold with no rank stack, run in both. `tests/CATALOG.md`'s entry for that ID records the split.
+The other four `orchestration/work-done/032` tests in `src/lock_rank.rs` run in both. Two of them, `work_done_032_try_lock_now_does_not_wait_for_another_thread` and `work_done_032_try_lock_now_answers_poison_and_rank_as_asked`, check `try_lock_now` refusing without waiting and its poison handling in both profiles, and wrap only their rank-stack and `RankViolation` assertions in `if cfg!(debug_assertions)`, so the release tier skips those assertions and nothing else. `tests/CATALOG.md`'s entry for that ID records the split.
 
 ## Its cost
 
@@ -51,4 +49,6 @@ Measured on 2026-11-08 on the branch that added it, each from a cold `target/`. 
 | where | wall | measured |
 | --- | --- | --- |
 | RWX task, 4 CPU / 16 GB (`rwx run .rwx/release-lib.yml`) | 7m55s, 8m01s for the whole run | RWX run `01a1b9ccd5c57a53b4ffb401e471828f` |
-| GitHub Actions `release-lib`, `ubuntu-latest`, no cache yet (caches are saved only from `main`) | 13m58s | run [`42454635091`](https://github.com/vfarcic/dot-agent-deck/actions/runs/42454635091) |
+| GitHub Actions `release-lib`, `ubuntu-latest`, no cache | 13m58s | run [`42454635091`](https://github.com/vfarcic/dot-agent-deck/actions/runs/42454635091) |
+
+The GitHub job never saves a Rust cache, on `main` included (`save-if: false`), so it has none of its own to restore and builds cold every time. The repository's caches were already over GitHub's 10 GB limit when it was added (10.56 GB, 2026-11-08), and one more release-profile cache saved from `main` would evict `main`'s other entries (the cache note above `jobs:` in `ci.yml`). Sharing `build-release`'s cache was not taken: that job builds neither the lib's test target nor the dev-dependencies, so this job would still build those cold.

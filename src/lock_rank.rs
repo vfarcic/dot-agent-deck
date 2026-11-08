@@ -579,10 +579,6 @@ mod tests {
     /// Scenario: Another OS thread holds a ranked lock while this thread asks for it with `try_lock_now`. It answers `WouldBlock` at once instead of waiting, leaves nothing on this thread's rank stack, and hands out the guard once the holder lets go.
     #[spec("orchestration/work-done/032")]
     #[test]
-    // Rank checking exists only with debug assertions (issue #2134): a
-    // release-profile test build has no rank stack, so it panics on no
-    // violation. The debug tiers (`cargo test-fast`, CI's `test`) run it.
-    #[cfg(debug_assertions)]
     fn work_done_032_try_lock_now_does_not_wait_for_another_thread() {
         let mutex = Arc::new(RankedMutex::<R3, u32>::new(5));
         let (held_tx, held_rx) = std::sync::mpsc::channel();
@@ -615,7 +611,12 @@ mod tests {
         holder.join().unwrap();
         let guard = mutex.try_lock_now(OnPoison::Skip).expect("free now");
         assert_eq!(*guard, 5);
-        assert_eq!(held_ranks(), vec![R3]);
+        // The rank stack exists only with debug assertions (issue #2134): a
+        // release-profile build keeps no entry for the guard, so only this
+        // assertion is left to the debug tiers; the rest holds in both.
+        if cfg!(debug_assertions) {
+            assert_eq!(held_ranks(), vec![R3]);
+        }
         drop(guard);
         assert!(held_ranks().is_empty());
     }
@@ -623,10 +624,6 @@ mod tests {
     /// Scenario: Poison a ranked lock, then take it with `try_lock_now` under each poison policy, and take one out of rank order. `Recover` hands out the recovered guard, `Skip` answers `Poisoned`, the out-of-order one answers `RankViolation` without panicking, and the lock is still poisoned at the end.
     #[spec("orchestration/work-done/032")]
     #[test]
-    // Rank checking exists only with debug assertions (issue #2134): a
-    // release-profile test build has no rank stack, so it panics on no
-    // violation. The debug tiers (`cargo test-fast`, CI's `test`) run it.
-    #[cfg(debug_assertions)]
     fn work_done_032_try_lock_now_answers_poison_and_rank_as_asked() {
         let mutex = Arc::new(RankedMutex::<R2, u32>::new(7));
         poison(&mutex);
@@ -640,13 +637,19 @@ mod tests {
             7
         );
         assert!(mutex.is_poisoned(), "no form clears poison");
-        let registry = RankedMutex::<R4, u32>::new(0);
-        let _held = registry.lock();
-        assert_eq!(
-            mutex.try_lock_now(OnPoison::Recover).err(),
-            Some(NotNow::Unavailable(Unavailable::RankViolation))
-        );
-        assert_eq!(held_ranks(), vec![R4]);
+        // Rank checking exists only with debug assertions (issue #2134): a
+        // release-profile build answers this out-of-order call with the
+        // guard and keeps no rank stack, so only the rank half is left to
+        // the debug tiers; the poison half above holds in both.
+        if cfg!(debug_assertions) {
+            let registry = RankedMutex::<R4, u32>::new(0);
+            let _held = registry.lock();
+            assert_eq!(
+                mutex.try_lock_now(OnPoison::Recover).err(),
+                Some(NotNow::Unavailable(Unavailable::RankViolation))
+            );
+            assert_eq!(held_ranks(), vec![R4]);
+        }
     }
 
     /// A subscriber that panics on any event, so a `tracing` call made where
@@ -691,9 +694,11 @@ mod tests {
     /// Scenario: A destructor runs during an unwind with a higher rank held and a poisoned lock, under a tracing subscriber that panics on any event. `lock_in_drop` skips both without a tracing call, counts both in `SKIPPED_IN_UNWIND`, and the next ordinary acquisition reports and resets the count.
     #[spec("orchestration/work-done/032")]
     #[test]
-    // Rank checking exists only with debug assertions (issue #2134): a
-    // release-profile test build has no rank stack, so it panics on no
-    // violation. The debug tiers (`cargo test-fast`, CI's `test`) run it.
+    // Rank checking exists only with debug assertions (issue #2134): in a
+    // release-profile build `lock_in_drop` hands out the guard instead of
+    // skipping the out-of-order lock, so `SkipsInDrop`'s assertion fails
+    // inside a destructor during the unwind and aborts the test process. The
+    // debug tiers (`cargo test-fast`, CI's `test`) run it.
     #[cfg(debug_assertions)]
     fn work_done_032_lock_in_drop_during_an_unwind_counts_and_does_not_log() {
         let returns = RankedMutex::<R2, u32>::new(0);
