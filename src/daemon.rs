@@ -776,6 +776,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // are then pointed nowhere rather than at the default endpoint.
     pty_registry.set_attach_socket(daemon.attach_socket_path.clone());
     let state = daemon.state;
+    // PRD #1666 part 3, round 5-wake (plan §3.4′): the doorbell's
+    // re-projection publisher, before anything can ask it to run.
+    let doorbell_publisher = pty_registry.spawn_doorbell_publisher();
     // PRD #1666 S4: the doorbell, for agents no inbox component is armed for.
     let doorbell = crate::doorbell::spawn(
         Arc::clone(&pty_registry),
@@ -1071,6 +1074,18 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #1666 part 3 (Q35-20e): unconditional — every attached client's
+    // card follows the typing the deck holds for its pane. Waits on the
+    // registry's display notice, so it runs no timer while nothing is held.
+    let input_held_handle = {
+        let registry = pty_registry.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(crate::agent_pty::watch_input_held(
+            registry,
+            monitor_event_tx,
+        ))
+    };
+
     // PRD #2050: unconditional — how an OpenCode agent runs is read from its
     // pane's process tree, and its card says when the deck cannot fully
     // support that. Idle unless an OpenCode agent runs.
@@ -1127,12 +1142,16 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    input_held_handle.abort();
     opencode_mode_handle.abort();
     pull_request_handle.abort();
     scheduler_handle.abort();
     inbox_ticker.abort();
     offer_assigner.abort();
     doorbell.abort();
+    if let Some(publisher) = doorbell_publisher {
+        publisher.abort();
+    }
     if let Some(h) = orphan_handle {
         h.abort();
     }
@@ -1857,6 +1876,13 @@ async fn ingest_hook_event(
             )
         })
     };
+    // PRD #1666 part 3, round 5-wake (plan §4.6): the generation's first
+    // `UserPromptSubmit`, attested to it, closes its header window.
+    if event.user_prompt.is_some()
+        && let Some(owner) = attested_agent.as_deref()
+    {
+        registry.close_release_window(owner);
+    }
     let event_type = event.event_type.clone();
     let claimed_pane = event.pane_id.clone();
     let ingested = ingest_event_unless(
@@ -2100,38 +2126,30 @@ where
             registry.quota_note_work_event(pane_id, generation);
         }
     }
-    // PRD #1666: an Idle from the pane's own agent that ends a turn it
-    // reported starting ends what a run of the user's Escape keys could have
-    // been holding, the interrupt of that turn, so the doorbell stops reading
-    // those keys as a draft (`DraftTracker::turn_ended`). Under this lock,
-    // like the quota latch, so it reaches the tracker in the order the card
-    // sees it.
+    // PRD #1666: the pane's turn clock. An Idle from the pane's own agent
+    // ends a turn it reported starting, and the doorbell's episodes and the
+    // inbox's turn clock count it. Under this lock, like the quota latch, so
+    // it reaches the clock in the order the card sees it.
     //
     // A turn starts with a report that the agent is working: thinking, a
     // tool starting, compacting or a permission request (r8k R8G-02). A tool
     // FINISHING starts nothing: a ToolEnd that arrives after its turn's Idle
-    // would otherwise open a turn the next Idle "ends", releasing Escapes
-    // that opened a menu meanwhile (Qodo r8, PR #1735), and the daemon cannot
-    // tell it from the first report of a turn whose start it never saw. So a
-    // turn whose start report is missing (lost, or its hook switched off)
-    // releases nothing when it ends, and its Escapes hold until a submit or
-    // the user's clear, the Enter the user docs give. An Idle with no turn
-    // under way releases nothing: a repeated Idle (OpenCode sends two) must not
-    // release the Escapes that opened a menu on an agent already Idle. A
-    // line `dot-agent-deck wrap` classified from the child's output proves
-    // only that it printed something, or stopped printing, so it neither
-    // starts nor ends a turn: a wrapped Codex's quiet-output Idle does not
-    // end a turn its hooks reported (Qodo r8). A wrapper-only agent
-    // therefore has no turn end to release on, and its Escapes hold until a
-    // submit or the user's clear.
+    // would otherwise open a turn the next Idle "ends" (Qodo r8, PR #1735),
+    // and the daemon cannot tell it from the first report of a turn whose
+    // start it never saw. So a turn whose start report is missing (lost, or
+    // its hook switched off) counts nothing when it ends. An Idle with no
+    // turn under way counts nothing: OpenCode sends two. A line
+    // `dot-agent-deck wrap` classified from the child's output proves only
+    // that it printed something, or stopped printing, so it neither starts
+    // nor ends a turn: a wrapped Codex's quiet-output Idle does not end a
+    // turn its hooks reported (Qodo r8).
     //
     // Only the generation that sent it counts, as for the quota latch: the
     // one it names, or the one its token was minted for, and the registry
     // applies it only while that generation is the pane's live owner, or
     // keeps it for a spawn reserved on the pane (r8g R8G-01). A report with
     // neither touches nothing. An event the daemon authored is no turn of the
-    // agent's, and a subagent's turn is not the main thread's the user
-    // interrupted.
+    // agent's, and a subagent's turn is not the main thread's.
     let turn_edge = match event.event_type {
         _ if event.is_wrapper_output_classified() => None,
         crate::event::EventType::Idle => Some(crate::agent_pty::TurnEdge::Ended),
@@ -2141,6 +2159,24 @@ where
         | crate::event::EventType::PermissionRequest => Some(crate::agent_pty::TurnEdge::Started),
         _ => None,
     };
+    // PRD #1666 part 3, round 5-wake (plan rev 2 §6): the wrapper's report of
+    // how the command it ran exited, on its final event, for the notices its
+    // generation's exit owes. The same generation checks as the turn edge;
+    // the registry keeps it only for a wrapped generation, and the hook socket
+    // only from that generation's own child
+    // ([`keep_wrapper_report_from_own_child`]). That is not an authenticated
+    // wrapper identity: a same-user process is inside the accepted trust
+    // boundary (`crate::hook_provenance`).
+    if !unproven
+        && !event.is_daemon_synthetic()
+        && let Some(ended) = event
+            .metadata
+            .get(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+        && let Some(pane_id) = event.pane_id.as_deref()
+        && let Some(generation) = event.agent_id.as_deref().or(attested_agent)
+    {
+        registry.note_wrapper_child_exit(pane_id, generation, ended);
+    }
     if !unproven
         && let Some(edge) = turn_edge
         && !event.is_daemon_synthetic()
@@ -2356,7 +2392,9 @@ pub(crate) fn note_pending_question(
 ///   same id and content ([`crate::question::PendingQuestion::same_content`]),
 ///   keeps that revision — and keeps a keyboard-only channel the daemon set on
 ///   it after typing part of an answer, so a repeat cannot make a half-typed
-///   form answerable again.
+///   form answerable again. (The `answer_queued` mark of an answer a fence
+///   holds is kept by the state's apply, which reads the question off the
+///   event, sanitized of the mark: Q35-17.)
 /// - Anything else is new content and gets a fresh revision; a hold on the old
 ///   one is then released by the reconciliation that follows the apply.
 ///
@@ -2814,6 +2852,56 @@ fn strip_question_metadata(event: &mut AgentEvent) {
     event
         .metadata
         .remove(crate::event::QUESTION_RESOLVED_METADATA_KEY);
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): keep the wrapper's report
+/// of how the command it ran exited
+/// ([`crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY`]) only on a frame the
+/// generation's own child sent: the process the deck started in the pane,
+/// which is the wrapper. What runs below it inherits the pane, the generation
+/// and the hook capability, so without this a `dot-agent-deck wrap` nested
+/// inside the agent, reporting its own child's exit first, would be the
+/// generation's first report and win over the outer wrapper's. Its report is
+/// dropped, and the capture keeps the outer wrapper's, or the deck's own
+/// status. `peer` is the connecting process as the hook socket accepted it.
+///
+/// The peer is the child only when its pid and its start time, read when the
+/// connection was accepted, are the child's as the deck spawned it, so a
+/// process that later reuses a reaped child's pid is not taken for it; a start
+/// time either side could not read drops the report.
+///
+/// This tells the deck's child from its descendants. It does not authenticate
+/// the report: a process running as the deck's user can still impersonate the
+/// wrapper, which is inside the accepted trust boundary
+/// (`crate::hook_provenance`), and the report only chooses a notice's words.
+fn keep_wrapper_report_from_own_child(
+    event: &mut AgentEvent,
+    peer: Option<AcceptedPeer>,
+    attested_agent: Option<&str>,
+    registry: &AgentPtyRegistry,
+) {
+    if !event
+        .metadata
+        .contains_key(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+    {
+        return;
+    }
+    let own_child = event
+        .agent_id
+        .as_deref()
+        .or(attested_agent)
+        .and_then(|generation| registry.child_identity(generation));
+    let from_own_child = match (own_child, peer) {
+        (Some((pid, Some(started))), Some(peer)) => {
+            peer.pid == pid && peer.started == Some(started)
+        }
+        _ => false,
+    };
+    if !from_own_child {
+        event
+            .metadata
+            .remove(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY);
+    }
 }
 
 /// PRD #1631: an event the daemon itself ingests about the question
@@ -5945,8 +6033,20 @@ async fn run_hook_loop_with_limits(
                         crate::platform::peercred::peer_pid(&stream).ok(),
                         crate::platform::peercred::peer_is_same_user(&stream),
                     );
+                    // PRD #1666 part 3 (Q35-14b): the connection's descriptor,
+                    // for an editor helper's `SO_PEERPIDFD` and for what is
+                    // pending on it at its read deadline. Used only by
+                    // synchronous calls in this task, while the halves below,
+                    // which own it, are alive; never handed to another task
+                    // (Q84: what crosses to a blocking task is an `OwnedFd`).
+                    #[cfg(target_os = "linux")]
+                    let composer_socket = std::os::fd::AsRawFd::as_raw_fd(&stream);
+                    #[cfg(target_os = "linux")]
+                    let mut composer_conn: Option<crate::composer_probe::observe::Connection> =
+                        None;
                     let (read_half, mut write_half) = tokio::io::split(stream);
                     let mut reader = tokio::io::BufReader::new(read_half);
+                    let mut line_buf = crate::bounded_read::CappedLine::default();
 
                     // Issue #903 (duplicate #319): this used to be
                     // `reader.lines()` driven by `next_line()`, which grows its
@@ -5966,11 +6066,49 @@ async fn run_hook_loop_with_limits(
                         // the daemon is the one working: `dispatch`'s worktree
                         // creation and `delegate`'s `clear = true` respawn both
                         // run in the arms below, outside this call.
-                        let read = crate::bounded_read::read_capped_line(
+                        // PRD #1666 part 3 (Q84, Q85): a registered composer
+                        // connection whose helper's exit the observer saw
+                        // reads until its read deadline, one instant for the
+                        // whole connection, and ends there; what it hadn't
+                        // read by then makes its record's drain uncertain.
+                        // `line_buf` keeps a partial line across the race.
+                        #[cfg(target_os = "linux")]
+                        let read = crate::composer_probe::observe::read_line(
+                            composer_conn.as_ref(),
+                            &mut line_buf,
                             &mut reader,
+                            // SAFETY: the connection's own descriptor, owned
+                            // by the halves alive in this task for the whole
+                            // read.
+                            unsafe { std::os::fd::BorrowedFd::borrow_raw(composer_socket) },
                             crate::bounded_read::MAX_HOOK_LINE_BYTES,
                         );
-                        let line = match tokio::time::timeout(idle_timeout, read).await
+                        #[cfg(not(target_os = "linux"))]
+                        let read = async {
+                            Some(
+                                line_buf
+                                    .read(&mut reader, crate::bounded_read::MAX_HOOK_LINE_BYTES)
+                                    .await,
+                            )
+                        };
+                        let line = match tokio::time::timeout(idle_timeout, read)
+                            .await
+                            .map(|read| read.ok_or(()))
+                        {
+                            // The read deadline: the connection ends.
+                            Ok(Err(())) => break,
+                            Ok(Ok(read)) => Ok(read),
+                            Err(elapsed) => Err(elapsed),
+                        };
+                        // A composer connection ending mid-line or on a line
+                        // it refused leaves its record's evidence unread.
+                        #[cfg(target_os = "linux")]
+                        if let Some(conn) = composer_conn.as_ref()
+                            && (line_buf.partial() || matches!(line, Ok(Err(_))))
+                        {
+                            conn.lose();
+                        }
+                        let line = match line
                         {
                             Err(_elapsed) => {
                                 warn!(
@@ -6564,6 +6702,23 @@ async fn run_hook_loop_with_limits(
                                     let Some(agent_id) = attested_agent else {
                                         continue;
                                     };
+                                    // PRD #1666 part 3, round 5-wake (plan
+                                    // §1.4): a prompt hook's ring evidence,
+                                    // handed on whether or not the fetch
+                                    // grants anything.
+                                    if let Some(token) = req.doorbell_ring.as_deref() {
+                                        pty_registry.note_doorbell_evidence(
+                                            crate::agent_pty::RingEvidence {
+                                                pane_id: req.pane_id.clone(),
+                                                agent_id: agent_id.clone(),
+                                                message_id: req.doorbell.clone(),
+                                                token: token.to_string(),
+                                                shape: req
+                                                    .doorbell_prompt
+                                                    .unwrap_or(crate::event::PromptShape::Unknown),
+                                            },
+                                        );
+                                    }
                                     // Part 2 §2.4, §2.7: a hook's fetch is a
                                     // one-shot receiver of its own, held on
                                     // this connection for its controls; below
@@ -7208,6 +7363,42 @@ async fn run_hook_loop_with_limits(
                                         .await;
                                 }
                                 DaemonMessage::HookCapabilities(_) => {
+                                    // PRD #1666 part 3 (Q35-14b): the composer
+                                    // capability, only to an installed
+                                    // generation's helper copy, named by this
+                                    // connection's `SO_PEERPIDFD` (Q81), and
+                                    // only within the connection budgets.
+                                    #[cfg(target_os = "linux")]
+                                    let composer_probe = match attested_agent
+                                        .as_deref()
+                                        .and_then(|agent| pty_registry.composer_observer(agent))
+                                    {
+                                        Some(observer) => {
+                                            // SAFETY: the connection's own
+                                            // descriptor, owned by the halves
+                                            // alive in this task, borrowed
+                                            // only for this synchronous call.
+                                            let socket = unsafe {
+                                                std::os::fd::BorrowedFd::borrow_raw(composer_socket)
+                                            };
+                                            // The peer pidfd, an `OwnedFd`, is
+                                            // what crosses to the blocking task.
+                                            let peer =
+                                                crate::composer_probe::attest::peer_pidfd_of(socket);
+                                            composer_conn = tokio::task::spawn_blocking(move || {
+                                                observer.connect(peer)
+                                            })
+                                            .await
+                                            .ok()
+                                            .flatten();
+                                            composer_conn
+                                                .as_ref()
+                                                .map(|_| crate::event::COMPOSER_PROBE)
+                                        }
+                                        None => None,
+                                    };
+                                    #[cfg(not(target_os = "linux"))]
+                                    let composer_probe = None;
                                     // PRD #1666 part 3, round 5 (plan D1): the
                                     // question, answered on this connection,
                                     // which then carries the mutation.
@@ -7215,9 +7406,192 @@ async fn run_hook_loop_with_limits(
                                         task_scoped_completion: Some(
                                             crate::event::TASK_SCOPED_COMPLETION,
                                         ),
+                                        // PRD #1666 part 3, round 5-wake:
+                                        // `input_mode` reports are stored.
+                                        input_mode_report: Some(
+                                            crate::input_mode::INPUT_MODE_REPORT,
+                                        ),
+                                        composer_probe,
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
+                                        let line = format!("{json}\n");
+                                        if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                            .await
+                                            .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                }
+                                DaemonMessage::ComposerInvocation(request) => {
+                                    // PRD #1666 part 3 (Q35-14b): served only
+                                    // on a connection this daemon told the
+                                    // capability, by the attested agent's
+                                    // observer; anything else is unsupported,
+                                    // and none of its request is read.
+                                    #[cfg(target_os = "linux")]
+                                    let served = composer_conn.take().filter(|conn| {
+                                        attested_agent.as_deref().is_some_and(|agent| {
+                                            pty_registry
+                                                .composer_observer(agent)
+                                                .is_some_and(|o| Arc::ptr_eq(&o, conn.observer()))
+                                        })
+                                    });
+                                    #[cfg(target_os = "linux")]
+                                    let Some(conn) = served
+                                    else {
+                                        let reply =
+                                            crate::event::ComposerInvocationReply::unsupported();
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    };
+                                    #[cfg(not(target_os = "linux"))]
+                                    {
+                                        let _ = request;
+                                        let reply =
+                                            crate::event::ComposerInvocationReply::unsupported();
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    #[cfg(target_os = "linux")]
+                                    {
+                                        let editor_bearing = request.decision
+                                            != crate::event::ComposerDecision::Armed;
+                                        let (conn, outcome) = match tokio::task::spawn_blocking(
+                                            move || {
+                                                let outcome =
+                                                    conn.observer().invocation(&conn, &request);
+                                                (conn, outcome)
+                                            },
+                                        )
+                                        .await
+                                        {
+                                            Ok(answered) => answered,
+                                            Err(_) => break,
+                                        };
+                                        let reply = crate::event::ComposerInvocationReply {
+                                            outcome: Some(outcome),
+                                            ..Default::default()
+                                        };
+                                        if let Ok(json) = serde_json::to_string(&reply) {
+                                            let line = format!("{json}\n");
+                                            if write_hook_reply(&mut write_half, &line, idle_timeout)
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        // The helper's report comes after its
+                                        // editor, which runs as long as the
+                                        // user edits: this connection gives its
+                                        // hook slot back and holds its composer
+                                        // slot instead, and reads one bounded
+                                        // line, or the end.
+                                        // It reads until its helper's exit
+                                        // plus the read deadline (Q84, Q85);
+                                        // what it hadn't read by then, or a
+                                        // report it refused or couldn't
+                                        // parse, makes the drain uncertain.
+                                        if editor_bearing {
+                                            permit.take();
+                                            let line = match crate::composer_probe::observe::read_line(
+                                                Some(&conn),
+                                                &mut line_buf,
+                                                &mut reader,
+                                                // SAFETY: the connection's own
+                                                // descriptor, owned by the
+                                                // halves alive in this task for
+                                                // the whole read.
+                                                unsafe {
+                                                    std::os::fd::BorrowedFd::borrow_raw(
+                                                        composer_socket,
+                                                    )
+                                                },
+                                                crate::composer_probe::observe::REPORT_BYTES,
+                                            )
+                                            .await
+                                            {
+                                                Some(Ok(line)) => line,
+                                                Some(Err(_)) => {
+                                                    conn.lose();
+                                                    None
+                                                }
+                                                None => None,
+                                            };
+                                            if let Some(line) = line {
+                                                match serde_json::from_str::<
+                                                    crate::event::EditorReport,
+                                                >(line.trim())
+                                                {
+                                                    Ok(report) => {
+                                                        let _ = tokio::task::spawn_blocking(
+                                                            move || {
+                                                                conn.observer().report(&conn, report);
+                                                            },
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(_) => conn.lose(),
+                                                }
+                                            }
+                                        }
+                                        break;
+                                    }
+                                }
+                                DaemonMessage::InputMode(report) => {
+                                    // PRD #1666 part 3, round 5-wake (plan
+                                    // §1.3): the generation's input-mode
+                                    // store, and nothing else.
+                                    let verdict = match (attested_agent.as_deref(), peer_pid) {
+                                        (Some(agent_id), Some(peer)) => match peer.started {
+                                            Some(start) => pty_registry
+                                                .accept_input_mode(
+                                                    agent_id,
+                                                    crate::input_mode::Observer {
+                                                        pid: peer.pid,
+                                                        start,
+                                                    },
+                                                    crate::input_mode::ModeSample {
+                                                        seq: report.seq,
+                                                        icanon: report.icanon,
+                                                        echo: report.echo,
+                                                        sampled_mono_ns: report.sampled_mono_ns,
+                                                        sample_done_mono_ns: report
+                                                            .sample_done_mono_ns,
+                                                    },
+                                                )
+                                                .map(|_| ()),
+                                            None => Err("peer_start_unreadable"),
+                                        },
+                                        (None, _) => Err("unattested"),
+                                        (_, None) => Err("peer_unreadable"),
+                                    };
+                                    let ack = match verdict {
+                                        Ok(()) => crate::event::SignalAck::accepted(),
+                                        Err(code) => crate::event::SignalAck::refused(
+                                            code,
+                                            "the input-mode report was not stored",
+                                        ),
+                                    };
+                                    if let Ok(json) = serde_json::to_string(&ack) {
                                         let line = format!("{json}\n");
                                         if write_hook_reply(&mut write_half, &line, idle_timeout)
                                             .await
@@ -7373,8 +7747,15 @@ async fn run_hook_loop_with_limits(
                                     // reply would otherwise read and dispatch
                                     // more lines outside both bounds.
                                     let ack = signal.ack;
+                                    let mut signal = *signal;
+                                    keep_wrapper_report_from_own_child(
+                                        &mut signal.event,
+                                        peer_pid,
+                                        attested_agent.as_deref(),
+                                        &pty_registry,
+                                    );
                                     let Some(held) = handle_question_signal(
-                                        *signal,
+                                        signal,
                                         attested_agent.clone(),
                                         unproven,
                                         &state,
@@ -7583,6 +7964,12 @@ async fn run_hook_loop_with_limits(
                             // Issue #714: normalise the quota-block keys, and hand
                             // a Codex event's rollout and turn to the tailer.
                             admit_producer_event(&mut event);
+                            keep_wrapper_report_from_own_child(
+                                &mut event,
+                                peer_pid,
+                                attested_agent.as_deref(),
+                                &pty_registry,
+                            );
                             // PRD #1666 S6: a prompt that is the deck's own
                             // message is acknowledged and labelled here, for the
                             // agent the token attests, before anything reads it.
@@ -7744,6 +8131,15 @@ async fn run_hook_loop_with_limits(
                             )
                             .await;
                         } else {
+                            // PRD #1666 part 3 (Q87): on a registered composer
+                            // connection a line it can't parse, half an
+                            // invocation ended by the peer's close among them,
+                            // is evidence unread, so its helper's exit drains
+                            // only uncertain. Other connections are unchanged.
+                            #[cfg(target_os = "linux")]
+                            if let Some(conn) = composer_conn.as_ref() {
+                                conn.lose();
+                            }
                             // The line is producer-controlled, and issue #903
                             // is about not letting a producer make the daemon
                             // spend unbounded resources on a message it is
@@ -8263,6 +8659,8 @@ mod quota_admission_tests {
                 wake: crate::inbox_hub::WakePath::Doorbell,
                 component: None,
                 wake_stalled: false,
+                wake_hold: None,
+                hold_detail: None,
                 notices: crate::inbox_hub::InboxCardNotices {
                     integration: Some(crate::inbox_display::IntegrationNotice::RefreshFailedPi),
                     ..Default::default()
@@ -8417,6 +8815,77 @@ mod hook_ingestion_tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::io::AsyncWriteExt;
     use tokio::net::{UnixListener, UnixStream};
+
+    /// Scenario: PRD #1666 part 3 (Q35-21; 059's prompt-report cases, moved to 002). Type into a live Claude Code pane's agent, so its box is touched, then ingest hook events for that pane through the daemon: the agent's thinking report, a tool starting, its prompt hook's report of a prompt it took, the deck's own line it recognised and the turn ending, a prompt report from the pane's previous generation, and a subagent's prompt report. None of them moves the box's input epoch, so the box stays touched and only a check can read it empty.
+    #[spec("inbox/probe/002")]
+    #[tokio::test]
+    async fn probe_002_the_daemons_prompt_reports_never_move_the_epoch() {
+        let pane = "prompt-report";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let owner = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("/bin/cat"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                agent_type: Some(AgentType::ClaudeCode),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn stand-in");
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane.to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let event = |event_type, prompt: Option<&str>| {
+            let mut event = super::quota_admission_tests::quota_frame(event_type);
+            event.pane_id = Some(pane.to_string());
+            event.agent_id = Some(owner.clone());
+            event.user_prompt = prompt.map(str::to_string);
+            event
+        };
+        use crate::event::EventType::{Idle, Thinking, ToolStart};
+        registry
+            .write_user_bytes(pane, &owner, b"\x1b[A\r")
+            .await
+            .unwrap();
+        let input = registry.composer_input(&owner).expect("the owner's input");
+        let typed = input.epoch();
+        assert!(typed.touched(), "the user's keys touched the box");
+        let mut deck = event(Thinking, Some("\u{2709} task"));
+        deck.metadata.insert(
+            crate::inbox_prompt::DECK_MESSAGE_METADATA_KEY.to_string(),
+            "1".to_string(),
+        );
+        for (what, frame) in [
+            ("a thinking report", event(Thinking, None)),
+            (
+                "the prompt it took",
+                event(Thinking, Some("the recalled prompt")),
+            ),
+            ("the deck's own line", deck),
+            ("the turn ending", event(Idle, None)),
+            ("a tool starting", event(ToolStart, None)),
+            ("a predecessor's prompt", {
+                let mut frame = event(Thinking, Some("old prompt"));
+                frame.agent_id = Some("a-predecessor".to_string());
+                frame
+            }),
+            ("a subagent's prompt", {
+                let mut frame = event(Thinking, Some("sub prompt"));
+                frame.metadata.insert(
+                    crate::event::SUBAGENT_ID_METADATA_KEY.to_string(),
+                    "sub-1".to_string(),
+                );
+                frame
+            }),
+        ] {
+            ingest_event(&state, &event_tx, &registry, frame).await;
+            assert_eq!(input.epoch(), typed, "{what}: the epoch is unchanged");
+            assert!(registry.input_touched(&owner), "{what}: still touched");
+        }
+        registry.shutdown_all();
+    }
 
     /// Issue #714: the Codex rollout tailer is armed only for an event whose
     /// pane and agent name the pane's live owner, and only by a genuine Codex
@@ -9628,6 +10097,146 @@ mod hook_ingestion_tests {
         // Await the aborted task so it drops its `registry` Arc clone before
         // we tear the registry down — strictly sequences cleanup instead of
         // racing `shutdown_all` against the still-live loop task.
+        let _ = handle.await;
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #1666 part 3, round 5-wake. A wrapped generation's final event names how the wrapper's command exited. The report is kept when the deck's own child sent it, and dropped when anything else did: a `dot-agent-deck wrap` nested below it (another pid with the same pane, generation and token), a later process given the child's pid (the same pid, started at another time), a connection whose sender or start time cannot be read, or a generation the registry does not hold.
+    #[spec("inbox/status/032")]
+    #[test]
+    fn status_032_only_the_decks_own_child_reports_its_commands_exit() {
+        let pane = "wrapper-report";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let generation = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        let child = registry.child_pid(&generation).expect("child pid");
+        let born = crate::platform::proc::process_start_of(child).expect("child start time");
+        let peer = |pid, started| {
+            Some(AcceptedPeer {
+                pid,
+                started,
+                same_user: Some(true),
+            })
+        };
+        let kept = |peer, agent: &str| {
+            let mut event =
+                super::quota_admission_tests::quota_frame(crate::event::EventType::Idle);
+            event.pane_id = Some(pane.to_string());
+            event.agent_id = Some(agent.to_string());
+            event.metadata.insert(
+                crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY.to_string(),
+                "5".to_string(),
+            );
+            keep_wrapper_report_from_own_child(&mut event, peer, None, &registry);
+            event
+                .metadata
+                .contains_key(crate::event::WRAPPER_CHILD_EXIT_METADATA_KEY)
+        };
+        assert!(
+            kept(peer(child, Some(born)), &generation),
+            "the deck's own child"
+        );
+        assert!(
+            !kept(peer(child + 1, Some(born)), &generation),
+            "a nested wrapper"
+        );
+        assert!(
+            !kept(peer(child, Some(born + 1)), &generation),
+            "a later process reusing the child's pid"
+        );
+        assert!(
+            !kept(peer(child, None), &generation),
+            "a sender whose start time could not be read"
+        );
+        assert!(!kept(None, &generation), "an unreadable sender");
+        assert!(
+            !kept(peer(child, Some(born)), "another-generation"),
+            "another generation"
+        );
+        registry.shutdown_all();
+    }
+
+    /// Scenario: PRD #1666 part 3, round 5-wake. Through the real hook socket, a process that is not the deck's child (as a `dot-agent-deck wrap` nested inside the agent is) sends the wrapped generation's final event, attested by the generation's own token and naming its command's exit. The event itself is applied, so the pane learns its agent type, but its exit report is not recorded for the generation, leaving that to the deck's own wrapper.
+    #[spec("inbox/status/032")]
+    #[tokio::test]
+    async fn status_032_a_nested_wrappers_exit_report_is_dropped_at_the_socket() {
+        let pane = "nested-wrapper";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let generation = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    DOT_AGENT_DECK_PANE_ID.to_string(),
+                    pane.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn");
+        assert_eq!(registry.wrapper_report_for_test(&generation), None);
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+            .expect("chmod tempdir");
+        let sock = dir.path().join("hook.sock");
+        let listener =
+            IpcListener::from_tokio_listener(UnixListener::bind(&sock).expect("bind hook socket"));
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(pane.to_string());
+        let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+        let handle = tokio::spawn({
+            let registry = registry.clone();
+            let state = state.clone();
+            let wtr = crate::issue_dispatch_run::new_worktree_registry();
+            async move {
+                run_hook_loop(
+                    listener,
+                    state,
+                    event_tx,
+                    registry,
+                    Arc::new(Notify::new()),
+                    wtr,
+                )
+                .await
+            }
+        });
+        let event = serde_json::json!({
+            "session_id": "nested-sess",
+            "agent_type": "codex",
+            "event_type": "idle",
+            "timestamp": "2026-10-26T12:00:00Z",
+            "pane_id": pane,
+            "agent_id": generation,
+            "metadata": { "wrapper_child_exit": "7" },
+            "token": registry.hook_token_of(&generation).expect("capability"),
+        });
+        let mut stream = UnixStream::connect(&sock).await.expect("connect");
+        stream
+            .write_all(format!("{event}\n").as_bytes())
+            .await
+            .expect("write hook line");
+        stream.flush().await.unwrap();
+        // The event's agent type reaching the registry is what says the
+        // event itself was ingested.
+        let mut applied = false;
+        for _ in 0..80 {
+            if registry.agent_records()[0].agent_type == Some(AgentType::Codex) {
+                applied = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(applied, "the event itself was ingested");
+        assert_eq!(
+            registry.wrapper_report_for_test(&generation),
+            None,
+            "a report from below the deck's child is not the generation's"
+        );
+        handle.abort();
         let _ = handle.await;
         registry.shutdown_all();
     }
@@ -16212,6 +16821,758 @@ mod hook_provenance_audit_tests {
         deck.stop().await;
     }
 
+    /// Scenario: A generation's prompt hook sends doorbell fetches to the daemon's real hook socket while a doorbell transaction listens on the pane: one carrying a ring token for a message that is not queued, one from an older hook with no ring, and one carrying a ring but attested by another pane's token. Only the first reaches the pane's evidence channel, with the generation, message, token and shape, although its fetch granted nothing.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test]
+    async fn doorbell_046_a_hooks_ring_evidence_reaches_the_panes_channel() {
+        use crate::event::PromptShape;
+        const PANE: &str = "pane-ring-evidence";
+        const OTHER: &str = "pane-ring-other";
+        const MESSAGE: &str = "m-abcdefgh-0123456789abcdef";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/bin/cat");
+        let token = registry
+            .hook_token_of(&agent)
+            .expect("the generation's token");
+        let other = spawn(&registry, Some(OTHER), "/bin/cat");
+        let other_token = registry.hook_token_of(&other).expect("the other token");
+        let mut evidence = registry.subscribe_doorbell_evidence(PANE);
+        let deck = AuditDeck::start(registry.clone()).await;
+        let fetch = |token: &str, agent: &str, ring: Option<&str>| {
+            let mut line = serde_json::json!({
+                "message_type": "inbox_fetch", "pane_id": PANE, "agent_id": agent,
+                "token": token, "consumer": "doorbell_hook", "doorbell": MESSAGE,
+                "max_chars": 4096
+            });
+            if let Some(ring) = ring {
+                line["doorbell_ring"] = ring.into();
+                line["doorbell_prompt"] = "exact".into();
+            }
+            line
+        };
+        // A fetch is answered (here refused: these stand-ins run no deck
+        // hooks); the evidence is handed on before its answer either way.
+        let ask = |payload: serde_json::Value| {
+            let deck = &deck;
+            async move {
+                use tokio::io::AsyncBufReadExt;
+                let stream = deck.open(payload).await;
+                let mut reply = String::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::io::BufReader::new(stream).read_line(&mut reply),
+                )
+                .await;
+            }
+        };
+        ask(fetch(&token, &agent, Some("abcdfg"))).await;
+        let got = tokio::time::timeout(Duration::from_secs(5), evidence.recv())
+            .await
+            .expect("the evidence arrives")
+            .expect("the channel is open");
+        assert_eq!(
+            got,
+            crate::agent_pty::RingEvidence {
+                pane_id: PANE.to_string(),
+                agent_id: agent.clone(),
+                message_id: Some(MESSAGE.to_string()),
+                token: "abcdfg".to_string(),
+                shape: PromptShape::Exact,
+            }
+        );
+        ask(fetch(&token, &agent, None)).await;
+        ask(fetch(&other_token, &other, Some("zzzzzz"))).await;
+        // A later report from the generation is the next thing on the channel.
+        ask(fetch(&token, &agent, Some("bcdfgi"))).await;
+        let next = tokio::time::timeout(Duration::from_secs(5), evidence.recv())
+            .await
+            .expect("the evidence arrives")
+            .expect("the channel is open");
+        assert_eq!(
+            next.token, "bcdfgi",
+            "no evidence came from the older hook or the other pane"
+        );
+        deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A generation has an open doorbell attempt and nothing listens on its pane's evidence channel. Through the daemon's real hook socket its prompt hook reports the attempt's token shaped with other text, then another pane's hook reports the same token, then its own hook reports it exact. Only the last moves the generation's latch cell, on receipt, to submitted; the cell never waits for a transaction to drain the channel.
+    #[spec("inbox/doorbell/046")]
+    #[tokio::test]
+    async fn doorbell_046_the_hook_arm_resolves_the_open_attempt_on_receipt() {
+        use crate::doorbell_txn::{Latch, Resolution, RingToken};
+        const PANE: &str = "pane-ring-cell";
+        const OTHER: &str = "pane-ring-cell-other";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/bin/cat");
+        let token = registry.hook_token_of(&agent).expect("the token");
+        let other = spawn(&registry, Some(OTHER), "/bin/cat");
+        let other_token = registry.hook_token_of(&other).expect("the other token");
+        let doorbell = registry.generation_doorbell(&agent).expect("its doorbell");
+        let attempt = doorbell.counter().allocate().unwrap();
+        doorbell
+            .ring()
+            .record(attempt, RingToken::parse("abcdfg").unwrap());
+        doorbell.cell().open(attempt).unwrap();
+        let deck = AuditDeck::start(registry.clone()).await;
+        let fetch = |token: &str, agent: &str, pane: &str, shape: &str| {
+            serde_json::json!({
+                "message_type": "inbox_fetch", "pane_id": pane, "agent_id": agent,
+                "token": token, "consumer": "doorbell_hook",
+                "doorbell": "m-abcdefgh-0123456789abcdef", "max_chars": 4096,
+                "doorbell_ring": "abcdfg", "doorbell_prompt": shape
+            })
+        };
+        let ask = |payload: serde_json::Value| {
+            let deck = &deck;
+            async move {
+                use tokio::io::AsyncBufReadExt;
+                let stream = deck.open(payload).await;
+                let mut reply = String::new();
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    tokio::io::BufReader::new(stream).read_line(&mut reply),
+                )
+                .await;
+            }
+        };
+        ask(fetch(&token, &agent, PANE, "with_other_text")).await;
+        assert_eq!(doorbell.cell().load(), Latch::Open(attempt), "not exact");
+        ask(fetch(&other_token, &other, OTHER, "exact")).await;
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Open(attempt),
+            "another generation's hook"
+        );
+        ask(fetch(&token, &agent, PANE, "exact")).await;
+        assert_eq!(
+            doorbell.cell().load(),
+            Latch::Resolved(attempt, Resolution::Submitted)
+        );
+        deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A generation is spawned, and status events reach the daemon's real hook socket: one carrying no prompt, then a prompt with no hook token, then a prompt attested by the generation's own token. Only the attested prompt closes the generation's header window, at the first prompt; the others leave its scanner reading.
+    #[spec("inbox/doorbell/055")]
+    #[tokio::test]
+    async fn doorbell_055_an_attested_prompt_closes_the_header_window() {
+        use crate::release_scanner::WindowClose;
+        const PANE: &str = "pane-release-prompt";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let agent = spawn(&registry, Some(PANE), "/bin/cat");
+        let token = registry
+            .hook_token_of(&agent)
+            .expect("the generation's token");
+        let deck = AuditDeck::start(registry.clone()).await;
+        let status = |prompt: Option<&str>, token: Option<&str>| {
+            let mut payload = line(PANE, Some(PANE), Some(&agent), "thinking", token);
+            if let Some(prompt) = prompt {
+                payload["user_prompt"] = prompt.into();
+            }
+            payload
+        };
+        let open = |registry: &AgentPtyRegistry| registry.release_capture(&agent).unwrap();
+        deck.send(status(None, Some(&token))).await;
+        assert!(
+            open(&registry).2,
+            "a status event with no prompt left the window open"
+        );
+        deck.send(status(Some("hello"), None)).await;
+        assert!(open(&registry).2, "an unattested prompt closed the window");
+        deck.send(status(Some("hello"), Some(&token))).await;
+        let (_, closed, alive) = open(&registry);
+        assert!(!alive);
+        assert_eq!(closed, Some(WindowClose::FirstPrompt));
+        deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// PRD #1666 part 3, round 5-wake: the variable that turns this test
+    /// binary into 051's helper process, with its [`ModeHelper`] as JSON.
+    const MODE_HELPER: &str = "DAD_TEST_INPUT_MODE_HELPER";
+    const MODE_HELPER_TEST: &str = "daemon::hook_provenance_audit_tests::input_mode_helper_process";
+
+    /// A pane's child for 051: a shell that runs each line typed into its PTY,
+    /// so every helper it starts is in the pane's session.
+    const MODE_SHELL: &str = "while read -r line; do eval \"$line\"; done";
+
+    /// What one 051 helper process sends, and how.
+    #[derive(Clone, serde::Serialize, serde::Deserialize)]
+    struct ModeHelper {
+        sock: std::path::PathBuf,
+        out: std::path::PathBuf,
+        pane: String,
+        token: Option<String>,
+        seq: u64,
+        /// `plain`; `setsid` (from a session of its own, a nested wrapper's
+        /// position); `handoff` (connect, hand the connection to a child and
+        /// exit, so the peer is gone when its line is read); `handoff_child`.
+        how: String,
+        #[serde(default)]
+        fd: Option<i32>,
+        #[serde(default)]
+        parent: Option<u32>,
+        /// Batch mode, for 052: reports `(seq, icanon, echo)` sent by this one
+        /// process, batch `k` once `gate/go-<k>` exists, each on its own
+        /// connection, its replies written to `gate/out-<k>.json`.
+        #[serde(default)]
+        batches: Vec<Vec<(u64, bool, bool)>>,
+        #[serde(default)]
+        gate: Option<std::path::PathBuf>,
+    }
+
+    /// A batch's result: the reporting process and the daemon's replies.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ModeBatchOut {
+        pid: u32,
+        replies: Vec<String>,
+    }
+
+    /// Send one `input_mode` report on a connection of its own, stamped now,
+    /// and return the daemon's reply.
+    fn send_mode_report(helper: &ModeHelper, seq: u64, icanon: bool, echo: bool) -> String {
+        use std::io::{Read, Write};
+        let mut stream = std::os::unix::net::UnixStream::connect(&helper.sock).expect("connect");
+        let sampled = crate::input_mode::monotonic_ns().expect("the clock");
+        let done = crate::input_mode::monotonic_ns().expect("the clock");
+        let report = DaemonMessage::InputMode(crate::event::InputModeReport {
+            pane_id: helper.pane.clone(),
+            token: helper.token.clone(),
+            seq,
+            icanon,
+            echo,
+            sampled_mono_ns: sampled,
+            sample_done_mono_ns: done,
+        });
+        let line = serde_json::to_string(&report).unwrap();
+        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        reply
+    }
+
+    /// Write `value` to `path` whole: a reader polling for `path` never sees
+    /// it half written.
+    fn write_whole(path: &std::path::Path, value: &impl serde::Serialize) {
+        let tmp = path.with_extension("part");
+        std::fs::write(&tmp, serde_json::to_vec(value).unwrap()).unwrap();
+        std::fs::rename(&tmp, path).unwrap();
+    }
+
+    /// A helper's result: the connecting process and the daemon's reply.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct ModeHelperOut {
+        pid: u32,
+        reply: String,
+    }
+
+    impl ModeHelperOut {
+        fn ack(&self) -> crate::event::SignalAck {
+            serde_json::from_str(self.reply.trim()).expect("one ack line")
+        }
+    }
+
+    /// Not a check of its own: without [`MODE_HELPER`] it returns at once.
+    /// 051 starts this test binary inside a pane's session with it set, and
+    /// this process sends one `input_mode` report, both bits clear, stamped
+    /// from its own clock.
+    #[test]
+    fn input_mode_helper_process() {
+        use std::io::{Read, Write};
+        use std::os::fd::{FromRawFd, IntoRawFd};
+        let Ok(helper) = std::env::var(MODE_HELPER) else {
+            return;
+        };
+        let helper: ModeHelper = serde_json::from_str(&helper).expect("the helper's spec");
+        if let Some(gate) = &helper.gate {
+            for (k, batch) in helper.batches.iter().enumerate() {
+                let deadline = std::time::Instant::now() + Duration::from_secs(60);
+                while !gate.join(format!("go-{k}")).exists() {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "batch {k} never opened"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                let replies = batch
+                    .iter()
+                    .map(|&(seq, icanon, echo)| send_mode_report(&helper, seq, icanon, echo))
+                    .collect();
+                write_whole(
+                    &gate.join(format!("out-{k}.json")),
+                    &ModeBatchOut {
+                        pid: std::process::id(),
+                        replies,
+                    },
+                );
+            }
+            return;
+        }
+        let (mut stream, peer) = if helper.how == "handoff_child" {
+            let parent = helper.parent.expect("the connecting process");
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            // SAFETY: signal 0 only checks that the pid exists.
+            while unsafe { libc::kill(parent as libc::pid_t, 0) } == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the connecting process stayed"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // SAFETY: the parent cleared close-on-exec on this connected
+            // socket for this process, and nothing else here owns it.
+            let stream =
+                unsafe { std::os::unix::net::UnixStream::from_raw_fd(helper.fd.expect("fd")) };
+            (stream, parent)
+        } else {
+            if helper.how == "setsid" {
+                // SAFETY: no arguments; this process is not a group leader.
+                assert_ne!(unsafe { libc::setsid() }, -1, "a session of its own");
+            }
+            let stream = std::os::unix::net::UnixStream::connect(&helper.sock).expect("connect");
+            if helper.how == "handoff" {
+                let fd = stream.into_raw_fd();
+                // SAFETY: clears close-on-exec on a descriptor this process owns.
+                assert_ne!(unsafe { libc::fcntl(fd, libc::F_SETFD, 0) }, -1);
+                let child = ModeHelper {
+                    how: "handoff_child".to_string(),
+                    fd: Some(fd),
+                    parent: Some(std::process::id()),
+                    ..helper
+                };
+                std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                    .args([
+                        "--exact",
+                        MODE_HELPER_TEST,
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(MODE_HELPER, serde_json::to_string(&child).unwrap())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("hand the connection on");
+                std::process::exit(0);
+            }
+            (stream, std::process::id())
+        };
+        let sampled = crate::input_mode::monotonic_ns().expect("the clock");
+        let done = crate::input_mode::monotonic_ns().expect("the clock");
+        let report = DaemonMessage::InputMode(crate::event::InputModeReport {
+            pane_id: helper.pane.clone(),
+            token: helper.token.clone(),
+            seq: helper.seq,
+            icanon: false,
+            echo: false,
+            sampled_mono_ns: sampled,
+            sample_done_mono_ns: done,
+        });
+        let line = serde_json::to_string(&report).unwrap();
+        stream.write_all(format!("{line}\n").as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        let _ = stream.read_to_string(&mut reply);
+        write_whole(&helper.out, &ModeHelperOut { pid: peer, reply });
+    }
+
+    /// 051's fixture: a deck on the real hook socket and the panes whose
+    /// shells start the helpers.
+    struct ModeDeck {
+        deck: AuditDeck,
+        dir: tempfile::TempDir,
+        runs: std::sync::atomic::AtomicU32,
+    }
+
+    impl ModeDeck {
+        async fn start(registry: Arc<AgentPtyRegistry>) -> Self {
+            Self {
+                deck: AuditDeck::start(registry).await,
+                dir: tempfile::tempdir().unwrap(),
+                runs: std::sync::atomic::AtomicU32::new(0),
+            }
+        }
+
+        /// Type `line` into `agent`'s shell.
+        async fn type_line(&self, agent: &str, line: &str) {
+            let writer = self.deck.registry.agent_writer(agent).expect("writer");
+            writer
+                .lock()
+                .await
+                .write_user(format!("{line}\n").as_bytes())
+                .await
+                .expect("type into the pane's shell");
+        }
+
+        /// Start a helper from `agent`'s shell, sending for `pane` with
+        /// `token`, and wait for its result.
+        async fn report(
+            &self,
+            agent: &str,
+            pane: &str,
+            token: Option<&str>,
+            seq: u64,
+            how: &str,
+        ) -> ModeHelperOut {
+            let run = self.runs.fetch_add(1, Ordering::Relaxed);
+            let out = self.dir.path().join(format!("helper-{run}.json"));
+            let helper = ModeHelper {
+                sock: self.deck.sock.clone(),
+                out: out.clone(),
+                pane: pane.to_string(),
+                token: token.map(str::to_string),
+                seq,
+                how: how.to_string(),
+                fd: None,
+                parent: None,
+                batches: Vec::new(),
+                gate: None,
+            };
+            self.start_helper(agent, &helper).await;
+            Self::wait_for(&out, &format!("helper {run} ({how})")).await
+        }
+
+        /// Type the command that starts `helper` into `agent`'s shell.
+        async fn start_helper(&self, agent: &str, helper: &ModeHelper) {
+            let exe = std::env::current_exe().expect("the test binary");
+            self.type_line(
+                agent,
+                &format!(
+                    "{MODE_HELPER}='{}' '{}' --exact {MODE_HELPER_TEST} --nocapture --test-threads=1 >/dev/null 2>&1",
+                    serde_json::to_string(helper).unwrap(),
+                    exe.display()
+                ),
+            )
+            .await;
+        }
+
+        async fn wait_for<T: serde::de::DeserializeOwned>(out: &std::path::Path, what: &str) -> T {
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Ok(bytes) = std::fs::read(out) {
+                    return serde_json::from_slice(&bytes).expect("the helper's result");
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} never reported"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Start one helper from `agent`'s shell that sends `batches` as one
+        /// process, each batch when [`Self::open_batch`] opens it.
+        async fn start_batches(
+            &self,
+            agent: &str,
+            pane: &str,
+            token: &str,
+            batches: Vec<Vec<(u64, bool, bool)>>,
+        ) -> std::path::PathBuf {
+            let run = self.runs.fetch_add(1, Ordering::Relaxed);
+            let gate = self.dir.path().join(format!("gate-{run}"));
+            std::fs::create_dir(&gate).unwrap();
+            let helper = ModeHelper {
+                sock: self.deck.sock.clone(),
+                out: gate.join("unused.json"),
+                pane: pane.to_string(),
+                token: Some(token.to_string()),
+                seq: 0,
+                how: "plain".to_string(),
+                fd: None,
+                parent: None,
+                batches,
+                gate: Some(gate.clone()),
+            };
+            self.start_helper(agent, &helper).await;
+            gate
+        }
+
+        /// Let batch `k` go, and wait for its replies.
+        async fn open_batch(gate: &std::path::Path, k: usize) -> ModeBatchOut {
+            std::fs::write(gate.join(format!("go-{k}")), b"").unwrap();
+            Self::wait_for(&gate.join(format!("out-{k}.json")), &format!("batch {k}")).await
+        }
+    }
+
+    fn mode_pane(registry: &Arc<AgentPtyRegistry>, pane: &str) -> (String, String) {
+        let agent = spawn(registry, Some(pane), MODE_SHELL);
+        let token = registry
+            .hook_token_of(&agent)
+            .expect("the generation's token");
+        (agent, token)
+    }
+
+    /// Scenario: A pane's shell starts a helper process that reports both bits clear on the daemon's real hook socket with the generation's token, then a second helper in the same session reports. The first binds the generation's evidence to itself and sets the settle anchor; the second is refused as `input_mode_conflict`, the store records the conflict naming both processes, and from then on the evidence reads `input_mode_conflict`, so the first helper's next report is refused too.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_a_second_reporter_in_the_session_is_a_conflict() {
+        use crate::input_mode::ModeClause;
+        const PANE: &str = "pane-mode-conflict";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let deck = ModeDeck::start(registry.clone()).await;
+        let first = deck.report(&agent, PANE, Some(&token), 1, "plain").await;
+        assert!(first.ack().accepted, "the first helper: {}", first.reply);
+        let store = registry.input_mode_store(&agent).unwrap();
+        let bound = store.observer().expect("bound");
+        assert_eq!(bound.pid, first.pid);
+        assert!(store.anchor().is_some(), "both bits clear set the anchor");
+        let second = deck.report(&agent, PANE, Some(&token), 2, "plain").await;
+        let ack = second.ack();
+        assert!(!ack.accepted);
+        assert_eq!(ack.reason.as_deref(), Some("input_mode_conflict"));
+        let store = registry.input_mode_store(&agent).unwrap();
+        let (a, b) = store.conflict().expect("the conflict is recorded");
+        assert_eq!((a.pid, b.pid), (first.pid, second.pid));
+        assert_eq!(store.sticky(), Some(ModeClause::Conflict));
+        let now = crate::input_mode::monotonic_ns().unwrap();
+        assert_eq!(store.usable(now), Err(ModeClause::Conflict));
+        assert_eq!(
+            store.usable(now).unwrap_err().as_str(),
+            "input_mode_conflict"
+        );
+        let again = deck.report(&agent, PANE, Some(&token), 3, "plain").await;
+        assert_eq!(again.ack().reason.as_deref(), Some("input_mode_conflict"));
+        assert_eq!(
+            registry
+                .input_mode_store(&agent)
+                .unwrap()
+                .latest()
+                .unwrap()
+                .seq,
+            1
+        );
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A pane's shell first prints a line shaped exactly like an `input_mode` report into the pane's output, then starts helpers that report on the real hook socket from a session of their own, with no token, with another pane's token, and by connecting and exiting before their line is read. Each is refused and the generation's evidence stays empty; a helper reporting properly afterwards is accepted and binds, so the refusals were not the fixture's.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_reports_from_outside_the_generation_are_refused() {
+        const PANE: &str = "pane-mode-outside";
+        const OTHER: &str = "pane-mode-other";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let (_other, other_token) = mode_pane(&registry, OTHER);
+        let deck = ModeDeck::start(registry.clone()).await;
+        let shaped =
+            serde_json::to_string(&DaemonMessage::InputMode(crate::event::InputModeReport {
+                pane_id: PANE.to_string(),
+                token: Some(token.clone()),
+                seq: 1,
+                icanon: false,
+                echo: false,
+                sampled_mono_ns: 1,
+                sample_done_mono_ns: 2,
+            }))
+            .unwrap();
+        deck.type_line(&agent, &format!("printf '%s\\n' '{shaped}'"))
+            .await;
+        let empty = |what: &str| {
+            let store = registry.input_mode_store(&agent).unwrap();
+            assert!(
+                store.observer().is_none() && store.latest().is_none() && store.sticky().is_none(),
+                "{what} changed the store: {store:?}"
+            );
+        };
+        // The shell runs one line at a time, so this helper's result also
+        // means the printed line has gone out.
+        let nested = deck.report(&agent, PANE, Some(&token), 2, "setsid").await;
+        assert_ne!(nested.pid, 0);
+        let ack = nested.ack();
+        assert!(!ack.accepted);
+        assert_eq!(ack.reason.as_deref(), Some("peer_session"));
+        empty("a report-shaped line in the pane's output, or another session");
+        let untokened = deck.report(&agent, PANE, None, 3, "plain").await;
+        assert!(!untokened.ack().accepted, "{}", untokened.reply);
+        empty("a report with no token");
+        let wrong = deck
+            .report(&agent, PANE, Some(&other_token), 4, "plain")
+            .await;
+        assert!(!wrong.ack().accepted, "{}", wrong.reply);
+        empty("another pane's token");
+        let gone = deck.report(&agent, PANE, Some(&token), 5, "handoff").await;
+        assert!(!gone.ack().accepted, "{}", gone.reply);
+        empty("a peer that exited before its line was read");
+        let proper = deck.report(&agent, PANE, Some(&token), 6, "plain").await;
+        assert!(proper.ack().accepted, "the control: {}", proper.reply);
+        let store = registry.input_mode_store(&agent).unwrap();
+        assert_eq!(store.observer().map(|o| o.pid), Some(proper.pid));
+        assert_eq!(store.latest().map(|s| s.seq), Some(6));
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A pane's shell draws a Codex start-up header and a helper in its session binds the generation's evidence; then the pane is restarted. The new generation starts with an empty store and no release latched; a helper in the new session reporting with the old generation's token is refused and leaves it empty; a helper reporting with the new token binds it to itself, with its own anchor.
+    #[spec("inbox/doorbell/051")]
+    #[tokio::test]
+    async fn doorbell_051_a_respawned_generation_starts_its_evidence_afresh() {
+        use crate::release_scanner::ScanLatch;
+        const PANE: &str = "pane-mode-respawn";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (old, old_token) = mode_pane(&registry, PANE);
+        let deck = ModeDeck::start(registry.clone()).await;
+        let header = deck.dir.path().join("header.bin");
+        std::fs::write(
+            &header,
+            "\x1b[2;3H>_ \x1b[1mOpenAI Codex\x1b[22m\x1b[2m (v0.164.0)\x1b[22m\r\n",
+        )
+        .unwrap();
+        deck.type_line(&old, &format!("cat '{}'", header.display()))
+            .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !matches!(
+            registry.release_capture(&old).unwrap().0,
+            ScanLatch::Latched { .. }
+        ) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the header never latched"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let bound = deck.report(&old, PANE, Some(&old_token), 1, "plain").await;
+        assert!(bound.ack().accepted, "{}", bound.reply);
+        let old_anchor = registry.input_mode_store(&old).unwrap().anchor();
+        assert!(old_anchor.is_some());
+
+        let new = registry
+            .respawn_agent_for_pane(PANE, MODE_SHELL)
+            .await
+            .expect("restart the pane");
+        assert_ne!(new, old);
+        let token = registry.hook_token_of(&new).expect("the new token");
+        let store = registry.input_mode_store(&new).unwrap();
+        assert!(store.observer().is_none() && store.anchor().is_none());
+        assert_eq!(
+            registry.release_capture(&new).unwrap().0,
+            ScanLatch::Pending
+        );
+        let stale = deck.report(&new, PANE, Some(&old_token), 2, "plain").await;
+        assert!(!stale.ack().accepted, "{}", stale.reply);
+        let store = registry.input_mode_store(&new).unwrap();
+        assert!(store.observer().is_none() && store.latest().is_none());
+        let fresh = deck.report(&new, PANE, Some(&token), 1, "plain").await;
+        assert!(fresh.ack().accepted, "{}", fresh.reply);
+        let store = registry.input_mode_store(&new).unwrap();
+        assert_eq!(store.observer().map(|o| o.pid), Some(fresh.pid));
+        assert_ne!(store.anchor(), old_anchor);
+        assert!(store.anchor().is_some());
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Every broadcast waiting on `events`, counted and dropped.
+    fn broadcasts(events: &mut broadcast::Receiver<BroadcastMsg>) -> u64 {
+        let mut count = 0;
+        loop {
+            match events.try_recv() {
+                Ok(_) => count += 1,
+                Err(broadcast::error::TryRecvError::Lagged(missed)) => count += missed,
+                Err(_) => return count,
+            }
+        }
+    }
+
+    /// Scenario: A card is put through Working, Blocked, WaitingForInput and Idle on the real hook socket, and at each one a helper in the pane's session, one process throughout, sends reports that go raw, cooked, raw and raw again. Every report is accepted and stored, yet the card, its last activity and journal included, is exactly what it was before them, nothing is broadcast to attached clients, and the settle anchor is set by the first raw report and never moves.
+    #[spec("inbox/doorbell/052")]
+    #[tokio::test]
+    async fn doorbell_052_reports_move_nothing_but_the_mode_store() {
+        const PANE: &str = "pane-mode-quiet";
+        const SESSION: &str = "mode-quiet-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let mut deck = ModeDeck::start(registry.clone()).await;
+        let event = |kind: &str| line(SESSION, Some(PANE), Some(&agent), kind, Some(&token));
+        deck.deck.send(event("session_start")).await;
+        let statuses = [
+            ("tool_start", SessionStatus::Working),
+            ("quota_blocked", SessionStatus::Blocked),
+            ("waiting_for_input", SessionStatus::WaitingForInput),
+            ("idle", SessionStatus::Idle),
+        ];
+        let batch = |k: u64| {
+            let base = 1 + 4 * k;
+            vec![
+                (base, false, false),
+                (base + 1, true, true),
+                (base + 2, false, false),
+                (base + 3, false, false),
+            ]
+        };
+        let gate = deck
+            .start_batches(&agent, PANE, &token, (0..4).map(batch).collect())
+            .await;
+        let mut anchor = None;
+        for (k, (kind, status)) in statuses.into_iter().enumerate() {
+            deck.deck.send(event(kind)).await;
+            let card = deck.deck.card(SESSION).await.expect("the card");
+            assert_eq!(card.status, status, "precondition: {kind}");
+            let before = format!("{card:?}");
+            broadcasts(&mut deck.deck.events);
+            let out = ModeDeck::open_batch(&gate, k).await;
+            for reply in &out.replies {
+                let ack: crate::event::SignalAck = serde_json::from_str(reply.trim()).unwrap();
+                assert!(ack.accepted, "{kind}: {reply}");
+            }
+            let after = format!("{:?}", deck.deck.card(SESSION).await.unwrap());
+            assert_eq!(after, before, "{kind}: the card moved");
+            assert_eq!(broadcasts(&mut deck.deck.events), 0, "{kind}: a broadcast");
+            let store = registry.input_mode_store(&agent).unwrap();
+            assert_eq!(store.latest().map(|s| s.seq), Some(4 * k as u64 + 4));
+            assert_eq!(store.observer().map(|o| o.pid), Some(out.pid));
+            match k {
+                0 => anchor = store.anchor(),
+                _ => assert_eq!(store.anchor(), anchor, "{kind}: the anchor moved"),
+            }
+        }
+        assert!(anchor.is_some());
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
+    /// Scenario: A stand-in for an older wrapper reports a session start and an idle status for its pane on the real hook socket, and sends neither a capabilities probe nor any input-mode report. Each event is broadcast once and the card reads Idle, the generation's input-mode store stays empty, so its evidence reads `input_mode_unverified`, and the doorbell's hold clock reads as it does with no evidence at all: the generation is admitted and no stall is raised.
+    #[spec("inbox/doorbell/052")]
+    #[tokio::test]
+    async fn doorbell_052_an_older_wrapper_leaves_the_evidence_unverified() {
+        const PANE: &str = "pane-mode-older";
+        const SESSION: &str = "mode-older-card";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (agent, token) = mode_pane(&registry, PANE);
+        let mut deck = AuditDeck::start(registry.clone()).await;
+        for kind in ["session_start", "idle"] {
+            deck.send(line(SESSION, Some(PANE), Some(&agent), kind, Some(&token)))
+                .await;
+        }
+        assert_eq!(broadcasts(&mut deck.events), 2);
+        assert_eq!(
+            deck.card(SESSION).await.map(|card| card.status),
+            Some(SessionStatus::Idle)
+        );
+        let store = registry.input_mode_store(&agent).unwrap();
+        assert!(store.observer().is_none() && store.latest().is_none());
+        let now = crate::input_mode::monotonic_ns().unwrap();
+        assert_eq!(
+            store.usable(now).map_err(|clause| clause.as_str()),
+            Err("input_mode_unverified")
+        );
+        assert!(
+            deck.state
+                .read()
+                .await
+                .doorbell_admission(&agent, PANE)
+                .is_some(),
+            "the doorbell still admits the generation"
+        );
+        assert!(!registry.inbox().wake_stalled(PANE, &agent));
+        deck.handle.abort();
+        registry.shutdown_all();
+    }
+
     fn assert_bounded(state: &AppState, what: &str) {
         for (map, size) in state.retained_map_sizes() {
             assert!(
@@ -16964,10 +18325,11 @@ mod hook_provenance_audit_tests {
     /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, agent A
     /// exits and agent B replaces it on a pane; B reports Thinking and the
     /// user presses Escape twice into B. A's Idle naming A, and an Idle naming
-    /// no agent but attested to A's token, must leave B's Escapes holding the
-    /// doorbell, and so must A's Thinking then Idle after B's own Idle and a
-    /// second Escape pair, and B's own Idle with no Thinking of B's before it;
-    /// B's own Idle releases them once B has reported Thinking.
+    /// no agent but attested to A's token, must end no turn on B's clock, and
+    /// so must A's Thinking then Idle after B's own Idle and a second Escape
+    /// pair, and B's own Idle with no Thinking of B's before it; B's own Idle
+    /// ends B's turn once B has reported Thinking (Q35-21: re-oracled to the
+    /// turn clock; the Escapes hold nothing of their own since the switch).
     #[spec("inbox/doorbell/020")]
     #[tokio::test]
     async fn doorbell_020_a_replaced_generations_idle_cannot_release_its_successors_escapes() {
@@ -17002,58 +18364,60 @@ mod hook_provenance_audit_tests {
                     .await
                     .expect("Escape twice reaches the successor");
             };
+            let turns = || registry.pane_input_hold(&pane, &new).turns;
 
             ingest("thinking", Some(&new), None).await;
             escape_twice().await;
-            assert!(
-                registry.draft_pending(&pane),
-                "{agent_type}: precondition: the successor's interrupt holds"
+            assert_eq!(
+                turns(),
+                0,
+                "{agent_type}: precondition: the successor's turn is under way"
             );
             ingest("idle", Some(&old), None).await;
-            let after_tagged = registry.draft_pending(&pane);
+            let after_tagged = turns();
             ingest("idle", None, Some(&old)).await;
-            let after_attested = registry.draft_pending(&pane);
+            let after_attested = turns();
             ingest("idle", Some(&new), None).await;
-            let after_own = registry.draft_pending(&pane);
+            let after_own = turns();
 
             escape_twice().await;
             ingest("thinking", Some(&old), None).await;
             ingest("idle", Some(&old), None).await;
-            let after_old_turn = registry.draft_pending(&pane);
+            let after_old_turn = turns();
             ingest("idle", Some(&new), None).await;
-            let after_own_idle_alone = registry.draft_pending(&pane);
+            let after_own_idle_alone = turns();
             ingest("thinking", Some(&new), None).await;
             ingest("idle", Some(&new), None).await;
-            let after_own_again = registry.draft_pending(&pane);
+            let after_own_again = turns();
             registry.shutdown_all();
 
-            assert!(
-                after_tagged,
-                "{agent_type}: an Idle naming the replaced generation released \
-                 its successor's Escapes"
+            assert_eq!(
+                after_tagged, 0,
+                "{agent_type}: an Idle naming the replaced generation ended \
+                 its successor's turn"
             );
-            assert!(
-                after_attested,
+            assert_eq!(
+                after_attested, 0,
                 "{agent_type}: an untagged Idle attested to the replaced \
-                 generation released its successor's Escapes"
+                 generation ended its successor's turn"
             );
-            assert!(
-                !after_own,
-                "{agent_type}: the successor's own Idle must release its Escapes"
+            assert_eq!(
+                after_own, 1,
+                "{agent_type}: the successor's own Idle must end its turn"
             );
-            assert!(
-                after_old_turn,
+            assert_eq!(
+                after_old_turn, 1,
                 "{agent_type}: the replaced generation's Thinking then Idle \
-                 released the successor's Escapes on an Idle agent"
+                 ended a turn on its successor's clock"
             );
-            assert!(
-                after_own_idle_alone,
+            assert_eq!(
+                after_own_idle_alone, 1,
                 "{agent_type}: the successor's Idle with no turn under way \
-                 released the Escapes that opened a menu on an Idle agent"
+                 ended a turn"
             );
-            assert!(
-                !after_own_again,
-                "{agent_type}: the successor's own turn ending must release them again"
+            assert_eq!(
+                after_own_again, 2,
+                "{agent_type}: the successor's own turn ending must count again"
             );
         }
     }
@@ -17161,8 +18525,17 @@ mod hook_provenance_audit_tests {
             })
         }
 
+        /// PRD #1666 part 3 (Q35-21): the agent's box is touched: its input
+        /// epoch moved since a check last read it empty, so the doorbell
+        /// holds until one does.
         fn holds(&self) -> bool {
-            self.registry.draft_pending(&self.pane)
+            self.registry.input_touched(&self.agent)
+        }
+
+        /// PRD #1666 part 3 (Q35-21): how many of the agent's turns the
+        /// pane's turn clock has counted.
+        fn turns(&self) -> u64 {
+            self.registry.pane_input_hold(&self.pane, &self.agent).turns
         }
     }
 
@@ -17179,9 +18552,9 @@ mod hook_provenance_audit_tests {
     /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, the agent
     /// finishes a turn (Thinking, then Idle), the user presses Escape twice
     /// on the Idle agent — a menu — and the agent then reports Idle twice
-    /// more, as OpenCode does. The repeated Idle ends no turn, so the Escapes
-    /// must keep holding the doorbell; the agent's next Thinking then Idle
-    /// releases them.
+    /// more, as OpenCode does. The repeated Idle ends no turn on the pane's
+    /// turn clock; the agent's next Thinking then Idle ends one (Q35-21:
+    /// re-audited against the turn clock; the Escape-release half retires).
     #[spec("inbox/doorbell/021")]
     #[tokio::test]
     async fn doorbell_021_a_repeated_idle_releases_no_menus_escapes() {
@@ -17189,172 +18562,34 @@ mod hook_provenance_audit_tests {
             let pane = TurnPane::new(&format!("repeated-idle-{agent_type}"), agent_type);
             pane.report("thinking").await;
             pane.report("idle").await;
+            let after_first = pane.turns();
             pane.keys(&[0x1b, 0x1b]).await;
             pane.report("idle").await;
             pane.report("idle").await;
-            let after_repeats = pane.holds();
+            let after_repeats = pane.turns();
             pane.report("thinking").await;
             pane.report("idle").await;
-            let after_turn = pane.holds();
+            let after_turn = pane.turns();
             pane.registry.shutdown_all();
 
-            assert!(
-                after_repeats,
-                "{agent_type}: a repeated Idle released a menu's Escapes"
+            assert_eq!(after_first, 1, "{agent_type}: the first turn counts");
+            assert_eq!(
+                after_repeats, after_first,
+                "{agent_type}: a repeated Idle ended a turn"
             );
-            assert!(
-                !after_turn,
-                "{agent_type}: the agent's next turn ending must release them"
+            assert_eq!(
+                after_turn,
+                after_first + 1,
+                "{agent_type}: the agent's next turn ending must count"
             );
-        }
-    }
-
-    /// Scenario: The agent reports Thinking and the user presses Escape twice.
-    /// The PTY takes both keys, and the agent's Idle is ingested after the
-    /// write returned but before the keys are recorded. The Escapes reached
-    /// the agent before its turn ended, so they were the interrupt, and must
-    /// not hold the doorbell once recorded.
-    #[spec("inbox/doorbell/022")]
-    #[tokio::test]
-    async fn doorbell_022_an_interrupt_recorded_after_its_idle_holds_nothing() {
-        let pane = TurnPane::new("escape-recorded-late", "opencode");
-        pane.report("thinking").await;
-        let (at_record, release) = pane
-            .registry
-            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeRecord);
-        let write = pane.keys_in_background(&[0x1b, 0x1b]);
-        reached(at_record, "the write never reached its record").await;
-        pane.report("idle").await;
-        release.send(()).unwrap();
-        write.await.unwrap();
-        let holds = pane.holds();
-        pane.registry.shutdown_all();
-        assert!(
-            !holds,
-            "an interrupt recorded after the Idle that ended its turn held the doorbell"
-        );
-    }
-
-    /// Scenario: The agent reports Thinking and the user presses Escape twice,
-    /// and the agent's Idle is ingested before the PTY write: once with the
-    /// whole write parked before it, and once while the second part of a
-    /// write the PTY took one byte at a time is still in progress (three
-    /// Escapes, the last two after the Idle). Escapes that reach an agent
-    /// already Idle open a menu, so in both the Escapes must hold the doorbell.
-    #[spec("inbox/doorbell/023")]
-    #[tokio::test]
-    async fn doorbell_023_escapes_written_after_the_idle_keep_the_menu_held() {
-        let pane = TurnPane::new("escape-written-late", "opencode");
-        pane.report("thinking").await;
-        let (at_write, release) = pane
-            .registry
-            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeWrite);
-        let write = pane.keys_in_background(&[0x1b, 0x1b]);
-        reached(at_write, "the write never reached the PTY").await;
-        pane.report("idle").await;
-        release.send(()).unwrap();
-        write.await.unwrap();
-        let whole_write_holds = pane.holds();
-        pane.registry.shutdown_all();
-
-        let pane = TurnPane::new("escape-partial-write", "opencode");
-        let second_part = Arc::new(SecondPartGate::default());
-        let _displaced = pane
-            .registry
-            .replace_agent_writer_for_test(
-                &pane.agent,
-                Box::new(OneByteThenGated {
-                    calls: 0,
-                    gate: second_part.clone(),
-                }),
-            )
-            .await;
-        pane.report("thinking").await;
-        let write = pane.keys_in_background(&[0x1b, 0x1b, 0x1b]);
-        second_part.wait_until_reached().await;
-        pane.report("idle").await;
-        second_part.release();
-        write.await.unwrap();
-        let partial_write_holds = pane.holds();
-        pane.registry.shutdown_all();
-
-        assert!(
-            whole_write_holds,
-            "Escapes written after the Idle were read as the ended turn's interrupt"
-        );
-        assert!(
-            partial_write_holds,
-            "the part of a write the PTY took after the Idle was read as the \
-             ended turn's interrupt"
-        );
-    }
-
-    /// A writer that takes one byte on its first call, then parks its second
-    /// call until [`SecondPartGate::release`] and takes the rest.
-    struct OneByteThenGated {
-        calls: usize,
-        gate: Arc<SecondPartGate>,
-    }
-
-    impl std::io::Write for OneByteThenGated {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.calls += 1;
-            if self.calls == 1 {
-                return Ok(buf.len().min(1));
-            }
-            if self.calls == 2 {
-                self.gate.park();
-            }
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[derive(Default)]
-    struct SecondPartGate {
-        state: std::sync::Mutex<(bool, bool)>,
-        wake: std::sync::Condvar,
-    }
-
-    impl SecondPartGate {
-        fn park(&self) {
-            let mut state = self.state.lock().unwrap();
-            state.0 = true;
-            self.wake.notify_all();
-            while !state.1 {
-                state = self.wake.wait(state).unwrap();
-            }
-        }
-
-        async fn wait_until_reached(self: &Arc<Self>) {
-            let gate = self.clone();
-            tokio::task::spawn_blocking(move || {
-                let state = gate.state.lock().unwrap();
-                let (state, timeout) = gate
-                    .wake
-                    .wait_timeout_while(state, Duration::from_secs(10), |state| !state.0)
-                    .unwrap();
-                assert!(
-                    !timeout.timed_out() && state.0,
-                    "the write's second part never started"
-                );
-            })
-            .await
-            .unwrap();
-        }
-
-        fn release(&self) {
-            self.state.lock().unwrap().1 = true;
-            self.wake.notify_all();
         }
     }
 
     /// Scenario: For each of Claude Code, Codex, OpenCode and Pi, a freshly
     /// started agent reports Thinking before the user has typed anything into
     /// its pane, the user presses Escape twice, and the agent reports Idle.
-    /// That first turn counts, so the interrupt must not hold the doorbell.
+    /// That first turn counts on the pane's turn clock (Q35-21: re-oracled to
+    /// the turn clock).
     #[spec("inbox/doorbell/024")]
     #[tokio::test]
     async fn doorbell_024_a_first_turn_reported_before_any_input_is_a_turn() {
@@ -17363,12 +18598,12 @@ mod hook_provenance_audit_tests {
             pane.report("thinking").await;
             pane.keys(&[0x1b, 0x1b]).await;
             pane.report("idle").await;
-            let holds = pane.holds();
+            let turns = pane.turns();
             pane.registry.shutdown_all();
-            assert!(
-                !holds,
+            assert_eq!(
+                turns, 1,
                 "{agent_type}: the first turn's Thinking, reported before any \
-                 input, was lost and its interrupt held the doorbell"
+                 input, was lost and its turn did not count"
             );
         }
     }
@@ -17376,8 +18611,8 @@ mod hook_provenance_audit_tests {
     /// Scenario: An agent is started on a pane and reports Thinking while its
     /// start is still being registered, before the deck publishes it. Once
     /// it is published, the user presses Escape twice and the agent reports
-    /// Idle: the early Thinking began that turn, so the interrupt must not
-    /// hold the doorbell.
+    /// Idle: the early Thinking began that turn, so it counts on the pane's
+    /// turn clock (Q35-21: re-oracled to the turn clock).
     #[spec("inbox/doorbell/025")]
     #[tokio::test]
     async fn doorbell_025_a_turn_reported_before_publication_is_kept() {
@@ -17441,96 +18676,13 @@ mod hook_provenance_audit_tests {
         assert_eq!(published, pane.agent);
         pane.keys(&[0x1b, 0x1b]).await;
         pane.report("idle").await;
-        let holds = pane.holds();
+        let turns = pane.turns();
         pane.registry.shutdown_all();
-        assert!(
-            !holds,
+        assert_eq!(
+            turns, 1,
             "a Thinking reported before publication was lost and the first \
-             turn's interrupt held the doorbell"
+             turn did not count"
         );
-    }
-
-    /// Scenario: The agent reports Thinking and the user's interrupt arrives
-    /// as two separate Escape writes; the agent reports Idle and the
-    /// interrupt must not hold the doorbell. On an Idle agent two separate
-    /// Escape writes are a menu and hold it. And when the first of two
-    /// Escapes is recorded only after the Idle that ended its turn (it
-    /// reached the agent before), the second Escape, written after, does not
-    /// pair with it and holds nothing.
-    #[spec("inbox/doorbell/026")]
-    #[tokio::test]
-    async fn doorbell_026_split_escapes_pair_only_within_one_turn() {
-        let pane = TurnPane::new("split-interrupt", "opencode");
-        pane.report("thinking").await;
-        pane.keys(&[0x1b]).await;
-        pane.keys(&[0x1b]).await;
-        pane.report("idle").await;
-        let interrupt_holds = pane.holds();
-        pane.keys(&[0x1b]).await;
-        pane.keys(&[0x1b]).await;
-        let menu_holds = pane.holds();
-        pane.registry.shutdown_all();
-
-        let pane = TurnPane::new("split-across-the-idle", "opencode");
-        pane.report("thinking").await;
-        let (at_record, release) = pane
-            .registry
-            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::BeforeRecord);
-        let write = pane.keys_in_background(&[0x1b]);
-        reached(at_record, "the first Escape never reached its record").await;
-        pane.report("idle").await;
-        release.send(()).unwrap();
-        write.await.unwrap();
-        pane.keys(&[0x1b]).await;
-        let across_holds = pane.holds();
-        pane.registry.shutdown_all();
-
-        assert!(
-            !interrupt_holds,
-            "an interrupt split across two writes held the doorbell"
-        );
-        assert!(
-            menu_holds,
-            "two Escape writes on an Idle agent are a menu and must hold"
-        );
-        assert!(
-            !across_holds,
-            "an Escape after the Idle paired with one that reached the agent \
-             before it"
-        );
-    }
-
-    /// Scenario: The agent reports Thinking and the user presses Escape
-    /// twice. The PTY takes both keys, and the agent's Idle — the turn the
-    /// Escapes interrupted ending — is ingested after the write returned but
-    /// before the deck reads the turn count for those keys. The deck cannot
-    /// tell that Idle from one that came before the keys, so the Escapes
-    /// must hold the doorbell until the user's Enter — pressed twice, since
-    /// an Enter right after an Escape reads as Alt+Enter.
-    #[spec("inbox/doorbell/027")]
-    #[tokio::test]
-    async fn doorbell_027_an_idle_between_the_write_and_its_count_holds_the_doorbell() {
-        let pane = TurnPane::new("escape-idle-before-count", "opencode");
-        pane.report("thinking").await;
-        let (after_write, release) = pane
-            .registry
-            .pause_next_pty_write_for_test(&pane.pane, PtyWritePause::AfterWrite);
-        let write = pane.keys_in_background(&[0x1b, 0x1b]);
-        reached(after_write, "the write never returned").await;
-        pane.report("idle").await;
-        release.send(()).unwrap();
-        write.await.unwrap();
-        let held = pane.holds();
-        pane.keys(b"\r").await;
-        pane.keys(b"\r").await;
-        let after_enter = pane.holds();
-        pane.registry.shutdown_all();
-        assert!(
-            held,
-            "an Idle ingested between the write and its turn-count reading \
-             released the Escapes"
-        );
-        assert!(!after_enter, "the user's Enter must release them");
     }
 
     /// Scenario: Agent A is sent keys, and its PTY takes them, but the deck
@@ -17615,8 +18767,9 @@ mod hook_provenance_audit_tests {
     /// reports Thinking and the user presses Escape twice. An Idle that
     /// `dot-agent-deck wrap` classified from the agent's output then arrives,
     /// as a wrapped Codex's quiet output sends it. Output going quiet is not
-    /// the agent reporting its turn over, so the Escapes must keep holding
-    /// the doorbell; the agent's own Idle then releases them.
+    /// the agent reporting its turn over, so it ends no turn on the pane's
+    /// turn clock; the agent's own Idle then ends it (Q35-21: re-oracled to
+    /// the turn clock).
     #[spec("inbox/doorbell/029")]
     #[tokio::test]
     async fn doorbell_029_a_wrapper_classified_idle_ends_no_reported_turn() {
@@ -17625,19 +18778,19 @@ mod hook_provenance_audit_tests {
             pane.report("thinking").await;
             pane.keys(&[0x1b, 0x1b]).await;
             pane.report_classified("idle").await;
-            let after_classified = pane.holds();
+            let after_classified = pane.turns();
             pane.report("idle").await;
-            let after_own = pane.holds();
+            let after_own = pane.turns();
             pane.registry.shutdown_all();
 
-            assert!(
-                after_classified,
+            assert_eq!(
+                after_classified, 0,
                 "{agent_type}: a wrapper-classified Idle ended the turn the \
-                 agent reported, releasing its Escapes"
+                 agent reported"
             );
-            assert!(
-                !after_own,
-                "{agent_type}: the agent's own Idle must release them"
+            assert_eq!(
+                after_own, 1,
+                "{agent_type}: the agent's own Idle must end it"
             );
         }
     }
@@ -17646,8 +18799,9 @@ mod hook_provenance_audit_tests {
     /// finishes a turn (Thinking, then Idle) and the user presses Escape
     /// twice on the Idle agent — a menu. A ToolEnd of that finished turn
     /// then arrives late, followed by another Idle. A tool finishing starts
-    /// no turn, so the Escapes must keep holding the doorbell; the agent's
-    /// next Thinking then Idle releases them.
+    /// no turn, so that Idle counts none on the pane's turn clock; the
+    /// agent's next Thinking then Idle counts one (Q35-21: re-oracled to the
+    /// turn clock).
     #[spec("inbox/doorbell/030")]
     #[tokio::test]
     async fn doorbell_030_a_late_tool_end_starts_no_turn() {
@@ -17655,22 +18809,24 @@ mod hook_provenance_audit_tests {
             let pane = TurnPane::new(&format!("late-tool-end-{agent_type}"), agent_type);
             pane.report("thinking").await;
             pane.report("idle").await;
+            let after_first = pane.turns();
             pane.keys(&[0x1b, 0x1b]).await;
             pane.report("tool_end").await;
             pane.report("idle").await;
-            let after_late_tool_end = pane.holds();
+            let after_late_tool_end = pane.turns();
             pane.report("thinking").await;
             pane.report("idle").await;
-            let after_turn = pane.holds();
+            let after_turn = pane.turns();
             pane.registry.shutdown_all();
 
-            assert!(
-                after_late_tool_end,
-                "{agent_type}: a late ToolEnd then Idle released a menu's Escapes"
+            assert_eq!(
+                after_late_tool_end, after_first,
+                "{agent_type}: a late ToolEnd then Idle ended a turn"
             );
-            assert!(
-                !after_turn,
-                "{agent_type}: the agent's next turn ending must release them"
+            assert_eq!(
+                after_turn,
+                after_first + 1,
+                "{agent_type}: the agent's next turn ending must count"
             );
         }
     }
@@ -20021,10 +21177,165 @@ mod hook_pin_refresh_tests {
     }
 }
 
+/// PRD #1666 part 3 (Q35): the hook loop's `composer_invocation` arm, while
+/// the verb is declared and not served (`inbox/probe/016`).
+#[cfg(all(test, unix))]
+mod composer_invocation_tests {
+    use super::*;
+    use crate::event::{
+        ComposerDecision, ComposerInvocationReply, ComposerInvocationRequest,
+        HookCapabilitiesReply, HookCapabilitiesRequest,
+    };
+    use crate::state::AppState;
+    use spec::spec;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{UnixListener, UnixStream};
+
+    const PANE: &str = "composer-pane";
+
+    struct Deck {
+        _dir: tempfile::TempDir,
+        sock: std::path::PathBuf,
+        registry: Arc<AgentPtyRegistry>,
+        handle: tokio::task::JoinHandle<Result<(), DaemonError>>,
+    }
+
+    impl Deck {
+        async fn start(registry: Arc<AgentPtyRegistry>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("hook.sock");
+            let listener = IpcListener::from_tokio_listener(
+                UnixListener::bind(&sock).expect("bind hook socket"),
+            );
+            let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+            let (event_tx, _) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            let handle = tokio::spawn({
+                let registry = registry.clone();
+                let shutdown = Arc::new(Notify::new());
+                let wtr = crate::issue_dispatch_run::new_worktree_registry();
+                async move { run_hook_loop(listener, state, event_tx, registry, shutdown, wtr).await }
+            });
+            Self {
+                _dir: dir,
+                sock,
+                registry,
+                handle,
+            }
+        }
+
+        /// Write `message` on a fresh connection, close the write half, and
+        /// read every line the daemon answers until it closes.
+        async fn exchange(&self, message: &DaemonMessage) -> Vec<String> {
+            let mut stream = UnixStream::connect(&self.sock).await.expect("connect");
+            stream
+                .write_all(format!("{}\n", serde_json::to_string(message).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            stream.shutdown().await.unwrap();
+            let mut answer = String::new();
+            tokio::time::timeout(Duration::from_secs(10), stream.read_to_string(&mut answer))
+                .await
+                .expect("the daemon answers and closes")
+                .unwrap();
+            answer.lines().map(str::to_string).collect()
+        }
+
+        async fn stop(self) {
+            self.handle.abort();
+            let _ = self.handle.await;
+            self.registry.shutdown_all();
+        }
+    }
+
+    fn invocation(token: Option<&str>) -> DaemonMessage {
+        DaemonMessage::ComposerInvocation(ComposerInvocationRequest {
+            pane_id: PANE.to_string(),
+            token: token.map(str::to_string),
+            generation: 1,
+            decision: ComposerDecision::Armed,
+            claim: None,
+            seg_seen: Some(1),
+            native_seen: None,
+            argv: vec!["/tmp/claude-1000/prompt.md".to_string()],
+        })
+    }
+
+    /// Scenario: A helper with a token that attests the pane's agent sends a `composer_invocation` straight to the hook socket, skipping the capability check: the daemon answers exactly one line, refused `unsupported` with no outcome, so nothing reads as the deck's invocation or as no arm. The same request with no token is refused by the provenance gate, also with no outcome.
+    #[spec("inbox/probe/016")]
+    #[tokio::test]
+    async fn probe_016_the_daemon_answers_an_invocation_unsupported() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (_agent, token) = registry.reserve_spawn_for_test(Some(PANE));
+        let deck = Deck::start(registry).await;
+
+        let answered = deck.exchange(&invocation(Some(&token))).await;
+        assert_eq!(answered.len(), 1, "one line per message: {answered:?}");
+        let reply: ComposerInvocationReply = serde_json::from_str(&answered[0]).unwrap();
+        assert_eq!(reply, ComposerInvocationReply::unsupported());
+        assert_eq!(
+            reply.code.as_deref(),
+            Some(crate::event::COMPOSER_INVOCATION_UNSUPPORTED)
+        );
+
+        let unattested = deck.exchange(&invocation(None)).await;
+        assert_eq!(unattested.len(), 1, "{unattested:?}");
+        let refused: ComposerInvocationReply = serde_json::from_str(&unattested[0]).unwrap();
+        assert_eq!(refused.outcome, None, "{refused:?}");
+        assert!(refused.code.is_some(), "{refused:?}");
+        assert_ne!(
+            refused.code.as_deref(),
+            Some(crate::event::COMPOSER_INVOCATION_UNSUPPORTED),
+            "the gate refuses it before the arm"
+        );
+        deck.stop().await;
+    }
+
+    /// Scenario: A helper asks the daemon's hook socket which verbs it serves, as the shared sender does before an invocation: the answer names task-scoped completion and input-mode reports but not the composer probe, so the sender would withhold the invocation.
+    #[spec("inbox/probe/016")]
+    #[tokio::test]
+    async fn probe_016_the_daemon_withholds_the_composer_capability() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (_agent, token) = registry.reserve_spawn_for_test(Some(PANE));
+        let deck = Deck::start(registry).await;
+        let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+            pane_id: PANE.to_string(),
+            token: Some(token),
+        });
+        let mut stream = UnixStream::connect(&deck.sock).await.expect("connect");
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&question).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(&mut stream).read_line(&mut answer),
+        )
+        .await
+        .expect("the daemon answers the question")
+        .unwrap();
+        let reply: HookCapabilitiesReply = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(
+            reply.task_scoped_completion,
+            Some(crate::event::TASK_SCOPED_COMPLETION),
+            "control: the answer is the daemon's real one: {answer:?}"
+        );
+        assert_eq!(reply.composer_probe, None, "{answer:?}");
+        assert!(crate::hook::confirms_composer_probe(&answer).is_err());
+        drop(stream);
+        deck.stop().await;
+    }
+}
+
 // Unix-only, like `hook_ingestion_tests`: it drives the loop over a Unix socket.
 #[cfg(all(test, unix))]
 #[path = "daemon_hook_reply_deadline_tests.rs"]
 mod hook_reply_deadline_tests;
+
+// Linux-only: the composer probe's observer and `SO_PEERPIDFD` are.
+#[cfg(all(test, target_os = "linux"))]
+#[path = "daemon_composer_reader_tests.rs"]
+mod composer_reader_tests;
 
 // Unix-only, like `question_hold_tests`, which it sits beside.
 #[cfg(all(test, unix))]

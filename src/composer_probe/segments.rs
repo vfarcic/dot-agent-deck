@@ -1,0 +1,1638 @@
+//! PRD #1666 part 3 (Q35-08; core §4.5–§4.7 and §4.9, amendments 1–6 of
+//! Q35-core): a generation's segments, what releases the bytes held behind
+//! each, and when each is complete ([`Segments`]).
+//!
+//! **A segment** is one Ctrl+G the deck writes and waits for the agent to
+//! act on: a [`Kind::Probe`], the deck's own check, or a [`Kind::HumanG`], a
+//! person's Ctrl+G that arrived while the gate held. It has a number (the
+//! arm page's `seg_seq`, handed out here when it is published), the output
+//! offset and instant at which the writer reported its trigger accepted, and
+//! at most one matched invocation record ([`super::record`]). A `HumanG`
+//! waits, unnumbered, until every segment ahead of it has ended; the
+//! caller then publishes its number and writes its trigger alone
+//! ([`Segments::next_trigger`]). So at most one trigger is outstanding
+//! (core §4.5's strict serialization), apart from a lapsed probe's, which
+//! its retry supersedes and D5 says the agent never reads (core §4.7).
+//!
+//! **What the number shows, and what it doesn't.** The number is published
+//! before the trigger is submitted. A helper that read `S` read it after
+//! `S` was published; that says nothing about whether `S`'s trigger had been
+//! written, so a match by number is not evidence that the agent read the
+//! deck's byte. A match rests on serialization (no other trigger was
+//! outstanding when `S` was published), on P-E′ (an `Owned`, export-shaped
+//! invocation is the composer acting on a key from its own input) and on
+//! D5, whose residual (a native Ctrl+G written before the probe and read
+//! after it) can match a probe's segment: core §4.9 states that effect (CL-19).
+//!
+//! **Matching (core §4.5).** The outstanding written segment matches the
+//! one `Owned` record that read its number, or, failing that, the one
+//! `Owned` record with no decision and no number on any channel whose birth
+//! floor is at or after the trigger's written instant (the birth frontier,
+//! which refuses a floor in the same tick). Two candidates of either kind
+//! match nothing. A record matched by its birth that later names another
+//! number holds its segment for good ([`Stage::Mismatched`]).
+//!
+//! **The return markers.** The output hook (`super::paste_mode::OutputHook`)
+//! reads them in its own framing, every byte from the generation's birth, so
+//! a marker's offset is in the coordinate its triggers and frontiers are in
+//! (R-U2-02); [`ReturnMarkers`] is the same reading on its own, for a caller
+//! that holds no hook. Either reads the output through the
+//! output grammar and reports `ESC [ ? 2004 l`, `ESC [ ? 2004 h` and
+//! `ESC [ ? 2026 h`, each spelled exactly, with the offset of its ESC: the
+//! frame is [`super::epoch`]'s marker predicate itself, and the two paste
+//! markers are held to the same spelling (amendment 1 §2.2's "exact grammar
+//! for both"). A combined `?1049;2026h` or a gap between the ESC and the `[`
+//! is no marker, which holds. [`ReturnWatch`] keeps a segment's progress
+//! past a lower bound:
+//! - **E1** (core §4.5): a `?2004l` at or after the trigger's written offset,
+//!   then a `?2004h`; a later `?2004l` before completion starts the pair over.
+//!   **E1F** (amendment 1 §2.2): E1, then the first `?2026h` after its
+//!   `?2004h`. E1 alone never completes a Codex segment.
+//! - **EC** (amendment 3 §3.4, amendment 4 §7.2): a `?2004h` whose ESC is at
+//!   or after the drain frontier `o`, and on Codex a `?2026h` after it.
+//!
+//! **Release and completion (core §4.6, amendments 1, 2 and 5).** Release
+//! lets the bytes behind a segment go, up to the next held candidate;
+//! completion lets the next segment's trigger be written. Every completion
+//! here is a record completion through [`Records::complete`], so its
+//! refusals are the record's: nothing completes by markers while the writer
+//! scope is `Pending` or `Open`, EC completes nothing under
+//! [`super::record::EcPolicy::Hold`] (the production policy, which also
+//! covers a native `SpawnFailed`), and E1/E1F needs a matched, helper-only
+//! record. A segment completes only when its own matched record's route is
+//! accepted, and only once that record's exit has been drained: a record
+//! subsumed by a later invocation doesn't complete its segment, which then
+//! holds until retirement. The rows:
+//! - Claude `Probe`: released at its record's `Armed` or `Unarmed` decision;
+//!   complete at E1 (helper-only) or EC. An `Armed` release, here and in
+//!   Claude's `HumanG` stage 2 below, stops at the first held
+//!   [`line_discipline_key`] until E1 is read ([`Segments::front_stop`],
+//!   Q147b, Q151b): Claude is out of raw mode until then, so a Ctrl+C would
+//!   be a SIGINT. An `Unarmed` release of a `Probe` (the person never
+//!   pressed Ctrl+G, so the editor it opens is not one they asked for)
+//!   refuses the first held [`signal_key`] and everything after it until its
+//!   helper's exit has drained (Q151b).
+//! - Codex `Probe`, and Codex `HumanG` stage 2 `Armed`: released at
+//!   completion, E1F.
+//! - Claude `HumanG` stage 2 `Armed`: released at the decision; complete at
+//!   E1.
+//! - `HumanG` stage 2 `Unarmed`: released once the decision is `Unarmed` and
+//!   the editor child was observed running; complete at EC. When its record
+//!   then drains `WaitUnknown`, that release ends for what is still held
+//!   (R-U2-06): only retirement ends it. A release goes to the pane, not to
+//!   an editor as such: whatever reads the terminal then takes the bytes.
+//!   An editor that reads the terminal does; one that opens its own window
+//!   (a GUI editor) doesn't, so the bytes wait in the terminal for the
+//!   agent's return, where Claude keeps them (P-CRF, which M-PF2 is to
+//!   confirm) and Codex discards them as it returns (M31), as each does
+//!   with keys typed while its editor is open without the deck (A-20d-12).
+//!   On Claude, an editor not seen running (gone before the pin, or before
+//!   the release asks the pin) releases once its helper's `Done` report
+//!   (`Clean` or `Survivors`) was in at its drained exit (A-20d-15). On
+//!   Codex it holds: Codex's release would rest on a `Taken` drain
+//!   frontier, which no review accepts as premise-backed (E-MF is
+//!   unverified, Q86), so it waits for retirement (the revd21 review's
+//!   U2-1).
+//! - A segment's return markers read while its trigger is in flight (after
+//!   its number is published, before the writer's report reaches here) are
+//!   kept, and read once the trigger is reported written; a failed or
+//!   withdrawn trigger discards them (R-U2-01).
+//! - A record whose report is `SpawnFailed` before its release: released at
+//!   completion (E1 on Claude, E1F on Codex). `WaitUnknown` (an
+//!   editor-bearing decision with no report at the drain) opens the writer
+//!   scope, so only retirement ends its segment.
+//!
+//! **A segment that can never complete** ([`Segments::stranded`]): a front
+//! segment that released while the writer scope is open. No step but
+//! retirement closes an open scope, and [`Records::complete`] refuses every
+//! route while it is open, so no Ctrl+G behind it can ever be written as a
+//! trigger. Under `Hold` an `Unarmed` decision is what opens it, so a
+//! person's Ctrl+G during a check whose segment released to their editor
+//! leaves one. A later Ctrl+G behind it would wait for retirement and be
+//! discarded there, with what was typed after it, so the release driver
+//! refuses it instead, with what the gate holds after it, in the pass that
+//! finds it held: a release that stops before it at a key waiting for
+//! Claude's return keeps that key held when it sits in an earlier op, since
+//! what is refused starts at the op holding the Ctrl+G (one in the same op
+//! is refused with it: refusals take whole ops, an accepted fail-closed
+//! loss) ([`Segments::refuse_behind`], R-HOLD's bounded
+//! refusal, the user's ruling of 2026-11-03, Q151b): what is typed afterwards goes
+//! on to the pane as the release lets it. The segment itself stays open, so
+//! each later Ctrl+G is refused the same way while it stays released (an
+//! unknown wait's cut-off makes it hold everything instead), and no probe
+//! can open another segment in that generation.
+//!
+//! A `Tool` or unknown decision on a matched record releases nothing before
+//! completion. Nothing here releases or completes on a timer: the lapse
+//! ([`Stage::Lapsed`], a Claude `Probe` unmatched past [`T_TRIGGER`]) only
+//! lets one retry probe replace it while it holds nothing, and
+//! [`NOT_RETURNED`] only changes what the view says (E5, E5′).
+//!
+//! **Endings** ([`Outcome`]) are truthful: `Written` only for a completed
+//! segment, `TakenBack` and `Cancelled` only for a trigger never submitted
+//! or withdrawn before it was reported written (the caller withdraws only a
+//! job the writer hasn't started), `WriteFailed` for a trigger whose write failed and `Gone` for
+//! the segments its op still carried, `Superseded` for a lapsed probe its
+//! retry replaced, and `Retired` for everything at retirement.
+//!
+//! **The view** ([`Segments::view`]) publishes `AwaitingPostFlush` and
+//! `AwaitingReturn` only while the segment holds: once a segment has
+//! released, it reads `Released` until it completes. Each view carries the
+//! writer scope's state, so an `EditorLeftWriter` (or other) cause is
+//! published with the stage.
+//!
+//! **What reads it** (Q35-20): an installed generation's input keeps its
+//! segments beside its records (`super::epoch::GenerationInput`), feeds them
+//! the output hook's markers and every record step, and its release driver
+//! (`crate::agent_pty`) does what [`Segments::front`] allows to the held
+//! input. No production generation is `Armable` before activation, so none
+//! opens a segment there. M-PF1 (Q77) hasn't run, so this is observation
+//! code: the premises of E1F's rows are unverified on real agents.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use super::epoch::sync_begin;
+use super::framing::{Csi, Event, Framing, Token};
+use super::query_ledger::{HazardFifo, T_TRIGGER};
+use super::record::{
+    self, Attribution, Completion, Decision, ExitFact, Frontier, Record, RecordKey, Records,
+    Report, Route, ScopeState, Tree, born_at_or_after,
+};
+
+/// How long a held segment waits past its helper's drained exit (E5), or
+/// past E1 for its frame (E5′), before the view says it hasn't returned
+/// (core §7). Display only: it releases nothing.
+pub const NOT_RETURNED: Duration = Duration::from_secs(5);
+
+/// The most segments a generation keeps; the planner refuses an op that
+/// would open more.
+pub const SEGMENT_CAP: usize = 64;
+
+/// The most return markers a segment keeps while its trigger is in flight
+/// (R-U2-01): the latest are kept. An E1 needs only the last disable and
+/// the enable after it, and an enable with no disable before it counts for
+/// nothing, so dropping older ones can only hold, never release. That is a
+/// cost to availability, not a fast return preserved: a segment whose only
+/// eligible disable was dropped holds until the agent writes another whole
+/// return after the trigger's report, or until retirement (and Codex has no
+/// lapse recovery to end it sooner) (R-B-U3-01).
+pub const IN_FLIGHT_MARKERS: usize = 64;
+
+/// Whose return path a generation's segments wait for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Agent {
+    /// Returns with `?2004h` (M43b).
+    Claude,
+    /// Returns with `?2004h`, flushes its input, then draws (`?2026h`).
+    Codex,
+}
+
+/// A segment's kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    /// The deck's own check.
+    Probe,
+    /// A person's Ctrl+G held behind an earlier segment.
+    HumanG,
+}
+
+/// Q147b: a byte a terminal out of raw mode acts on rather than queueing it
+/// as typed, under the control characters a pane starts with: the deck sets
+/// no termios on a pane, so they are the kernel's pts defaults, and Claude
+/// switches only the mode flags for its editor (strace shows the flags; its
+/// `c_cc` array is elided, so the values rest on the defaults and on the
+/// deck setting none). They are the default control characters of
+/// `termios(3)`: Ctrl+C, Ctrl+\ and Ctrl+Z (the [`signal_key`]s), Ctrl+D
+/// (end of file), Backspace (erase, `0x7f`; the forward-Delete key sends an
+/// escape sequence and is not one), Ctrl+U (kill), Ctrl+W (word erase),
+/// Ctrl+R (reprint), Ctrl+V (literal next), Ctrl+O (discard), Ctrl+S and
+/// Ctrl+Q (flow control), and Enter, which `ICRNL` turns into a line feed.
+/// Other bytes, the BEL ending an OSC reply among them, are queued
+/// unchanged. It is the raw byte, wherever it sits in the input's framing:
+/// the line discipline reads no escape sequences, so a byte inside a paste
+/// or a sequence counts as well (a release then stops at the last ground
+/// point before it), and so does one after an Alt's ESC. A wrapper that
+/// remaps these keys with `stty` makes this fixed set wrong for its pane;
+/// and a BSD port would add `VSTATUS` (Ctrl+T) and `VDSUSP` (Ctrl+Y), which
+/// Linux has not (the release driver is Linux only).
+pub fn line_discipline_key(byte: u8) -> bool {
+    matches!(
+        byte,
+        0x03 | 0x04 | 0x0d | 0x0f | 0x11 | 0x12 | 0x13 | 0x15 | 0x16 | 0x17 | 0x1a | 0x1c | 0x7f
+    )
+}
+
+/// Q151b: the [`line_discipline_key`]s a terminal with `ISIG` set turns
+/// into a signal to its foreground process group rather than input, under
+/// the default control characters: Ctrl+C (`VINTR`), Ctrl+\ (`VQUIT`) and
+/// Ctrl+Z (`VSUSP`).
+pub fn signal_key(byte: u8) -> bool {
+    matches!(byte, 0x03 | 0x1a | 0x1c)
+}
+
+/// Q152b (fence29's ruling 4, revfence28's narrower option, revfence29's
+/// finding 3): how long a line with no end a release may leave in a Claude
+/// terminal out of raw mode. Linux's canonical-mode read buffer is 4096
+/// bytes, and while it holds no complete line it keeps room for one line
+/// end: bytes past the first 4095 are dropped or overwrite the last. So a
+/// release into such a terminal ([`Stop::Cooked`], and [`Stop::Signal`]
+/// behind a probe's `Unarmed` release while the terminal is canonical)
+/// stops before the bytes it has written there since the front's first
+/// release, with no [`line_end`] after them, reach this many, or before a
+/// UTF-8 lead byte whose whole character would reach it ([`utf8_width`],
+/// Q160b), and the rest waits with everything after it: for Claude's
+/// return (E1) behind `Cooked`, for the helper's drained exit (or the
+/// terminal going raw) behind `Signal`. The count spans release passes,
+/// since nothing drains the buffer while Claude is blocked in its editor
+/// spawn. Behind `Signal` a pass that reads the terminal raw (a terminal
+/// editor the check opened took it) applies no limit and starts the count
+/// afresh (Q160b, revact29 finding 1): a raw reader takes what it is given,
+/// and what it hasn't read when the terminal goes canonical again is a
+/// line of its own there. A single-line paste longer than this, held
+/// through a check, reaches Claude whole.
+pub const COOKED_LINE: usize = 4095;
+
+/// Q160b (revact29 finding 4): how many bytes the UTF-8 character `byte`
+/// leads takes; 1 for any other byte. The line limit stops before a lead
+/// byte whose whole character wouldn't fit, so it never falls between a
+/// well-formed character's bytes ([`Framing`](super::framing::Framing)
+/// reads every byte at or above `0x80` as ground).
+pub fn utf8_width(byte: u8) -> usize {
+    match byte {
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        _ => 1,
+    }
+}
+
+/// Q152b: a byte that ends a line in Claude's terminal while it is out of
+/// raw mode: a line feed, and Enter's carriage return, which Claude's
+/// cooked mode turns into one (`ICRNL`, in the flags strace shows). Only a
+/// [`Stop::Signal`] release writes a carriage return there: a
+/// [`Stop::Cooked`] one stops at it as a [`line_discipline_key`], so there
+/// a line ends at a line feed alone. Counting Enter matters behind
+/// `Signal`, where the check opened the person's editor and they may type
+/// lines into it for as long as it is open. NUL, `VEOL`'s default, is not
+/// counted (revfence29): not counting it can only stop earlier.
+pub fn line_end(byte: u8) -> bool {
+    matches!(byte, b'\n' | b'\r')
+}
+
+/// Q152b: the bytes of a line with no end left after writing `bytes` into
+/// a terminal out of raw mode whose line already had `run` of them.
+pub fn cooked_line_after(run: usize, bytes: &[u8]) -> usize {
+    match bytes.iter().rposition(|&b| line_end(b)) {
+        Some(at) => bytes.len() - at - 1,
+        None => run + bytes.len(),
+    }
+}
+
+/// Where the front segment's release stops short of the next held Ctrl+G
+/// candidate, and what happens to the byte it stops at
+/// ([`Segments::front_stop`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stop {
+    /// Only at the next held candidate.
+    Candidate,
+    /// Q147b: also at the first held [`line_discipline_key`], which waits
+    /// with everything after it until Claude's return (E1); and, Q152b,
+    /// before the line it leaves in the terminal reaches [`COOKED_LINE`]
+    /// bytes with no end.
+    Cooked,
+    /// Q151b: also at the first held [`signal_key`], which is refused with
+    /// everything held after it; and, Q152b, while the terminal is
+    /// canonical (Q160b), before the line it leaves there reaches
+    /// [`COOKED_LINE`] bytes with no end, which waits for the helper's
+    /// drained exit or for the terminal going raw.
+    Signal,
+}
+
+/// A return marker in the output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    /// `ESC [ ? 2004 l`.
+    PasteOff,
+    /// `ESC [ ? 2004 h`.
+    PasteOn,
+    /// `ESC [ ? 2026 h`.
+    Frame,
+}
+
+/// A marker and the output offset of its ESC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Seen {
+    pub marker: Marker,
+    pub start: u64,
+}
+
+/// The return marker a whole output CSI is, if any. The frame is
+/// [`super::epoch`]'s marker predicate; the paste markers are spelled as
+/// exactly: the `?` marker, the one parameter `2004`, no intermediate, the
+/// bytes contiguous from the ESC, outside a paste.
+pub fn return_marker(token: &Token<'_>, csi: &Csi<'_>) -> Option<Marker> {
+    if sync_begin(token, csi) {
+        return Some(Marker::Frame);
+    }
+    let exact = csi.private == Some(b'?')
+        && csi.params == b"2004"
+        && csi.intermediates.is_empty()
+        && csi.literal
+        && !token.in_paste;
+    match csi.final_byte {
+        b'h' if exact => Some(Marker::PasteOn),
+        b'l' if exact => Some(Marker::PasteOff),
+        _ => None,
+    }
+}
+
+/// Reads a generation's output for return markers, however it is split,
+/// counting the bytes it was fed.
+#[derive(Debug, Clone)]
+pub struct ReturnMarkers {
+    framing: Framing,
+    fed: u64,
+    /// The count can't advance: nothing more is reported.
+    exhausted: bool,
+}
+
+impl Default for ReturnMarkers {
+    fn default() -> Self {
+        Self {
+            framing: Framing::output(),
+            fed: 0,
+            exhausted: false,
+        }
+    }
+}
+
+/// The return marker a whole output CSI is, with the offset of its ESC,
+/// when the byte that completed it is at output offset `end`.
+pub fn seen_ending_at(token: &Token<'_>, csi: &Csi<'_>, end: u64) -> Option<Seen> {
+    let marker = return_marker(token, csi)?;
+    let start = end.checked_sub(MARKER_LEN - 1)?;
+    Some(Seen { marker, start })
+}
+
+impl ReturnMarkers {
+    /// Read the next output bytes, appending each marker they complete.
+    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<Seen>) {
+        for &byte in bytes {
+            if self.exhausted {
+                return;
+            }
+            let at = self.fed;
+            self.framing.feed(byte, |token| {
+                if let Event::Csi(csi) = token.event
+                    && let Some(seen) = seen_ending_at(&token, &csi, at)
+                {
+                    out.push(seen);
+                }
+            });
+            match self.fed.checked_add(1) {
+                Some(fed) => self.fed = fed,
+                None => self.exhausted = true,
+            }
+        }
+    }
+
+    /// The bytes read so far: the next byte's offset.
+    pub fn fed(&self) -> u64 {
+        self.fed
+    }
+}
+
+/// Every return marker's length, `ESC [ ? <4 digits> <final>`: its bytes
+/// are contiguous from its ESC, so its start is this far behind its final.
+const MARKER_LEN: u64 = 8;
+
+/// The return markers past a lower bound: E1 and E1F after a trigger, or EC
+/// after a drain frontier. A marker whose ESC is before the bound doesn't
+/// count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReturnWatch {
+    from: u64,
+    /// E1's: a `?2004l` comes first.
+    disable: bool,
+    off: Option<u64>,
+    on: Option<u64>,
+    frame: Option<u64>,
+}
+
+impl ReturnWatch {
+    /// E1 for a trigger written at output offset `from`.
+    pub fn e1(from: u64) -> Self {
+        Self {
+            from,
+            disable: true,
+            off: None,
+            on: None,
+            frame: None,
+        }
+    }
+
+    /// EC after the drain frontier `o`.
+    pub fn ec(o: u64) -> Self {
+        Self {
+            from: o,
+            disable: false,
+            off: None,
+            on: None,
+            frame: None,
+        }
+    }
+
+    /// The next marker, in output order.
+    pub fn feed(&mut self, seen: Seen) {
+        if seen.start < self.from {
+            return;
+        }
+        match seen.marker {
+            Marker::PasteOff if self.disable => {
+                self.off = Some(seen.start);
+                self.on = None;
+                self.frame = None;
+            }
+            Marker::PasteOn
+                if self.on.is_none()
+                    && (!self.disable || self.off.is_some_and(|off| seen.start > off)) =>
+            {
+                self.on = Some(seen.start);
+            }
+            Marker::Frame if self.frame.is_none() && self.on.is_some_and(|on| seen.start > on) => {
+                self.frame = Some(seen.start);
+            }
+            _ => {}
+        }
+    }
+
+    /// The enable has followed: E1's pair, or EC's `?2004h`.
+    pub fn enabled(&self) -> bool {
+        self.on.is_some()
+    }
+
+    /// The markers `agent`'s return needs: the enable on Claude, the enable
+    /// then a frame on Codex.
+    pub fn returned(&self, agent: Agent) -> bool {
+        match agent {
+            Agent::Claude => self.on.is_some(),
+            Agent::Codex => self.frame.is_some(),
+        }
+    }
+}
+
+/// What the front segment lets the held input do ([`Segments::front`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Front {
+    /// No segment is open.
+    None,
+    /// The front segment holds everything behind it.
+    Held,
+    /// The front segment released: what is held may go as far as the next
+    /// held candidate, which waits for the segment to complete.
+    Released,
+    /// The front is a `HumanG` waiting for its trigger.
+    Trigger,
+}
+
+/// How a segment ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// Its trigger was written and its matched invocation's return
+    /// completed it: what was behind it is released.
+    Written,
+    /// A probe's trigger was withdrawn before the writer started it.
+    TakenBack,
+    /// A person's Ctrl+G whose op was cancelled before its trigger was
+    /// started.
+    Cancelled,
+    /// A lapsed probe its retry replaced.
+    Superseded,
+    /// The generation retired.
+    Retired,
+    /// Its trigger's write failed.
+    WriteFailed,
+    /// Its op's write failed at an earlier trigger.
+    Gone,
+    /// A person's Ctrl+G behind a segment that can never complete
+    /// ([`Segments::refuse_behind`]): refused, with what was held after
+    /// it, and never written.
+    Refused,
+}
+
+/// One segment's ending.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ended {
+    pub number: Option<u64>,
+    pub kind: Kind,
+    pub op: Option<u64>,
+    pub outcome: Outcome,
+}
+
+/// Where a segment stands, as the view publishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stage {
+    /// Behind an earlier segment, unnumbered.
+    Waiting,
+    /// Numbered and submitted; the writer hasn't reported it.
+    Submitted,
+    /// Written, with no matched record.
+    Unmatched,
+    /// A Claude probe unmatched past [`T_TRIGGER`]: one retry may replace
+    /// it while it holds nothing.
+    Lapsed,
+    /// Matched; its record hasn't drained, or its return markers haven't
+    /// followed.
+    Matched,
+    /// A matched record named another segment's number after its match.
+    Mismatched,
+    /// Codex, helper-only: E1 followed, its frame hasn't, or wasn't
+    /// accepted.
+    AwaitingPostFlush,
+    /// An editor-bearing record drained; EC hasn't completed it.
+    AwaitingReturn,
+    /// What was behind it has gone; it isn't complete.
+    Released,
+}
+
+/// One segment as published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct View {
+    pub number: Option<u64>,
+    pub kind: Kind,
+    pub stage: Stage,
+    pub record: Option<RecordKey>,
+    /// The matched record's exit facts, kept after the record is deleted.
+    pub fact: Option<ExitFact>,
+    /// The writer scope as the view was taken.
+    pub scope: ScopeState,
+    /// EC's markers followed the frontier: computed, and logged by the
+    /// caller, whether or not the policy let it complete.
+    pub ec: bool,
+    /// E5 or E5′: [`NOT_RETURNED`] has passed in this stage.
+    pub not_returned: bool,
+    /// The user's editor its matched record's helper runs, as the observer
+    /// pinned it (A-20d-6): the editor process's `(pid, start)`, kept so a
+    /// release can ask whether that same process still runs. `None` until
+    /// one is pinned, and for an editor reported with no identity.
+    pub editor: Option<RecordKey>,
+}
+
+/// Why a step was refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The generation retired.
+    Retired,
+    /// Another generation's fact.
+    Stale,
+    /// A segment is outstanding, so no probe.
+    Busy,
+    /// No segment holds, so a person's Ctrl+G is native.
+    NotHeld,
+    /// [`SEGMENT_CAP`].
+    Full,
+    /// The segment number can't advance.
+    Exhausted,
+    /// No segment has that number.
+    NoSegment,
+    /// The trigger isn't submitted, or was already reported.
+    NotSubmitted,
+}
+
+/// The user's editor a segment's helper runs, as the observer pinned it
+/// (A-20d-6): its `(pid, start)`, and a check of whether that very process
+/// still runs, which the early release asks before it lets held typing go
+/// on the strength of a running editor. A pin whose editor has exited
+/// releases nothing on the pin: under `Hold`, production's policy, held
+/// typing then goes on Claude once the helper's own report of the editor's
+/// end is in at its drained exit (`editor_ended`, A-20d-15), and on Codex
+/// stays held until the generation retires (the revd21 review's U2-1). The
+/// observer's check polls the editor's pidfd, held since the pin, so it
+/// can't answer for another process that reused the pid. An editor
+/// reported with an identity but no check (tests only) is taken as running.
+#[derive(Clone)]
+pub struct EditorPin {
+    pub key: RecordKey,
+    running: Option<std::sync::Arc<dyn Fn() -> bool + Send + Sync>>,
+}
+
+impl EditorPin {
+    /// `key`, with `running` answering whether it still runs. Called under
+    /// the generation's lock: it must not block or take a lock.
+    pub fn new(key: RecordKey, running: impl Fn() -> bool + Send + Sync + 'static) -> Self {
+        Self {
+            key,
+            running: Some(std::sync::Arc::new(running)),
+        }
+    }
+
+    /// `key` with no check of its own, which [`Self::running`] answers as
+    /// running: built by the test-only reports alone
+    /// ([`Segments::editor_pinned_for_test`]), so a production report could
+    /// carry one only through a `_for_test` method, which stays `pub` and is
+    /// kept from production callers by its name and `#[doc(hidden)]` alone
+    /// (the revb21 review's U3-4, narrowed by the revc21 review's U3-a).
+    fn unchecked(key: RecordKey) -> Self {
+        Self { key, running: None }
+    }
+
+    /// Whether the pinned editor still runs; `true` with no check.
+    pub fn running(&self) -> bool {
+        self.running.as_ref().is_none_or(|running| running())
+    }
+}
+
+impl std::fmt::Debug for EditorPin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EditorPin")
+            .field("key", &self.key)
+            .field("checked", &self.running.is_some())
+            .finish()
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Segment {
+    kind: Kind,
+    op: Option<u64>,
+    number: Option<u64>,
+    /// The output offset and instant its trigger was reported accepted.
+    written: Option<(u64, Instant)>,
+    /// Return markers read while its trigger was in flight: numbered, its
+    /// write not yet reported (R-U2-01). The agent can read the trigger and
+    /// answer before the writer's report reaches here, so they are kept,
+    /// and read once it is reported written, against its offset; a trigger
+    /// that fails or is withdrawn takes them with it. The latest
+    /// [`IN_FLIGHT_MARKERS`] are kept.
+    in_flight: VecDeque<Seen>,
+    record: Option<RecordKey>,
+    mismatched: bool,
+    fact: Option<ExitFact>,
+    editor_running: bool,
+    /// The editor's pinned identity, when the report of it carried one
+    /// (A-20d-6).
+    editor: Option<EditorPin>,
+    e1: Option<ReturnWatch>,
+    ec: Option<ReturnWatch>,
+    /// When E1's enable followed (E5′'s origin).
+    enabled_at: Option<Instant>,
+    /// When its record was first seen drained (E5's origin).
+    drained_at: Option<Instant>,
+    released: bool,
+    /// Its release has been withdrawn for what is still held (R-U2-06): it
+    /// released while the user's editor ran, and its record then drained
+    /// `WaitUnknown`, an editor-bearing decision with no report. What went
+    /// before stays the pane's; what is still held waits for retirement
+    /// (Q104b's OQ5).
+    cut_off: bool,
+    /// A probe whose matched decision was handed to the epoch's settlement
+    /// ([`Segments::take_decided_probes`]).
+    decided: bool,
+    /// Q152b: the bytes of a line with no end its release has written into
+    /// Claude's terminal while out of raw mode ([`Stop::Cooked`],
+    /// [`Stop::Signal`], [`COOKED_LINE`]), as the release driver reports
+    /// them.
+    cooked_line: usize,
+}
+
+impl Segment {
+    fn new(kind: Kind, op: Option<u64>, number: Option<u64>) -> Self {
+        Self {
+            kind,
+            op,
+            number,
+            written: None,
+            in_flight: VecDeque::new(),
+            record: None,
+            mismatched: false,
+            fact: None,
+            editor_running: false,
+            editor: None,
+            e1: None,
+            ec: None,
+            enabled_at: None,
+            drained_at: None,
+            released: false,
+            cut_off: false,
+            decided: false,
+            cooked_line: 0,
+        }
+    }
+
+    fn end(&self, outcome: Outcome) -> Ended {
+        Ended {
+            number: self.number,
+            kind: self.kind,
+            op: self.op,
+            outcome,
+        }
+    }
+}
+
+/// One generation's segments, in order. See the module documentation.
+#[derive(Debug, Clone)]
+pub struct Segments {
+    generation: u64,
+    agent: Agent,
+    segments: VecDeque<Segment>,
+    /// The last number published; 0 before the first.
+    last: u64,
+    ended: Vec<Ended>,
+    /// Probes that completed before their decision was handed to the epoch's
+    /// settlement, or after it was handed back ([`Self::undecide`]): their
+    /// number, record and decision, for [`Self::take_completed_probes`]
+    /// (R-U2-05). A completion removes the segment, so it would otherwise
+    /// take the settlement with it.
+    completed: Vec<(u64, RecordKey, Option<Decision>)>,
+    /// Records whose editor child was seen running before a segment matched
+    /// them (R-U2-01's kind: the observer reports it once, and a trigger's
+    /// written report can still be on its way): a segment that matches one
+    /// takes it then. The latest [`super::record::RECORD_CAP`] are kept.
+    ///
+    /// **A past observation (the audit's U3-7), re-checked at release
+    /// (A-20d-6).** "Running" is what the observer saw when it reported,
+    /// applied at match time, one report later. The observer's report
+    /// carries the editor's pin ([`EditorPin`]), and the early release asks
+    /// it, under this lock, whether that process still runs: one that
+    /// exited before the release is decided releases nothing on the pin,
+    /// and its segment is held until, on Claude, its helper's report of the
+    /// editor's end is in at its drained exit (A-20d-15), and short of that
+    /// (on Codex, always) until
+    /// the generation retires under `Hold` (production's policy, which
+    /// completes no editor-bearing segment) or, under `Authority`, until
+    /// its helper's completion (the revb21 review's U2-1). An
+    /// editor that exits after the release was decided still leaves the
+    /// segment `Released` until its helper's drain shows how it ended
+    /// (R-U2-06's cut-off). A report with no check (tests only) is taken
+    /// as running.
+    editors: VecDeque<(RecordKey, Option<EditorPin>)>,
+    retired: bool,
+}
+
+impl Segments {
+    pub fn new(generation: u64, agent: Agent) -> Self {
+        Self {
+            generation,
+            agent,
+            segments: VecDeque::new(),
+            last: 0,
+            ended: Vec::new(),
+            completed: Vec::new(),
+            editors: VecDeque::new(),
+            retired: false,
+        }
+    }
+
+    fn live(&self) -> Result<(), Refusal> {
+        if self.retired {
+            return Err(Refusal::Retired);
+        }
+        Ok(())
+    }
+
+    fn next_number(&self) -> Result<u64, Refusal> {
+        self.last.checked_add(1).ok_or(Refusal::Exhausted)
+    }
+
+    /// Whether `seg` is a Claude probe still unmatched past [`T_TRIGGER`]
+    /// since its trigger was written (the tie isn't a lapse).
+    fn lapsed(&self, seg: &Segment, now: Instant) -> bool {
+        self.agent == Agent::Claude
+            && seg.kind == Kind::Probe
+            && seg.record.is_none()
+            && !seg.mismatched
+            && seg
+                .written
+                .is_some_and(|(_, at)| now.saturating_duration_since(at) > T_TRIGGER)
+    }
+
+    /// Open a probe, returning the number to publish before its trigger is
+    /// submitted. Refused while a segment is outstanding, except one lapsed
+    /// Claude probe while nothing is held behind it (`held`, the gate's),
+    /// which its retry supersedes (core §4.7). The rest of admission is the
+    /// caller's.
+    pub fn open_probe(&mut self, held: bool, now: Instant) -> Result<u64, Refusal> {
+        self.live()?;
+        let retry = match self.segments.front() {
+            None => false,
+            Some(seg) if self.segments.len() == 1 && !held && self.lapsed(seg, now) => true,
+            Some(_) => return Err(Refusal::Busy),
+        };
+        let number = self.next_number()?;
+        if retry && let Some(old) = self.segments.pop_front() {
+            self.ended.push(old.end(Outcome::Superseded));
+        }
+        self.last = number;
+        self.segments
+            .push_back(Segment::new(Kind::Probe, None, Some(number)));
+        Ok(number)
+    }
+
+    /// A person's Ctrl+G the planner cut from op `op` behind the open
+    /// segments: it waits, unnumbered. With nothing open it isn't held.
+    pub fn open_human_g(&mut self, op: u64) -> Result<(), Refusal> {
+        self.live()?;
+        if self.segments.is_empty() {
+            return Err(Refusal::NotHeld);
+        }
+        if self.segments.len() >= SEGMENT_CAP {
+            return Err(Refusal::Full);
+        }
+        self.segments
+            .push_back(Segment::new(Kind::HumanG, Some(op), None));
+        Ok(())
+    }
+
+    /// A person's Ctrl+G the planner cut from an op the gate let through
+    /// with no fence closed, a liability being out (core §4.3; A1 §3.3: with
+    /// a count above 0 it opens a `HumanG` and isn't native; A-20d-5). It
+    /// waits, unnumbered, behind whatever is still open (a probe whose job
+    /// that op took back ends shortly after), and with nothing open it is the
+    /// front at once, asking for its trigger ([`Front::Trigger`]): the caller
+    /// numbers it with [`Self::next_trigger`], publishes the number and only
+    /// then submits the trigger, the op's bytes through the cut. It carries
+    /// no op: nothing else is cut from that op before its trigger is written.
+    pub fn open_cut(&mut self) -> Result<(), Refusal> {
+        self.live()?;
+        if self.segments.len() >= SEGMENT_CAP {
+            return Err(Refusal::Full);
+        }
+        self.segments
+            .push_back(Segment::new(Kind::HumanG, None, None));
+        Ok(())
+    }
+
+    /// A person's Ctrl+G a release reached at the front of the held input
+    /// with no segment open (Q35-20): every segment ahead of it has ended,
+    /// so it is a `HumanG` whose trigger may be written now, numbered here.
+    /// The caller publishes the number, then submits the trigger alone. With
+    /// a segment open it waits behind it instead ([`Self::open_human_g`]),
+    /// and this refuses [`Refusal::Busy`].
+    pub fn open_held_trigger(&mut self) -> Result<u64, Refusal> {
+        self.live()?;
+        if !self.segments.is_empty() {
+            return Err(Refusal::Busy);
+        }
+        let number = self.next_number()?;
+        self.last = number;
+        self.segments
+            .push_back(Segment::new(Kind::HumanG, None, Some(number)));
+        Ok(number)
+    }
+
+    /// What the front segment lets the held input do now (Q35-20): nothing
+    /// while it holds, go as far as the next held candidate once it has
+    /// released, and with no segment open, the same, the candidate there
+    /// then opening the next segment. A front `HumanG` still unnumbered
+    /// asks for its trigger.
+    pub fn front(&self) -> Front {
+        match self.segments.front() {
+            None => Front::None,
+            Some(seg) if seg.number.is_none() => Front::Trigger,
+            Some(seg) if seg.released && !seg.cut_off => Front::Released,
+            Some(_) => Front::Held,
+        }
+    }
+
+    /// Where the front segment's release stops short of the next held
+    /// candidate ([`Stop`]). Only a released Claude segment stops anywhere
+    /// else: Codex releases nothing before its return.
+    ///
+    /// - [`Stop::Cooked`] (Q147b, Q151b): released on an `Armed` decision (a
+    ///   `Probe`'s, or a `HumanG`'s second stage), whose E1 hasn't been read.
+    ///   What it releases goes to a Claude that left raw mode to run its
+    ///   editor, here the deck's helper, and Claude's `?2004h` after a
+    ///   `?2004l` after the trigger (E1) is written after it is back in raw
+    ///   mode: Claude's editor spawn blocks it, and strace of 2.1.317 shows
+    ///   the switch back to raw before the write carrying the `?2004h` at
+    ///   each round trip. Until then the line discipline acts on those keys
+    ///   instead of queueing them: a Ctrl+C is a SIGINT to Claude's process
+    ///   group, which ends the session, an Enter is read back as a line
+    ///   feed, a Backspace erases a key queued before it. The ordinary keys
+    ///   M44 measured are kept, so they still go at the release. The
+    ///   helper's exit drain is not waited for: it says nothing more about
+    ///   Claude's mode, and the observer that reports it can be starved.
+    /// - [`Stop::Signal`] (Q151b): a `Probe` released on an `Unarmed`
+    ///   decision whose helper's exit hasn't drained. Its helper runs the
+    ///   person's editor, which the person didn't ask for (they pressed no
+    ///   Ctrl+G), while Claude is out of raw mode; one that never takes raw
+    ///   mode (a GUI editor) leaves the terminal there for the whole edit,
+    ///   so a Ctrl+C, Ctrl+\ or Ctrl+Z would signal Claude. Its helper's
+    ///   drained exit says the editor is gone. A `HumanG`'s `Unarmed`
+    ///   release goes to the editor the person asked for, as it would
+    ///   without the deck, so it stops at the candidate only.
+    pub fn front_stop(&self, records: &Records) -> Stop {
+        let Some(seg) = self.segments.front() else {
+            return Stop::Candidate;
+        };
+        if self.agent != Agent::Claude || !seg.released || seg.cut_off {
+            return Stop::Candidate;
+        }
+        let Some(key) = seg.record else {
+            return Stop::Candidate;
+        };
+        // A matched record deleted by a subsumption leaves its kept facts.
+        let record = records.get(key);
+        let decision = record
+            .and_then(|r| r.decision)
+            .or_else(|| seg.fact.and_then(|f| f.decision));
+        let drained = record.map_or(seg.fact.is_some(), |r| r.drained);
+        match decision {
+            Some(Decision::Armed) if !self.returned(seg) => Stop::Cooked,
+            Some(Decision::Unarmed) if seg.kind == Kind::Probe && !drained => Stop::Signal,
+            _ => Stop::Candidate,
+        }
+    }
+
+    /// Whether `seg`'s E1 has been read, as `self.agent`'s return needs it.
+    fn returned(&self, seg: &Segment) -> bool {
+        seg.e1.as_ref().is_some_and(|w| w.returned(self.agent))
+    }
+
+    /// Q152b: while the front's release goes into Claude's terminal out of
+    /// raw mode ([`Stop::Cooked`] or [`Stop::Signal`]), its number and the
+    /// bytes of a line with no end its release has written there so far
+    /// ([`COOKED_LINE`]); `None` otherwise.
+    pub fn cooked_line(&self, records: &Records) -> Option<(u64, usize)> {
+        if self.front_stop(records) == Stop::Candidate {
+            return None;
+        }
+        let seg = self.segments.front()?;
+        Some((seg.number?, seg.cooked_line))
+    }
+
+    /// Q152b: the release driver wrote into segment `number`'s cooked
+    /// terminal, which now holds `run` bytes of a line with no end
+    /// ([`cooked_line_after`]). Nothing when that segment has ended.
+    pub fn note_cooked_line(&mut self, number: u64, run: usize) {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|seg| seg.number == Some(number))
+        {
+            seg.cooked_line = run;
+        }
+    }
+
+    /// The release driver refuses the first held [`signal_key`] behind a
+    /// front whose release stops at one ([`Stop::Signal`]), with what is
+    /// held after it: every segment waiting behind the front ends
+    /// [`Outcome::Refused`], and the front stays. Whether it does, so the
+    /// caller may refuse what the gate holds from that key on. The caller
+    /// refuses from the first held op holding a signal key or a Ctrl+G
+    /// candidate, and only when that op holds a signal key, so every
+    /// `HumanG` waiting here, whose trigger is a held candidate, is one of
+    /// the ops refused; a release may have stopped earlier, at the line
+    /// limit (revact29 finding 6).
+    pub fn refuse_signal_behind(&mut self, records: &Records) -> bool {
+        if self.front_stop(records) != Stop::Signal {
+            return false;
+        }
+        let behind: VecDeque<Segment> = self.segments.drain(1..).collect();
+        for seg in behind {
+            self.ended.push(seg.end(Outcome::Refused));
+        }
+        true
+    }
+
+    /// Whether the only open segment is a Claude probe that lapsed (core
+    /// §4.7), so admission may read the gate as [`super::admission::Fence::Lapsed`]
+    /// when nothing is held behind it. The writer epoch of its own byte is
+    /// the caller's.
+    pub fn lapsed_alone(&self, now: Instant) -> bool {
+        self.segments.len() == 1 && self.segments.front().is_some_and(|s| self.lapsed(s, now))
+    }
+
+    /// The lone lapsed Claude probe's number ([`Self::lapsed_alone`]).
+    pub fn lapsed_number(&self, now: Instant) -> Option<u64> {
+        if !self.lapsed_alone(now) {
+            return None;
+        }
+        self.segments.front().and_then(|s| s.number)
+    }
+
+    /// Whether the front segment can never complete (see the module
+    /// documentation): it released, its release wasn't cut off, and the
+    /// writer scope is open, which only retirement undoes. Everything behind
+    /// it would then wait for retirement.
+    pub fn stranded(&self, records: &Records) -> bool {
+        !self.retired
+            && matches!(records.scope().state(), ScopeState::Open(_))
+            && self
+                .segments
+                .front()
+                .is_some_and(|seg| seg.number.is_some() && seg.released && !seg.cut_off)
+    }
+
+    /// The release driver refuses the person's Ctrl+G held behind a
+    /// [stranded](Self::stranded) front, with what is held after it: every
+    /// segment waiting behind the front ends [`Outcome::Refused`], and the
+    /// front stays. Whether the front is stranded, so the caller may refuse
+    /// what the gate holds from that Ctrl+G on. Nothing behind the front is
+    /// numbered (a number goes only to the front), so none of these had a
+    /// trigger written.
+    pub fn refuse_behind(&mut self, records: &Records) -> bool {
+        if !self.stranded(records) {
+            return false;
+        }
+        let behind: VecDeque<Segment> = self.segments.drain(1..).collect();
+        for seg in behind {
+            self.ended.push(seg.end(Outcome::Refused));
+        }
+        true
+    }
+
+    /// The open segments' count.
+    pub fn len(&self) -> usize {
+        self.segments.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    /// The probes whose matched record has decided, each once (Q35-20, R3
+    /// §3.4's apply rule): the caller settles the epoch from each.
+    pub fn take_decided_probes(&mut self, records: &Records) -> Vec<(u64, RecordKey, Decision)> {
+        let mut decided = Vec::new();
+        for seg in &mut self.segments {
+            if seg.kind != Kind::Probe || seg.decided {
+                continue;
+            }
+            let (Some(number), Some(key)) = (seg.number, seg.record) else {
+                continue;
+            };
+            let decision = records
+                .get(key)
+                .and_then(|r| r.decision)
+                .or_else(|| seg.fact.and_then(|f| f.decision));
+            if let Some(decision) = decision {
+                seg.decided = true;
+                decided.push((number, key, decision));
+            }
+        }
+        decided
+    }
+
+    /// The probes that completed with their settlement still to do, each
+    /// once (R-U2-05): its number, matched record and decision, `None` when
+    /// none was ever known. Their records have drained, so nothing they wait
+    /// for is still coming.
+    pub fn take_completed_probes(&mut self) -> Vec<(u64, RecordKey, Option<Decision>)> {
+        std::mem::take(&mut self.completed)
+    }
+
+    /// Hand probe `number`'s decision to [`Self::take_decided_probes`] again
+    /// later: its settlement waits for something its record doesn't hold yet.
+    pub fn undecide(&mut self, number: u64) {
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|s| s.kind == Kind::Probe && s.number == Some(number))
+        {
+            seg.decided = false;
+        }
+    }
+
+    /// The number of the next `HumanG` whose trigger may be written, once
+    /// every segment ahead of it has ended: publish it, then submit the
+    /// trigger alone.
+    pub fn next_trigger(&mut self) -> Option<u64> {
+        if self.retired {
+            return None;
+        }
+        let number = self.next_number().ok()?;
+        let seg = self.segments.front_mut()?;
+        if seg.number.is_some() {
+            return None;
+        }
+        seg.number = Some(number);
+        self.last = number;
+        Some(number)
+    }
+
+    fn submitted(&mut self, number: u64) -> Result<usize, Refusal> {
+        self.live()?;
+        let i = self
+            .segments
+            .iter()
+            .position(|s| s.number == Some(number))
+            .ok_or(Refusal::NoSegment)?;
+        if self.segments[i].written.is_some() {
+            return Err(Refusal::NotSubmitted);
+        }
+        Ok(i)
+    }
+
+    /// The writer took segment `number`'s trigger, with the output at
+    /// `offset`, at `at`.
+    pub fn written(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        number: u64,
+        offset: u64,
+        at: Instant,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        let i = self.submitted(number)?;
+        let seg = &mut self.segments[i];
+        seg.written = Some((offset, at));
+        seg.e1 = Some(ReturnWatch::e1(offset));
+        // What the agent wrote while the report was on its way: read now,
+        // the watch's own bound deciding what counts (R-U2-01).
+        let kept = std::mem::take(&mut seg.in_flight);
+        if i == 0 {
+            for s in kept {
+                Self::feed_front(seg, records, s, now);
+            }
+        }
+        self.evaluate(records, fifo, now);
+        Ok(())
+    }
+
+    /// Segment `number`'s trigger write failed: it ends `WriteFailed`, and
+    /// the segments its op still carried end `Gone`.
+    pub fn write_failed(&mut self, number: u64) -> Result<(), Refusal> {
+        let i = self.submitted(number)?;
+        let Some(seg) = self.segments.remove(i) else {
+            return Err(Refusal::NoSegment);
+        };
+        self.ended.push(seg.end(Outcome::WriteFailed));
+        if let Some(op) = seg.op {
+            self.end_where(|s| s.op == Some(op) && s.number.is_none(), Outcome::Gone);
+        }
+        Ok(())
+    }
+
+    /// Segment `number`'s trigger was withdrawn before the writer started
+    /// it (its job's claim): a probe ends `TakenBack`, a person's Ctrl+G
+    /// `Cancelled`.
+    pub fn withdrawn(&mut self, number: u64) -> Result<(), Refusal> {
+        let i = self.submitted(number)?;
+        let Some(seg) = self.segments.remove(i) else {
+            return Err(Refusal::NoSegment);
+        };
+        let outcome = match seg.kind {
+            Kind::Probe => Outcome::TakenBack,
+            Kind::HumanG => Outcome::Cancelled,
+        };
+        self.ended.push(seg.end(outcome));
+        Ok(())
+    }
+
+    /// Op `op` was cancelled: its waiting Ctrl+G presses end `Cancelled`.
+    /// How many.
+    pub fn cancelled(&mut self, op: u64) -> usize {
+        self.end_where(
+            |s| s.op == Some(op) && s.number.is_none(),
+            Outcome::Cancelled,
+        )
+    }
+
+    fn end_where(&mut self, which: impl Fn(&Segment) -> bool, outcome: Outcome) -> usize {
+        let before = self.segments.len();
+        let mut kept = VecDeque::with_capacity(before);
+        for seg in self.segments.drain(..) {
+            if which(&seg) {
+                self.ended.push(seg.end(outcome));
+            } else {
+                kept.push_back(seg);
+            }
+        }
+        self.segments = kept;
+        before - self.segments.len()
+    }
+
+    /// Return markers the output hook read, in output order.
+    pub fn on_output(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        seen: &[Seen],
+        now: Instant,
+    ) {
+        if self.retired {
+            return;
+        }
+        for &s in seen {
+            if let Some(seg) = self.segments.front_mut() {
+                if seg.written.is_some() {
+                    Self::feed_front(seg, records, s, now);
+                } else if seg.number.is_some() {
+                    // Its trigger is in flight: kept until it is reported.
+                    if seg.in_flight.len() == IN_FLIGHT_MARKERS {
+                        seg.in_flight.pop_front();
+                    }
+                    seg.in_flight.push_back(s);
+                }
+            }
+            self.evaluate(records, fifo, now);
+        }
+    }
+
+    /// One return marker for the front segment, whose trigger was reported
+    /// written.
+    fn feed_front(seg: &mut Segment, records: &Records, s: Seen, now: Instant) {
+        // The caller publishes the frontier before it feeds the output after
+        // it (amendment 4 §7.2). One learned later counts only the markers
+        // fed after it, which holds.
+        if seg.ec.is_none()
+            && let Some(r) = seg.record.and_then(|k| records.get(k))
+            && let Frontier::Taken { offset } = r.frontier
+        {
+            seg.ec = Some(ReturnWatch::ec(offset));
+        }
+        if let Some(w) = seg.e1.as_mut() {
+            w.feed(s);
+            seg.enabled_at = match (w.enabled(), seg.enabled_at) {
+                (true, None) => Some(now),
+                (true, at) => at,
+                (false, _) => None,
+            };
+        }
+        if let Some(w) = seg.ec.as_mut() {
+            w.feed(s);
+        }
+    }
+
+    /// A record step happened (an observation, a report, a frontier, an
+    /// exit, a subsumption, or the writer scope closing): match, release
+    /// and complete what it now allows.
+    pub fn settle(&mut self, records: &mut Records, fifo: &mut HazardFifo, now: Instant) {
+        if !self.retired {
+            self.evaluate(records, fifo, now);
+        }
+    }
+
+    /// A record's exit drain finished: its facts are kept by the segment it
+    /// matched, for after the record is deleted (AU7 §2).
+    pub fn drained(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        fact: ExitFact,
+        now: Instant,
+    ) -> Result<(), Refusal> {
+        self.live()?;
+        if fact.generation != self.generation {
+            return Err(Refusal::Stale);
+        }
+        self.evaluate(records, fifo, now);
+        if let Some(seg) = self
+            .segments
+            .iter_mut()
+            .find(|s| s.record == Some(fact.key))
+        {
+            seg.fact = Some(fact);
+        }
+        self.evaluate(records, fifo, now);
+        Ok(())
+    }
+
+    /// Tests only: record `key`'s editor child was observed running an
+    /// executable other than the helper, with no check of whether it still
+    /// runs, which an early release then takes as running. Whether a
+    /// segment matched to it took it. The observer reports through
+    /// [`Self::editor_pinned_with`]; the `_for_test` name keeps a
+    /// production caller from reaching for this one (the revb21 review's
+    /// U3-4).
+    #[doc(hidden)]
+    pub fn editor_running_for_test(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        now: Instant,
+    ) -> bool {
+        self.editor_pinned_for_test(records, fifo, key, None, now)
+    }
+
+    /// Tests only: [`Self::editor_running_for_test`], with the editor's own
+    /// identity as the observer pinned it (A-20d-6), kept with the segment
+    /// its record matches, now or when it matches later; with no check of
+    /// whether it still runs.
+    #[doc(hidden)]
+    pub fn editor_pinned_for_test(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        editor: Option<RecordKey>,
+        now: Instant,
+    ) -> bool {
+        self.editor_report(records, fifo, key, editor.map(EditorPin::unchecked), now)
+    }
+
+    /// Record `key`'s editor child was observed running an executable other
+    /// than the helper, with its identity as the observer pinned it and the
+    /// observer's check of whether that pinned editor still runs, which the
+    /// release asks (A-20d-6). Kept with the segment its record matches,
+    /// now or when it matches later. Whether a segment matched to it took
+    /// it.
+    pub fn editor_pinned_with(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        editor: EditorPin,
+        now: Instant,
+    ) -> bool {
+        self.editor_report(records, fifo, key, Some(editor), now)
+    }
+
+    fn editor_report(
+        &mut self,
+        records: &mut Records,
+        fifo: &mut HazardFifo,
+        key: RecordKey,
+        editor: Option<EditorPin>,
+        now: Instant,
+    ) -> bool {
+        if self.retired {
+            return false;
+        }
+        self.evaluate(records, fifo, now);
+        let Some(seg) = self.segments.iter_mut().find(|s| s.record == Some(key)) else {
+            match self.editors.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, known)) => {
+                    if editor.is_some() {
+                        *known = editor;
+                    }
+                }
+                None => {
+                    if self.editors.len() == record::RECORD_CAP {
+                        self.editors.pop_front();
+                    }
+                    self.editors.push_back((key, editor));
+                }
+            }
+            return false;
+        };
+        seg.editor_running = true;
+        if editor.is_some() {
+            seg.editor = editor;
+        }
+        self.evaluate(records, fifo, now);
+        true
+    }
+
+    /// The generation retired: every segment ends `Retired`, and every
+    /// later step is refused.
+    pub fn retire(&mut self) {
+        if self.retired {
+            return;
+        }
+        self.end_where(|_| true, Outcome::Retired);
+        self.retired = true;
+    }
+
+    /// The endings since the last call, in order.
+    pub fn take_ended(&mut self) -> Vec<Ended> {
+        std::mem::take(&mut self.ended)
+    }
+
+    /// The open segments, in order, as of `now`.
+    pub fn view(&self, records: &Records, now: Instant) -> Vec<View> {
+        let scope = records.scope().state();
+        self.segments
+            .iter()
+            .map(|seg| {
+                let record = seg.record.and_then(|k| records.get(k));
+                let (stage, since) = self.stage(seg, record.as_ref(), now);
+                View {
+                    number: seg.number,
+                    kind: seg.kind,
+                    stage,
+                    record: seg.record,
+                    fact: seg.fact,
+                    scope,
+                    ec: seg.ec.is_some_and(|w| w.returned(self.agent)),
+                    not_returned: since
+                        .is_some_and(|at| now.saturating_duration_since(at) >= NOT_RETURNED),
+                    editor: seg.editor.as_ref().map(|e| e.key),
+                }
+            })
+            .collect()
+    }
+
+    /// A segment's stage, and since when a held, returning one has waited.
+    fn stage(
+        &self,
+        seg: &Segment,
+        record: Option<&Record>,
+        now: Instant,
+    ) -> (Stage, Option<Instant>) {
+        if seg.number.is_none() {
+            return (Stage::Waiting, None);
+        }
+        if seg.written.is_none() {
+            return (Stage::Submitted, None);
+        }
+        if seg.mismatched {
+            return (Stage::Mismatched, None);
+        }
+        if seg.released && !seg.cut_off {
+            return (Stage::Released, None);
+        }
+        if seg.record.is_none() {
+            let stage = if self.lapsed(seg, now) {
+                Stage::Lapsed
+            } else {
+                Stage::Unmatched
+            };
+            return (stage, None);
+        }
+        let (drained, helper_only) = match (record, seg.fact) {
+            (Some(r), _) => (r.drained, r.helper_only()),
+            (None, Some(f)) => (true, fact_helper_only(&f)),
+            (None, None) => (false, false),
+        };
+        if !drained {
+            return (Stage::Matched, None);
+        }
+        if !helper_only {
+            return (Stage::AwaitingReturn, seg.drained_at);
+        }
+        match (self.agent, seg.enabled_at) {
+            (Agent::Codex, Some(at)) => (Stage::AwaitingPostFlush, Some(at)),
+            _ => (Stage::Matched, seg.drained_at),
+        }
+    }
+
+    /// Match, release and complete the outstanding segment, then any that a
+    /// completion brings to the front.
+    fn evaluate(&mut self, records: &mut Records, fifo: &mut HazardFifo, now: Instant) {
+        // A drained record can still learn its frontier, match or report:
+        // the kept facts follow it until it is deleted.
+        for seg in &mut self.segments {
+            if let Some(fact) = seg.record.and_then(|k| records.fact(k)) {
+                seg.fact = Some(fact);
+            }
+            // A release before an unknown ending was the running editor's;
+            // once the ending is known unknown, it releases nothing more.
+            if seg.released
+                && let Some(fact) = seg.fact
+                && wait_unknown(fact.decision, fact.report)
+            {
+                seg.cut_off = true;
+            }
+        }
+        while let Some(seg) = self.segments.front_mut() {
+            let (Some(number), Some((_, written_at))) = (seg.number, seg.written) else {
+                return;
+            };
+            if seg.record.is_none()
+                && !seg.mismatched
+                && let Some(key) = find_match(records, number, written_at)
+                && records.match_segment(self.generation, key, number).is_ok()
+            {
+                seg.record = Some(key);
+                if let Some(at) = self.editors.iter().position(|(k, _)| *k == key) {
+                    let (_, editor) = self.editors.remove(at).unwrap_or((key, None));
+                    seg.editor_running = true;
+                    seg.editor = editor;
+                }
+            }
+            let Some(key) = seg.record else {
+                return;
+            };
+            // A matched record that is gone was deleted after a completion
+            // that wasn't this segment's (a subsumption): it holds.
+            let Some(r) = records.get(key) else {
+                return;
+            };
+            if r.seg_seen.is_some_and(|s| s != number) {
+                seg.mismatched = true;
+            }
+            if seg.mismatched {
+                return;
+            }
+            if r.drained && seg.drained_at.is_none() {
+                seg.drained_at = Some(now);
+            }
+            if !seg.released && early_release(self.agent, seg, &r) {
+                seg.released = true;
+            }
+            let (route, watch) = if r.helper_only() {
+                (Route::HelperOnly, seg.e1)
+            } else {
+                (Route::EditorBearing, seg.ec)
+            };
+            if !r.drained || !watch.is_some_and(|w| w.returned(self.agent)) {
+                return;
+            }
+            match records.complete(fifo, self.generation, key, route, now, now) {
+                Ok(()) | Err(record::Refusal::NotPending(Completion::Complete { .. })) => {}
+                Err(_) => return,
+            }
+            if let Some(seg) = self.segments.pop_front() {
+                if seg.kind == Kind::Probe
+                    && !seg.decided
+                    && let (Some(number), Some(key)) = (seg.number, seg.record)
+                {
+                    let decision = records
+                        .get(key)
+                        .and_then(|r| r.decision)
+                        .or_else(|| seg.fact.and_then(|f| f.decision));
+                    self.completed.push((number, key, decision));
+                }
+                self.ended.push(seg.end(Outcome::Written));
+            }
+        }
+    }
+}
+
+/// Core §4.5's match for segment `number`, written at `written`: the one
+/// unmatched `Owned` record that read the number, else the one with no
+/// decision and no number whose birth floor is at or after `written`.
+fn find_match(records: &Records, number: u64, written: Instant) -> Option<RecordKey> {
+    let free = |r: &&Record| r.attribution == Attribution::Owned && r.matched.is_none();
+    let mut by_number = records
+        .iter()
+        .filter(free)
+        .filter(|r| r.seg_seen == Some(number));
+    if let Some(r) = by_number.next() {
+        return by_number.next().is_none().then_some(r.key);
+    }
+    let mut by_birth = records.iter().filter(free).filter(|r| {
+        r.decision.is_none() && r.seg_seen.is_none() && born_at_or_after(r.birth_floor, written)
+    });
+    let r = by_birth.next()?;
+    by_birth.next().is_none().then_some(r.key)
+}
+
+/// The releases that come before completion (core §4.6). A failed start
+/// releases only at completion: no editor took the bytes.
+fn early_release(agent: Agent, seg: &Segment, r: &Record) -> bool {
+    if matches!(r.report, Report::SpawnFailed { .. }) {
+        return false;
+    }
+    match (agent, seg.kind, r.decision) {
+        (Agent::Claude, Kind::Probe, Some(Decision::Armed | Decision::Unarmed)) => true,
+        (Agent::Claude, Kind::HumanG, Some(Decision::Armed)) => true,
+        // A-20d-6, option (a): released to the pane while the editor
+        // pinned for it still runs (A-20d-12: the editor takes the bytes
+        // only if it reads the terminal). One that already exited, or that
+        // was never seen running, releases nothing here until, on Claude,
+        // its helper has reported the editor's end and drained
+        // ([`editor_ended`], A-20d-15; Codex holds, U2-1); short of that the
+        // segment holds: under `Hold`
+        // (production's `EC_POLICY`) until the generation retires, since
+        // `Hold` completes no editor-bearing segment, and under `Authority`
+        // until its helper's completion (fail closed: typing held longer,
+        // never handed to an editor that isn't there).
+        (_, Kind::HumanG, Some(Decision::Unarmed)) => {
+            (seg.editor_running && seg.editor.as_ref().is_none_or(EditorPin::running))
+                || editor_ended(agent, r)
+        }
+        _ => false,
+    }
+}
+
+/// A-20d-15: a person's `Unarmed` Ctrl+G on Claude whose editor is known
+/// to have ended, by its helper's own account: the helper reaped the editor
+/// and accounted for its tree (a `Done` report with a `Clean` or
+/// `Survivors` tree), and that report was in when the helper's exit
+/// drained, so the helper is gone too. What is held then goes to Claude,
+/// which reads the pane again and keeps queued input through its return
+/// (P-CRF), so the drain is enough. A drain that gave up uncertain keeps
+/// the report it had ([`Record::drained_report`] is taken at the first
+/// drain, whichever way it ended), so a `Done(Clean)` report in by then
+/// releases too: the uncertainty is about settlement, not about the
+/// editor's end.
+///
+/// Codex holds (the revd21 review's U2-1): Codex discards queued input as
+/// it returns (M31), so its release would also wait for Codex's return past
+/// the drain frontier (EC's `?2004h` then `?2026h`), and that frontier is
+/// one E-MF's scan took, which no review accepts as premise-backed (Q86). A
+/// holder of the terminal the scan missed could write those markers while
+/// Codex is still away and lose the bytes into its discard; held, they are
+/// refused at retirement with the card showing them instead.
+///
+/// This release runs on no timer. A drain with no report, an unknown tree,
+/// a report delivered only after the drain ([`Record::drained_report`]) and
+/// a failed start release nothing here. The segment still doesn't complete
+/// under `Hold`.
+fn editor_ended(agent: Agent, r: &Record) -> bool {
+    agent == Agent::Claude
+        && r.drained
+        && matches!(
+            r.drained_report,
+            Some(Report::Done(Tree::Clean | Tree::Survivors))
+        )
+}
+
+/// Whether a drained record's ending is `WaitUnknown`: an editor-bearing
+/// decision (or none) and no report the helper recognisably sent, so
+/// nothing says when, or whether, its editor stopped reading.
+pub(crate) fn wait_unknown(decision: Option<Decision>, report: Report) -> bool {
+    !decision.is_some_and(Decision::helper_only)
+        && matches!(report, Report::None | Report::Unrecognised)
+}
+
+/// [`Record::helper_only`], from the facts kept at the drain.
+fn fact_helper_only(f: &ExitFact) -> bool {
+    f.decision.is_some_and(Decision::helper_only) || matches!(f.report, Report::SpawnFailed { .. })
+}

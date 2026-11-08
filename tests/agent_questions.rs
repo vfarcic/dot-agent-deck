@@ -55,6 +55,7 @@ fn question(id: &str, tool: Option<(&str, Option<&str>)>) -> PendingQuestion {
         channel: AnswerChannel::Held,
         subagent_id: None,
         revision: None,
+        answer_queued: false,
     }
 }
 

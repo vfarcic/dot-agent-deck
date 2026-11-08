@@ -1,0 +1,1244 @@
+//! PRD #1666 part 3 (Q35-14b; core §2.4 and §5.4, amendments 1–6 of
+//! Q35-core): the daemon's side of an installed generation's editor helper
+//! (`src/composer_probe/observe.rs`), pure over scripted connections: the
+//! seam that applies an attested invocation, scan or marker to the real
+//! invocation records through a generation's input lock and publishes the
+//! count to a page; what the helper is told; the epoch's external-edit move;
+//! E2's clock; the budgets; the drain's reschedule; and the `e2e` build's
+//! control verb. The real processes, helper and arm page are
+//! `inbox/probe/021`, `022` and `039`.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use dot_agent_deck::composer_probe::classifier::FileId;
+use dot_agent_deck::composer_probe::epoch::GenerationInput;
+use dot_agent_deck::composer_probe::observe::{
+    Bell, ControlOp, ControlRefusal, ControlStep, DRAIN_RETRIES, Departure, DrainStep, E2_AFTER,
+    Evidence, Page, Pool, READ_DEADLINE, Seam, SettleClaim, Slot, TestLiability, birth_floor,
+    drain_step, e2_due, marker_observation, outcome, read_before, report, scan_observation,
+};
+use dot_agent_deck::composer_probe::observe::{Bound, ProcFacts, bound_agent, shell_words};
+use dot_agent_deck::composer_probe::record::{
+    Attribution, Cause, Decision, EcPolicy, Marker, NotConsumed, NotOwned, RecordKey, Recorded,
+    Records, Refusal, Report, ScopeState, Settlement, Tree,
+};
+use dot_agent_deck::composer_probe::{InertCause, Permission};
+use dot_agent_deck::event::{
+    ComposerClaim, ComposerDecision, ComposerInvocationRequest, ComposerOutcome, EditorReport,
+    EditorTree, ExportRead,
+};
+use spec::spec;
+
+const G: u64 = 41;
+
+fn key(pid: u32) -> RecordKey {
+    RecordKey {
+        pid,
+        start: 9_000 + u64::from(pid),
+    }
+}
+
+/// A page that keeps every count published to it.
+#[derive(Debug, Default)]
+struct Book(Vec<u32>);
+
+impl Page for Book {
+    fn publish(&mut self, count: u32) {
+        self.0.push(count);
+    }
+}
+
+/// A seam over a fresh generation with its records attached, under `Hold`.
+fn seam(permission: Permission) -> Seam<Book> {
+    let input = Arc::new(GenerationInput::default());
+    assert!(input.attach_records(Records::new(G, EcPolicy::Hold, Instant::now())));
+    let mut seam = Seam::new(G, input, Book::default());
+    seam.set_permission(permission);
+    seam
+}
+
+fn request(decision: ComposerDecision, claim: Option<ComposerClaim>) -> ComposerInvocationRequest {
+    ComposerInvocationRequest {
+        pane_id: "p".into(),
+        token: None,
+        generation: G,
+        decision,
+        claim,
+        seg_seen: Some(0),
+        native_seen: Some(0),
+        argv: vec!["/tmp/claude-1000/claude-prompt-1.md".into()],
+    }
+}
+
+fn evidence(pid: u32, attribution: Attribution, read: Option<ExportRead>) -> Evidence {
+    Evidence {
+        key: key(pid),
+        birth_floor: Instant::now(),
+        attribution,
+        read,
+    }
+}
+
+fn armed() -> ComposerInvocationRequest {
+    request(ComposerDecision::Armed, Some(ComposerClaim::Owned))
+}
+
+fn count(seam: &Seam<Book>) -> u32 {
+    seam.input().liability_count().unwrap()
+}
+
+/// Scenario: Publish one liability on an armable generation and hand the seam a sequence of scripted helper connections: an `Owned` `Armed` invocation with an empty export consumes it once, is told `Mine` and the page goes to 0; the same invocation again, a second `Owned` helper at a count of 0, a tool's, an unattributable one, one whose claim disagrees, one the identity refusal dropped and one naming another generation are each told `Uncertain` and consume nothing; an `Owned` helper whose export couldn't be read consumes and is told `Unreadable`, never `Empty`.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_the_handler_settles_only_an_attested_armed_invocation() {
+    let mut s = seam(Permission::Armable);
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    let now = Instant::now();
+    let owned = evidence(1, Attribution::Owned, Some(ExportRead::Empty));
+    assert_eq!(
+        s.invocation(&armed(), Some(owned), now),
+        ComposerOutcome::Mine {
+            read: ExportRead::Empty
+        }
+    );
+    assert_eq!(count(&s), 0);
+    assert_eq!(s.page().0, [1, 0], "the page follows the records' count");
+    // The settled record's outcome stands; nothing more is consumed.
+    assert_eq!(
+        s.invocation(&armed(), Some(owned), now),
+        ComposerOutcome::Mine {
+            read: ExportRead::Empty
+        }
+    );
+    assert_eq!(s.page().0, [1, 0]);
+    assert_eq!(
+        s.input().record(key(1)).unwrap().settlement,
+        Settlement::Consumed
+    );
+    // Another `Owned` helper with no liability left.
+    assert_eq!(
+        s.invocation(
+            &armed(),
+            Some(evidence(2, Attribution::Owned, Some(ExportRead::Empty))),
+            now
+        ),
+        ComposerOutcome::Uncertain
+    );
+    assert_eq!(
+        s.input().record(key(2)).unwrap().settlement,
+        Settlement::NotConsumed(NotConsumed::AlreadyZero)
+    );
+
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    for (pid, attribution, claim) in [
+        (
+            3,
+            Attribution::NotOwned(NotOwned::Tool),
+            ComposerClaim::Tool,
+        ),
+        (
+            4,
+            Attribution::NotOwned(NotOwned::Unknown),
+            ComposerClaim::Unknown,
+        ),
+        (5, Attribution::Unattributable, ComposerClaim::Owned),
+        (
+            6,
+            Attribution::NotOwned(NotOwned::Shape),
+            ComposerClaim::Owned,
+        ),
+        // The daemon reads `Owned` but the helper's own class disagreed.
+        (7, Attribution::Owned, ComposerClaim::Unknown),
+    ] {
+        let got = s.invocation(
+            &request(ComposerDecision::Armed, Some(claim)),
+            Some(evidence(pid, attribution, None)),
+            now,
+        );
+        assert_eq!(got, ComposerOutcome::Uncertain, "{attribution:?} {claim:?}");
+        assert_eq!(count(&s), 1, "{attribution:?}: the liability stays");
+    }
+    assert_eq!(
+        s.invocation(&armed(), None, now),
+        ComposerOutcome::Uncertain,
+        "an identity refusal makes no record"
+    );
+    let mut other = armed();
+    other.generation = G + 1;
+    assert_eq!(
+        s.invocation(&other, Some(evidence(8, Attribution::Owned, None)), now),
+        ComposerOutcome::Uncertain
+    );
+    assert!(s.input().record(key(8)).is_none(), "another generation's");
+    assert_eq!(count(&s), 1);
+    assert_eq!(s.page().0, [1, 0, 1]);
+
+    // An `Owned` helper whose export didn't read: consumed, unreadable.
+    let unreadable = evidence(9, Attribution::Owned, Some(ExportRead::Unreadable));
+    assert_eq!(
+        s.invocation(&armed(), Some(unreadable), now),
+        ComposerOutcome::Mine {
+            read: ExportRead::Unreadable
+        }
+    );
+    let no_read = evidence(10, Attribution::Owned, None);
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    assert_eq!(
+        s.invocation(&armed(), Some(no_read), now),
+        ComposerOutcome::Mine {
+            read: ExportRead::Unreadable
+        },
+        "an `Owned` record with no read is never `Empty`"
+    );
+    assert_eq!(count(&s), 0);
+}
+
+/// Scenario: On a generation with its segments attached, hand the seam `Owned` `Armed` invocations whose export the daemon read empty, not empty, as unknown, as unreadable, or not at all, one liability published for each. The read the epoch keeps for each record's settlement is empty, not empty, not empty, unreadable and unreadable: only a read that saw the box counts as one, so an export the daemon couldn't read, or didn't, settles as a timed recheck (revfence29 finding 6, Q151b).
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_the_epoch_keeps_what_the_daemon_read_of_the_export() {
+    use dot_agent_deck::composer_probe::epoch::BoxRead;
+    use dot_agent_deck::composer_probe::segments::Agent;
+    let mut s = seam(Permission::Armable);
+    assert!(s.input().attach_segments(G, Agent::Claude));
+    let now = Instant::now();
+    for (pid, read, kept) in [
+        (21, Some(ExportRead::Empty), BoxRead::Empty),
+        (22, Some(ExportRead::NonEmpty), BoxRead::NonEmpty),
+        (23, Some(ExportRead::Unknown), BoxRead::NonEmpty),
+        (24, Some(ExportRead::Unreadable), BoxRead::Unreadable),
+        (25, None, BoxRead::Unreadable),
+    ] {
+        assert_eq!(s.control(G, ControlOp::Publish), Ok(1), "{read:?}");
+        s.invocation(&armed(), Some(evidence(pid, Attribution::Owned, read)), now);
+        assert_eq!(s.input().export_read(key(pid)), Some(kept), "{read:?}");
+    }
+}
+
+/// Scenario: Hand the seam an `Unarmed`, a `Tool` and an unknown decision, each from its own helper, and an `Armed` one. Each non-`Armed` one moves the generation's input epoch once as an external edit before its outcome comes back, and the writer scope is already open by then, so the reply can't go out first; the `Armed` one moves nothing.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_an_invocation_that_is_not_the_decks_moves_the_epoch_before_its_reply() {
+    let mut s = seam(Permission::Armable);
+    let now = Instant::now();
+    for (pid, decision, expected) in [
+        (1, ComposerDecision::Unarmed, ComposerOutcome::Unarmed),
+        (2, ComposerDecision::Tool, ComposerOutcome::Unarmed),
+        (3, ComposerDecision::Unknown, ComposerOutcome::Uncertain),
+    ] {
+        let before = s.input().epoch();
+        let got = s.invocation(
+            &request(decision, Some(ComposerClaim::Owned)),
+            Some(evidence(pid, Attribution::Owned, None)),
+            now,
+        );
+        let after = s.input().epoch();
+        assert_eq!(got, expected, "{decision:?}");
+        assert_eq!(after.epoch(), before.epoch() + 1, "{decision:?}: one move");
+        assert_eq!(after.last_foreign(), after.epoch(), "foreign: no deck job");
+        assert!(after.touched());
+        assert!(
+            matches!(
+                s.input().writer_scope().unwrap().state(),
+                ScopeState::Open(Cause::EditorReturnUnchecked)
+            ),
+            "{decision:?}: open before the reply"
+        );
+    }
+    let before = s.input().epoch();
+    s.invocation(
+        &armed(),
+        Some(evidence(4, Attribution::Owned, Some(ExportRead::Empty))),
+        now,
+    );
+    assert_eq!(
+        s.input().epoch(),
+        before,
+        "an `Armed` invocation moves nothing"
+    );
+}
+
+/// Scenario: Observe a helper's `Armed` decision 30 s after the generation started, then a duplicate 3 s later. E2 isn't due 4.9 s after the first observation and is due at 5 s, whatever the helper's birth or the duplicate; a helper seen only by a scan, one that decided `Unarmed`, and an `Armed` one whose exit was observed are never due.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_e2_runs_from_the_first_armed_observation() {
+    let t = Instant::now();
+    let mut s = seam(Permission::Armable);
+    let first = t + Duration::from_secs(30);
+    let born_early = Evidence {
+        birth_floor: t,
+        ..evidence(1, Attribution::Owned, Some(ExportRead::Empty))
+    };
+    s.invocation(&armed(), Some(born_early), first);
+    s.invocation(&armed(), Some(born_early), first + Duration::from_secs(3));
+    let r = s.input().record(key(1)).unwrap();
+    assert_eq!(
+        r.first_armed_seen,
+        Some(first),
+        "a duplicate doesn't move it"
+    );
+    assert!(!e2_due(&r, first + E2_AFTER - Duration::from_millis(100)));
+    assert!(e2_due(&r, first + E2_AFTER));
+    assert!(!e2_due(&r, first), "not at its decision");
+
+    let obs = scan_observation(G, key(2), Attribution::Owned, t);
+    s.observe(&obs, first).unwrap();
+    s.invocation(
+        &request(ComposerDecision::Unarmed, Some(ComposerClaim::Owned)),
+        Some(evidence(3, Attribution::Owned, None)),
+        first,
+    );
+    let late = first + Duration::from_secs(60);
+    for pid in [2, 3] {
+        assert!(!e2_due(&s.input().record(key(pid)).unwrap(), late), "{pid}");
+    }
+    s.exit(
+        key(1),
+        first + Duration::from_secs(1),
+        first + Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(!e2_due(&s.input().record(key(1)).unwrap(), late), "exited");
+}
+
+/// Scenario: Take units from a generation's pool of two and a total of three: the third from one generation is refused, a second generation gets one and is then refused by the full total (giving its own unit back), and dropping a slot returns a unit to both, which never go below zero.
+#[spec("inbox/probe/070")]
+#[test]
+fn probe_070_each_budget_holds_per_generation_and_in_total() {
+    let total: &'static Pool = Box::leak(Box::new(Pool::new(3)));
+    let a = Arc::new(Pool::new(2));
+    let b = Arc::new(Pool::new(2));
+    let one = Slot::take(&a, total).unwrap();
+    let two = Slot::take(&a, total).unwrap();
+    assert!(Slot::take(&a, total).is_none(), "the generation's bound");
+    assert_eq!((a.used(), total.used()), (2, 2));
+    let three = Slot::take(&b, total).unwrap();
+    assert!(Slot::take(&b, total).is_none(), "the total's bound");
+    assert_eq!((b.used(), total.used()), (1, 3), "b's unit given back");
+    drop(one);
+    assert_eq!((a.used(), total.used()), (1, 2));
+    let four = Slot::take(&b, total).unwrap();
+    drop((two, three, four));
+    assert_eq!((a.used(), b.used(), total.used()), (0, 0, 0));
+    total.give();
+    a.give();
+    assert_eq!((a.used(), total.used()), (0, 0), "never below zero");
+    assert!(Pool::new(0).used() == 0 && !Pool::new(0).take());
+}
+
+/// Scenario: Ask the drain what to do with an exited helper: with a connection of its not finished, or its markers not read completely, it is rescheduled however long ago the exit was, and only once its retries are spent does it give up to the uncertain outcome; with neither it settles, unless a connection of its ended with bytes it never read, which gives up to the uncertain outcome at once rather than settling. Then drive a decisionless `Owned` helper through the seam: born after a liability was published, its exit observed, and not drained, it stays open and consumes nothing; drained once, its exit consumes the liability and the page follows; drained again, nothing moves.
+#[spec("inbox/probe/070")]
+#[test]
+fn probe_070_the_drain_reschedules_while_evidence_is_undrained() {
+    assert_eq!(drain_step(0, true, false, 0), DrainStep::Settle);
+    assert_eq!(
+        drain_step(0, true, false, DRAIN_RETRIES + 5),
+        DrainStep::Settle
+    );
+    // Q85: a connection that ended with bytes unread never settles clean;
+    // once nothing else is outstanding it gives up without waiting out the
+    // retries, since what it didn't read is never read later.
+    assert_eq!(drain_step(0, true, true, 0), DrainStep::GiveUp);
+    for (open, markers_read) in [(1, true), (2, true), (0, false), (1, false)] {
+        for unread in [false, true] {
+            assert_eq!(
+                drain_step(open, markers_read, unread, 0),
+                DrainStep::Wait,
+                "no timer settles: {open} open, markers read {markers_read}, unread {unread}"
+            );
+            assert_eq!(
+                drain_step(open, markers_read, unread, DRAIN_RETRIES - 1),
+                DrainStep::Wait
+            );
+            assert_eq!(
+                drain_step(open, markers_read, unread, DRAIN_RETRIES),
+                DrainStep::GiveUp,
+                "never Settle while evidence is unread"
+            );
+        }
+    }
+
+    let mut s = seam(Permission::Armable);
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    let born = Instant::now();
+    let obs = scan_observation(G, key(1), Attribution::Owned, born);
+    assert!(matches!(
+        s.observe(&obs, born),
+        Ok(Recorded::Kept {
+            settlement: Settlement::Open,
+            ..
+        })
+    ));
+    assert_eq!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Pending,
+        "a decisionless sighting is undecided"
+    );
+    let exit = born + Duration::from_millis(5);
+    s.exit(key(1), exit, exit).unwrap();
+    // Rescheduled: nothing settles before the drain.
+    assert_eq!(
+        s.input().record(key(1)).unwrap().settlement,
+        Settlement::Open
+    );
+    assert_eq!(count(&s), 1);
+    let drained = s.drained(key(1), exit + READ_DEADLINE).unwrap();
+    assert_eq!(drained.settlement, Settlement::Consumed);
+    assert_eq!(count(&s), 0);
+    assert_eq!(s.page().0, [1, 0]);
+    assert!(s.drained(key(1), exit + READ_DEADLINE).is_ok());
+    assert_eq!(s.page().0, [1, 0], "a second drain changes nothing");
+}
+
+/// Scenario: Address the control verb to another generation, to a generation whose permission is pending or inert, and to an armable one: only the last publishes. Publishing twice raises the count once and withdrawing twice lowers it once and never below zero; after the liability is consumed, a withdrawal does nothing and a new publication raises the count again. Its stepping is checked on its own for each operation and count, and a retired generation refuses.
+#[spec("inbox/probe/071")]
+#[test]
+fn probe_071_the_control_verb_is_bounded_and_idempotent() {
+    for permission in [
+        Permission::Pending,
+        Permission::Inert(InertCause::UnsupportedAgent),
+    ] {
+        let mut s = seam(permission);
+        assert_eq!(
+            s.control(G, ControlOp::Publish),
+            Err(ControlRefusal::Permission(permission))
+        );
+        assert!(s.page().0.is_empty());
+    }
+    let mut s = seam(Permission::Armable);
+    assert_eq!(
+        s.control(G + 1, ControlOp::Publish),
+        Err(ControlRefusal::Generation)
+    );
+    assert_eq!(
+        s.control(G - 1, ControlOp::Withdraw),
+        Err(ControlRefusal::Generation)
+    );
+    assert!(s.page().0.is_empty(), "a refused generation writes nothing");
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    assert_eq!(s.control(G, ControlOp::Withdraw), Ok(0));
+    assert_eq!(s.control(G, ControlOp::Withdraw), Ok(0));
+    assert_eq!(s.page().0, [1, 0]);
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    s.invocation(
+        &armed(),
+        Some(evidence(1, Attribution::Owned, Some(ExportRead::Empty))),
+        Instant::now(),
+    );
+    assert_eq!(
+        s.control(G, ControlOp::Withdraw),
+        Ok(0),
+        "consumed: nothing"
+    );
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1), "a new one");
+    assert_eq!(s.page().0, [1, 0, 1, 0, 1]);
+
+    let mut t = TestLiability::default();
+    assert_eq!(t.step(ControlOp::Withdraw, 0), ControlStep::Unchanged);
+    assert_eq!(t.step(ControlOp::Publish, 0), ControlStep::Raise);
+    assert_eq!(t.step(ControlOp::Publish, 1), ControlStep::Unchanged);
+    assert_eq!(
+        t.step(ControlOp::Publish, 0),
+        ControlStep::Raise,
+        "consumed"
+    );
+    assert_eq!(t.step(ControlOp::Withdraw, 1), ControlStep::Lower);
+    assert_eq!(t.step(ControlOp::Withdraw, 1), ControlStep::Unchanged);
+
+    s.input().retire();
+    assert_eq!(
+        s.control(G, ControlOp::Withdraw),
+        Err(ControlRefusal::Records(Refusal::Stale))
+    );
+}
+
+/// Scenario: Feed one generation's seam the channels' evidence in the orders the integration can see: two helpers sighted by the scan and undecided, only one then deciding by marker; a marker and then the IPC for the same `Armed` helper; an IPC before the scan; an exit observed before the IPC decision is drained; and a late IPC after the exit drain. The count drops exactly once per consumed record, the scope stays pending while one sighting is undecided and closes when its exit drains, and nothing after a settlement or a retirement moves the count.
+#[spec("inbox/probe/058")]
+#[test]
+fn probe_058_the_real_channels_settle_each_record_once() {
+    let mut s = seam(Permission::Armable);
+    let t = Instant::now();
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    let born = Instant::now();
+    for pid in [1, 2] {
+        s.observe(
+            &scan_observation(G, key(pid), Attribution::Owned, born),
+            born,
+        )
+        .unwrap();
+    }
+    assert_eq!(s.input().writer_scope().unwrap().undecided(), 2);
+    let marker = Marker {
+        key: key(1),
+        decision: Decision::Armed,
+        seen: Some((0, 0)),
+        renamed: false,
+    };
+    let applied = s.observe(
+        &marker_observation(G, &marker, Attribution::Pending, born),
+        born,
+    );
+    assert!(matches!(
+        applied,
+        Ok(Recorded::Kept {
+            settlement: Settlement::Consumed,
+            ..
+        })
+    ));
+    assert_eq!(count(&s), 0);
+    assert_eq!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Pending,
+        "the other sighting is still undecided"
+    );
+    // The same helper's IPC after its marker: the settled outcome, once.
+    assert_eq!(
+        s.invocation(
+            &armed(),
+            Some(evidence(1, Attribution::Owned, Some(ExportRead::Empty))),
+            born
+        ),
+        ComposerOutcome::Mine {
+            read: ExportRead::Empty
+        }
+    );
+    assert_eq!(count(&s), 0);
+    assert_eq!(s.page().0, [1, 0]);
+    // The undecided one's exit drains with no proof (the count was 0).
+    s.exit(key(2), born, born).unwrap();
+    let drained = s.drained(key(2), born).unwrap();
+    assert_eq!(
+        drained.settlement,
+        Settlement::NotConsumed(NotConsumed::Unproven)
+    );
+    assert!(drained.rescan || s.input().writer_scope().unwrap().undecided() == 0);
+
+    // IPC before the scan, then the scan: nothing more.
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    let born3 = Instant::now();
+    let three = Evidence {
+        birth_floor: born3,
+        ..evidence(3, Attribution::Owned, Some(ExportRead::NonEmpty))
+    };
+    assert_eq!(
+        s.invocation(&armed(), Some(three), born3),
+        ComposerOutcome::Mine {
+            read: ExportRead::NonEmpty
+        }
+    );
+    s.observe(
+        &scan_observation(G, key(3), Attribution::Owned, born3),
+        born3,
+    )
+    .unwrap();
+    assert_eq!(count(&s), 0);
+
+    // An exit observed before the decision's drain: the decision settles.
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    let born4 = Instant::now();
+    s.observe(
+        &scan_observation(G, key(4), Attribution::Owned, born4),
+        born4,
+    )
+    .unwrap();
+    s.exit(key(4), born4, born4).unwrap();
+    let four = Evidence {
+        birth_floor: born4,
+        ..evidence(4, Attribution::Owned, Some(ExportRead::Empty))
+    };
+    assert!(matches!(
+        s.invocation(&armed(), Some(four), born4),
+        ComposerOutcome::Mine { .. }
+    ));
+    assert_eq!(count(&s), 0);
+    let drained = s.drained(key(4), born4).unwrap();
+    assert_eq!(drained.settlement, Settlement::Consumed, "once");
+    assert_eq!(count(&s), 0, "the drain doesn't consume again");
+
+    // A late IPC after a drained, settled exit changes nothing.
+    assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+    assert!(matches!(
+        s.invocation(&armed(), Some(four), born4),
+        ComposerOutcome::Mine { .. }
+    ));
+    assert_eq!(count(&s), 1, "a later liability survives late evidence");
+    assert_eq!(s.page().0, [1, 0, 1, 0, 1, 0, 1]);
+
+    // Retired: nothing applies, nothing is consumed.
+    s.input().retire();
+    assert_eq!(
+        s.invocation(
+            &armed(),
+            Some(evidence(5, Attribution::Owned, Some(ExportRead::Empty))),
+            t
+        ),
+        ComposerOutcome::Uncertain
+    );
+    assert!(s.input().liability_count().is_none());
+}
+
+/// Scenario: Map every decision and settlement to what the helper is told, the helper's reports to the record's, and check that a scan's observation carries no decision, claim or numbers and a marker's carries its decision and numbers but no claim.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_the_adapters_and_the_reply_table() {
+    let consumed = Ok(Recorded::Kept {
+        settlement: Settlement::Consumed,
+        rescan: false,
+    });
+    let zero = Ok(Recorded::Kept {
+        settlement: Settlement::NotConsumed(NotConsumed::AlreadyZero),
+        rescan: false,
+    });
+    let read = Some(ExportRead::NonEmpty);
+    assert_eq!(
+        outcome(Decision::Armed, consumed, read),
+        ComposerOutcome::Mine {
+            read: ExportRead::NonEmpty
+        }
+    );
+    assert_eq!(
+        outcome(Decision::Armed, zero, read),
+        ComposerOutcome::Uncertain
+    );
+    assert_eq!(
+        outcome(Decision::Armed, Ok(Recorded::Dropped), read),
+        ComposerOutcome::Uncertain
+    );
+    assert_eq!(
+        outcome(Decision::Armed, Err(Refusal::Stale), read),
+        ComposerOutcome::Uncertain
+    );
+    for decision in [Decision::Unarmed, Decision::Tool] {
+        assert_eq!(outcome(decision, consumed, read), ComposerOutcome::Unarmed);
+    }
+    assert_eq!(
+        outcome(Decision::Unknown, consumed, read),
+        ComposerOutcome::Uncertain
+    );
+
+    for (got, want) in [
+        (
+            EditorReport::EditorDone {
+                tree: EditorTree::Clean,
+            },
+            Report::Done(Tree::Clean),
+        ),
+        (
+            EditorReport::EditorDone {
+                tree: EditorTree::Survivors,
+            },
+            Report::Done(Tree::Survivors),
+        ),
+        (
+            EditorReport::EditorDone {
+                tree: EditorTree::Unknown,
+            },
+            Report::Done(Tree::Unknown),
+        ),
+        (
+            EditorReport::SpawnFailed { errno: Some(2) },
+            Report::SpawnFailed { errno: Some(2) },
+        ),
+        (EditorReport::Unknown, Report::Unrecognised),
+    ] {
+        assert_eq!(report(got), want);
+    }
+
+    let t = Instant::now();
+    let scan = scan_observation(G, key(1), Attribution::Owned, t);
+    assert_eq!(
+        (scan.decision, scan.claim, scan.seg_seen, scan.native_seen),
+        (None, None, None, None)
+    );
+    let marker = Marker {
+        key: key(2),
+        decision: Decision::Unarmed,
+        seen: Some((5, 6)),
+        renamed: false,
+    };
+    let m = marker_observation(G, &marker, Attribution::Pending, t);
+    assert_eq!(
+        (m.decision, m.claim, m.seg_seen, m.native_seen),
+        (Some(Decision::Unarmed), None, Some(5), Some(6))
+    );
+}
+
+/// Scenario: Report a clean editor tree on an `Unarmed` helper's connection: the record keeps the report and its frontier reads missing at once, since no reader takes one yet; a second report is ignored, and the scope stays open for the editor-bearing decision under `Hold`.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_a_clean_report_records_no_frontier() {
+    let mut s = seam(Permission::Armable);
+    let now = Instant::now();
+    s.invocation(
+        &request(ComposerDecision::Unarmed, Some(ComposerClaim::Owned)),
+        Some(evidence(1, Attribution::Owned, None)),
+        now,
+    );
+    s.report(
+        key(1),
+        EditorReport::EditorDone {
+            tree: EditorTree::Clean,
+        },
+        now,
+    );
+    let r = s.input().record(key(1)).unwrap();
+    assert_eq!(r.report, Report::Done(Tree::Clean));
+    assert_eq!(
+        r.frontier,
+        dot_agent_deck::composer_probe::record::Frontier::Missing
+    );
+    s.report(
+        key(1),
+        EditorReport::EditorDone {
+            tree: EditorTree::Survivors,
+        },
+        now,
+    );
+    assert_eq!(
+        s.input().record(key(1)).unwrap().report,
+        Report::Done(Tree::Clean)
+    );
+    assert!(matches!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Open(_)
+    ));
+}
+
+/// Scenario: Convert start ticks to a birth floor: 250 ticks at 100 per second with the boot clock at 3 s is 0.5 s before now, a start after the boot clock's reading or a zero tick rate gives none. Drop an `Unarmed` and an `Armed` observation through the identity refusal: the first opens the writer scope and the second doesn't, neither makes a record, and after retirement the refusal is stale. Drain a tool's helper and prune it: it goes with its exit facts, and an unsettled one stays. Ring a bell: a scan asked for is taken once, and a thread parked on it wakes.
+#[spec("inbox/probe/069")]
+#[test]
+fn probe_069_the_floor_the_refusal_the_prune_and_the_bell() {
+    let now = Instant::now();
+    assert_eq!(
+        birth_floor(250, 100, now, 3_000_000_000),
+        Some(now - Duration::from_millis(500))
+    );
+    assert_eq!(
+        birth_floor(250, 100, now, 2_000_000_000),
+        None,
+        "after the clock"
+    );
+    assert_eq!(birth_floor(250, 0, now, 3_000_000_000), None);
+
+    let mut s = seam(Permission::Armable);
+    s.refused(
+        dot_agent_deck::composer_probe::record::Channel::Marker,
+        Some(Decision::Armed),
+        None,
+        now,
+    )
+    .unwrap();
+    assert_eq!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Closed
+    );
+    s.refused(
+        dot_agent_deck::composer_probe::record::Channel::Ipc,
+        Some(Decision::Unarmed),
+        Some(dot_agent_deck::composer_probe::record::Claim::Owned),
+        now,
+    )
+    .unwrap();
+    assert!(matches!(
+        s.input().writer_scope().unwrap().state(),
+        ScopeState::Open(_)
+    ));
+    assert!(s.input().record(key(1)).is_none());
+
+    let tool = request(ComposerDecision::Tool, Some(ComposerClaim::Tool));
+    s.invocation(
+        &tool,
+        Some(evidence(2, Attribution::NotOwned(NotOwned::Tool), None)),
+        now,
+    );
+    s.observe(&scan_observation(G, key(3), Attribution::Owned, now), now)
+        .unwrap();
+    assert_eq!(s.prune(key(2), true, now), Ok(None), "not exited yet");
+    s.exit(key(2), now, now).unwrap();
+    s.drained(key(2), now).unwrap();
+    let fact = s
+        .prune(key(2), true, now)
+        .unwrap()
+        .expect("pruned with its facts");
+    assert_eq!(fact.key, key(2));
+    assert!(s.input().record(key(2)).is_none());
+    s.exit(key(3), now, now).unwrap();
+    s.drained(key(3), now).unwrap();
+    assert_eq!(
+        s.prune(key(3), true, now),
+        Ok(None),
+        "its completion is pending"
+    );
+    assert!(s.input().record(key(3)).is_some());
+    s.input().retire();
+    assert_eq!(
+        s.refused(
+            dot_agent_deck::composer_probe::record::Channel::Scan,
+            None,
+            None,
+            now
+        ),
+        Err(Refusal::Stale)
+    );
+
+    let bell = Arc::new(Bell::default());
+    assert!(!bell.take_scan());
+    bell.ring_scan();
+    assert!(bell.take_scan());
+    assert!(!bell.take_scan(), "taken once");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let parked = std::thread::spawn(move || {
+        tx.send(()).unwrap();
+        let started = Instant::now();
+        std::thread::park_timeout(Duration::from_secs(5));
+        started.elapsed()
+    });
+    rx.recv().unwrap();
+    bell.bind(parked.thread().clone());
+    std::thread::sleep(Duration::from_millis(20));
+    bell.ring();
+    assert!(
+        parked.join().unwrap() < Duration::from_secs(4),
+        "rung awake"
+    );
+    let scanned = Arc::new(Bell::default());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let parked = std::thread::spawn(move || {
+        tx.send(()).unwrap();
+        let started = Instant::now();
+        std::thread::park_timeout(Duration::from_secs(5));
+        started.elapsed()
+    });
+    rx.recv().unwrap();
+    scanned.bind(parked.thread().clone());
+    std::thread::sleep(Duration::from_millis(20));
+    scanned.ring_scan();
+    assert!(
+        parked.join().unwrap() < Duration::from_secs(4),
+        "a scan wakes it too"
+    );
+}
+
+/// Scenario: A connection's departure is marked when its helper's exit is observed: a waiter started before the mark and one started after it both resolve, and the read deadline resolves no sooner than `READ_DEADLINE` after the mark; with no mark, neither resolves. The deadline is one instant: marking again doesn't move it, and once it has passed, awaiting it again resolves at once instead of starting a new window.
+#[spec("inbox/probe/070")]
+#[test]
+fn probe_070_a_departure_wakes_its_connection_then_waits_the_read_deadline() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let quiet = Departure::default();
+        assert_eq!(quiet.deadline(), None);
+        assert!(!quiet.expired());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), quiet.read_deadline())
+                .await
+                .is_err(),
+            "no exit observed: no deadline"
+        );
+
+        let departure = Arc::new(Departure::default());
+        let early = tokio::spawn({
+            let departure = Arc::clone(&departure);
+            async move { departure.wait().await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!departure.departed());
+        let marked = tokio::time::Instant::now();
+        departure.depart();
+        assert!(!departure.expired(), "not before the deadline");
+        let end = departure.deadline().expect("marked");
+        assert!(end >= marked + READ_DEADLINE);
+        let within = Duration::from_secs(2);
+        tokio::time::timeout(within, early)
+            .await
+            .expect("a waiter from before the mark wakes")
+            .unwrap();
+        tokio::time::timeout(within, departure.wait())
+            .await
+            .expect("a waiter from after the mark resolves");
+        tokio::time::timeout(within, departure.read_deadline())
+            .await
+            .expect("the read deadline resolves");
+        assert!(marked.elapsed() >= READ_DEADLINE);
+        assert!(departure.expired());
+
+        // Anchored (Q85): nothing renews it.
+        departure.depart();
+        assert_eq!(
+            departure.deadline(),
+            Some(end),
+            "a second mark moves nothing"
+        );
+        let again = tokio::time::Instant::now();
+        tokio::time::timeout(within, departure.read_deadline())
+            .await
+            .expect("the read deadline resolves");
+        assert!(
+            again.elapsed() < READ_DEADLINE,
+            "a passed deadline resolves at once: {:?}",
+            again.elapsed()
+        );
+    });
+}
+
+/// Scenario: On a paused clock, a connection's helper is marked departed, a complete line arrives 90 ms later and the reader returns it, and then the peer goes silent with the connection held open: the next read ends exactly at the read deadline, 100 ms after the departure, not a full read deadline after that last line, and with nothing unread it marks nothing lost. The same with half a line arriving at 90 ms ends at the same instant and marks the connection lost.
+#[spec("inbox/probe/070")]
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn probe_070_a_late_line_then_silence_ends_at_the_departure_deadline() {
+    use tokio::io::AsyncWriteExt as _;
+    // The paused clock's timer granularity.
+    const TICK: Duration = Duration::from_millis(2);
+
+    for half in [false, true] {
+        let (peer, mut holder) = tokio::io::duplex(1024);
+        let mut reader = tokio::io::BufReader::new(peer);
+        let mut line = dot_agent_deck::bounded_read::CappedLine::default();
+        let departure = Departure::default();
+        let departed = tokio::time::Instant::now();
+        departure.depart();
+        let late = Duration::from_millis(90);
+        let send = async {
+            tokio::time::sleep(late).await;
+            let bytes: &[u8] = if half {
+                b"{\"half\":"
+            } else {
+                b"{\"whole\":1}\n"
+            };
+            holder.write_all(bytes).await.unwrap();
+        };
+        let mut lost = false;
+        if half {
+            let (_, ended) = tokio::join!(
+                send,
+                read_before(
+                    &departure,
+                    &mut line,
+                    &mut reader,
+                    1024,
+                    |_| false,
+                    || lost = true
+                ),
+            );
+            assert!(ended.is_none(), "half a line is never returned");
+        } else {
+            let (_, read) = tokio::join!(
+                send,
+                read_before(
+                    &departure,
+                    &mut line,
+                    &mut reader,
+                    1024,
+                    |_| false,
+                    || { panic!("nothing is unread") }
+                ),
+            );
+            assert_eq!(read.unwrap().unwrap().as_deref(), Some("{\"whole\":1}"));
+            assert!(
+                (late..late + TICK).contains(&departed.elapsed()),
+                "the line, read when it came: {:?}",
+                departed.elapsed()
+            );
+            let ended = read_before(
+                &departure,
+                &mut line,
+                &mut reader,
+                1024,
+                |_| false,
+                || lost = true,
+            )
+            .await;
+            assert!(ended.is_none(), "silence ends the connection");
+        }
+        // A deadline renewed by the line would end at 190 ms.
+        assert!(
+            (READ_DEADLINE..READ_DEADLINE + TICK).contains(&departed.elapsed()),
+            "ends at the departure's deadline, not a read deadline after the last line: {:?}",
+            departed.elapsed()
+        );
+        assert_eq!(lost, half, "only the half line is lost");
+        drop(holder);
+    }
+}
+
+/// Scenario: Settle an `Owned`, decisionless helper's exit whose interval proof holds, once with its evidence read (the control: it consumes) and once given up with evidence unread: the second consumes nothing, settles `NotConsumed(Unproven)`, opens the writer scope as unconfirmed, and moves no count. An `Armed` decision that arrives after either settlement is told the settled outcome (`Mine` for the consumption, `Uncertain` for the uncertain one) and changes nothing: no decision, no count.
+#[spec("inbox/probe/070")]
+#[test]
+fn probe_070_a_drain_given_up_never_consumes_and_a_late_decision_changes_nothing() {
+    for complete in [true, false] {
+        let mut s = seam(Permission::Armable);
+        assert_eq!(s.control(G, ControlOp::Publish), Ok(1));
+        let born = Instant::now();
+        s.observe(&scan_observation(G, key(1), Attribution::Owned, born), born)
+            .unwrap();
+        let exit = born + Duration::from_millis(5);
+        s.exit(key(1), exit, exit).unwrap();
+        assert!(!s.late(key(1)), "exited, not yet drained");
+        let drained = if complete {
+            s.drained(key(1), exit)
+        } else {
+            s.drained_uncertain(key(1), exit)
+        }
+        .unwrap();
+        if complete {
+            assert_eq!(drained.settlement, Settlement::Consumed);
+            assert_eq!(count(&s), 0);
+        } else {
+            assert_eq!(
+                drained.settlement,
+                Settlement::NotConsumed(NotConsumed::Unproven)
+            );
+            assert_eq!(count(&s), 1, "the liability stays");
+            assert_eq!(s.page().0, [1]);
+            assert_eq!(
+                s.input().writer_scope().unwrap().state(),
+                ScopeState::Open(Cause::EditorUnconfirmed)
+            );
+        }
+        assert!(s.late(key(1)), "a decision now comes after the drain");
+        assert!(!s.late(key(2)), "no record");
+        let before = count(&s);
+        let late = s.invocation(
+            &armed(),
+            Some(evidence(1, Attribution::Owned, Some(ExportRead::Empty))),
+            exit,
+        );
+        let settled = if complete {
+            ComposerOutcome::Mine {
+                read: ExportRead::Empty,
+            }
+        } else {
+            ComposerOutcome::Uncertain
+        };
+        assert_eq!(late, settled, "complete: {complete}");
+        assert_eq!(count(&s), before);
+        assert_eq!(s.input().record(key(1)).unwrap().decision, None);
+    }
+}
+
+/// Scenario: Two settlers race for a generation's permission behind a barrier: exactly one takes the claim at a time, failed attempts while it is held leave it held, a released claim can be taken again, and the seam moves out of `Pending` once, the second settlement (another permission) reporting it lost and changing nothing.
+#[spec("inbox/probe/073")]
+#[test]
+fn probe_073_the_permission_settles_once() {
+    let claim = Arc::new(SettleClaim::default());
+    for _ in 0..50 {
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let both = Arc::new(std::sync::Barrier::new(2));
+        let racers: Vec<_> = (0..2)
+            .map(|_| {
+                let claim = Arc::clone(&claim);
+                let barrier = Arc::clone(&barrier);
+                let both = Arc::clone(&both);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    let held = claim.claim();
+                    let won = held.is_some();
+                    // Both have tried before either lets go.
+                    both.wait();
+                    drop(held);
+                    won
+                })
+            })
+            .collect();
+        let won: Vec<bool> = racers.into_iter().map(|r| r.join().unwrap()).collect();
+        assert_eq!(won.iter().filter(|w| **w).count(), 1, "{won:?}");
+    }
+    let held = claim.claim().expect("released when dropped");
+    for _ in 0..3 {
+        assert!(
+            claim.claim().is_none(),
+            "a failed claim leaves the holder's in place"
+        );
+    }
+    drop(held);
+    assert!(claim.claim().is_some());
+
+    let mut s = seam(Permission::Pending);
+    assert!(
+        !s.set_permission(Permission::Pending),
+        "pending moves nothing"
+    );
+    assert!(s.set_permission(Permission::Armable));
+    assert!(!s.set_permission(Permission::Inert(InertCause::Unbound)));
+    assert_eq!(s.permission(), Permission::Armable);
+}
+
+fn id(ino: u64) -> FileId {
+    FileId { dev: 1, ino }
+}
+
+fn argv(words: &[&str]) -> Vec<std::ffi::OsString> {
+    words.iter().map(Into::into).collect()
+}
+
+fn facts(ino: u64, words: &[&str]) -> ProcFacts {
+    ProcFacts {
+        exe: id(ino),
+        argv: argv(words),
+    }
+}
+
+/// The executables a scripted `PATH` resolves: `/bin/sh` is 1, the real
+/// Claude 2, a user's launcher script named `claude` 3, a tool 4.
+fn resolve(program: &std::ffi::OsStr) -> Option<FileId> {
+    match program.to_str()? {
+        "/bin/sh" => Some(id(1)),
+        "/opt/claude/claude" | "claude" => Some(id(2)),
+        "/home/u/bin/claude" => Some(id(3)),
+        "/usr/bin/tool" => Some(id(4)),
+        _ => None,
+    }
+}
+
+/// Scenario: Split the command lines the deck's shell runs as the shell would, for the plain argv a direct agent's command is: quoted words keep their blanks and a `'\''` keeps its quote; every line the shell would expand, redirect, glob, chain or comment, a leading assignment, a line break or an unterminated quote gives no argv at all.
+#[spec("inbox/probe/073")]
+#[test]
+fn probe_073_shell_words_splits_only_a_plain_command() {
+    assert_eq!(
+        shell_words("claude --model haiku"),
+        Some(vec!["claude".into(), "--model".into(), "haiku".into()])
+    );
+    assert_eq!(
+        shell_words("  '/opt/my claude/claude'\t\"a b\" 'it'\\''s' x=y "),
+        Some(vec![
+            "/opt/my claude/claude".into(),
+            "a b".into(),
+            "it's".into(),
+            "x=y".into()
+        ])
+    );
+    assert_eq!(
+        shell_words("claude ''"),
+        Some(vec!["claude".into(), String::new()])
+    );
+    for refused in [
+        "",
+        "   ",
+        "claude $HOME",
+        "claude \"$HOME\"",
+        "claude `id`",
+        "claude; id",
+        "claude && id",
+        "claude | tee",
+        "claude > out",
+        "claude *",
+        "claude ?",
+        "claude [ab]",
+        "claude {a,b}",
+        "claude ~/x",
+        "claude # note",
+        "claude\nid",
+        "claude \\\nmore",
+        "X=1 claude",
+        "claude 'open",
+        "claude \"open",
+        "claude (x)",
+    ] {
+        assert_eq!(shell_words(refused), None, "{refused:?}");
+    }
+}
+
+/// Scenario: Bind `A` from the deck's own launch record over a scripted process table: the deck's direct launch, and its `sh -c` line whether the shell `exec`ed the agent or forked it as its one child, bind the agent; a user's launcher script named `claude` binds nothing, whether its child is the real Claude or a tool, and nor does a shell that is no longer the deck's, a child with other arguments or another executable, two children, a line the shell would expand, or a launch whose program is a shell.
+#[spec("inbox/probe/073")]
+#[test]
+fn probe_073_a_shells_child_is_bound_only_from_the_decks_own_launch() {
+    let line = "/opt/claude/claude --model haiku";
+    let deck_shell = argv(&["/bin/sh", "-c", line]);
+    let agent = facts(2, &["/opt/claude/claude", "--model", "haiku"]);
+    let shell = facts(1, &["/bin/sh", "-c", line]);
+
+    // The deck executed the agent itself, whatever its arguments.
+    let direct = argv(&["/opt/claude/claude", "--model", "haiku"]);
+    assert_eq!(bound_agent(&direct, &agent, &[], resolve), Some(Bound::Pty));
+    let flagged = argv(&["/opt/claude/claude", "-c", "haiku"]);
+    assert_eq!(
+        bound_agent(
+            &flagged,
+            &facts(2, &["/opt/claude/claude", "-c", "haiku"]),
+            &[],
+            resolve
+        ),
+        Some(Bound::Pty),
+        "a `-c` that isn't a shell's is the agent's own argument"
+    );
+    // The deck's shell exec'd it, or forked it as its only child.
+    assert_eq!(
+        bound_agent(&deck_shell, &agent, &[], resolve),
+        Some(Bound::Pty)
+    );
+    assert_eq!(
+        bound_agent(&deck_shell, &shell, &[(77, agent.clone())], resolve),
+        Some(Bound::Child(77))
+    );
+
+    // A user's launcher script named `claude`: its process runs the
+    // interpreter, so neither it nor its child is bound, whatever the child.
+    let launcher = argv(&["/home/u/bin/claude"]);
+    let script = facts(1, &["/bin/sh", "/home/u/bin/claude"]);
+    let real = facts(2, &["/opt/claude/claude"]);
+    let tool = facts(4, &["/usr/bin/tool"]);
+    assert_eq!(
+        bound_agent(&launcher, &script, &[(78, real.clone())], resolve),
+        None
+    );
+    assert_eq!(
+        bound_agent(&launcher, &script, &[(79, tool.clone())], resolve),
+        None
+    );
+    // The same launcher run under the deck's shell.
+    let launched = argv(&["/bin/sh", "-c", "/home/u/bin/claude"]);
+    let under = facts(1, &["/bin/sh", "/home/u/bin/claude"]);
+    assert_eq!(
+        bound_agent(&launched, &shell, &[(80, under.clone())], resolve),
+        None
+    );
+    assert_eq!(
+        bound_agent(&launched, &under, &[(81, real.clone())], resolve),
+        None
+    );
+
+    // The deck's shell, but not as it launched it, or not the one child.
+    let other_shell = facts(1, &["/bin/sh", "-c", "something else"]);
+    assert_eq!(
+        bound_agent(&deck_shell, &other_shell, &[(82, agent.clone())], resolve),
+        None
+    );
+    let other_args = facts(2, &["/opt/claude/claude", "--model", "opus"]);
+    assert_eq!(
+        bound_agent(&deck_shell, &shell, &[(83, other_args)], resolve),
+        None
+    );
+    let other_exe = facts(4, &["/opt/claude/claude", "--model", "haiku"]);
+    assert_eq!(
+        bound_agent(&deck_shell, &shell, &[(84, other_exe)], resolve),
+        None
+    );
+    assert_eq!(
+        bound_agent(
+            &deck_shell,
+            &shell,
+            &[(85, agent.clone()), (86, tool)],
+            resolve
+        ),
+        None
+    );
+    // A line the shell would expand, and a launch that is only a shell.
+    let expanded = argv(&["/bin/sh", "-c", "/opt/claude/claude $ARGS"]);
+    assert_eq!(bound_agent(&expanded, &shell, &[(87, real)], resolve), None);
+    assert_eq!(
+        bound_agent(&argv(&["/bin/sh"]), &shell, &[(88, agent.clone())], resolve),
+        None
+    );
+    let nested = argv(&["/bin/sh", "-c", "sh -c claude"]);
+    assert_eq!(
+        bound_agent(&nested, &shell, &[(89, agent.clone())], resolve),
+        None
+    );
+    // An unresolvable program binds nothing.
+    let unknown = argv(&["/nowhere/claude"]);
+    assert_eq!(bound_agent(&unknown, &agent, &[], resolve), None);
+    assert_eq!(bound_agent(&[], &agent, &[], resolve), None);
+}

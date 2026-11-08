@@ -212,8 +212,9 @@ pub enum WakePath {
     TurnEnd,
     /// Nothing is armed, so the deck rings the doorbell when the agent is idle.
     Doorbell,
-    /// Nothing is armed and the agent has reported no status, so the doorbell
-    /// has no idle moment to ring at.
+    /// Nothing is armed, and either the agent has reported no status or the
+    /// deck won't type the doorbell into this generation, so the doorbell
+    /// won't ring (PRD #1666 part 3, round 5-wake, Q16).
     None,
 }
 
@@ -257,6 +258,18 @@ pub struct InboxSummary {
     /// daemon's answer, and while false.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub wake_stalled: bool,
+    /// PRD #1666 part 3, round 5-wake (plan §5.2): why the deck holds the
+    /// doorbell for the waiting messages ([`InboxHub::set_wake_hold`]).
+    /// Absent from an older daemon's answer, and while there is none; a
+    /// reason this build does not know reads as
+    /// [`crate::inbox_display::WakeHold::Unknown`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wake_hold: Option<crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3 (Q35, OQ1): with [`Self::wake_hold`]
+    /// `cannot_check`, why. Absent from an older daemon's answer, and while
+    /// there is none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold_detail: Option<crate::inbox_display::HoldDetail>,
     /// PRD #1666 §6.5: what the card lists and warns of beside its counts.
     /// Every field is additive and absent while empty.
     #[serde(flatten, default)]
@@ -521,6 +534,33 @@ struct HubState {
     /// their waiting messages, with the oldest of those messages
     /// ([`InboxHub::set_wake_stalled`]). Gone once that message is taken.
     wake_stalled: HashMap<AgentKey, String>,
+    /// PRD #1666 part 3, round 5-wake (Q16, Q18): the generations the deck
+    /// won't type the doorbell into, with the clause: their activation is
+    /// NoGo, or a clause that holds for the rest of the generation. Written
+    /// only by the doorbell's re-projection publisher
+    /// ([`InboxHub::set_typed_fallback`]); read by [`wake_of`], so the
+    /// status's WAKE and the overdue notice agree.
+    typed_refused: HashMap<AgentKey, &'static str>,
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): while
+    /// [`InboxHub::agent_exited_as`] settles a generation, the generation and
+    /// what the deck observed ending its pane, which that settlement's
+    /// notices and broadcasts carry.
+    exiting: Option<(AgentKey, crate::inbox_display::PaneTermination)>,
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′, §5.1 row 1): a generation
+    /// whose doorbell is suspended on an attempt, with the reason its card
+    /// shows at once (`uncertain_input`, or `dialog_during_ring`). Written
+    /// only by the doorbell's re-projection publisher, from the generation's
+    /// latch cell as it is when the request runs; it takes precedence over
+    /// the doorbell's episode reason ([`InboxHub::set_wake_hold`]).
+    wake_suspension: HashMap<AgentKey, crate::inbox_display::WakeHold>,
+    /// PRD #1666 part 3, round 5-wake (plan §5): why the doorbell holds for
+    /// an agent generation's waiting messages, with the message the hold was
+    /// last told against ([`InboxHub::set_wake_hold`]).
+    wake_hold: HashMap<AgentKey, (crate::inbox_display::WakeHold, String)>,
+    /// PRD #1666 part 3 (Q35-27, OQ1): why a `cannot_check` hold in
+    /// [`Self::wake_hold`] holds, for its card; kept and dropped with it
+    /// ([`InboxHub::set_wake_hold_with_detail`]).
+    wake_hold_detail: HashMap<AgentKey, crate::inbox_display::HoldDetail>,
     /// Whether a bound recipient's agent still holds its pane, asked under
     /// this lock right before a message for it goes in
     /// ([`InboxHub::set_live_agent_check`]); unset, every post is taken as
@@ -836,6 +876,11 @@ impl InboxHub {
                 owed_notices: Vec::new(),
                 owed_retry_at: None,
                 wake_stalled: HashMap::new(),
+                typed_refused: HashMap::new(),
+                exiting: None,
+                wake_suspension: HashMap::new(),
+                wake_hold: HashMap::new(),
+                wake_hold_detail: HashMap::new(),
                 live_agent: None,
                 offers: HashMap::new(),
                 pooled: Arc::new(Notify::new()),
@@ -1889,19 +1934,22 @@ impl InboxHub {
                 worker.pane_id.clone(),
                 worker.agent_id.clone().unwrap_or_default(),
             );
-            let wake = if st.waiters.get(&key).is_some_and(|list| !list.is_empty()) {
-                WakePath::Native
-            } else if st
-                .announced
-                .get(&key)
-                .is_some_and(|a| a.wake == InboxWake::TurnEnd)
-            {
-                WakePath::TurnEnd
-            } else {
-                WakePath::Doorbell
-            };
+            let wake = wake_of(st, &key);
+            let typed_refused = st.typed_refused.contains_key(&key);
             let rings = st.rings.get(&key).copied().unwrap_or(0);
-            let body = compose_undelivered_notice(&id, &watch.role, held, wake, rings);
+            // PRD #1666 part 3, round 5-wake (plan §5.3): why the doorbell
+            // holds, as it stands when the notice is composed. The notice is
+            // composed once, so a later change is not sent.
+            let hold = shown_hold(st, &key);
+            let body = compose_undelivered_notice(
+                &id,
+                &watch.role,
+                held,
+                wake,
+                typed_refused,
+                rings,
+                hold,
+            );
             let orchestrator = watch.orchestrator.clone();
             if let Some(watch) = st.delegates.get_mut(&id) {
                 watch.notified = true;
@@ -2023,7 +2071,7 @@ impl InboxHub {
     /// is told — the notices this exit owes are held until the caller runs
     /// [`Self::post_owed_notices`].
     pub fn agent_exited(&self, pane_id: &str, agent_id: &str) -> Vec<DelegateLedger> {
-        self.agent_exited_as(pane_id, agent_id, ExitKind::Natural)
+        self.agent_exited_as(pane_id, agent_id, ExitKind::Natural, None)
             .ledgers
     }
 
@@ -2036,9 +2084,25 @@ impl InboxHub {
     /// the tasks it acknowledged (or that ran out of hand-overs) owe one
     /// "worker exited" notice naming them; a close or respawn owes none of
     /// the latter. Each walked task is closed, and its debt answered.
-    pub fn agent_exited_as(&self, pane_id: &str, agent_id: &str, kind: ExitKind) -> ExitSettlement {
+    ///
+    /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): `termination` is what
+    /// the deck observed ending the generation's pane; the notices this exit
+    /// owes, its card notice and its broadcasts say it, and `None` reads as
+    /// [`crate::inbox_display::PaneTermination::Unknown`].
+    pub fn agent_exited_as(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        kind: ExitKind,
+        termination: Option<crate::inbox_display::PaneTermination>,
+    ) -> ExitSettlement {
         let mut st = self.lock();
         let now = Instant::now();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        st.exiting = Some((
+            key.clone(),
+            termination.unwrap_or(crate::inbox_display::PaneTermination::Unknown),
+        ));
         let mut walked_debt = Vec::new();
         let walked = match st
             .guarded_section(|st, reports| walk_exited_tasks(st, reports, pane_id, agent_id, kind))
@@ -2053,7 +2117,6 @@ impl InboxHub {
             }
         };
         st.inbox.agent_exited(now, pane_id, agent_id);
-        let key = (pane_id.to_string(), agent_id.to_string());
         // PRD #1666 §2 T9: the generation's attempts are fenced and its
         // receipt spool goes, off the lock.
         if let Some(spool) = engine::exit(&mut st, &key, now) {
@@ -2083,10 +2146,16 @@ impl InboxHub {
         st.spills.release_tasks(pane_id, |_, agent| {
             agent.is_none_or(|agent| agent == agent_id)
         });
-        if let Some(id) = st.wake_stalled.remove(&key) {
-            broadcast_wake_stall(&st, pane_id, agent_id, &id, false);
+        let stall = st.wake_stalled.remove(&key);
+        let hold = st.wake_hold.remove(&key).map(|(_, id)| id);
+        st.wake_hold_detail.remove(&key);
+        st.typed_refused.remove(&key);
+        let suspended = st.wake_suspension.remove(&key).is_some();
+        if let Some(id) = stall.or(hold).or_else(|| suspended.then(String::new)) {
+            broadcast_wake(&st, pane_id, agent_id, &id);
         }
         drain_events(&mut st);
+        st.exiting = None;
         let mut ledgers = std::mem::take(&mut st.exited_ledgers);
         ledgers.append(&mut walked_debt);
         drop(st);
@@ -2123,7 +2192,165 @@ impl InboxHub {
             }
         };
         info!(pane_id, agent_id, message_id = %id, stalled, "inbox: wake stalled");
-        broadcast_wake_stall(&st, pane_id, agent_id, &id, stalled);
+        broadcast_wake(&st, pane_id, agent_id, &id);
+    }
+
+    /// PRD #1666 part 3, round 5-wake (Q16, Q18): whether the deck will type
+    /// the doorbell into `agent_id`'s generation in `pane_id`: `refused` is
+    /// the clause that holds it (its activation is NoGo, or a clause that
+    /// holds for the rest of the generation), `None` when the doorbell may
+    /// type. Only the doorbell's re-projection publisher calls this, with no
+    /// other lock held. Read by the snapshot's WAKE and by the overdue notice
+    /// ([`wake_of`]); no broadcast carries it. A generation with no entry is
+    /// not refused. The entry goes when the agent exits. Returns whether it
+    /// changed.
+    pub fn set_typed_fallback(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        refused: Option<&'static str>,
+    ) -> bool {
+        let mut st = self.state.lock();
+        apply_typed_fallback(&mut st, pane_id, agent_id, refused)
+    }
+
+    /// Test seam: what the re-projection publisher last wrote for
+    /// `agent_id` in `pane_id`, the suspension shown and the typed-fallback
+    /// refusal.
+    #[cfg(test)]
+    pub(crate) fn wake_projection_for_test(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> (Option<crate::inbox_display::WakeHold>, Option<&'static str>) {
+        let st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        (
+            st.wake_suspension.get(&key).copied(),
+            st.typed_refused.get(&key).copied(),
+        )
+    }
+
+    /// The re-projection publisher's write (plan §3.4′): [`Self::set_wake_suspension`]
+    /// and [`Self::set_typed_fallback`] for `agent_id` in `pane_id`, under one
+    /// hold of the hub, and only while `current` says, asked under that hold,
+    /// that the generation is still the pane's live one. A generation's exit
+    /// marks it no longer current before its hub entries go, and both happen
+    /// on the hub's side of this check, so a request that read its inputs
+    /// before the exit and writes after it puts back no entry for the retired
+    /// generation. `current` may take the registry's record table, which
+    /// ranks inside the hub. Returns whether the suspension and whether the
+    /// refusal changed.
+    pub fn set_wake_projection(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        shown: Option<crate::inbox_display::WakeHold>,
+        refused: Option<&'static str>,
+        current: impl FnOnce() -> bool,
+    ) -> (bool, bool) {
+        let mut st = self.lock();
+        if !current() {
+            debug!(
+                pane_id,
+                agent_id, "inbox: wake projection for a retired generation dropped"
+            );
+            return (false, false);
+        }
+        let shown = apply_wake_suspension(&mut st, pane_id, agent_id, shown);
+        let refused = apply_typed_fallback(&mut st, pane_id, agent_id, refused);
+        (shown, refused)
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §3.4′, §5.1 row 1): the card's
+    /// reason for a suspended doorbell, `shown`, or none: what the
+    /// re-projection publisher read from `agent_id`'s latch cell when its
+    /// request ran. It shows at once, with or without mail, ahead of the
+    /// episode's reason, and is broadcast in a wake update whenever it
+    /// changes. Only the publisher calls this, with no other lock held. The
+    /// entry goes when the agent exits. Returns whether it changed.
+    pub fn set_wake_suspension(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        shown: Option<crate::inbox_display::WakeHold>,
+    ) -> bool {
+        let mut st = self.lock();
+        apply_wake_suspension(&mut st, pane_id, agent_id, shown)
+    }
+
+    /// PRD #1666 part 3, round 5-wake (plan §5): the doorbell's account of
+    /// why it holds for `agent_id` in `pane_id`'s waiting messages (`hold`),
+    /// or that it says nothing now (`None`). Recorded against the message
+    /// queued oldest when a reason is told, shown in its summary, and
+    /// broadcast in a wake update that also carries the current wake stall,
+    /// so both clients show the reason. The same reason told again keeps that
+    /// message, even once it is taken while another still waits: the record
+    /// names the message the hold was last told against, not necessarily the
+    /// oldest waiting now. A hold with nothing queued is no hold. Cleared by
+    /// the doorbell or by the agent exiting.
+    pub fn set_wake_hold(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        hold: Option<crate::inbox_display::WakeHold>,
+    ) {
+        self.set_wake_hold_with_detail(pane_id, agent_id, hold, None);
+    }
+
+    /// [`Self::set_wake_hold`], with why a `cannot_check` hold holds
+    /// (`detail`, PRD #1666 part 3 Q35-27, OQ1): shown in the summary and the
+    /// wake update while that hold is the one the card shows, and dropped
+    /// with the hold. A detail with any other hold is not kept.
+    pub fn set_wake_hold_with_detail(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        hold: Option<crate::inbox_display::WakeHold>,
+        detail: Option<crate::inbox_display::HoldDetail>,
+    ) {
+        let mut st = self.lock();
+        let key = (pane_id.to_string(), agent_id.to_string());
+        let detail = detail.filter(|_| hold == Some(crate::inbox_display::WakeHold::CannotCheck));
+        let before = st.wake_hold.get(&key).map(|(hold, _)| *hold);
+        if before == hold && st.wake_hold_detail.get(&key) == detail.as_ref() {
+            return;
+        }
+        let oldest = queued_for(&st.inbox, pane_id, agent_id)
+            .next()
+            .map(|m| m.id.to_string());
+        let (id, now) = match (hold, oldest) {
+            (Some(hold), Some(oldest)) => {
+                st.wake_hold.insert(key.clone(), (hold, oldest.clone()));
+                match detail {
+                    Some(detail) => st.wake_hold_detail.insert(key, detail),
+                    None => st.wake_hold_detail.remove(&key),
+                };
+                (oldest, Some(hold))
+            }
+            _ => {
+                st.wake_hold_detail.remove(&key);
+                match st.wake_hold.remove(&key) {
+                    Some((_, id)) => (id, None),
+                    None => return,
+                }
+            }
+        };
+        info!(pane_id, agent_id, message_id = %id, ?before, ?now, "inbox: wake hold");
+        broadcast_wake(&st, pane_id, agent_id, &id);
+    }
+
+    /// Why the doorbell holds for `agent_id` in `pane_id`, as recorded
+    /// ([`Self::set_wake_hold`]).
+    pub fn wake_hold(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::inbox_display::WakeHold> {
+        self.lock()
+            .wake_hold
+            .get(&(pane_id.to_string(), agent_id.to_string()))
+            .map(|(hold, _)| *hold)
     }
 
     /// Whether `agent_id` in `pane_id` is recorded as waiting to wake
@@ -2177,7 +2404,32 @@ impl InboxHub {
     /// messages (only those this agent generation may take), its armed waiters
     /// and its announcement.
     pub fn doorbell_facts(&self, pane_id: &str, agent_id: &str) -> DoorbellFacts {
-        let st = self.lock();
+        Self::doorbell_facts_in(&self.lock(), pane_id, agent_id)
+    }
+
+    /// PRD #1666 part 3, round 5-wake: [`Self::doorbell_facts`] without
+    /// waiting for the hub's lock, `None` while another thread holds it. For
+    /// the doorbell's admission check, which runs while a ring holds the
+    /// pane's writer and so must not wait on a lock whose holders can
+    /// themselves wait on other locks (plan §2.3). A poisoned hub is read as
+    /// every hub path reads it, recovered.
+    pub fn try_doorbell_facts(&self, pane_id: &str, agent_id: &str) -> Option<DoorbellFacts> {
+        let st = self
+            .state
+            .try_lock_now(crate::lock_rank::OnPoison::Recover)
+            .ok()?;
+        Some(Self::doorbell_facts_in(&st, pane_id, agent_id))
+    }
+
+    /// Test seam: run `hold` with the hub's lock held on this thread.
+    #[cfg(test)]
+    pub(crate) fn with_state_held_for_test(&self, hold: impl FnOnce()) {
+        let _st = self.lock();
+        hold();
+    }
+
+    /// [`Self::doorbell_facts`] over a held hub.
+    fn doorbell_facts_in(st: &HubState, pane_id: &str, agent_id: &str) -> DoorbellFacts {
         let key = (pane_id.to_string(), agent_id.to_string());
         let mut queued: Vec<String> = st
             .inbox
@@ -2193,7 +2445,7 @@ impl InboxHub {
             .collect();
         // PRD #1666 §6: a scheduled repeat waiting for a receiver is waiting
         // mail too, so the doorbell (and the stalled-wake notice) cover it.
-        for id in engine::candidates(&st, &key) {
+        for id in engine::candidates(st, &key) {
             if !queued.contains(&id) {
                 queued.push(id);
             }
@@ -2619,6 +2871,45 @@ impl InboxHub {
 }
 
 /// [`InboxHub::summary`], under a lock the caller holds.
+/// The reason a generation's card shows for its doorbell: a suspension
+/// first ([`InboxHub::set_wake_suspension`]), then the episode's reason.
+fn shown_hold(st: &HubState, key: &AgentKey) -> Option<crate::inbox_display::WakeHold> {
+    st.wake_suspension
+        .get(key)
+        .copied()
+        .or_else(|| st.wake_hold.get(key).map(|(hold, _)| *hold))
+}
+
+/// Why the hold [`shown_hold`] shows holds, when it is the episode's
+/// `cannot_check` and one was told ([`InboxHub::set_wake_hold_with_detail`]);
+/// never with a suspension in front of it.
+fn shown_detail(st: &HubState, key: &AgentKey) -> Option<crate::inbox_display::HoldDetail> {
+    if st.wake_suspension.contains_key(key) {
+        return None;
+    }
+    st.wake_hold_detail.get(key).cloned()
+}
+
+/// PRD #1666 part 3, round 5-wake (Q16): the one choice of a generation's
+/// wake path, for both its summary and the overdue notice. In order: an armed
+/// waiter is native; a turn-end announcement is turn-end; a generation the
+/// deck won't type the doorbell into is none; otherwise the doorbell.
+fn wake_of(st: &HubState, key: &AgentKey) -> WakePath {
+    if st.waiters.get(key).is_some_and(|list| !list.is_empty()) {
+        WakePath::Native
+    } else if st
+        .announced
+        .get(key)
+        .is_some_and(|a| a.wake == InboxWake::TurnEnd)
+    {
+        WakePath::TurnEnd
+    } else if st.typed_refused.contains_key(key) {
+        WakePath::None
+    } else {
+        WakePath::Doorbell
+    }
+}
+
 fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
     let key = (pane_id.to_string(), agent_id.to_string());
     let now = Instant::now();
@@ -2631,6 +2922,8 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
         wake: WakePath::Doorbell,
         component: None,
         wake_stalled: st.wake_stalled.contains_key(&key),
+        wake_hold: shown_hold(st, &key),
+        hold_detail: shown_detail(st, &key),
         notices: engine::notices(st, &key, now),
     };
     let mut last_acked: Option<Instant> = None;
@@ -2654,13 +2947,10 @@ fn summary_of(st: &HubState, pane_id: &str, agent_id: &str) -> InboxSummary {
             .ok()
             .map(|ago| chrono::Utc::now() - ago)
     });
+    summary.wake = wake_of(st, &key);
     if let Some(waiter) = st.waiters.get(&key).and_then(|list| list.last()) {
-        summary.wake = WakePath::Native;
         summary.component = component_name(waiter.component);
     } else if let Some(announced) = st.announced.get(&key) {
-        if announced.wake == InboxWake::TurnEnd {
-            summary.wake = WakePath::TurnEnd;
-        }
         summary.component = component_name(announced.component);
     }
     summary
@@ -4437,10 +4727,10 @@ fn walk_exited_tasks(
                         TaskDelivery::Live => claim.withheld.push((
                             orchestrator,
                             UNDELIVERED_SUBJECT,
-                            compose_undeliverable_notice(
+                            compose_exited_notice(
                                 &id,
                                 &task.binding.role,
-                                UndeliverableReason::AgentExited,
+                                exiting_termination(st, pane_id, agent_id),
                             ),
                         )),
                         TaskDelivery::Acknowledged | TaskDelivery::Ended
@@ -4474,15 +4764,15 @@ fn walk_exited_tasks(
             continue;
         };
         match task.delivery {
-            TaskDelivery::Live => st.owed_notices.push((
-                orchestrator,
-                UNDELIVERED_SUBJECT,
-                compose_undeliverable_notice(
+            TaskDelivery::Live => {
+                let body = compose_exited_notice(
                     &id,
                     &task.binding.role,
-                    UndeliverableReason::AgentExited,
-                ),
-            )),
+                    exiting_termination(st, pane_id, agent_id),
+                );
+                st.owed_notices
+                    .push((orchestrator, UNDELIVERED_SUBJECT, body));
+            }
             TaskDelivery::Acknowledged | TaskDelivery::Ended if kind == ExitKind::Natural => {
                 match exited.iter_mut().find(|(to, _)| *to == orchestrator) {
                     Some((_, ids)) => ids.push(id),
@@ -4741,13 +5031,7 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
             let key = (recipient.pane_id.clone(), agent.clone());
             if st.wake_stalled.get(&key).map(String::as_str) == Some(event.message_id.as_str()) {
                 st.wake_stalled.remove(&key);
-                broadcast_wake_stall(
-                    st,
-                    &recipient.pane_id,
-                    agent,
-                    event.message_id.as_str(),
-                    false,
-                );
+                broadcast_wake(st, &recipient.pane_id, agent, event.message_id.as_str());
             }
         }
         settle_late_ack(st, &event);
@@ -4777,13 +5061,17 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
                 reason: event.undeliverable_reason,
                 returned: true,
                 wake_stalled: false,
+                wake_hold: None,
+                hold_detail: None,
                 wake_update: false,
                 attention_update: false,
                 requeued: false,
                 notices: InboxCardNotices::default(),
                 provenance: event.provenance.clone(),
+                termination: None,
             }));
         }
+        let termination = event_termination(st, &event).cloned();
         let Some(recipient) = event.recipient else {
             continue;
         };
@@ -4806,11 +5094,14 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
             reason: event.undeliverable_reason,
             returned: false,
             wake_stalled: false,
+            wake_hold: None,
+            hold_detail: None,
             wake_update: false,
             attention_update: false,
             requeued: event.requeued,
             notices: InboxCardNotices::default(),
             provenance: event.provenance.clone(),
+            termination,
         }));
         if let Some(key) = refused {
             engine::broadcast_notices(st, &key, Instant::now());
@@ -4820,14 +5111,64 @@ fn consume_events(st: &mut HubState, events: Vec<InboxEvent>, verdicts: &TaskVer
     st.cancelled_handed.clear();
 }
 
-/// PR #1735 fifth review (B-03, B-04): tell attached clients that `agent_id`'s
-/// wake stall in `pane_id` is now `stalled`, in a notice that names `id`, the
-/// message it was recorded against, and changes nothing else
-/// ([`InboxNotice::wake_update`]).
-fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, stalled: bool) {
+/// [`InboxHub::set_wake_suspension`] under the hub's hold.
+fn apply_wake_suspension(
+    st: &mut HubState,
+    pane_id: &str,
+    agent_id: &str,
+    shown: Option<crate::inbox_display::WakeHold>,
+) -> bool {
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let before = st.wake_suspension.get(&key).copied();
+    if before == shown {
+        return false;
+    }
+    match shown {
+        Some(hold) => st.wake_suspension.insert(key.clone(), hold),
+        None => st.wake_suspension.remove(&key),
+    };
+    let id = queued_for(&st.inbox, pane_id, agent_id)
+        .next()
+        .map(|m| m.id.to_string())
+        .or_else(|| st.wake_hold.get(&key).map(|(_, id)| id.clone()))
+        .unwrap_or_default();
+    info!(pane_id, agent_id, ?before, now = ?shown, "inbox: wake suspension");
+    broadcast_wake(st, pane_id, agent_id, &id);
+    true
+}
+
+/// [`InboxHub::set_typed_fallback`] under the hub's hold.
+fn apply_typed_fallback(
+    st: &mut HubState,
+    pane_id: &str,
+    agent_id: &str,
+    refused: Option<&'static str>,
+) -> bool {
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let changed = match refused {
+        Some(clause) => st.typed_refused.insert(key, clause) != Some(clause),
+        None => st.typed_refused.remove(&key).is_some(),
+    };
+    if changed {
+        debug!(pane_id, agent_id, ?refused, "inbox: typed fallback");
+    }
+    changed
+}
+
+/// PR #1735 fifth review (B-03, B-04): tell attached clients `agent_id`'s
+/// wake stall in `pane_id` and, since PRD #1666 part 3's round 5-wake, why the
+/// doorbell holds for it, both as they stand now, in a notice that names `id`,
+/// the message the change was recorded against, and changes nothing else
+/// ([`InboxNotice::wake_update`]). Carrying both in every such notice keeps a
+/// client that reads only the stall from clearing it on a hold's change.
+fn broadcast_wake(st: &HubState, pane_id: &str, agent_id: &str, id: &str) {
     let Some(tx) = st.broadcast.as_ref() else {
         return;
     };
+    let key = (pane_id.to_string(), agent_id.to_string());
+    let stalled = st.wake_stalled.contains_key(&key);
+    let hold = shown_hold(st, &key);
+    let hold_detail = shown_detail(st, &key);
     let message = st.inbox.get(id, pane_id);
     let _ = tx.send(BroadcastMsg::Inbox(InboxNotice {
         pane_id: pane_id.to_string(),
@@ -4842,11 +5183,14 @@ fn broadcast_wake_stall(st: &HubState, pane_id: &str, agent_id: &str, id: &str, 
         reason: None,
         returned: false,
         wake_stalled: stalled,
+        wake_hold: hold,
+        hold_detail,
         wake_update: true,
         attention_update: false,
         requeued: false,
         notices: InboxCardNotices::default(),
         provenance: None,
+        termination: None,
     }));
 }
 
@@ -5056,7 +5400,8 @@ fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
     }
     let detail = match event.undeliverable_reason {
         Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER,
-        Some(UndeliverableReason::AgentExited) => NOTICE_AGENT_EXITED,
+        Some(UndeliverableReason::AgentExited) => event_termination(st, event)
+            .map_or(NOTICE_AGENT_EXITED, |termination| termination.card_notice()),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5135,6 +5480,8 @@ fn settle_delegate(st: &mut HubState, event: &InboxEvent, verdicts: &TaskVerdict
     if let Some(to) = watch.orchestrator {
         let body = if reason == UndeliverableReason::Cancelled {
             compose_cancelled_notice(id, &watch.role, handed)
+        } else if reason == UndeliverableReason::AgentExited {
+            compose_exited_notice(id, &watch.role, event_termination(st, event))
         } else {
             compose_undeliverable_notice(id, &watch.role, reason)
         };
@@ -5326,29 +5673,47 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
 }
 
 /// PRD #1666 S5: the notice an orchestrator gets when a task it delegated is
-/// still unacknowledged past [`ENV_UNDELIVERED_NOTICE_AFTER_MS`].
+/// still unacknowledged past [`ENV_UNDELIVERED_NOTICE_AFTER_MS`]. `hold` is
+/// why the doorbell holds for the worker when it is composed, if the deck
+/// says (PRD #1666 part 3, round 5-wake). `typed_refused` says the deck won't
+/// type the doorbell into the worker's generation (Q16): its wake route is
+/// then told without the doorbell's promise.
 pub fn compose_undelivered_notice(
     message_id: &str,
     role: &str,
     held: &str,
     wake: WakePath,
+    typed_refused: bool,
     rings: u32,
+    hold: Option<crate::inbox_display::WakeHold>,
 ) -> String {
-    let path = match wake {
-        WakePath::Native => "an inbox component is armed for the worker and hands messages over",
-        WakePath::TurnEnd => {
+    let path = match (wake, typed_refused) {
+        (WakePath::Native, _) => {
+            "an inbox component is armed for the worker and hands messages over"
+        }
+        (WakePath::TurnEnd, false) => {
             "the worker takes messages at the end of its turns, and the doorbell rings while it is idle"
         }
-        WakePath::Doorbell | WakePath::None => {
+        (WakePath::TurnEnd, true) => {
+            "the worker takes messages at the end of its turns; the deck can't ring the doorbell for it now, so while it is idle it takes them only when it is sent a prompt in its pane"
+        }
+        (WakePath::None, true) => {
+            "nothing is armed for the worker and the deck can't ring the doorbell for it now; it takes its messages when it is sent a prompt in its pane"
+        }
+        (WakePath::Doorbell | WakePath::None, _) => {
             "nothing is armed for the worker, so the deck rings the doorbell whenever it reports idle"
         }
     };
+    let holding = hold
+        .and_then(crate::inbox_display::WakeHold::notice_clause)
+        .map(|clause| format!(" The deck is holding the doorbell now: {clause}."))
+        .unwrap_or_default();
     format!(
         "Task {message_id} to the worker in role {} has not reached the worker: it is {held}. \
-         Wake path: {}, {path}; the doorbell has rung {rings} time(s) for it so far. The deck \
-         keeps the task and keeps trying. Check the worker's pane; `dot-agent-deck inbox list \
-         --all` shows where the task is. Decide whether to wait, re-delegate with --supersede, \
-         or notify the user.",
+         Wake path: {}, {path}; the doorbell has rung {rings} time(s) for it so far.{holding} \
+         The deck keeps the task and keeps trying. Check the worker's pane; `dot-agent-deck \
+         inbox list --all` shows where the task is. Decide whether to wait, re-delegate with \
+         --supersede, or notify the user.",
         crate::state::quote_untrusted_role(role),
         wake.label(),
     )
@@ -5381,11 +5746,9 @@ pub fn compose_undeliverable_notice(
             "The deck will not deliver it again, but it may already have reached the worker, \
              which may be working on it; its work-done can still arrive.",
         ),
-        UndeliverableReason::AgentExited => (
-            "the worker it was addressed to exited before acknowledging it",
-            "It may have reached the worker before it exited, so some of the work may already \
-             be done.",
-        ),
+        UndeliverableReason::AgentExited => {
+            return compose_exited_notice(message_id, role, None);
+        }
         UndeliverableReason::InboxShut => (
             "the deck is shutting down",
             "It may already have reached the worker.",
@@ -5400,6 +5763,54 @@ pub fn compose_undeliverable_notice(
          {CHECK}",
         crate::state::quote_untrusted_role(role),
     )
+}
+
+/// PRD #1666 part 3, round 5-wake (plan rev 2 §6): the notice an orchestrator
+/// gets when a task it delegated became undeliverable because its worker's
+/// pane ended (`agent_exited`), saying what the deck observed end the pane
+/// (`None`: it can't say). It names the command the deck started in the pane,
+/// never the agent, which can run below it and outlive it.
+pub fn compose_exited_notice(
+    message_id: &str,
+    role: &str,
+    termination: Option<&crate::inbox_display::PaneTermination>,
+) -> String {
+    let why = termination.map_or_else(
+        || crate::inbox_display::TERMINATION_UNKNOWN.to_string(),
+        crate::inbox_display::PaneTermination::words,
+    );
+    format!(
+        "Task {message_id} to the worker in role {} is undeliverable: {why}. It may have \
+         reached the worker before then, so some of the work may already be done. Check the \
+         worker's pane before you re-delegate or reassign it, or notify the user.",
+        crate::state::quote_untrusted_role(role),
+    )
+}
+
+/// The termination [`InboxHub::agent_exited_as`] is settling for generation
+/// `(pane_id, agent_id)`, if it is that one.
+fn exiting_termination<'a>(
+    st: &'a HubState,
+    pane_id: &str,
+    agent_id: &str,
+) -> Option<&'a crate::inbox_display::PaneTermination> {
+    st.exiting
+        .as_ref()
+        .filter(|((pane, agent), _)| pane == pane_id && agent == agent_id)
+        .map(|(_, termination)| termination)
+}
+
+/// The termination an `agent_exited` event's message owes to its notices: the
+/// exiting generation's, when the event's recipient is that generation.
+fn event_termination<'a>(
+    st: &'a HubState,
+    event: &InboxEvent,
+) -> Option<&'a crate::inbox_display::PaneTermination> {
+    if event.undeliverable_reason != Some(UndeliverableReason::AgentExited) {
+        return None;
+    }
+    let recipient = event.recipient.as_ref()?;
+    exiting_termination(st, &recipient.pane_id, recipient.agent_id.as_deref()?)
 }
 
 /// PRD #1666 §6.4: the notice an orchestrator gets when the user cancelled a
@@ -6829,6 +7240,364 @@ mod tests {
             .unwrap_or(0)
     }
 
+    /// Scenario: The doorbell says why it holds for an agent whose wake has already stalled, changes the reason, then the message the stall was told against is taken and the agent exits. Every wake update the deck broadcasts carries both the stall and the reason as they stand, so a released client that reads only the stall keeps it while the reason changes; the summary says the same; the stall ending keeps the reason; the same reason told again after that take sends nothing, the hold still naming the taken message it was last told against while another waits; the exit clears both in one update naming that message; and a hold asked for with nothing queued records nothing.
+    #[spec("inbox/status/034")]
+    #[test]
+    fn status_034_every_wake_update_carries_the_stall_and_the_hold() {
+        use crate::inbox_display::WakeHold;
+        /// The notice as a released client decodes it: no `wake_hold`.
+        #[derive(serde::Deserialize)]
+        struct ReleasedNotice {
+            #[serde(default)]
+            wake_stalled: bool,
+            #[serde(default)]
+            wake_update: bool,
+        }
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        hub.set_wake_hold("p", "a", Some(WakeHold::PossibleDraft));
+        assert_eq!(hub.wake_hold("p", "a"), None, "nothing queued, no hold");
+        assert!(rx.try_recv().is_err(), "nothing to tell");
+        let oldest = hub
+            .post_direct(Recipient::bound("p", "a"), content("first"))
+            .unwrap();
+        hub.post_direct(Recipient::bound("p", "a"), content("second"))
+            .unwrap();
+        hub.set_wake_stalled("p", "a", true);
+        while rx.try_recv().is_ok() {}
+        let next = |rx: &mut broadcast::Receiver<BroadcastMsg>| match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => notice,
+            other => panic!("a wake update is broadcast: {other:?}"),
+        };
+        for hold in [WakeHold::PossibleDraft, WakeHold::AwaitingPrompt] {
+            hub.set_wake_hold("p", "a", Some(hold));
+            let notice = next(&mut rx);
+            assert!(notice.wake_update && notice.wake_stalled, "{notice:?}");
+            assert_eq!(notice.wake_hold, Some(hold));
+            assert_eq!(notice.message_id, oldest.to_string());
+            let released: ReleasedNotice =
+                serde_json::from_value(serde_json::to_value(&notice).unwrap()).unwrap();
+            assert!(
+                released.wake_update && released.wake_stalled,
+                "a released client keeps the stall on a hold's update"
+            );
+            let summary = hub.summary("p", "a");
+            assert!(summary.wake_stalled);
+            assert_eq!(summary.wake_hold, Some(hold));
+        }
+        hub.set_wake_hold("p", "a", Some(WakeHold::AwaitingPrompt));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged hold is not told again"
+        );
+        // The oldest alone is taken; the second still waits.
+        let hook =
+            hub.test_hook_fetch_named("p", "a", Some(oldest.as_str()), Some(InboxBudget::Chars(1)));
+        assert_eq!(hook.ids(), vec![oldest.to_string()]);
+        hub.test_hook_close(hook);
+        let ended = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Inbox(notice) if notice.wake_update => Some(notice),
+                _ => None,
+            })
+            .last()
+            .expect("the stall's end is broadcast");
+        assert!(!ended.wake_stalled);
+        assert_eq!(
+            ended.wake_hold,
+            Some(WakeHold::AwaitingPrompt),
+            "the hold stays"
+        );
+        // After that partial take, the same reason told again keeps the
+        // message it was last told against.
+        hub.set_wake_hold("p", "a", Some(WakeHold::AwaitingPrompt));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged hold is not told again after a partial take"
+        );
+        assert_eq!(hub.summary("p", "a").queued, 1, "the second still waits");
+        hub.agent_exited("p", "a");
+        let exited = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Inbox(notice) if notice.wake_update => Some(notice),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exited.len(), 1, "{exited:?}");
+        assert!(!exited[0].wake_stalled && exited[0].wake_hold.is_none());
+        assert_eq!(
+            exited[0].message_id,
+            oldest.to_string(),
+            "the message the hold was last told against, not the one still waiting"
+        );
+        assert_eq!(hub.wake_hold("p", "a"), None);
+    }
+
+    /// Scenario: The doorbell holds an agent's waiting message because the deck can't check its input box, and says why: the directory the deck refused. The wake update and the summary carry that detail with the hold; the same told again sends nothing; a suspension shown in front of the hold hides it until the suspension ends; another hold drops it, and a detail told with another hold isn't kept; and the agent exiting clears it with the hold.
+    #[spec("inbox/status/036")]
+    #[test]
+    fn status_036_a_cannot_check_hold_carries_its_detail_and_drops_it_with_the_hold() {
+        use crate::inbox_display::{HoldCause, HoldDetail, WakeHold};
+        let hub = hub();
+        let (tx, mut rx) = broadcast::channel(16);
+        hub.set_broadcast(tx);
+        let detail = HoldDetail::new(
+            HoldCause::WritableDirectory,
+            Some("/home/me/.codex/editor"),
+            None,
+        );
+        hub.post_direct(Recipient::bound("p", "a"), content("first"))
+            .unwrap();
+        while rx.try_recv().is_ok() {}
+        let next = |rx: &mut broadcast::Receiver<BroadcastMsg>| match rx.try_recv() {
+            Ok(BroadcastMsg::Inbox(notice)) => notice,
+            other => panic!("a wake update is broadcast: {other:?}"),
+        };
+        hub.set_wake_hold_with_detail("p", "a", Some(WakeHold::CannotCheck), Some(detail.clone()));
+        let notice = next(&mut rx);
+        assert!(notice.wake_update, "{notice:?}");
+        assert_eq!(notice.wake_hold, Some(WakeHold::CannotCheck));
+        assert_eq!(notice.hold_detail.as_ref(), Some(&detail));
+        assert_eq!(hub.summary("p", "a").hold_detail.as_ref(), Some(&detail));
+        hub.set_wake_hold_with_detail("p", "a", Some(WakeHold::CannotCheck), Some(detail.clone()));
+        assert!(
+            rx.try_recv().is_err(),
+            "an unchanged hold is not told again"
+        );
+
+        assert!(hub.set_wake_suspension("p", "a", Some(WakeHold::UncertainInput)));
+        let summary = hub.summary("p", "a");
+        assert_eq!(summary.wake_hold, Some(WakeHold::UncertainInput));
+        assert_eq!(
+            summary.hold_detail, None,
+            "the suspension shows, without it"
+        );
+        assert!(hub.set_wake_suspension("p", "a", None));
+        assert_eq!(hub.summary("p", "a").hold_detail.as_ref(), Some(&detail));
+        while rx.try_recv().is_ok() {}
+
+        hub.set_wake_hold("p", "a", Some(WakeHold::PossibleDraft));
+        let notice = next(&mut rx);
+        assert_eq!(notice.wake_hold, Some(WakeHold::PossibleDraft));
+        assert_eq!(notice.hold_detail, None, "another hold drops it");
+        assert_eq!(hub.summary("p", "a").hold_detail, None);
+        hub.set_wake_hold_with_detail(
+            "p",
+            "a",
+            Some(WakeHold::PossibleDraft),
+            Some(detail.clone()),
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "a detail with another hold isn't kept"
+        );
+        assert_eq!(hub.summary("p", "a").hold_detail, None);
+
+        hub.set_wake_hold_with_detail("p", "a", Some(WakeHold::CannotCheck), Some(detail.clone()));
+        assert_eq!(next(&mut rx).hold_detail.as_ref(), Some(&detail));
+        hub.agent_exited("p", "a");
+        let exited = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Inbox(notice) if notice.wake_update => Some(notice),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(exited.len(), 1, "{exited:?}");
+        assert_eq!((exited[0].wake_hold, &exited[0].hold_detail), (None, &None));
+        assert_eq!(hub.summary("p", "a").hold_detail, None);
+    }
+
+    /// Scenario: A delegated task is overdue while the doorbell holds for its worker because of a possible draft. The orchestrator's notice says so; the reason changing afterwards sends nothing more; a task overdue while nothing holds says nothing about a hold; a notice composed while the orchestrator's inbox is full keeps the reason it was composed with when it is posted later, though the reason changed meanwhile; and the orchestrator's own waiting notices, held themselves, never get a notice of their own.
+    #[spec("inbox/status/033")]
+    #[test]
+    fn status_033_the_overdue_notice_says_why_the_doorbell_holds() {
+        use crate::inbox_display::WakeHold;
+        const DRAFT: &str = "The deck is holding the doorbell now: the worker's pane may have an unsent draft in its input, which the user can send or clear.";
+        const PROMPT: &str = "The deck is holding the doorbell now: the worker may be waiting at a prompt in its pane.";
+        let told = |hub: &InboxHub| -> Vec<String> {
+            hub.list_with_bodies(Some("o"))
+                .into_iter()
+                .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+                .filter_map(|m| m.text)
+                .collect()
+        };
+        let mut hub = hub();
+        hub.undelivered_after = Duration::ZERO;
+        let task = delegate(&hub, "TASK-HELD-BY-A-DRAFT");
+        hub.set_wake_hold("w", "wa", Some(WakeHold::PossibleDraft));
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(
+            bodies[0].contains(task.as_str()) && bodies[0].contains(DRAFT),
+            "{}",
+            bodies[0]
+        );
+        hub.set_wake_hold("w", "wa", Some(WakeHold::AwaitingPrompt));
+        hub.tick();
+        assert_eq!(told(&hub).len(), 1, "a changed reason sends nothing more");
+        // The orchestrator holds that notice, and its own doorbell holds too: a
+        // notice is never watched, so nothing is said of it.
+        hub.set_wake_hold("o", "oa", Some(WakeHold::PossibleDraft));
+        hub.tick();
+        assert_eq!(told(&hub).len(), 1, "no notice for a notice");
+
+        let mut hub = InboxHub::new(deck(), InboxLimits::default(), DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::ZERO;
+        delegate(&hub, "TASK-NOT-HELD");
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "{bodies:?}");
+        assert!(!bodies[0].contains("holding the doorbell"), "{}", bodies[0]);
+
+        let limits = InboxLimits {
+            max_per_recipient: 1,
+            ..InboxLimits::default()
+        };
+        let mut hub = InboxHub::new(deck(), limits, DEFAULT_KEEPALIVE);
+        hub.undelivered_after = Duration::ZERO;
+        hub.post_direct(Recipient::bound("o", "oa"), content("filler"))
+            .unwrap();
+        delegate(&hub, "TASK-TOLD-LATE");
+        hub.set_wake_hold("w", "wa", Some(WakeHold::AwaitingPrompt));
+        hub.tick();
+        assert!(told(&hub).is_empty(), "the orchestrator's inbox is full");
+        hub.set_wake_hold("w", "wa", Some(WakeHold::PossibleDraft));
+        assert_eq!(hub.test_take_acked("o", "oa").len(), 1);
+        hub.post_owed_notices();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "posted once there is room: {bodies:?}");
+        assert!(
+            bodies[0].contains(PROMPT) && !bodies[0].contains(DRAFT),
+            "the reason it was composed with: {}",
+            bodies[0]
+        );
+    }
+
+    /// Scenario: A worker's task goes overdue under each wake route and typed-fallback verdict: nothing armed with the fallback refused and available, a native waiter armed, a turn-end announcement with the fallback refused and available, a verdict that changes after a notice went, and a generation that exits and is followed by another in its pane. The snapshot's wake and the overdue notice the hub posts name the same route every time; a refused fallback reads none with no promise of the doorbell, a working native or turn-end route still shows, an announced notice keeps the route it was told, and the verdict goes with its generation.
+    #[spec("inbox/doorbell/057")]
+    #[tokio::test]
+    async fn doorbell_057_the_status_and_the_notice_report_one_route() {
+        const REFUSED_NONE: &str = "Wake path: none, nothing is armed for the worker and the deck can't ring the doorbell for it now; it takes its messages when it is sent a prompt in its pane";
+        const DOORBELL: &str = "Wake path: doorbell, nothing is armed for the worker, so the deck rings the doorbell whenever it reports idle";
+        const TURN_END: &str = "Wake path: turn-end, the worker takes messages at the end of its turns, and the doorbell rings while it is idle";
+        const TURN_END_REFUSED: &str = "Wake path: turn-end, the worker takes messages at the end of its turns; the deck can't ring the doorbell for it now, so while it is idle it takes them only when it is sent a prompt in its pane";
+        const NATIVE: &str =
+            "Wake path: native, an inbox component is armed for the worker and hands messages over";
+        let told = |hub: &InboxHub| -> Vec<String> {
+            hub.list_with_bodies(Some("o"))
+                .into_iter()
+                .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+                .filter_map(|m| m.text)
+                .collect()
+        };
+        let fresh = || {
+            let mut hub = hub();
+            hub.undelivered_after = Duration::ZERO;
+            hub
+        };
+        // (a) Refused, nothing armed: none, and no doorbell promised.
+        let hub = fresh();
+        assert!(hub.set_typed_fallback("w", "wa", Some("agent_not_supported")));
+        assert!(!hub.set_typed_fallback("w", "wa", Some("agent_not_supported")));
+        delegate(&hub, "TASK-REFUSED");
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::None);
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains(REFUSED_NONE), "{}", bodies[0]);
+        assert!(!bodies[0].contains("rings the doorbell"), "{}", bodies[0]);
+        // (b) Control: the fallback available.
+        let hub = fresh();
+        delegate(&hub, "TASK-AVAILABLE");
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::Doorbell);
+        hub.tick();
+        assert!(told(&hub)[0].contains(DOORBELL), "{}", told(&hub)[0]);
+        // (c) Refused with a native waiter armed: native in both, and a
+        // message goes to that waiter.
+        let hub = Arc::new(fresh());
+        hub.set_typed_fallback("w", "wa", Some("agent_not_supported"));
+        let (mut waiter, armed) = OnceWaiter::open(&hub, "w", "wa", None).await;
+        assert!(armed.registered.is_some());
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::Native);
+        delegate(&hub, "TASK-NATIVE");
+        let handed = waiter.next().await.expect("the waiter is handed the task");
+        assert!(
+            serde_json::to_string(&handed)
+                .unwrap()
+                .contains("TASK-NATIVE"),
+            "handed natively, not held: {handed:?}"
+        );
+        waiter.close().await;
+        let native =
+            compose_undelivered_notice("m", "coder", "queued", WakePath::Native, true, 0, None);
+        assert!(native.contains(NATIVE), "{native}");
+        // (d) Refused with a turn-end announcement: turn-end, without the
+        // idle doorbell's promise.
+        let hub = fresh();
+        hub.set_typed_fallback("w", "wa", Some("agent_not_supported"));
+        hub.announce(
+            "w",
+            "wa",
+            InboxWake::TurnEnd,
+            InboxComponent::CodexHooks,
+            None,
+        )
+        .unwrap();
+        delegate(&hub, "TASK-TURN-END-REFUSED");
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::TurnEnd);
+        hub.tick();
+        let body = &told(&hub)[0];
+        assert!(body.contains(TURN_END_REFUSED), "{body}");
+        assert!(
+            !body.contains("the doorbell rings while it is idle"),
+            "{body}"
+        );
+        // (e) Control: turn-end with the fallback available.
+        let hub = fresh();
+        hub.announce(
+            "w",
+            "wa",
+            InboxWake::TurnEnd,
+            InboxComponent::CodexHooks,
+            None,
+        )
+        .unwrap();
+        delegate(&hub, "TASK-TURN-END");
+        hub.tick();
+        assert!(told(&hub)[0].contains(TURN_END), "{}", told(&hub)[0]);
+        // (g) The verdict changes after the notice: the next snapshot shows
+        // it, and the notice keeps the route it was told.
+        let hub = fresh();
+        hub.set_typed_fallback("w", "wa", Some("unknown_release"));
+        delegate(&hub, "TASK-LATCHED-LATER");
+        hub.tick();
+        assert!(hub.set_typed_fallback("w", "wa", None));
+        assert_eq!(hub.summary("w", "wa").wake, WakePath::Doorbell);
+        hub.tick();
+        let bodies = told(&hub);
+        assert_eq!(bodies.len(), 1, "composed once");
+        assert!(bodies[0].contains(REFUSED_NONE), "{}", bodies[0]);
+        // (h) The generation exits: its entry goes; a successor with its own
+        // refusal reads none, one with none reads doorbell.
+        let hub = fresh();
+        hub.set_typed_fallback("w", "wa", Some("agent_not_supported"));
+        hub.agent_exited_as("w", "wa", ExitKind::Natural, None);
+        hub.post_direct(Recipient::bound("w", "wb"), content("for wb"))
+            .unwrap();
+        assert_eq!(hub.summary("w", "wb").wake, WakePath::Doorbell);
+        hub.post_direct(Recipient::bound("w", "wa"), content("late for wa"))
+            .ok();
+        assert_ne!(
+            hub.summary("w", "wa").wake,
+            WakePath::None,
+            "the exited generation's refusal is gone"
+        );
+        hub.set_typed_fallback("w", "wb", Some("unknown_release"));
+        assert_eq!(hub.summary("w", "wb").wake, WakePath::None);
+    }
+
     /// PR #1735 fifth review (R5): a stalled wake is recorded against the
     /// oldest queued message, shown in the summary and broadcast as a
     /// wake-stall notice for that message; it ends when that message is taken
@@ -8199,6 +8968,76 @@ mod tests {
 
     /// Delegate `task` to worker pane `w` (agent `wa`) from orchestrator pane
     /// `o` (agent `oa`), with notices due at once.
+    /// Scenario: A worker's pane ends, by each kind of evidence and with none, before it takes a delegated task. The orchestrator's notice must say what the deck saw end the pane, never that the agent exited, and the task's undeliverable broadcast must carry the same evidence.
+    #[spec("inbox/status/032")]
+    #[test]
+    fn status_032_an_exit_notice_says_what_ended_the_pane() {
+        use crate::inbox_display::{PaneTermination, TerminationSource};
+        let cases = [
+            (
+                Some(PaneTermination::PaneCommandExited {
+                    code: 7,
+                    reported_by: TerminationSource::Wrapper,
+                }),
+                "undeliverable: the command started in the agent's pane exited (code 7) before taking this message.",
+            ),
+            (
+                Some(PaneTermination::ConnectionEnded {
+                    read_end: "eof".to_string(),
+                }),
+                "undeliverable: the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown.",
+            ),
+            (
+                Some(PaneTermination::Replaced),
+                "undeliverable: the agent's pane was replaced before it took this message; the message stays with the previous agent.",
+            ),
+            (
+                Some(PaneTermination::Closed),
+                "undeliverable: the pane was closed before the agent took this message.",
+            ),
+            (
+                None,
+                "undeliverable: the agent's pane ended before it took this message.",
+            ),
+        ];
+        for (termination, words) in cases {
+            let hub = hub();
+            let (tx, mut rx) = broadcast::channel(256);
+            hub.set_broadcast(tx);
+            let task = delegate(&hub, "TASK-WHOSE-PANE-ENDS");
+            hub.agent_exited_as("w", "wa", ExitKind::Natural, termination.clone());
+            hub.post_owed_notices();
+            let bodies: Vec<String> = hub
+                .list_with_bodies(Some("o"))
+                .into_iter()
+                .filter(|m| m.subject == UNDELIVERED_SUBJECT)
+                .filter_map(|m| m.text)
+                .collect();
+            assert_eq!(bodies.len(), 1, "{termination:?}: {bodies:?}");
+            assert!(bodies[0].contains(task.as_str()), "{}", bodies[0]);
+            assert!(bodies[0].contains(words), "{termination:?}: {}", bodies[0]);
+            assert!(
+                !bodies[0].contains(" exited before acknowledging"),
+                "{}",
+                bodies[0]
+            );
+            let mut carried = None;
+            while let Ok(msg) = rx.try_recv() {
+                if let BroadcastMsg::Inbox(notice) = msg
+                    && notice.message_id == task.as_str()
+                    && notice.reason == Some(UndeliverableReason::AgentExited)
+                {
+                    carried = Some(notice.termination);
+                }
+            }
+            assert_eq!(
+                carried,
+                Some(Some(termination.unwrap_or(PaneTermination::Unknown))),
+                "the task's undeliverable broadcast carries the evidence"
+            );
+        }
+    }
+
     fn delegate(hub: &InboxHub, task: &str) -> MessageId {
         hub.post_delegate(
             Recipient::bound("w", "wa"),
@@ -8380,8 +9219,7 @@ mod tests {
         assert_eq!(told.len(), 1, "{told:?}");
         let body = &told[0];
         assert!(
-            body.contains("may have reached the worker before it exited")
-                && body.contains(CHECK_FIRST),
+            body.contains("may have reached the worker before then") && body.contains(CHECK_FIRST),
             "{body}"
         );
         assert!(

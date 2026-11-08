@@ -14,6 +14,10 @@
 //! [`tests::every_permission_site_has_a_windows_counterpart_or_a_justification`]
 //! fails the build if any row claims a Windows no-op without saying why.
 
+/// PRD #1666 part 3 (Q35-03): the Linux view the export path rule walks.
+/// It changes no permission, so it has no [`SITE_AUDIT`] row.
+#[cfg(target_os = "linux")]
+pub mod fs_view;
 #[cfg(unix)]
 mod unix;
 #[cfg(windows)]

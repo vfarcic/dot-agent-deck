@@ -637,7 +637,7 @@ jobs:
           name: release-body
           path: ${{ runner.temp }}/release-body
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3
         with:
           tag_name: v${{ needs.prepare.outputs.version }}
           name: v${{ needs.prepare.outputs.version }}
@@ -805,7 +805,7 @@ jobs:
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev \
             librsvg2-dev libxdo-dev libasound2-dev \
             patchelf fakeroot file desktop-file-utils
-      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+      - uses: pnpm/action-setup@73e46992e05b19abd31f2f3c20e0e7370d762115 # v6
         with:
           version: 12.9.0
       # pnpm and Node match ci.yml's `desktop-web` job, so what is tested is

@@ -11,7 +11,7 @@ use serde_json::json;
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must show exactly the fixed doorbell and a submission, while the task body remains only in the inbox; an empty inbox never rings.
+/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must receive exactly one doorbell line, led by its ring token, and one submission, while the task body remains only in the inbox; an empty inbox never rings.
 #[spec("inbox/doorbell/001")]
 #[test]
 fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
@@ -25,14 +25,14 @@ fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
     ring(&daemon, &pane, &id);
     assert_eq!(
         bytes(&pane),
-        format!("{}\r", fixed_line(&id)).as_bytes(),
-        "exact fixed line, no body, paste markers, LF or extra submits"
+        format!("{}\r", rung_line(&pane, &id).unwrap()).as_bytes(),
+        "exact token-led line, no body, paste markers, LF or extra submits"
     );
     assert_eq!(rings(&pane).len(), 1);
     state(&daemon, &pane, &id, "queued");
 }
 
-/// Scenario: Queue one task before any status is reported, then report each busy or dialog status from each supported agent type. The pane must receive nothing until an Idle hook permits the fixed doorbell.
+/// Scenario: Queue one task before any status is reported, then report each busy or dialog status from each supported agent type. The pane must receive nothing until an Idle hook permits the token-led doorbell.
 #[spec("inbox/doorbell/002")]
 #[test]
 fn doorbell_002_unknown_dialogs_and_busy_states_never_ring() {
@@ -69,7 +69,7 @@ fn doorbell_002_unknown_dialogs_and_busy_states_never_ring() {
     }
 }
 
-/// Scenario: Hold a native Stream waiter connected with its hand-over paused and a task still Queued. No doorbell may type even after native grace expires; dropping the waiter through EOF must release the fixed line for that same Queued task.
+/// Scenario: Hold a native Stream waiter connected with its hand-over paused and a task still Queued. No doorbell may type even after native grace expires; dropping the waiter through EOF must release the token-led line for that same Queued task.
 #[spec("inbox/doorbell/003")]
 #[test]
 fn doorbell_003_armed_waiter_suppresses_ring_until_eof() {
@@ -95,7 +95,7 @@ fn doorbell_003_armed_waiter_suppresses_ring_until_eof() {
     ring(&daemon, &pane, &id);
 }
 
-/// Scenario: Announce a Native component without arming a waiter and queue a task for an Idle pane. The fixed line must remain absent during arm_grace, then ring if the component has still not armed; a TurnEnd announce gets no native grace.
+/// Scenario: Announce a Native component without arming a waiter and queue a task for an Idle pane. The token-led line must remain absent during arm_grace, then ring if the component has still not armed; a TurnEnd announce gets no native grace.
 #[spec("inbox/doorbell/004")]
 #[test]
 fn doorbell_004_native_announce_gets_arm_grace() {
@@ -202,7 +202,7 @@ fn ring_times(path: &std::path::Path, pane: &inbox::Pane) -> Vec<chrono::DateTim
         .collect()
 }
 
-/// Scenario: Queue three tasks while the pane is busy, then report Idle. One fixed line must cover the batch, carry a queued id, and a single fetch must return and acknowledge all three bodies.
+/// Scenario: Queue three tasks while the pane is busy, then report Idle. One token-led line must cover the batch, carry a queued id, and a single fetch must return and acknowledge all three bodies.
 #[spec("inbox/doorbell/006")]
 #[test]
 fn doorbell_006_one_ring_coalesces_all_queued_messages() {
@@ -223,7 +223,7 @@ fn doorbell_006_one_ring_coalesces_all_queued_messages() {
     assert_eq!(observed.len(), 1, "one owed ring covers the whole batch");
     let ringing_id = ids
         .iter()
-        .find(|id| observed[0]["line"] == fixed_line(id))
+        .find(|id| is_ring_line(observed[0]["line"].as_str().unwrap(), id))
         .expect("ring must name a queued id");
     ring(&daemon, &pane, ringing_id);
     let fetched = fetch(&daemon, &pane, true).to_string();
@@ -242,10 +242,10 @@ fn doorbell_006_one_ring_coalesces_all_queued_messages() {
     assert!(!screen(&daemon, &pane).contains(BODY));
 }
 
-/// Scenario: Let each supported synthetic agent leave a doorbell outstanding until the next scheduled ring. Its exact input must contain a bare CR before the second fixed line, and one cleanup CR after another consumer fetches the task; neither CR creates a new message line.
+/// Scenario: Let each supported synthetic agent leave a doorbell outstanding until the next scheduled ring, then have another consumer fetch the task. The pane must receive exactly two token-led lines with different tokens, each followed by one CR, and nothing after the fetch: no bare CR before a ring and none to clean up after one.
 #[spec("inbox/doorbell/007")]
 #[test]
-fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
+fn doorbell_007_outstanding_ring_rerings_with_a_fresh_token_and_no_bare_cr() {
     let daemon = daemon_unbound(&[("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "1500")]);
     for agent_type in ["claude_code", "open_code", "pi", "codex", "devin"] {
         let pane = pane(&daemon, agent_type);
@@ -256,31 +256,117 @@ fn doorbell_007_outstanding_ring_gets_pre_ring_and_cleanup_cr() {
             common::wait_until(WAIT, || rings(&pane).len() >= 2),
             "second ring never submitted"
         );
-        let line = fixed_line(&id);
+        let lines = ring_lines(&pane);
+        assert!(
+            lines.iter().all(|line| is_ring_line(line, &id)),
+            "{agent_type}: {lines:?}"
+        );
+        assert_ne!(
+            lines[0], lines[1],
+            "{agent_type}: each ring has its own token"
+        );
+        let expected = format!("{}\r{}\r", lines[0], lines[1]);
         assert_eq!(
-            bytes(&pane),
-            format!("{line}\r\r{line}\r").as_bytes(),
-            "{agent_type}: pre-ring must be exactly one bare CR"
+            String::from_utf8_lossy(&bytes(&pane)),
+            expected,
+            "{agent_type}: two lines, one CR each"
         );
         fetch(&daemon, &pane, true);
         state(&daemon, &pane, &id, "acknowledged");
-        let cleaned = format!("{line}\r\r{line}\r\r");
-        assert!(
-            common::wait_until(WAIT, || bytes(&pane) == cleaned.as_bytes()),
-            "{agent_type}: outstanding ring needs one cleanup CR; received={:?}",
-            bytes(&pane)
-        );
         unchanged(&pane, Duration::from_millis(1800));
         assert_eq!(rings(&pane).len(), 2);
         assert_eq!(
-            turns(&pane)
-                .iter()
-                .filter(|turn| turn["line"] == "")
-                .count(),
-            2,
-            "pre-ring and cleanup CRs submit only empty composers"
+            String::from_utf8_lossy(&bytes(&pane)),
+            expected,
+            "{agent_type}: nothing to clean up after a submitted ring"
+        );
+        assert!(
+            turns(&pane).iter().all(|turn| turn["line"] != ""),
+            "{agent_type}: no empty composer was submitted"
         );
     }
+}
+
+/// The agent's `wake_hold`, as the daemon's agent records show it.
+fn wake_hold(daemon: &impl Endpoint, pane: &inbox::Pane) -> serde_json::Value {
+    attach(daemon, json!({"op":"list-agents"}))["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|record| record["id"] == pane.agent)
+        .map(|record| record["inbox"]["wake_hold"].clone())
+        .unwrap_or_default()
+}
+
+/// Wait for the doorbell's line and its Enter in `pane`, and answer the line.
+fn line_and_enter(pane: &inbox::Pane, id: &str) -> String {
+    let typed = || String::from_utf8_lossy(&bytes(pane)).into_owned();
+    assert!(
+        common::wait_until(WAIT, || typed()
+            .strip_suffix('\r')
+            .is_some_and(|line| is_ring_line(line, id))),
+        "the doorbell must type its line and one Enter: {:?}",
+        typed()
+    );
+    typed().trim_end_matches('\r').to_string()
+}
+
+/// Scenario: An Idle stand-in does not take the deck's Enter, its composer keeping the line. After its submit window the deck deletes exactly the line it typed and sends no second Enter, nothing is submitted, the task stays queued, no further ring follows in the episode, and the inbox names not_taken.
+#[spec("inbox/doorbell/042")]
+#[test]
+fn doorbell_042_an_enter_the_agent_did_not_take_is_taken_back_and_named() {
+    let daemon = daemon_unbound(&[
+        ("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "300"),
+        ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
+    ]);
+    let pane = pane(&daemon, "dropped-enter");
+    std::fs::write(pane.capture.with_extension("drop-enter"), "").unwrap();
+    status(&daemon, &pane, "idle", "claude_code");
+    let id = enqueue(&daemon, &pane, BODY);
+    let line = line_and_enter(&pane, &id);
+    let expected = format!("{line}\r{}", "\x7f".repeat(line.chars().count()));
+    assert!(
+        common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
+        "the deck must delete exactly its line: {:?}",
+        String::from_utf8_lossy(&bytes(&pane))
+    );
+    assert!(
+        common::wait_until(WAIT, || wake_hold(&daemon, &pane)
+            .to_string()
+            .contains("not_taken")),
+        "the inbox names not_taken: {}",
+        wake_hold(&daemon, &pane)
+    );
+    unchanged(&pane, Duration::from_millis(1500));
+    assert!(turns(&pane).is_empty(), "nothing was submitted");
+    state(&daemon, &pane, &id, "queued");
+}
+
+/// Scenario: An Idle stand-in does not take the deck's Enter, and the user types a draft while the deck waits for the submit. The deck takes back exactly the line it typed first, and only then does the user's draft reach the pane, exactly as typed: one Enter in all, and no submission of the line and the draft together.
+#[spec("inbox/doorbell/042")]
+#[test]
+fn doorbell_042_the_users_draft_waits_for_the_take_back() {
+    let daemon = daemon_unbound(&[]);
+    let pane = pane(&daemon, "dropped-enter-draft");
+    std::fs::write(pane.capture.with_extension("drop-enter"), "").unwrap();
+    status(&daemon, &pane, "idle", "claude_code");
+    let mut user = common::AttachInput::attach(&daemon.attach_socket, &pane.agent);
+    let id = enqueue(&daemon, &pane, BODY);
+    let line = line_and_enter(&pane, &id);
+    user.write(DRAFT);
+    let expected = format!("{line}\r{}{DRAFT}", "\x7f".repeat(line.chars().count()));
+    assert!(
+        common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
+        "the take-back must come before the user's draft: {:?}",
+        String::from_utf8_lossy(&bytes(&pane))
+    );
+    assert!(
+        common::wait_until(WAIT, || screen(&daemon, &pane)
+            .contains(&format!("COMPOSER: {DRAFT}"))),
+        "the user's draft sits in the composer alone"
+    );
+    unchanged(&pane, Duration::from_millis(800));
+    assert!(turns(&pane).is_empty(), "nothing was submitted");
 }
 
 /// Scenario: Hold a task behind an old agent's human draft, stop it, and spawn a new agent in the same pane identity, on both one-worker and four-worker daemons. A predecessor-session ShellIdle must not type into the replacement at completed policy ages of 5 seconds, 10 seconds and up to one day, nor during the real observation window; its own Idle then submits only the newly bound task, which can be fetched.
@@ -347,7 +433,7 @@ fn assert_respawn_waits_for_ready(workers: &str) {
     status(&daemon, &new, "idle", "claude_code");
     assert!(
         common::wait_until(Duration::from_secs(1), || !rings(&new).is_empty()),
-        "own ready must promptly submit replacement's fixed line"
+        "own ready must promptly submit replacement's doorbell line"
     );
     ring(&daemon, &new, &id);
     assert!(
@@ -358,7 +444,7 @@ fn assert_respawn_waits_for_ready(workers: &str) {
     assert!(fetched.contains(&id) && fetched.contains(BODY), "{fetched}");
 }
 
-/// Scenario: Queue a task for a synthetic pane with a bare hydrated placeholder at the oldest representable startup, or its own native SessionStart aged to one day and the oldest representable startup in both session and process records. Each pane must receive zero automatic bytes until its own Idle hook permits the fixed line and an in-pane fetch.
+/// Scenario: Queue a task for a synthetic pane with a bare hydrated placeholder at the oldest representable startup, or its own native SessionStart aged to one day and the oldest representable startup in both session and process records. Each pane must receive zero automatic bytes until its own Idle hook permits the token-led line and an in-pane fetch.
 #[spec("inbox/doorbell/008")]
 #[test]
 fn doorbell_008_placeholder_alone_does_not_establish_readiness() {
@@ -401,6 +487,14 @@ fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::Date
     };
     let pane = route::start(&fixture, "placeholder-readiness", json!({}));
     if session_start {
+        // Started, its prompt not drawn yet: SessionStart alone is not the
+        // readiness a ring needs.
+        route::hold_ready(&fixture, true);
+        assert!(
+            common::wait_until(WAIT, || screen(&fixture, &pane)
+                .contains("DOORBELL-STANDIN-BOOTING")),
+            "the stand-in must draw no prompt"
+        );
         status(&fixture, &pane, "session_start", "claude_code");
     }
     runtime.block_on(async {
@@ -451,10 +545,13 @@ fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::Date
     );
     state(&fixture, &pane, &id, "queued");
     route::fetch_enable(&pane);
+    if session_start {
+        route::hold_ready(&fixture, false);
+    }
     status(&fixture, &pane, "idle", "claude_code");
     assert!(
         common::wait_until(Duration::from_secs(1), || bytes(&pane).ends_with(b"\r")),
-        "own ready must promptly submit placeholder's fixed line"
+        "own ready must promptly submit placeholder's doorbell line"
     );
     // Fetch from the fixture agent itself: this in-process daemon deliberately
     // keeps real component ancestry admission, unlike daemon_unbound fixtures.
@@ -466,63 +563,42 @@ fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::Date
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_ack_after_decision_cancels_stale_rering() {
-    assert_ack_fences_rering("decided", true, false);
+    assert_ack_fences_rering("decided", Settle::Ack);
 }
 
 /// Scenario: Fetch the selected message without acknowledging it while its retry is paused after decision, then queue another task. The fetched ID must receive no further input while the queued control can progress.
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_fetch_after_decision_cancels_stale_rering() {
-    assert_ack_fences_rering("decided", false, false);
+    assert_ack_fences_rering("decided", Settle::Fetch);
 }
 
-/// Scenario: Pause a retry after its pre-ring CR, then acknowledge its selected task and leave another message queued without changing Idle. The already-written CR is allowed, but the retry payload and submission must be absent; an unchanged selected-message control still submits its line.
+/// Scenario: Pause a retry after its token-led line reaches the pane, with the writer held and before its Enter, then acknowledge the selected task and leave another message queued. Releasing it must delete exactly the line it typed and send no Enter; an unchanged selected-message control still submits its line.
 #[spec("inbox/doorbell/031")]
 #[test]
-fn doorbell_031_ack_after_pre_cr_cancels_stale_payload() {
-    assert_ack_fences_rering("after-pre-cr", true, false);
-}
-
-/// Scenario: Settle the selected message while another remains queued after the inter-step delay. The paused retry must emit no further byte, while an unchanged selected message still completes its retry.
-#[spec("inbox/doorbell/031")]
-#[test]
-fn doorbell_031_ack_after_delay_cancels_remaining_bytes() {
-    assert_ack_fences_rering("after-delay", true, false);
-}
-
-/// Scenario: Settle the selected message while another remains queued just before the retry's final submit. The payload already written is allowed but the final CR must be withheld; the unchanged-message control still submits.
-#[spec("inbox/doorbell/031")]
-#[test]
-fn doorbell_031_ack_before_submit_cancels_final_cr() {
-    assert_ack_fences_rering("before-submit", true, false);
-}
-
-/// Scenario: Type a human draft while the retry is paused between its pre-ring CR and payload. Releasing the retry must not append automatic text or submit the draft.
-#[spec("inbox/doorbell/031")]
-#[test]
-fn doorbell_031_human_draft_between_steps_withholds_remaining_input() {
-    assert_ack_fences_rering("after-delay", true, true);
+fn doorbell_031_ack_after_the_line_takes_it_back() {
+    assert_ack_fences_rering("after-line", Settle::Ack);
 }
 
 /// Scenario: A human input frame arrives while a retry is paused after decision, before writer admission. The queued task must remain deferred with the draft unsent; the unchanged-message control still completes its retry.
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_human_draft_after_decision_withholds_retry() {
-    assert_ack_fences_rering("decided", true, true);
+    assert_ack_fences_rering("decided", Settle::HumanDraft);
 }
 
-/// Scenario: After the retry payload reaches the pane, a human input frame arrives before its final submit CR. The already-written payload is allowed, but releasing the writer must deliver only the human draft and no automatic submit; the unchanged-message control still submits.
+/// Scenario: After the retry's line reaches the pane, a human input frame arrives while the writer is still held. The deck must finish its own attempt first, its Enter and then the human's bytes exactly as typed, and submit nothing of the human's; the unchanged-message control still submits.
 #[spec("inbox/doorbell/031")]
 #[test]
-fn doorbell_031_human_draft_before_submit_withholds_final_cr() {
-    assert_ack_fences_rering("before-submit", true, true);
+fn doorbell_031_human_frame_after_the_line_waits_for_the_submit() {
+    assert_ack_fences_rering("after-line", Settle::HumanDraft);
 }
 
 /// Scenario: Leave completion and writer-held barriers unreleased in separate fixtures until their test-only timeouts unwind the tasks. Each pane must then accept and submit another scheduled ring, proving recovery of its writer and logical busy slot.
 #[spec("inbox/doorbell/031")]
 #[test]
 fn doorbell_031_timed_out_barrier_does_not_strand_slot() {
-    for phase in ["completed", "after-delay"] {
+    for phase in ["completed", "admitted"] {
         let daemon = daemon_unbound(&[
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
             ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "timeout-control"),
@@ -545,16 +621,26 @@ fn doorbell_031_timed_out_barrier_does_not_strand_slot() {
         );
         assert!(
             common::wait_until(WAIT, || rings(&pane).len() >= 2),
-            "seam timeout stranded the doorbell's busy slot"
+            "seam timeout stranded the doorbell's writer or busy slot"
         );
         fetch(&daemon, &pane, true);
     }
 }
 
-fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
+#[derive(Clone, Copy, PartialEq)]
+enum Settle {
+    /// Fetch and acknowledge the selected message.
+    Ack,
+    /// Fetch it without acknowledging, the receiver kept open.
+    Fetch,
+    /// Leave it queued and type a human draft into the pane.
+    HumanDraft,
+}
+
+fn assert_ack_fences_rering(phase: &str, settle: Settle) {
     // Run the queued control FIRST, so a RED below still proves the barrier
     // releases a real re-ring with the ordinary payload and submission.
-    for acknowledge in [false, true] {
+    for intervene in [false, true] {
         let daemon = daemon_unbound(&[
             ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "500"),
             ("DOT_AGENT_DECK_TEST_DOORBELL_PAUSE_PANE", "fenced"),
@@ -572,28 +658,41 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
         status(&daemon, &pane, "idle", "claude_code");
         let id = enqueue(&daemon, &pane, BODY);
         ring(&daemon, &pane, &id);
-        let first = format!("{}\r", fixed_line(&id));
+        let first = format!("{}\r", rung_line(&pane, &id).unwrap());
         assert!(
             common::wait_until(wait_budget(), || root
                 .join(format!("{phase}.reached"))
                 .exists()),
             "re-ring must reach {phase} barrier"
         );
-        let parked = match phase {
-            "decided" => first.clone(),
-            "before-submit" => format!("{first}\r{}", fixed_line(&id)),
-            _ => format!("{first}\r"),
+        // Parked: after decision nothing more is written; after the line, the
+        // retry's own token-led line and no Enter.
+        let retry_line = || {
+            let text = String::from_utf8_lossy(&bytes(&pane)).into_owned();
+            text.strip_prefix(&first)
+                .filter(|rest| is_ring_line(rest, &id))
+                .map(str::to_string)
         };
-        assert!(
-            common::wait_until(wait_budget(), || bytes(&pane) == parked.as_bytes()),
-            "{phase}: barrier must precede payload: {:?}",
-            bytes(&pane)
-        );
+        let parked = if phase == "after-line" {
+            assert!(
+                common::wait_until(wait_budget(), || retry_line().is_some()),
+                "{phase}: barrier must follow the retry's line: {:?}",
+                String::from_utf8_lossy(&bytes(&pane))
+            );
+            retry_line().unwrap()
+        } else {
+            assert!(
+                common::wait_until(wait_budget(), || bytes(&pane) == first.as_bytes()),
+                "{phase}: barrier must precede the retry: {:?}",
+                String::from_utf8_lossy(&bytes(&pane))
+            );
+            String::new()
+        };
         let mut _held = None;
-        if acknowledge && !draft {
+        if intervene && settle != Settle::HumanDraft {
             // Without an ack the fetch keeps its receiver, which holds the
             // message for it (PRD #1666 part 3).
-            let fetched = if ack {
+            let fetched = if settle == Settle::Ack {
                 fetch(&daemon, &pane, true)
             } else {
                 let (socket, reply) = take(&daemon, &pane);
@@ -606,14 +705,18 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
                 &daemon,
                 &pane,
                 &id,
-                if ack { "acknowledged" } else { "fetched" },
+                if settle == Settle::Ack {
+                    "acknowledged"
+                } else {
+                    "fetched"
+                },
             );
         } else {
             state(&daemon, &pane, &id, "queued");
         }
         let other = enqueue(&daemon, &pane, "SECOND-QUEUED-MESSAGE");
         state(&daemon, &pane, &other, "queued");
-        if acknowledge && draft {
+        if intervene && settle == Settle::HumanDraft {
             user.write(DRAFT);
             assert!(
                 common::wait_until(wait_budget(), || std::fs::read_to_string(
@@ -632,38 +735,45 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
             root.join(format!("{phase}.timed-out")).exists()
         );
         drained(&pane);
-        if !acknowledge {
+        if !intervene {
             assert!(
                 common::wait_until(wait_budget(), || rings(&pane).len() >= 2),
                 "{phase}: still-queued control must submit its second ring"
             );
+            let lines = ring_lines(&pane);
+            assert!(is_ring_line(&lines[1], &id), "{lines:?}");
             assert_eq!(
-                bytes(&pane),
-                format!("{first}\r{}\r", fixed_line(&id)).as_bytes()
+                String::from_utf8_lossy(&bytes(&pane)),
+                format!("{first}{}\r", lines[1])
             );
             fetch(&daemon, &pane, true);
             std::fs::write(root.join("completed.release"), "").unwrap();
             continue;
         }
-        let expected = if draft {
-            format!("{parked}{DRAFT}")
-        } else {
-            parked
+        let expected = match (phase, settle) {
+            // The line typed, then settled: deleted, no Enter.
+            ("after-line", Settle::Ack | Settle::Fetch) => {
+                format!("{first}{parked}{}", "\x7f".repeat(parked.chars().count()))
+            }
+            // The human's frame waits behind the deck's own Enter.
+            ("after-line", Settle::HumanDraft) => format!("{first}{parked}\r{DRAFT}"),
+            (_, Settle::HumanDraft) => format!("{first}{DRAFT}"),
+            _ => first.clone(),
         };
-        if draft {
-            assert!(
-                common::wait_until(wait_budget(), || bytes(&pane).ends_with(DRAFT.as_bytes())),
-                "human input must resume after writer release"
-            );
-        }
-        assert_eq!(
-            String::from_utf8_lossy(&bytes(&pane)),
-            expected,
-            "{phase}: settled selected ID with another message queued (or intervening human draft) must emit no remaining payload or submit"
+        assert!(
+            common::wait_until(wait_budget(), || bytes(&pane) == expected.as_bytes()),
+            "{phase}: expected {expected:?}, received {:?}",
+            String::from_utf8_lossy(&bytes(&pane))
         );
-        assert_eq!(rings(&pane).len(), 1, "ack must stop second submission");
+        let rang = if (phase, settle) == ("after-line", Settle::HumanDraft) {
+            2
+        } else {
+            1
+        };
+        assert_eq!(rings(&pane).len(), rang, "{phase}: submitted rings");
         std::fs::write(root.join("completed.release"), "").unwrap();
-        if draft {
+        if settle == Settle::HumanDraft {
+            // The draft stays in the composer, so nothing else is typed.
             unchanged(&pane, Duration::from_millis(600));
         } else {
             ring(&daemon, &pane, &other);
@@ -672,11 +782,11 @@ fn assert_ack_fences_rering(phase: &str, ack: bool, draft: bool) {
     }
 }
 
-/// Scenario: Type a worker draft, queue a task, and keep typing while delivery waits. Enter must submit the human draft separately, after which exactly the fixed doorbell arrives without blocking the user's input.
+/// Scenario: Type a worker draft, queue a task, and keep typing while delivery waits; the user's typing is never blocked. Enter submits the human draft as its own line. The box was touched and no check can read this pane, so the deck types nothing after it and the card says why (`cannot_type`); the in-pane fetch, as a prompt would run it, still hands over the task.
 #[spec("scheduler/dispatch/023")]
 #[test]
 fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
-    let daemon = daemon_unbound(&[]);
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
     let pane = pane(&daemon, "worker-draft");
     status(&daemon, &pane, "idle", "codex");
     let mut user = input(&daemon, &pane, DRAFT);
@@ -691,100 +801,176 @@ fn dispatch_023_doorbell_waits_for_unsent_worker_draft() {
     unchanged(&pane, Duration::from_millis(300));
     assert!(rings(&pane).is_empty());
     user.write("\r");
-    ring(&daemon, &pane, &id);
+    // Q35-21: the user's own submit leaves a box no check has read. With no
+    // check available here, it holds with its reason and the deck types
+    // nothing after the draft; the prompt route still delivers.
+    let submitted = format!("{DRAFT}-still-typing\r");
+    assert!(
+        common::wait_until(WAIT, || bytes(&pane) == submitted.as_bytes()),
+        "the draft must be submitted as its own line: {:?}",
+        bytes(&pane)
+    );
+    assert!(
+        common::wait_until(WAIT, || wake_hold(&daemon, &pane) == "cannot_type"),
+        "a touched box no check can read holds with its reason: {}",
+        wake_hold(&daemon, &pane)
+    );
+    unchanged(&pane, Duration::from_millis(600));
     assert_eq!(
         bytes(&pane),
-        format!("{DRAFT}-still-typing\r{}\r", fixed_line(&id)).as_bytes(),
-        "draft and doorbell must be separate submitted lines"
+        submitted.as_bytes(),
+        "nothing may be typed after the user's own line"
+    );
+    assert!(rings(&pane).is_empty());
+    let taken = fetch(&daemon, &pane, true);
+    assert!(
+        taken.to_string().contains(&id),
+        "the prompt route must hand over the task: {taken}"
     );
 }
 
-/// Scenario: Forward only terminal focus, mouse and query-response bytes into an Idle worker pane, then queue a task. These terminal reports must not count as a human draft, so the fixed doorbell reaches the pane without Enter.
+/// Scenario: Forward only terminal focus, mouse and query-response bytes into an Idle worker pane whose agent turned on no report mode, then queue a task. Reports the agent did not ask for may be input to it, so they touch the box: the deck types nothing after them, the card says why (`cannot_type`), and the in-pane fetch, as a prompt would run it, still hands over the task.
 #[spec("scheduler/dispatch/023")]
 #[test]
-fn dispatch_023_terminal_reports_do_not_hold_doorbell() {
-    let daemon = daemon_unbound(&[]);
+fn dispatch_023_unrequested_terminal_reports_hold_with_their_reason() {
+    let daemon = daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
     let pane = pane(&daemon, "terminal-reports");
     status(&daemon, &pane, "idle", "codex");
     let reports =
         "\x1b[<64;10;5M\x1b[I\x1b[10;5R\x1b[?1;2c\x1b]10;rgb:ffff/ffff/ffff\x07\x1bP1$r0m\x1b\\";
     let _user = input(&daemon, &pane, reports);
-    let id = enqueue(&daemon, &pane, BODY);
-    let expected = format!("{reports}{}\r", fixed_line(&id));
     assert!(
-        common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
-        "terminal reports must not defer the doorbell: {:?}",
+        common::wait_until(WAIT, || bytes(&pane) == reports.as_bytes()),
+        "the reports reach the pane: {:?}",
         bytes(&pane)
     );
-    assert!(screen(&daemon, &pane).contains("waiting, run: dot-agent-deck inbox fetch"));
+    let id = enqueue(&daemon, &pane, BODY);
+    // Q35-21 (R3 §3.2): reports outside the agent's enabled modes and the
+    // ledger's solicited replies touch the box. With no check available
+    // here it holds with its reason; the prompt route still delivers.
+    assert!(
+        common::wait_until(WAIT, || wake_hold(&daemon, &pane) == "cannot_type"),
+        "unrequested reports hold the doorbell with its reason: {}",
+        wake_hold(&daemon, &pane)
+    );
+    unchanged(&pane, Duration::from_millis(600));
+    assert_eq!(
+        bytes(&pane),
+        reports.as_bytes(),
+        "nothing may be typed after the reports"
+    );
+    assert!(rings(&pane).is_empty());
+    let taken = fetch(&daemon, &pane, true);
+    assert!(
+        taken.to_string().contains(&id),
+        "the prompt route must hand over the task: {taken}"
+    );
 }
 
-/// Scenario: For each supported synthetic agent type, report the worker Thinking, forward the interrupt OpenCode uses (Escape, a 300 ms pause, Escape) as the user's keys, then report it Idle and queue a task. An interrupt is not a draft, so the fixed doorbell must follow the two Escapes and a fetch must deliver the task.
-#[spec("inbox/doorbell/019")]
+/// Scenario: Type and delete text in OpenCode and Pi panes with their native receipt streams registered, then queue a message. Each native stream must hand over its message without a probe or notice, and its card must not acquire a composer-check reason.
+#[spec("inbox/probe/037")]
 #[test]
-fn doorbell_019_an_interrupts_escapes_do_not_hold_doorbell() {
-    let daemon = daemon_unbound(&[]);
-    for agent_type in ["open_code", "claude_code", "codex", "pi"] {
-        let pane = pane(
-            &daemon,
-            &format!("interrupt-{}", agent_type.replace('_', "-")),
-        );
-        status(&daemon, &pane, "thinking", agent_type);
-        let mut user = input(&daemon, &pane, "\x1b");
-        // OpenCode's interrupt: the second Escape about 300 ms later.
-        unchanged(&pane, Duration::from_millis(300));
-        user.write("\x1b");
-        assert!(
-            common::wait_until(WAIT, || bytes(&pane) == b"\x1b\x1b"),
-            "{agent_type}: interrupt not received"
-        );
-        status(&daemon, &pane, "idle", agent_type);
-        let id = enqueue(&daemon, &pane, BODY);
-        let expected = format!("\x1b\x1b{}\r", fixed_line(&id));
-        assert!(
-            common::wait_until(WAIT, || bytes(&pane) == expected.as_bytes()),
-            "{agent_type}: an interrupt held the doorbell: {:?}",
-            bytes(&pane)
-        );
-        let fetched = fetch(&daemon, &pane, true).to_string();
-        assert!(
-            fetched.contains(&id) && fetched.contains(BODY),
-            "{agent_type}: the task was not delivered: {fetched}"
-        );
-        state(&daemon, &pane, &id, "acknowledged");
+fn probe_037_absent_opencode_and_pi_keep_native_delivery() {
+    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
+        let daemon = inbox::daemon_unbound(&[]);
+        let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
+        inbox::status(&daemon, &pane, "idle", kind);
+        let _human = inbox::input(&daemon, &pane, "x\x7f");
+        let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
+        let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+        let message = inbox::receipt_handout(&mut stream, &id);
+        assert_eq!(message["id"], id);
+        assert!(message.to_string().contains(inbox::BODY));
+        let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+        let record = records["agent_records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["id"] == pane.agent)
+            .unwrap();
+        assert_eq!(record["inbox"]["wake"], "native", "{record}");
+        assert!(record["inbox"]["wake_hold"].is_null(), "{record}");
+        inbox::unchanged(&pane, Duration::from_millis(250));
+        assert_eq!(inbox::bytes(&pane), b"x\x7f");
     }
 }
 
-/// Scenario: Leave a typed draft followed by two Escapes, two Escapes followed by typing, and two Escapes pressed on an agent that is already Idle (a menu, not an interrupt) followed by two more Idle reports, as OpenCode sends, then report Idle where the agent was busy and queue a task in each pane. None of these is an interrupt that emptied the box, and a repeated Idle ends no turn, so each pane must receive nothing and its task must stay Queued.
+/// Scenario: Announce Devin's ordinary turn-end receipt route without typing into its pane, queue mail, and fetch it through the ordinary CLI receipt path. Its existing cannot-type reason and prompt route remain available without a check or notice being typed.
+#[spec("inbox/probe/037")]
+#[test]
+fn probe_037_absent_devin_keeps_its_prompt_fetch_route() {
+    let daemon = inbox::daemon_unbound(&[("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "100")]);
+    let pane = inbox::pane_with(
+        &daemon,
+        "devin-absent",
+        json!({"agent_type":"devin","profile":false}),
+    );
+    inbox::status(&daemon, &pane, "idle", "devin");
+    let mut announcement = inbox::request(&pane, "inbox_announce");
+    announcement["component"] = json!("devin_hooks");
+    announcement["component_version"] = json!("synthetic-absent");
+    announcement["wake"] = json!("turn_end");
+    announcement["pid"] = json!(pane.pid);
+    assert_eq!(inbox::hook(&daemon, announcement)["accepted"], true);
+    let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+    assert!(
+        common::wait_until(WAIT, || {
+            let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+            records["agent_records"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["id"] == pane.agent && r["inbox"]["wake_hold"] == "cannot_type")
+        }),
+        "Devin's untouched prompt route must retain cannot_type: {}",
+        inbox::attach(&daemon, json!({"op":"list-agents"}))
+    );
+    let records = inbox::attach(&daemon, json!({"op":"list-agents"}));
+    let record = records["agent_records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["id"] == pane.agent)
+        .unwrap();
+    assert_eq!(record["inbox"]["wake"], "turn_end", "{record}");
+    assert!(
+        !matches!(
+            record["inbox"]["wake_hold"].as_str(),
+            Some("needs_fetch" | "cannot_check")
+        ),
+        "{record}"
+    );
+    assert!(inbox::fetch(&daemon, &pane, true).to_string().contains(&id));
+    assert_eq!(inbox::bytes(&pane), b"");
+}
+
+/// Scenario: Interrupt working OpenCode and Pi panes with two Escapes, and separately press Escapes while they are already Idle and repeat their Idle reports. Their registered native streams still deliver queued mail once without a typed fallback.
 #[spec("inbox/doorbell/019")]
 #[test]
-fn doorbell_019_drafts_and_escapes_on_an_idle_agent_still_hold_doorbell() {
-    let daemon = daemon_unbound(&[]);
-    for (name, while_busy, once_idle) in [
-        ("typed-then-escapes", "unsent\x1b\x1b", ""),
-        ("escapes-then-typed", "\x1b\x1bunsent", ""),
-        ("escapes-on-idle", "", "\x1b\x1b"),
-    ] {
-        let pane = pane(&daemon, name);
-        status(&daemon, &pane, "thinking", "open_code");
-        let mut user = (!while_busy.is_empty()).then(|| input(&daemon, &pane, while_busy));
-        status(&daemon, &pane, "idle", "open_code");
-        if !once_idle.is_empty() {
-            user = Some(input(&daemon, &pane, once_idle));
-            assert!(
-                common::wait_until(WAIT, || bytes(&pane).ends_with(once_idle.as_bytes())),
-                "{name}: the Escapes were not received"
+fn doorbell_019_native_opencode_and_pi_deliver_after_escapes() {
+    for (kind, component) in [("open_code", "opencode_plugin"), ("pi", "pi_extension")] {
+        for already_idle in [false, true] {
+            let daemon = inbox::daemon_unbound(&[]);
+            let pane = inbox::pane_with(&daemon, kind, json!({"agent_type":kind,"profile":false}));
+            inbox::status(
+                &daemon,
+                &pane,
+                if already_idle { "idle" } else { "thinking" },
+                kind,
             );
-            // OpenCode reports Idle twice for one turn's end.
-            status(&daemon, &pane, "idle", "open_code");
-            status(&daemon, &pane, "idle", "open_code");
+            let mut human = inbox::input(&daemon, &pane, "\x1b");
+            inbox::unchanged(&pane, Duration::from_millis(300));
+            human.write("\x1bx\x7f");
+            assert!(common::wait_until(WAIT, || inbox::bytes(&pane) == b"\x1b\x1bx\x7f"));
+            inbox::status(&daemon, &pane, "idle", kind);
+            inbox::status(&daemon, &pane, "idle", kind);
+            let mut stream = inbox::receipt_stream_as(&daemon, &pane, component);
+            let id = inbox::enqueue(&daemon, &pane, inbox::BODY);
+            let delivered = inbox::receipt_handout(&mut stream, &id);
+            assert_eq!(delivered["id"], id);
+            assert!(delivered.to_string().contains(inbox::BODY));
+            inbox::unchanged(&pane, Duration::from_millis(250));
+            assert_eq!(inbox::bytes(&pane), b"\x1b\x1bx\x7f");
         }
-        let before = bytes(&pane);
-        let id = enqueue(&daemon, &pane, BODY);
-        unchanged(&pane, Duration::from_millis(800));
-        assert_eq!(bytes(&pane), before, "{name}: the doorbell typed");
-        assert!(rings(&pane).is_empty(), "{name}: the doorbell rang");
-        state(&daemon, &pane, &id, "queued");
-        drop(user);
     }
 }

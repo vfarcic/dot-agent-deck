@@ -6,6 +6,61 @@
   "workDone": "work-done",
   "wakeStalled": "waiting to wake",
   "wakeStalledHint": "send it a prompt",
+  "wakeHolds": {
+    "possible_draft": "waiting: there may be an unsent draft. Send it or clear it.",
+    "awaiting_prompt": "not yet taken: the agent may be waiting at a prompt. Check its pane.",
+    "paste_open": "waiting: a paste into its input has not finished.",
+    "cannot_type": "waiting for the agent to fetch it. Send it a prompt.",
+    "not_taken": "waiting: the agent did not take the deck's Enter. Send it a prompt.",
+    "uncertain_input": "waiting: the deck's notice may be in its input. Check it before Enter.",
+    "dialog_during_ring": "waiting: a dialog may have taken the deck's keys. Check its pane.",
+    "needs_fetch": "waiting: ask the agent to run dot-agent-deck inbox fetch; reinstall the deck integration to restore automatic delivery",
+    "cannot_check": "waiting: the deck can't check this agent's input box. Check its pane."
+  },
+  "inputHeld": {
+    "checking": "input held: the deck is checking the input box; what you typed or answered will appear in a moment",
+    "check_not_opened": "input held: the agent hasn't opened the deck's check yet; what you typed or answered is kept until it does. Restarting the agent discards it.",
+    "check_not_returned": "input held: the agent hasn't come back from the deck's check; what you typed or answered is kept until it does. Restarting the agent discards it.",
+    "after_your_ctrl_g": "input held: the agent didn't open the editor for your Ctrl+G; what you typed or answered is kept. Restarting the agent discards it.",
+    "queue_full": "input held: too much typing is waiting; the rest is paused",
+    "check_blocked": "waiting: can't check this input box; press Ctrl+G to let the deck check it",
+    "unknown": "input held: what you typed or answered is kept while the deck checks this input box"
+  },
+  "inputNotDelivered": "not delivered: your held typing; restarting the agent discarded it. Type it again if you still need it.",
+  "inputRejected": {
+    "history-only": "Input not delivered: this agent has no live terminal",
+    "exited": "Input not delivered: the agent has exited",
+    "write-failed": "Input not delivered: the agent's terminal did not take it",
+    "stale": "Input not delivered: the agent in this pane was replaced or closed",
+    "wrong-session": "Input not delivered: the agent in this pane was replaced or closed",
+    "ctrl-g-refused": "Input not delivered: your Ctrl+G and what you typed after it; the deck passes no more Ctrl+G to this agent until it restarts",
+    "signal-key-refused": "Input not delivered: your Ctrl+C, Ctrl+Z or Ctrl+\\ and what you typed after it, while the deck's check had your editor open; type it again once the editor has closed",
+    "": "Input not delivered"
+  },
+  "inputUnavailable": {
+    "history-only": "Terminal input unavailable: this agent has no live terminal, only its history",
+    "none": "Terminal input unavailable: this agent has no live terminal"
+  },
+  "cannotCheckDetail": "waiting: the deck can't check this agent's input box: {cause}. {remedy}",
+  "holdCauses": {
+    "filesystem": "{path} is on {filesystem}, which the check doesn't support",
+    "writable_directory": "others can write to {path}, a directory you own",
+    "foreign_owner": "{path} belongs to another user",
+    "acl": "an access control list on {path} lets others write to it, or can't be read",
+    "export_file": "the agent's file {path} isn't one the check can trust",
+    "io": "the deck couldn't read {path}"
+  },
+  "holdPathUnnamed": "a path the deck didn't name",
+  "holdFilesystemUnnamed": "a filesystem the deck didn't name",
+  "holdRemedies": {
+    "relocate": "Point TMPDIR (or CODEX_HOME) at a directory on ext4, XFS, Btrfs or tmpfs (Linux), or APFS or HFS+ (macOS), owned by you, with no group or other write permission on it or on any directory above it other than a sticky directory root owns, such as /tmp.",
+    "remove_write": "Remove the write permission others have on that directory, with chmod g-w (and chmod o-w if others can write too) on it.",
+    "reread": "Check that you can read it, or point TMPDIR (or CODEX_HOME) at another directory."
+  },
+  "wakeHoldsAlone": {
+    "uncertain_input": "The deck's notice may be in its input. Check it before pressing Enter.",
+    "dialog_during_ring": "A dialog may have taken the deck's keys. Check the agent's pane."
+  },
   "uncertain": "delivery uncertain",
   "uncertainMany": "deliveries uncertain",
   "uncertainReason": "a deck message may or may not have reached this agent. Retry sends it again marked as a possible repeat; Cancel stops delivering it.",
@@ -41,5 +96,14 @@
   },
   "evidencePaused": "deck messages paused: {n} delivered messages still wait for proof that older copies cannot run; restart the agent to clear them",
   "actionUnsupported": "this deck cannot Retry or Cancel deck messages: upgrade dot-agent-deck",
-  "attentionTitle": "Deck messages"
+  "attentionTitle": "Deck messages",
+  "attentionOtherHeld": "other held",
+  "attentionHeld": "held",
+  "terminations": {
+    "pane_command_exited": "the command started in the agent's pane exited (code {code}) before taking this message",
+    "connection_ended": "the deck's connection to the agent's pane ended before it took this message; whether the agent is still running is unknown",
+    "replaced": "the agent's pane was replaced before it took this message; the message stays with the previous agent",
+    "closed": "the pane was closed before the agent took this message",
+    "unknown": "the agent's pane ended before it took this message"
+  }
 }

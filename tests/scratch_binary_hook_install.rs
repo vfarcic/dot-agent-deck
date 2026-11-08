@@ -129,7 +129,15 @@ impl Fixture {
                 let _ = self.0.wait();
             }
         }
-        let socket = self.path().join("attach.sock");
+        // The sockets live in a short private directory, not beside HOME: a
+        // fixture under `CARGO_TARGET_TMPDIR` inherits the checkout's path
+        // length, and a checkout path over ~63 bytes puts `attach.sock` past
+        // the 107-byte Unix socket limit, so the daemon exits at bind before
+        // it binds anything. Declared before the daemon so it outlives it.
+        let sockets = test_temp::tempdir().expect("short socket directory");
+        let socket = sockets.path().join("attach.sock");
+        let stderr_path = self.path().join("daemon.stderr");
+        let stderr = std::fs::File::create(&stderr_path).expect("daemon stderr file");
         let mut daemon = Daemon(
             Command::new(deck)
                 .args(["daemon", "serve"])
@@ -137,22 +145,24 @@ impl Fixture {
                 .env_clear()
                 .env("HOME", self.home())
                 .env("PATH", path)
-                .env("DOT_AGENT_DECK_SOCKET", self.path().join("hook.sock"))
+                .env("DOT_AGENT_DECK_SOCKET", sockets.path().join("hook.sock"))
                 .env("DOT_AGENT_DECK_ATTACH_SOCKET", &socket)
                 .env("DOT_AGENT_DECK_STATE_DIR", self.path().join("state"))
                 .env("DOT_AGENT_DECK_LOG", self.path().join("deck.log"))
                 .env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "30")
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(stderr)
                 .spawn()
                 .expect("automatic install via daemon serve"),
         );
         let deadline = Instant::now() + Duration::from_secs(15);
         while !socket.exists() && Instant::now() < deadline {
-            assert!(
-                daemon.0.try_wait().unwrap().is_none(),
-                "daemon exited before install"
-            );
+            if let Some(status) = daemon.0.try_wait().unwrap() {
+                panic!(
+                    "daemon exited before install ({status}); stderr:\n{}",
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                );
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         let log = std::fs::read_to_string(self.path().join("deck.log")).unwrap_or_default();

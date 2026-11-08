@@ -1,0 +1,384 @@
+{
+  "source_run": "capture",
+  "argv0": "claude",
+  "rows": 24,
+  "cols": 80,
+  "read_lens": [
+    13,
+    44,
+    1086,
+    21,
+    104,
+    132,
+    69,
+    72,
+    71,
+    240,
+    477,
+    20,
+    763,
+    101,
+    57,
+    20,
+    828,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    43,
+    42,
+    42,
+    42,
+    42,
+    42,
+    517,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    44,
+    20,
+    43,
+    42,
+    108,
+    91,
+    42,
+    42,
+    42,
+    86,
+    43,
+    88,
+    75,
+    69,
+    72,
+    71,
+    68,
+    67,
+    71,
+    43,
+    71,
+    70,
+    73,
+    106
+  ],
+  "points": {
+    "empty": 1164,
+    "mark:up-1": 1164,
+    "up-1": 1268,
+    "mark:up-2": 1268,
+    "up-2": 1400,
+    "mark:up-3": 1400,
+    "up-3": 1469,
+    "mark:up-4": 1469,
+    "up-4": 1541,
+    "mark:up-5": 1541,
+    "up-5": 1612,
+    "mark:ctrl-u": 1612,
+    "cleared": 1852,
+    "before-ring": 1852,
+    "mark:line": 1852,
+    "echoed": 2329,
+    "typed": 2329,
+    "mark:cr": 2329,
+    "submitted": 3270,
+    "after-enter": 4118,
+    "mark:clear": 4118,
+    "after-clear": 8867,
+    "mark:walk-up-1": 8867,
+    "walk-up-1": 8955,
+    "mark:walk-up-2": 8955,
+    "walk-up-2": 9030,
+    "mark:walk-up-3": 9030,
+    "walk-up-3": 9099,
+    "mark:walk-up-4": 9099,
+    "walk-up-4": 9171,
+    "mark:walk-up-5": 9171,
+    "walk-up-5": 9242,
+    "mark:walk-up-6": 9242,
+    "walk-up-6": 9310,
+    "mark:walk-up-7": 9310,
+    "walk-up-7": 9310,
+    "mark:walk-up-8": 9310,
+    "walk-up-8": 9310,
+    "mark:walk-down-1": 9310,
+    "walk-down-1": 9377,
+    "mark:walk-down-2": 9377,
+    "walk-down-2": 9491,
+    "mark:walk-down-3": 9491,
+    "walk-down-3": 9562,
+    "mark:walk-down-4": 9562,
+    "walk-down-4": 9632,
+    "mark:walk-down-5": 9632,
+    "walk-down-5": 9705,
+    "mark:walk-down-6": 9705,
+    "walk-down-6": 9811,
+    "mark:walk-down-7": 9811,
+    "walk-down-7": 9811,
+    "mark:walk-down-8": 9811,
+    "walk-down-8": 9811,
+    "mark:walk-down-9": 9811,
+    "walk-down-9": 9811,
+    "end": 9811
+  },
+  "edges": [],
+  "lines": [
+    "(tagrzf) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b845 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "release": "2.1.317",
+  "executable_sha256": "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+  "recorder": "tests/support/claude_history_submit_measure.py",
+  "recorder_sha256": "1ae3a1031e3930037534304afc6ed10b2f4b7346e76863cd60109e75e2b3de68",
+  "release_recorder_sha256": "79931911fe27567810448c5f20e876e38782f64b758968bdacb718e7bc51c36e",
+  "trace_sha256": "3d78f4fa9f5184103708ecd6e155a443ee2a44de1d45461a1b6db5369f8efbe5",
+  "hook_prompts": [
+    "(tagrzf) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b845 waiting, run: dot-agent-deck inbox fetch"
+  ],
+  "hook_events": [
+    "UserPromptSubmit"
+  ],
+  "outcome": {
+    "after_clear": {
+      "box": "",
+      "editable": true,
+      "history": false,
+      "point": "after-clear",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "after_clear_empty_and_ready": true,
+    "after_enter": {
+      "box": "(tagrzf) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b845 waiting, run:\ndot-agent-deck inbox fetch",
+      "editable": true,
+      "history": false,
+      "point": "after-enter",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "after_enter_dialog": "None",
+    "before_ring": {
+      "box": "Try \"how does <filepath> work?\"",
+      "editable": true,
+      "history": false,
+      "point": "before-ring",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "before_ring_empty_and_ready": true,
+    "capture": "/var/tmp/dad-claude-release-measure-HAbQR9/capture",
+    "case": "plain",
+    "cleared": {
+      "box": "Try \"how does <filepath> work?\"",
+      "editable": true,
+      "history": false,
+      "point": "cleared",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "cleared_empty_and_ready": true,
+    "echo_ms": 40.187022,
+    "history_log": [
+      "HISTORYONEalpha",
+      "HISTORYTWObravo",
+      "HISTORYTHREEcharlie",
+      "HISTORYFOURdelta",
+      "HISTORYFIVEecho",
+      "HISTORYSIXfoxtrot"
+    ],
+    "hook_ms": 218.957489,
+    "line": "(tagrzf) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b845 waiting, run: dot-agent-deck inbox fetch",
+    "load": [
+      [
+        2.83984375,
+        4.54150390625,
+        8.7783203125
+      ],
+      "some avg10=0.85 avg60=0.70 avg300=2.30 total=204854419446",
+      [
+        2.6845703125,
+        4.3447265625,
+        8.5771484375
+      ],
+      "some avg10=1.09 avg60=0.80 avg300=2.16 total=204854914162"
+    ],
+    "presses": 4,
+    "prompts": [
+      "(tagrzf) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b845 waiting, run: dot-agent-deck inbox fetch"
+    ],
+    "reachable": null,
+    "recalled": [
+      "HISTORYSIXfoxtrot",
+      "HISTORYFIVEecho",
+      "HISTORYFOURdelta",
+      "HISTORYTHREEcharlie",
+      "HISTORYTWObravo",
+      "HISTORYONEalpha"
+    ],
+    "release": "2.1.317",
+    "size": "24x80",
+    "slot": "2/6",
+    "slot_down": null,
+    "slot_text": "HISTORYTWObravo",
+    "slot_up": null,
+    "trial": 5,
+    "typed": {
+      "box": "(tagrzf) dot-agent-deck: message m-hist319p-0f3c9a71d2e4b845 waiting, run:\ndot-agent-deck inbox fetch",
+      "editable": true,
+      "history": false,
+      "point": "typed",
+      "rule": "────────────────────────────────────────────────────────────────────────────────"
+    },
+    "typed_holds": "Some(Exact)",
+    "walk": [
+      [
+        "─── History 6/6 ────",
+        "HISTORYSIXfoxtrot"
+      ],
+      [
+        "─── History 5/6 ────",
+        "HISTORYFIVEecho"
+      ],
+      [
+        "─── History 4/6 ────",
+        "HISTORYFOURdelta"
+      ],
+      [
+        "─── History 3/6 ────",
+        "HISTORYTHREEcharlie"
+      ],
+      [
+        "─── History 2/6 ────",
+        "HISTORYTWObravo"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 1/6 ────",
+        "HISTORYONEalpha"
+      ],
+      [
+        "─── History 2/6 ────",
+        "HISTORYTWObravo"
+      ],
+      [
+        "─── History 3/6 ────",
+        "HISTORYTHREEcharlie"
+      ],
+      [
+        "─── History 4/6 ────",
+        "HISTORYFOURdelta"
+      ],
+      [
+        "─── History 5/6 ────",
+        "HISTORYFIVEecho"
+      ],
+      [
+        "─── History 6/6 ────",
+        "HISTORYSIXfoxtrot"
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ],
+      [
+        "────────────────────",
+        ""
+      ]
+    ]
+  },
+  "load": [
+    [
+      2.83984375,
+      4.54150390625,
+      8.7783203125
+    ],
+    "some avg10=0.85 avg60=0.70 avg300=2.30 total=204854419446",
+    [
+      2.6845703125,
+      4.3447265625,
+      8.5771484375
+    ],
+    "some avg10=1.09 avg60=0.80 avg300=2.16 total=204854914162"
+  ]
+}

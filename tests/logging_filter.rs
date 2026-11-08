@@ -153,3 +153,32 @@ fn logging_filter_explicit_crate_directive_can_quiet_the_crate() {
     );
     assert!(out.contains("crate-warn-line"), "got:\n{out}");
 }
+
+/// PRD #1666 part 3, round 5-wake: the doorbell, release-capture and
+/// input-mode lines the troubleshooting page points at land in the default
+/// log, and their debug lines stay out of it.
+#[test]
+fn logging_filter_default_keeps_the_doorbells_own_targets_at_info() {
+    let buf = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_env_filter(env_filter(None))
+        .with_writer(CaptureWriter(Arc::clone(&buf)))
+        .with_ansi(false)
+        .without_time()
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tracing::info!(target: "doorbell", "info-line-doorbell");
+        tracing::info!(target: "pane_release", "info-line-pane_release");
+        tracing::info!(target: "pane_input_mode", "info-line-pane_input_mode");
+        tracing::debug!(target: "doorbell", "debug-line-doorbell");
+        tracing::debug!(target: "pane_release", "debug-line-pane_release");
+    });
+    let out = String::from_utf8(buf.lock().unwrap().clone()).unwrap();
+    for target in ["doorbell", "pane_release", "pane_input_mode"] {
+        assert!(
+            out.contains(&format!("info-line-{target}")),
+            "{target}: {out}"
+        );
+    }
+    assert!(!out.contains("debug-line"), "{out}");
+}
