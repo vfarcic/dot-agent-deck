@@ -14,6 +14,7 @@ This repository can use [RWX](https://www.rwx.com) in two places, each behind it
 | job | pull request, `ci-backend=rwx` | pull request, `ci-backend=gha` | push to `main` |
 | --- | --- | --- | --- |
 | every Linux job in `ci.yml` (`fmt`, `clippy`, `build-release`, `test`, `e2e-build`, the `e2e` shards, `desktop-web`, `desktop-browser`, `desktop-driver`, `windows-cross-check`, `security`, `nix`, `devbox`) and `aarch64-crossbuild-check.yml` | RWX | GitHub Actions | GitHub Actions |
+| `release-lib` in `ci.yml` (advisory) | RWX, as `.rwx/release-lib.yml` (status `RWX: release-lib`) | GitHub Actions | GitHub Actions |
 | `cross-version` | GitHub Actions | GitHub Actions | GitHub Actions |
 | `build-macos` | not run | not run | GitHub Actions |
 | `build-windows` | `if: false` until Windows ships | | |
@@ -22,6 +23,7 @@ This repository can use [RWX](https://www.rwx.com) in two places, each behind it
 The exceptions, and why:
 
 - **`cross-version` stays on GitHub Actions.** Its harness contains the builds in unprivileged bubblewrap namespaces, and inside an RWX task bwrap cannot set up the network namespace (measured 2026-10-22: `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
+- **`release-lib` moves to a run definition of its own, `.rwx/release-lib.yml`.** RWX reports one status per run and any failing task fails it, so a task in `.rwx/ci.yml` would be part of the required `RWX: linux`; the job is advisory ([release-lib-tier.md](release-lib-tier.md)).
 - **`docs.yml` stays.** `docs-preview.yml` deploys the preview from its uploaded artifact through `workflow_run`, which only a GitHub Actions run can feed.
 - **`build-macos` runs on `main`, not on pull requests.** RWX has no macOS runners, and on a pull request it was the slowest required check (5 to 18 minutes) for a 3% rate of macOS-only failures (545 runs, 2026-10-06 to 10-21). A macOS-only defect now surfaces on `main`: whoever merged watches that run and owns a red (the `merge-pr` skill), `notify-main-red` opens an issue, and `tag-release.yml` refuses to release a `main` whose run is not green.
 

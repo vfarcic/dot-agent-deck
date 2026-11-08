@@ -1053,7 +1053,62 @@ jobs:
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
 
-  # The required `build` context: green only when every part above is. A part
+  # Issue #2134 — the deck's unit tests built with `--release`
+  # (scripts/test-release-lib.sh), so a test or a code path that holds only in
+  # a debug build is found here rather than in a shipped release. Every other
+  # test job builds the dev profile.
+  #
+  # ADVISORY: outside `build`'s `needs:` and outside the ruleset, as
+  # `desktop-browser` and `cross-version` are, until a run history shows it
+  # stable; requiring it is a `REQUIRED_CHECKS` change made with
+  # `scripts/apply-branch-protection.sh`, not something a PR does. On `main` a
+  # red here still turns the run red, which `tag-release.yml` refuses to
+  # release, so `notify-main-red` lists it. With `.github/ci-backend` at `rwx` a
+  # pull request runs it as `.rwx/release-lib.yml` instead, a run of its own
+  # because a task in `.rwx/ci.yml` would be part of the required `RWX: linux`.
+  # docs/develop/release-lib-tier.md has the rest.
+  release-lib:
+    needs: changes
+    if: needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && needs.changes.outputs.linux_backend != 'rwx'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      # The Pi extension's Node suites in the lib tier, as in `test`.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: 26
+      # The desktop crate's Linux build deps — the comment on `clippy`'s copy of
+      # this step has why, and where else the same set is declared.
+      - run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev
+      - run: scripts/test-release-lib.sh
+      - name: Preserve this attempt's test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: nextest-release-lib-attempt-${{ github.run_attempt }}
+          path: target/nextest/default/junit.xml
+          if-no-files-found: warn
+
+  # The required `build` context: green only when every part in its `needs:`
+  # is (not `release-lib`, which is advisory). A part
   # skipped by the `changes` gate leaves this skipped too, which the ruleset
   # counts as passing, exactly as it counted the single job before the split.
   build:
@@ -2089,6 +2144,7 @@ jobs:
       - clippy
       - build-release
       - test
+      - release-lib
       - build
       - e2e-build
       - e2e
