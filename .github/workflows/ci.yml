@@ -1089,7 +1089,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: false
-      - uses: taiki-e/install-action@3a3daafd3b7f23b8f65d9f5ba2db203fb59b79e2 # v2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
           tool: cargo-nextest@0.9.146
       # The Pi extension's Node suites in the lib tier, as in `test`.
@@ -2084,7 +2084,7 @@ jobs:
       # `devbox` job stops the lane that produced #648 from merging itself.
       - name: Toolchain pins in devbox.json and the workflows agree
         run: scripts/check-pin-lockstep.sh
-      - uses: jetify-com/devbox-install-action@8c6a66ed6273138b1915457069de78cb52fe3bd7 # v0.15.0
+      - uses: jetify-com/devbox-install-action@05e954310554b6122a26b4880d69937f61b1eb2e # v0.16.0
         with:
           # Caches the whole Nix store keyed on devbox.json. Worth it: the
           # `path:gcloud#google-cloud-sdk` flake pulls nixpkgs-unstable and
