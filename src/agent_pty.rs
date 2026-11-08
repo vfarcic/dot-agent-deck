@@ -32079,12 +32079,14 @@ mod spawn_tests {
     ///
     /// Issue #2170: the reader's end is the PTY's EOF, and a child closes its
     /// terminal before it exits, so reaching the hold says nothing about the
-    /// exit. A removal keeps only the status of a child that had exited by
-    /// then; past that, the status is the remover's own reap, which the
-    /// callers hold. So this waits for the exit itself, read through the
-    /// registry while it still holds the record. The agent closes its
-    /// terminal well before it exits, so a caller that removed it on the EOF
-    /// alone would fail on every run, not on one in a few hundred under load.
+    /// exit. The callers hold the remover before its reap, so the code they
+    /// assert can only be the one the removal kept, and a removal keeps the
+    /// status of a child that had exited by then. So this waits for the exit
+    /// itself, read through the registry while it still holds the record:
+    /// the callers cover a child that exited before its removal, not one
+    /// removed between its EOF and its exit. The agent closes its terminal
+    /// well before it exits, so a caller that removed it on the EOF alone
+    /// would fail on every run, not on one in a few hundred under load.
     async fn natural_exit_held_before_telemetry(
         registry: &Arc<AgentPtyRegistry>,
         pane: &str,
