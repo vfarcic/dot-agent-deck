@@ -252,29 +252,22 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(opencode_auto_submits_daemon_injected_prompt)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
-# Eighteen sequential menu recordings (two pinned releases; three dark sizes,
-# indexed light and five 50x200 palettes) took about 160s for the eight
-# size/theme recordings and 210s for the ten palette recordings, run apart.
-# A third release (2.1.317, 2026-11-03) makes twenty-seven, about 560s at
-# that rate, so the window is 900s.
+# The installed release's nine menu recordings (three dark sizes, indexed
+# light and five 50x200 palettes), about 190s when one release's set was
+# recorded on its own (2.1.318, 2026-11-04), and the history-recall
+# acquisition: two recordings (50x200 and 24x80), about 90s at the 178s four
+# took on 2026-11-04. The menu set is past the 180s default, so each gets
+# 480s.
 [[profile.default.overrides]]
-filter = 'test(doorbell_036_live_release_menu_frames)'
-slow-timeout = { period = "60s", terminate-after = 15 }
-
-# One release's nine menu recordings on its own (2.1.318, 2026-11-04), about
-# 190s at the rate above, and the history-recall acquisition: four recordings
-# (2.1.317 and 2.1.318 at 50x200 and 24x80), 178s in the run that recorded
-# its fixtures. Both are past the 180s default, so each gets 480s.
-[[profile.default.overrides]]
-filter = 'test(doorbell_036_live_release_318_menu_frames) | test(doorbell_036_live_release_history_recall_frames)'
+filter = 'test(doorbell_036_live_release_menu_frames) | test(doorbell_036_live_release_history_recall_frames)'
 slow-timeout = { period = "60s", terminate-after = 8 }
 
-# Q143b (2026-11-04): each `doorbell_036_live_release_31[78]_history_submit_*`
-# test takes twenty recordings (five trials at each of two sizes, with one
-# and with four Ctrl+U presses), each a history-recall walk of about 45s at
-# the history acquisition's rate above, so about 900s; each gets 1800s.
+# Q143b (2026-11-04): each `doorbell_036_live_release_history_submit_*` test
+# takes twenty recordings (five trials at each of two sizes, with one and
+# with four Ctrl+U presses), each a history-recall walk of about 45s at the
+# history acquisition's rate above, so about 900s; each gets 1800s.
 [[profile.default.overrides]]
-filter = 'test(/^doorbell_036_live_release_31[78]_history_submit_/)'
+filter = 'test(/^doorbell_036_live_release_history_submit_/)'
 slow-timeout = { period = "60s", terminate-after = 30 }
 
 # Q147b (2026-11-04): `doorbell_010_live_ctrl_c_during_a_check_leaves_claude_running`
@@ -828,17 +821,17 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 filter = 'test(probe_083_claude_idle_screen_freshness_refusal_rate)'
 slow-timeout = { period = "60s", terminate-after = 14 }
 
-# PRD #1666 part 3, activation: the editor-probe measurements of a pinned
-# Claude Code release (`tests/e2e_claude_editor_measure.rs`, lane 2). The
+# PRD #1666 part 3, activation: the editor-probe measurements of the
+# installed Claude Code (`tests/e2e_claude_editor_measure.rs`, lane 2). The
 # ten-minute keymap sample and the wire-form catalog (six states, twelve
 # forms, whole and split, plus paste cells) are the long ones; the rest
 # launch Claude a few times each.
 [[profile.default.overrides]]
-filter = 'test(/^probe_088_live_claude_31[78]_/)'
+filter = 'test(/^probe_088_live_claude_/)'
 slow-timeout = { period = "60s", terminate-after = 16 }
 
 [[profile.default.overrides]]
-filter = 'test(/^probe_089_live_claude_31[78]_ctrl_g_forms$/)'
+filter = 'test(/^probe_089_live_claude_ctrl_g_forms$/)'
 slow-timeout = { period = "60s", terminate-after = 28 }
 
 # PRD #1666 part 3, U4: Codex 0.164.0's editor-probe, E1F and M58r
@@ -855,18 +848,19 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 filter = 'test(/^probe_095_live_codex_164_/)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
-# PRD #1666 part 3, Codex Go: Codex 0.164.0's `head_echo`
-# (`tests/e2e_codex_release_measure.rs`, lane 2). Each run is one harness deck
+# PRD #1666 part 3, Codex Go: the installed Codex's `head_echo`
+# (`tests/e2e_codex_release_measure.rs`, lane 2; measured on 0.164.0 at the
+# rate below). Each run is one harness deck
 # (300 s cap) whose recorder waits at most 280 s; five staged rings with their
 # real model turns measured at about 100–200 s.
 [[profile.default.overrides]]
-filter = 'test(/^doorbell_036_live_codex_164_head_echo_/)'
+filter = 'test(/^doorbell_036_live_codex_head_echo_/)'
 slow-timeout = { period = "60s", terminate-after = 6 }
 
 # M59 (`tests/e2e_claude_helper_alarm.rs`, lane 2): ten Ctrl+G trials per
 # cell on a real Claude Code, the unarmed cell's editor sleeping 8 s each.
 [[profile.default.overrides]]
-filter = 'test(/^probe_090_live_claude_31[78]_/)'
+filter = 'test(/^probe_090_live_claude_/)'
 slow-timeout = { period = "60s", terminate-after = 9 }
 
 # PRD #1666 part 3, Q35-28's lane-2 gates on a real installed Claude Code

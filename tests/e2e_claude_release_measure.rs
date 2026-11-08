@@ -1,13 +1,22 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
-//! Exact-release M1/Q32 measurements, inside the disposable TUI harness.
+//! M1/Q32 measurements of the installed Claude Code, inside the disposable
+//! TUI harness. Each test runs whichever `claude` the harness's `PATH`
+//! resolves (issue #2146) and asserts the facts the doorbell's one set of
+//! Claude Code facts relies on; the captures recorded on 2.1.310, 2.1.312,
+//! 2.1.317 and 2.1.318 stay committed under `tests/fixtures/claude-inbox/`
+//! and replayed in the fast tier (`tests/doorbell_screen_profiles.rs`), with
+//! what holds only for those releases (executable hashes, exact palettes).
 mod common;
+#[path = "support/installed_agent.rs"]
+mod installed;
 
 use dot_agent_deck::doorbell_screen::{
     CLAUDE_PROFILE, ComposerText, Grid, WidthsSeen, find_marker,
 };
 use dot_agent_deck::event::AgentType;
 use dot_agent_deck::release_scanner::{HEADER_RECOGNISERS, ReleaseScanner, ScanLatch};
+use installed::Installed;
 use serde_json::Value;
 use spec::spec;
 use std::path::PathBuf;
@@ -15,7 +24,7 @@ use std::time::Duration;
 
 struct Capture {
     root: PathBuf,
-    /// The release the recorder read from the pinned executable.
+    /// The release the recorder read from the executable it ran.
     release: String,
     index: Value,
     result: Value,
@@ -260,8 +269,8 @@ impl Capture {
     }
 }
 
-fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Capture {
-    record(None, kind, rows, cols, &[], path)
+fn measure(claude: &Installed, kind: &str, rows: u16, cols: u16) -> Capture {
+    record(claude, None, kind, rows, cols, &[])
 }
 
 /// Runs a recorder in the private TUI harness. The committed release
@@ -269,12 +278,12 @@ fn measure_with_path(kind: &str, rows: u16, cols: u16, path: Option<&str>) -> Ca
 /// further recorder (its file name and source) that imports it and is the
 /// one run, with `extra` after the usual `kind out rows cols` arguments.
 fn record(
+    claude: &Installed,
     entry: Option<(&str, &str)>,
     kind: &str,
     rows: u16,
     cols: u16,
     extra: &[String],
-    path: Option<&str>,
 ) -> Capture {
     let root = tempfile::Builder::new()
         .prefix("dad-claude-release-measure-")
@@ -298,11 +307,8 @@ fn record(
         command.push(' ');
         command.push_str(&quote(argument));
     }
-    let mut builder = common::TuiDeck::builder();
-    if let Some(path) = path {
-        builder = builder.with_env("PATH", path);
-    }
-    let deck = builder
+    let deck = common::TuiDeck::builder()
+        .with_env("PATH", claude.path.clone())
         .with_env(
             "PYTHONPATH",
             std::env::var("PYTHONPATH").unwrap_or_default(),
@@ -345,6 +351,12 @@ fn record(
         result["error"],
         output.display()
     );
+    assert_eq!(
+        result["release"],
+        claude.release.as_str(),
+        "the recorder ran another Claude Code than the installed one selected; {}",
+        output.display()
+    );
     let capture = Capture {
         release: result["release"].as_str().unwrap().to_string(),
         index: read_json("index.json"),
@@ -384,127 +396,85 @@ fn assert_empty_menu_composer(capture: &Capture) {
     assert_eq!(screen.cursor_position(), (prompt, 2));
 }
 
-/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.310, 2.1.312 and 2.1.317 composers at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and indexed dark-ansi/light-ansi/dark-daltonized themes. Capture their raw bytes and rendered frames, including a normal composer with warning phrases quoted in a real user transcript echo whose submission is blocked before a model turn.
+/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated composers of the installed real Claude Code at 24×80, 40×120 and 50×200 in the indexed dark theme, at 50×200 in the indexed light theme, and at 50×200 in truecolor dark/light and indexed dark-ansi/light-ansi/dark-daltonized themes, with a normal composer whose user transcript quotes the warning phrases (its submission blocked before a model turn). Every set must draw the main composer's prompt in the default colour under a coloured rule and the overview's rule in the default colour over a coloured prompt, and the screen profile must find the empty and the quoting composers ready and refuse every other surface.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_menu_frames() {
     skip_unless!(common::check_claude_available());
-    for release in ["2.1.310", "2.1.312", "2.1.317"] {
-        menu_frames(release);
-    }
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
+    };
+    menu_frames(&claude);
 }
 
-/// Scenario: Open the slash menu, file menu, shell mode, exit warning and background overview in isolated real Claude Code 2.1.318 composers, the release installed on 2026-11-04, at the nine sizes and palettes 2.1.310, 2.1.312 and 2.1.317 were recorded at. Each set must draw the same rule, shell and overview foregrounds and the same screen signatures as those releases, with its one submission blocked before a model turn.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_menu_frames() {
-    skip_unless!(common::check_claude_available());
-    menu_frames("2.1.318");
-}
+/// The installed release's nine menu size/palette recordings. Each is
+/// checked for the structure the profile reads and for the profile's own
+/// verdicts; the exact foregrounds measured on the recorded releases are
+/// printed here and pinned on the committed captures by
+/// `doorbell_036_committed_claude_menu_captures_draw_the_recorded_palettes`.
+fn menu_frames(claude: &Installed) {
+    use vt100::Color;
 
-/// One release's nine menu size/palette recordings, each checked against the
-/// foregrounds and screen signatures measured on 2.1.310 and 2.1.312.
-fn menu_frames(release: &str) {
-    use vt100::Color::{self, Idx, Rgb};
-
-    let (_root, path) = pinned_path(release).unwrap_or_else(|| {
-        panic!(
-            "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
-            release.replace('.', "_")
-        )
-    });
-    // Measured foregrounds: the main composer's upper rule, the shell
-    // glyph and the overview's own prompt glyph.
-    let indexed_dark = (Idx(244), Idx(211), Idx(246));
-    for (kind, rows, cols, theme, colorterm, (rule, shell, overview)) in [
-        ("menus", 24, 80, "dark", None, indexed_dark),
-        ("menus", 40, 120, "dark", None, indexed_dark),
-        ("menus", 50, 200, "dark", None, indexed_dark),
-        (
-            "menus-light",
-            50,
-            200,
-            "light",
-            None,
-            (Idx(245), Idx(199), Idx(241)),
-        ),
-        (
-            "menus-truecolor-dark",
-            50,
-            200,
-            "dark",
-            Some("truecolor"),
-            (Rgb(136, 136, 136), Rgb(253, 93, 177), Rgb(153, 153, 153)),
-        ),
-        (
-            "menus-truecolor-light",
-            50,
-            200,
-            "light",
-            Some("truecolor"),
-            (Rgb(138, 138, 138), Rgb(255, 0, 135), Rgb(102, 102, 102)),
-        ),
-        (
-            "menus-dark-ansi",
-            50,
-            200,
-            "dark-ansi",
-            None,
-            (Idx(7), Idx(13), Idx(7)),
-        ),
-        (
-            "menus-light-ansi",
-            50,
-            200,
-            "light-ansi",
-            None,
-            (Idx(7), Idx(5), Idx(8)),
-        ),
-        (
-            "menus-dark-daltonized",
-            50,
-            200,
-            "dark-daltonized",
-            None,
-            (Idx(244), Idx(75), Idx(246)),
-        ),
+    let release = claude.release.as_str();
+    preflight();
+    for (kind, rows, cols, theme, colorterm) in [
+        ("menus", 24, 80, "dark", None),
+        ("menus", 40, 120, "dark", None),
+        ("menus", 50, 200, "dark", None),
+        ("menus-light", 50, 200, "light", None),
+        ("menus-truecolor-dark", 50, 200, "dark", Some("truecolor")),
+        ("menus-truecolor-light", 50, 200, "light", Some("truecolor")),
+        ("menus-dark-ansi", 50, 200, "dark-ansi", None),
+        ("menus-light-ansi", 50, 200, "light-ansi", None),
+        ("menus-dark-daltonized", 50, 200, "dark-daltonized", None),
     ] {
-        let capture = measure_with_path(kind, rows, cols, Some(&path));
+        let capture = measure(claude, kind, rows, cols);
         eprintln!(
             "{release} {kind} {rows}x{cols} capture: {}",
             capture.root.display()
         );
-        assert_eq!(capture.result["release"], release);
         assert_eq!(capture.result["theme"], theme);
         assert_eq!(capture.result["colorterm"], serde_json::json!(colorterm));
-        let foreground = |point: &str, row| {
-            capture
-                .parser(capture.point(point))
-                .screen()
-                .cell(row, 0)
-                .unwrap()
-                .fgcolor()
+        // The last row starting with `glyph` at `point`, and the foregrounds
+        // of that glyph and of the cell above it.
+        let drawn = |point: &str, glyph: &str| {
+            let parser = capture.parser(capture.point(point));
+            let screen = parser.screen();
+            let row = (1..rows)
+                .rev()
+                .find(|&row| screen.cell(row, 0).unwrap().contents() == glyph)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{kind} {point}: no row starts with {glyph:?}; {}",
+                        capture.root.display()
+                    )
+                });
+            (
+                screen.cell(row - 1, 0).unwrap().fgcolor(),
+                screen.cell(row, 0).unwrap().fgcolor(),
+            )
         };
-        assert_eq!(foreground("empty", rows - 4), rule, "{kind} main rule");
-        assert_eq!(foreground("bang", rows - 3), shell, "{kind} shell glyph");
-        assert_eq!(
-            foreground("overview", rows - 3),
-            overview,
-            "{kind} overview glyph"
+        let (rule, prompt) = drawn("empty", "❯");
+        let (overview_rule, overview_prompt) = drawn("overview", "❯");
+        // Printed only: the profile does not read the shell glyph's colour.
+        let shell = {
+            let parser = capture.parser(capture.point("bang"));
+            let screen = parser.screen();
+            (1..rows)
+                .rev()
+                .find(|&row| screen.cell(row, 0).unwrap().contents() == "!")
+                .map(|row| screen.cell(row, 0).unwrap().fgcolor())
+        };
+        eprintln!(
+            "{release} {kind} palette: main rule {rule:?}, main prompt {prompt:?}, shell glyph {shell:?}, overview rule {overview_rule:?}, overview prompt {overview_prompt:?}"
         );
-        // The structural premise the recogniser reads, beyond the palette:
-        // the main composer has a coloured rule and a Default prompt, the
-        // overview a Default rule and a coloured prompt.
-        assert_eq!(
-            foreground("empty", rows - 3),
-            Color::Default,
-            "{kind} main prompt"
-        );
-        assert_eq!(
-            foreground("overview", rows - 4),
-            Color::Default,
-            "{kind} overview rule"
-        );
+        // The structure the recogniser reads: the main composer has a
+        // coloured rule and a Default prompt, the overview a Default rule
+        // and a coloured prompt (`src/doorbell_screen.rs`).
+        assert_ne!(rule, Color::Default, "{kind} main rule");
+        assert_eq!(prompt, Color::Default, "{kind} main prompt");
+        assert_eq!(overview_rule, Color::Default, "{kind} overview rule");
+        assert_ne!(overview_prompt, Color::Default, "{kind} overview prompt");
         assert_empty_menu_composer(&capture);
         assert!(
             capture
@@ -540,6 +510,39 @@ fn menu_frames(release: &str) {
                 "{release} {point}: missing real screen signature {signature:?}"
             );
         }
+        // The profile's verdict on each surface, the one the fast replay
+        // (`doorbell_036_claude_composer_over_real_frames`) checks on the
+        // recorded releases: the empty composer and the one under the
+        // transcript quotation ready and empty, every other surface neither.
+        let mut wrong_surfaces = Vec::new();
+        for (point, expected) in [
+            ("empty", true),
+            ("transcript-quotation", true),
+            ("overview", false),
+            ("slash", false),
+            ("at", false),
+            ("bang", false),
+            ("exit-warning", false),
+        ] {
+            let grid = capture.grid(point);
+            let ready = (CLAUDE_PROFILE.ready)(&grid);
+            let empty_and_ready = CLAUDE_PROFILE.empty_and_ready(&grid);
+            if ready != expected || empty_and_ready != expected {
+                wrong_surfaces.push(format!(
+                    "{point}: {}: ready={ready}, empty_and_ready={empty_and_ready}, expected {expected}",
+                    if expected {
+                        "wrong refusal (availability)"
+                    } else {
+                        "wrong acceptance (safety)"
+                    }
+                ));
+            }
+        }
+        assert!(
+            wrong_surfaces.is_empty(),
+            "{release} {kind} {rows}x{cols}: the profile must recognise the main composer and refuse other input surfaces: {wrong_surfaces:?}; {}",
+            capture.root.display()
+        );
         let mut rendered = String::new();
         for point in [
             "empty",
@@ -583,36 +586,7 @@ fn menu_frames(release: &str) {
     }
 }
 
-/// A private executable search path whose `claude` is the pinned executable
-/// `DOT_AGENT_DECK_CLAUDE_MENU_<release>` names, outside the checkout. The
-/// directory lives as long as the returned guard.
-fn pinned_path(release: &str) -> Option<(tempfile::TempDir, String)> {
-    let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
-    let binary = std::env::var(&key).ok()?;
-    let root = tempfile::Builder::new()
-        .prefix("dad-claude-menu-bin-")
-        .tempdir_in("/var/tmp")
-        .unwrap();
-    std::os::unix::fs::symlink(&binary, root.path().join("claude")).unwrap();
-    let path = format!(
-        "{}:{}",
-        root.path().display(),
-        std::env::var("PATH").unwrap()
-    );
-    Some((root, path))
-}
-
-/// The search path a release's measurement runs under: the pinned executable
-/// when its variable is set, else the host's `claude`, whose version
-/// [`preflight`] then checks.
-fn release_path(release: &str) -> (Option<tempfile::TempDir>, Option<String>) {
-    match pinned_path(release) {
-        Some((root, path)) => (Some(root), Some(path)),
-        None => (None, None),
-    }
-}
-
-fn preflight(release: &str, path: Option<&str>) {
+fn preflight() {
     let python = std::process::Command::new("python3")
         .args(["-c", "import pyte"])
         .output()
@@ -621,25 +595,16 @@ fn preflight(release: &str, path: Option<&str>) {
         python.status.success(),
         "the measurement controller requires Python pyte"
     );
-    let mut command = std::process::Command::new("claude");
-    if let Some(path) = path {
-        command.env("PATH", path);
-    }
-    let version = command.arg("--version").output().unwrap();
-    assert!(version.status.success());
-    assert!(
-        String::from_utf8_lossy(&version.stdout).starts_with(&format!("{release} ")),
-        "this measurement requires the pinned Claude Code {release} executable: set \
-         DOT_AGENT_DECK_CLAUDE_MENU_{} or put it first on PATH",
-        release.replace('.', "_")
-    );
 }
 
-fn startups(release: &str, count: usize) {
-    let (_root, path) = release_path(release);
-    preflight(release, path.as_deref());
+fn startups(count: usize) {
+    skip_unless!(common::check_claude_available());
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
+    };
+    preflight();
     for _ in 0..count {
-        let capture = measure_with_path("startup", 50, 200, path.as_deref());
+        let capture = measure(&claude, "startup", 50, 200);
         capture.verify_start();
         assert!(CLAUDE_PROFILE.empty_and_ready(&capture.grid("end")));
         for sample in 0..200 {
@@ -650,160 +615,64 @@ fn startups(release: &str, count: usize) {
     }
 }
 
-fn composer(release: &str, rows: u16, cols: u16) {
-    let (_root, path) = release_path(release);
-    preflight(release, path.as_deref());
-    measure_with_path("composer", rows, cols, path.as_deref()).verify_composer();
+fn composer(rows: u16, cols: u16) {
+    skip_unless!(common::check_claude_available());
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
+    };
+    preflight();
+    measure(&claude, "composer", rows, cols).verify_composer();
 }
 
-/// Scenario: Launch four isolated real Haiku composers on pinned Claude Code 2.1.312, leaving each idle for twenty seconds. Each must retain the measured ready composer, raw input mode and recognisable release header without a post-ready dialog.
+/// Scenario: Launch four isolated real Haiku composers on the installed Claude Code, leaving each idle for twenty seconds. Each must show the ready composer, raw input mode and the release header of the release `claude --version` reports, with no dialog after it is ready.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_startup_first_four() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.312", 4);
+    startups(4);
 }
 
-/// Scenario: Launch three further isolated real Haiku composers on pinned Claude Code 2.1.312 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
+/// Scenario: Launch three further isolated real Haiku composers on the installed Claude Code and observe each for twenty seconds. The profile must still read the ready composer and the release.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_startup_next_three() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.312", 3);
+    startups(3);
 }
 
-/// Scenario: Launch the last three of ten isolated real Haiku composers on pinned Claude Code 2.1.312 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
+/// Scenario: Launch the last three of ten isolated real Haiku composers on the installed Claude Code and observe each for twenty seconds. The profile must still read the ready composer and the release.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_startup_last_three() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.312", 3);
+    startups(3);
 }
 
-/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes, transcript user echoes, and the blank composer after clears and deletes.
+/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on the installed Claude Code at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes within the deck's waits, transcript user echoes, every blocked prompt's restore within the bound, and the blank composer after clears and deletes.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_small_composer() {
-    skip_unless!(common::check_claude_available());
-    composer("2.1.312", 24, 80);
+    composer(24, 80);
 }
 
-/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
+/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on the installed Claude Code at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_large_composer_and_layout() {
-    skip_unless!(common::check_claude_available());
-    composer("2.1.312", 50, 200);
+    composer(50, 200);
 }
 
-/// Scenario: Launch four isolated real Haiku composers on pinned Claude Code 2.1.317, the release installed on 2026-11-03, leaving each idle for twenty seconds. Each must show the measured ready composer, raw input mode and its own release header, with no dialog after it is ready.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_317_startup_first_four() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.317", 4);
-}
-
-/// Scenario: Launch three further isolated real Haiku composers on pinned Claude Code 2.1.317 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_317_startup_next_three() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.317", 3);
-}
-
-/// Scenario: Launch the last three of ten isolated real Haiku composers on pinned Claude Code 2.1.317 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_317_startup_last_three() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.317", 3);
-}
-
-/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.317 at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes, transcript user echoes, and the blank composer after clears and deletes.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_317_small_composer() {
-    skip_unless!(common::check_claude_available());
-    composer("2.1.317", 24, 80);
-}
-
-/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.317 at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_317_large_composer_and_layout() {
-    skip_unless!(common::check_claude_available());
-    composer("2.1.317", 50, 200);
-}
-
-/// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on pinned Claude Code 2.1.312, revealing retained text with harmless markers instead of submitting it. The reviewer's sequence must retain two spaces, Enter after non-ASCII deletion must preserve the two-space draft, and three spaces must remain after Left three times.
+/// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on the installed Claude Code, revealing retained text with harmless markers instead of submitting it. Every sequence must leave the composer the recorded releases left, including two spaces after the reviewer's sequence, the two-space draft after Enter following a non-ASCII deletion, and three spaces after Left three times.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_compound_keys() {
     skip_unless!(common::check_claude_available());
-    compound_keys("2.1.312");
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
+    };
+    compound_keys(&claude);
 }
 
-/// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on pinned Claude Code 2.1.317, revealing retained text with harmless markers instead of submitting it. Every sequence must leave the composer 2.1.312 left, including two spaces after the reviewer's sequence, the two-space draft after Enter following a non-ASCII deletion, and three spaces after Left three times.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_317_compound_keys() {
-    skip_unless!(common::check_claude_available());
-    compound_keys("2.1.317");
-}
-
-/// Scenario: Launch four isolated real Haiku composers on pinned Claude Code 2.1.318, the release installed on 2026-11-04, leaving each idle for twenty seconds. Each must show the measured ready composer, raw input mode and its own release header, with no dialog after it is ready.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_startup_first_four() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.318", 4);
-}
-
-/// Scenario: Launch three further isolated real Haiku composers on pinned Claude Code 2.1.318 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_startup_next_three() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.318", 3);
-}
-
-/// Scenario: Launch the last three of ten isolated real Haiku composers on pinned Claude Code 2.1.318 and observe each for twenty seconds. The recorded profile must still read the ready composer and release.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_startup_last_three() {
-    skip_unless!(common::check_claude_available());
-    startups("2.1.318", 3);
-}
-
-/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.318 at 24 by 80, blocking every submission before a model turn. Replay the raw capture to verify exact composer and hook echoes, transcript user echoes, every blocked prompt's restore within the bound, and the blank composer after clears and deletes.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_small_composer() {
-    skip_unless!(common::check_claude_available());
-    composer("2.1.318", 24, 80);
-}
-
-/// Scenario: Type and submit fifteen token-led doorbell lines into real Haiku on pinned Claude Code 2.1.318 at 50 by 200 with model turns blocked, then delete three lines, resize ten times and nudge ten times. Replay the capture to verify the same composer and hook premises, full redraw markers and width witnesses.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_large_composer_and_layout() {
-    skip_unless!(common::check_claude_available());
-    composer("2.1.318", 50, 200);
-}
-
-/// Scenario: Type the nineteen Q32 compound-key sequences into real Haiku on pinned Claude Code 2.1.318, revealing retained text with harmless markers instead of submitting it. Every sequence must leave the composer 2.1.312 left, including two spaces after the reviewer's sequence, the two-space draft after Enter following a non-ASCII deletion, and three spaces after Left three times.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_compound_keys() {
-    skip_unless!(common::check_claude_available());
-    compound_keys("2.1.318");
-}
-
-fn compound_keys(release: &str) {
-    let (_root, path) = release_path(release);
-    preflight(release, path.as_deref());
-    let capture = measure_with_path("keys", 50, 200, path.as_deref());
+fn compound_keys(claude: &Installed) {
+    preflight();
+    let capture = measure(claude, "keys", 50, 200);
     capture.verify_start();
     let expected = [
         "X  Z|",
@@ -845,65 +714,60 @@ fn compound_keys(release: &str) {
     assert_eq!(capture.result["keys"][20]["composer"], "X   Z");
 }
 
-/// Scenario: In isolated real Haiku composers on pinned Claude Code 2.1.317 and 2.1.318, at 50×200 and 24×80, seed six prompts from an earlier session in the disposable HOME's history, submit one line (blocked by the hook before a model turn) and clear it, then walk the prompt history with Up and Down from the empty composer, leave a recalled prompt with Escape, Ctrl+U, Ctrl+C and Enter (blocked again) in turn, and press Up over a typed draft. Every frame is rendered with what the screen profile reads in it, so the history-recall surface can be judged against the profile.
+/// Scenario: In isolated real Haiku composers on the installed Claude Code, at 50×200 and 24×80, seed six prompts from an earlier session in the disposable HOME's history, submit one line (blocked by the hook before a model turn) and clear it, then walk the prompt history with Up and Down from the empty composer, leave a recalled prompt with Escape, Ctrl+U, Ctrl+C and Enter (blocked again) in turn, and press Up over a typed draft. Every frame is rendered with what the screen profile reads in it, and the profile must read no composer in any frame whose upper rule carries `History `.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_live_release_history_recall_frames() {
     skip_unless!(common::check_claude_available());
-    for release in ["2.1.317", "2.1.318"] {
-        let (_root, path) = pinned_path(release).unwrap_or_else(|| {
-            panic!(
-                "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
-                release.replace('.', "_")
-            )
-        });
-        preflight(release, Some(&path));
-        for (rows, cols) in [(50, 200), (24, 80)] {
-            let capture = measure_with_path("history", rows, cols, Some(&path));
-            assert_eq!(capture.result["release"], release);
-            let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
-            assert_eq!(
-                hooks.lines().count(),
-                2,
-                "two blocked submissions; no model turn; {}",
-                capture.root.display()
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
+    };
+    let release = claude.release.as_str();
+    preflight();
+    for (rows, cols) in [(50, 200), (24, 80)] {
+        let capture = measure(&claude, "history", rows, cols);
+        let hooks = std::fs::read_to_string(capture.root.join("hook.jsonl")).unwrap();
+        assert_eq!(
+            hooks.lines().count(),
+            2,
+            "two blocked submissions; no model turn; {}",
+            capture.root.display()
+        );
+        let mut rendered = String::new();
+        let mut points: Vec<(&String, usize)> = capture.index["points"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| !name.starts_with("mark:"))
+            .map(|(name, at)| (name, at.as_u64().unwrap() as usize))
+            .collect();
+        points.sort_by_key(|&(_, at)| at);
+        for (name, at) in points {
+            let parser = capture.parser(at);
+            let grid = Grid::of(parser.screen(), at as u64);
+            let composer = (CLAUDE_PROFILE.composer)(&grid);
+            let verdict = format!(
+                "{release} {rows}x{cols} {name}@{at}: composer={:?} ready={} empty_and_ready={} dialog={:?}",
+                composer
+                    .as_ref()
+                    .map(|c| (&c.text, c.cursor_at_end, c.hidden)),
+                (CLAUDE_PROFILE.ready)(&grid),
+                CLAUDE_PROFILE.empty_and_ready(&grid),
+                (CLAUDE_PROFILE.dialog)(&grid)
             );
-            let mut rendered = String::new();
-            let mut points: Vec<(&String, usize)> = capture.index["points"]
-                .as_object()
-                .unwrap()
-                .iter()
-                .filter(|(name, _)| !name.starts_with("mark:"))
-                .map(|(name, at)| (name, at.as_u64().unwrap() as usize))
-                .collect();
-            points.sort_by_key(|&(_, at)| at);
-            for (name, at) in points {
-                let parser = capture.parser(at);
-                let grid = Grid::of(parser.screen(), at as u64);
-                let composer = (CLAUDE_PROFILE.composer)(&grid);
-                let verdict = format!(
-                    "{release} {rows}x{cols} {name}@{at}: composer={:?} ready={} empty_and_ready={} dialog={:?}",
-                    composer
-                        .as_ref()
-                        .map(|c| (&c.text, c.cursor_at_end, c.hidden)),
-                    (CLAUDE_PROFILE.ready)(&grid),
-                    CLAUDE_PROFILE.empty_and_ready(&grid),
-                    (CLAUDE_PROFILE.dialog)(&grid)
-                );
-                eprintln!("{verdict}");
-                rendered.push_str(&format!(
-                    "{verdict}\ncursor={:?}\n{}\n\n",
-                    parser.screen().cursor_position(),
-                    parser.screen().contents()
-                ));
-            }
-            std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
-            eprintln!(
-                "{release} history {rows}x{cols} capture: {}",
-                capture.root.display()
-            );
-            verify_history(&capture);
+            eprintln!("{verdict}");
+            rendered.push_str(&format!(
+                "{verdict}\ncursor={:?}\n{}\n\n",
+                parser.screen().cursor_position(),
+                parser.screen().contents()
+            ));
         }
+        std::fs::write(capture.root.join("rendered.txt"), rendered).unwrap();
+        eprintln!(
+            "{release} history {rows}x{cols} capture: {}",
+            capture.root.display()
+        );
+        verify_history(&capture);
     }
 }
 
@@ -993,36 +857,18 @@ fn verify_history(capture: &Capture) {
     );
 }
 
-/// Scenario: In isolated real Haiku composers on pinned Claude Code 2.1.317, at 50×200 and 24×80 and five trials each, seed six prompts from an earlier session, recall slot k with Up, clear it with one and, in other trials, four Ctrl+U presses so Claude draws the plain empty composer, then type a line shaped like the deck's doorbell line in one write and press Enter on its own (blocked by the hook before a model turn). The submitted prompt, the screen after it and the history walked afterwards are recorded with what the screen profile reads at every point.
+/// Scenario: In isolated real Haiku composers on the installed Claude Code, at 50×200 and 24×80 and five trials each, seed six prompts from an earlier session, recall slot k with Up, clear it with one and, in other trials, four Ctrl+U presses so Claude draws the plain empty composer, then type a line shaped like the deck's doorbell line in one write and press Enter on its own (blocked by the hook before a model turn). Each trial must submit the line alone, held exactly before the Enter, with no dialog after it, an empty ready composer once it is cleared and the six seeded entries recalled intact.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_release_317_history_submit_plain() {
-    skip_unless!(common::check_claude_available());
-    history_submit("2.1.317", "plain");
+fn doorbell_036_live_release_history_submit_plain() {
+    history_submit("plain");
 }
 
-/// Scenario: In isolated real Haiku composers on pinned Claude Code 2.1.317, at 50×200 and 24×80 and five trials each, recall slot k, clear it with one or four Ctrl+U presses, press Up and Down back onto it so Claude draws `History k/6` over an empty box (blank or the placeholder) when it kept its position (a trial where it did not rings nothing and is counted), then type a line shaped like the deck's doorbell line in one write and press Enter on its own (blocked by the hook before a model turn). The submitted prompt, the screen after it and the history walked afterwards are recorded with what the screen profile reads at every point.
+/// Scenario: In isolated real Haiku composers on the installed Claude Code, at 50×200 and 24×80 and five trials each, recall slot k, clear it with one or four Ctrl+U presses, press Up and Down back onto it so Claude draws `History k/6` over an empty box (blank or the placeholder) when it kept its position (a trial where it did not rings nothing and is counted), then type a line shaped like the deck's doorbell line in one write and press Enter on its own (blocked by the hook before a model turn). Each trial that rings must submit the line alone, held exactly before the Enter, with no dialog after it, an empty ready composer once it is cleared and the six seeded entries recalled intact.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_release_317_history_submit_labelled() {
-    skip_unless!(common::check_claude_available());
-    history_submit("2.1.317", "labelled");
-}
-
-/// Scenario: The plain-drawn case of `doorbell_036_live_release_317_history_submit_plain`, on pinned Claude Code 2.1.318: recall slot k, one or four Ctrl+U presses, then the deck-shaped line in one write and a lone Enter (blocked before a model turn), five trials at each of 50×200 and 24×80, recording the submitted prompt, the screen after it and the history afterwards.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_history_submit_plain() {
-    skip_unless!(common::check_claude_available());
-    history_submit("2.1.318", "plain");
-}
-
-/// Scenario: The History-labelled case of `doorbell_036_live_release_317_history_submit_labelled`, on pinned Claude Code 2.1.318: recall slot k, one or four Ctrl+U presses, Up and Down back onto the cleared `History k/6` slot when reachable, then the deck-shaped line in one write and a lone Enter (blocked before a model turn), five trials at each of 50×200 and 24×80, recording the submitted prompt, the screen after it and the history afterwards.
-#[spec("inbox/doorbell/036")]
-#[test]
-fn doorbell_036_live_release_318_history_submit_labelled() {
-    skip_unless!(common::check_claude_available());
-    history_submit("2.1.318", "labelled");
+fn doorbell_036_live_release_history_submit_labelled() {
+    history_submit("labelled");
 }
 
 /// The seeded prompts, newest first, as Up recalls them.
@@ -1041,20 +887,19 @@ const SEEDED_HISTORY: [&str; 6] = [
 /// `2/6`). Every trial is recorded before any outcome is asserted, so one
 /// surprise does not hide the others; a `labelled` trial whose blank
 /// `History k/6` slot is not reachable rings nothing and is counted.
-fn history_submit(release: &str, case: &str) {
-    let (_root, path) = pinned_path(release).unwrap_or_else(|| {
-        panic!(
-            "set DOT_AGENT_DECK_CLAUDE_MENU_{} to the pinned executable",
-            release.replace('.', "_")
-        )
-    });
-    preflight(release, Some(&path));
+fn history_submit(case: &str) {
+    skip_unless!(common::check_claude_available());
+    let Some(claude) = installed::or_skip(installed::claude()) else {
+        return;
+    };
+    let release = claude.release.as_str();
+    preflight();
     let mut outcomes = Vec::new();
     for presses in [1usize, 4] {
         for (rows, cols) in [(50, 200), (24, 80)] {
             for trial in 1..=5usize {
                 outcomes.push(history_submit_trial(
-                    release, case, presses, rows, cols, trial, &path,
+                    &claude, case, presses, rows, cols, trial,
                 ));
             }
         }
@@ -1108,14 +953,14 @@ fn history_submit(release: &str, case: &str) {
 /// One Q143b trial, recorded with what the profile reads at the points the
 /// question turns on.
 fn history_submit_trial(
-    release: &str,
+    claude: &Installed,
     case: &str,
     presses: usize,
     rows: u16,
     cols: u16,
     trial: usize,
-    path: &str,
 ) -> Value {
+    let release = claude.release.as_str();
     let alphabet = dot_agent_deck::doorbell_txn::TOKEN_ALPHABET;
     let token: String = (0..6)
         .map(|i| char::from(alphabet[(trial * 3 + i * 5 + presses * 7 + cols as usize) % 16]))
@@ -1123,6 +968,7 @@ fn history_submit_trial(
     let id = format!("m-hist319{}-0f3c9a71d2e4b8{presses}{trial}", &case[..1]);
     let line = format!("({token}){}", dot_agent_deck::doorbell::doorbell_line(&id));
     let capture = record(
+        claude,
         Some((
             "history_submit.py",
             include_str!("support/claude_history_submit_measure.py"),
@@ -1131,9 +977,7 @@ fn history_submit_trial(
         rows,
         cols,
         &[trial.to_string(), presses.to_string(), line.clone()],
-        Some(path),
     );
-    assert_eq!(capture.result["release"], release);
     let rendered = render_points(
         &capture,
         &format!("{release} {case} x{presses} {rows}x{cols} t{trial}"),

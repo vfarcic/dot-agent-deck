@@ -1,13 +1,14 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", target_os = "linux"))]
 
-//! A measurement, not a contract: what one Claude Code release's
-//! external-editor action does, for the `editor_probe` field of its
-//! `doorbell_activation` record (PRD #1666 part 3, activation).
+//! What the installed Claude Code's external-editor action does, measured
+//! against the `editor_probe` facts the doorbell holds for Claude Code (PRD
+//! #1666 part 3, activation; issue #2146: the installed release, not a pinned
+//! one, so a release that breaks a fact turns these tests red).
 //!
 //! Each test runs `tests/support/claude_editor_measure.py` in a pane of the
 //! deck's TUI harness, with the harness's own HOME and work directory, never
-//! the host's. The recorder launches the pinned executable that
-//! `DOT_AGENT_DECK_CLAUDE_MENU_<release>` names on its own PTY, sets the
+//! the host's. The recorder launches the `claude` the harness's `PATH`
+//! resolves on its own PTY, sets the
 //! user's editor to a stand-in that logs its argv, environment and export and
 //! then keeps or rewrites the file, and drives Ctrl+G and the other keys. No
 //! prompt is submitted; a private UserPromptSubmit hook blocks any that is,
@@ -17,31 +18,18 @@
 //! holds every row, and each launch's raw PTY bytes are beside it.
 
 mod common;
+#[path = "support/installed_agent.rs"]
+mod installed;
 
 use serde_json::Value;
 use spec::spec;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A private executable search path whose `claude` is the pinned executable.
-fn pinned_path(release: &str) -> Result<(tempfile::TempDir, String), String> {
-    let key = format!("DOT_AGENT_DECK_CLAUDE_MENU_{}", release.replace('.', "_"));
-    let binary = std::env::var(&key).map_err(|_| format!("set {key} to the pinned executable"))?;
-    let root = tempfile::Builder::new()
-        .prefix("dad-claude-editor-bin-")
-        .tempdir_in("/var/tmp")
-        .unwrap();
-    std::os::unix::fs::symlink(&binary, root.path().join("claude")).unwrap();
-    let path = format!(
-        "{}:{}",
-        root.path().display(),
-        std::env::var("PATH").unwrap()
-    );
-    Ok((root, path))
-}
-
 struct Capture {
     root: PathBuf,
+    /// The installed release the recorder ran.
+    release: String,
     result: Value,
 }
 
@@ -56,14 +44,13 @@ impl Capture {
     }
 }
 
-fn measure(release: &str, mode: &str, wait: Duration) -> Option<Capture> {
-    let (_bin, path) = match pinned_path(release) {
-        Ok(p) => p,
-        Err(why) => {
-            common::_skip_if_err(Err::<(), _>(why));
-            return None;
-        }
-    };
+/// Runs one recorder mode on the installed Claude Code, or `None` after
+/// reporting why it cannot run (`SKIP:`).
+fn measure(mode: &str, wait: Duration) -> Option<Capture> {
+    if common::_skip_if_err(common::check_claude_available()) {
+        return None;
+    }
+    let claude = installed::or_skip(installed::claude())?;
     let python = std::process::Command::new("python3")
         .args(["-c", "import pyte"])
         .output()
@@ -80,7 +67,7 @@ fn measure(release: &str, mode: &str, wait: Duration) -> Option<Capture> {
     std::fs::write(&script, include_str!("support/claude_editor_measure.py")).unwrap();
     let command = format!("exec python3 {} {mode} {}", quote(&script), quote(&output));
     let deck = common::TuiDeck::builder()
-        .with_env("PATH", path)
+        .with_env("PATH", claude.path.clone())
         .with_env(
             "PYTHONPATH",
             std::env::var("PYTHONPATH").unwrap_or_default(),
@@ -113,7 +100,12 @@ fn measure(release: &str, mode: &str, wait: Duration) -> Option<Capture> {
         result["release"].as_str().unwrap(),
         output.display()
     );
-    assert_eq!(result["release"], release);
+    assert_eq!(
+        result["release"],
+        claude.release.as_str(),
+        "the recorder ran another Claude Code than the installed one selected; {}",
+        output.display()
+    );
     assert!(
         result["error"].is_null(),
         "measurement premise differed: {}; {}",
@@ -125,6 +117,7 @@ fn measure(release: &str, mode: &str, wait: Duration) -> Option<Capture> {
     drop(deck);
     Some(Capture {
         root: output,
+        release: claude.release,
         result,
     })
 }
@@ -142,25 +135,16 @@ fn count(modes: &Value, wanted: &str) -> usize {
         .unwrap_or(0)
 }
 
-/// Scenario: On pinned Claude Code 2.1.317, type a draft and press Ctrl+G five times with the user's editor set in VISUAL to a logging stand-in that rewrites the file, then once with the stand-in exiting 37; launch again with only EDITOR set, and twice with neither, the stand-in installed as vi and nano and then as code, vi and nano. Each invocation's argv, export path and contents, and the bracketed-paste mode writes Claude makes around it, are recorded.
+/// Scenario: On the installed Claude Code, type a draft and press Ctrl+G five times with the user's editor set in VISUAL to a logging stand-in that rewrites the file, then once with the stand-in exiting 37; launch again with only EDITOR set, and twice with neither, the stand-in installed as vi and nano and then as code, vi and nano. Each invocation's argv, export path and contents, and the bracketed-paste mode writes Claude makes around it, are recorded.
 #[spec("inbox/probe/088")]
 #[test]
-fn probe_088_live_claude_317_editor_export_selection_and_paste_toggles() {
-    skip_unless!(common::check_claude_available());
-    editor_export_selection_and_paste_toggles("2.1.317");
+fn probe_088_live_claude_editor_export_selection_and_paste_toggles() {
+    editor_export_selection_and_paste_toggles();
 }
 
-/// Scenario: On pinned Claude Code 2.1.318, type a draft and press Ctrl+G five times with the user's editor set in VISUAL to a logging stand-in that rewrites the file, then once with the stand-in exiting 37; launch again with only EDITOR set, and twice with neither, the stand-in installed as vi and nano and then as code, vi and nano. Each invocation's argv, export path and contents, and the bracketed-paste mode writes Claude makes around it, are recorded.
-#[spec("inbox/probe/088")]
-#[test]
-fn probe_088_live_claude_318_editor_export_selection_and_paste_toggles() {
-    skip_unless!(common::check_claude_available());
-    editor_export_selection_and_paste_toggles("2.1.318");
-}
-
-/// The `probe_088_live_claude_*_editor_export_selection_and_paste_toggles` measurement on one pinned release.
-fn editor_export_selection_and_paste_toggles(release: &str) {
-    let Some(c) = measure(release, "editor", Duration::from_secs(300)) else {
+/// The `probe_088_live_claude_editor_export_selection_and_paste_toggles` measurement on the installed release.
+fn editor_export_selection_and_paste_toggles() {
+    let Some(c) = measure("editor", Duration::from_secs(300)) else {
         return;
     };
     let mut toggles = Vec::new();
@@ -255,25 +239,16 @@ fn editor_export_selection_and_paste_toggles(release: &str) {
     }
 }
 
-/// Scenario: Launch pinned Claude Code 2.1.317 five times with a keybindings.json in its HOME that unbinds Ctrl+G and binds Ctrl+E to the external editor, and at the first composer frame type a draft, then press Ctrl+G and Ctrl+E. Ctrl+G must open no editor and Ctrl+E must open it, every time.
+/// Scenario: Launch the installed Claude Code five times with a keybindings.json in its HOME that unbinds Ctrl+G and binds Ctrl+E to the external editor, and at the first composer frame type a draft, then press Ctrl+G and Ctrl+E. Ctrl+G must open no editor and Ctrl+E must open it, every time.
 #[spec("inbox/probe/088")]
 #[test]
-fn probe_088_live_claude_317_keymap_loaded_at_start() {
-    skip_unless!(common::check_claude_available());
-    keymap_loaded_at_start("2.1.317");
+fn probe_088_live_claude_keymap_loaded_at_start() {
+    keymap_loaded_at_start();
 }
 
-/// Scenario: Launch pinned Claude Code 2.1.318 five times with a keybindings.json in its HOME that unbinds Ctrl+G and binds Ctrl+E to the external editor, and at the first composer frame type a draft, then press Ctrl+G and Ctrl+E. Ctrl+G must open no editor and Ctrl+E must open it, every time.
-#[spec("inbox/probe/088")]
-#[test]
-fn probe_088_live_claude_318_keymap_loaded_at_start() {
-    skip_unless!(common::check_claude_available());
-    keymap_loaded_at_start("2.1.318");
-}
-
-/// The `probe_088_live_claude_*_keymap_loaded_at_start` measurement on one pinned release.
-fn keymap_loaded_at_start(release: &str) {
-    let Some(c) = measure(release, "keymap-start", Duration::from_secs(300)) else {
+/// The `probe_088_live_claude_keymap_loaded_at_start` measurement on the installed release.
+fn keymap_loaded_at_start() {
+    let Some(c) = measure("keymap-start", Duration::from_secs(300)) else {
         return;
     };
     let rows = c.rows("keymap-start");
@@ -291,25 +266,16 @@ fn keymap_loaded_at_start(release: &str) {
     }
 }
 
-/// Scenario: Launch pinned Claude Code 2.1.317 with the Ctrl+G-unbinding keybindings.json present, leave the file untouched, and press Ctrl+G once a minute for ten minutes, then Ctrl+E. Ctrl+G must open no editor at any sample, the file's stat must not change, and Ctrl+E must still open the editor.
+/// Scenario: Launch the installed Claude Code with the Ctrl+G-unbinding keybindings.json present, leave the file untouched, and press Ctrl+G once a minute for ten minutes, then Ctrl+E. Ctrl+G must open no editor at any sample, the file's stat must not change, and Ctrl+E must still open the editor.
 #[spec("inbox/probe/088")]
 #[test]
-fn probe_088_live_claude_317_keymap_unchanged_ten_minutes() {
-    skip_unless!(common::check_claude_available());
-    keymap_unchanged_ten_minutes("2.1.317");
+fn probe_088_live_claude_keymap_unchanged_ten_minutes() {
+    keymap_unchanged_ten_minutes();
 }
 
-/// Scenario: Launch pinned Claude Code 2.1.318 with the Ctrl+G-unbinding keybindings.json present, leave the file untouched, and press Ctrl+G once a minute for ten minutes, then Ctrl+E. Ctrl+G must open no editor at any sample, the file's stat must not change, and Ctrl+E must still open the editor.
-#[spec("inbox/probe/088")]
-#[test]
-fn probe_088_live_claude_318_keymap_unchanged_ten_minutes() {
-    skip_unless!(common::check_claude_available());
-    keymap_unchanged_ten_minutes("2.1.318");
-}
-
-/// The `probe_088_live_claude_*_keymap_unchanged_ten_minutes` measurement on one pinned release.
-fn keymap_unchanged_ten_minutes(release: &str) {
-    let Some(c) = measure(release, "keymap-unchanged", Duration::from_secs(900)) else {
+/// The `probe_088_live_claude_keymap_unchanged_ten_minutes` measurement on the installed release.
+fn keymap_unchanged_ten_minutes() {
+    let Some(c) = measure("keymap-unchanged", Duration::from_secs(900)) else {
         return;
     };
     let rows = c.rows("keymap-unchanged");
@@ -324,25 +290,16 @@ fn keymap_unchanged_ten_minutes(release: &str) {
     );
 }
 
-/// Scenario: Launch pinned Claude Code 2.1.317 with no keybindings.json, confirm Ctrl+G opens the editor, then create the unbinding file and alternate Ctrl+G and Ctrl+E until the binding has moved, then remove the file and alternate again until it has moved back. The time each change took to show is recorded.
+/// Scenario: Launch the installed Claude Code with no keybindings.json, confirm Ctrl+G opens the editor, then create the unbinding file and alternate Ctrl+G and Ctrl+E until the binding has moved, then remove the file and alternate again until it has moved back. The time each change took to show is recorded.
 #[spec("inbox/probe/088")]
 #[test]
-fn probe_088_live_claude_317_keymap_created_and_removed() {
-    skip_unless!(common::check_claude_available());
-    keymap_created_and_removed("2.1.317");
+fn probe_088_live_claude_keymap_created_and_removed() {
+    keymap_created_and_removed();
 }
 
-/// Scenario: Launch pinned Claude Code 2.1.318 with no keybindings.json, confirm Ctrl+G opens the editor, then create the unbinding file and alternate Ctrl+G and Ctrl+E until the binding has moved, then remove the file and alternate again until it has moved back. The time each change took to show is recorded.
-#[spec("inbox/probe/088")]
-#[test]
-fn probe_088_live_claude_318_keymap_created_and_removed() {
-    skip_unless!(common::check_claude_available());
-    keymap_created_and_removed("2.1.318");
-}
-
-/// The `probe_088_live_claude_*_keymap_created_and_removed` measurement on one pinned release.
-fn keymap_created_and_removed(release: &str) {
-    let Some(c) = measure(release, "keymap-reload", Duration::from_secs(300)) else {
+/// The `probe_088_live_claude_keymap_created_and_removed` measurement on the installed release.
+fn keymap_created_and_removed() {
+    let Some(c) = measure("keymap-reload", Duration::from_secs(300)) else {
         return;
     };
     assert_eq!(c.rows("keymap-reload-baseline")[0]["ctrlg"]["opened"], true);
@@ -359,25 +316,16 @@ fn keymap_created_and_removed(release: &str) {
     }
 }
 
-/// Scenario: Put the Ctrl+G-unbinding keybindings.json in the project's own .claude directory instead of the HOME, launch pinned Claude Code 2.1.317 there, once with user settings only and once with every settings source as a deck pane launches it, type a draft and press Ctrl+G, then Ctrl+E. The result shows whether the project file is a source of key bindings.
+/// Scenario: Put the Ctrl+G-unbinding keybindings.json in the project's own .claude directory instead of the HOME, launch the installed Claude Code there, once with user settings only and once with every settings source as a deck pane launches it, type a draft and press Ctrl+G, then Ctrl+E. The result shows whether the project file is a source of key bindings.
 #[spec("inbox/probe/088")]
 #[test]
-fn probe_088_live_claude_317_project_keymap() {
-    skip_unless!(common::check_claude_available());
-    project_keymap("2.1.317");
+fn probe_088_live_claude_project_keymap() {
+    project_keymap();
 }
 
-/// Scenario: Put the Ctrl+G-unbinding keybindings.json in the project's own .claude directory instead of the HOME, launch pinned Claude Code 2.1.318 there, once with user settings only and once with every settings source as a deck pane launches it, type a draft and press Ctrl+G, then Ctrl+E. The result shows whether the project file is a source of key bindings.
-#[spec("inbox/probe/088")]
-#[test]
-fn probe_088_live_claude_318_project_keymap() {
-    skip_unless!(common::check_claude_available());
-    project_keymap("2.1.318");
-}
-
-/// The `probe_088_live_claude_*_project_keymap` measurement on one pinned release.
-fn project_keymap(release: &str) {
-    let Some(c) = measure(release, "keymap-project", Duration::from_secs(180)) else {
+/// The `probe_088_live_claude_project_keymap` measurement on the installed release.
+fn project_keymap() {
+    let Some(c) = measure("keymap-project", Duration::from_secs(180)) else {
         return;
     };
     for cell in ["keymap-project", "keymap-project-all-sources"] {
@@ -389,25 +337,16 @@ fn project_keymap(release: &str) {
     }
 }
 
-/// Scenario: In pinned Claude Code 2.1.317, put the composer in each of six states (a draft, the slash menu, help, reverse search, shell mode and after Escape twice) and send each of the twelve candidate wire forms of Ctrl+G, whole and split in two writes; then Escape and BEL with 0, 30 and 60 ms between them, and a bracketed paste holding a BEL, whole and split. Whether each opened the editor, and what the next export held after the paste, is recorded.
+/// Scenario: In the installed Claude Code, put the composer in each of six states (a draft, the slash menu, help, reverse search, shell mode and after Escape twice) and send each of the twelve candidate wire forms of Ctrl+G, whole and split in two writes; then Escape and BEL with 0, 30 and 60 ms between them, and a bracketed paste holding a BEL, whole and split. Whether each opened the editor, and what the next export held after the paste, is recorded.
 #[spec("inbox/probe/089")]
 #[test]
-fn probe_089_live_claude_317_ctrl_g_forms() {
-    skip_unless!(common::check_claude_available());
-    ctrl_g_forms("2.1.317");
+fn probe_089_live_claude_ctrl_g_forms() {
+    ctrl_g_forms();
 }
 
-/// Scenario: In pinned Claude Code 2.1.318, put the composer in each of six states (a draft, the slash menu, help, reverse search, shell mode and after Escape twice) and send each of the twelve candidate wire forms of Ctrl+G, whole and split in two writes; then Escape and BEL with 0, 30 and 60 ms between them, and a bracketed paste holding a BEL, whole and split. Whether each opened the editor, and what the next export held after the paste, is recorded.
-#[spec("inbox/probe/089")]
-#[test]
-fn probe_089_live_claude_318_ctrl_g_forms() {
-    skip_unless!(common::check_claude_available());
-    ctrl_g_forms("2.1.318");
-}
-
-/// The `probe_089_live_claude_*_ctrl_g_forms` measurement on one pinned release.
-fn ctrl_g_forms(release: &str) {
-    let Some(c) = measure(release, "forms", Duration::from_secs(1500)) else {
+/// The `probe_089_live_claude_ctrl_g_forms` measurement on the installed release.
+fn ctrl_g_forms() {
+    let Some(c) = measure("forms", Duration::from_secs(1500)) else {
         return;
     };
     let mut table: std::collections::BTreeMap<String, (usize, usize)> = Default::default();
@@ -425,11 +364,11 @@ fn ctrl_g_forms(release: &str) {
     // The pasted BEL is read from the next export, the bytes the editor
     // stand-in read from the file, never from `composer_after`: that is the
     // screen, where a BEL kept in the draft is not drawn, so it reads
-    // `BASEPASTETAIL` whether the BEL was kept or dropped. The 2.1.317
-    // record's comment says "kept as text" (its `pasted_bel_is_text` stays
-    // `Absent`, the safe default), and 2.1.318 read the same on 2026-11-04,
-    // so this test holds that reading: a rerun that reads "dropped" fails
-    // rather than only printing the flip.
+    // `BASEPASTETAIL` whether the BEL was kept or dropped. Claude Code's
+    // facts say "kept as text" (their `pasted_bel_is_text` stays `Absent`,
+    // the safe default), measured on 2.1.317 and on 2.1.318 (2026-11-04), so
+    // this test holds that reading on the installed release: a run that
+    // reads "dropped" fails rather than only printing the flip.
     let pastes = c.rows("paste-bel");
     for split in [false, true] {
         assert!(
@@ -461,7 +400,8 @@ fn ctrl_g_forms(release: &str) {
         assert_eq!(
             reading,
             "kept as text",
-            "{release} was measured keeping the pasted BEL as text; {}",
+            "{}: 2.1.317 and 2.1.318 were measured keeping the pasted BEL as text; {}",
+            c.release,
             c.root.display()
         );
     }

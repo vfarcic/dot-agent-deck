@@ -36,8 +36,6 @@ import sys
 import termios
 import time
 
-PINS = {'2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
-        '2.1.318': '708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd',}
 TRIALS = 10
 NOTICE = b'dot-agent-deck: the deck was checking this input box.'
 # Claude's own line when the editor it ran ends badly, naming the signal or
@@ -280,9 +278,10 @@ def main():
     home = Path(os.environ['HOME']).resolve()
     assert home.name == 'home' and home.parent == Path.cwd().resolve(), 'requires TuiDeck private HOME'
     binary = Path(shutil.which('claude')).resolve(strict=True)
+    # Whichever Claude Code `claude` resolves to (issue #2146): its release
+    # and SHA-256 are recorded, and the run fails if it changes meanwhile.
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    assert PINS.get(release) == digest, 'executable pin changed'
     out.mkdir(mode=0o700)
     settings = home / '.claude/settings.json'
     hook = ' '.join(shlex.quote(x) for x in [sys.executable, str(Path(__file__).resolve()), '--block-hook', str(out)])
