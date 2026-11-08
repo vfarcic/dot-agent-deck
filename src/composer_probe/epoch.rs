@@ -1773,6 +1773,17 @@ impl GenerationInput {
         }
     }
 
+    /// Admission refused a due attempt at `now` when it was scheduled only
+    /// because the frame didn't show the composer
+    /// ([`super::probe::Schedule::surface`], #2147): the next is due soon,
+    /// and only every [`super::probe::SURFACE_PER_FAILURE`]th in a row is a
+    /// failure.
+    pub fn probe_surface(&self, now: Instant) {
+        if let Some(live) = self.state.lock_recovering().live.as_mut() {
+            live.schedule.surface(now);
+        }
+    }
+
     /// The writer refused a due attempt at `now` only because the screen
     /// moved since its scheduling ([`super::probe::Schedule::moved`]): a
     /// failure only for every [`super::probe::MOVED_PER_FAILURE`]th in a
@@ -1889,6 +1900,16 @@ impl GenerationInput {
             .live
             .as_ref()
             .is_some_and(|live| live.schedule.failures() > 0)
+    }
+
+    /// Whether the card says the deck can't check the box: the last attempt
+    /// failed or was refused, and the schedule is waiting before the next.
+    pub fn probe_failing(&self) -> bool {
+        self.state
+            .lock_recovering()
+            .live
+            .as_ref()
+            .is_some_and(|live| live.schedule.failing())
     }
 
     /// Open a probe's segment at `now` (core §4.5): its number and job, to

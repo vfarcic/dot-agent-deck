@@ -1309,6 +1309,58 @@ fn probe_059_automatic_retries_continue_through_broken() {
     );
 }
 
+/// Scenario: Touch an idle Claude Code stand-in's empty box, then blank its screen so the frame shows no input box, and ask a check through the live scheduling path twice. Each is refused when scheduled for the screen alone, nothing is typed and no failure is counted, and the next check is due once the 2 s recheck has passed, not after the 30 s backoff step (#2147).
+#[spec("inbox/probe/102")]
+#[test]
+fn probe_102_a_live_screen_refusal_when_scheduled_counts_no_failure_and_rechecks_soon() {
+    use dot_agent_deck::composer_probe::probe::{SURFACE_PER_FAILURE, SURFACE_RECHECK};
+
+    let f = Fixture::start("claude");
+    f.hook_event("session_start");
+    f.hook_event("idle");
+    let mut human = f.connect();
+    human.write("x\x7f");
+    f.expect(b"x\x7f");
+    // The stand-in redraws only on a key or a resize, so the blank frame
+    // stands: no ready screen and no composer for admission's `Surface`.
+    f.emit(b"\x1b[2J\x1b[H");
+    // Two refusals, fewer than the run that counts one failure.
+    const { assert!(SURFACE_PER_FAILURE > 2) };
+    for attempt in 1..=2 {
+        let refused = f.probe();
+        assert_eq!(
+            refused["composer_probe"]["outcome"], "refused",
+            "attempt {attempt}: {refused}"
+        );
+        assert_eq!(
+            refused["composer_probe"]["reason"], "Surface",
+            "attempt {attempt}: refused when scheduled, for the screen: {refused}"
+        );
+        let status = f.control("schedule-status");
+        assert_eq!(
+            status["composer_schedule"]["failures"], 0,
+            "attempt {attempt}: a screen refusal when scheduled counts no failure: {status}"
+        );
+        assert_eq!(
+            status["composer_schedule"]["due"], false,
+            "attempt {attempt}: {status}"
+        );
+        let advanced = f.control(&format!("schedule-advance:{}", SURFACE_RECHECK.as_millis()));
+        assert_eq!(
+            advanced["composer_schedule"]["due"], true,
+            "attempt {attempt}: the next check is due after the {SURFACE_RECHECK:?} recheck, \
+             not a backoff step: {advanced}"
+        );
+    }
+    f.stable(b"x\x7f");
+    assert!(
+        !f.input().contains(&7),
+        "no check's Ctrl+G: {:?}",
+        f.input()
+    );
+    assert_eq!(f.page().seg_seq, 0, "a refused check publishes no segment");
+}
+
 /// Scenario: Send OSC 10 and 11 reports, whole or byte-split and BEL- or ST-ended, before requesting a live probe, with each query retained before ledger saturation or dropped after it. A split or unretained BEL is a physical native candidate and refuses the first check without publication; other reports permit exactly one real probe byte.
 #[spec("inbox/probe/061")]
 #[test]
