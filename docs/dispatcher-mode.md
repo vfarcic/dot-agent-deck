@@ -44,6 +44,17 @@ dot-agent-deck dispatch <name> --task-file <file> --orchestration '<orchestratio
 
 It runs these, and `dispatch --list-targets`, by the deck's full path, such as `/home/you/.local/bin/dot-agent-deck dispatch …`, so they reach this deck whatever the agent's own `PATH` holds. If you let the agent run commands through a permission rule, write the rule against the path shown in the dispatcher's pane: a Claude Code allow rule such as `Bash(dot-agent-deck dispatch:*)` does not match it.
 
+### Choose the agent a unit runs
+
+A single-agent unit runs the same agent, started with the same command, as the dispatcher. To start one on another agent or with another command, say so when you ask: *"start the login bug on OpenCode"*, or *"use `devbox run oc-big` for this one"*. The dispatcher passes your choice on:
+
+```bash
+dot-agent-deck dispatch <name> --task-file <file> --agent opencode
+dot-agent-deck dispatch <name> --task-file <file> --command "devbox run oc-big" --agent opencode
+```
+
+The unit's pane then runs that command, in the unit's own copy of the repository, and its card shows that agent, in the TUI and in the desktop app alike: the choice is made in the dispatcher's conversation, which works the same in both. The task it gets is the same as without the flags. A choice of agent or command always starts one agent, so the dispatcher does not ask about the shape for that unit. The dispatcher uses these flags only when you ask for a particular agent or command; otherwise units run what the dispatcher runs.
+
 ### Write the request so the unit can act on it
 
 - **The task must stand on its own.** The unit is a fresh agent that cannot see the dispatcher's conversation. State the goal and the expected outcome.
@@ -54,7 +65,7 @@ It runs these, and `dispatch --list-targets`, by the deck's full path, such as `
 ## `dispatch` reference
 
 ```
-dot-agent-deck dispatch <NAME> (--task <TEXT> | --task-file <PATH>) [--single | --orchestration <NAME>]
+dot-agent-deck dispatch <NAME> (--task <TEXT> | --task-file <PATH>) [--single [--agent <AGENT>] [--command <CMD>] | --orchestration <NAME>]
 dot-agent-deck dispatch --list-targets
 ```
 
@@ -64,10 +75,14 @@ dot-agent-deck dispatch --list-targets
 | `--task <TEXT>` | The unit's task. |
 | `--task-file <PATH>` | Read the task from a file, or from stdin with `-`. Use it for text with quotes, backticks, `$` or newlines. A regular file of at most 1 MiB. |
 | `--single` | Start one agent, with the same command and agent as the dispatcher that asked for it: a dispatcher started as `devbox run agent` gets units started as `devbox run agent`, in the unit's own copy of the repository, and a Codex, OpenCode, Pi or Devin dispatcher gets units of its own agent. A dispatcher started with no command, or with one that only opens a shell (`bash`, `devbox shell`, `nix develop`) in which you then started the agent, gets the configured `default_command`, or `claude`. So does one started from a subdirectory of the repository with a command such as `./agent.sh`, which would not be found from the root of the unit's copy. |
+| `--agent <AGENT>` | Start one agent of this kind: `claude`, `opencode`, `pi`, `codex` or `devin`, the names a role's `agent = "…"` takes. Alone, it starts that agent with its own command, so `--agent opencode` runs `opencode`. With `--command`, it says which agent that command starts. Implies `--single`. Any other name is refused with the list of valid ones, and nothing is started. |
+| `--command <CMD>` | Start one agent with this command instead of the dispatcher's, for example `--command "devbox run oc-big"`. It runs from the root of the unit's copy of the repository. When the command does not start with the agent's own program name, add `--agent` to say which agent it starts; `--command "opencode --model big"` needs no `--agent`, `--command "devbox run oc-big"` does, and is refused without it. Implies `--single`. |
 | `--orchestration <NAME>` | Start the orchestration with that `name`. `--orchestration=` with an empty value starts the project's default orchestration (the one with `default = true`, else the first with roles). The value is required: `--orchestration my-unit` reads `my-unit` as the orchestration name. |
 | `--list-targets` | Print what can be dispatched here and exit. It cannot be combined with the other arguments. |
 
-With neither `--single` nor `--orchestration`, the unit starts as the project's default orchestration, or as a single agent when the project defines no orchestration with roles.
+`--agent` and `--command` cannot be combined with `--orchestration`: each role of an orchestration has its own command and agent in `.dot-agent-deck.toml`.
+
+With neither `--single` nor `--orchestration` (nor `--agent` or `--command`), the unit starts as the project's default orchestration, or as a single agent when the project defines no orchestration with roles.
 
 `--list-targets` prints, for example:
 
@@ -90,7 +105,7 @@ Starting a unit happens in three steps, and each one tells you something differe
 
 | What you see | What it means | What it does not mean |
 |---|---|---|
-| `dot-agent-deck dispatch` exits 0 | The daemon accepted the request, or gave no answer the command could check (an older daemon, or none within 5 seconds). | That a worktree was created, that a unit started, or that it got its task. The daemon answers before doing any of that. |
+| `dot-agent-deck dispatch` exits 0 | The daemon accepted the request, or gave no answer the command could check (an older daemon, or none within 5 seconds). With `--agent` or `--command`, only an accepted request exits 0. | That a worktree was created, that a unit started, or that it got its task. The daemon answers before doing any of that. |
 | A turn in the dispatcher pane beginning `dispatch: spawned isolated` | The worktree exists and the unit's agents were started in it. The turn names what was started, its directory and its branch, and usually the commit the worktree was cut from. | That the agent received its task. |
 | A turn beginning `dispatch: a unit you dispatched has completed` | The unit is reporting back: finished, or stuck and unable to continue. The unit received enough work to send a report; read the report to see what happened. | That the work is correct; read the report. |
 | A `dispatch ended` message: `Dispatched unit <name> ended (it exited / it was closed / it could not be restarted) without reporting.` | The unit's agent stopped before it reported: it exited on its own, its pane was closed, or the deck could not restart it. No report is coming. | That its work is lost: its branch and directory are as it left them. |
@@ -158,6 +173,9 @@ dot-agent-deck worktree reclaim     # remove the worktrees marked "remove": deck
 | `dispatch: branch agent/dispatch-<name> already exists from an earlier dispatch …` | A unit with this name ran before; its branch was kept. | Use another name, or delete the branch with the `git … branch -D` command the message gives. |
 | A `dispatch:` failure naming an orchestration and listing the available ones | `--orchestration` named an orchestration the project does not define (names are matched exactly). | Run `dispatch --list-targets` and use a listed name. Nothing was created. |
 | `dispatch: ambiguous-orchestration: …` | The project's `.dot-agent-deck.toml` declares more than one orchestration with roles under that name, so the deck cannot tell which one you meant. | Rename one of them (`dot-agent-deck validate` reports the duplicate as a warning), then dispatch again. Nothing was created. |
+| `Error: unknown agent '<name>' for --agent; known agents: …` | `--agent` named an agent the deck does not know. | Use one of the listed names. Nothing was started. |
+| `Error: --command '<cmd>' does not name an agent the deck recognises, …` | The command does not start with an agent's own program name (for example `devbox run …`), so the deck cannot tell which agent it starts. | Add `--agent <name>`. Nothing was started. |
+| `Error: nothing was dispatched: this deck's daemon did not confirm that it can start a unit with a chosen --command or --agent …` | The deck's daemon is older than the `dot-agent-deck` command and cannot start a unit with a chosen agent or command. Nothing was started. | Dispatch without `--agent` and `--command`, or use them once the daemon runs the same version as the command ([After upgrading](installation.md#after-upgrading)). |
 | `--list-targets` exits non-zero and prints a parse error | The project's `.dot-agent-deck.toml` cannot be read. | Fix it (`dot-agent-deck validate`), or dispatch with `--single`, which needs no config. |
 | `Error: the daemon did not answer list-targets …` | No daemon, or one that does not support the listing. | Start the deck, or dispatch with `--single` or `--orchestration <name>`. |
 | A dispatched orchestration is refused because of `.dot-agent-deck` | The project's `.dot-agent-deck` is a symlink or writable by group or other. | See [The orchestrator does not know its workers, or a dispatched orchestration is refused](orchestration.md#the-orchestrator-does-not-know-its-workers-or-a-dispatched-orchestration-is-refused). |

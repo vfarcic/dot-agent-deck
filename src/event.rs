@@ -3396,6 +3396,25 @@ pub struct DispatchSignal {
     /// `changelog.d/1077.breaking.md`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// Issue #2172: the command a single-agent unit runs (`dispatch
+    /// --command`), ahead of the dispatcher's own and every fallback — see
+    /// [`crate::dispatch::resolve_single_unit_launch`].
+    ///
+    /// **Additive optional on the hook socket, so it does NOT move
+    /// [`crate::daemon_protocol::PROTOCOL_VERSION`]**, but it is not safe to
+    /// send to any daemon: one that predates it ignores the unknown key and
+    /// starts the dispatcher's command instead, the opposite of what was asked.
+    /// So a sender includes it (or [`Self::agent`]) only on a connection whose
+    /// [`HookCapabilitiesReply::dispatch_launch`] named [`DISPATCH_LAUNCH`]
+    /// ([`crate::hook::send_dispatch_with_launch`]). Absent, the dispatch is
+    /// byte-for-byte the one an older CLI sends.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Issue #2172: the agent [`Self::command`] launches (`dispatch --agent`),
+    /// by the names a role's `agent = "…"` takes. Alone, the unit runs that
+    /// agent's default command. Same gate as [`Self::command`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -4380,6 +4399,12 @@ pub struct HookCapabilitiesReply {
     /// frontier before Q35-20a.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub editor_frontier: Option<u32>,
+    /// Issue #2172: this daemon honours [`DispatchSignal::command`] and
+    /// [`DispatchSignal::agent`] at this version ([`DISPATCH_LAUNCH`]). The CLI
+    /// sends a dispatch carrying either only on the connection whose answer
+    /// named it, so a daemon that would ignore them gets no dispatch at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_launch: Option<u32>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
@@ -4395,6 +4420,12 @@ pub const COMPOSER_PROBE: u32 = 1;
 /// PRD #1666 part 3 (Q35-12): the version of the post-editor report and its
 /// acknowledgement this build speaks ([`HookCapabilitiesReply::editor_frontier`]).
 pub const EDITOR_FRONTIER: u32 = 1;
+
+/// Issue #2172: the version of a dispatch's chosen launch
+/// ([`DispatchSignal::command`], [`DispatchSignal::agent`]) this build speaks.
+/// A sender requires equality ([`HookCapabilitiesReply::dispatch_launch`]),
+/// never `>=`.
+pub const DISPATCH_LAUNCH: u32 = 1;
 
 /// PRD #1666 part 3 (Q35-12; amendment 3 §3.2, amendment 6 §2.3): what the
 /// editor helper reports after its editor phase, as one line on the
@@ -5487,6 +5518,8 @@ mod tests {
                 shape: None,
                 timestamp: ts,
                 token: None,
+                command: None,
+                agent: None,
             }),
             DaemonMessage::ListTargets(ListTargetsRequest {
                 pane_id: "p".into(),

@@ -189,25 +189,172 @@ pub type DispatcherLaunch = crate::agent_pty::ConfiguredLaunch;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SingleUnitLaunch {
     pub command: String,
-    /// `Some` when `command` is the dispatcher's own, carrying how the
-    /// dispatcher ran it; `None` for the fallbacks, which the spawn starts the
-    /// way it always has.
+    /// `Some` when the launch carries its own agent type and shell: a command
+    /// the dispatch chose ([`ChosenLaunch`]), or the dispatcher's own, carrying
+    /// how the dispatcher ran it. `None` for the fallbacks, which the spawn
+    /// starts the way it always has.
     pub inherited: Option<crate::spawn::InheritedLaunch>,
+}
+
+/// Issue #2172: what a dispatch asked its single unit to run, as the caller
+/// gave it (`dispatch --command`, `--agent`). Both `None` asks for nothing,
+/// and the unit is started exactly as before the flags existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LaunchChoice<'a> {
+    pub command: Option<&'a str>,
+    pub agent: Option<&'a str>,
+}
+
+impl LaunchChoice<'_> {
+    /// Whether the caller chose anything.
+    pub fn is_empty(&self) -> bool {
+        self.command.is_none() && self.agent.is_none()
+    }
+}
+
+/// Issue #2172: a [`LaunchChoice`] resolved to a command and the agent it runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChosenLaunch {
+    pub command: String,
+    pub agent_type: crate::event::AgentType,
+}
+
+/// The longest stretch of a caller-supplied value a refusal quotes back.
+const MAX_QUOTED_CHOICE_CHARS: usize = 120;
+
+fn quote_choice(value: &str) -> String {
+    let mut quoted: String = value.chars().take(MAX_QUOTED_CHOICE_CHARS).collect();
+    if value.chars().count() > MAX_QUOTED_CHOICE_CHARS {
+        quoted.push('…');
+    }
+    quoted
+}
+
+/// Issue #2172: resolve what `dispatch --command` / `--agent` asked for, or
+/// say why it cannot be started. `Ok(None)` when nothing was chosen.
+///
+/// Run twice, with the same answer: by the CLI, so a mistake is refused before
+/// anything reaches the daemon, and by the daemon, which does not trust that
+/// every sender is this CLI.
+///
+/// - `--agent` takes the names a role's `agent = "…"` takes, and an unknown
+///   one is refused with the list of known ones. A role's unknown name is only
+///   a `validate` warning because the file may be shared across deck versions;
+///   here the caller is present to correct it, and a unit started as no agent
+///   would get no readiness or prompt-delivery path.
+/// - `--command` alone must name a known agent's binary directly (`opencode
+///   --model x`); otherwise the deck cannot tell what it starts, for the same
+///   reason a role behind `devbox run <script>` declares one (issue #1243), and
+///   `--agent` is required. Inferring when it can keeps the common case short.
+/// - `--agent` alone runs that agent's default command (`opencode`).
+/// - With both, the declaration wins over what the command looks like, as it
+///   does for a role ([`crate::project_config::OrchestrationRoleConfig::resolved_agent_type`]).
+pub fn resolve_chosen_launch(choice: LaunchChoice<'_>) -> Result<Option<ChosenLaunch>, String> {
+    let declared = match choice.agent.map(str::trim) {
+        None => None,
+        Some("") => return Err("--agent is empty; name an agent, or leave it out".to_string()),
+        Some(name) => match crate::agent_registry::detect_from_basename(name) {
+            Some(agent_type) => Some(agent_type),
+            None => {
+                return Err(format!(
+                    "unknown agent '{}' for --agent; known agents: {}",
+                    quote_choice(name),
+                    crate::agent_registry::declarable_agent_names().join(", ")
+                ));
+            }
+        },
+    };
+    match (choice.command.map(str::trim), declared) {
+        (None, None) => Ok(None),
+        (Some(""), _) => {
+            Err("--command is empty; give the command the unit runs, or leave it out".to_string())
+        }
+        (Some(command), Some(agent_type)) => Ok(Some(ChosenLaunch {
+            command: command.to_string(),
+            agent_type,
+        })),
+        (Some(command), None) => match crate::event::AgentType::from_command(Some(command)) {
+            Some(agent_type) => Ok(Some(ChosenLaunch {
+                command: command.to_string(),
+                agent_type,
+            })),
+            None => Err(format!(
+                "--command '{}' does not name an agent the deck recognises, so say which one it \
+                 starts with --agent <NAME> (one of: {})",
+                quote_choice(command),
+                crate::agent_registry::declarable_agent_names().join(", ")
+            )),
+        },
+        (None, Some(agent_type)) => {
+            match crate::agent_registry::spec(&agent_type).default_command {
+                Some(command) => Ok(Some(ChosenLaunch {
+                    command: command.to_string(),
+                    agent_type,
+                })),
+                // Unreachable for a declarable name today: every shipped agent has
+                // a default command. Refused rather than guessed if one ever lacks it.
+                None => Err(format!(
+                    "agent '{}' has no default command; give one with --command",
+                    crate::agent_registry::spec(&agent_type).label
+                )),
+            }
+        }
+    }
+}
+
+/// Issue #2172: the shape a dispatch takes once it is known whether it chose
+/// its unit's launch. A chosen command or agent describes ONE agent, so it
+/// makes the dispatch single-agent: left to the config, a repo with a default
+/// orchestration would start the team and silently drop the choice. Beside an
+/// explicit orchestration it is refused rather than ignored, for the same
+/// reason; the CLI refuses that combination itself, so only another sender
+/// gets this answer. Without a choice the shape is passed through untouched.
+pub fn shape_for_chosen_launch(
+    chosen: bool,
+    shape: Option<&crate::event::DispatchShape>,
+) -> Result<Option<crate::event::DispatchShape>, String> {
+    match (chosen, shape) {
+        (false, shape) => Ok(shape.cloned()),
+        (true, Some(crate::event::DispatchShape::Orchestration { .. })) => Err(
+            "--command and --agent choose what a single agent runs, and an orchestration's \
+             roles carry their own commands; dispatch with --single, or leave them out"
+                .to_string(),
+        ),
+        (true, _) => Ok(Some(crate::event::DispatchShape::SingleAgent)),
+    }
 }
 
 /// Issue #1602: the command a single-agent unit runs, and as which agent.
 ///
 /// Precedence, first match wins:
 ///
+/// 0. the launch the dispatch itself chose (`dispatch --command` / `--agent`,
+///    issue #2172), with the agent it named or that its command reveals;
 /// 1. an explicit per-project single-unit command — not offered today; when it
 ///    is, it goes ABOVE the dispatcher's command, so a project can override
-///    what every dispatcher in it would otherwise pass on;
+///    what every dispatcher in it would otherwise pass on, and BELOW the
+///    dispatch's own choice;
 /// 2. the dispatching pane's configured command, with its agent type and its
 ///    shell, so a dispatcher started as `devbox run agent` gets units started
 ///    the same way (inside devbox, as Claude Code) rather than as bare
 ///    `claude` under the daemon's environment;
 /// 3. the deck's `default_command`;
 /// 4. `claude`.
+///
+/// Why the dispatch's own choice (0) outranks the per-project slot (1): the
+/// slot is a default for units nobody chose a command for, written once for
+/// every dispatcher in the project, while `--command` is a decision made for
+/// THIS unit by the person (or the dispatcher acting for them) who is present
+/// when it is made. The more specific and more recent choice wins, as a
+/// command-line flag outranks a config file everywhere else in the deck — and
+/// a project slot that won would leave the flag doing nothing in exactly the
+/// projects that set one, with no way to override it short of editing the
+/// shared config. The slot still outranks the dispatcher's command (2), which
+/// is inherited rather than chosen.
+///
+/// A chosen command runs like a role's command does: a command line that needs
+/// a shell runs under `/bin/sh`, not the dispatcher's shell, because it was
+/// chosen for the unit rather than copied from how the dispatcher was started.
 ///
 /// `dispatcher` is `None` for a dispatch no pane asked for (the scheduler,
 /// unit tests) and for a pane started with no command, which skips step 2. So
@@ -217,9 +364,20 @@ pub struct SingleUnitLaunch {
 /// task would then be typed and run as shell input. Steps 3 and 4 carry
 /// nothing: the spawn derives the type from the command, as it always did.
 pub fn resolve_single_unit_launch(
+    chosen: Option<&ChosenLaunch>,
     dispatcher: Option<&DispatcherLaunch>,
     default_command: Option<&str>,
 ) -> SingleUnitLaunch {
+    if let Some(chosen) = chosen {
+        return SingleUnitLaunch {
+            command: chosen.command.clone(),
+            inherited: Some(crate::spawn::InheritedLaunch {
+                agent_type: Some(chosen.agent_type.clone()),
+                shell: crate::agent_pty::command_needs_shell_wrap(&chosen.command)
+                    .then(|| crate::platform::shell::fixed_command_shell("/bin/sh")),
+            }),
+        };
+    }
     if let Some(d) = dispatcher {
         let command = d.command.trim();
         if !command.is_empty() && !opens_an_interactive_shell(command) {
@@ -732,9 +890,29 @@ pub async fn handle_dispatch(
     name: &str,
     task: &str,
     shape: Option<&crate::event::DispatchShape>,
+    launch: LaunchChoice<'_>,
 ) -> DispatchResult {
     let paths = derive_dispatch_paths(&ctx.working_dir, name);
     let clone_dir = ctx.working_dir.clone();
+    let refuse = |message: String| DispatchResult {
+        worktree_dir: paths.worktree_dir.clone(),
+        success: false,
+        message: format!("dispatch: {message}"),
+        unit_id: None,
+    };
+
+    // Issue #2172: a chosen command or agent, validated before any git work so
+    // a mistake leaves nothing behind, and the shape it implies
+    // ([`shape_for_chosen_launch`]).
+    let chosen = match resolve_chosen_launch(launch) {
+        Ok(chosen) => chosen,
+        Err(e) => return refuse(e),
+    };
+    let shape = match shape_for_chosen_launch(chosen.is_some(), shape) {
+        Ok(shape) => shape,
+        Err(e) => return refuse(e),
+    };
+    let shape = shape.as_ref();
 
     // Resolve the shape from the CALLER's repo config, BEFORE any git work.
     //
@@ -751,9 +929,13 @@ pub async fn handle_dispatch(
     // Read by the agent id the daemon captured for this caller, so a pane that
     // changed hands since then contributes nothing rather than its successor's
     // command.
+    //
+    // Issue #2172: not consulted when the dispatch chose its own launch, which
+    // outranks it (`resolve_single_unit_launch`).
     let mut dispatcher_launch = ctx
         .caller
         .as_ref()
+        .filter(|_| chosen.is_none())
         .and_then(|caller| ctx.registry.configured_launch_of(&caller.agent_id));
     // A unit starts at its worktree's root. A dispatcher started below its
     // repository's root with `./agent.sh` would hand its unit a path that names
@@ -769,8 +951,11 @@ pub async fn handle_dispatch(
         );
         dispatcher_launch = None;
     }
-    let single_launch =
-        resolve_single_unit_launch(dispatcher_launch.as_ref(), ctx.default_command.as_deref());
+    let single_launch = resolve_single_unit_launch(
+        chosen.as_ref(),
+        dispatcher_launch.as_ref(),
+        ctx.default_command.as_deref(),
+    );
     let single_command = single_launch.command.clone();
     let caller_config = crate::spawn::load_config_for_dir(&clone_dir);
     // Issue #704: when the caller named no orchestration and the config left the
@@ -1758,6 +1943,7 @@ mod tests {
         use crate::event::AgentType;
         assert_eq!(
             resolve_single_unit_launch(
+                None,
                 Some(&dispatcher("devbox run agent", Some(AgentType::ClaudeCode))),
                 Some("opencode")
             ),
@@ -1770,6 +1956,7 @@ mod tests {
         // A non-Claude dispatcher gets units of its own agent type.
         assert_eq!(
             resolve_single_unit_launch(
+                None,
                 Some(&dispatcher("devbox run codex-big", Some(AgentType::Codex))),
                 None
             )
@@ -1781,13 +1968,17 @@ mod tests {
         let mut sourced = dispatcher("source ./env.sh && claude", None);
         sourced.shell = Some("/bin/bash".to_string());
         assert_eq!(
-            resolve_single_unit_launch(Some(&sourced), None).inherited,
+            resolve_single_unit_launch(None, Some(&sourced), None).inherited,
             inherited(None, Some("/bin/bash"))
         );
         // A dispatcher whose type nobody knows still passes its command on; the
         // spawn then derives the type from it, as it always did.
         assert_eq!(
-            resolve_single_unit_launch(Some(&dispatcher("  ./my-agent  ", None)), Some("opencode")),
+            resolve_single_unit_launch(
+                None,
+                Some(&dispatcher("  ./my-agent  ", None)),
+                Some("opencode")
+            ),
             SingleUnitLaunch {
                 command: "./my-agent".to_string(),
                 inherited: inherited(None, None),
@@ -1811,12 +2002,19 @@ mod tests {
             inherited: None,
         };
         assert_eq!(
-            resolve_single_unit_launch(None, Some("opencode")),
+            resolve_single_unit_launch(None, None, Some("opencode")),
             fallback("opencode")
         );
-        assert_eq!(resolve_single_unit_launch(None, None), fallback(&claude));
         assert_eq!(
-            resolve_single_unit_launch(Some(&dispatcher("   ", Some(AgentType::Codex))), None),
+            resolve_single_unit_launch(None, None, None),
+            fallback(&claude)
+        );
+        assert_eq!(
+            resolve_single_unit_launch(
+                None,
+                Some(&dispatcher("   ", Some(AgentType::Codex))),
+                None
+            ),
             fallback(&claude),
             "a blank dispatcher command must not carry its type onto the fallback"
         );
@@ -1832,12 +2030,170 @@ mod tests {
         ] {
             assert_eq!(
                 resolve_single_unit_launch(
+                    None,
                     Some(&dispatcher(shell, Some(AgentType::ClaudeCode))),
                     Some("opencode")
                 ),
                 fallback("opencode"),
                 "{shell:?} only opens a shell, so the unit must fall back"
             );
+        }
+    }
+
+    fn choice<'a>(command: Option<&'a str>, agent: Option<&'a str>) -> LaunchChoice<'a> {
+        LaunchChoice { command, agent }
+    }
+
+    fn chosen(command: &str, agent_type: crate::event::AgentType) -> ChosenLaunch {
+        ChosenLaunch {
+            command: command.to_string(),
+            agent_type,
+        }
+    }
+
+    /// Issue #2172: what `--command` / `--agent` resolve to. Nothing chosen is
+    /// nothing; a declared agent wins over what the command looks like; a
+    /// command that names an agent's program needs no `--agent`; `--agent`
+    /// alone runs that agent's default command.
+    #[test]
+    fn a_chosen_launch_resolves_to_a_command_and_the_agent_it_runs() {
+        use crate::event::AgentType;
+        assert_eq!(resolve_chosen_launch(LaunchChoice::default()), Ok(None));
+        assert_eq!(
+            resolve_chosen_launch(choice(Some("devbox run oc-big"), Some("opencode"))),
+            Ok(Some(chosen("devbox run oc-big", AgentType::OpenCode))),
+            "a launcher that hides its agent runs as the agent --agent names"
+        );
+        assert_eq!(
+            resolve_chosen_launch(choice(Some("  opencode --model big  "), None)),
+            Ok(Some(chosen("opencode --model big", AgentType::OpenCode))),
+            "a command naming the agent's program needs no --agent, and is trimmed"
+        );
+        assert_eq!(
+            resolve_chosen_launch(choice(Some("codex"), Some("claude"))),
+            Ok(Some(chosen("codex", AgentType::ClaudeCode))),
+            "the declaration wins over what the command looks like, as it does for a role"
+        );
+        for (name, agent_type) in [
+            ("claude", AgentType::ClaudeCode),
+            ("opencode", AgentType::OpenCode),
+            ("pi", AgentType::Pi),
+            ("codex", AgentType::Codex),
+            ("devin", AgentType::Devin),
+        ] {
+            let expected = crate::agent_registry::spec(&agent_type)
+                .default_command
+                .expect("every shipped agent has a default command");
+            assert_eq!(
+                resolve_chosen_launch(choice(None, Some(name))),
+                Ok(Some(chosen(expected, agent_type))),
+                "--agent {name} alone runs that agent's default command"
+            );
+        }
+    }
+
+    /// Issue #2172: the mistakes a chosen launch is refused for, each with a
+    /// message that says how to fix it.
+    #[test]
+    fn a_chosen_launch_is_refused_with_a_reason_the_caller_can_act_on() {
+        let unknown = resolve_chosen_launch(choice(None, Some("opencod"))).unwrap_err();
+        assert!(unknown.contains("'opencod'"), "{unknown}");
+        for name in crate::agent_registry::declarable_agent_names() {
+            assert!(unknown.contains(name), "{unknown} must list {name}");
+        }
+        let hidden = resolve_chosen_launch(choice(Some("devbox run oc-big"), None)).unwrap_err();
+        assert!(
+            hidden.contains("devbox run oc-big") && hidden.contains("--agent"),
+            "a command that hides its agent must ask for --agent: {hidden}"
+        );
+        assert!(
+            resolve_chosen_launch(choice(Some("   "), Some("opencode")))
+                .unwrap_err()
+                .contains("--command is empty")
+        );
+        assert!(
+            resolve_chosen_launch(choice(Some("opencode"), Some(" ")))
+                .unwrap_err()
+                .contains("--agent is empty")
+        );
+        let long = "x".repeat(10_000);
+        let bounded = resolve_chosen_launch(choice(None, Some(&long))).unwrap_err();
+        assert!(
+            bounded.len() < 1_000,
+            "a refusal quotes a bounded stretch of the value: {} bytes",
+            bounded.len()
+        );
+    }
+
+    /// Issue #2172: the dispatch's own choice outranks every other step, the
+    /// dispatcher's command included, and runs as the agent it named, under
+    /// `/bin/sh` when it is a command line (as a role's command does) rather
+    /// than under the dispatcher's shell.
+    #[test]
+    fn a_chosen_launch_outranks_the_dispatchers_command_and_every_fallback() {
+        use crate::event::AgentType;
+        let mut claude_dispatcher = dispatcher("devbox run agent", Some(AgentType::ClaudeCode));
+        claude_dispatcher.shell = Some("/bin/bash".to_string());
+        let pick = chosen("devbox run oc-big", AgentType::OpenCode);
+        assert_eq!(
+            resolve_single_unit_launch(Some(&pick), Some(&claude_dispatcher), Some("pi")),
+            SingleUnitLaunch {
+                command: "devbox run oc-big".to_string(),
+                inherited: inherited(
+                    Some(AgentType::OpenCode),
+                    Some(&crate::platform::shell::fixed_command_shell("/bin/sh"))
+                ),
+            }
+        );
+        // One bare word is exec'd directly, so no shell is pinned for it.
+        assert_eq!(
+            resolve_single_unit_launch(Some(&chosen("codex", AgentType::Codex)), None, None),
+            SingleUnitLaunch {
+                command: "codex".to_string(),
+                inherited: inherited(Some(AgentType::Codex), None),
+            }
+        );
+        // Without a choice, the order below it is untouched.
+        assert_eq!(
+            resolve_single_unit_launch(None, Some(&claude_dispatcher), Some("pi")).command,
+            "devbox run agent"
+        );
+    }
+
+    /// Issue #2172: a chosen launch makes the dispatch single-agent, even
+    /// where the repo's config would open an orchestration, and is refused
+    /// beside an explicit orchestration rather than ignored. Without a choice
+    /// the shape the caller sent is passed through untouched.
+    #[test]
+    fn a_chosen_launch_makes_the_dispatch_single_agent() {
+        use crate::event::DispatchShape;
+        let named = DispatchShape::Orchestration {
+            name: Some("review".into()),
+        };
+        let default = DispatchShape::Orchestration { name: None };
+        for shape in [
+            None,
+            Some(&DispatchShape::SingleAgent),
+            Some(&named),
+            Some(&default),
+        ] {
+            assert_eq!(
+                shape_for_chosen_launch(false, shape),
+                Ok(shape.cloned()),
+                "no choice leaves {shape:?} as it was"
+            );
+        }
+        assert_eq!(
+            shape_for_chosen_launch(true, None),
+            Ok(Some(DispatchShape::SingleAgent))
+        );
+        assert_eq!(
+            shape_for_chosen_launch(true, Some(&DispatchShape::SingleAgent)),
+            Ok(Some(DispatchShape::SingleAgent))
+        );
+        for shape in [&named, &default] {
+            let refused = shape_for_chosen_launch(true, Some(shape)).unwrap_err();
+            assert!(refused.contains("--single"), "{refused}");
         }
     }
 
@@ -2267,6 +2623,7 @@ mod tests {
             "team-unit",
             "Verify PR #232 and report back.",
             Some(&crate::event::DispatchShape::Orchestration { name: None }),
+            LaunchChoice::default(),
         )
         .await;
 
@@ -2437,6 +2794,7 @@ mod tests {
             "refused-unit",
             "Implement PRD #742 end to end.",
             Some(&crate::event::DispatchShape::Orchestration { name: None }),
+            LaunchChoice::default(),
         )
         .await;
 
@@ -2561,6 +2919,7 @@ mod tests {
             "partial-unit",
             "Verify the partial-spawn rollback.",
             Some(&crate::event::DispatchShape::Orchestration { name: None }),
+            LaunchChoice::default(),
         )
         .await;
 
@@ -2673,6 +3032,7 @@ mod tests {
             "doomed-unit",
             "This one never starts an agent at all.",
             Some(&crate::event::DispatchShape::Orchestration { name: None }),
+            LaunchChoice::default(),
         )
         .await;
 
@@ -3024,6 +3384,7 @@ mod tests {
             Some(&crate::event::DispatchShape::Orchestration {
                 name: Some("revew".into()),
             }),
+            LaunchChoice::default(),
         )
         .await;
 
@@ -3046,6 +3407,64 @@ mod tests {
             !branch_exists(tmp.path(), &repo, "agent/dispatch-typo-unit"),
             "no branch may be left behind either"
         );
+    }
+
+    /// Issue #2172: a chosen launch the daemon cannot start — an unknown agent,
+    /// or a choice beside an orchestration — is refused before any git work,
+    /// like a typo'd orchestration name, so it leaves no worktree or branch.
+    #[tokio::test]
+    async fn a_chosen_launch_that_cannot_start_is_refused_without_creating_a_worktree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+
+        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+        let ctx = DispatchContext {
+            working_dir: repo.clone(),
+            registry: Arc::new(AgentPtyRegistry::new()),
+            event_tx,
+            worktrees: new_worktree_registry(),
+            default_command: None,
+            state: None,
+            caller: None,
+        };
+        let orchestration = crate::event::DispatchShape::Orchestration { name: None };
+        for (unit, shape, launch, expected) in [
+            (
+                "unknown-agent",
+                Some(&crate::event::DispatchShape::SingleAgent),
+                choice(Some("devbox run x"), Some("opencod")),
+                "unknown agent",
+            ),
+            (
+                "hidden-agent",
+                None,
+                choice(Some("devbox run x"), None),
+                "--agent",
+            ),
+            (
+                "with-a-team",
+                Some(&orchestration),
+                choice(None, Some("opencode")),
+                "--single",
+            ),
+        ] {
+            let result = handle_dispatch(&ctx, unit, "task", shape, launch).await;
+            assert!(!result.success, "{unit}: {}", result.message);
+            assert!(
+                result.message.starts_with("dispatch: ") && result.message.contains(expected),
+                "{unit}: {}",
+                result.message
+            );
+            assert!(
+                !result.worktree_dir.exists(),
+                "{unit}: no worktree may be created for a refused choice"
+            );
+            assert!(
+                !branch_exists(tmp.path(), &repo, &format!("agent/dispatch-{unit}")),
+                "{unit}: no branch may be left behind either"
+            );
+        }
     }
 
     /// Issue #1396 item 4: `dispatch --orchestration <name>` naming an
@@ -3085,6 +3504,7 @@ mod tests {
             Some(&crate::event::DispatchShape::Orchestration {
                 name: Some("dup".into()),
             }),
+            LaunchChoice::default(),
         )
         .await;
         registry.shutdown_all();
