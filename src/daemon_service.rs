@@ -66,6 +66,13 @@ pub const CARRIED_ENV: &[&str] = &[
     "XDG_STATE_HOME",
 ];
 
+/// Non-path overrides copied verbatim from the installing shell. The daemon's
+/// doorbell switch interprets these values, just as for a shell-started daemon.
+pub const CARRIED_SCALAR_ENV: &[&str] = &[
+    crate::doorbell_switch::CLAUDE_ENV,
+    crate::doorbell_switch::CODEX_ENV,
+];
+
 /// The service manager `daemon install` targets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceManager {
@@ -104,7 +111,7 @@ impl ServiceManager {
         }
     }
 
-    /// The variables carried from the installing shell, beyond
+    /// The path variables carried from the installing shell, beyond
     /// [`CARRIED_ENV`]. systemd sets the service's own `XDG_RUNTIME_DIR`, and
     /// a value from the shell could only be staler than it. launchd sets
     /// neither that nor, reliably, `TMPDIR`, which the sockets fall back to.
@@ -126,9 +133,9 @@ pub struct ServiceSpec {
 /// The environment written into the service: [`IDLE_SHUTDOWN_ENV`], then each
 /// carried variable `lookup` finds set and non-empty, in a fixed order.
 ///
-/// A carried value must be an absolute path: a relative one would resolve
-/// against the service's working directory, not the shell's, and so name a
-/// different socket.
+/// A carried path must be absolute: a relative one would resolve against the
+/// service's working directory, not the shell's, and so name a different socket.
+/// [`CARRIED_SCALAR_ENV`] values are copied verbatim, without path validation.
 pub fn carried_env(
     manager: ServiceManager,
     lookup: impl Fn(&str) -> Option<String>,
@@ -147,6 +154,12 @@ pub fn carried_env(
                  would resolve it from a different directory than this shell does"
             ));
         }
+        env.push((name.to_string(), value));
+    }
+    for name in CARRIED_SCALAR_ENV {
+        let Some(value) = lookup(name).filter(|v| !v.is_empty()) else {
+            continue;
+        };
         env.push((name.to_string(), value));
     }
     Ok(env)
@@ -777,11 +790,23 @@ mod tests {
         }
     }
 
+    fn doorbell_overrides(name: &str) -> Option<String> {
+        match name {
+            "DOT_AGENT_DECK_DOORBELL_CLAUDE" => Some("0".into()),
+            "DOT_AGENT_DECK_DOORBELL_CODEX" => Some("false".into()),
+            _ => None,
+        }
+    }
+
     #[test]
     fn systemd_unit_runs_serve_restarts_on_failure_and_starts_with_the_user_manager() {
-        let unit = render_systemd_unit(&spec()).unwrap();
+        let mut spec = spec();
+        spec.env = carried_env(ServiceManager::Systemd, doorbell_overrides).unwrap();
+        let unit = render_systemd_unit(&spec).unwrap();
         assert!(unit.contains("ExecStart=\"/home/u/.local/bin/dot-agent-deck\" daemon serve\n"));
         assert!(unit.contains("Environment=\"DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0\"\n"));
+        assert!(unit.contains("Environment=\"DOT_AGENT_DECK_DOORBELL_CLAUDE=0\"\n"));
+        assert!(unit.contains("Environment=\"DOT_AGENT_DECK_DOORBELL_CODEX=false\"\n"));
         assert!(unit.contains("Restart=on-failure\n"));
         assert!(!unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target\n"));
@@ -808,11 +833,19 @@ mod tests {
         bad.binary = "/x\nExecStartPre=/bin/evil".into();
         assert!(render_systemd_unit(&bad).is_err());
         assert!(render_launchd_plist(&bad, Path::new("/h")).is_err());
-        let mut bad = spec();
-        bad.env
-            .push(("DOT_AGENT_DECK_SOCKET".into(), "/a\n[Service]".into()));
-        assert!(render_systemd_unit(&bad).is_err());
-        assert!(render_launchd_plist(&bad, Path::new("/h")).is_err());
+        for name in [
+            "DOT_AGENT_DECK_SOCKET",
+            "DOT_AGENT_DECK_DOORBELL_CLAUDE",
+            "DOT_AGENT_DECK_DOORBELL_CODEX",
+        ] {
+            let mut bad = spec();
+            bad.env.push((name.into(), "/a\n[Service]".into()));
+            assert!(render_systemd_unit(&bad).is_err(), "{name}");
+            assert!(
+                render_launchd_plist(&bad, Path::new("/h")).is_err(),
+                "{name}"
+            );
+        }
         assert!(render_launchd_plist(&spec(), Path::new("/h\n")).is_err());
     }
 
@@ -821,7 +854,7 @@ mod tests {
         let plist = render_launchd_plist(
             &ServiceSpec {
                 binary: "/Users/a&b/<bin>/dot-agent-deck".into(),
-                env: spec().env,
+                env: carried_env(ServiceManager::Launchd, doorbell_overrides).unwrap(),
             },
             Path::new("/Users/u"),
         )
@@ -835,6 +868,12 @@ mod tests {
         assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
         assert!(
             plist.contains("<key>DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS</key>\n    <string>0</string>")
+        );
+        assert!(
+            plist.contains("<key>DOT_AGENT_DECK_DOORBELL_CLAUDE</key>\n    <string>0</string>")
+        );
+        assert!(
+            plist.contains("<key>DOT_AGENT_DECK_DOORBELL_CODEX</key>\n    <string>false</string>")
         );
         assert!(plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")));
     }
@@ -863,6 +902,7 @@ mod tests {
             "DOT_AGENT_DECK_SOCKET" => Some(String::new()),
             "TMPDIR" => Some("/var/folders/x/T/".to_string()),
             "DOT_AGENT_DECK_SCHEDULES" => Some("/s/schedules.toml".to_string()),
+            "DOT_AGENT_DECK_DOORBELL_CLAUDE" => Some(String::new()),
             "ANTHROPIC_API_KEY" => Some("secret".to_string()),
             _ => None,
         };

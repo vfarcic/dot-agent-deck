@@ -1800,10 +1800,10 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 #### daemon/service
 
-##### daemon/service/001 — `dot-agent-deck daemon install` writes a unit that runs the installed deck with the idle shutdown off and the shell's endpoint overrides, and enables a running service without stopping or restarting it.
+##### daemon/service/001 — `dot-agent-deck daemon install` writes a unit that runs the installed deck with the idle shutdown off and the shell's endpoint and doorbell overrides, and enables a running service without stopping or restarting it.
 - **Layer:** fast synthetic real-binary-subprocess integration (the REAL CLI as a subprocess in an isolated `HOME`/`XDG_CONFIG_HOME`, with stand-in `systemctl` and `loginctl` on `PATH` that record their calls; no daemon, no PTY, no LLM, no `e2e` feature gate).
 - **Agent:** none.
-- **Asserts:** the unit lands at `$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service`; its one `ExecStart` names the `~/.local/bin` install rather than the cargo artifact it links to; its `Environment` lines are exactly the idle-shutdown `0` and the four endpoint and directory overrides set in the shell (`DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_STATE_DIR`, `XDG_CONFIG_HOME`); `Restart=on-failure` and `WantedBy=default.target`; `systemctl` is asked to `daemon-reload` and `enable` and never to stop, restart, kill or `--now` anything when the service is already active; the lingering advice is printed when `loginctl` reports `no`.
+- **Asserts:** the unit lands at `$XDG_CONFIG_HOME/systemd/user/dot-agent-deck.service`; its one `ExecStart` names the `~/.local/bin` install rather than the cargo artifact it links to; without doorbell overrides its `Environment` lines are exactly the idle-shutdown `0` and the four endpoint and directory overrides set in the shell (`DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_STATE_DIR`, `XDG_CONFIG_HOME`); reinstalls carry both doorbell overrides verbatim (`0`/`false`, then ` ON `/`1`), omit a credential, and remove the saved overrides when empty or unset; `Restart=on-failure` and `WantedBy=default.target`; `systemctl` is asked to `daemon-reload` and `enable` and never to stop, restart, kill or `--now` anything when the service is already active; the lingering advice is printed when `loginctl` reports `no`.
 - **Does not assert:** that systemd accepts the unit or runs it (the PRD's recorded real-systemd verification); the start path (`daemon/service/004`); launchd.
 - **Platform coverage:** linux.
 
@@ -1814,10 +1814,10 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** launchd's unload decision (unit-tested in `daemon_service::tests`).
 - **Platform coverage:** linux.
 
-##### daemon/service/003 — `dot-agent-deck daemon install` refuses a relative endpoint override before writing anything.
+##### daemon/service/003 — `dot-agent-deck daemon install` refuses a relative path override or a doorbell override with a control character before writing anything.
 - **Layer:** fast synthetic real-binary-subprocess integration (as `/001`).
 - **Agent:** none.
-- **Asserts:** a relative `DOT_AGENT_DECK_STATE_DIR` fails the command with an error naming the variable and not clap's usage banner, no unit is written, and `systemctl` is never called.
+- **Asserts:** a relative `DOT_AGENT_DECK_STATE_DIR`, a newline in `DOT_AGENT_DECK_DOORBELL_CLAUDE` or a carriage return in `DOT_AGENT_DECK_DOORBELL_CODEX` fails the command with an error naming the variable and not clap's usage banner, no unit is written, and `systemctl` is never called.
 - **Does not assert:** the other override variables (unit-tested in `daemon_service::tests`).
 - **Platform coverage:** linux.
 

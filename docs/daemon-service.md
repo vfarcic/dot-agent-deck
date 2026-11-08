@@ -46,9 +46,21 @@ sudo loginctl enable-linger "$USER"
 - **`daemon stop` and the TUI's Stop stop it until you start it again.** The service does not undo a deliberate stop. It starts again at your next login (or boot, with lingering), or with `systemctl --user start dot-agent-deck.service`. If you open the TUI, or press **Start daemon** in the desktop app, in the meantime, that starts a daemon of its own, as it does without a service; stop that one before you start the service again.
 - **Where it runs.** The service starts in your home directory, so it reads the same `~/.dot-agent-deck.toml` as a daemon started from a shell there. If the shell that runs `daemon install` sets the socket, state or file locations the daemon uses (`DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_STATE_DIR`, `DOT_AGENT_DECK_SCHEDULES` and the other daemon-side variables in [Paths and endpoints](configuration.md#paths-and-endpoints), `DOT_AGENT_DECK_FEATURES_CONFIG`, `DOT_AGENT_DECK_BIN`, `XDG_CONFIG_HOME` or `XDG_STATE_HOME`), the service gets the same values, so it listens where that shell's clients look and reads the same configuration and schedules. Set them as absolute paths; `daemon install` refuses a relative one.
 
+## Doorbell overrides
+
+`daemon install` also saves non-empty `DOT_AGENT_DECK_DOORBELL_CLAUDE` and `DOT_AGENT_DECK_DOORBELL_CODEX` values from the installing shell in the service, on Linux and macOS. For example, to turn the doorbell off for both agents in a service-started daemon:
+
+```bash
+DOT_AGENT_DECK_DOORBELL_CLAUDE=0 DOT_AGENT_DECK_DOORBELL_CODEX=0 dot-agent-deck daemon install
+```
+
+These overrides win over `doorbell.claude` and `doorbell.codex` in `config.toml`, whether you use the TUI or the desktop app. They accept `0`, `false` or `off` to turn the doorbell off, and `1`, `true` or `on` to turn it on ([Configuration](configuration.md#turn-the-doorbell-off-for-claude-code-or-codex)).
+
+Reinstalling leaves a running daemon unchanged: the updated values apply when systemd next starts the service, or at your next login on macOS. Restarting a service stops its agents, so finish their work first. To return to the config keys, unset the two variables in the installing shell and run `daemon install` again; once the updated service takes effect, those overrides are removed. The config keys are simpler if you want changes to apply to newly started agents without restarting the daemon.
+
 ## Credentials and other environment
 
-A service does not read your shell profile. The daemon takes `PATH` from your login shell when it starts, and nothing else. Anything else the agents need from the environment, such as an `ANTHROPIC_API_KEY`, has to be given to the service, and so does a variable the daemon itself reads that the list in [What the service changes](#what-the-service-changes) leaves out, such as `DOT_AGENT_DECK_DOORBELL_CLAUDE`; for that one, the `doorbell.claude` key in `config.toml` is simpler ([Configuration](configuration.md#turn-the-doorbell-off-for-claude-code-or-codex)). An agent that logs in through its own flow (Claude Code's `/login`, for example) needs nothing here. `daemon install` never writes credentials anywhere.
+A service does not read your shell profile. The daemon takes `PATH` from your login shell when it starts. Beyond the [path settings](#what-the-service-changes) and [doorbell overrides](#doorbell-overrides) saved by `daemon install`, give the service any other environment variables your agents need, such as an `ANTHROPIC_API_KEY`. An agent that logs in through its own flow (Claude Code's `/login`, for example) needs no extra credential environment setting here. `daemon install` does not copy credentials from your shell into the service file.
 
 **Linux:** add them in a drop-in, which `daemon install` does not overwrite:
 

@@ -135,7 +135,7 @@ fn unit_line<'a>(unit: &'a str, prefix: &str) -> Vec<&'a str> {
     unit.lines().filter(|l| l.starts_with(prefix)).collect()
 }
 
-/// Scenario: With the deck installed at `~/.local/bin` in an isolated home, a stand-in `systemctl` that reports the service already active, and sandbox socket overrides set, run `dot-agent-deck daemon install`. It writes the unit under `$XDG_CONFIG_HOME/systemd/user/` running that installed path with the idle shutdown off and the socket overrides carried, enables it without starting or restarting anything, and prints the lingering advice the stand-in `loginctl` calls for.
+/// Scenario: With the deck installed at `~/.local/bin` in an isolated home, a stand-in `systemctl` that reports the service already active, and sandbox socket overrides set, run `dot-agent-deck daemon install`. It writes the unit under `$XDG_CONFIG_HOME/systemd/user/` running that installed path with the idle shutdown off and the socket overrides carried, enables it without starting or restarting anything, and prints the lingering advice the stand-in `loginctl` calls for. Reinstall with doorbell overrides off, on and then empty or unset: the unit carries the non-empty values, removes the previous overrides when cleared, and still leaves the running service alone.
 #[spec("daemon/service/001")]
 #[test]
 fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_running() {
@@ -197,6 +197,34 @@ fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_runni
         vec!["WantedBy=default.target"]
     );
 
+    for (claude, codex) in [("0", "false"), (" ON ", "1")] {
+        let out = sandbox.run(
+            "install",
+            true,
+            &[
+                ("DOT_AGENT_DECK_DOORBELL_CLAUDE", claude),
+                ("DOT_AGENT_DECK_DOORBELL_CODEX", codex),
+                ("ANTHROPIC_API_KEY", "not-a-real-key"),
+            ],
+        );
+        assert!(out.status.success(), "{}", text(&out.stderr));
+        let unit = std::fs::read_to_string(sandbox.unit()).unwrap();
+        for (name, value) in [
+            ("DOT_AGENT_DECK_DOORBELL_CLAUDE", claude),
+            ("DOT_AGENT_DECK_DOORBELL_CODEX", codex),
+        ] {
+            assert!(
+                unit_line(&unit, "Environment=")
+                    .contains(&format!("Environment=\"{name}={value}\"").as_str()),
+                "missing {name}={value}; unit:\n{unit}"
+            );
+        }
+        assert!(!unit.contains("ANTHROPIC_API_KEY"), "{unit}");
+    }
+    let cleared = sandbox.run("install", true, &[("DOT_AGENT_DECK_DOORBELL_CLAUDE", "")]);
+    assert!(cleared.status.success(), "{}", text(&cleared.stderr));
+    assert_eq!(std::fs::read_to_string(sandbox.unit()).unwrap(), unit);
+
     let calls = sandbox.calls();
     assert!(
         calls.contains(&"--user daemon-reload".to_string()),
@@ -245,28 +273,31 @@ fn daemon_service_002_uninstall_removes_the_unit_and_never_stops_the_daemon() {
     );
 }
 
-/// Scenario: Run `dot-agent-deck daemon install` with `DOT_AGENT_DECK_STATE_DIR` set to a relative path. It refuses, naming the variable, before writing a unit or calling `systemctl`, because a service would resolve that path from a different directory than the shell.
+/// Scenario: Run `dot-agent-deck daemon install` with `DOT_AGENT_DECK_STATE_DIR` set to a relative path, then with each doorbell override containing a control character. It refuses each invalid value, naming the variable, before writing a unit or calling `systemctl`.
 #[spec("daemon/service/003")]
 #[test]
 fn daemon_service_003_install_refuses_a_relative_override_before_touching_anything() {
     let sandbox = Sandbox::new();
-    let out = sandbox.run("install", false, &[("DOT_AGENT_DECK_STATE_DIR", "state")]);
-    let stderr = text(&out.stderr);
-    assert!(
-        !out.status.success(),
-        "install accepted a relative override"
-    );
-    assert!(
-        !stderr.contains("Usage:"),
-        "clap did not recognise `daemon install`: {stderr}"
-    );
-    assert!(stderr.contains("DOT_AGENT_DECK_STATE_DIR"), "{stderr}");
-    assert!(!sandbox.unit().exists(), "a unit was written anyway");
-    assert!(
-        sandbox.calls().is_empty(),
-        "systemctl was called: {:?}",
-        sandbox.calls()
-    );
+    for (name, value) in [
+        ("DOT_AGENT_DECK_STATE_DIR", "state"),
+        ("DOT_AGENT_DECK_DOORBELL_CLAUDE", "0\n[Service]"),
+        ("DOT_AGENT_DECK_DOORBELL_CODEX", "false\rEnvironment=evil"),
+    ] {
+        let out = sandbox.run("install", false, &[(name, value)]);
+        let stderr = text(&out.stderr);
+        assert!(!out.status.success(), "install accepted {name}={value:?}");
+        assert!(
+            !stderr.contains("Usage:"),
+            "clap did not recognise `daemon install`: {stderr}"
+        );
+        assert!(stderr.contains(name), "{stderr}");
+        assert!(!sandbox.unit().exists(), "a unit was written anyway");
+        assert!(
+            sandbox.calls().is_empty(),
+            "systemctl was called: {:?}",
+            sandbox.calls()
+        );
+    }
 }
 
 /// Scenario: Run `dot-agent-deck daemon install` with a stand-in `systemctl` that reports loading `dot-agent-deck.service` from `/etc/systemd/user/` rather than from the file the command just wrote. It fails, naming both paths, before enabling or starting anything, instead of starting a unit other than the one it wrote.
