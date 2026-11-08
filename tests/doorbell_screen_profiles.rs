@@ -562,6 +562,135 @@ fn doorbell_036_claude_composer_over_real_frames() {
     assert_claude_corpus_decisions();
 }
 
+/// Scenario: Replay every committed menu capture of Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 at its recorded size and palette, and read the foreground of the main composer's upper rule, the shell-mode glyph and the overview's prompt where each was drawn. Each must be the colour the live acquisition measured for that palette; the live test prints these for the installed release rather than asserting them, because the screen profile reads only which of rule and prompt is in the default colour.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_committed_claude_menu_captures_draw_the_recorded_palettes() {
+    use vt100::Color::{Idx, Rgb};
+
+    // The main composer's upper rule, the shell glyph and the overview's own
+    // prompt glyph, as `doorbell_036_live_release_menu_frames` asserted them
+    // on each recorded release before it measured the installed one.
+    let indexed_dark = (Idx(244), Idx(211), Idx(246));
+    for release in ["2.1.310", "2.1.312", "2.1.317", "2.1.318"] {
+        for (set, (rule, shell, overview)) in [
+            ("24x80", indexed_dark),
+            ("40x120", indexed_dark),
+            ("50x200", indexed_dark),
+            ("light-50x200", (Idx(245), Idx(199), Idx(241))),
+            (
+                "truecolor-dark-50x200",
+                (Rgb(136, 136, 136), Rgb(253, 93, 177), Rgb(153, 153, 153)),
+            ),
+            (
+                "truecolor-light-50x200",
+                (Rgb(138, 138, 138), Rgb(255, 0, 135), Rgb(102, 102, 102)),
+            ),
+            ("dark-ansi-50x200", (Idx(7), Idx(13), Idx(7))),
+            ("light-ansi-50x200", (Idx(7), Idx(5), Idx(8))),
+            ("dark-daltonized-50x200", (Idx(244), Idx(75), Idx(246))),
+        ] {
+            let trace = fixture(&format!("claude-inbox/r5wake/claude-{release}-menus-{set}"));
+            let rows = trace.rows;
+            let foreground = |point: &str, row: u16| {
+                trace
+                    .parser_upto(trace.points[point])
+                    .screen()
+                    .cell(row, 0)
+                    .unwrap()
+                    .fgcolor()
+            };
+            assert_eq!(
+                foreground("empty", rows - 4),
+                rule,
+                "{release} {set} main rule"
+            );
+            assert_eq!(
+                foreground("bang", rows - 3),
+                shell,
+                "{release} {set} shell glyph"
+            );
+            assert_eq!(
+                foreground("overview", rows - 3),
+                overview,
+                "{release} {set} overview prompt"
+            );
+        }
+    }
+}
+
+/// Scenario: Read every committed capture index and measurement summary under `tests/fixtures/claude-inbox/` that names the release it was recorded on and its executable's SHA-256. Each must name the hash of that release's executable as the recorders pinned it before the live measurements moved to the installed release, and each of the four recorded releases must be named somewhere.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_committed_claude_captures_name_their_recorded_executable() {
+    // The recorded releases' executables, as the recorders under
+    // `tests/support/` pinned them until issue #2146.
+    const RECORDED: [(&str, &str); 4] = [
+        (
+            "2.1.310",
+            "b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56",
+        ),
+        (
+            "2.1.312",
+            "4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d",
+        ),
+        (
+            "2.1.317",
+            "eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0",
+        ),
+        (
+            "2.1.318",
+            "708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd",
+        ),
+    ];
+    fn walk(dir: &std::path::Path, found: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, found);
+            } else if path.extension().is_some_and(|e| e == "json") {
+                found.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/claude-inbox"),
+        &mut files,
+    );
+    let mut seen: HashMap<&str, usize> = HashMap::new();
+    for file in &files {
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+        let (Some(release), Some(hash)) = (
+            value["release"].as_str(),
+            value["executable_sha256"]
+                .as_str()
+                .or(value["sha256"].as_str()),
+        ) else {
+            continue;
+        };
+        let pinned = RECORDED
+            .iter()
+            .find(|(recorded, _)| *recorded == release)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{}: a committed capture of {release}, a release with no recorded hash here",
+                    file.display()
+                )
+            });
+        assert_eq!(hash, pinned.1, "{}: {release}", file.display());
+        *seen.entry(pinned.0).or_default() += 1;
+    }
+    for (release, _) in RECORDED {
+        assert!(
+            seen.get(release).is_some_and(|n| *n > 0),
+            "no committed capture names {release}: {seen:?}"
+        );
+    }
+    eprintln!("committed Claude Code captures per recorded executable: {seen:?}");
+}
+
 /// Scenario: Replay the history-recall captures of Claude Code 2.1.317 and 2.1.318 at 50×200 and 24×80: Up from the empty composer draws `─── History i/n` in place of the composer's upper rule over the recalled prompt, Ctrl+U on a recalled prompt draws the plain composer while Claude keeps its history position, and walking straight back to that cleared prompt draws a History rule over a blank box with the cursor at the indent. The profile reads no composer, no readiness and no empty box in any History-ruled frame, and the two releases draw the same rule and prompt rows after the first frame; were the label read as a rule, the blank-slot frame would be the empty ready composer.
 #[spec("inbox/doorbell/036")]
 #[test]

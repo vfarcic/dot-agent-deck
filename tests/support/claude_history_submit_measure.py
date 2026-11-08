@@ -2,9 +2,9 @@
 """Q143b recorder: the deck's line plus Enter after Ctrl+U on a recalled prompt.
 
 Invoked only by the credentialed Rust TUI harness, which writes the committed
-release recorder beside this file as `measure.py`. That recorder is imported,
-not edited, so the file whose SHA-256 the committed fixtures cite stays the
-same; its PINS, private blocking hook and Recorder are used as they are.
+release recorder beside this file as `measure.py`, and imports it for its
+private blocking hook and Recorder. Like it, it measures whichever Claude Code
+`claude` resolves to (issue #2146), recording its release and SHA-256.
 
 HOME, cwd and deck endpoints belong to TuiDeck. Submissions are blocked by the
 private hook before Claude can start a paid model turn. The sole child is
@@ -36,7 +36,7 @@ import termios
 import time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import measure  # noqa: E402  (the committed release recorder, unchanged)
+import measure  # noqa: E402  (the release recorder)
 
 UP, DOWN, CTRL_U, BS = '\x1b[A', '\x1b[B', '\x15', '\x7f'
 # Newest first, as Up recalls them; the seeding below writes them oldest first.
@@ -215,11 +215,8 @@ def main():
     assert home.name == 'home' and home.parent == Path.cwd().resolve(), 'requires TuiDeck private HOME'
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
-    digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert digest in measure.PINS.values(), 'executable pin changed'
+    expected = hashlib.sha256(binary.read_bytes()).hexdigest()
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    expected = measure.PINS[release]
-    assert digest == expected, 'executable pin changed'
     recorder = SubmitRecorder(out, rows, cols)
     recorder.executable, recorder.release, recorder.sha256 = str(binary), release, expected
     recorder.theme, recorder.colorterm = 'dark', None
@@ -266,7 +263,7 @@ def main():
                 break
             time.sleep(.02)
         os.close(fd)
-        assert hashlib.sha256(binary.read_bytes()).hexdigest() == expected, 'executable pin changed'
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == expected, 'the executable changed during the run'
         recorder.save(child, error)
 
 

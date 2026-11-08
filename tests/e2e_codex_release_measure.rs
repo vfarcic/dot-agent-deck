@@ -1,25 +1,27 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
-//! Codex 0.164.0's `head_echo` (PRD #1666 part 3, Q27): the token head alone,
-//! its exact echo, the rest after it, at the deck's own timing, on the real
-//! Codex composer, inside the disposable TUI harness. Each run records with
+//! Codex's `head_echo` (PRD #1666 part 3, Q27): the token head alone, its
+//! exact echo, the rest after it, at the deck's own timing, on the real Codex
+//! composer, inside the disposable TUI harness. Each run measures the Codex
+//! installed on the harness's `PATH` (issue #2146), records with
 //! `tests/support/codex_head_echo_measure.py` and reads the capture back the
-//! way the deck reads its pane (`tests/support/codex_head_echo.rs`).
+//! way the deck reads its pane (`tests/support/codex_head_echo.rs`). The
+//! captures recorded on 0.164.0 stay committed and replayed in the fast tier
+//! (`tests/codex_head_echo_evidence.rs`).
 mod common;
 #[path = "support/codex_head_echo.rs"]
 mod head_echo;
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
+#[path = "support/installed_agent.rs"]
+mod installed;
 #[path = "support/codex_inbox_live.rs"]
 mod live;
 
 use head_echo::{Capture, spread};
+use installed::Installed;
 use spec::spec;
 use std::time::Duration;
-
-/// The release this file measures, and its native executable's SHA-256 (the
-/// recorder refuses any other).
-const RELEASE: &str = "0.164.0";
 
 /// How a run's Codex is set up.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -47,19 +49,18 @@ fn preflight() {
         python.status.success(),
         "the measurement controller requires Python pyte (run inside devbox)"
     );
-    let version = std::process::Command::new("codex")
-        .arg("--version")
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&version.stdout).contains(RELEASE),
-        "this measurement requires Codex {RELEASE} first on PATH: {version:?}"
-    );
 }
 
 /// Runs the recorder in a pane of a fresh harness deck and returns its
 /// capture, kept under `/var/tmp` for export.
-fn record(kind: &str, rows: u16, cols: u16, trials: usize, hooks: Hooks) -> Capture {
+fn record(
+    codex: &Installed,
+    kind: &str,
+    rows: u16,
+    cols: u16,
+    trials: usize,
+    hooks: Hooks,
+) -> Capture {
     let root = tempfile::Builder::new()
         .prefix("dad-codex-head-echo-")
         .tempdir_in("/var/tmp")
@@ -81,7 +82,7 @@ fn record(kind: &str, rows: u16, cols: u16, trials: usize, hooks: Hooks) -> Capt
             "PYTHONPATH",
             std::env::var("PYTHONPATH").unwrap_or_default(),
         )
-        .with_env("PATH", common::path_with_binary_dir())
+        .with_env("PATH", codex.path.clone())
         .with_pty_size(220, 60)
         .with_imported_codex_credentials()
         .with_continue_session("codex-head-echo", command)
@@ -151,7 +152,7 @@ fn record(kind: &str, rows: u16, cols: u16, trials: usize, hooks: Hooks) -> Capt
         capture.result["load_start"]["loadavg"],
         capture.result["load_end"]["loadavg"],
     );
-    assert_eq!(capture.result["release"], RELEASE);
+    codex.assert_recorded(&capture.result, &output);
     assert!(
         capture.result["error"].is_null(),
         "measurement premise differed: {}; {}",
@@ -159,7 +160,8 @@ fn record(kind: &str, rows: u16, cols: u16, trials: usize, hooks: Hooks) -> Capt
         output.display()
     );
     // The recorder hashed the running Codex process's own executable and
-    // refused any but the pinned one (it would have set `error`).
+    // refused any but the one it resolved and hashed at start (it would have
+    // set `error`).
     assert!(
         capture.result["running_executables"]
             .as_array()
@@ -173,13 +175,16 @@ fn record(kind: &str, rows: u16, cols: u16, trials: usize, hooks: Hooks) -> Capt
 
 fn staged(rows: u16, cols: u16, trials: usize, hooks: Hooks) {
     skip_unless!(common::check_codex_available());
+    let Some(codex) = installed::or_skip(installed::codex()) else {
+        return;
+    };
     preflight();
     let kind = if hooks == Hooks::Untrusted {
         "staged-launcher"
     } else {
         "staged"
     };
-    let capture = record(kind, rows, cols, trials, hooks);
+    let capture = record(&codex, kind, rows, cols, trials, hooks);
     let measured = head_echo::staged_trials(&capture);
     assert_eq!(measured.len(), trials);
     // At 50 × 200 Codex draws its width witness from the start, so every
@@ -204,89 +209,92 @@ fn staged(rows: u16, cols: u16, trials: usize, hooks: Hooks) {
     );
 }
 
-/// Scenario: Start real Codex 0.164.0 at 50 × 200 under the deck's own wrapper, with the deck's hooks installed and trusted, and ring it five times the way the deck's staged doorbell does: the eight-character token head alone, then the rest of the line as soon as the composer holds exactly the head, then Enter once it holds exactly the whole line and at least 150 ms after the rest was written, each turn left to end before the next. Read back through the deck's evidence state and screen profile, every trial shows only the placeholder or a prefix of the head until the head is held exactly, within the echo wait, with no dialog; then only prefixes of the line until it is held exactly before the Enter; then the line as a transcript user message within the confirm wait, and Codex's own record holds exactly that prompt once.
+/// Scenario: Start the installed Codex at 50 × 200 under the deck's own wrapper, with the deck's hooks installed and trusted, and ring it five times the way the deck's staged doorbell does: the eight-character token head alone, then the rest of the line as soon as the composer holds exactly the head, then Enter once it holds exactly the whole line and at least 150 ms after the rest was written, each turn left to end before the next. Read back through the deck's evidence state and screen profile, every trial shows only the placeholder or a prefix of the head until the head is held exactly, within the echo wait, with no dialog; then only prefixes of the line until it is held exactly before the Enter; then the line as a transcript user message within the confirm wait, and Codex's own record holds exactly that prompt once.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_large_first() {
+fn doorbell_036_live_codex_head_echo_large_first() {
     staged(50, 200, 5, Hooks::Trusted);
 }
 
-/// Scenario: The same five staged rings on real Codex 0.164.0 at 50 × 200 with trusted hooks, in a second fresh session.
+/// Scenario: The same five staged rings on the installed Codex at 50 × 200 with trusted hooks, in a second fresh session.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_large_second() {
+fn doorbell_036_live_codex_head_echo_large_second() {
     staged(50, 200, 5, Hooks::Trusted);
 }
 
-/// Scenario: The same five staged rings on real Codex 0.164.0 at 50 × 200 with trusted hooks, in a third fresh session.
+/// Scenario: The same five staged rings on the installed Codex at 50 × 200 with trusted hooks, in a third fresh session.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_large_third() {
+fn doorbell_036_live_codex_head_echo_large_third() {
     staged(50, 200, 5, Hooks::Trusted);
 }
 
-/// Scenario: The same five staged rings on real Codex 0.164.0 at 50 × 200 with trusted hooks, in a fourth fresh session.
+/// Scenario: The same five staged rings on the installed Codex at 50 × 200 with trusted hooks, in a fourth fresh session.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_large_fourth() {
+fn doorbell_036_live_codex_head_echo_large_fourth() {
     staged(50, 200, 5, Hooks::Trusted);
 }
 
-/// Scenario: Five staged rings, as in the 50 × 200 runs, on real Codex 0.164.0 at 24 × 80 with trusted hooks, where the line wraps over two composer rows.
+/// Scenario: Five staged rings, as in the 50 × 200 runs, on the installed Codex at 24 × 80 with trusted hooks, where the line wraps over two composer rows.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_small_first() {
+fn doorbell_036_live_codex_head_echo_small_first() {
     staged(24, 80, 5, Hooks::Trusted);
 }
 
-/// Scenario: Five more staged rings on real Codex 0.164.0 at 24 × 80 with trusted hooks, in a second fresh session.
+/// Scenario: Five more staged rings on the installed Codex at 24 × 80 with trusted hooks, in a second fresh session.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_small_second() {
+fn doorbell_036_live_codex_head_echo_small_second() {
     staged(24, 80, 5, Hooks::Trusted);
 }
 
-/// Scenario: Five staged rings on real Codex 0.164.0 at 50 × 200 with every one of the deck's hooks switched off in Codex's own trust records, so Codex runs none of them; each must read exactly as with trusted hooks.
+/// Scenario: Five staged rings on the installed Codex at 50 × 200 with every one of the deck's hooks switched off in Codex's own trust records, so Codex runs none of them; each must read exactly as with trusted hooks.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_hooks_off_first() {
+fn doorbell_036_live_codex_head_echo_hooks_off_first() {
     staged(50, 200, 5, Hooks::Off);
 }
 
-/// Scenario: Five more staged rings on real Codex 0.164.0 at 50 × 200 with the deck's hooks switched off, in a second fresh session.
+/// Scenario: Five more staged rings on the installed Codex at 50 × 200 with the deck's hooks switched off, in a second fresh session.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_hooks_off_second() {
+fn doorbell_036_live_codex_head_echo_hooks_off_second() {
     staged(50, 200, 5, Hooks::Off);
 }
 
-/// Scenario: Start real Codex 0.164.0 at 50 × 200 through a shell launcher the deck's wrapper cannot see into, in a Codex home where the deck's hooks are installed and nothing trusts them, answer Codex's hooks review with "Continue without trusting", and ring it five times as in the trusted runs; each must read exactly as with trusted hooks.
+/// Scenario: Start the installed Codex at 50 × 200 through a shell launcher the deck's wrapper cannot see into, in a Codex home where the deck's hooks are installed and nothing trusts them, answer Codex's hooks review with "Continue without trusting", and ring it five times as in the trusted runs; each must read exactly as with trusted hooks.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_untrusted_first() {
+fn doorbell_036_live_codex_head_echo_untrusted_first() {
     staged(50, 200, 5, Hooks::Untrusted);
 }
 
-/// Scenario: Five more staged rings on real Codex 0.164.0 at 50 × 200 through a shell launcher with the deck's hooks untrusted and Codex's hooks review answered "Continue without trusting", in a second fresh session.
+/// Scenario: Five more staged rings on the installed Codex at 50 × 200 through a shell launcher with the deck's hooks untrusted and Codex's hooks review answered "Continue without trusting", in a second fresh session.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_untrusted_second() {
+fn doorbell_036_live_codex_head_echo_untrusted_second() {
     staged(50, 200, 5, Hooks::Untrusted);
 }
 
 fn controls(rows: u16, cols: u16) {
     skip_unless!(common::check_codex_available());
+    let Some(codex) = installed::or_skip(installed::codex()) else {
+        return;
+    };
     preflight();
-    let capture = record("controls", rows, cols, 0, Hooks::Trusted);
+    let capture = record(&codex, "controls", rows, cols, 0, Hooks::Trusted);
     // The same verdicts the fast tier pins on the committed capture.
     for control in head_echo::checked_controls(&capture) {
         eprintln!("{control:?}");
     }
 }
 
-/// Scenario: On real Codex 0.164.0 at 50 × 200 with trusted hooks, type six token heads alone and delete each with eight deletes; type the first one to seven characters of a head and delete them; type a head and then none, one, ten or forty characters of the rest and delete all of it; type a doorbell-shaped line with another token and an earlier attempt's line and delete them; type three whole lines with the Enter straight after them; and type six staged lines with the Enter asked for 50, 100 or 120 ms after the rest and written once the line has echoed. Read back through the deck's evidence state and screen profile, no write opens a dialog or submits anything but those Enters; each typed text is held exactly before its deletes, where the strict withdrawal recogniser counts the deletes for a whole head and refuses a partial one, a head plus a space and another line, and every delete leaves the placeholder; the three burst Enters are kept and refused for withdrawal, the six after the echo submit, and Codex's own record holds each submitted line once and nothing else doorbell-shaped.
+/// Scenario: On the installed Codex at 50 × 200 with trusted hooks, type six token heads alone and delete each with eight deletes; type the first one to seven characters of a head and delete them; type a head and then none, one, ten or forty characters of the rest and delete all of it; type a doorbell-shaped line with another token and an earlier attempt's line and delete them; type three whole lines with the Enter straight after them; and type six staged lines with the Enter asked for 50, 100 or 120 ms after the rest and written once the line has echoed. Read back through the deck's evidence state and screen profile, no write opens a dialog or submits anything but those Enters; each typed text is held exactly before its deletes, where the strict withdrawal recogniser counts the deletes for a whole head and refuses a partial one, a head plus a space and another line, and every delete leaves the placeholder; the three burst Enters are kept and refused for withdrawal, the six after the echo submit, and Codex's own record holds each submitted line once and nothing else doorbell-shaped.
 #[spec("inbox/doorbell/036")]
 #[test]
-fn doorbell_036_live_codex_164_head_echo_controls() {
+fn doorbell_036_live_codex_head_echo_controls() {
     controls(50, 200);
 }

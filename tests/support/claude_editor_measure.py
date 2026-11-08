@@ -41,12 +41,6 @@ import sys
 import termios
 import time
 
-PINS = {
-    '2.1.310': 'b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56',
-    '2.1.312': '4f4178ce41d83e23341ebfbaecdbcf8ea6bf7baea0690025abe49eeec3a5d01d',
-    '2.1.317': 'eb224419e344575faa4a1f39b290b649425a10cd5ee2ef1d003480cd9ae57eb0',
-    '2.1.318': '708c77b204db30086ff6f1ed34577bda03e1be74ced80557cbf7b54249ebf0bd',
-}
 UNBIND = {'bindings': [{'context': 'Chat', 'bindings': {'ctrl+g': None, 'ctrl+e': 'chat:externalEditor'}}]}
 FORMS = [('bel', '\x07'), ('esc-bel', '\x1b\x07')]
 for _cp in (103, 71):
@@ -513,10 +507,10 @@ def main():
     assert home.name == 'home' and home.parent == Path.cwd().resolve(), 'requires TuiDeck private HOME'
     assert Path(os.environ['DOT_AGENT_DECK_ATTACH_SOCKET']).parent == home.parent, 'requires private endpoint'
     binary = Path(shutil.which('claude')).resolve(strict=True)
+    # Whichever Claude Code `claude` resolves to (issue #2146): its release
+    # and SHA-256 are recorded, and the run fails if it changes meanwhile.
     digest = hashlib.sha256(binary.read_bytes()).hexdigest()
-    assert digest in PINS.values(), 'executable pin changed'
     release = subprocess.check_output([str(binary), '--version'], text=True).split()[0]
-    assert PINS[release] == digest, 'executable pin changed'
     out.mkdir(mode=0o700)
     settings = home / '.claude/settings.json'
     hook = ' '.join(shlex.quote(x) for x in [sys.executable, str(Path(__file__).resolve()), '--block-hook', str(out)])
@@ -534,7 +528,7 @@ def main():
     except Exception as exc:
         error = repr(exc)
     finally:
-        assert hashlib.sha256(binary.read_bytes()).hexdigest() == digest, 'executable pin changed'
+        assert hashlib.sha256(binary.read_bytes()).hexdigest() == digest, 'the executable changed during the run'
         recorder.save(error)
 
 
