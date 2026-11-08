@@ -234,12 +234,14 @@ where
 /// the config path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConfigFile {
-    /// No file: [`BoundedLoad::config`] is the defaults, as intended.
+    /// Nothing at the path, not even a symlink: [`BoundedLoad::config`] is the
+    /// defaults, as intended.
     Absent,
     /// The file was read, and [`BoundedLoad::config`] is what it says.
     Read,
     /// There is a file, but it was not read (not a regular file, over
-    /// [`MAX_DASHBOARD_CONFIG_BYTES`], unreadable), is not valid TOML, or a
+    /// [`MAX_DASHBOARD_CONFIG_BYTES`], unreadable, a link whose target is
+    /// missing), is not valid TOML, or a
     /// setting has the wrong type: [`BoundedLoad::config`] is the defaults,
     /// which may not be what the user wrote.
     Failed,
@@ -572,6 +574,11 @@ pub const MAX_DASHBOARD_CONFIG_BYTES: u64 = crate::project_resolve::MAX_PROJECT_
 /// [`DashboardConfig::load_bounded`]'s read: `Ok(None)` when there is no file,
 /// `Err` with a short reason (no file content) when there is one that is not a
 /// regular file within [`MAX_DASHBOARD_CONFIG_BYTES`] or cannot be read.
+///
+/// Issue #2137 N2: a symlink at `path` whose target is missing (moved, or on a
+/// volume that is not mounted) is a file that cannot be read, not an absent
+/// one: the target may be the config that turned a doorbell off. Only a path
+/// with nothing at it, not even a link, is `Ok(None)`.
 fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -582,7 +589,15 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
     }
     let file = match options.open(path) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let is_link =
+                std::fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink());
+            return if is_link {
+                Err("it is a link whose target is missing".into())
+            } else {
+                Ok(None)
+            };
+        }
         Err(e) => return Err(format!("open failed: {e}")),
     };
     let metadata = file.metadata().map_err(|e| format!("stat failed: {e}"))?;

@@ -14,7 +14,7 @@
 //! (`crate::composer_probe::install::at_spawn`), and the generation keeps the
 //! value for its life, so a change applies to agents started after it. A
 //! `config.toml` that is there but cannot be used (malformed, a wrong-typed
-//! value, too large, unreadable) holds the doorbell off for both agents rather
+//! value, too large, unreadable, a link whose target is missing) holds the doorbell off for both agents rather
 //! than falling back to the default of on: the file may be the one that turned
 //! an agent off, and the variables still win over it. Off,
 //! the generation's verdict is `turned_off` (`NoGo::TurnedOff`), whatever its
@@ -233,6 +233,75 @@ mod tests {
                 DoorbellSwitch {
                     claude: false,
                     codex: true
+                },
+                "{name}: the variable still wins"
+            );
+        }
+    }
+
+    /// Scenario: Read the doorbell switch from a `config.toml` that is a symlink: to a missing target, to a readable file, to a folder, and in a loop, next to a path with nothing at it. Only the path with nothing at it reads as absent and leaves both agents on; a link to a readable file says what the file says; a link whose target is missing, a folder or a loop is a config that is there but can't be used, and holds the doorbell off for both agents, with a variable still winning over it.
+    #[spec("inbox/doorbell/061")]
+    #[cfg(unix)]
+    #[test]
+    fn doorbell_061_a_config_link_whose_target_is_missing_holds_the_doorbell_off() {
+        use crate::config::{ConfigFile, DashboardConfig};
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let none = |_: &str| None;
+        let off = DoorbellSwitch {
+            claude: false,
+            codex: false,
+        };
+
+        let nothing = dir.path().join("nothing.toml");
+        let load = DashboardConfig::load_bounded_status_from(&nothing);
+        assert_eq!(load.file, ConfigFile::Absent, "no file and no link");
+        assert!(load.warnings.is_empty(), "{:?}", load.warnings);
+        assert_eq!(
+            DoorbellSwitch::from_load(&load, none),
+            DoorbellSwitch::default()
+        );
+
+        let file = dir.path().join("dotfiles-deck.toml");
+        std::fs::write(&file, "[doorbell]\nclaude = false\n").unwrap();
+        let to_file = dir.path().join("to-file.toml");
+        symlink(&file, &to_file).unwrap();
+        let load = DashboardConfig::load_bounded_status_from(&to_file);
+        assert_eq!(load.file, ConfigFile::Read, "a link to a readable file");
+        assert_eq!(
+            DoorbellSwitch::from_load(&load, none),
+            DoorbellSwitch {
+                claude: false,
+                codex: true
+            }
+        );
+
+        let dangling = dir.path().join("dangling.toml");
+        symlink(dir.path().join("unmounted/deck.toml"), &dangling).unwrap();
+        let dangling_relative = dir.path().join("dangling-relative.toml");
+        symlink("moved-away.toml", &dangling_relative).unwrap();
+        let chained = dir.path().join("chained.toml");
+        symlink(&dangling, &chained).unwrap();
+        let to_dir = dir.path().join("to-dir.toml");
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        symlink(&folder, &to_dir).unwrap();
+        let looped = dir.path().join("loop-a.toml");
+        let loop_b = dir.path().join("loop-b.toml");
+        symlink(&loop_b, &looped).unwrap();
+        symlink(&looped, &loop_b).unwrap();
+
+        for path in [dangling, dangling_relative, chained, to_dir, looped] {
+            let name = path.file_name().unwrap().to_string_lossy().into_owned();
+            let load = DashboardConfig::load_bounded_status_from(&path);
+            assert_eq!(load.file, ConfigFile::Failed, "{name}");
+            assert_eq!(load.warnings.len(), 1, "{name}: {:?}", load.warnings);
+            assert_eq!(DoorbellSwitch::from_load(&load, none), off, "{name}");
+            assert_eq!(
+                DoorbellSwitch::from_load(&load, |var| (var == CLAUDE_ENV).then(|| "on".into())),
+                DoorbellSwitch {
+                    claude: true,
+                    codex: false
                 },
                 "{name}: the variable still wins"
             );
