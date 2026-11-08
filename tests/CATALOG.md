@@ -10417,8 +10417,8 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 ##### inbox/doorbell/061 — A `config.toml` that is a link to a missing file holds the doorbell off, like any config that is there but can't be used.
 - **Layer:** Fast (`src/doorbell_switch.rs`, `src/config.rs`), temp files and symlinks.
 - **Agent:** none.
-- **Asserts:** the daemon's bounded config read reports a path with nothing at it (no link either) as absent, with no warning, and both agents on; a link to a readable file as read, saying what the file says; and a link whose target is missing (absolute, relative, or reached through a second link), a link to a folder and a link loop each as failed with one warning, holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CLAUDE=on` still turns Claude Code back on over it and leaves Codex off.
-- **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests), the warning's text, a missing folder above `config.toml` (a link at the folder rather than at the file still reads as absent), or `config get` / `config set` through such a link.
+- **Asserts:** the daemon's bounded config read reports a path with nothing at it (no link either), and a path inside a config folder that does not exist (a fresh install), as absent, with no warning, and both agents on; a link to a readable file as read, saying what the file says; and a link whose target is missing (absolute, relative, or reached through a second link), a link to a folder and a link loop each as failed with one warning, holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CLAUDE=on` still turns Claude Code back on over it and leaves Codex off.
+- **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests), the warning's text, a dangling link at the config folder rather than at the file (it still reads as absent), or `config get` / `config set` through such a link.
 - **Platform coverage:** unix (the test creates symlinks).
 
 #### inbox/probe

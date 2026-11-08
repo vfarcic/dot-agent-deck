@@ -239,7 +239,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Read the doorbell switch from a `config.toml` that is a symlink: to a missing target, to a readable file, to a folder, and in a loop, next to a path with nothing at it. Only the path with nothing at it reads as absent and leaves both agents on; a link to a readable file says what the file says; a link whose target is missing, a folder or a loop is a config that is there but can't be used, and holds the doorbell off for both agents, with a variable still winning over it.
+    /// Scenario: Read the doorbell switch from a `config.toml` that is a symlink: to a missing target, to a readable file, to a folder, and in a loop, next to a path with nothing at it and a path inside a config folder that does not exist yet. Only those two read as absent, with no warning, and leave both agents on; a link to a readable file says what the file says; a link whose target is missing, a folder or a loop is a config that is there but can't be used, and holds the doorbell off for both agents, with a variable still winning over it.
     #[spec("inbox/doorbell/061")]
     #[cfg(unix)]
     #[test]
@@ -256,6 +256,16 @@ mod tests {
         let nothing = dir.path().join("nothing.toml");
         let load = DashboardConfig::load_bounded_status_from(&nothing);
         assert_eq!(load.file, ConfigFile::Absent, "no file and no link");
+        assert!(load.warnings.is_empty(), "{:?}", load.warnings);
+        assert_eq!(
+            DoorbellSwitch::from_load(&load, none),
+            DoorbellSwitch::default()
+        );
+
+        // A fresh install: the config folder itself does not exist yet.
+        let first_run = dir.path().join("no-such-dir/config.toml");
+        let load = DashboardConfig::load_bounded_status_from(&first_run);
+        assert_eq!(load.file, ConfigFile::Absent, "a missing config folder");
         assert!(load.warnings.is_empty(), "{:?}", load.warnings);
         assert_eq!(
             DoorbellSwitch::from_load(&load, none),
