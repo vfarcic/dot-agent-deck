@@ -1,0 +1,145 @@
+# Issue #2134 — the release-profile library test tier
+# (scripts/test-release-lib.sh), the RWX counterpart of ci.yml's advisory
+# `release-lib` job, for a pull request whose `.github/ci-backend` says `rwx`.
+#
+# A run definition of its own rather than a task in `.rwx/ci.yml`: RWX reports
+# one status for a run, every task's failure fails it, and `.rwx/ci.yml`'s
+# status, `RWX: linux`, is required, so a task there would block every merge.
+# This file reports `RWX: release-lib`, which no ruleset requires. Making it
+# required is a `REQUIRED_CHECKS` change made with
+# `scripts/apply-branch-protection.sh` (docs/develop/release-lib-tier.md).
+#
+# The setup tasks are copies of `.rwx/ci.yml`'s. scripts/check-pin-lockstep.sh
+# and renovate.json's RWX customManagers read every `.rwx/*.yml`, so the
+# toolchain, nextest and Node pins here are bumped and checked with the others.
+# No tool cache: `.rwx/ci.yml`'s daily cron is what writes the caches, and a
+# cold release build of the lib tests fits in the task's timeout.
+on:
+  github:
+    pull_request:
+      status-checks:
+        name: release-lib
+      init:
+        commit-sha: ${{ event.git.sha }}
+        trigger: pull_request
+        base-sha: ${{ event.github.pull_request.pull_request.base.sha }}
+        author: ${{ event.github.pull_request.pull_request.user.login }}
+  cli:
+    init:
+      commit-sha: ${{ event.git.sha }}
+      trigger: cli
+      base-sha: ""
+      author: ""
+
+base:
+  image: ubuntu:24.04
+  config: rwx/base 1.2.0
+
+defaults:
+  runner:
+    cpus: 4
+    memory: 16gb
+
+tasks:
+  - key: history
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/vfarcic/dot-agent-deck.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+      fetch-full-depth: true
+
+  # `.rwx/ci.yml`'s `backend` task, reduced to what this run reads: whether the
+  # run is active (a pull request runs here only when `.github/ci-backend` says
+  # `rwx`), whether the change is one that builds Rust at all
+  # (scripts/ci-changes.sh, as both CI systems classify it), and the version
+  # the build reports (issue #326).
+  - key: backend
+    use: history
+    env:
+      TRIGGER: ${{ init.trigger }}
+      BASE_SHA: ${{ init.base-sha }}
+      AUTHOR: ${{ init.author }}
+    run: |
+      set -euo pipefail
+      active=true
+      if [ "$TRIGGER" = pull_request ] \
+          && [ "$(tr -d '[:space:]' < .github/ci-backend 2>/dev/null)" != rwx ]; then
+        active=false
+      fi
+      files=""
+      if [ "$TRIGGER" = pull_request ] && [ -n "$BASE_SHA" ]; then
+        if git fetch -q origin "$BASE_SHA" && mb=$(git merge-base "$BASE_SHA" HEAD); then
+          files=$(git diff --no-renames --name-only "$mb" HEAD)
+        fi
+      fi
+      printf '%s' "$files" | scripts/ci-changes.sh "$TRIGGER" "$AUTHOR" > changes.env
+      cat changes.env
+      . ./changes.env
+      put() { printf '%s' "$2" > "$RWX_VALUES/$1"; echo "$1=$2"; }
+      rust=false
+      if [ "$active" = true ] && [ "$devbox_only" != true ] && [ "$flake_only" != true ]; then
+        rust=true
+      fi
+      put rust "$rust"
+      dad_version=""
+      if [ "$rust" = true ]; then
+        dad_version=$(scripts/latest-release-version.sh origin)
+      fi
+      put dad_version "$dad_version"
+
+  - key: system-packages
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    run: |
+      sudo apt-get update
+      sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev \
+        libayatana-appindicator3-dev librsvg2-dev libxdo-dev libasound2-dev \
+        build-essential pkg-config jq
+      sudo apt-get clean
+
+  - key: code
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    call: git/clone 2.2.0
+    with:
+      repository: https://github.com/vfarcic/dot-agent-deck.git
+      ref: ${{ init.commit-sha }}
+      preserve-git-dir: true
+
+  - key: rust
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    call: rust-lang/install 1.1.1
+    with:
+      rust-version: 1.99.0
+
+  - key: nextest
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: rust
+    run: |
+      mkdir -p "$HOME/.cargo/bin"
+      curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
+      cargo nextest --version
+
+  # The Pi extension's Node suites in the lib tier, as in `.rwx/ci.yml`'s
+  # `test`.
+  - key: node
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    call: nodejs/install 1.2.0
+    with:
+      node-version: "26.13.0"
+
+  - key: release-lib
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [system-packages, code, rust, nextest, node]
+    timeout: 45m
+    env:
+      # Issue #326: see the `backend` task.
+      DAD_VERSION: ${{ tasks.backend.values.dad_version }}
+      CARGO_INCREMENTAL: "0"
+    run: scripts/test-release-lib.sh
+    outputs:
+      filesystem: false
+      test-results:
+        - path: target/nextest/default/junit.xml
+          options:
+            language: Rust
+            framework: cargo-nextest
