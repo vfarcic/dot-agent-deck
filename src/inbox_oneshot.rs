@@ -1190,9 +1190,11 @@ pub const MAX_QUEUED_LINES: usize = 8;
 /// XNU's `soreceive` has dropped its lock) and sleep until the deck drops the
 /// stream; a read that times out and reads again sees the end at once. It
 /// bounds that delay only: a timed-out read is never an error or an end, so
-/// every wait lasts exactly as long as it did.
+/// every wait lasts exactly as long as it did, and a line is read when it
+/// arrives rather than at the next poll. A quarter of a second keeps an idle
+/// waiting one-shot to four wakeups a second.
 #[cfg(unix)]
-const READ_POLL: Duration = Duration::from_millis(100);
+const READ_POLL: Duration = Duration::from_millis(250);
 
 /// A socket read with [`READ_POLL`] as its timeout, read again whenever that
 /// timeout ends a read, so it returns only bytes, the end of the stream or
@@ -2566,7 +2568,9 @@ pub(crate) mod tests {
             done_tx.send(()).unwrap();
             (first, after, connection.ended())
         });
-        std::thread::sleep(Duration::from_millis(500));
+        // Every silence is a whole number of polls, so each one spans at
+        // least one timed-out read whatever `READ_POLL` is set to.
+        std::thread::sleep(READ_POLL * 3);
         assert!(
             !waiter.is_finished(),
             "a silent deck ended the wait: the timeout is not read again"
@@ -2576,9 +2580,9 @@ pub(crate) mod tests {
         // lands inside the line.
         let (head, tail) = line.split_at(line.len() / 2);
         deck.write_all(head.as_bytes()).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(READ_POLL * 2);
         deck.write_all(format!("{tail}\n").as_bytes()).unwrap();
-        std::thread::sleep(Duration::from_millis(300));
+        std::thread::sleep(READ_POLL * 2);
         deck.shutdown(std::net::Shutdown::Write).unwrap();
         done_rx
             .recv_timeout(Duration::from_secs(10))
