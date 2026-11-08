@@ -14,8 +14,9 @@
 mod build_version_resolve;
 
 use build_version_resolve::{
-    VersionSource, escape_for_cargo_warning, is_single_line_directive_value, normalize_build_id,
-    normalize_version, resolve_build_id, resolve_version,
+    VersionSource, build_needs_git, escape_for_cargo_warning, git_watch_names,
+    is_single_line_directive_value, normalize_build_id, normalize_version, resolve_build_id,
+    resolve_version,
 };
 
 /// The `Cargo.toml` placeholder, i.e. what a source build wrongly reported
@@ -294,4 +295,49 @@ fn line_protocol_check_rejects_control_characters() {
             "{value:?} must be safe to emit as a cargo: directive value"
         );
     }
+}
+
+/// Issue #2072: git is skipped (no commands, no watched files) only when
+/// neither value can come from it — a valid `DAD_BUILD_ID` injection AND a
+/// version that came from a valid `DAD_VERSION` injection. Any other
+/// combination keeps git, because a checkout can move the sha or the tag.
+#[test]
+fn git_is_needed_unless_both_values_are_validly_injected() {
+    assert!(!build_needs_git(
+        VersionSource::Injected,
+        Some("1.2.3-gabc1234")
+    ));
+    // The build id still comes from git.
+    assert!(build_needs_git(VersionSource::Injected, None));
+    assert!(build_needs_git(VersionSource::Injected, Some("   ")));
+    // An injected build id that fails validation falls through to git.
+    assert!(build_needs_git(VersionSource::Injected, Some("bad\nid")));
+    // The version still comes from a tag, or could once a tag is reachable.
+    assert!(build_needs_git(VersionSource::Git, Some("1.2.3-gabc1234")));
+    assert!(build_needs_git(
+        VersionSource::Placeholder,
+        Some("1.2.3-gabc1234")
+    ));
+}
+
+/// Issue #2072: the watched git files. `logs/HEAD` is what still catches a
+/// commit on a branch whose loose ref file did not exist at the last build,
+/// now that `build.rs` emits only paths that exist; the branch ref comes last
+/// and only when HEAD is on a branch.
+#[test]
+fn git_watch_names_cover_head_reflog_index_packed_refs_and_the_branch_ref() {
+    assert_eq!(
+        git_watch_names(Some("refs/heads/main")),
+        [
+            "HEAD",
+            "logs/HEAD",
+            "index",
+            "packed-refs",
+            "refs/heads/main"
+        ]
+    );
+    assert_eq!(
+        git_watch_names(None),
+        ["HEAD", "logs/HEAD", "index", "packed-refs"]
+    );
 }
