@@ -32071,18 +32071,33 @@ mod spawn_tests {
         );
     }
 
-    /// Issue #2028 (review U2): spawn `sh -c 'sleep 1; exit 7'` on `pane`
-    /// with telemetry capturing, and hold its reader once its exit is
-    /// published and before its telemetry run ends. Returns the agent, its
-    /// removal evidence, and the hold's release, once the reader reached it.
+    /// Issue #2028 (review U2): spawn an agent on `pane` that exits with code
+    /// 7 by itself, with telemetry capturing, and hold its reader once its
+    /// exit is published and before its telemetry run ends. Returns the
+    /// agent, its removal evidence, and the hold's release, once the reader
+    /// reached it and the child has exited.
+    ///
+    /// Issue #2170: the reader's end is the PTY's EOF, and a child closes its
+    /// terminal before it exits, so reaching the hold says nothing about the
+    /// exit. The callers hold the remover before its reap, so the code they
+    /// assert can only be the one the removal kept, and a removal keeps the
+    /// status of a child that had exited by then. So this waits for the exit
+    /// itself, read through the registry while it still holds the record:
+    /// the callers cover a child that exited before its removal, not one
+    /// removed between its EOF and its exit. The agent closes its terminal
+    /// well before it exits, so a caller that removed it on the EOF alone
+    /// would fail on every run, not on one in a few hundred under load.
     async fn natural_exit_held_before_telemetry(
         registry: &Arc<AgentPtyRegistry>,
         pane: &str,
     ) -> (String, Arc<RemovalEvidence>, std::sync::mpsc::Sender<()>) {
         let agent = registry
             .spawn_agent(SpawnOptions {
-                command: Some("sh -c 'sleep 1; exit 7'"),
-                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                command: Some("sleep 1; exec </dev/null >/dev/null 2>/dev/null; sleep 0.3; exit 7"),
+                env: vec![
+                    (DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string()),
+                    ("SHELL".to_string(), "/bin/sh".to_string()),
+                ],
                 ..SpawnOptions::default()
             })
             .expect("spawn a naturally-exiting agent");
@@ -32095,6 +32110,18 @@ mod spawn_tests {
         })
         .await
         .unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        while registry.exit_status_after_eof(&agent, &removal).is_none() {
+            assert!(
+                registry.is_agent_still_registered(&agent),
+                "test prerequisite: nothing removed the generation"
+            );
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "test prerequisite: the child exited"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
         assert!(
             registry.is_agent_still_registered(&agent),
             "test prerequisite: the generation ended by itself"
@@ -32122,7 +32149,7 @@ mod spawn_tests {
         }
     }
 
-    /// Scenario: An agent exits with code 7 by itself, and a close removes its pane while the agent's reader is still on its way to ending the telemetry run. The close is held after it removed the agent and before it terminates and reaps the child, past the reader's exit-code wait; the run must still end as exited with code 7.
+    /// Scenario: An agent closes its terminal and then exits with code 7 by itself, and a close removes its pane while the agent's reader is still on its way to ending the telemetry run. The close is held after it removed the agent and before it terminates and reaps the child, past the reader's exit-code wait; the run must still end as exited with code 7.
     #[spec("telemetry/otlp/010")]
     #[tokio::test(flavor = "multi_thread")]
     async fn otlp_010_a_close_held_before_its_reap_keeps_the_exit_code() {
@@ -32164,7 +32191,7 @@ mod spawn_tests {
         registry.shutdown_all();
     }
 
-    /// Scenario: An agent exits with code 7 by itself, and a respawn of its pane removes it before its reader ends the telemetry run. Once with the respawn held after the removal and before it terminates and reaps the old child, and once with the respawn finished and the successor's run open first; the old run must end as exited with code 7 either way.
+    /// Scenario: An agent closes its terminal and then exits with code 7 by itself, and a respawn of its pane removes it before its reader ends the telemetry run. Once with the respawn held after the removal and before it terminates and reaps the old child, and once with the respawn finished and the successor's run open first; the old run must end as exited with code 7 either way.
     #[spec("telemetry/otlp/010")]
     #[tokio::test(flavor = "multi_thread")]
     async fn otlp_010_a_respawn_after_a_natural_exit_keeps_the_exit_code() {
