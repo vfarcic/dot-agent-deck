@@ -5821,6 +5821,27 @@ without depending on the config struct API.
 - **Does not assert:** that a scheduled (no-pane) single spawn still uses `default_command` — `scheduler/dispatch/004` pins that path, which does not go through `dispatch`; the precedence order itself (`dispatch::tests::a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent`, `…_falls_back_to_default_then_claude`); that the registry keeps the configured command rather than the wrapped exec line (`agent_pty::spawn_tests::configured_launch_of_reports_the_configured_command_and_its_agent`); a real agent or a real `devbox run`.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; the stand-ins are POSIX shell).
 
+##### dispatch/single/002 — `dispatch --command <cmd> --agent opencode` starts a unit whose pane runs `<cmd>` as OpenCode, from a dispatcher running Claude Code (issue #2172).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_dispatch_single.rs`, `TuiDeck` on the `minimal` fixture), the same setup as `dispatch/single/001`, then the REAL `dot-agent-deck dispatch --single --command … --agent opencode` CLI through the deck's hook socket, which asks the daemon whether it honours a chosen launch before sending the dispatch.
+- **Agent:** none. The three shell stand-ins each record `<which>|<cwd>` to one launch log and `exec cat`: the deck's `default_command`, the caller's launcher (announces itself as Claude Code), and the chosen command, a launcher that reveals no agent and never announces one, standing in for `devbox run oc-big`. Not demo-reel-eligible.
+- **Asserts:** the dispatch CLI succeeds; the unit's own pane shows the chosen stand-in's ready marker; the launch log records the chosen command starting in the unit's worktree, and neither the dispatcher's launcher nor the default command starting there; the unit's `ListAgents` record carries `agent_type = open_code`, which only `--agent` could have supplied, since the dispatcher is Claude Code and the chosen stand-in never announces.
+- **Does not assert:** the precedence order itself or the agent-name rules (`dispatch::tests::a_chosen_launch_*`); the refusal from an older daemon (`dispatch/single/003`); a real OpenCode or a real `devbox run`.
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; the stand-ins are POSIX shell).
+
+##### dispatch/single/003 — A dispatch that chose its command or agent is refused, and never sent, when the daemon does not confirm it honours the choice (issue #2172).
+- **Layer:** L2, lane 1 (`tests/e2e_dispatch_single.rs`): the REAL `dot-agent-deck dispatch` CLI pointed at a stand-in hook socket. No deck and no PTY.
+- **Agent:** none. The stand-in answers the capabilities question the way v0.49's daemon does (`task_scoped_completion` and `input_mode_report`, no `dispatch_launch`), acknowledges any `dispatch`, and records every line it reads.
+- **Asserts:** `--command … --agent …`, `--agent` alone and `--command` alone each exit non-zero with a message saying nothing was dispatched and why, and the stand-in reads no `dispatch` line for any of them — so an older daemon cannot start the dispatcher's own command in their place; control, the same dispatch without the flags is sent as before, exits 0, and carries no `command` or `agent` key.
+- **Does not assert:** a real previous-release daemon (the `cross-version` CI job runs one, without the new flags); the gated sender's timing and refusal cases (`hook::gated_send_tests`); that the real daemon advertises the capability (`daemon::…::the_daemon_confirms_a_dispatchs_chosen_launch`).
+- **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; Unix socket stand-in).
+
+##### dispatch/single/004 — A real dispatcher told to dispatch with `--command <launcher> --agent claude` gets a real unit that runs that launcher and does its task (issue #2172).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatch_single_live.rs`, `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]`): a real interactive dispatcher opened through the new-pane form, which runs the real `dispatch` CLI itself.
+- **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree. Not marked `[reel]`.
+- **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's record is Claude Code.
+- **Does not assert:** a unit on a different agent from its dispatcher (that is `dispatch/single/002`, with stand-ins, because the harness runs only Claude Code headless); the dispatcher choosing the flags from a request in plain words (the directive gives it the command line); the completion report back to the dispatcher (`dispatch/return/006`).
+- **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
+
 #### orchestration/roles
 
 ##### orchestration/roles/001 — Discover orchestrators and workers across folders through the roles CLI.

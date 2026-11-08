@@ -7265,6 +7265,10 @@ async fn run_hook_loop_with_limits(
                                         &signal.name,
                                         task,
                                         signal.shape.as_ref(),
+                                        dispatch::LaunchChoice {
+                                            command: signal.command.as_deref(),
+                                            agent: signal.agent.as_deref(),
+                                        },
                                     )
                                     .await;
 
@@ -7412,6 +7416,11 @@ async fn run_hook_loop_with_limits(
                                             crate::input_mode::INPUT_MODE_REPORT,
                                         ),
                                         composer_probe,
+                                        // Issue #2172: a dispatch's chosen
+                                        // command and agent are honoured.
+                                        dispatch_launch: Some(
+                                            crate::event::DISPATCH_LAUNCH,
+                                        ),
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -15617,6 +15626,8 @@ mod hook_ingestion_tests {
             }),
             timestamp: chrono::Utc::now(),
             token: Some(fx.orchestrator_token.clone()),
+            command: None,
+            agent: None,
         });
         let line = format!("{}\n", serde_json::to_string(&msg).unwrap());
         let mut stream = UnixStream::connect(&fx.sock).await.expect("connect");
@@ -21322,6 +21333,42 @@ mod composer_invocation_tests {
         );
         assert_eq!(reply.composer_probe, None, "{answer:?}");
         assert!(crate::hook::confirms_composer_probe(&answer).is_err());
+        drop(stream);
+        deck.stop().await;
+    }
+
+    /// Issue #2172: the daemon's real answer to the capabilities question
+    /// names the chosen dispatch launch, so `dispatch --command` / `--agent`
+    /// is sent to it rather than refused as if it were an older daemon.
+    #[tokio::test]
+    async fn the_daemon_confirms_a_dispatchs_chosen_launch() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (_agent, token) = registry.reserve_spawn_for_test(Some(PANE));
+        let deck = Deck::start(registry).await;
+        let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+            pane_id: PANE.to_string(),
+            token: Some(token),
+        });
+        let mut stream = UnixStream::connect(&deck.sock).await.expect("connect");
+        stream
+            .write_all(format!("{}\n", serde_json::to_string(&question).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        let mut answer = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::io::BufReader::new(&mut stream).read_line(&mut answer),
+        )
+        .await
+        .expect("the daemon answers the question")
+        .unwrap();
+        let reply: HookCapabilitiesReply = serde_json::from_str(answer.trim()).unwrap();
+        assert_eq!(
+            reply.dispatch_launch,
+            Some(crate::event::DISPATCH_LAUNCH),
+            "{answer:?}"
+        );
+        assert_eq!(crate::hook::confirms_dispatch_launch(&answer), Ok(()));
         drop(stream);
         deck.stop().await;
     }

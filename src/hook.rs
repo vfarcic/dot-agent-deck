@@ -2709,6 +2709,70 @@ pub fn confirms_composer_probe(line: &str) -> Result<(), Option<(String, String)
     Err(reply.code.zip(reply.message))
 }
 
+/// Issue #2172: whether a capabilities answer confirms
+/// [`crate::event::DISPATCH_LAUNCH`], by equality. A refusal of the question
+/// comes back with its code and message.
+pub fn confirms_dispatch_launch(line: &str) -> Result<(), Option<(String, String)>> {
+    let Ok(reply) = serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim()) else {
+        return Err(None);
+    };
+    if reply.dispatch_launch == Some(crate::event::DISPATCH_LAUNCH) {
+        return Ok(());
+    }
+    Err(reply.code.zip(reply.message))
+}
+
+/// Issue #2172: send a dispatch that chose its unit's command or agent, only
+/// on a connection whose capabilities answer named
+/// [`crate::event::DISPATCH_LAUNCH`].
+///
+/// A daemon that predates the choice would ignore the two fields and start the
+/// dispatcher's own command, the opposite of what was asked, so it must get no
+/// dispatch at all: it answers the question without the capability (or, older
+/// still, not at all), [`send_gated_at`] withholds the dispatch, and the CLI
+/// says so. A dispatch that chose nothing does not come here; it is sent
+/// exactly as it always was.
+pub fn send_dispatch_with_launch(signal: &crate::event::DispatchSignal) -> Gated {
+    send_dispatch_with_launch_at(
+        &client_socket_path(),
+        signal,
+        GATED_QUESTION_WAIT,
+        SIGNAL_ACK_TIMEOUT,
+    )
+}
+
+/// [`send_dispatch_with_launch`] against an explicit endpoint and deadlines.
+pub fn send_dispatch_with_launch_at(
+    path: &std::path::Path,
+    signal: &crate::event::DispatchSignal,
+    question_wait: std::time::Duration,
+    reply_wait: std::time::Duration,
+) -> Gated {
+    let question =
+        crate::event::DaemonMessage::HookCapabilities(crate::event::HookCapabilitiesRequest {
+            pane_id: signal.pane_id.clone(),
+            token: signal.token.clone(),
+        });
+    let mutation = crate::event::DaemonMessage::Dispatch(signal.clone());
+    let (Ok(question), Ok(mutation)) = (
+        serde_json::to_string(&question),
+        serde_json::to_string(&mutation),
+    ) else {
+        return Gated::NotConfirmed {
+            refusal: None,
+            why: "the request could not be encoded",
+        };
+    };
+    send_gated_at(
+        path,
+        &question,
+        &mutation,
+        confirms_dispatch_launch,
+        question_wait,
+        reply_wait,
+    )
+}
+
 /// PRD #1666 part 3 (Q35): send `request` to the daemon at `path` through
 /// [`send_gated_at`], so it goes only on a connection whose capabilities answer
 /// named [`crate::event::COMPOSER_PROBE`], with no reconnect; `wait`
@@ -7862,5 +7926,127 @@ mod gated_send_tests {
             );
         }
         assert!(!crate::work_done_text::unconfirmed(None, true).contains("note"));
+    }
+
+    fn launch_dispatch() -> crate::event::DispatchSignal {
+        crate::event::DispatchSignal {
+            pane_id: "p".into(),
+            name: "unit".into(),
+            task: Some("t".into()),
+            shape: Some(crate::event::DispatchShape::SingleAgent),
+            token: Some("tok".into()),
+            command: Some("devbox run oc-big".into()),
+            agent: Some("opencode".into()),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    fn send_launch(stub: &Stub) -> Gated {
+        send_dispatch_with_launch_at(
+            &stub.path,
+            &launch_dispatch(),
+            Duration::from_millis(300),
+            Duration::from_millis(500),
+        )
+    }
+
+    fn dispatches(stub: &Stub) -> Vec<String> {
+        std::thread::sleep(Duration::from_millis(100));
+        stub.lines
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .filter(|line| line.contains(r#""message_type":"dispatch""#))
+            .cloned()
+            .collect()
+    }
+
+    /// Issue #2172: a daemon that predates the chosen launch answers the
+    /// capabilities question without `dispatch_launch` (the v0.49 answer
+    /// below), or does not know the question at all and answers nothing. It
+    /// would ignore `command` and `agent` and start the dispatcher's own
+    /// command, so it must get no dispatch: the sender says it did not
+    /// confirm, and the stub never reads one.
+    #[test]
+    fn an_older_daemon_gets_no_dispatch_that_chose_its_launch() {
+        for script in [
+            Script::Answer(
+                r#"{"task_scoped_completion":1,"input_mode_report":1}"#,
+                Duration::ZERO,
+            ),
+            Script::Answer(r#"{"dispatch_launch":2}"#, Duration::ZERO),
+            Script::Answer(r#"{"kind":"signal_ack","accepted":true}"#, Duration::ZERO),
+            Script::Silent,
+            Script::Close,
+        ] {
+            let stub = stub(script);
+            assert!(
+                matches!(
+                    send_launch(&stub),
+                    Gated::NotConfirmed { refusal: None, .. }
+                ),
+                "an unconfirmed launch is withheld"
+            );
+            assert!(
+                dispatches(&stub).is_empty(),
+                "{:?}",
+                stub.lines.lock().unwrap()
+            );
+        }
+    }
+
+    /// Issue #2172: a refused question comes back with the daemon's own code
+    /// and sentence, and no dispatch is sent.
+    #[test]
+    fn a_refused_question_names_the_refusal_and_sends_no_dispatch() {
+        let stub = stub(Script::Answer(
+            r#"{"code":"unknown_token","message":"no such pane"}"#,
+            Duration::ZERO,
+        ));
+        assert_eq!(
+            send_launch(&stub),
+            Gated::NotConfirmed {
+                refusal: Some(("unknown_token".into(), "no such pane".into())),
+                why: "the daemon did not confirm the verb",
+            }
+        );
+        assert!(dispatches(&stub).is_empty());
+    }
+
+    /// Issue #2172: a daemon that names `dispatch_launch` gets the dispatch on
+    /// the same connection, carrying the chosen command and agent.
+    #[test]
+    fn a_daemon_that_confirms_gets_the_dispatch_with_its_launch() {
+        let stub = stub(Script::Answer(
+            r#"{"task_scoped_completion":1,"dispatch_launch":1}"#,
+            Duration::ZERO,
+        ));
+        // The stub reads the dispatch and closes without acknowledging it.
+        assert!(matches!(send_launch(&stub), Gated::Unconfirmed(_)));
+        let sent = dispatches(&stub);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        let message: crate::event::DaemonMessage = serde_json::from_str(&sent[0]).unwrap();
+        let crate::event::DaemonMessage::Dispatch(signal) = message else {
+            panic!("not a dispatch: {}", sent[0]);
+        };
+        assert_eq!(signal.command.as_deref(), Some("devbox run oc-big"));
+        assert_eq!(signal.agent.as_deref(), Some("opencode"));
+        let lines = stub.lines.lock().unwrap();
+        assert_eq!(lines.len(), 1, "one connection carries both: {lines:?}");
+        assert!(lines[0][0].contains("hook_capabilities"), "{lines:?}");
+    }
+
+    /// Issue #2172: a dispatch that chose nothing serializes exactly as one
+    /// from a CLI that predates the fields, so it needs no gate and an older
+    /// daemon reads it as it always did.
+    #[test]
+    fn a_dispatch_that_chose_nothing_carries_no_launch_keys() {
+        let mut signal = launch_dispatch();
+        signal.command = None;
+        signal.agent = None;
+        let json = serde_json::to_string(&crate::event::DaemonMessage::Dispatch(signal)).unwrap();
+        assert!(!json.contains(r#""command":"#), "{json}");
+        assert!(!json.contains(r#""agent":"#), "{json}");
     }
 }

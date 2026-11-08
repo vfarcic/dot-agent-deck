@@ -127,7 +127,9 @@ enum Commands {
     /// the unit started, or that its task reached the agent: the daemon answers
     /// before it does any of that work. Non-zero means the request did not get
     /// that far: no daemon was reachable, the daemon refused it (the reason is
-    /// printed), or the command line itself was unusable.
+    /// printed), or the command line itself was unusable. With --command or
+    /// --agent, no answer is non-zero too, and so is a daemon too old to
+    /// honour them: nothing is dispatched to it.
     ///
     /// What happened arrives afterwards as messages in this agent's inbox: first the
     /// daemon's reply to the dispatch, beginning `dispatch:`. A reply beginning
@@ -174,6 +176,19 @@ enum Commands {
         /// invocation unambiguous.
         #[arg(long, value_name = "NAME")]
         orchestration: Option<String>,
+        /// The command the unit's agent is started with, instead of the one
+        /// this pane was started with (`--command "devbox run oc-big"`). Starts
+        /// ONE agent, as --single does. When the command does not name an
+        /// agent's program directly, say which agent it starts with --agent.
+        /// Mutually exclusive with --orchestration.
+        #[arg(long, value_name = "CMD", conflicts_with = "orchestration")]
+        command: Option<String>,
+        /// The agent the unit runs: claude, opencode, pi, codex or devin. With
+        /// --command, the agent that command starts; alone, that agent's own
+        /// command (`--agent opencode` runs `opencode`). Starts ONE agent, as
+        /// --single does. Mutually exclusive with --orchestration.
+        #[arg(long, value_name = "NAME", conflicts_with = "orchestration")]
+        agent: Option<String>,
         /// Print the spawn targets available in this repo, then exit. Ask the
         /// user which one they want before dispatching.
         ///
@@ -182,7 +197,9 @@ enum Commands {
         /// usage lines reported a unit as started that never existed.
         #[arg(
             long,
-            conflicts_with_all = ["name", "task", "task_file", "single", "orchestration"]
+            conflicts_with_all = [
+                "name", "task", "task_file", "single", "orchestration", "command", "agent"
+            ]
         )]
         list_targets: bool,
     },
@@ -1323,25 +1340,77 @@ fn send_signal_and_report_ack(json: &str, verb: &str, subject: &str) -> ExitCode
             ExitCode::FAILURE
         }
         SocketReply::NoReply => ExitCode::SUCCESS,
-        SocketReply::Line(line) => match parse_signal_ack(&line) {
-            Some(ack) if !ack.accepted => {
-                // The daemon's sentence carries the remedy; the code is the word
-                // it also put in its own `warn!` line, so an operator reading
-                // both has one string to grep for.
-                eprintln!(
-                    "Error: the daemon did not accept this {subject}: {}{}",
-                    ack.error.as_deref().unwrap_or(
-                        "refused, and the daemon gave no reason this build understands."
-                    ),
-                    ack.reason
-                        .as_deref()
-                        .map(|r| format!(" [{r}]"))
-                        .unwrap_or_default()
-                );
-                ExitCode::FAILURE
-            }
-            _ => ExitCode::SUCCESS,
-        },
+        SocketReply::Line(line) => report_signal_ack_line(&line, subject),
+    }
+}
+
+/// What a signal's acknowledgement line means for the exit status: only a
+/// recognisable refusal fails (see [`parse_signal_ack`] for why anything else
+/// reads as success).
+fn report_signal_ack_line(line: &str, subject: &str) -> ExitCode {
+    match parse_signal_ack(line) {
+        Some(ack) if !ack.accepted => {
+            // The daemon's sentence carries the remedy; the code is the word
+            // it also put in its own `warn!` line, so an operator reading
+            // both has one string to grep for.
+            eprintln!(
+                "Error: the daemon did not accept this {subject}: {}{}",
+                ack.error
+                    .as_deref()
+                    .unwrap_or("refused, and the daemon gave no reason this build understands."),
+                ack.reason
+                    .as_deref()
+                    .map(|r| format!(" [{r}]"))
+                    .unwrap_or_default()
+            );
+            ExitCode::FAILURE
+        }
+        _ => ExitCode::SUCCESS,
+    }
+}
+
+/// Issue #2172: the words `dispatch --command` / `--agent` prints when the
+/// daemon did not confirm it honours them, so nothing was sent.
+const DISPATCH_LAUNCH_UNSUPPORTED: &str = "Error: nothing was dispatched: this deck's daemon did \
+     not confirm that it can start a unit with a chosen --command or --agent. An older daemon \
+     would ignore them and start this pane's own command instead, so the dispatch was not sent. \
+     Use them once the deck's daemon runs this version, or dispatch without them.";
+
+/// Issue #2172: what `dispatch` reports for a dispatch that chose its unit's
+/// command or agent, sent through
+/// [`dot_agent_deck::hook::send_dispatch_with_launch`].
+///
+/// The cases differ from [`send_signal_and_report_ack`]'s in one way that
+/// matters: no answer is a FAILURE here, not a success. There, silence is
+/// what a daemon predating acknowledgements sends; here, the daemon has
+/// already said it is new enough to acknowledge, so silence means the
+/// dispatch may or may not have been taken, and the caller is told to look
+/// for the daemon's `dispatch:` reply before trying again.
+fn report_dispatch_with_launch(sent: dot_agent_deck::hook::Gated) -> ExitCode {
+    use dot_agent_deck::hook::Gated;
+    match sent {
+        Gated::NotConfirmed {
+            refusal: Some((code, message)),
+            ..
+        } => {
+            eprintln!("Error: the daemon did not accept this dispatch: {message} [{code}]");
+            ExitCode::FAILURE
+        }
+        Gated::NotConfirmed { why, .. } => {
+            eprintln!("{DISPATCH_LAUNCH_UNSUPPORTED}");
+            eprintln!("({why})");
+            ExitCode::FAILURE
+        }
+        Gated::Unconfirmed(why) => {
+            eprintln!(
+                "Error: the dispatch was sent, but the daemon's acknowledgement did not arrive, \
+                 so it may or may not have started. Wait for a `dispatch:` reply in this pane \
+                 before dispatching it again."
+            );
+            eprintln!("({why})");
+            ExitCode::FAILURE
+        }
+        Gated::Reply(line) => report_signal_ack_line(&line, "dispatch"),
     }
 }
 
@@ -1792,6 +1861,8 @@ fn main() -> ExitCode {
             task_file,
             single,
             orchestration,
+            command,
+            agent,
             list_targets,
         }) => {
             let pane_id = match std::env::var(DOT_AGENT_DECK_PANE_ID) {
@@ -1865,6 +1936,17 @@ fn main() -> ExitCode {
                     eprintln!("Error: a dispatch name is required.");
                     return ExitCode::FAILURE;
                 };
+                // Issue #2172: a chosen command or agent is checked here, before
+                // the task is read or the daemon is asked anything, with the same
+                // rule the daemon applies, so a typo'd agent name costs nothing.
+                let launch = dot_agent_deck::dispatch::LaunchChoice {
+                    command: command.as_deref(),
+                    agent: agent.as_deref(),
+                };
+                if let Err(e) = dot_agent_deck::dispatch::resolve_chosen_launch(launch) {
+                    eprintln!("Error: {e}");
+                    return ExitCode::FAILURE;
+                }
                 let task_text = match resolve_task(task, task_file, std::io::stdin().lock()) {
                     Ok(t) => t,
                     Err(e) => {
@@ -1880,7 +1962,11 @@ fn main() -> ExitCode {
                 // otherwise travels to the daemon with its whitespace, fails the exact
                 // name comparison, and is refused with "no orchestration named 'review ';
                 // available: review" — after a full worktree round trip.
-                let shape = match (single, orchestration) {
+                //
+                // Issue #2172: a chosen command or agent describes one agent, so
+                // it makes the dispatch `--single` (clap refuses it beside
+                // `--orchestration`).
+                let shape = match (single || !launch.is_empty(), orchestration) {
                     (true, _) => Some(dot_agent_deck::event::DispatchShape::SingleAgent),
                     (false, Some(n)) => Some(dot_agent_deck::event::DispatchShape::Orchestration {
                         name: {
@@ -1901,7 +1987,14 @@ fn main() -> ExitCode {
                     shape,
                     timestamp: chrono::Utc::now(),
                     token: dot_agent_deck::hook_provenance::token_from_env(),
+                    command: command.as_deref().map(|c| c.trim().to_string()),
+                    agent: agent.as_deref().map(|a| a.trim().to_string()),
                 };
+                if !launch.is_empty() {
+                    return report_dispatch_with_launch(
+                        dot_agent_deck::hook::send_dispatch_with_launch(&signal),
+                    );
+                }
                 let msg = dot_agent_deck::event::DaemonMessage::Dispatch(signal);
                 let json = match serde_json::to_string(&msg) {
                     Ok(j) => j,
@@ -4551,6 +4644,8 @@ mod tests {
             vec!["unit", "--task", "t"],
             vec!["--single"],
             vec!["--orchestration=review"],
+            vec!["--command", "opencode"],
+            vec!["--agent", "opencode"],
         ] {
             let mut argv = vec!["dot-agent-deck", "dispatch", "--list-targets"];
             argv.extend(extra.iter().copied());
@@ -4590,6 +4685,47 @@ mod tests {
             .is_err(),
             "--single and --orchestration must conflict"
         );
+    }
+
+    /// Issue #2172: `--command` and `--agent` choose what ONE agent runs, so
+    /// each is refused beside `--orchestration`, whose roles carry their own
+    /// commands, and either parses with or without `--single`.
+    #[test]
+    fn dispatch_command_and_agent_parse_and_refuse_an_orchestration() {
+        for flag in [["--command", "devbox run oc-big"], ["--agent", "opencode"]] {
+            let mut argv = vec![
+                "dot-agent-deck",
+                "dispatch",
+                "unit",
+                "--orchestration=review",
+            ];
+            argv.extend(flag);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{flag:?} must conflict with --orchestration"
+            );
+        }
+        for single in [false, true] {
+            let mut argv = vec![
+                "dot-agent-deck",
+                "dispatch",
+                "unit",
+                "--command",
+                "devbox run oc-big",
+                "--agent",
+                "opencode",
+            ];
+            if single {
+                argv.push("--single");
+            }
+            let Some(Commands::Dispatch { command, agent, .. }) =
+                Cli::try_parse_from(argv).expect("parses").command
+            else {
+                panic!("expected the Dispatch subcommand");
+            };
+            assert_eq!(command.as_deref(), Some("devbox run oc-big"));
+            assert_eq!(agent.as_deref(), Some("opencode"));
+        }
     }
 
     /// `--list-targets` is the one form that needs no name; every other form does,
