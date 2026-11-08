@@ -11745,7 +11745,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 ##### inbox/status/007 — A narrow card retains inbox badge, status and tools within its width budget.
 - **Layer:** L1 (`tests/render_dashboard.rs`), Compact 20-column TestBackend + insta.
 - **Agent:** none.
-- **Asserts:** ✉2, Thinking and 14 tools remain visible without exceeding 20 cells per row.
+- **Asserts:** ✉2, Thinking and 14 tools remain visible without exceeding 20 cells per row; the count sits at the right end of the Dir row (`inbox/status/037`) and the top border carries the status alone.
 - **Does not assert:** desktop CSS layout.
 - **Platform coverage:** all.
 
@@ -11956,6 +11956,55 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Agent:** none.
 - **Asserts:** a `cannot_check` hold told with a detail (a writable directory and its path) against a waiting message is broadcast in a wake update and shown in the summary with that detail; the same hold and detail told again sends nothing; a suspension shown in front of the hold hides the detail until the suspension ends; another hold drops the detail from both, and a detail told with a hold other than `cannot_check` isn't kept; the agent exiting clears hold and detail in one wake update.
 - **Does not assert:** where the detail comes from (`inbox/probe/091`), or how a client renders it (`inbox/status/034`'s card cases and the shared fixture).
+- **Platform coverage:** all.
+
+##### inbox/status/037 — The inbox line moves to the right end of the Dir row where it would cut the card's title, and the title keeps its width.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render from the daemon's record seam at every density, 40 columns.
+- **Agent:** none.
+- **Asserts:** the top-border row of a card named `reviewer` and of one named `orchestrator` is byte-for-byte the same with no inbox line, with `✉ delivered` and with `✉2 queued`, the status chip carries no inbox line, the line is the last thing on the Dir row, the card has the rows it had, and no row below the Dir row differs from the card with no line.
+- **Does not assert:** a card narrower or wider than 40 columns (`inbox/status/038`, `inbox/status/039`), the desktop tile, or the words, which `inbox/status/006` and the shared fixture pin.
+- **Platform coverage:** all.
+
+##### inbox/status/038 — The directory is cut before the inbox line loses a word, and the line degrades from its words to the count to the top border.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render, 40, 24, 18, 13 and 12 columns.
+- **Agent:** none.
+- **Asserts:** with a directory too long for the Dir row beside `✉ delivered`, the directory ends in `…` and keeps its `Dir:  ` label while the line keeps all its words; with two queued messages the Dir row carries `✉2 queued`, then the bare `✉2`, then, where not even the count fits beside the label and a character of the directory, the line stays in the top border as it did before, and where it never fitted it shows nowhere; every row is exactly as wide as the card.
+- **Does not assert:** wide-character directories (`inbox/status/041`).
+- **Platform coverage:** all.
+
+##### inbox/status/039 — The inbox line stays in the top border where it cannot or need not move.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render, 80 columns and 40 columns at Minimal density.
+- **Agent:** none.
+- **Asserts:** at 80 columns, where the whole title fits beside the line, the top border and the Dir row are as they were; a Minimal card whose Blocked reason takes the Dir row's place keeps `✉2 queued` in the top border and cuts the title as before; a card with no agent draws no inbox line.
+- **Does not assert:** the orchestrator seat's card (`inbox/status/040`).
+- **Platform coverage:** all.
+
+##### inbox/status/040 — The orchestrator seat's ORCHESTRATOR word and the inbox line each keep the row they had.
+- **Layer:** Fast (`src/ui.rs`), `render_session_card` into a TestBackend with the seat flag the L1 card seams do not expose.
+- **Agent:** none.
+- **Asserts:** with room for the title, the word and the line, nothing moves; where the line would cut the title it moves to the Dir row, the title is whole and the word keeps its row of its own; where the word's row is a Minimal card's only row the line stays in the top border; and moving the line never changes which rows the card has, so the word keeps its row even where the title would then have room for it.
+- **Does not assert:** the orchestrator seat through the attached TUI (`orchestration/roles/002`).
+- **Platform coverage:** all.
+
+##### inbox/status/041 — Placing the inbox line on the Dir row cannot panic or overrun, at any width.
+- **Layer:** Fast (`src/ui.rs`), the card renderer and the Dir row's two helpers.
+- **Agent:** none.
+- **Asserts:** cards with a queued, delivered or stalled line, with no directory, a wide-character one and a plain one, as the seat or not, at every density and every width from 0 to 90, draw without panicking and draw the line at most once; the Dir row offers the full words, then the count, then nothing, at exact column boundaries, counting a wide first character as two columns and the `…`; the row it draws is never wider than asked, in drawn columns.
+- **Does not assert:** which of those cards moved the line, which `inbox/status/037` to `040` pin.
+- **Platform coverage:** all.
+
+##### inbox/status/042 — A directory's name cannot pass for the inbox line on the Dir row.
+- **Layer:** L1 (`tests/render_dashboard.rs`), TestBackend card render, 40 columns, with the cells' styles read.
+- **Agent:** none.
+- **Asserts:** on the Dir row the line is bold and the label, the directory and the padding are not; a directory named like the line shows `?` for the envelope glyph and the card shows one glyph; each bidi formatting character in a directory name is dropped from the row; where the line stays in the top border (80 columns), the directory is drawn as it is.
+- **Does not assert:** look-alike glyphs other than the envelope, or the directory text on a Dir row with no inbox line.
+- **Platform coverage:** all.
+
+##### inbox/status/043 — A line the top border showed before it could move to the Dir row is still shown somewhere.
+- **Layer:** Fast (`src/ui.rs`), the card renderer against `card_inbox_badge`, every density, widths 5 to 90.
+- **Agent:** none.
+- **Asserts:** for queued, delivered, stalled and uncertain lines, in Idle and Blocked, for the seat or not, with a short and a long name, every card whose top border would have carried a line carries one in the top border or on the Dir row.
+- **Does not assert:** where the line is (`inbox/status/037` to `040`), or that a line hidden before now shows.
 - **Platform coverage:** all.
 
 ##### inbox/claude/001 — Supported Claude installs one status handler and one day-long native waiter per managed event.
