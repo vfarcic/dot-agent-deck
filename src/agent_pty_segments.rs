@@ -980,6 +980,32 @@ pub(super) fn probe_ended(
     }
 }
 
+/// How a due attempt that admission refused when it was scheduled counts on
+/// the schedule. A refusal for the screen alone (`Surface`: every earlier
+/// conjunct passed, but the frame didn't show the composer) makes the next
+/// attempt due soon and counts a failure only for every
+/// [`crate::composer_probe::probe::SURFACE_PER_FAILURE`]th in a row
+/// (`Schedule::surface`, #2147): after a person's key the agent is usually
+/// still drawing, and the attempt it makes due is admitted only if the
+/// screen then shows the composer. Every other refusal counts, as before. A
+/// lapse retry's refusal counts nothing here: its asker decides.
+#[cfg(target_os = "linux")]
+pub(super) fn scheduling_refused(
+    input: &crate::composer_probe::epoch::GenerationInput,
+    refusal: crate::composer_probe::admission::Refusal,
+    ask: ProbeAsk,
+    now: Instant,
+) {
+    if ask == ProbeAsk::Lapse {
+        return;
+    }
+    if refusal == crate::composer_probe::admission::Refusal::Surface {
+        input.probe_surface(now);
+    } else {
+        input.probe_failed(now);
+    }
+}
+
 /// Whether a probe the writer refused at its arm section counts as a failed
 /// attempt on the schedule (A-20d-11). The screen's freshness refusal
 /// (`Admission(Surface)` at the writer) doesn't, by itself: the probe passed
@@ -1151,7 +1177,7 @@ impl AgentPtyRegistry {
     /// supersedes its lapsed probe and asks admission for that. Admission is
     /// asked when it is scheduled, with the facts read there, and again on
     /// the writer thread at the arm section, with the writer's own boundary.
-    /// A due attempt refused counts as a failure on the schedule. Answers
+    /// A due attempt refused counts on the schedule ([`scheduling_refused`]). Answers
     /// once the job was refused, taken back or written, not after the
     /// helper's completion.
     #[cfg(target_os = "linux")]
@@ -1266,9 +1292,7 @@ impl AgentPtyRegistry {
                 ?widths,
                 "probe refused when scheduled"
             );
-            if ask != ProbeAsk::Lapse {
-                input.probe_failed(now);
-            }
+            scheduling_refused(&input, refusal, ask, now);
             return ProbeOutcome::Refused(format!("{refusal:?}"));
         }
         let (number, job) = match input.segment_open_probe(status.held_ops > 0, now) {
@@ -1469,7 +1493,8 @@ pub(crate) fn tick_probe(
 impl AgentPtyRegistry {
     /// PRD #1666 part 3 (Q35-21): whether the last check the deck tried on
     /// generation `agent_id` failed (refused, lapsed or uncertain) and the
-    /// schedule is backing off before the next: the card then says the deck
+    /// schedule is waiting before the next, a short recheck after a refusal
+    /// for the screen alone included (#2147): the card then says the deck
     /// can't check the box, rather than that a check read it non-empty.
     /// `false` for a generation with no segments.
     pub(crate) fn composer_probe_failing(&self, agent_id: &str) -> bool {
@@ -1480,7 +1505,7 @@ impl AgentPtyRegistry {
                 .get(agent_id)
                 .map(|agent| Arc::clone(agent.bus.input()))
         };
-        input.is_some_and(|input| input.has_segments() && input.probe_retrying())
+        input.is_some_and(|input| input.has_segments() && input.probe_failing())
     }
 
     /// The revcxact review's MEDIUM-2: generation `agent_id`'s pane width
@@ -2141,6 +2166,140 @@ mod tests {
             !input.probe_due(now + BACKOFF[0]),
             "non-empty: its recheck waits on the box, not the failure's backoff"
         );
+    }
+
+    /// The doorbell tick's decisions from `from` on, one every
+    /// [`crate::doorbell::DEFAULT_TICK`], up to `limit` later: the first
+    /// instant it asks a probe, if any.
+    #[cfg(target_os = "linux")]
+    fn next_ask(
+        input: &crate::composer_probe::epoch::GenerationInput,
+        status: crate::composer_probe::gate::Status,
+        from: Instant,
+        limit: Duration,
+    ) -> Option<(Instant, ProbeAsk)> {
+        let tick = crate::doorbell::DEFAULT_TICK;
+        (1..)
+            .map(|n| from + tick * n)
+            .take_while(|t| *t <= from + limit)
+            .find_map(|t| match tick_probe(input, status, t) {
+                TickProbe::Ask(ask) => Some((t, ask)),
+                _ => None,
+            })
+    }
+
+    /// Scenario: A person's key touches the box and the doorbell tick asks the first check, which is refused when scheduled because the frame doesn't show the input box yet (the agent is still redrawing). The card says the deck can't check the box, and the tick asks the next check within five seconds rather than after the first backoff step. For Claude, that check is written and lapses with no helper seen, as under load: the lapse is the first failure, so the next retry is due one backoff step (30 s) after it, not two (#2147).
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/101")]
+    #[test]
+    fn probe_101_a_screen_refusal_when_scheduled_is_rechecked_within_seconds() {
+        use crate::composer_probe::admission::Refusal;
+        use crate::composer_probe::epoch::Writer;
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::probe::BACKOFF;
+        use crate::composer_probe::query_ledger::T_TRIGGER;
+        use crate::composer_probe::segments::Agent;
+        // The bound for the check after a transient screen refusal: inside
+        // the doorbell's first re-ring (15 s), so a refusal while the agent
+        // redraws costs no more than one ring interval. Observed under load
+        // (#2147): the refusal came 165 ms after the person's Ctrl+C, and
+        // the next check, 30 s later, found the frame healthy.
+        const RECOVERY: Duration = Duration::from_secs(5);
+        let tick = crate::doorbell::DEFAULT_TICK;
+        let horizon = Duration::from_secs(15 * 60);
+        let fenced = Status {
+            fenced: true,
+            ..Status::default()
+        };
+        let t0 = Instant::now();
+        for agent in [Agent::Claude, Agent::Codex] {
+            let input = live(agent);
+            input.enqueue(Writer::Human, b"x");
+            assert_eq!(
+                tick_probe(&input, Status::default(), t0),
+                TickProbe::Ask(ProbeAsk::First),
+                "{agent:?}: a touched box is checked"
+            );
+            scheduling_refused(&input, Refusal::Surface, ProbeAsk::First, t0);
+            assert!(
+                input.probe_failing(),
+                "{agent:?}: the card says the deck can't check the box"
+            );
+            let (t1, _) =
+                next_ask(&input, Status::default(), t0, horizon).expect("a check is asked again");
+            assert!(
+                t1 - t0 <= RECOVERY,
+                "{agent:?}: the check after a screen refusal waited {:?}, past {RECOVERY:?}",
+                t1 - t0
+            );
+            if agent != Agent::Claude {
+                continue;
+            }
+            // The frame is healthy now: the check is written, and lapses.
+            let (number, _) = input.segment_open_probe(false, t1).unwrap();
+            input.segment_written(number, 0, t1, t1).unwrap();
+            let (t2, ask) = next_ask(&input, fenced, t1, horizon).expect("the lapse is retried");
+            assert_eq!(ask, ProbeAsk::Lapse);
+            let bound = T_TRIGGER + BACKOFF[0] + tick * 2;
+            assert!(
+                t2 - t1 <= bound,
+                "the retry after the lapse waited {:?} from the write, past {bound:?}: \
+                 the screen refusal was counted as a failure before it",
+                t2 - t1
+            );
+        }
+    }
+
+    /// Scenario: The frame never shows the input box (a dialog stays open over it, or a kept draft hides Codex's placeholder), so every check the tick asks is refused when scheduled, and nobody types. Nothing is ever written, the card says the deck can't check the box throughout, no two checks come closer than two seconds apart, and the long waits still grow through the backoff steps (30 s, 2 min, 10 min), with the observer reported broken after the third failure.
+    #[cfg(target_os = "linux")]
+    #[spec("inbox/probe/101")]
+    #[test]
+    fn probe_101_a_screen_that_never_shows_the_box_still_backs_off() {
+        use crate::composer_probe::admission::Refusal;
+        use crate::composer_probe::epoch::Writer;
+        use crate::composer_probe::gate::Status;
+        use crate::composer_probe::probe::{BACKOFF, BROKEN_AFTER};
+        use crate::composer_probe::segments::Agent;
+        let tick = crate::doorbell::DEFAULT_TICK;
+        let horizon = Duration::from_secs(20 * 60);
+        let t0 = Instant::now();
+        for agent in [Agent::Claude, Agent::Codex] {
+            let input = live(agent);
+            input.enqueue(Writer::Human, b"x");
+            let mut at = t0;
+            let mut asks = vec![t0];
+            scheduling_refused(&input, Refusal::Surface, ProbeAsk::First, t0);
+            while let Some((t, ask)) = next_ask(&input, Status::default(), at, horizon - (at - t0))
+            {
+                assert!(input.probe_failing(), "{agent:?}: the card holds");
+                scheduling_refused(&input, Refusal::Surface, ask, t);
+                asks.push(t);
+                at = t;
+            }
+            let gaps: Vec<Duration> = asks.windows(2).map(|w| w[1] - w[0]).collect();
+            assert!(
+                gaps.iter().all(|g| *g >= Duration::from_secs(2)),
+                "{agent:?}: checks no closer than 2 s apart: {gaps:?}"
+            );
+            let long: Vec<Duration> = gaps.iter().copied().filter(|g| *g >= BACKOFF[0]).collect();
+            assert!(
+                long.len() >= BACKOFF.len(),
+                "{agent:?}: every backoff step is reached: {gaps:?}"
+            );
+            for (step, gap) in BACKOFF.iter().zip(&long) {
+                assert!(
+                    *gap >= *step && *gap <= *step + tick,
+                    "{agent:?}: the long waits follow the backoff steps: {gaps:?}"
+                );
+            }
+            let (_, failures, broken) = input
+                .advance_schedule_for_e2e(Duration::ZERO, at)
+                .expect("a live schedule");
+            assert!(
+                failures >= BROKEN_AFTER && broken,
+                "{agent:?}: the persistent refusal is counted ({failures} failures)"
+            );
+        }
     }
 
     /// Scenario: For Claude and Codex, a probe is written past the trigger's wait with no helper seen and nothing held behind it, and the agent may be waiting for a cursor report (`B` holds). Only Claude's reads as lapsed, so only Claude's lapse retry reaches admission's lapse checks, where `B` refuses it; Codex's is refused as having no lapsed probe to supersede, before any lapse check, whatever `B` says (O-20.7c: the lapse retry's checks are Claude's alone, though an attempt carries no agent).
