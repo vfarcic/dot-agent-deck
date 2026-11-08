@@ -18,6 +18,9 @@ use dot_agent_deck::release_scanner::{
 use semver::Version;
 use spec::spec;
 
+#[path = "support/installed_release.rs"]
+mod installed_release;
+
 /// One recorded launch: the bytes, the sizes the PTY reader returned them in,
 /// the stream offset of each named moment, and each resize.
 struct Trace {
@@ -373,6 +376,81 @@ fn doorbell_036_release_recogniser_negatives() {
         scanner.latch(),
         ScanLatch::Latched { release, .. } if *release == Version::new(2, 1, 310)
     ));
+}
+
+/// Scenario: Read the `--version` output a lane-2 measurement gets from an installed Claude Code or Codex: a bare release, a pre-release, a build tag and no version. Only a bare release is usable; then the same versions are drawn in each agent's start-up header, and the deck's release scanner latches exactly the versions the measurements accept.
+#[spec("inbox/doorbell/036")]
+#[test]
+fn doorbell_036_installed_release_shape_follows_the_release_scanner() {
+    use installed_release::{VersionShape, version_shape};
+    let release = |v: &str| VersionShape::Release(v.to_string());
+    let tagged = |v: &str| VersionShape::Tagged(v.to_string());
+    for (program, output, expected) in [
+        ("claude", "2.1.319 (Claude Code)\n", release("2.1.319")),
+        (
+            "claude",
+            "2.1.320-beta.1 (Claude Code)\n",
+            tagged("2.1.320-beta.1"),
+        ),
+        (
+            "claude",
+            "2.1.320+abc (Claude Code)\n",
+            tagged("2.1.320+abc"),
+        ),
+        ("claude", "Claude Code 2.1.319\n", VersionShape::NoRelease),
+        ("claude", "", VersionShape::NoRelease),
+        ("codex", "codex-cli 0.164.0\n", release("0.164.0")),
+        (
+            "codex",
+            "codex-cli 0.165.0-alpha.2\n",
+            tagged("0.165.0-alpha.2"),
+        ),
+        ("codex", "codex-cli\n", VersionShape::NoRelease),
+    ] {
+        assert_eq!(
+            version_shape(program, output),
+            expected,
+            "{program} --version printed {output:?}"
+        );
+    }
+    // What a measurement accepts is exactly what the deck latches from the
+    // same version in the agent's header: a bare release, nothing tagged.
+    for version in [
+        "2.1.319",
+        "0.164.0",
+        "2.1.320-beta.1",
+        "2.1.320+abc",
+        "0.165.0-alpha.2",
+        "2.1.320-rc.1+abc",
+        "2.01.319",
+        "2.1",
+    ] {
+        for (program, output, header) in [
+            (
+                "claude",
+                format!("{version} (Claude Code)\n"),
+                format!("\x1b[2;12HClaude Code v{version}\r\n"),
+            ),
+            (
+                "codex",
+                format!("codex-cli {version}\n"),
+                format!("\x1b[2;6HOpenAI Codex (v{version})\r\n"),
+            ),
+        ] {
+            let latched = match latch_of(header.as_bytes()) {
+                ScanLatch::Latched { release, .. } => Some(release.to_string()),
+                _ => None,
+            };
+            let accepted = match version_shape(program, &output) {
+                VersionShape::Release(release) => Some(release),
+                _ => None,
+            };
+            assert_eq!(
+                accepted, latched,
+                "{program} {version}: the measurement and the release scanner disagree"
+            );
+        }
+    }
 }
 
 fn holds(profile: &ScreenProfile, grid: &Grid, line: &str) -> Option<ComposerText> {
