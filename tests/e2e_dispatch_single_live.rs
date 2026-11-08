@@ -193,6 +193,14 @@ fn dispatch_single_004_a_real_unit_runs_the_chosen_command_and_does_its_task() {
         })
         .filter_map(|message| message.bind_agent)
         .collect();
+    // An empty list would make the settle-wait pass at once, typing the
+    // directive into a pane still painting its seed turn with no warning
+    // (Qodo, PR #2176). The seed was acknowledged above, so its agent is known.
+    assert!(
+        !dispatcher_ids.is_empty(),
+        "precondition: the acknowledged dispatcher seed names no bound agent, so the test \
+         cannot wait for the dispatcher pane to settle"
+    );
     if !common::wait_until_panes_settled(
         deck.attach_socket_path(),
         &dispatcher_ids,
