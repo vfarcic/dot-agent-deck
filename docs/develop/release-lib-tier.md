@@ -46,9 +46,9 @@ The other two `orchestration/work-done/032` tests, whose assertions also hold wi
 
 ## Its cost
 
-Measured on 2026-11-08 on this branch: the tier itself, 5328 tests, runs in about 48 seconds on a 16-CPU RWX sandbox; the rest is the release build in front of it. The whole script took 3m22s there from a cold `target/`. The CI wall times are in the table below.
+Measured on 2026-11-08 on the branch that added it, each from a cold `target/`. Most of each wall time is the release build in front of the 5328 tests, whose run took 175 seconds on GitHub's 4 CPUs (48 seconds in a 16-CPU RWX sandbox).
 
 | where | wall | measured |
 | --- | --- | --- |
-| RWX task, 4 CPU / 16 GB, cold (`rwx run .rwx/release-lib.yml`) | RWX_WALL | RWX_RUN |
-| GitHub Actions `release-lib`, `ubuntu-latest` | GHA_WALL | GHA_RUN |
+| RWX task, 4 CPU / 16 GB (`rwx run .rwx/release-lib.yml`) | 7m55s, 8m01s for the whole run | RWX run `01a1b9ccd5c57a53b4ffb401e471828f` |
+| GitHub Actions `release-lib`, `ubuntu-latest`, no cache yet (caches are saved only from `main`) | 13m58s | run [`42454635091`](https://github.com/vfarcic/dot-agent-deck/actions/runs/42454635091) |
