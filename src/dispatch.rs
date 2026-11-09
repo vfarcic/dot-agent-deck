@@ -2604,144 +2604,150 @@ mod tests {
         );
     }
 
-    /// An ORCHESTRATION dispatch must start the team WITH its delegation protocol.
-    ///
-    /// This is the defect reported from real use: the orchestration came up, its
-    /// orchestrator received the task, and every worker sat idle — because the daemon
-    /// spawn path never composed the orchestrator context that the interactive
-    /// `Ctrl+n` path writes, so the orchestrator was never told it was one or how to
-    /// `delegate`. Asserted on the CONTEXT FILE in the dispatched worktree, which is
-    /// the artefact that was missing entirely.
-    ///
-    /// Roles run `cat` (alive on stdin, no LLM tokens), mirroring the `orch-deck`
-    /// fixture.
-    // Gated to the e2e tier: this spawns REAL PTYs, which puts it outside the
-    // per-task fast gate and outside what a unit test is by any honest reading.
+    // Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+    // build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
     #[cfg(feature = "e2e")]
-    #[tokio::test]
-    async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {
-        let tmp = crate::test_temp::tempdir().unwrap();
-        let repo = tmp.path().join("repo");
-        init_repo_in(tmp.path(), &repo);
-        std::fs::write(
-            repo.join(".dot-agent-deck.toml"),
-            "[[orchestrations]]\nname = \"demo-orch\"\n\n\
-             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
-             [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
-        )
-        .unwrap();
-        // The config must be COMMITTED: the shape is resolved from the caller's repo,
-        // but the worktree the roles run in is a HEAD checkout.
-        git_in(tmp.path(), &repo, &["add", "-A"]);
-        git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
+    mod e2e_only {
+        use super::*;
 
-        let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
-        let ctx = DispatchContext {
-            working_dir: repo.clone(),
-            registry: Arc::new(AgentPtyRegistry::new()),
-            event_tx,
-            worktrees: new_worktree_registry(),
-            default_command: None,
-            // These unit tests assert on the worktree + spawn shape, not on
-            // delegate routing (`orchestration/dispatch/001` owns that).
-            state: None,
-            // No live caller to report back to: these tests assert on the
-            // worktree/spawn result, and PRD #220's return edge is covered by
-            // `dispatch/return/*` end to end.
-            caller: None,
-        };
-
-        let result = handle_dispatch(
-            &ctx,
-            "team-unit",
-            "Verify PR #232 and report back.",
-            Some(&crate::event::DispatchShape::Orchestration { name: None }),
-            LaunchChoice::default(),
-        )
-        .await;
-
-        let worktree = result.worktree_dir.clone();
-        // Reclaim the sibling worktree regardless of the assertions below.
-        struct Guard(std::path::PathBuf);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
-        let _guard = Guard(worktree.clone());
-
-        assert!(
-            result.success,
-            "the orchestration dispatch should succeed, got: {}",
-            result.message
-        );
-        assert!(
-            result.message.contains("orchestration"),
-            "the reported shape must say orchestration, got: {}",
-            result.message
-        );
-        // PRD #1589: the reply names the branch the unit works on, which is what
-        // `/issue-queue` records per unit for its `close --all` ledger.
-        assert!(
-            result.message.contains(&format!(
-                "in {} on branch agent/dispatch-team-unit",
-                worktree.display()
-            )),
-            "the success reply must name the worktree and its branch, got: {}",
-            result.message
-        );
-
-        // Issue #1233: the orchestration's own per-publish file, not the
-        // compatibility mirror beside it.
-        let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
-            .expect("list the dispatched worktree's .dot-agent-deck")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| {
-                        name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
-                            && name.ends_with(".md")
-                    })
-            })
-            .expect("the dispatched orchestration must publish its own context file");
-        let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
-            panic!(
-                "the dispatched orchestration must get a context file at {} \
-                 (its absence is exactly why workers sat idle): {e}",
-                context.display()
+        /// An ORCHESTRATION dispatch must start the team WITH its delegation protocol.
+        ///
+        /// This is the defect reported from real use: the orchestration came up, its
+        /// orchestrator received the task, and every worker sat idle — because the daemon
+        /// spawn path never composed the orchestrator context that the interactive
+        /// `Ctrl+n` path writes, so the orchestrator was never told it was one or how to
+        /// `delegate`. Asserted on the CONTEXT FILE in the dispatched worktree, which is
+        /// the artefact that was missing entirely.
+        ///
+        /// Roles run `cat` (alive on stdin, no LLM tokens), mirroring the `orch-deck`
+        /// fixture.
+        // Gated to the e2e tier: this spawns REAL PTYs, which puts it outside the
+        // per-task fast gate and outside what a unit test is by any honest reading.
+        #[tokio::test]
+        async fn an_orchestration_dispatch_writes_the_delegation_protocol_and_the_task() {
+            let tmp = crate::test_temp::tempdir().unwrap();
+            let repo = tmp.path().join("repo");
+            init_repo_in(tmp.path(), &repo);
+            std::fs::write(
+                repo.join(".dot-agent-deck.toml"),
+                "[[orchestrations]]\nname = \"demo-orch\"\n\n\
+                 [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n\n\
+                 [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
             )
-        });
-        assert!(
-            content.contains("Delegation protocol"),
-            "the orchestrator must be told HOW to delegate:\n{content}"
-        );
-        assert!(
-            content.contains("worker") && content.contains("Does the work"),
-            "the orchestrator must be told WHICH agents exist:\n{content}"
-        );
-        assert!(
-            content.contains("## Your task") && content.contains("Verify PR #232"),
-            "the caller's task must ride inside the context file:\n{content}"
-        );
-        // Issue #703, on the real dispatch path rather than on the composer
-        // alone: nobody is WATCHING a dispatched pane, so the composed file must
-        // say so — otherwise a coordinator inheriting an interactive template's
-        // "STOP and wait for explicit approval" step parks its whole team for the
-        // life of the run, silently — and must say which half wins when that
-        // template and this task disagree. PRD #220 Phase 2's return edge does
-        // not soften this: it fires once, at terminal completion, which a parked
-        // coordinator never reaches.
-        assert!(
-            content.contains("## Unattended run")
-                && content.contains("nobody has been asked to watch this pane"),
-            "a dispatched orchestration must be told it is unattended:\n{content}"
-        );
-        assert!(
-            content.contains("## Task precedence") && content.contains("WHEN to stop"),
-            "the composed file must arbitrate between the template and the task:\n{content}"
-        );
+            .unwrap();
+            // The config must be COMMITTED: the shape is resolved from the caller's repo,
+            // but the worktree the roles run in is a HEAD checkout.
+            git_in(tmp.path(), &repo, &["add", "-A"]);
+            git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
+
+            let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
+            let ctx = DispatchContext {
+                working_dir: repo.clone(),
+                registry: Arc::new(AgentPtyRegistry::new()),
+                event_tx,
+                worktrees: new_worktree_registry(),
+                default_command: None,
+                // These unit tests assert on the worktree + spawn shape, not on
+                // delegate routing (`orchestration/dispatch/001` owns that).
+                state: None,
+                // No live caller to report back to: these tests assert on the
+                // worktree/spawn result, and PRD #220's return edge is covered by
+                // `dispatch/return/*` end to end.
+                caller: None,
+            };
+
+            let result = handle_dispatch(
+                &ctx,
+                "team-unit",
+                "Verify PR #232 and report back.",
+                Some(&crate::event::DispatchShape::Orchestration { name: None }),
+                LaunchChoice::default(),
+            )
+            .await;
+
+            let worktree = result.worktree_dir.clone();
+            // Reclaim the sibling worktree regardless of the assertions below.
+            struct Guard(std::path::PathBuf);
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    let _ = std::fs::remove_dir_all(&self.0);
+                }
+            }
+            let _guard = Guard(worktree.clone());
+
+            assert!(
+                result.success,
+                "the orchestration dispatch should succeed, got: {}",
+                result.message
+            );
+            assert!(
+                result.message.contains("orchestration"),
+                "the reported shape must say orchestration, got: {}",
+                result.message
+            );
+            // PRD #1589: the reply names the branch the unit works on, which is what
+            // `/issue-queue` records per unit for its `close --all` ledger.
+            assert!(
+                result.message.contains(&format!(
+                    "in {} on branch agent/dispatch-team-unit",
+                    worktree.display()
+                )),
+                "the success reply must name the worktree and its branch, got: {}",
+                result.message
+            );
+
+            // Issue #1233: the orchestration's own per-publish file, not the
+            // compatibility mirror beside it.
+            let context = std::fs::read_dir(worktree.join(".dot-agent-deck"))
+                .expect("list the dispatched worktree's .dot-agent-deck")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| {
+                            name.starts_with(crate::orchestrator_context::CONTEXT_FILE_PREFIX)
+                                && name.ends_with(".md")
+                        })
+                })
+                .expect("the dispatched orchestration must publish its own context file");
+            let content = std::fs::read_to_string(&context).unwrap_or_else(|e| {
+                panic!(
+                    "the dispatched orchestration must get a context file at {} \
+                     (its absence is exactly why workers sat idle): {e}",
+                    context.display()
+                )
+            });
+            assert!(
+                content.contains("Delegation protocol"),
+                "the orchestrator must be told HOW to delegate:\n{content}"
+            );
+            assert!(
+                content.contains("worker") && content.contains("Does the work"),
+                "the orchestrator must be told WHICH agents exist:\n{content}"
+            );
+            assert!(
+                content.contains("## Your task") && content.contains("Verify PR #232"),
+                "the caller's task must ride inside the context file:\n{content}"
+            );
+            // Issue #703, on the real dispatch path rather than on the composer
+            // alone: nobody is WATCHING a dispatched pane, so the composed file must
+            // say so — otherwise a coordinator inheriting an interactive template's
+            // "STOP and wait for explicit approval" step parks its whole team for the
+            // life of the run, silently — and must say which half wins when that
+            // template and this task disagree. PRD #220 Phase 2's return edge does
+            // not soften this: it fires once, at terminal completion, which a parked
+            // coordinator never reaches.
+            assert!(
+                content.contains("## Unattended run")
+                    && content.contains("nobody has been asked to watch this pane"),
+                "a dispatched orchestration must be told it is unattended:\n{content}"
+            );
+            assert!(
+                content.contains("## Task precedence") && content.contains("WHEN to stop"),
+                "the composed file must arbitrate between the template and the task:\n{content}"
+            );
+        }
     }
 
     /// Issue #1065 — the other half of the test above, at the same altitude: the
