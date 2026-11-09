@@ -102,6 +102,9 @@ RELAY_DIR="$HOME/.config/otelcol"
 RELAY_CONFIG="$RELAY_DIR/config.yaml"
 HONEYCOMB_ENV="$RELAY_DIR/honeycomb.env"
 DASH0_ENV="$RELAY_DIR/dash0.env"
+# Written once this script has started the relay, so a later run knows it
+# manages it without asking Docker, which may not be running yet.
+RELAY_MANAGED="$RELAY_DIR/.dad-box-managed"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -146,15 +149,13 @@ env_file_sets() {
 
 # Whether this run installs and runs the relay (layer 6). --relay given now
 # does; a RELAY block carried over from an earlier run does only when this
-# script started the relay container then (it carries the dad-box.relay
-# label). A box whose block predates the relay being installed here, from when
+# script started the relay then ($RELAY_MANAGED). A box whose block predates the relay being installed here, from when
 # --relay only pointed the environment at a relay the box ran itself, keeps
 # that meaning until --relay is given again.
 RELAY_INSTALL=0
 if [ "$RELAY_GIVEN" = 1 ]; then
   RELAY_INSTALL=1
-elif [ "$RELAY_FLAG" = 1 ] && have docker \
-     && [ -n "$(sudo docker container inspect -f '{{index .Config.Labels "dad-box.relay"}}' "$RELAY_CONTAINER" 2>/dev/null | sed 's/^<no value>$//')" ]; then
+elif [ "$RELAY_FLAG" = 1 ] && [ -f "$RELAY_MANAGED" ]; then
   RELAY_INSTALL=1
 fi
 
@@ -165,7 +166,12 @@ if [ "$RELAY_INSTALL" = 1 ]; then
     echo "bootstrap.sh: changed nothing; see --relay in \`bash $0 --help\`" >&2
     exit 1
   }
-  # A key file is the operator's own regular file that nobody else can read.
+  # A key file is the operator's own regular file that nobody else can read,
+  # in a directory of the operator's that nobody else can write to.
+  if [ -e "$RELAY_DIR" ] || [ -L "$RELAY_DIR" ]; then
+    { [ -d "$RELAY_DIR" ] && [ ! -L "$RELAY_DIR" ] && [ -O "$RELAY_DIR" ]; } || relay_fail "$RELAY_DIR must be a directory (not a link) owned by $ME"
+    (( (8#$(stat -c %a "$RELAY_DIR") & 8#022) == 0 )) || relay_fail "$RELAY_DIR can be written by other users; run: chmod go-w $RELAY_DIR"
+  fi
   for f in "$HONEYCOMB_ENV" "$DASH0_ENV"; do
     if [ -e "$f" ] || [ -L "$f" ]; then
       { [ -f "$f" ] && [ ! -L "$f" ] && [ -O "$f" ]; } || relay_fail "$f must be a regular file (not a link) owned by $ME"
@@ -644,6 +650,15 @@ if [ "$RELAY_INSTALL" = 1 ]; then
       done
     } | sha256sum | cut -c1-16
   )"
+  # A replacement interrupted after it set the previous relay aside (below)
+  # left it as $RELAY_CONTAINER.prev with no $RELAY_CONTAINER: put it back
+  # first, so the backup is never thrown away.
+  if ! sudo docker container inspect "$RELAY_CONTAINER" >/dev/null 2>&1 \
+     && sudo docker container inspect "$RELAY_CONTAINER.prev" >/dev/null 2>&1; then
+    if [ -f "$RELAY_CONFIG.prev" ]; then mv "$RELAY_CONFIG.prev" "$RELAY_CONFIG"; fi
+    sudo docker rename "$RELAY_CONTAINER.prev" "$RELAY_CONTAINER"
+    echo "  recovered the relay an interrupted run had set aside"
+  fi
   relay_now="$(sudo docker container inspect -f '{{index .Config.Labels "dad-box.relay"}} {{.State.Running}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
   if [ "$relay_now" = "$relay_fp true" ] || [ "$relay_now" = "$relay_fp false" ]; then
     # Same fingerprint: the container runs this config. Put it back in place
@@ -664,27 +679,32 @@ if [ "$RELAY_INSTALL" = 1 ]; then
   else
     # Replace it, keeping the previous container (stopped, renamed) and config
     # until the new one has stayed up, and putting them back if it does not.
+    # The config is backed up before the container is touched, so a failed
+    # copy stops the run with the old relay still running. Once the old
+    # container is set aside, every step goes through the restore below.
+    # (A $RELAY_CONTAINER.prev left beside a $RELAY_CONTAINER is a run's
+    # leftover backup whose replacement got created; it is superseded.)
     sudo docker rm -f "$RELAY_CONTAINER.prev" >/dev/null 2>&1 || true
     rm -f "$RELAY_CONFIG.prev"
+    if [ -f "$RELAY_CONFIG" ]; then cp -p "$RELAY_CONFIG" "$RELAY_CONFIG.prev"; fi
     if [ -n "$relay_now" ]; then
       sudo docker stop "$RELAY_CONTAINER" >/dev/null 2>&1 || true
       sudo docker rename "$RELAY_CONTAINER" "$RELAY_CONTAINER.prev"
     fi
-    [ -f "$RELAY_CONFIG" ] && cp -p "$RELAY_CONFIG" "$RELAY_CONFIG.prev"
-    mv "$RELAY_CONFIG.dad-box" "$RELAY_CONFIG"
     relay_up=0
-    if sudo docker run -d "${RELAY_RUN_ARGS[@]}" "${RELAY_ENV_ARGS[@]}" --label "dad-box.relay=$relay_fp" \
+    if mv "$RELAY_CONFIG.dad-box" "$RELAY_CONFIG" && sudo docker run -d "${RELAY_RUN_ARGS[@]}" "${RELAY_ENV_ARGS[@]}" --label "dad-box.relay=$relay_fp" \
          "$RELAY_IMAGE" --config /etc/otelcol-contrib/config.yaml >/dev/null; then
       sleep 5
       [ "$(sudo docker container inspect -f '{{.State.Running}}' "$RELAY_CONTAINER" 2>/dev/null)" = true ] && relay_up=1
     fi
     if [ "$relay_up" = 1 ]; then
       sudo docker rm -f "$RELAY_CONTAINER.prev" >/dev/null 2>&1 || true
-      rm -f "$RELAY_CONFIG.prev"
+      rm -f "$RELAY_CONFIG.prev" "$RELAY_CONFIG.dad-box"
       echo "  (re)created"
     else
       sudo docker logs --tail 20 "$RELAY_CONTAINER" >&2 || true
       sudo docker rm -f "$RELAY_CONTAINER" >/dev/null 2>&1 || true
+      rm -f "$RELAY_CONFIG.dad-box"
       if [ -f "$RELAY_CONFIG.prev" ]; then mv "$RELAY_CONFIG.prev" "$RELAY_CONFIG"; fi
       if [ -n "$relay_now" ]; then
         sudo docker rename "$RELAY_CONTAINER.prev" "$RELAY_CONTAINER"
@@ -696,6 +716,8 @@ if [ "$RELAY_INSTALL" = 1 ]; then
       exit 1
     fi
   fi
+
+  touch "$RELAY_MANAGED"
 
   step "per-run resource collector (dot-agent-deck-collector user service)"
   COLLECTOR_BIN="$HOME/.local/bin/dot-agent-deck-collector"
