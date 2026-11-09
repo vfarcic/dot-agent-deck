@@ -5,7 +5,7 @@ import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey, boundAgentKey } from "./agentKey";
 import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
-import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
+import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, worktreeKeptOf, type DaemonHookEvent } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
@@ -46,6 +46,7 @@ import type { HandoffEdge,
   InboxActionResult,
   InboxActionVerb,
   InboxAttentionItem,
+  KeptWorktreeView,
   NewAgentOptions,
   NewAgentOrchestrations,
   PromptKeys,
@@ -2188,6 +2189,15 @@ export interface DeckBridge {
    */
   onVoiceReadingConsentOn(listener: () => void): Promise<() => void>;
   /**
+   * Issue #1674 — be told once for every `worktree_kept` broadcast the daemon
+   * event stream carries, WHICHEVER deck it was stamped with: a close on a
+   * deck the screen is not on still kept a directory the user should hear
+   * about, so this does not pass the deck screen's selected-deck filter. The
+   * listener receives the kept worktree with the deck it came from. Answers
+   * the unsubscribe.
+   */
+  onWorktreeKept(listener: (kept: { path: string; confirmedDirty: boolean; deck?: string }) => void): Promise<() => void>;
+  /**
    * States the WHOLE set of agents whose terminal is on screen right now
    * (PRD #745 M7). Attach follows this and nothing else — not `connect()`, not
    * a snapshot event — because an attach costs one daemon socket and one full
@@ -2237,6 +2247,16 @@ export interface DeckBridge {
    * deck whose connection has `listingOptions` — any other deck refuses them.
    */
   listDirectories(deckId: string, path?: string, options?: DeckListingOptions): Promise<DeckDirectoryListing>;
+  /**
+   * Issue #1674 — would closing the panes `paneIds` name on the deck `deckId`
+   * names leave a dispatched worktree behind? Read-only and best-effort:
+   * `null` when the close keeps nothing. Rejects with the crate's
+   * `DeckScope::resolve` wording for a deck the app no longer observes, or
+   * with a connection error for one that stopped answering — and the caller
+   * catches both, because a preview that cannot be asked is no reason to
+   * refuse the close (the TUI's dialog behaves the same).
+   */
+  worktreeClosePreview(deckId: string, paneIds: string[]): Promise<KeptWorktreeView | null>;
   /**
    * PRD #1223 M4 — what the New agent form needs to know about the deck
    * `deckId` names. Resolves `unsupported` for a deck without the query, and
@@ -3521,6 +3541,17 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   /**
+   * The preview dispatches nothing, so no daemon ever broadcasts a kept
+   * worktree at it. Answering a made-up one here would teach the same lesson
+   * `resolveProject` refuses to: that a client may answer a question only the
+   * daemon can.
+   */
+  async onWorktreeKept(): Promise<() => void> {
+    await Promise.resolve();
+    return () => undefined;
+  }
+
+  /**
    * The whole voice backend, deterministically (PRD #802 M6).
    *
    * The vocabulary and every sentence it renders live in `data/fixture.ts` with
@@ -3728,6 +3759,17 @@ class FixtureDeckBridge implements DeckBridge {
   async resolveProject(): Promise<DaemonResolvedProject> {
     await Promise.resolve();
     throw new Error("The deterministic preview has no daemon, so it can resolve no project. Run against a live daemon to choose one.");
+  }
+
+  /**
+   * Issue #1674 — the preview dispatches nothing and closes nothing it
+   * dispatched, so the honest preview answer is "this close keeps nothing"
+   * (`null`): no warning on the preview's close confirmations, exactly as a
+   * live bridge answers for an agent that owns no worktree.
+   */
+  async worktreeClosePreview(): Promise<KeptWorktreeView | null> {
+    await Promise.resolve();
+    return null;
   }
 
   /**
@@ -5471,6 +5513,22 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   /**
+   * Issue #1674. The daemon event stream is the one the evidence drawer reads
+   * (`subscribe`), but this listener must NOT inherit its selected-deck
+   * filter: the overview closes agents on decks the screen is not on, and a
+   * kept directory on any of them is the fact this exists to report. A
+   * separate `listen` on the same event rather than a hook inside
+   * `subscribe`, so the two readers cannot drop each other's events.
+   */
+  async onWorktreeKept(listener: (kept: { path: string; confirmedDirty: boolean; deck?: string }) => void): Promise<() => void> {
+    const { listen } = await import("@tauri-apps/api/event");
+    return listen<unknown>("desktop://daemon-event", (event) => {
+      const kept = worktreeKeptOf(event.payload);
+      if (kept) listener(kept);
+    });
+  }
+
+  /**
    * Resolved by composite VALUE, never by object identity: the caller allocates
    * a fresh `{ deckId, agentId }` on every render, so a `Map` keyed on the
    * object would find nothing in production while passing any test that reused
@@ -5618,6 +5676,12 @@ export class TauriDeckBridge implements DeckBridge {
     // Issue #1240: `options` only when given, so a PRD #1223 listing is the
     // same invoke it always was.
     return invoke<DeckDirectoryListing>("desktop_list_directories", { deckId, path: path ?? null, ...(options ? { options } : {}) });
+  }
+
+  /** Issue #1674. The deck and the panes go through untouched, as for {@link listDirectories}. */
+  async worktreeClosePreview(deckId: string, paneIds: string[]): Promise<KeptWorktreeView | null> {
+    const invoke = await this.getInvoke();
+    return invoke<KeptWorktreeView | null>("desktop_worktree_close_preview", { deckId, paneIds });
   }
 
   async inboxAction(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult> {

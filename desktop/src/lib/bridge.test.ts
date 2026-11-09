@@ -696,6 +696,46 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
+  /**
+   * Issue #1674: the close-confirmation preview goes to the deck the close
+   * names with the panes it would tear down, verbatim, and a `worktree_kept`
+   * broadcast on the daemon event stream reaches the kept-worktree listener
+   * whichever deck stamped it — a close on a deck the screen is not on still
+   * kept a directory the user should hear about.
+   */
+  it("asks the named deck whether a close would keep a worktree, and hears every kept one", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+
+    invoke.mockResolvedValueOnce(null);
+    await expect(bridge.worktreeClosePreview("deck-build", ["pane-41"])).resolves.toBeNull();
+    expect(invoke).toHaveBeenCalledWith("desktop_worktree_close_preview", { deckId: "deck-build", paneIds: ["pane-41"] });
+
+    invoke.mockResolvedValueOnce({ path: "/home/build/code/deck-dispatch-issue-1674", confirmedDirty: true });
+    await expect(bridge.worktreeClosePreview("deck-build", ["pane-41", "pane-42"])).resolves.toEqual({ path: "/home/build/code/deck-dispatch-issue-1674", confirmedDirty: true });
+
+    const heard: { path: string; confirmedDirty: boolean; deck?: string }[] = [];
+    const stop = await bridge.onWorktreeKept((kept) => heard.push(kept));
+    listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", path: "/home/build/kept", confirmed_dirty: false, deck: "deck-build" } });
+    // Any other broadcast kind reaches the same stream and is not a report.
+    listeners.get("desktop://daemon-event")?.({ payload: { kind: "event", event_type: "tool_start" } });
+    expect(heard).toEqual([{ path: "/home/build/kept", confirmedDirty: false, deck: "deck-build" }]);
+    stop();
+    await bridge.dispose();
+  });
+
+  /** Issue #1674: the preview owns no daemon and dispatches nothing, so no close it offers keeps anything and nothing is ever reported kept. */
+  it("has the fixture bridge answer no kept worktree and report none", async () => {
+    const { createDeckBridge } = await import("./bridge");
+    const bridge = createDeckBridge("fixture");
+    await expect(bridge.worktreeClosePreview("deck-build", ["pane-41"])).resolves.toBeNull();
+    const heard: unknown[] = [];
+    const stop = await bridge.onWorktreeKept((kept) => heard.push(kept));
+    expect(heard).toEqual([]);
+    stop();
+    await bridge.dispose();
+  });
+
   /// Scenario: Stop a daemon, then send Stop, Rename, orchestration close, inbox Retry/Cancel and a voice answer from a listed card through the live bridge. Agent-directed IPC retains the incarnation that the snapshot row carried.
   it("sends stop_daemon and preserves the listed incarnation on card actions through the live bridge", async () => {
     const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");

@@ -585,6 +585,20 @@ const ORCHESTRATION_ROLE_START_TIMEOUT: Duration = crate::daemon_bridge::DECK_RE
 /// rollback moves on to the next role instead of waiting behind it.
 const ORCHESTRATION_ROLE_STOP_TIMEOUT: Duration = crate::daemon_bridge::DECK_REPLY_TIMEOUT;
 
+/// Issue #1674: how long the close-confirmation preview may take before the
+/// dialog gives up on the warning and opens without it.
+///
+/// The TUI bounds its own ask at 500 ms (`CLOSE_PREVIEW_TIMEOUT` in
+/// `src/ui.rs`), and for the same reason: the question sits between a click
+/// and the dialog that click asked for. This bound is wider because the
+/// desktop's ask runs off the render loop — an invoke, not a blocked frame —
+/// and because a remote deck reaches its daemon over an ssh tunnel the TUI's
+/// local-socket deadline does not model. Like the TUI's, a blown deadline is
+/// not an error the user sees: the webview renders the dialog exactly as it
+/// did before this existed, which is also how both clients treat a daemon
+/// that cannot answer at all.
+const WORKTREE_CLOSE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// A role a launch started (or found started by reconciliation), which a
 /// rollback must stop.
 #[derive(Debug, Clone)]
@@ -1881,6 +1895,72 @@ async fn desktop_list_directories(
 ) -> Result<DesktopDirectoryListing, String> {
     ensure_main_webview(&webview)?;
     list_directories_on(&state, &deck_id, path, options.unwrap_or_default()).await
+}
+
+/// Issue #1674: the daemon's answer to "would closing these panes keep a
+/// dispatched worktree?" — the desktop's copy of the TUI's close-confirmation
+/// warning (issue #717), in the shape the webview renders.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopKeptWorktree {
+    path: String,
+    confirmed_dirty: bool,
+}
+
+/// Issue #1674: the close-confirmation preview for the deck `deck_id` names —
+/// read-only, best-effort, and bounded by [`WORKTREE_CLOSE_PREVIEW_TIMEOUT`].
+///
+/// `pane_ids` are the panes the confirmed close would tear down (one for an
+/// agent's row, all of them for an orchestration's roles), because a
+/// multi-role orchestration shares ONE worktree and any of its panes resolves
+/// it. `Ok(None)` — "this close keeps nothing" — is the ordinary answer, and
+/// so is an error as far as the dialog is concerned: the webview catches the
+/// rejection and opens the confirmation without the warning, which is exactly
+/// how the TUI's dialog treats a daemon that cannot answer.
+#[tauri::command]
+async fn desktop_worktree_close_preview(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    pane_ids: Vec<String>,
+) -> Result<Option<DesktopKeptWorktree>, String> {
+    ensure_main_webview(&webview)?;
+    worktree_close_preview_on(&state, &deck_id, pane_ids).await
+}
+
+/// [`desktop_worktree_close_preview`] minus the webview, so a test can drive
+/// it against a real daemon.
+///
+/// The deck comes from the request, never the selection, for
+/// [`list_directories_on`]'s reason: the overview closes agents on decks it is
+/// not showing, and asking whichever deck happens to be selected would warn
+/// about the wrong machine's directory or none.
+async fn worktree_close_preview_on(
+    state: &DesktopState,
+    deck_id: &str,
+    pane_ids: Vec<String>,
+) -> Result<Option<DesktopKeptWorktree>, String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let daemon = state.daemon.trusted(scope.endpoint()).await?;
+    daemon.require_compatible()?;
+    let kept = match tokio::time::timeout(
+        WORKTREE_CLOSE_PREVIEW_TIMEOUT,
+        daemon.client.dispatch_worktree_close_preview(&pane_ids),
+    )
+    .await
+    {
+        Ok(kept) => kept.map_err(|error| safe_message(error.to_string()))?,
+        Err(_) => {
+            return Err(format!(
+                "the daemon did not answer the worktree close preview within {}s",
+                WORKTREE_CLOSE_PREVIEW_TIMEOUT.as_secs()
+            ));
+        }
+    };
+    Ok(kept.map(|kept| DesktopKeptWorktree {
+        path: kept.path,
+        confirmed_dirty: kept.confirmed_dirty,
+    }))
 }
 
 /// PRD #1666 §6.4: the desktop's answer to a Retry or Cancel — the daemon's
@@ -6791,6 +6871,7 @@ pub fn run() {
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
             desktop_list_directories,
+            desktop_worktree_close_preview,
             desktop_inbox_action,
             desktop_new_agent_options,
             desktop_bootstrap,
@@ -9026,6 +9107,29 @@ mod tests {
     /// decks observed, where every payload's `deck` must equal the
     /// `connection.deckId` of the deck that emitted it.
     ///
+    /// Issue #1674: `DesktopKeptWorktree` is the close-confirmation preview's
+    /// reply, and the webview reads it field by field as
+    /// `KeptWorktreeView` — `confirmedDirty`, not `confirmed_dirty`. The
+    /// command itself needs a live daemon, so the one half a unit test can
+    /// reach is the wire shape, which is also the half a lost `rename_all`
+    /// would break silently: the dialog would read `confirmedDirty` as absent
+    /// and phrase a measured keep as a conditional one.
+    #[test]
+    fn a_kept_worktree_reply_serializes_camel_case_for_the_webview() {
+        let kept = DesktopKeptWorktree {
+            path: "/home/dev/code/deck-dispatch-issue-1674".into(),
+            confirmed_dirty: true,
+        };
+        let value = serde_json::to_value(&kept).expect("the preview reply");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "path": "/home/dev/code/deck-dispatch-issue-1674",
+                "confirmedDirty": true
+            })
+        );
+    }
+
     /// **PRD #742 M5 changed the stamp's value from the label to the key**, and
     /// the assertion below moved with it: the webview compares this against the
     /// deck id it holds the group under, and a stamp that stayed

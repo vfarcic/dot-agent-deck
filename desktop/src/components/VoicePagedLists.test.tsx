@@ -589,7 +589,7 @@ describe("the agent dashboard scrolls while voice is on", () => {
     fireEvent.click(within(screen.getByTestId("settings-panel")).getByRole("button", { name: /^close/i }));
     expect(screen.queryByTestId("settings-panel")).toBeNull();
 
-    fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]);
+    await act(async () => fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]));
     expect(screen.getByRole("alertdialog")).toBeInTheDocument();
     await speak(voice, "scroll down");
     expect(screen.getByTestId("voice-report")).toHaveTextContent(/open over the dashboard/i);

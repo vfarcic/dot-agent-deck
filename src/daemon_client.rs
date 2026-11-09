@@ -3626,6 +3626,43 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Issue #1674: would closing the panes in `pane_ids` leave a dispatched
+    /// worktree on disk holding uncommitted work? **Read-only** — see
+    /// [`AttachRequest::DispatchWorktreeClosePreview`].
+    ///
+    /// The desktop's close-confirmation dialog asks this while it arms, the
+    /// way the TUI's has since issue #717 (`kept_worktree_for_plan` in
+    /// `src/ui.rs`). The reply's `kept_worktree` is `None` when the close
+    /// would keep nothing, so `Ok(None)` needs no error arm: it is the
+    /// ordinary answer, not a malformed one.
+    ///
+    /// Best-effort by contract, and the caller holds the deadline: the TUI
+    /// bounds its own ask at 500 ms and renders no warning on any failure,
+    /// and the desktop does the same, so a caller that cannot afford to wait
+    /// wraps the call in `tokio::time::timeout` and treats a failure as "no
+    /// warning" rather than propagating it.
+    pub async fn dispatch_worktree_close_preview(
+        &self,
+        pane_ids: &[String],
+    ) -> Result<Option<crate::issue_dispatch_run::KeptWorktree>, ClientError> {
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::DispatchWorktreeClosePreview {
+                pane_ids: pane_ids.to_vec(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "worktree close preview failed".into()),
+            ));
+        }
+        Ok(resp.kept_worktree)
+    }
+
     /// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection.
     /// Returns once the daemon has confirmed the subscription with a
     /// successful RESP — subsequent frames on the wire are `KIND_EVENT`
@@ -9005,6 +9042,125 @@ pub(crate) mod gate_fixture {
         fn drop(&mut self) {
             self.server.abort();
         }
+    }
+}
+
+/// Issue #1674: the client half of the close-confirmation preview — the
+/// desktop's dialog asks the daemon the same question the TUI's has since
+/// issue #717, through [`DaemonClient::dispatch_worktree_close_preview`]. The
+/// daemon handler and the worktree policy it reads are driven end to end by
+/// `dispatch/close/002` through the TUI; what nothing else exercised is the
+/// CLIENT's wire behaviour, which is what this pins: the pane ids the request
+/// carries, and the reply field's readings.
+#[cfg(all(test, unix))]
+mod close_preview_tests {
+    use super::*;
+    use crate::daemon_protocol::{
+        AttachRequest, AttachResponse, KIND_REQ, bind_attach_listener, read_frame, write_resp,
+    };
+    use crate::issue_dispatch_run::KeptWorktree;
+    use spec::spec;
+    use std::sync::{Arc, Mutex};
+
+    /// One scripted reply for every connection, and a log of the requests it
+    /// answered. A trimmed copy on the `gate_fixture` model rather than a lift
+    /// into it: that fixture answers `Hello` and serves follow-ons, none of
+    /// which a bare `connect()` — the preview's only path — ever sends.
+    struct PreviewPeer {
+        _dir: tempfile::TempDir,
+        path: std::path::PathBuf,
+        requests: Arc<Mutex<Vec<AttachRequest>>>,
+    }
+
+    impl PreviewPeer {
+        fn spawn(reply: AttachResponse) -> Self {
+            let (dir, path, listener) = {
+                let _g = super::tests::BIND_LOCK
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("preview.sock");
+                let listener = bind_attach_listener(&path).expect("bind the preview peer");
+                (dir, path, listener)
+            };
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&requests);
+            tokio::spawn(async move {
+                while let Ok(mut stream) = listener.accept().await {
+                    let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                        continue;
+                    };
+                    let Ok(request) = serde_json::from_slice(&payload) else {
+                        continue;
+                    };
+                    log.lock().unwrap().push(request);
+                    let _ = write_resp(&mut stream, &reply).await;
+                }
+            });
+            Self {
+                _dir: dir,
+                path,
+                requests,
+            }
+        }
+
+        fn requests(&self) -> Vec<AttachRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// Scenario: the close-confirmation preview asks the daemon whether closing panes would keep a dispatched worktree. The request carries the pane ids the caller named verbatim; a reply that kept nothing reads `Ok(None)`; one that kept a tree reads `Ok(Some)` with the path and the confirmed-dirty flag; a refused request surfaces the daemon's error rather than reading as "nothing kept", because a dialog that mistook a failure for an answer would warn about nothing while a directory stayed on disk.
+    #[spec("protocol/close-preview/001")]
+    #[tokio::test]
+    async fn close_preview_001_the_client_sends_the_panes_and_reads_the_kept_worktree() {
+        let pane_ids = vec!["pane-41".to_string(), "pane-42".to_string()];
+
+        let nothing_kept = PreviewPeer::spawn(AttachResponse::ok());
+        let answer = DaemonClient::new(nothing_kept.path.clone())
+            .dispatch_worktree_close_preview(&pane_ids)
+            .await
+            .expect("a clean preview reply");
+        assert_eq!(
+            answer, None,
+            "ok with no kept_worktree field reads as nothing kept"
+        );
+        assert!(
+            matches!(
+                nothing_kept.requests().as_slice(),
+                [AttachRequest::DispatchWorktreeClosePreview { pane_ids: sent }] if sent.as_slice() == pane_ids.as_slice()
+            ),
+            "the request carries the panes the caller named, verbatim: {:?}",
+            nothing_kept.requests()
+        );
+
+        let mut kept_reply = AttachResponse::ok();
+        kept_reply.kept_worktree = Some(KeptWorktree {
+            path: "/home/dev/code/deck-dispatch-issue-1674".into(),
+            confirmed_dirty: true,
+        });
+        let kept = PreviewPeer::spawn(kept_reply);
+        let answer = DaemonClient::new(kept.path.clone())
+            .dispatch_worktree_close_preview(&pane_ids)
+            .await
+            .expect("a preview reply naming a kept worktree");
+        assert_eq!(
+            answer,
+            Some(KeptWorktree {
+                path: "/home/dev/code/deck-dispatch-issue-1674".into(),
+                confirmed_dirty: true,
+            }),
+            "the reply's kept_worktree travels to the caller whole"
+        );
+
+        let refused = PreviewPeer::spawn(AttachResponse::err("worktree registry unavailable"));
+        let error = DaemonClient::new(refused.path.clone())
+            .dispatch_worktree_close_preview(&pane_ids)
+            .await
+            .expect_err("a refused preview is an error, not a silent nothing");
+        assert!(
+            matches!(&error, ClientError::Server(message) if message.contains("worktree registry unavailable")),
+            "the daemon's refusal surfaces: {error:?}"
+        );
     }
 }
 

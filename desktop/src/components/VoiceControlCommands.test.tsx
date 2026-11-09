@@ -782,7 +782,7 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
-    fireEvent.click(entry(2, second.label));
+    await act(async () => fireEvent.click(entry(2, second.label)));
     const dialog = screen.getByRole("alertdialog");
     expect(dialog).toHaveTextContent(second.label);
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
@@ -845,7 +845,7 @@ describe("PRD #1261 numbered choice over the original voice command", () => {
     await turnVoiceOn();
     await completeUtterance();
     expect(entry(2, second.label)).toBeVisible();
-    fireEvent.click(screen.getByRole("button", { name: `Close ${first.label} agent` }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: `Close ${first.label} agent` })));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.queryByRole("button", { name: `2. ${second.label}` })).toBeNull();
     expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
@@ -1431,7 +1431,7 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true })));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1459,7 +1459,7 @@ describe("typing into the open agent", () => {
     await completeUtterance();
     expect(resolveVoice).toHaveBeenCalledWith(said);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true })));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1489,7 +1489,7 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true })));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => { settleTyped(); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1516,7 +1516,7 @@ describe("typing into the open agent", () => {
     await completeUtterance();
     expect(resolveVoice).toHaveBeenLastCalledWith(said);
 
-    fireEvent.click(screen.getByTestId("stop-run"));
+    await act(async () => fireEvent.click(screen.getByTestId("stop-run")));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.getByRole("alertdialog")).toHaveTextContent("This sends a stop request to");
     await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
@@ -2298,7 +2298,7 @@ describe("sticky dictation in the open agent pane", () => {
     await enter(voice);
     expect(screen.getByTestId("voice-dictating")).toHaveTextContent(/typing to coder/i);
 
-    fireEvent.click(screen.getByTestId("stop-run"));
+    await act(async () => fireEvent.click(screen.getByTestId("stop-run")));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.queryByTestId("voice-dictation")).toBeNull();
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
@@ -2809,7 +2809,7 @@ describe("sticky dictation in the open agent pane", () => {
     await completeUtterance();
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true })));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));

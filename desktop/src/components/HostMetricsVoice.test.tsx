@@ -266,7 +266,7 @@ describe("closing the Host popover by voice (PR #1672 round 10)", () => {
     render(<DeckShell runtime={runtime(voice, withPlanner())} initialView={{ kind: "overview" }} />);
     await turnOnVoice();
     await speak(voice, "show host");
-    fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]);
+    await act(async () => fireEvent.click(screen.getAllByRole("button", { name: /^Close .* agent$/ })[0]));
     expect(screen.getByRole("alertdialog")).toBeInTheDocument();
     await speak(voice, "close");
     expect(screen.queryByRole("alertdialog")).toBeNull();

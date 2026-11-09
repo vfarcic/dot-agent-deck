@@ -157,6 +157,8 @@ The TUI shows the same pull request on the agent's card, as `#1234` with a glyph
 - **Stop one agent:** press the stop control on its row (`Close <name> agent`), or **Close agent** in its full-window pane. The confirmation, `Close <name>?`, names the daemon the stop request goes to. For an orchestration role it warns that the other roles keep running. Press **Close agent**. Closing from the pane returns you to the Dashboard.
 - **Stop every role of an orchestration:** press **Close** on its group header. The confirmation lists every role it will stop. Press **Close all N roles** (or **Close 1 role**).
 
+**A kept worktree:** when closing would leave a dispatched unit's worktree on disk because it holds uncommitted changes, the confirmation says so and names the directory, so you can note the path before answering. After the close, a notice in the corner names the directory again: that one is measured after the close, so it is what actually happened, and it stays until you dismiss it. A worktree that turned out to be clean is removed with no message. The TUI's confirmation and status line say the same things.
+
 **Check it worked:** the row, or the whole group, disappears from the section. If the app cannot confirm that some roles stopped, it says how many may still be running on which daemon, in a message on the Dashboard and in the New agent dialog; open the TUI against that daemon, or run `dot-agent-deck daemon status` on its host, to see what is still there.
 
 In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab.

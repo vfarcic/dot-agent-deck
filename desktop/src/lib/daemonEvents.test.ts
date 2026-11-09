@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyHandoffEvent, mapDaemonEvent } from "./daemonEvents";
+import { applyHandoffEvent, mapDaemonEvent, worktreeKeptOf } from "./daemonEvents";
 import type { HandoffEdge } from "../types";
 
 describe("daemon event consumers", () => {
@@ -37,6 +37,27 @@ describe("daemon event consumers", () => {
     expect(item?.agentId).toBe("7");
   });
 });
+
+describe("worktree_kept broadcasts (issue #1674)", () => {
+  /// Scenario: a close left a dispatched worktree on disk. The broadcast carries the path and whether uncommitted work was confirmed, snake_case beside its `kind`, with the deck it was stamped with — the reader keeps all three.
+  it("reads a kept worktree out of the payload, with its deck", () => {
+    expect(worktreeKeptOf({ kind: "worktree_kept", path: "/home/dev/code/deck-dispatch-issue-1674", confirmed_dirty: true, deck: "/tmp/remote.sock" }))
+      .toEqual({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true, deck: "/tmp/remote.sock" });
+    expect(worktreeKeptOf({ kind: "worktree_kept", path: "/home/dev/x", confirmed_dirty: false }))
+      .toEqual({ path: "/home/dev/x", confirmedDirty: false });
+  });
+
+  /// Scenario: any other broadcast kind, a payload that is not an object, or one missing the path reads as nothing — ignoring beats guessing, as `mapDaemonEvent` keeps for an unknown `kind`.
+  it("reads nothing from another kind or a pathless payload", () => {
+    expect(worktreeKeptOf({ kind: "event", event_type: "tool_start" })).toBeUndefined();
+    expect(worktreeKeptOf({ kind: "inbox" })).toBeUndefined();
+    expect(worktreeKeptOf(null)).toBeUndefined();
+    expect(worktreeKeptOf("worktree_kept")).toBeUndefined();
+    expect(worktreeKeptOf({ kind: "worktree_kept", confirmed_dirty: true })).toBeUndefined();
+    expect(worktreeKeptOf({ kind: "worktree_kept", path: "   ", confirmed_dirty: true })).toBeUndefined();
+  });
+});
+
 
 describe("inbox/status/032 — what ended an agent's pane, in the events drawer", () => {
   const notice = (termination?: unknown) => ({

@@ -1576,6 +1576,34 @@ export interface CleanupWarningEntry {
   deck?: string;
 }
 
+/**
+ * Issue #1674 — a dispatched worktree a close kept on disk, in the shape the
+ * daemon reports it: once as the close-confirmation's prediction (asked while
+ * the agent is still alive) and once as the post-close fact (the
+ * `worktree_kept` broadcast, measured after the agent was reaped).
+ *
+ * `confirmedDirty` separates the two ways a tree ends up kept: `true` when
+ * uncommitted work was actually measured, `false` when the daemon could not
+ * tell and kept it anyway — which read differently to a human, so the
+ * sentences differ.
+ */
+export interface KeptWorktreeView {
+  path: string;
+  confirmedDirty: boolean;
+}
+
+/**
+ * Issue #1674 — one kept-worktree notice the user has not dismissed: the
+ * broadcast's report plus the `id` the runtime mints per broadcast, so two
+ * closes that each kept a tree are two notices, dismissed separately — the
+ * `CleanupWarningEntry` lifetime, for its reason: the path is the one thing
+ * the user may still need, and a later close's sentence must not replace it
+ * unread.
+ */
+export interface KeptWorktreeEntry extends KeptWorktreeView {
+  id: number;
+}
+
 export interface DeckRuntimeState {
   mode: RuntimeMode;
   /**
@@ -1641,6 +1669,29 @@ export interface DeckRuntimeState {
   decideUpgrade?: (upgradeId: string, questionId: number, choice: import("./lib/upgrade").UpgradeChoice) => Promise<void>;
   /** PRD #1666 §6.4: Retry or Cancel one listed deck message; absent where no daemon can answer. */
   inboxAction?: (target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb) => Promise<InboxActionResult>;
+  /**
+   * Issue #1674 — would closing the panes `paneIds` name on the deck `deckId`
+   * keep a dispatched worktree? Read-only and best-effort: `null` when the
+   * close keeps nothing, and a rejection renders no warning, exactly as the
+   * TUI's dialog treats a daemon that cannot answer.
+   *
+   * **Optional, and absence is a real state**, for the voice members' reason:
+   * render-only test runtimes and the browser preview have no daemon to ask,
+   * and a runtime without it opens the confirmation without the warning rather
+   * than a dialog that cannot open.
+   */
+  worktreeClosePreview?: (deckId: string, paneIds: string[]) => Promise<KeptWorktreeView | null>;
+  /**
+   * Issue #1674 — the dispatched worktrees closes have kept on disk and the
+   * user has not dismissed, one entry per `worktree_kept` broadcast from any
+   * deck. Held rather than replaced (the `restart` notice's reason): the path
+   * is the one thing the user may still need, and a later close's sentence
+   * must not take it away unread. Removed by
+   * {@link dismissWorktreeKept} and by nothing else.
+   */
+  keptWorktrees?: readonly KeptWorktreeEntry[];
+  /** Remove one entry of {@link keptWorktrees} — the user's explicit dismissal. */
+  dismissWorktreeKept?: (id: number) => void;
   sendTerminalInput: (target: AgentTarget, data: string, precondition?: () => boolean) => Promise<void>;
   resizeTerminal: (target: AgentTarget, cols: number, rows: number) => Promise<void>;
   /**

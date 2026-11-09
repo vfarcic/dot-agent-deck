@@ -31,6 +31,11 @@ const { bridge } = vi.hoisted(() => ({
     setShownTerminals: vi.fn(async () => {}),
     listProjects: vi.fn(async () => ({ projects: [] })),
     resolveProject: vi.fn(),
+    // Issue #1674: the kept-worktree seam. Defaults that answer "nothing
+    // kept" and "never told", so a test that sets no implementation of its
+    // own exercises the same paths a bridge without the verbs would.
+    worktreeClosePreview: vi.fn(async (): Promise<{ path: string; confirmedDirty: boolean } | null> => null),
+    onWorktreeKept: vi.fn(async (_listener: (kept: { path: string; confirmedDirty: boolean; deck?: string }) => void): Promise<() => void> => () => {}),
     declareVoiceScreen: vi.fn(),
     dispose: vi.fn(async () => {}),
   },
@@ -297,5 +302,45 @@ describe("useDeckRuntime", () => {
     expect(grid("1")).toBeUndefined();
     // Another deck's agent is not this deck's to forget.
     expect(buffer(OTHER_DECK, "1", "elsewhere")).toBeDefined();
+  });
+
+  /**
+   * Scenario (issue #1674): the daemon broadcasts that closes on two decks
+   * each kept a dispatched worktree. The runtime holds one notice per
+   * broadcast, from any deck, and dismissing one leaves the other on screen;
+   * the close-confirmation preview passes the deck and its panes through to
+   * the bridge untouched.
+   */
+  it("holds one kept-worktree notice per broadcast and passes the preview through", async () => {
+    let onWorktreeKept: ((kept: { path: string; confirmedDirty: boolean; deck?: string }) => void) | undefined;
+    bridge.onWorktreeKept.mockImplementation((listener: (kept: { path: string; confirmedDirty: boolean; deck?: string }) => void) => {
+      onWorktreeKept = listener;
+      return Promise.resolve(() => {});
+    });
+    bridge.connect.mockResolvedValue([createFixtureSnapshot("connected")]);
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
+    await waitFor(() => expect(onWorktreeKept).toBeDefined());
+
+    act(() => onWorktreeKept!({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true, deck: FIXTURE_REMOTE_DAEMON_ID }));
+    act(() => onWorktreeKept!({ path: "/home/dev/code/deck-dispatch-another", confirmedDirty: false }));
+    expect(result.current.keptWorktrees?.map(({ path, confirmedDirty }) => ({ path, confirmedDirty }))).toEqual([
+      { path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true },
+      { path: "/home/dev/code/deck-dispatch-another", confirmedDirty: false },
+    ]);
+
+    // Dismissing one notice leaves the other; each is its own dismissal.
+    const [first, second] = result.current.keptWorktrees ?? [];
+    act(() => result.current.dismissWorktreeKept?.(first.id));
+    expect(result.current.keptWorktrees).toEqual([second]);
+    act(() => result.current.dismissWorktreeKept?.(second.id));
+    // An empty list is carried as an absent key, as the cleanup warnings are.
+    expect(result.current.keptWorktrees ?? []).toEqual([]);
+
+    bridge.worktreeClosePreview.mockResolvedValueOnce({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true });
+    await act(async () => {
+      await expect(result.current.worktreeClosePreview?.(FIXTURE_REMOTE_DAEMON_ID, ["pane-41"])).resolves.toEqual({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true });
+    });
+    expect(bridge.worktreeClosePreview).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41"]);
   });
 });

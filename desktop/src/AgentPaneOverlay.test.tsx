@@ -337,7 +337,7 @@ describe("agent pane overlay", () => {
     const close = () => within(pane()).getByRole("button", { name: "Close agent" });
 
     expect(within(pane()).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
-    fireEvent.click(close());
+    await act(async () => fireEvent.click(close()));
     let dialog = screen.getByRole("alertdialog");
     expect(dialog).toHaveTextContent("Close Plan / architecture?");
     expect(dialog.closest("[inert]")).toBeNull();
@@ -346,7 +346,7 @@ describe("agent pane overlay", () => {
     expect(runAction).not.toHaveBeenCalled();
     expect(pane()).toBeVisible();
 
-    fireEvent.click(close());
+    await act(async () => fireEvent.click(close()));
     dialog = screen.getByRole("alertdialog");
     fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" }));
     expect(within(dialog).getByRole("button", { name: "Stopping…" })).toBeDisabled();
@@ -361,11 +361,11 @@ describe("agent pane overlay", () => {
   });
 
   /** Scenario: an agent disappears while its close confirmation is awaiting a click. The pane and its confirmation close together, without sending the captured stop request. */
-  it.each(["overview", "deck"] as const)("dismisses an unconfirmed close when its agent retires from %s", (from) => {
+  it.each(["overview", "deck"] as const)("dismisses an unconfirmed close when its agent retires from %s", async (from) => {
     const rt = runtime();
     const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from };
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" })));
     expect(screen.getByRole("alertdialog")).toBeVisible();
 
     const ended = { ...rt.snapshot, agents: rt.snapshot.agents.filter((agent) => agent.id !== "planner") };
@@ -380,15 +380,15 @@ describe("agent pane overlay", () => {
     let settle!: (result: DeckActionResult) => void;
     const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
     render(<DeckShell runtime={runtime({ runAction })} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" }} />);
-    const ask = () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
-    ask();
+    const ask = async () => { await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }))); };
+    await ask();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" }));
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     if (differentPane) {
       fireEvent.keyDown(window, { key: "Escape" });
       fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
     }
-    ask();
+    await ask();
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => settle({ ok: true }));
     if (differentPane) {
@@ -409,13 +409,13 @@ describe("agent pane overlay", () => {
     const rt = runtime({ runAction });
     const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" as const };
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
-    const confirm = () => {
-      fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    const confirm = async () => {
+      await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" })));
       fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" }));
     };
-    confirm();
+    await confirm();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
-    confirm();
+    await confirm();
     expect(runAction).toHaveBeenCalledTimes(2);
     await act(async () => pending[0]({ ok: false }));
     expect(screen.getByRole("alertdialog")).toBeVisible();
@@ -432,7 +432,7 @@ describe("agent pane overlay", () => {
   it("keeps the pane when closing its agent is refused, and Back stops nothing", async () => {
     const runAction = vi.fn(async () => { throw new Error("daemon refused the stop"); });
     render(<DeckShell runtime={runtime({ runAction })} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" }} />);
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" })));
     await act(async () => fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" })));
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
@@ -442,10 +442,10 @@ describe("agent pane overlay", () => {
   });
 
   /** Scenario: Escape cancels the stop confirmation without also closing the agent pane behind it. */
-  it("lets Escape dismiss only the stop confirmation", () => {
+  it("lets Escape dismiss only the stop confirmation", async () => {
     const rt = runtime();
     render(<DeckShell runtime={rt} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" }} />);
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" })));
     fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
@@ -462,7 +462,7 @@ describe("agent pane overlay", () => {
     const rt = runtime({ snapshot: fleet[0], fleet, runAction });
     const view = { kind: "agent" as const, deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: target.id, incarnation: "process-a", from: "overview" as const };
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
-    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" })));
     expect(screen.getByRole("alertdialog")).toHaveTextContent("dev@build-box");
     if (replaced) {
       const successor = fleet.map((deck) => deck === remote ? { ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "process-b" })) } : deck);

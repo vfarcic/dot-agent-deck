@@ -1754,6 +1754,16 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** reconnect serialization (covered by `session/live/010`) or card rendering (`dashboard/pane/009`).
 - **Platform coverage:** mac+linux+windows.
 
+#### protocol/close-preview
+
+##### protocol/close-preview/001 — The client sends the close-preview's pane ids verbatim and reads the reply's three answers (issue #1674).
+- **Layer:** unit (client library against a synthetic socket peer, `src/daemon_client.rs`).
+- **Agent:** none.
+- **Asserts:** `DaemonClient::dispatch_worktree_close_preview` puts the caller's pane ids on the wire unchanged; an `ok` reply with no `kept_worktree` reads `Ok(None)`; one naming a kept worktree arrives whole with its path and `confirmed_dirty`; a refused request surfaces as `ClientError::Server` rather than reading as "nothing kept".
+- **Why it exists:** the desktop's close confirmation asks this question through this method (issue #1674), and nothing else exercises the client half — the TUI sends the raw request itself, and the daemon handler is driven end to end by `dispatch/close/002`.
+- **Does not assert:** the daemon's preview answer or the worktree policy behind it (covered by `dispatch/close/002` and the `issue_dispatch_run` unit tests); the desktop's rendering of the answer (the vitest tier).
+- **Platform coverage:** mac+linux (Unix socket harness).
+
 #### daemon/status
 
 ##### daemon/status/001 — `dot-agent-deck daemon status` names a managed agent and visibly reflects a driven live status, not a placeholder identical to an agent with no session.

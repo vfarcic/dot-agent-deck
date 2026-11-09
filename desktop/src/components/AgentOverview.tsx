@@ -1,7 +1,7 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
-import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
+import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView, type KeptWorktreeView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
 import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
@@ -61,6 +61,8 @@ export type OverviewAgent = Pick<
   | "pullRequest"
   /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
   | "incarnation"
+  /* Issue #1674 — the pane the daemon tagged the agent with, sent with the close-confirmation preview so the daemon can resolve the worktree it owns. */
+  | "paneId"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -87,7 +89,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId } = agent;
   return {
     id,
     daemonId,
@@ -108,6 +110,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     writeLease: writeLease === "unknown" ? undefined : writeLease,
     ...(pullRequest ? { pullRequest } : {}),
     ...(incarnation ? { incarnation } : {}),
+    ...(paneId ? { paneId } : {}),
   };
 }
 
@@ -816,15 +819,47 @@ export function stopTargetName(agent: OverviewAgent): string {
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
 
+/**
+ * Issue #1674 — what a close confirmation (and, after the close, the toast)
+ * says about a dispatched worktree that is kept. The TUI's sentences, so the
+ * two clients say the same words for the same fact (CLAUDE.md rule 22), with
+ * the path spelled out because going to it is the whole point of the report.
+ */
+export function keptWorktreeSentence(kept: KeptWorktreeView): string {
+  return kept.confirmedDirty
+    ? `Uncommitted work here is KEPT, not deleted: ${kept.path}.`
+    : `Uncommitted work here, if any, is KEPT: ${kept.path}.`;
+}
+
+/**
+ * Issue #1674 — ask the daemon whether closing `paneIds` on `deckId` would
+ * keep a dispatched worktree, best-effort: any failure, an absent preview on
+ * the runtime, or an empty pane list reads as "nothing to warn about", which
+ * is exactly how the TUI's dialog treats a daemon that cannot answer. The
+ * answer names the directory, so the warning can.
+ */
+export async function keptWorktreeForClose(
+  preview: DeckRuntimeState["worktreeClosePreview"],
+  deckId: string | undefined,
+  paneIds: string[],
+): Promise<KeptWorktreeView | undefined> {
+  if (!preview || deckId === undefined || paneIds.length === 0) return undefined;
+  try {
+    return (await preview(deckId, paneIds)) ?? undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 /** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
-export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void): ConfirmState {
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, kept?: KeptWorktreeView): ConfirmState {
   const name = stopTargetName(agent);
   const roleWarning = agent.tab.kind === "orchestration"
     ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
     : "";
   return {
     title: `Close ${name}?`,
-    body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
+    body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}${kept ? ` ${keptWorktreeSentence(kept)}` : ""}`,
     label: "Close agent",
     busyLabel: "Stopping…",
     action: async () => {
@@ -1437,7 +1472,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction));
+        /*
+         * Issue #1674: the daemon is asked BEFORE the question opens, the way
+         * the TUI's dialog arms (issue #717), so the warning is in the body
+         * the user reads rather than a late amendment to it. Best-effort: a
+         * preview that fails or cannot be asked opens the question exactly as
+         * it read before this existed.
+         */
+        void keptWorktreeForClose(runtime.worktreeClosePreview, agent.daemonId, agent.paneId ? [agent.paneId] : []).then((kept) => {
+          setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, kept));
+        });
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -1446,12 +1490,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
         const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
         const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
-        setConfirm({
-          title: `Close ${title}?`,
-          body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
-          label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
-          busyLabel: "Stopping…",
-          action: () => run({ type: "stop_orchestration", deckId, roles }),
+        /*
+         * Issue #1674: the preview is asked before the question opens, as the
+         * single close above does — and EVERY role's pane is sent, because a
+         * multi-role orchestration shares ONE worktree and any of its panes
+         * resolves it.
+         */
+        const paneIds = group.agents.flatMap((agent) => (agent.paneId ? [agent.paneId] : []));
+        void keptWorktreeForClose(runtime.worktreeClosePreview, deckId, paneIds).then((kept) => {
+          setConfirm({
+            title: `Close ${title}?`,
+            body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.${kept ? ` ${keptWorktreeSentence(kept)}` : ""}`,
+            label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
+            busyLabel: "Stopping…",
+            action: () => run({ type: "stop_orchestration", deckId, roles }),
+          });
         });
       },
     };

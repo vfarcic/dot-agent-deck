@@ -556,7 +556,7 @@ describe("voice control panel", () => {
       let release!: (answer: VoiceResultDto) => void;
       resolveVoice.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
       await say(command.said);
-      fireEvent.click(screen.getByTestId("stop-run"));
+      await act(async () => fireEvent.click(screen.getByTestId("stop-run")));
       expect(screen.getByRole("alertdialog")).toBeVisible();
       await act(async () => { release(dispatchPrompt(command.said)); });
       await flush();

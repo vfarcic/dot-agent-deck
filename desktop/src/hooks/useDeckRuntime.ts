@@ -12,7 +12,7 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, KeptWorktreeEntry, RuntimeMode, TerminalBuffer } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -416,6 +416,48 @@ export function useDeckRuntime(): DeckRuntimeState {
     ? (upgradeId: string, questionId: number, choice: UpgradeChoice) => bridge.decideUpgrade(upgradeId, questionId, choice)
     : undefined), [bridge]);
 
+  /*
+   * Issue #1674 — the close-confirmation preview and the post-close report,
+   * the desktop's copy of the TUI's two halves (issue #717). The preview is
+   * deliberately NOT wrapped in the `setError` bookkeeping `runAction` uses:
+   * a preview that cannot be asked is no fault of the screen behind the
+   * dialog, and the close confirmation catches it and opens without the
+   * warning, exactly as the TUI's does for a daemon that cannot answer.
+   */
+  const worktreeClosePreview = useMemo(() => (typeof bridge.worktreeClosePreview === "function"
+    ? (deckId: string, paneIds: string[]) => bridge.worktreeClosePreview(deckId, paneIds)
+    : undefined), [bridge]);
+  /*
+   * And the report: every `worktree_kept` broadcast, from ANY deck, becomes
+   * one entry the toast holds until dismissed — the cleanup warnings'
+   * lifetime, for their reason: the path is the one thing the user may still
+   * need, and a later close's sentence must not replace it unread.
+   */
+  const [keptWorktrees, setKeptWorktrees] = useState<readonly KeptWorktreeEntry[]>([]);
+  const nextKeptWorktreeId = useRef(0);
+  useEffect(() => {
+    if (typeof bridge.onWorktreeKept !== "function") return;
+    let unsubscribe: (() => void) | undefined;
+    let active = true;
+    void bridge.onWorktreeKept((kept) => {
+      if (!active) return;
+      nextKeptWorktreeId.current += 1;
+      const entry: KeptWorktreeEntry = { id: nextKeptWorktreeId.current, path: kept.path, confirmedDirty: kept.confirmedDirty };
+      setKeptWorktrees((current) => [...current, entry]);
+    }).then((stop) => {
+      if (active) unsubscribe = stop;
+      else stop();
+    }, () => undefined);
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [bridge]);
+  /** Issue #1674 — the one writer that removes a kept-worktree notice. */
+  const dismissWorktreeKept = useCallback((id: number) => {
+    setKeptWorktrees((current) => (current.some((entry) => entry.id === id) ? current.filter((entry) => entry.id !== id) : current));
+  }, []);
+
   // PRD #882: the geometry the daemon has applied per agent. Held here rather
   // than inside each tile because the push is per agent and arrives on one
   // bridge-wide subscription — and because a tile has to be able to read a
@@ -489,6 +531,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),
+    ...(worktreeClosePreview ? { worktreeClosePreview } : {}),
+    ...(keptWorktrees.length ? { keptWorktrees } : {}),
+    dismissWorktreeKept,
     sendTerminalInput,
     resizeTerminal,
     setShownTerminals,

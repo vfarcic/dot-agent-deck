@@ -17,6 +17,7 @@ function role(deckId: string, id: string, roleName: string, roleIndex: number): 
     tab: { kind: "orchestration", orchestrationId: "orc-loop", name: "loop", displayTitle: "demo-project-orchestrator-1", roleName, roleIndex, isStartRole: roleIndex === 0, cwd: "/home/build/demo-project" },
     inOrchestration: true,
     incarnation: "listed-process-a",
+    paneId: `pane-${id}`,
   };
 }
 
@@ -27,7 +28,7 @@ function fleetWithOrchestration(): DeckFleet {
     : deck);
 }
 
-function runtime(runAction: DeckRuntimeState["runAction"], fleet: DeckFleet = fleetWithOrchestration()): DeckRuntimeState {
+function runtime(runAction: DeckRuntimeState["runAction"], fleet: DeckFleet = fleetWithOrchestration(), worktreeClosePreview: DeckRuntimeState["worktreeClosePreview"] = async () => null): DeckRuntimeState {
   return {
     mode: "fixture",
     snapshot: fleet[0],
@@ -35,6 +36,7 @@ function runtime(runAction: DeckRuntimeState["runAction"], fleet: DeckFleet = fl
     terminalData: {},
     clearError: vi.fn(),
     runAction,
+    worktreeClosePreview,
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),
     setShownTerminals: vi.fn(async () => undefined),
@@ -68,7 +70,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     const stop = within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent");
     expect(stop).toHaveAccessibleName("Close planner agent");
     expect(stop).toHaveAttribute("title", "Close planner");
-    fireEvent.click(stop);
+    await act(async () => fireEvent.click(stop));
     expect(confirmation()).toHaveTextContent("Close planner?");
     expect(confirmation()).toHaveTextContent("dev@build-box");
     expect(confirmation()).toHaveTextContent("This closes only this role, leaving the orchestration one role short. Other roles keep running.");
@@ -76,7 +78,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();
 
-    fireEvent.click(stop);
+    await act(async () => fireEvent.click(stop));
     const successor = fleetWithOrchestration().map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "successor-process-b" })) }));
     rerender(<AgentOverview runtime={runtime(runAction, successor)} onNavigate={vi.fn()} />);
     await act(async () => fireEvent.click(within(confirmation()!).getByRole("button", { name: "Close agent" })));
@@ -105,7 +107,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(plainCards.length).toBeGreaterThan(0);
     for (const card of plainCards) expect(within(card as HTMLElement).queryByTestId("overview-close-orchestration")).toBeNull();
     expect(closes[0]).toHaveAccessibleName("Close demo-project-orchestrator-1 orchestration");
-    fireEvent.click(closes[0]);
+    await act(async () => fireEvent.click(closes[0]));
     const dialog = confirmation()!;
     expect(dialog).toHaveTextContent("Close demo-project-orchestrator-1?");
     expect(dialog).toHaveTextContent("This stops every role of this orchestration on dev@build-box — all 2 of its roles: planner, builder.");
@@ -134,7 +136,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     }));
     render(<AgentOverview runtime={runtime(runAction)} onNavigate={vi.fn()} />);
 
-    fireEvent.click(within(row(FIXTURE_DAEMON_ID, "planner")).getByTestId("overview-stop-agent"));
+    await act(async () => fireEvent.click(within(row(FIXTURE_DAEMON_ID, "planner")).getByTestId("overview-stop-agent")));
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Close agent" }));
     const busy = within(confirmation()!).getByRole("button", { name: "Stopping…" });
     expect(busy).toBeDisabled();
@@ -144,6 +146,76 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
 
     await act(async () => settle("refused"));
     expect(confirmation()).toBeNull();
+  });
+});
+
+describe("the close confirmation warns about a kept worktree (issue #1674)", () => {
+  /**
+   * Scenario: the daemon's preview answers that closing the planner role
+   * would keep a dispatched worktree with uncommitted work. The confirmation
+   * the stop control opens says so and names the directory, in the TUI's
+   * words, and the preview was asked on the deck the agent is on with the
+   * pane the daemon tagged it with.
+   */
+  it("warns before a single-agent close, naming the directory, in the TUI's words", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const worktreeClosePreview = vi.fn(async (): Promise<{ path: string; confirmedDirty: boolean } | null> => ({ path: "/home/build/code/deck-dispatch-issue-1674", confirmedDirty: true }));
+    render(<AgentOverview runtime={runtime(runAction, fleetWithOrchestration(), worktreeClosePreview)} onNavigate={vi.fn()} />);
+
+    await act(async () => fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")));
+    expect(worktreeClosePreview).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41"]);
+    expect(confirmation()).toHaveTextContent("Uncommitted work here is KEPT, not deleted: /home/build/code/deck-dispatch-issue-1674.");
+  });
+
+  /**
+   * Scenario: the same close, but the daemon could not confirm the tree is
+   * dirty. The confirmation still names the directory, under the conditional
+   * wording, because the tree is kept either way.
+   */
+  it("warns conditionally when the daemon could not confirm the worktree is dirty", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const worktreeClosePreview = vi.fn(async (): Promise<{ path: string; confirmedDirty: boolean } | null> => ({ path: "/home/build/code/deck-dispatch-issue-1674", confirmedDirty: false }));
+    render(<AgentOverview runtime={runtime(runAction, fleetWithOrchestration(), worktreeClosePreview)} onNavigate={vi.fn()} />);
+
+    await act(async () => fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")));
+    expect(confirmation()).toHaveTextContent("Uncommitted work here, if any, is KEPT: /home/build/code/deck-dispatch-issue-1674.");
+  });
+
+  /**
+   * Scenario: press Close on the orchestration's card with the preview
+   * answering. Every role's pane is asked — a multi-role orchestration shares
+   * one worktree and any of its panes resolves it — and the confirmation
+   * carries the warning beside the role list.
+   */
+  it("warns before an orchestration close, asking every role's pane", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const worktreeClosePreview = vi.fn(async (): Promise<{ path: string; confirmedDirty: boolean } | null> => ({ path: "/home/build/code/deck-dispatch-issue-1674", confirmedDirty: true }));
+    render(<AgentOverview runtime={runtime(runAction, fleetWithOrchestration(), worktreeClosePreview)} onNavigate={vi.fn()} />);
+
+    const remoteGroup = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === FIXTURE_REMOTE_DAEMON_ID)!;
+    await act(async () => fireEvent.click(within(remoteGroup).getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" })));
+    expect(worktreeClosePreview).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41", "pane-42"]);
+    expect(confirmation()).toHaveTextContent("Uncommitted work here is KEPT, not deleted: /home/build/code/deck-dispatch-issue-1674.");
+  });
+
+  /**
+   * Scenario: the preview cannot be asked — the runtime offers the verb but
+   * the daemon refuses, or the runtime is a render-only double with no verb
+   * at all. The confirmation opens exactly as it read before, with no
+   * warning: a preview that cannot be asked is no reason to refuse the close,
+   * which is how the TUI's dialog treats a daemon that cannot answer.
+   */
+  it.each([
+    ["the daemon refuses the preview", async () => { throw new Error("deck unreachable"); }],
+    ["the runtime has no preview to ask", undefined],
+  ] as const)("opens the confirmation without a warning when %s", async (_name, preview) => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AgentOverview runtime={runtime(runAction, fleetWithOrchestration(), preview)} onNavigate={vi.fn()} />);
+
+    await act(async () => fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")));
+    const dialog = confirmation()!;
+    expect(dialog).toHaveTextContent("Close planner?");
+    expect(dialog).not.toHaveTextContent("KEPT");
   });
 });
 
@@ -168,12 +240,12 @@ describe("a spoken stop holds to the daemon process it named (PRD #1666 part 2, 
     const target = { deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", from: "overview" };
 
     let answer: string | undefined;
-    act(() => { answer = voice.confirmStopAgent({ ...target, incarnation: "listed-process-a" }); });
+    await act(async () => { answer = voice.confirmStopAgent({ ...target, incarnation: "listed-process-a" }); });
     expect(answer).toBe(opens ? undefined : STOP_TARGET_RESTARTED);
     expect(confirmation() !== null).toBe(opens);
     if (opens) fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
 
-    act(() => { answer = voice.confirmCloseOrchestration({ ...target, orchestrationAgentId: "41", orchestrationIncarnation: "listed-process-a" }); });
+    await act(async () => { answer = voice.confirmCloseOrchestration({ ...target, orchestrationAgentId: "41", orchestrationIncarnation: "listed-process-a" }); });
     expect(answer).toBe(opens ? undefined : STOP_TARGET_RESTARTED);
     expect(confirmation() !== null).toBe(opens);
     expect(runAction).not.toHaveBeenCalled();

@@ -51,6 +51,38 @@ export interface DaemonInboxNotice {
   termination?: unknown;
 }
 
+/**
+ * Issue #1674: the `worktree_kept` variant of the daemon's `BroadcastMsg` —
+ * a close left a dispatched worktree on disk, and this says where. Snake_case
+ * and flattened beside `kind`, like the `event` variant. The deck it came from
+ * rides beside it as `deck` (PRD #742 M3's stamp), which the reader keeps so
+ * a kept path can be named with the machine it is on.
+ */
+export interface DaemonWorktreeKept {
+  kind: "worktree_kept";
+  path?: unknown;
+  confirmed_dirty?: unknown;
+  /** PRD #742 M3: the deck the broadcast was stamped with, when there is one. */
+  deck?: unknown;
+}
+
+/**
+ * Issue #1674: read a `worktree_kept` broadcast out of a
+ * `desktop://daemon-event` payload, or `undefined` for any other kind — the
+ * same ignoring-beats-guessing rule {@link mapDaemonEvent} keeps. A payload
+ * missing its path cannot name what was kept, so it reads as nothing rather
+ * than as a warning with a blank directory in it.
+ */
+export function worktreeKeptOf(payload: unknown): { path: string; confirmedDirty: boolean; deck?: string } | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const notice = payload as DaemonWorktreeKept;
+  if (notice.kind !== "worktree_kept") return undefined;
+  const path = typeof notice.path === "string" && notice.path.trim() ? notice.path : undefined;
+  if (!path) return undefined;
+  const deck = typeof notice.deck === "string" && notice.deck.trim() ? notice.deck : undefined;
+  return { path, confirmedDirty: notice.confirmed_dirty === true, ...(deck ? { deck } : {}) };
+}
+
 /** Resolves the deck-side agent behind a hook event, when one is known. */
 export type AgentResolver = (agentId?: string, paneId?: string) => { id: string; role: string } | undefined;
 

@@ -32,7 +32,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
+import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, keptWorktreeForClose, keptWorktreeSentence, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -90,7 +90,7 @@ import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
-import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
+import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, KeptWorktreeEntry, PanelTab, OrchestrationLaunchConfig } from "./types";
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
@@ -925,14 +925,22 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
-    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped);
-    setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
-      const attempt = { view: agentView };
-      stoppingAttempt.current = attempt;
-      try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
-    } });
+    /*
+     * Issue #1674: the preview is asked before the question opens, as every
+     * other close confirmation now does, so the kept-worktree warning is in
+     * the body the user reads. The answer to the utterance is unchanged —
+     * `undefined` says the question is opening, which it is.
+     */
+    void keptWorktreeForClose(runtime.worktreeClosePreview, paneAgent.daemonId, paneAgent.paneId ? [paneAgent.paneId] : []).then((kept) => {
+      const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, kept);
+      setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
+        const attempt = { view: agentView };
+        stoppingAttempt.current = attempt;
+        try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
+      } });
+    });
     return undefined;
-  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
+  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction, runtime.worktreeClosePreview]);
   const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
     confirmStopAgent: confirmPaneStop,
     reportRefused: (sentence: string) => panelVoiceContext.current?.reportRefused?.(sentence),
@@ -1347,7 +1355,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} kept={runtime.keptWorktrees} onDismissKept={runtime.dismissWorktreeKept} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
@@ -2239,12 +2247,21 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       });
       return;
     }
-    setConfirm({
-      title: `Close ${selectedAgent.role}?`,
-      body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
-      label: "Close agent",
-      busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
+    /*
+     * Issue #1674: the daemon is asked whether this close would keep a
+     * dispatched worktree BEFORE the question opens — the overview's and the
+     * TUI's arm the same way — so the warning is in the body the user reads.
+     * Best-effort: a preview that fails or cannot be asked opens the question
+     * exactly as it read before this existed.
+     */
+    void keptWorktreeForClose(runtime.worktreeClosePreview, snapshot.connection.deckId, selectedAgent.paneId ? [selectedAgent.paneId] : []).then((kept) => {
+      setConfirm({
+        title: `Close ${selectedAgent.role}?`,
+        body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.${kept ? ` ${keptWorktreeSentence(kept)}` : ""}`,
+        label: "Close agent",
+        busyLabel: "Stopping…",
+        action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
+      });
     });
   };
 
@@ -2711,7 +2728,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} kept={runtime.keptWorktrees} onDismissKept={runtime.dismissWorktreeKept} />
     </div>
   );
 }
@@ -2737,15 +2754,16 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, kept, onDismissKept }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; kept?: readonly KeptWorktreeEntry[]; onDismissKept?: (id: number) => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
   const newestWarning = warnings?.at(-1)?.id;
+  const newestKept = kept?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, message, restart]);
-  if (!message && !warnings?.length && !restart) return null;
+  }, [newestWarning, newestKept, message, restart]);
+  if (!message && !warnings?.length && !restart && !kept?.length) return null;
   return (
     <div className="toast-stack" ref={stack}>
       {warnings?.map((warning) => (
@@ -2770,6 +2788,20 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
           <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
         </div>
       )}
+      {/* Issue #1674: each dispatched worktree a close kept on disk, in a slot
+          of its own for the restart notice's reason — the path is the one
+          thing the user may still need, so a later sentence must not replace
+          it unread. The TUI's status-line words, so both clients say the same
+          sentence for the same fact (CLAUDE.md rule 22). */}
+      {kept?.map((entry) => (
+        <div key={entry.id} className="toast toast-restart" data-testid="worktree-kept-toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body">
+            <span>{sanitizeText(keptWorktreeSentence(entry))}</span>
+          </div>
+          <button aria-label="Dismiss kept worktree notice" onClick={() => onDismissKept?.(entry.id)}><X size={14} /></button>
+        </div>
+      ))}
       {message && (
         <div className="toast" data-testid="toast" role="status">
           <AlertTriangle size={15} />
