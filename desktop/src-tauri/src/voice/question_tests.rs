@@ -1314,7 +1314,7 @@ fn codex_permission() -> DesktopPendingQuestion {
         command.map(str::to_string),
         command,
         1,
-        None,
+        Some((0, 160, 0)),
     ))
 }
 
@@ -1356,7 +1356,7 @@ fn devin_permission() -> DesktopPendingQuestion {
         "exec",
         Some("ls".into()),
         1,
-        None,
+        Some((3000, 11, 3)),
     ))
 }
 
@@ -1369,7 +1369,7 @@ fn codex_form() -> DesktopPendingQuestion {
             payload["tool_use_id"].as_str(),
             payload.get("tool_input"),
             1,
-            None,
+            Some((0, 160, 0)),
         )
         .unwrap(),
     )
@@ -1702,7 +1702,7 @@ async fn question_desktop_025_a_keyboard_only_question_refuses_every_way_of_nami
             Some("call_wide"),
             Some(&serde_json::json!({"questions": [{"header": "Pick", "id": "pick", "question": "Which?", "options": options}]})),
             1,
-            None,
+            Some((0, 160, 0)),
         )
         .unwrap(),
     );

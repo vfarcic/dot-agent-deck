@@ -1648,7 +1648,7 @@ mod tests {
             Some("touch x".into()),
             Some("touch x"),
             1,
-            None,
+            Some((0, 160, 0)),
         );
         assert_eq!(
             options_sentence(&codex),

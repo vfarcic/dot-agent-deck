@@ -12633,7 +12633,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/006 — A Codex approval is answered by `1`, `p` and `3`, and Codex's `Interrupt` reads as Idle.
 - **Layer:** L1/fast unit (`src/hook.rs`, reconstructed Codex `PermissionRequest`).
 - **Agent:** none.
-- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle. Codex 0.160.999 remains covered, while 0.159.0 and 0.161.0 make the channel Unsupported and every table option keyboard-only.
+- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle. Codex 0.160.999 remains covered, while an unknown version, 0.159.0 and 0.161.0 make the channel Unsupported and every table option keyboard-only.
 - **Does not assert:** that Codex accepts those keys (`question/live/*`), or the production version probe (`question/detect/021`).
 - **Platform coverage:** mac+linux.
 
@@ -12651,10 +12651,10 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** a real Pi (`question/live/*`); the JS half where Node is older than 23.6, which prints `SKIP:`.
 - **Platform coverage:** mac+linux.
 
-##### question/detect/009 — A Devin permission request uses the docs-derived table, Allow once and Deny only.
+##### question/detect/009 — A Devin permission request uses the docs-derived table, Allow once and Deny only at a verified version.
 - **Layer:** L1/fast unit (`src/hook.rs`).
 - **Agent:** none (Devin is not logged in on any measured host).
-- **Asserts:** a Permission question on the keys channel with Devin's eight documented options, of which only Allow once and Deny are answerable.
+- **Asserts:** an unknown hook version makes the channel Unsupported and every option keyboard-only; at Devin 3000.11.3, the keys channel offers the eight documented options, of which only Allow once and Deny are answerable.
 - **Does not assert:** anything about a real Devin: the table is documentation-derived and untested.
 - **Platform coverage:** mac+linux.
 
@@ -12736,10 +12736,10 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** live agents running parallel calls; Codex's `PreToolUse` and `PermissionRequest` inputs agreeing.
 - **Platform coverage:** mac+linux.
 
-##### question/detect/021 — Codex past the verified minor keeps its permission answers keyboard-only.
-- **Layer:** L1/fast subprocess (`tests/codex_hook_ingestion.rs`), the real hook CLI with a Codex version stand-in first on its PATH.
-- **Agent:** none (a shell stand-in reports `codex-cli 0.161.0`; no real Codex runs).
-- **Asserts:** the hook's version probe reaches the question builder; past the 0.160.x table's verified minor, the permission question is still emitted with every table option keyboard-only and an Unsupported channel.
+##### question/detect/021 — Codex with an unverified or unknown version keeps its permission answers keyboard-only.
+- **Layer:** L1/fast subprocess (`tests/codex_hook_ingestion.rs`), the real hook CLI with Codex version stand-ins.
+- **Agent:** none (shell stand-ins report stable and prerelease versions; no real Codex runs).
+- **Asserts:** the hook probes the session's pinned direct executable rather than a different `codex` on PATH; a newer stable or prerelease minor, an unattributable launcher and a failed probe each leave the permission question visible with every table option keyboard-only and an Unsupported channel, while the direct 0.160.0 control stays on the keys channel.
 - **Does not assert:** the same-minor and held-hook boundaries (`question/detect/001`, `/004` and `/006`), or a real newer Codex's menu.
 - **Platform coverage:** mac+linux.
 #### question/state

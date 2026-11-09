@@ -67,8 +67,9 @@
 use std::sync::OnceLock;
 
 /// The deck identity variables, in the order `tests/harness_isolation.rs` lists
-/// them. Kept in step with `tests/common/mod.rs`'s `DECK_ENDPOINT_VARS`; the two
-/// cannot share a constant because the lib target does not link that file.
+/// them, plus the direct-agent version-probe provenance. The first five match
+/// `tests/common/mod.rs`'s `DECK_ENDPOINT_VARS`; the two cannot share a constant
+/// because the lib target does not link that file.
 ///
 /// Issue #1077 added `DOT_AGENT_DECK_PANE_CAPABILITY`. It is not an endpoint, but it
 /// has the same failure mode as the pane and agent ids beside it, and a sharper
@@ -79,12 +80,13 @@ use std::sync::OnceLock;
 /// `DOT_AGENT_DECK_HOOK_PROVENANCE=warn` does not admit. Every test that stands
 /// in for a pane by running the CLI would then fail only when run from a deck
 /// pane, and pass everywhere else.
-pub const DECK_ENDPOINT_VARS: [&str; 5] = [
+pub const DECK_ENDPOINT_VARS: [&str; 6] = [
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
     "DOT_AGENT_DECK_PANE_ID",
     "DOT_AGENT_DECK_AGENT_ID",
     "DOT_AGENT_DECK_PANE_CAPABILITY",
+    "DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM",
 ];
 
 /// Where [`detach_before_main`] points `XDG_RUNTIME_DIR`: a path beneath

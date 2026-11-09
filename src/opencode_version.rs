@@ -493,7 +493,7 @@ fn opencode_program(command: &str) -> Option<&str> {
 /// executable file of that name on `path_env` (the child's `PATH`). Always
 /// an absolute path, so a command rewritten to name it
 /// ([`with_standalone_at`]) runs the file that was probed.
-fn resolve_program(
+pub(crate) fn resolve_program(
     program: &str,
     path_env: Option<&std::ffi::OsStr>,
     cwd: Option<&Path>,

@@ -57,6 +57,11 @@ pub const DOT_AGENT_DECK_PANE_ID: &str = "DOT_AGENT_DECK_PANE_ID";
 /// literals can't drift apart.
 pub const DOT_AGENT_DECK_AGENT_ID: &str = "DOT_AGENT_DECK_AGENT_ID";
 
+/// The directly launched Claude Code or Codex executable whose version a hook
+/// may probe for its question tables. A launcher gets no value: the deck cannot
+/// attribute a `PATH` lookup to the agent that launcher eventually runs.
+pub const DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM: &str = "DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM";
+
 /// Hook-ingestion endpoint override read by [`crate::config::socket_path`].
 ///
 /// The daemon injects its OWN bound hook-socket path into every agent it
@@ -938,6 +943,35 @@ pub(crate) fn overlay_value<'a>(env: &'a [(String, String)], key: &str) -> Optio
         .map(|(_, v)| v.as_str())
 }
 
+/// The executable a direct Claude Code or Codex command starts, resolved from
+/// the PATH and working directory its child gets. Anything the command does not
+/// name directly — a launcher, an `env` prefix, shell syntax — answers `None`,
+/// so its hook leaves version-backed keys unsupported rather than probing an
+/// unrelated bare executable.
+fn question_version_program(
+    command: Option<&str>,
+    agent_type: &AgentType,
+    env: &[(String, String)],
+    cwd: Option<&str>,
+) -> Option<PathBuf> {
+    if !matches!(agent_type, AgentType::ClaudeCode | AgentType::Codex) {
+        return None;
+    }
+    let words = crate::composer_probe::observe::shell_words(command?)?;
+    let program = words.first()?;
+    if AgentType::from_command(Some(program)) != Some(agent_type.clone()) {
+        return None;
+    }
+    let path = overlay_value(env, "PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"));
+    crate::opencode_version::resolve_program(
+        program,
+        path.as_deref(),
+        cwd.map(std::path::Path::new),
+    )
+}
+
 /// How to spawn an agent.
 pub struct SpawnOptions<'a> {
     /// Command to run. `None` falls back to `$SHELL`. Strings containing spaces
@@ -1749,6 +1783,8 @@ fn spawn_with_dir(
         .clone()
         .or_else(|| AgentType::from_command(opts.command))
         .unwrap_or(AgentType::None);
+    let question_version_program =
+        question_version_program(opts.command, &resolved_agent, &opts.env, opts.cwd);
     // Issue #1685: a wrapped command the shell has to run itself (a leading
     // assignment, a compound) comes back as an argv that hands it to
     // `default_shell` inside the wrapper, so it is exec'd as it stands.
@@ -1886,6 +1922,15 @@ fn spawn_with_dir(
             continue;
         }
         cmd.env(k, v);
+    }
+
+    // A hook may probe only the executable this direct launch resolved. Applied
+    // after the caller's overlay so neither an inherited nor a caller-supplied
+    // value can attribute another session's executable to this one; a launcher
+    // explicitly clears it and leaves version-backed answers unsupported.
+    match question_version_program {
+        Some(program) => cmd.env(DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM, program),
+        None => cmd.env_remove(DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM),
     }
 
     // Issue #861: mint this pane's lifetime tag and export it, so a descendant
@@ -21897,6 +21942,42 @@ mod spawn_tests {
             validated.display_title.as_deref(),
             Some("issue-work · issue-1")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn question_version_program_pins_a_direct_binary_and_refuses_a_launcher() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join("codex");
+        crate::test_isolation::write_script(&codex, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let env = vec![(
+            "PATH".to_string(),
+            dir.path().to_string_lossy().into_owned(),
+        )];
+        assert_eq!(
+            question_version_program(Some("codex --full-auto"), &AgentType::Codex, &env, None),
+            Some(codex.clone())
+        );
+        let absolute = format!("\"{}\"", codex.display());
+        assert_eq!(
+            question_version_program(Some(&absolute), &AgentType::Codex, &env, None),
+            Some(codex)
+        );
+        for command in [
+            "devbox run codex-big",
+            "env FOO=1 codex",
+            "sh -c 'codex'",
+            "codex-big",
+        ] {
+            assert_eq!(
+                question_version_program(Some(command), &AgentType::Codex, &env, None),
+                None,
+                "{command} is not an attributable direct Codex launch"
+            );
+        }
     }
 
     #[test]

@@ -306,7 +306,7 @@ fn build(planted: Planted) -> PendingQuestion {
                     .map(str::to_string),
                 payload["tool_input"]["command"].as_str(),
                 1,
-                None,
+                Some((0, 160, 0)),
             )
         }
         Planted::OpenCodePermission => opencode_permission_asked(&payload(OPENCODE_PERMISSION), 1)

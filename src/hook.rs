@@ -186,8 +186,9 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
 
 /// The version whose question table a Claude-compatible hook should use.
 /// Only an event that can raise such a question pays for the bounded CLI
-/// probe; every other hook, and an agent with no version parser here, answers
-/// `None`, which leaves its table covered.
+/// probe, and only of the direct executable the spawn pinned for this session.
+/// Every other hook, a launcher, and an agent with no version parser here
+/// answers `None`, which leaves its key table uncovered.
 fn question_agent_version(
     agent_type: &AgentType,
     hook_event_name: &str,
@@ -205,12 +206,8 @@ fn question_agent_version(
         return None;
     }
     const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-    let program = match agent_type {
-        AgentType::ClaudeCode => "claude",
-        AgentType::Codex => "codex",
-        _ => return None,
-    };
-    let output = crate::hooks_manage::probe_agent_version(std::ffi::OsStr::new(program), TIMEOUT);
+    let program = std::env::var_os(crate::agent_pty::DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM)?;
+    let output = crate::hooks_manage::probe_agent_version(&program, TIMEOUT);
     match agent_type {
         AgentType::ClaudeCode => output
             .as_deref()
@@ -220,15 +217,11 @@ fn question_agent_version(
     }
 }
 
-/// Codex prints `codex-cli MAJOR.MINOR.PATCH`; accept exactly that bare
-/// release as its last word, not a pre-release or build-tagged version.
+/// Codex prints `codex-cli MAJOR.MINOR.PATCH`, with an optional prerelease or
+/// build suffix. The numeric release decides whether its minor is verified.
 fn parse_codex_version(output: &str) -> Option<(u64, u64, u64)> {
     let version = semver::Version::parse(output.split_whitespace().last()?).ok()?;
-    (version.pre.is_empty() && version.build.is_empty()).then_some((
-        version.major,
-        version.minor,
-        version.patch,
-    ))
+    Some((version.major, version.minor, version.patch))
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
@@ -1815,7 +1808,8 @@ fn build_event_typed_with_version(
 /// - Devin `PermissionRequest` → [`crate::question::devin_permission_request`].
 ///
 /// The agent's version is not in these payloads. `version` is what the bounded
-/// CLI probe found, or `None` when it is unknown, which leaves a table covered.
+/// probe of this session's direct executable found, or `None` when it is
+/// unknown, which leaves a key table uncovered.
 #[allow(clippy::too_many_arguments)]
 fn hook_question(
     agent_type: &AgentType,
@@ -6033,7 +6027,12 @@ mod question_tests {
     fn event_for(agent: AgentType, payload: &Value) -> AgentEvent {
         let input: ClaudeCodeHookInput =
             serde_json::from_value(payload.clone()).expect("a Claude-shaped payload");
-        build_event_typed(input, agent).expect("the payload maps to an event")
+        let version = match agent {
+            AgentType::ClaudeCode => Some((2, 1, 289)),
+            AgentType::Codex => Some((0, 160, 0)),
+            _ => None,
+        };
+        build_event_typed_with_version(input, agent, version).expect("the payload maps to an event")
     }
 
     fn question_for(agent: AgentType, payload: &Value) -> PendingQuestion {
@@ -6449,7 +6448,7 @@ mod question_tests {
             AnswerChannel::Keys,
             "a later patch of the verified minor is still covered"
         );
-        for version in [Some((0, 159, 0)), Some((0, 161, 0))] {
+        for version in [None, Some((0, 159, 0)), Some((0, 161, 0))] {
             let question = build(version);
             assert_eq!(
                 question.channel,
@@ -6467,9 +6466,9 @@ mod question_tests {
     }
 
     /// Scenario: A Devin `PermissionRequest` becomes a Permission question
-    /// from the docs-derived table in which only Allow once and Deny are
-    /// answerable; the four "allow for …" scopes and the two edit options are
-    /// keyboard-only.
+    /// from the docs-derived table. Its unknown hook version makes every key
+    /// answer keyboard-only; at the documented version, only Allow once and
+    /// Deny are answerable.
     #[spec("question/detect/009")]
     #[test]
     fn question_detect_009_devin_permission_is_docs_derived() {
@@ -6480,15 +6479,25 @@ mod question_tests {
             "tool_input": {"command": "rm -rf build"},
         });
         let q = question_for(AgentType::Devin, &payload);
-        assert_eq!(q.channel, AnswerChannel::Keys);
-        let answerable: Vec<&str> = q.questions[0]
+        assert_eq!(q.channel, AnswerChannel::Unsupported);
+        assert!(q.questions[0].options.iter().all(|o| !o.answerable()));
+        assert_eq!(q.questions[0].options.len(), 8);
+
+        let verified = crate::question::devin_permission_request(
+            "q-devin-verified".into(),
+            "exec",
+            None,
+            1,
+            Some((3000, 11, 3)),
+        );
+        assert_eq!(verified.channel, AnswerChannel::Keys);
+        let answerable: Vec<&str> = verified.questions[0]
             .options
             .iter()
             .filter(|o| o.answerable())
             .map(|o| o.label.as_str())
             .collect();
         assert_eq!(answerable, vec!["Allow once", "Deny"]);
-        assert_eq!(q.questions[0].options.len(), 8);
     }
 
     /// Scenario: A Pi extension's `select`, `confirm` and `input` dialogs, as

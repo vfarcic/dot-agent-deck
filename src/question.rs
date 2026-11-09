@@ -1148,8 +1148,9 @@ fn claude_offers_auto_mode(tool_name: &str, permission_mode: Option<&str>) -> bo
 ///   `permission_mode`, Claude's keyboard-only "Yes, and switch to auto mode",
 ///   and No; held.
 ///
-/// `version` is the Claude Code version when the hook's bounded CLI probe
-/// knows it; an unknown version leaves the table covered.
+/// `version` is the Claude Code version when the hook's bounded probe of the
+/// session's direct executable knows it; an unknown version leaves key-typed
+/// answers uncovered.
 #[allow(clippy::too_many_arguments)]
 pub fn claude_permission_request(
     id: String,
@@ -2828,7 +2829,14 @@ mod tests {
             ("no command", None),
         ] {
             let question = through_event(
-                codex_permission_request("q-codex".into(), "Bash", None, command, 1, None),
+                codex_permission_request(
+                    "q-codex".into(),
+                    "Bash",
+                    None,
+                    command,
+                    1,
+                    Some((0, 160, 0)),
+                ),
                 "codex",
             );
             let always = always_of(&question);
@@ -2848,7 +2856,14 @@ mod tests {
             );
         }
         let question = through_event(
-            codex_permission_request("q-codex".into(), "Bash", None, Some("touch x"), 1, None),
+            codex_permission_request(
+                "q-codex".into(),
+                "Bash",
+                None,
+                Some("touch x"),
+                1,
+                Some((0, 160, 0)),
+            ),
             "codex",
         );
         let always = always_of(&question);
@@ -2862,7 +2877,8 @@ mod tests {
         );
 
         // Devin: its "allow for …" options are keyboard-only by table.
-        let devin = devin_permission_request("q-devin".into(), "exec", None, 1, None);
+        let devin =
+            devin_permission_request("q-devin".into(), "exec", None, 1, Some((3000, 11, 3)));
         let alwayses: Vec<_> = devin.questions[0]
             .options
             .iter()
@@ -2958,7 +2974,7 @@ mod tests {
                 {"id": "first", "question": "First?", "options": options(2)},
                 {"id": "second", "question": "Second?", "options": options(second)},
             ]});
-            codex_request_user_input(Some("call_wide"), Some(&input), 1, None)
+            codex_request_user_input(Some("call_wide"), Some(&input), 1, Some((0, 160, 0)))
                 .expect("a form")
                 .sanitized()
                 .expect("still shown")
@@ -3161,10 +3177,15 @@ mod tests {
             {"id": "first", "question": "First?", "options": [{"label": "Yes"}, {"label": "No"}]},
             {"id": "second", "question": "Second?", "options": options},
         ]});
-        let codex = codex_request_user_input(Some("call_unlabeled"), Some(&codex_input), 1, None)
-            .expect("a form")
-            .sanitized()
-            .expect("still shown");
+        let codex = codex_request_user_input(
+            Some("call_unlabeled"),
+            Some(&codex_input),
+            1,
+            Some((0, 160, 0)),
+        )
+        .expect("a form")
+        .sanitized()
+        .expect("still shown");
         let claude_input = serde_json::json!({"questions": [
             {"question": "First?", "header": "First", "options": [{"label": "Yes"}, {"label": "No"}], "multiSelect": false},
             {"question": "Second?", "header": "Second", "options": options, "multiSelect": false},

@@ -16399,7 +16399,7 @@ mod question_answer_tests {
             Some("touch x".into()),
             Some("touch x"),
             1,
-            None,
+            Some((0, 160, 0)),
         );
         fx.ask_ingested(&approval).await;
         fx.answer("q-approve", &[(0, &[2], None)], true)
@@ -16416,7 +16416,7 @@ mod question_answer_tests {
             Some("call_form1"),
             Some(&form_input),
             1,
-            None,
+            Some((0, 160, 0)),
         )
         .unwrap();
         fx.ask_ingested(&form).await;
@@ -16488,7 +16488,8 @@ mod question_answer_tests {
             {"id": "colour", "question": "Which colour?", "options": [{"label": "Red"}, {"label": "Green"}]},
             {"id": "size", "question": "Which size?", "options": [{"label": "Small"}, {"label": "Large"}]}
         ]});
-        crate::question::codex_request_user_input(Some(id), Some(&input), 1, None).unwrap()
+        crate::question::codex_request_user_input(Some(id), Some(&input), 1, Some((0, 160, 0)))
+            .unwrap()
     }
 
     /// Scenario: A Codex prompt is waiting and the user starts answering it at
@@ -16528,7 +16529,7 @@ mod question_answer_tests {
             Some("touch x".into()),
             Some("touch x"),
             1,
-            None,
+            Some((0, 160, 0)),
         );
         fx.ask_ingested(&approval).await;
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -16569,7 +16570,7 @@ mod question_answer_tests {
             Some("touch x".into()),
             Some("touch x"),
             1,
-            None,
+            Some((0, 160, 0)),
         );
         fx.ask_ingested(&approval).await;
         let a = fx.answer_task("q-race", vec![one(0, 2)], true);
@@ -16780,7 +16781,7 @@ mod question_answer_tests {
             Some("touch x".into()),
             Some("touch x"),
             1,
-            None,
+            Some((0, 160, 0)),
         );
         fx.ask_ingested(&approval).await;
         let (reached, resume) = fx
@@ -17124,7 +17125,8 @@ mod question_answer_tests {
         let input = serde_json::json!({"questions": [
             {"id": "colour", "question": prompt, "options": [{"label": "Red"}, {"label": "Green"}]}
         ]});
-        crate::question::codex_request_user_input(Some(id), Some(&input), 1, None).unwrap()
+        crate::question::codex_request_user_input(Some(id), Some(&input), 1, Some((0, 160, 0)))
+            .unwrap()
     }
 
     /// Scenario: A voice answer to a Codex prompt is held up part way through

@@ -23,31 +23,61 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
     invoke_codex_hook_version(payload, "0.160.0")
 }
 
+enum VersionProbe<'a> {
+    Direct(&'a str),
+    Launcher,
+    Missing,
+}
+
 fn invoke_codex_hook_version(payload: &serde_json::Value, version: &str) -> AgentEvent {
+    invoke_codex_hook_probe(payload, version, VersionProbe::Direct(version))
+}
+
+fn invoke_codex_hook_probe(
+    payload: &serde_json::Value,
+    path_version: &str,
+    probe: VersionProbe<'_>,
+) -> AgentEvent {
     let temp = test_temp::tempdir().expect("create Codex hook socket directory");
     let codex = temp.path().join("codex");
     std::fs::write(
         &codex,
-        format!("#!/bin/sh\nprintf 'codex-cli {version}\\n'\n"),
+        format!("#!/bin/sh\nprintf 'codex-cli {path_version}\\n'\n"),
     )
     .expect("write the Codex version stand-in");
     let mut permissions = std::fs::metadata(&codex)
         .expect("read the Codex version stand-in's permissions")
         .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&codex, permissions)
+    std::fs::set_permissions(&codex, permissions.clone())
         .expect("make the Codex version stand-in executable");
     let path = std::env::join_paths(std::iter::once(temp.path().to_path_buf()).chain(
         std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
     ))
     .expect("put the Codex version stand-in first on PATH");
+    let launched = match probe {
+        VersionProbe::Direct(version) => {
+            let launched = temp.path().join("launched-codex");
+            std::fs::write(
+                &launched,
+                format!("#!/bin/sh\nprintf 'codex-cli {version}\\n'\n"),
+            )
+            .expect("write the launched Codex version stand-in");
+            std::fs::set_permissions(&launched, permissions.clone())
+                .expect("make the launched Codex version stand-in executable");
+            Some(launched)
+        }
+        VersionProbe::Launcher => None,
+        VersionProbe::Missing => Some(temp.path().join("missing-codex")),
+    };
     let socket = temp.path().join("hook.sock");
     let listener = UnixListener::bind(&socket).expect("bind Codex hook socket");
     listener
         .set_nonblocking(true)
         .expect("make Codex hook listener nonblocking");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+    command
         .args(["hook", "--agent", "codex"])
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", "codex-hook-pane")
@@ -57,11 +87,14 @@ fn invoke_codex_hook_version(payload: &serde_json::Value, version: &str) -> Agen
         // capability token; with one, the hook's inbox calls (PRD #1666 S7)
         // would reach this socket ahead of the event it reads.
         .env_remove("DOT_AGENT_DECK_PANE_CAPABILITY")
+        .env_remove("DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn Codex hook ingestion command");
+        .stderr(Stdio::piped());
+    if let Some(launched) = launched {
+        command.env("DOT_AGENT_DECK_QUESTION_VERSION_PROGRAM", launched);
+    }
+    let mut child = command.spawn().expect("spawn Codex hook ingestion command");
     child
         .stdin
         .take()
@@ -268,27 +301,47 @@ fn codex_hooks_002_failed_tool_emits_error_before_session_exit() {
     );
 }
 
-/// Scenario: Run a Codex permission hook whose CLI reports 0.161.0, past the 0.160.x key table's verified minor. The emitted question must remain visible, but its channel and every table option must be keyboard-only rather than letting voice type keys verified only on 0.160.
+/// Scenario: Run Codex permission hooks for a newer stable or prerelease binary, an unidentifiable launcher, a failed probe, and a direct binary that differs from the older `codex` on PATH. Each emitted question must remain visible but keyboard-only rather than trusting a missing version or probing the wrong executable, while the direct 0.160.0 control remains answerable.
 #[spec("question/detect/021")]
 #[test]
 fn question_detect_021_codex_past_the_verified_minor_is_keyboard_only() {
-    let event = invoke_codex_hook_version(
-        &serde_json::json!({
-            "session_id": "codex-hooks-session",
-            "hook_event_name": "PermissionRequest",
-            "cwd": "/tmp/codex-hooks",
-            "tool_name": "Bash",
-            "tool_input": {"command": "touch codex_newer.txt"}
-        }),
-        "0.161.0",
+    let payload = serde_json::json!({
+        "session_id": "codex-hooks-session",
+        "hook_event_name": "PermissionRequest",
+        "cwd": "/tmp/codex-hooks",
+        "tool_name": "Bash",
+        "tool_input": {"command": "touch codex_newer.txt"}
+    });
+    let verified = invoke_codex_hook_version(&payload, "0.160.0");
+    assert_eq!(
+        verified.question().expect("the verified question").channel,
+        AnswerChannel::Keys,
+        "the direct 0.160.0 control remains answerable"
     );
-    let question = event.question().expect("the permission question is shown");
-    assert_eq!(question.channel, AnswerChannel::Unsupported);
-    assert!(
-        question.questions[0]
-            .options
-            .iter()
-            .all(|option| option.keyboard_only),
-        "every answer from the unverified table is keyboard-only: {question:?}"
-    );
+    for (name, path_version, probe) in [
+        ("newer minor", "0.161.0", VersionProbe::Direct("0.161.0")),
+        (
+            "newer prerelease",
+            "0.161.0-alpha.1",
+            VersionProbe::Direct("0.161.0-alpha.1"),
+        ),
+        ("launcher", "0.160.0", VersionProbe::Launcher),
+        ("failed probe", "0.160.0", VersionProbe::Missing),
+        (
+            "direct binary differs from PATH",
+            "0.160.0",
+            VersionProbe::Direct("0.161.0"),
+        ),
+    ] {
+        let event = invoke_codex_hook_probe(&payload, path_version, probe);
+        let question = event.question().expect("the permission question is shown");
+        assert_eq!(question.channel, AnswerChannel::Unsupported, "{name}");
+        assert!(
+            question.questions[0]
+                .options
+                .iter()
+                .all(|option| option.keyboard_only),
+            "{name}: every answer from the unverified table is keyboard-only: {question:?}"
+        );
+    }
 }

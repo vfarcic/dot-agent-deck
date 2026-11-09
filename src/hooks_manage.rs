@@ -243,13 +243,21 @@ const WAITER_HOOK_TYPES: &[&str] = &["SessionStart", "Stop"];
 pub const WAITER_TIMEOUT_SECS: u64 = 86_400;
 
 /// Issue #714: parse the leading `MAJOR.MINOR.PATCH` of `claude --version`'s
-/// output (`2.1.283 (Claude Code)`). `None` for anything else.
+/// output (`2.1.283 (Claude Code)`), ignoring a prerelease or build suffix on
+/// the patch. `None` for anything else.
 pub fn parse_claude_version(output: &str) -> Option<(u64, u64, u64)> {
     let word = output.split_whitespace().next()?;
     let mut parts = word.split('.');
     let mut next = || parts.next()?.parse::<u64>().ok();
-    let version = (next()?, next()?, next()?);
-    Some(version)
+    let major = next()?;
+    let minor = next()?;
+    let patch = parts
+        .next()?
+        .split(['-', '+'])
+        .next()?
+        .parse::<u64>()
+        .ok()?;
+    Some((major, minor, patch))
 }
 
 /// Issue #714: whether a Claude Code reporting `output` for `--version`
@@ -2533,6 +2541,14 @@ mod tests {
         assert_eq!(
             parse_claude_version("2.1.283 (Claude Code)"),
             Some((2, 1, 283))
+        );
+        assert_eq!(
+            parse_claude_version("2.2.0-beta.1 (Claude Code)"),
+            Some((2, 2, 0))
+        );
+        assert_eq!(
+            parse_claude_version("2.2.0+build.1 (Claude Code)"),
+            Some((2, 2, 0))
         );
         assert!(claude_version_accepts_stop_failure("2.1.78 (Claude Code)"));
         assert!(claude_version_accepts_stop_failure("3.0.0"));
