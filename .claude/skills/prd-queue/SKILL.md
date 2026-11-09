@@ -485,7 +485,8 @@ GATES — CLAUDE.md is the authority, this is the summary:
   missing: with a working `rwx` login, `rwx run .rwx/ci.yml` runs the Linux
   half on RWX and `-f linux_jobs=false` dispatches build-macos alone (for
   when your gates did not run on macOS); without one, pass
-  `-f build_macos=false` when your gates ran on macOS. Both default to true. But the helper's gates run BEFORE
+  `-f build_macos=false` when your gates ran `cargo test-fast` on macOS and
+  the change leaves build-macos's own job alone. Both default to true. But the helper's gates run BEFORE
   a commit exists, so they have already passed by the time there is anything
   to dispatch, and the helper stays the per-task gate. What a dispatch
   buys is the part no local gate covers at all — build-macos,

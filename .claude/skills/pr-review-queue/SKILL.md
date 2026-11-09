@@ -426,7 +426,7 @@ EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
     the half you are missing: with a working `rwx` login,
     `rwx run .rwx/ci.yml` runs the Linux half on RWX and
     `-f linux_jobs=false` dispatches build-macos alone; without one,
-    `-f build_macos=false` when your gates ran on macOS. Reach for it
+    `-f build_macos=false` when your gates ran `cargo test-fast` on macOS and the change leaves `build-macos`'s own job alone. Reach for it
     when the box is loaded, when a change needs build-macos (build-windows is
     `if: false` until Windows ships, so a dispatch does not run it),
     or as a sweep after your fixes. It relieves no gate: the gates

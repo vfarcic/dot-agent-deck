@@ -283,12 +283,13 @@ jobs:
       # carry), so an RWX-owned or lock-only PR cannot go red over a tag it
       # would not use. `linux_backend` reads `rwx` on a pull request, where
       # `build-macos` does not run, and on a manual run with
-      # `linux_jobs=false` (issue #2090), where `build-macos` may: so the
-      # `rwx` skip applies to pull requests only. `.rwx/ci.yml`'s `backend`
+      # `linux_jobs=false` (issue #2090), where `build-macos` runs only when
+      # `build_macos` is on: so under `rwx` the lookup runs for that one case.
+      # `.rwx/ci.yml`'s `backend`
       # task runs the same script for RWX, and `.rwx/sandbox.yml`'s `version`
       # task for the sandbox (issue #2052).
       - id: version
-        if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && (steps.backend.outputs.linux_backend != 'rwx' || github.event_name != 'pull_request')
+        if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && (steps.backend.outputs.linux_backend != 'rwx' || (github.event_name == 'workflow_dispatch' && inputs.build_macos))
         env:
           REPO: ${{ github.repository }}
         run: |

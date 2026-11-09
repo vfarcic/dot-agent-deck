@@ -14,10 +14,10 @@ So pick the sweep by what you are missing, not by habit:
 | --- | --- | --- |
 | `rwx` is installed and `rwx whoami` succeeds | `rwx run .rwx/ci.yml` for the Linux half (below) | none |
 | and the change needs macOS, which your gates did not run on | also `gh workflow run ci.yml --ref <branch> -f linux_jobs=false` | `build-macos` and `changes` only |
-| no `rwx` CLI, your gates ran on macOS (a Mac, with `DAD_REMOTE_EXEC` unset) | `gh workflow run ci.yml --ref <branch> -f build_macos=false` | the Linux jobs |
+| no `rwx` CLI, your gates ran `cargo test-fast` on macOS (below) | `gh workflow run ci.yml --ref <branch> -f build_macos=false` | the Linux jobs |
 | no `rwx` CLI, your gates did not run on macOS | `gh workflow run ci.yml --ref <branch>`, the whole matrix | everything, as before #2090 |
 
-**When your gates did not run on macOS** means a Linux host, or `DAD_REMOTE_EXEC=rwx` sending `cargo xtask affected-checks --run`'s cargo commands to the Linux sandbox (unless the helper printed its note that it fell back to running them locally). A pull request does not run `build-macos`, so on such a machine a sweep is how that job runs before the merge, and dropping it moves a macOS-only defect's discovery to `main`'s push run (rule 8's post-merge watch). On a Mac running its gates locally, `cargo test-fast` has already run on macOS the `cargo nextest run --workspace` tier that `build-macos` runs. What the job still adds there is its bare `cargo clippy -- -D warnings`, which lints the `not(feature = "e2e")` arms in `src/` that the gate's clippy does not (CLAUDE.md rule 2): keep `build_macos` on for a change inside one of those arms. How much the job adds beyond that is not measured, which is #2090's open caveat.
+**Your gates ran `cargo test-fast` on macOS** only when you were on a Mac, `cargo xtask affected-checks --run` selected `cargo test-fast` (it does for any Rust, build input or unmapped path, and not for a change that is only mapped text, `.github/` included), and it ran locally: not with `DAD_REMOTE_EXEC=rwx` sending it to the Linux sandbox, unless the helper printed its note that it fell back to a local run. Anything else counts as your gates not having run on macOS. And keep `build-macos` whatever your gates did when the change touches that job itself or anything it runs (its steps in `ci.yml`, the toolchain or nextest pins it installs): no other run exercises it before the merge. A pull request does not run `build-macos`, so on such a machine a sweep is how that job runs before the merge, and dropping it moves a macOS-only defect's discovery to `main`'s push run (rule 8's post-merge watch). On a Mac running its gates locally, `cargo test-fast` has already run on macOS the `cargo nextest run --workspace` tier that `build-macos` runs. What the job still adds there is its bare `cargo clippy -- -D warnings`, which lints the `not(feature = "e2e")` arms in `src/` that the gate's clippy does not (CLAUDE.md rule 2): keep `build_macos` on for a change inside one of those arms. How much the job adds beyond that is not measured, which is #2090's open caveat.
 
 **Not sweeping at all is an option too.** The sweep buys the answer earlier than opening the pull request; it adds no check the pull request would not run, apart from `build-macos`.
 
@@ -46,10 +46,14 @@ What it does not run: `cross-version` (RWX cannot, see [rwx.md](rwx.md); the pul
 
 ```bash
 git push -u origin <branch>
-gh workflow run ci.yml --ref <branch> [-f build_macos=false | -f linux_jobs=false]   # prints the new run's URL
-gh run watch <run-id>                                 # follow it
-gh run view <run-id> --log-failed                     # read only what broke
+gh workflow run ci.yml --ref <branch>                         # the whole matrix; prints the new run's URL
+gh workflow run ci.yml --ref <branch> -f build_macos=false    # or: everything but build-macos
+gh workflow run ci.yml --ref <branch> -f linux_jobs=false     # or: build-macos alone
+gh run watch <run-id>                                         # follow it
+gh run view <run-id> --log-failed                             # read only what broke
 ```
+
+Run one of the three dispatch lines, chosen from the table above.
 
 **Take the run id from the URL that `gh workflow run` prints, not from a listing.** The command exits as soon as the dispatch is accepted, and on `gh` 2.98.0 it prints the new run's URL, whose last path segment is the run id. The obvious-looking alternative, `gh run list --workflow ci.yml --branch <branch> --limit 1`, is wrong twice over. For the first seconds the dispatch is not listed at all, so the newest run is the *previous* one — measured on 2026-09-15, the list was empty immediately after the dispatch and reported the run as `queued` about eleven seconds later. And a branch with an open pull request also carries `pull_request` runs, which are usually newer: measured on this branch, with the dispatch already complete, that exact command returned the PR's run `35025714262` on head `435e3358` rather than the dispatch `35025264144` on head `385e342d`. An agent that trusted it would have read a different run, on a different commit, as the answer to its dispatch. (Neither is a rejected dispatch — an empty list one second in means nothing.)
 
