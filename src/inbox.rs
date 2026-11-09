@@ -8,13 +8,16 @@
 //! so the semantics are deterministic under test.
 //!
 //! The semantics are JetStream-shaped (decision 1 of the PRD): globally unique
-//! ids that double as dedup keys, explicit acknowledgement, redelivery after an
-//! ack-wait, a `max_deliver` bound, and offers that go to one taker at a time
+//! ids that double as dedup keys, explicit acknowledgement, redelivery bounded
+//! by a `max_deliver` of hand-overs, and offers that go to one taker at a time
 //! under a time-limited claim.
 //!
 //! **States.** A message is `queued` until a consumer takes it (`fetched`), and
-//! `acknowledged` once an ack arrives. A fetch that is not acknowledged within
-//! the ack-wait returns it to `queued`; after `max_deliver` hand-overs it becomes
+//! `acknowledged` once an ack arrives. A fetched message carries no deadline of
+//! its own (PRD #1666 part 3, H5 removed the store's ack-wait): its
+//! generation's attempt model (`crate::inbox_attempts`) decides what becomes of
+//! it — every attempt positively not handed queues it again, a possession that
+//! lapses repeats it, and after `max_deliver` hand-overs it becomes
 //! `undeliverable`, as it does when its bound agent exits. An offer's ack is a
 //! claim (`claimed`), which ends in `acknowledged` on completion or returns the
 //! offer to its pool, excluding everyone who held it before. A message in
@@ -708,7 +711,17 @@ pub enum ReturnCause {
 /// overrides tests use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxLimits {
+    /// The receipt attempt model's ack-wait: `InboxHub::new` copies it into
+    /// `inbox_attempts::Limits::ack_wait`, where it is a once waiter's idle
+    /// grace, a hook receiver's hold, a one-shot grant's lifetime, a resume
+    /// answer's window and the revoke resend interval. The store itself reads
+    /// it nowhere — since PRD #1666 part 3's H5 a fetched message has no
+    /// deadline of its own.
     pub ack_wait: Duration,
+    /// Hand-overs without an acknowledgement before a message becomes
+    /// undeliverable: the store applies it to an offer its holder returns
+    /// (`return_offer`), and the receipt attempt model counts a message's
+    /// requeues against it before the engine retires the copy.
     pub max_deliver: u32,
     pub max_per_recipient: usize,
     pub max_messages: usize,

@@ -2,7 +2,7 @@
 
 Delegated tasks now use the per-agent inbox described in [Agent messaging](agent-messaging.md). A task is queued for the selected worker generation, fetched by its integration and acknowledged on that agent's receipt signal. The task-file pointer can be inside the message body; it is not typed into the worker's composer.
 
-The inbox id replaces the old delivery id for acknowledgement and dedup. A hook event from an unrelated turn does not settle pending work. Redelivery preserves the message id, uses the inbox ack-wait and delivery limit, and leaves the worker process running. A recipient exit makes its bound messages undeliverable rather than moving them silently to a successor.
+The inbox id replaces the old delivery id for acknowledgement and dedup. A hook event from an unrelated turn does not settle pending work. Redelivery preserves the message id, uses the receipt attempt model's ack-wait and delivery limit (`InboxLimits.ack_wait` and `max_deliver`, which the hub passes to the attempt model), and leaves the worker process running. A recipient exit makes its bound messages undeliverable rather than moving them silently to a successor.
 
 Which delegated task a report completes is no longer inferred: `work-done --task-id <id>` names it, `--done` is a terminal report and cannot be combined with `--task-id`, and a `work-done` with neither is a note to the orchestrator that completes no task. See [Task-scoped completion](agent-messaging.md#task-scoped-completion-prd-1666-part-3-round-5).
 
