@@ -820,16 +820,17 @@ export function stopTargetName(agent: OverviewAgent): string {
 export const AgentStopContext = createContext<Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused"> | undefined>(undefined);
 
 /** The overview row and the full-screen pane share the question and the stop action. */
-export function agentStopConfirmation(runtime: DeckRuntimeState, agent: OverviewAgent, onStopped?: () => void): ConfirmState | undefined {
+export function agentStopConfirmation(runtime: DeckRuntimeState, agent: OverviewAgent, from: "overview" | "agent", onStopped?: () => void): ConfirmState | undefined {
   const deck = runtime.fleet.find((entry) => entry.connection.deckId === agent.daemonId);
   if (!deck) return undefined;
   const name = stopTargetName(agent);
   const roleNotice = agent.tab.kind === "orchestration"
     ? " This closes only this role, leaving the orchestration without it. To close the whole orchestration, use its Close control on the dashboard."
     : "";
+  const interruptAdvice = from === "agent" ? " To interrupt its turn instead, say “typing on”, then “stop”." : "";
   return {
     title: `Close ${name}?`,
-    body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.${roleNotice} To interrupt its turn instead, say “typing on”, then “stop”.`,
+    body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.${roleNotice}${interruptAdvice}`,
     label: "Close agent",
     busyLabel: "Stopping…",
     action: async () => {
@@ -1431,7 +1432,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     return {
       stopAgent: (agent) => {
-        setConfirm(agentStopConfirmation(runtime, agent));
+        setConfirm(agentStopConfirmation(runtime, agent, "overview"));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;

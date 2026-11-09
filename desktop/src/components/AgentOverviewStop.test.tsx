@@ -58,7 +58,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
   /**
    * Scenario: on the fleet, press the stop control on the planner role's row —
    * an agent on the REMOTE deck. A confirmation names the agent and that daemon;
-   * Cancel sends nothing. Pressed again and confirmed, it sends one
+   * The dashboard offers no pane-only typing advice, and Cancel sends nothing. Pressed again and confirmed, it sends one
    * `stop_agent` naming the remote deck, agent id and the process captured when the confirmation opened, even if a refreshed row belongs to a successor.
    */
   it("confirms a stop and sends it to the daemon the agent is on", async () => {
@@ -72,6 +72,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(confirmation()).toHaveTextContent("Close planner?");
     expect(confirmation()).toHaveTextContent("dev@build-box");
     expect(confirmation()).toHaveTextContent("This closes only this role, leaving the orchestration without it.");
+    expect(confirmation()).not.toHaveTextContent("typing on");
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();

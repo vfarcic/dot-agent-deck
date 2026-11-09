@@ -114,7 +114,7 @@ describe("agent pane overlay", () => {
     window.localStorage.clear();
   });
 
-  /** Scenario: close the viewed agent from either origin. Cancel preserves the pane; confirmation targets that agent, and its disappearance returns to the overview. */
+  /** Scenario: close the viewed agent from either origin. The confirmation offers typing-mode interruption as an alternative; Cancel preserves the pane, and confirming targets that agent and returns to the overview on its disappearance. */
   it.each(["overview", "deck"] as const)("confirms Close agent from %s and returns to the overview", async (from) => {
     const state = runtime();
     const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from };
@@ -123,6 +123,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(within(pane).getByRole("button", { name: "Close agent" }));
     let dialog = screen.getByRole("alertdialog");
     expect(dialog).toHaveTextContent("Close Plan / architecture?");
+    expect(dialog).toHaveTextContent("To interrupt its turn instead, say “typing on”, then “stop”.");
     expect(dialog.closest("[inert]")).toBeNull();
     expect(pane.closest("[inert]")).not.toBeNull();
     fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));

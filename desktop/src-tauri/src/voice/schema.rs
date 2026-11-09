@@ -213,7 +213,7 @@ pub const LABELS_WITHHELD_HINT: &str = "naming an agent, daemon, directory, mode
     orchestration needs the command backend to see those names, and Settings → \
     Voice → Send on-screen names is off";
 
-/// Whether this row needs the observed labels at all: it declares a REQUIRED
+/// Whether this row's parameter resolution needs observed labels: it declares a REQUIRED
 /// param whose kind [`ParamKind::names_something_observed`]. An optional one
 /// (`open_new_agent`'s deck) leaves the row usable without it — a value the
 /// model supplies for one anyway is dropped unresolved, and the report says the
@@ -247,8 +247,9 @@ pub fn hidden_by_flag(row: &super::table::CommandRow, show_deck: bool) -> bool {
 }
 
 /// [`annotate_with`], and then — when the voice settings withhold labels —
-/// every row that [`needs_labels`] marked `callable: false` with
-/// [`LABELS_WITHHELD_HINT`], whatever the screen would have said; and — while
+/// rows that [`needs_labels`] marked `callable: false` with
+/// [`LABELS_WITHHELD_HINT`], except `stop_agent` on the agent screen, where
+/// local phrases target the viewed pane without a name; and — while
 /// the deck is hidden (issue #1198) — the row [`hidden_by_flag`] marks
 /// `callable: false` with [`DECK_HIDDEN_HINT`]. The one annotation both the
 /// intent backend and the discovery overlay are handed.
@@ -262,7 +263,11 @@ pub fn annotate_for(
 ) -> Vec<AnnotatedCommand> {
     let mut commands = annotate_with(table, screen, directories, new_agent);
     for (command, row) in commands.iter_mut().zip(table.rows()) {
-        if labels == crate::settings::LabelSharing::Withheld && needs_labels(row) {
+        let local_pane_stop = screen == Screen::Agent && row.id == "stop_agent";
+        if labels == crate::settings::LabelSharing::Withheld
+            && needs_labels(row)
+            && !local_pane_stop
+        {
             command.callable = false;
             command.unavailable_hint = LABELS_WITHHELD_HINT.to_string();
         }

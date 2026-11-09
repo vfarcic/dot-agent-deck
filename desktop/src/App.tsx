@@ -922,7 +922,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       if (target.incarnation !== paneAgent.incarnation) return STOP_TARGET_RESTARTED;
       if (overlayAbove(document.querySelector('[data-testid="agent-pane-overlay"]'))) return "Close the dialog over the agent first. Nothing was stopped.";
       paneStopView.current = agentView;
-      setPaneStop(agentStopConfirmation(runtime, toOverviewAgent(paneAgent), () => {
+      setPaneStop(agentStopConfirmation(runtime, toOverviewAgent(paneAgent), "agent", () => {
         // voice-registry-exempt: successful Close agent returns the view it closed to the overview
         setView((current) => current.kind === "agent" && current.deckId === agentView.deckId && current.agentId === agentView.agentId && current.incarnation === agentView.incarnation ? { kind: "overview" } : current);
       }));

@@ -937,9 +937,9 @@ pub async fn handle_utterance(
 /// dialog declaration, so `prompt::data_turn` is `None` and the request is the
 /// instructions and response schema, the command table and the transcript —
 /// plus what every request carries, the model name, the token ceiling and, for
-/// an off-machine endpoint, the key. **The table**: every
-/// row that [`needs_labels`] is `callable: false` with
-/// [`LABELS_WITHHELD_HINT`] ([`annotate_for`]). **The refusals**: such a row
+/// an off-machine endpoint, the key. **The table**: rows that [`needs_labels`]
+/// are `callable: false` with [`LABELS_WITHHELD_HINT`] ([`annotate_for`]), except
+/// the agent pane's stop, whose local phrases need no name. **The refusals**: such a row
 /// picked anyway is [`VoiceOutcome::Unavailable`] with that hint — never
 /// resolved against a model that saw nothing. An optional observed-name param
 /// supplied anyway (`open_new_agent` with a deck named) is not resolved either,
@@ -13897,48 +13897,77 @@ mod tests {
     }
 
     /// Scenario: with typing mode off, say a bare stop or close this agent.
-    /// The answer opens the viewed agent's confirmation without asking a model
-    /// to choose an agent; typing mode still interrupts or types these words.
+    /// Help offers the command with names shared or withheld, and the answer
+    /// opens the viewed agent's confirmation without a model choosing an agent;
+    /// typing mode still interrupts or types these words.
     #[tokio::test]
     async fn voice_outcome_a_bare_stop_outside_typing_mode_confirms_the_open_agent() {
-        for said in [
-            "stop",
-            "stop it",
-            "stop that",
-            "close this agent",
-            "close the agent",
-            "stop this agent",
-            "please close this agent",
-        ] {
-            let answer = handle_utterance(
-                &NoCommandsResolver,
-                table(),
-                Screen::Agent,
-                &fleet(),
-                &[],
-                None,
-                None,
-                Transcript::new(said),
-            )
-            .await;
-            assert_eq!(answer.resolve_ms, None, "{said} called a model");
-            assert!(
-                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
+        for labels in [LabelSharing::Shared, LabelSharing::Withheld] {
+            for (screen, new_agent) in [
+                (Screen::Agent, None),
+                (Screen::Overview, None),
+                (Screen::Deck, None),
+                (Screen::PullRequest, None),
+                (Screen::Agent, Some(VoiceNewAgent { form: None })),
+            ] {
+                let commands =
+                    annotate_for(table(), screen, None, new_agent.as_ref(), labels, true);
+                let stop = commands
+                    .iter()
+                    .find(|row| row.id == "stop_agent")
+                    .expect("stop row");
+                let available = new_agent.is_none()
+                    && (screen == Screen::Agent
+                        || (screen == Screen::Overview && labels == LabelSharing::Shared));
+                assert_eq!(
+                    stop.callable, available,
+                    "help on {screen:?}, {labels:?}, dialog {new_agent:?}"
+                );
+                if stop.callable {
+                    assert_ne!(stop.unavailable_hint, LABELS_WITHHELD_HINT);
+                }
+            }
+            for said in [
+                "stop",
+                "stop it",
+                "stop that",
+                "close this agent",
+                "close the agent",
+                "stop this agent",
+                "please close this agent",
+            ] {
+                let answer = handle_utterance_with(
+                    &NoCommandsResolver,
+                    table(),
+                    Screen::Agent,
+                    &fleet(),
+                    &[],
+                    None,
+                    None,
+                    Transcript::new(said),
+                    labels,
+                    true,
+                )
+                .await;
+                assert_eq!(answer.resolve_ms, None, "{said} called a model");
+                assert!(
+                    matches!(&answer.outcome, VoiceOutcome::Dispatch { action, invoke, params, .. }
                     if action == "stop_agent" && invoke == "confirmStopAgent" && params.is_empty()),
-                "{said}: {:?}",
-                answer.outcome
-            );
-            let typing = in_typing_mode(said).await;
-            let expected = if TYPING_STOP_PHRASES.contains(&said) {
-                INTERRUPT_ROW
-            } else {
-                DICTATE_ROW
-            };
-            assert!(
-                matches!(&typing.outcome, VoiceOutcome::Dispatch { action, .. } if action == expected),
-                "{said}: {:?}",
-                typing.outcome
-            );
+                    "{said}: {:?}",
+                    answer.outcome
+                );
+                let typing = in_typing_mode(said).await;
+                let expected = if TYPING_STOP_PHRASES.contains(&said) {
+                    INTERRUPT_ROW
+                } else {
+                    DICTATE_ROW
+                };
+                assert!(
+                    matches!(&typing.outcome, VoiceOutcome::Dispatch { action, .. } if action == expected),
+                    "{said}: {:?}",
+                    typing.outcome
+                );
+            }
         }
     }
 
