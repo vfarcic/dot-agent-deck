@@ -326,7 +326,7 @@ tasks:
       # A pinned rustup-init, checked against its published SHA-256 before it
       # runs; nothing downloaded is piped into a shell. A version bump needs
       # the new checksum (`rustup-init.sha256` beside the binary).
-      curl -fsSLo /tmp/rustup-init \
+      curl -fsSL --retry 5 --retry-all-errors -o /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
       echo "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init" | sha256sum -c -
       chmod +x /tmp/rustup-init
@@ -467,7 +467,7 @@ tasks:
       # The release tarball, checked against its published SHA-256, and its own
       # installer run from the unpacked copy; a version bump needs the new
       # checksum (`<tarball>.sha256` beside it).
-      curl -fsSLo /tmp/nix.tar.xz \
+      curl -fsSL --retry 5 --retry-all-errors -o /tmp/nix.tar.xz \
         "https://releases.nixos.org/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-x86_64-linux.tar.xz"
       echo "ff66236d2f7e2a21f3350e73668e021ac6a8881ef277a38e16e952bfb22718c3  /tmp/nix.tar.xz" | sha256sum -c -
       tar -xJf /tmp/nix.tar.xz -C /tmp
@@ -498,7 +498,13 @@ tasks:
       scripts/check-pin-lockstep.sh
       # The release binary, checked against its published SHA-256 (the
       # release's checksums.txt), rather than the get.jetify.com script.
-      curl -fsSLo /tmp/devbox.tar.gz \
+      # Issue #2160: a single HTTP 504 from this download turned the run red.
+      # `--retry 5 --retry-all-errors` makes up to six attempts on any failure
+      # (5xx, connection reset, timeout) with curl's doubling backoff
+      # (1s, 2s, 4s, 8s, 16s); `-S` prints each error and `-f` keeps the
+      # task failing with the last one once the attempts are spent. The
+      # rustup and nix downloads above carry the same flags.
+      curl -fsSL --retry 5 --retry-all-errors -o /tmp/devbox.tar.gz \
         "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
       echo "13a9c9ca15ffef279f5c37694e7feeeeaed93d7ab7b0a69c7b4301a06bcd21ba  /tmp/devbox.tar.gz" | sha256sum -c -
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
