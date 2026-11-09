@@ -135,12 +135,19 @@ fn unit_line<'a>(unit: &'a str, prefix: &str) -> Vec<&'a str> {
     unit.lines().filter(|l| l.starts_with(prefix)).collect()
 }
 
-/// Scenario: With the deck installed at `~/.local/bin` in an isolated home, a stand-in `systemctl` that reports the service already active, and sandbox socket overrides set, run `dot-agent-deck daemon install`. It writes the unit under `$XDG_CONFIG_HOME/systemd/user/` running that installed path with the idle shutdown off and the socket overrides carried, enables it without starting or restarting anything, and prints the lingering advice the stand-in `loginctl` calls for.
+/// Scenario: With the deck installed at `~/.local/bin` in an isolated home, a stand-in `systemctl` that reports the service already active, and sandbox socket and doorbell overrides set, run `dot-agent-deck daemon install`. It writes the unit under `$XDG_CONFIG_HOME/systemd/user/` running that installed path with the idle shutdown off and the socket and doorbell overrides carried, enables it without starting or restarting anything, and prints the lingering advice the stand-in `loginctl` calls for. Reinstalling without the doorbell variables removes their saved overrides without restarting the service.
 #[spec("daemon/service/001")]
 #[test]
 fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_running() {
     let sandbox = Sandbox::new();
-    let out = sandbox.run("install", true, &[]);
+    let out = sandbox.run(
+        "install",
+        true,
+        &[
+            ("DOT_AGENT_DECK_DOORBELL_CLAUDE", "0"),
+            ("DOT_AGENT_DECK_DOORBELL_CODEX", "on"),
+        ],
+    );
     let stdout = text(&out.stdout);
     assert!(
         out.status.success(),
@@ -164,6 +171,8 @@ fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_runni
     let env = unit_line(&unit, "Environment=");
     for expected in [
         "Environment=\"DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0\"".to_string(),
+        "Environment=\"DOT_AGENT_DECK_DOORBELL_CLAUDE=0\"".to_string(),
+        "Environment=\"DOT_AGENT_DECK_DOORBELL_CODEX=on\"".to_string(),
         format!(
             "Environment=\"DOT_AGENT_DECK_ATTACH_SOCKET={}\"",
             sandbox.attach_socket().display()
@@ -188,8 +197,8 @@ fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_runni
     }
     assert_eq!(
         env.len(),
-        5,
-        "only the idle setting and the shell's endpoint and directory overrides are carried: {env:?}"
+        7,
+        "the idle setting and the shell's endpoint, directory and doorbell overrides: {env:?}"
     );
     assert_eq!(unit_line(&unit, "Restart="), vec!["Restart=on-failure"]);
     assert_eq!(
@@ -209,6 +218,12 @@ fn daemon_service_001_install_writes_the_unit_and_leaves_a_running_service_runni
     assert_never_stops(&calls);
     assert!(stdout.contains("already running"), "{stdout}");
     assert!(stdout.contains("enable-linger"), "{stdout}");
+
+    let again = sandbox.run("install", true, &[]);
+    assert!(again.status.success(), "{}", text(&again.stderr));
+    let unit = std::fs::read_to_string(sandbox.unit()).expect("the unit was rewritten");
+    assert!(!unit.contains("DOT_AGENT_DECK_DOORBELL_"), "{unit}");
+    assert_never_stops(&sandbox.calls());
 }
 
 /// Scenario: Install the unit with a stand-in `systemctl`, then run `dot-agent-deck daemon uninstall` while the stand-in reports the service still active. The unit file is removed and the service disabled without being stopped, and the output says the daemon is still running and how to stop it; a second uninstall reports there is nothing installed and still succeeds.
