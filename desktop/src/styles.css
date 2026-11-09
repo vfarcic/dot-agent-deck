@@ -624,6 +624,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
+/* Issue #2075 — a question waiting, and for how long: the overview's ORCHESTRATOR
+   chip's shape in the Needs Input colour, since this one is asking for a person. */
+.question-badge { flex: 0 0 auto; padding: 1px 4px; border-radius: 2px; color: var(--amber); background: var(--amber-soft); font-family: "JetBrains Mono", monospace; font-size: 9px; font-weight: 800; letter-spacing: .04em; white-space: nowrap; }
 .agent-inbox-badge { color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 9px; white-space: nowrap; flex-shrink: 0; }
 /* PRD #1666 §6.4: a long list of deliveries waiting on Retry or Cancel scrolls in
    place, so every row and its buttons stay reachable in a tile that hides overflow. */

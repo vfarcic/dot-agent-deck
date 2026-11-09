@@ -3728,6 +3728,8 @@ describe("desktop settings hold no credential (issue 827)", () => {
       { voice: { intent: { backend: "remote", key: SENTINEL, token: SENTINEL } } },
       { voice: { transcription: SENTINEL, intent: SENTINEL } },
       { zoom: { level: 1.25, token: SENTINEL } },
+      // Issue #2075: the `[questions]` section is rebuilt field by field too.
+      { questions: { notify: 7, token: SENTINEL } },
       { version: SENTINEL },
       { appearance: { mode: SENTINEL } },
       [SENTINEL],
@@ -3746,7 +3748,7 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // `Option<EndpointSettings>` reads as `None`, because `JSON.stringify`
       // drops an `undefined` value on the way to the bridge. The assertion
       // below pins that it carries no *value*.
-      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "version", "voice", "zoom"]);
+      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "questions", "version", "voice", "zoom"]);
       expect(normalized.endpoints).toBeUndefined();
       expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("endpoints");
       // PRD #802 M4's `voice` takes the same shape for the same reason, and the

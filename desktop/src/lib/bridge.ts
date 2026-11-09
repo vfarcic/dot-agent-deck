@@ -581,6 +581,28 @@ export interface DesktopSettingsDto {
    * and the platform call are all in one unit.
    */
   zoom: { level: number };
+  /**
+   * Issue #2075: the `[questions]` section — `notify` is how many minutes a
+   * question may wait unanswered before the app posts one notification for it,
+   * `0` for none. **Optional for `voice`'s reason**: `undefined` is
+   * "unspecified", and `normalizeQuestionSettings` keeps it so, so a save from
+   * this webview never writes a fabricated default over the user's file.
+   * Readers take `questionNotifyAfterMinutes(settings)`.
+   */
+  questions?: QuestionSettingsDto;
+}
+
+/** Issue #2075: the `[questions]` section (`QuestionSettings` in `src-tauri/src/settings.rs`). */
+export interface QuestionSettingsDto {
+  notify: number;
+}
+
+/** What an absent `[questions]` section means: `DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES` on the Rust side. */
+export const DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES = 10;
+
+/** The minutes a question waits before its one notification, `0` for never. */
+export function questionNotifyAfterMinutes(settings: DesktopSettingsDto): number {
+  return settings.questions?.notify ?? DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES;
 }
 
 /**
@@ -1467,7 +1489,21 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
     endpoints: normalizeEndpointSettings(record.endpoints),
     voice: normalizeVoiceSettings(record.voice),
     zoom: { level: clampZoom(zoom.level) },
+    questions: normalizeQuestionSettings(record.questions),
   };
+}
+
+/**
+ * Coerce the `[questions]` section (issue #2075), **preserving absence** for
+ * `normalizeVoiceSettings`' reason. A present section is rebuilt field by
+ * field; a `notify` that is not a whole number of minutes from 0 to the `u32`
+ * ceiling reads as the default, as Rust's deserializer would refuse it.
+ */
+function normalizeQuestionSettings(value: unknown): QuestionSettingsDto | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const notify = (value as Record<string, unknown>).notify;
+  const valid = typeof notify === "number" && Number.isInteger(notify) && notify >= 0 && notify <= 0xffff_ffff;
+  return { notify: valid ? notify : DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES };
 }
 
 /**

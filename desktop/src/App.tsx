@@ -67,6 +67,7 @@ import { useDeckRuntime } from "./hooks/useDeckRuntime";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
+import { useQuestionNotifications } from "./hooks/useQuestionNotifications";
 import { OVERLAY_LAYER, overlayAbove, topmostOverlayClose, useInertBackground } from "./hooks/useInertBackground";
 import { useShownTerminals } from "./hooks/useShownTerminals";
 import { useHeldAgentRecord, type HeldAgentRecord } from "./hooks/useHeldAgentRecord";
@@ -312,6 +313,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * settings state instead of taking this one would re-create the bug.
    */
   const settings = useDesktopSettings(runtime);
+  /* Issue #2075 — one OS notification per question left unanswered for the
+     `[questions] notify` minutes, for every deck in the fleet, on every
+     screen: which is why it is mounted here beside the settings it reads. */
+  useQuestionNotifications(runtime.fleet, settings.settings, settings.loaded);
   /* PRD #1401 reads the level: a zoom change moves the pull request browser's
      frame, which it then reports again. */
   const zoom = useZoom(runtime, settings);

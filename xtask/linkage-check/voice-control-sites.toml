@@ -926,6 +926,14 @@ handler = "onClick"
 code = "requestDiscard"
 reason = "New agent Discard; voice does the same with `discard_new_agent`."
 
+# --- desktop/src/components/NotificationsPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/NotificationsPanel.tsx"
+handler = "onChange"
+code = "(event) => onSave({ ...settings, questions: { notify: Number(event.target.value) } })"
+reason = "Settings → Notifications question-wait select (issue #2075); a per-field preference edit inside the Settings sheet, which voice opens (`open_settings`, whose description names notifications) — like the Zoom and Appearance rows, no row sets the value itself."
+
 # --- desktop/src/components/OutputReader.tsx ---
 
 [[site]]

@@ -60,6 +60,13 @@ export type PendingQuestionDto = {
    * flag clearing.
    */
   answerQueued?: boolean;
+  /**
+   * Issue #2075: when the agent raised the question, in milliseconds since the
+   * Unix epoch, as its producer stamped it. The tile's `QUESTION <age>` badge
+   * and the one notification after N minutes count from it. Absent when the
+   * daemon reported no time.
+   */
+  raisedAtMs?: number;
 };
 
 /** One question's answer as the form holds it. */
