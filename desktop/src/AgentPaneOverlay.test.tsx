@@ -3,7 +3,7 @@ import { useEffect } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { AgentTileProps } from "./components/AgentTile";
 import { OVERVIEW_CLOCK_TICK_MS } from "./components/AgentOverview";
-import { createFixtureSnapshot, FIXTURE_DAEMON_ID } from "./data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "./data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, mapDesktopSnapshot, type DesktopAgentDto, type DesktopSettingsDto } from "./lib/bridge";
 import type { AgentTarget, DeckActionResult, DeckRuntimeState } from "./types";
 
@@ -322,6 +322,84 @@ describe("agent pane overlay", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(setShownTerminals).toHaveBeenCalledTimes(1);
     expect(setShownTerminals).toHaveBeenLastCalledWith([]);
+  });
+
+  /** Scenario: close the viewed agent from either screen origin, cancelling once first. The daemon receives the captured target only after confirmation; its refreshed listing removes the pane and returns to the dashboard, not an empty agent screen. */
+  it.each(["overview", "deck"] as const)("confirms closing the viewed agent from %s and returns to the dashboard", async (from) => {
+    const initial = runtime();
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a" })) };
+    let settle!: (result: DeckActionResult) => void;
+    const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
+    const rt = { ...initial, snapshot, fleet: [snapshot], runAction };
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from };
+    const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
+    const pane = () => screen.getByTestId("agent-pane-overlay");
+    const close = () => within(pane()).getByRole("button", { name: "Close agent" });
+
+    expect(within(pane()).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
+    fireEvent.click(close());
+    let dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Close Plan / architecture?");
+    expect(dialog.closest("[inert]")).toBeNull();
+    expect(pane().closest("[inert]")).not.toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(runAction).not.toHaveBeenCalled();
+    expect(pane()).toBeVisible();
+
+    fireEvent.click(close());
+    dialog = screen.getByRole("alertdialog");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" }));
+    expect(within(dialog).getByRole("button", { name: "Stopping…" })).toBeDisabled();
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a" });
+    // The daemon's listing can arrive before the action's reply.
+    const ended = { ...snapshot, agents: snapshot.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<DeckShell runtime={{ ...rt, snapshot: ended, fleet: [ended] }} initialView={view} />);
+    await act(async () => settle({ ok: true }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
+  });
+
+  /** Scenario: a stop is refused while the agent is still present. The error does not dismiss its pane; backing out afterwards closes the view without another stop request. */
+  it("keeps the pane when closing its agent is refused, and Back stops nothing", async () => {
+    const runAction = vi.fn(async () => { throw new Error("daemon refused the stop"); });
+    render(<DeckShell runtime={runtime({ runAction })} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" }} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    await act(async () => fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" })));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+    expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
+    expect(runAction).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: Escape cancels the stop confirmation without also closing the agent pane behind it. */
+  it("lets Escape dismiss only the stop confirmation", () => {
+    const rt = runtime();
+    render(<DeckShell runtime={rt} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" }} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(rt.runAction).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: the agent pane belongs to a remote deck, not the selected local one which has the same agent id. After a refresh replaces the remote agent, confirming still sends the captured remote process and never the local or replacement agent. */
+  it("holds a pane's close to its own deck and captured process", async () => {
+    const fleet = createFixtureFleet("fleet").map((deck) => ({ ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "process-a" })) }));
+    const remote = fleet.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)!;
+    const target = remote.agents[0];
+    expect(fleet[0].agents.some((agent) => agent.id === target.id)).toBe(true);
+    const runAction = vi.fn(async () => ({ ok: false }) as DeckActionResult);
+    const rt = runtime({ snapshot: fleet[0], fleet, runAction });
+    const view = { kind: "agent" as const, deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: target.id, incarnation: "process-a", from: "overview" as const };
+    const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("dev@build-box");
+    const successor = fleet.map((deck) => deck === remote ? { ...deck, agents: deck.agents.map((agent) => ({ ...agent, incarnation: "process-b" })) } : deck);
+    rerender(<DeckShell runtime={{ ...rt, fleet: successor }} initialView={view} />);
+    await act(async () => fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" })));
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: target.id, incarnation: "process-a" });
   });
 });
 

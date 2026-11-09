@@ -816,6 +816,28 @@ export function stopTargetName(agent: OverviewAgent): string {
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
 
+/** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void): ConfirmState {
+  const name = stopTargetName(agent);
+  const roleWarning = agent.tab.kind === "orchestration"
+    ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
+    : "";
+  return {
+    title: `Close ${name}?`,
+    body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
+    label: "Close agent",
+    busyLabel: "Stopping…",
+    action: async () => {
+      try {
+        const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation });
+        if (result.ok) onStopped?.();
+      } catch {
+        // The runtime files the refusal under its global error; keep the agent's view.
+      }
+    },
+  };
+}
+
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
@@ -1406,14 +1428,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        const name = stopTargetName(agent);
-        setConfirm({
-          title: `Close ${name}?`,
-          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
-          label: "Close agent",
-          busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
-        });
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;

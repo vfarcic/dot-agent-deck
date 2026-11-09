@@ -76,6 +76,26 @@ describe("a voice dispatch holds to the daemon process its agent was listed by",
   beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
   afterEach(() => vi.useRealTimers());
 
+  /** Scenario: a bare stop is resolving when another agent's pane replaces the one it was said in, or its daemon restarts. No close confirmation may be opened for the new subject; the unchanged pane remains a positive control. */
+  it.each(["other-agent", "restarted", "unchanged"])("holds a paramless pane stop to its declared subject (%s)", async (change) => {
+    const voice = microphone();
+    let release!: (answer: VoiceResultDto) => void;
+    const rt = runtime(voice, () => new Promise<VoiceResultDto>((resolve) => { release = resolve; }));
+    const onDispatch = vi.fn(() => ({}));
+    const pane = { deckId: "local", agentId: "a1", label: "tester", incarnation: "process-a" };
+    let listed = { [agentKey("local", "a1")]: { process: "process-a" } };
+    const props = { runtime: rt, screen: "agent" as const, onDispatch, selectedDeckId: "local", agentIncarnations: () => listed };
+    const { rerender } = render(<VoiceControlPanel {...props} pane={pane} />);
+    await turnOnVoice();
+    await speak(voice, "stop");
+    const next = change === "other-agent" ? { ...pane, agentId: "a2" } : change === "restarted" ? { ...pane, incarnation: "process-b" } : pane;
+    listed = { [agentKey("local", "a1")]: { process: next.incarnation } };
+    rerender(<VoiceControlPanel {...props} pane={next} />);
+    await act(async () => { release({ ...STOP, outcome: { ...STOP.outcome, kind: "dispatch", transcript: "stop", action: "stop_agent", invoke: "confirmStopAgent", params: [], sentence: "Confirm closing the open agent." } }); });
+    await flush();
+    expect(onDispatch).toHaveBeenCalledTimes(change === "unchanged" ? 1 : 0);
+  });
+
   /**
    * Scenario: "stop the tester" is declared while daemon process A lists the
    * tester. While it resolves, the deck restarts as process B and lists an

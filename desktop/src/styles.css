@@ -1663,6 +1663,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-header-actions { flex: 0 0 auto; display: flex; align-items: center; gap: 2px; }
 .agent-pane-control { width: 26px; height: 26px; display: grid; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--faint); background: transparent; cursor: pointer; }
 .agent-pane-control:hover { color: var(--teal); border-color: var(--teal-focus); background: var(--teal-soft); }
+.agent-stop-control { display: flex; align-items: center; gap: 5px; padding: 5px 8px; border: 1px solid currentColor; border-radius: 4px; color: var(--red); background: transparent; cursor: pointer; white-space: nowrap; }
+.agent-stop-control:hover, .agent-stop-control:focus-visible { background: var(--red-soft); }
 /* The overview's entry control. `margin-left: auto` puts it at the end of the
    name cell rather than beside the name, so a long display name is still
    clamped by its own `text-overflow` and the control never moves. */
