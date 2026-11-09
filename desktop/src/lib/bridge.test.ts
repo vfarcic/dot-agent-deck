@@ -70,6 +70,39 @@ describe("TauriDeckBridge", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  /** Scenario: the close dialog asks about captured panes on a remote deck. The bridge sends that deck and process unchanged, and a clean reply has no warning. */
+  it("asks the captured deck for its worktree close preview", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const kept = { path: "/remote/project-dispatch-1674", confirmed_dirty: true };
+    invoke.mockResolvedValueOnce(kept).mockResolvedValueOnce(null);
+    expect(await bridge.closeWorktreePreview("remote", ["pane-41", "pane-42"], "process-a")).toEqual(kept);
+    expect(invoke).toHaveBeenLastCalledWith("desktop_close_worktree_preview", { deckId: "remote", paneIds: ["pane-41", "pane-42"], incarnation: "process-a" });
+    expect(await bridge.closeWorktreePreview("remote", ["pane-41"], "process-a")).toBeUndefined();
+    await bridge.dispose();
+  });
+
+  /** Scenario: another observed deck reports a kept directory after its agents close. The notice belongs to that deck, survives its next empty listing, and does not enter the selected deck's evidence. */
+  it("retains kept worktree broadcasts on the emitting deck after its cards disappear", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    await bridge.subscribe(onFleet, vi.fn());
+    await bridge.connect();
+    const remote = structuredClone(snapshot);
+    remote.connection.deckId = "remote";
+    remote.fleet = [snapshot.connection.deckId!, "remote"];
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+    const kept = { path: "/remote/project-dispatch-1674", confirmed_dirty: false };
+    listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", deck: "remote", ...kept } });
+    remote.agents = [];
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+    const fleet = onFleet.mock.calls.at(-1)![0] as DeckFleet;
+    expect(fleet.find((deck) => deck.connection.deckId === "remote")?.keptWorktrees).toEqual([kept]);
+    expect(fleet.find((deck) => deck.connection.deckId === snapshot.connection.deckId)?.keptWorktrees).toBeUndefined();
+    await bridge.dispose();
+  });
+
   /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence; keyboard input rejects as not attached and no PTY bytes move. */
   it("opening a stale card preserves its incarnation and transfers no PTY bytes", async () => {
     const { TauriDeckBridge } = await import("./bridge");

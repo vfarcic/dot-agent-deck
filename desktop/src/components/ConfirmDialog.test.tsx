@@ -21,6 +21,22 @@ function Page({ onClose }: { onClose: () => void }) {
 /* Issue #1709 — the confirmation is on the overlay stack, so voice's "close"
    (which closes `topmostOverlayClose()`) dismisses it. */
 describe("ConfirmDialog on the overlay stack", () => {
+  /** Scenario: checking a close's worktree disables Confirm but leaves Cancel available. A failed preview restores the ordinary question; a late result for a cancelled question cannot put its path in the next one. */
+  it("waits for a best-effort preview and discards a replaced question's reply", async () => {
+    let settle!: (value: { path: string; confirmed_dirty: boolean }) => void;
+    const slow: ConfirmState = { ...STATE, worktreePreview: () => new Promise((resolve) => { settle = resolve; }) };
+    const { rerender } = render(<ConfirmDialog state={slow} onClose={vi.fn()} />);
+    expect(screen.getByRole("button", { name: "Checking worktree…" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Cancel" })).toBeEnabled();
+    rerender(<ConfirmDialog state={STATE} onClose={vi.fn()} />);
+    await act(async () => settle({ path: "/cancelled-worktree", confirmed_dirty: true }));
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("/cancelled-worktree");
+    const refused = { ...STATE, worktreePreview: vi.fn(async () => { throw new Error("unavailable"); }) };
+    rerender(<ConfirmDialog state={refused} onClose={vi.fn()} />);
+    await act(async () => undefined);
+    expect(screen.getByRole("button", { name: "Close agent" })).toBeEnabled();
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("KEPT");
+  });
   /** Scenario: With a confirmation open, the rest of the window is inert and voice's "close" is its Cancel; once it is gone the window is live again. */
   it("fences the window and closes on voice's close", () => {
     const onClose = vi.fn();

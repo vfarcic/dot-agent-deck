@@ -1199,7 +1199,14 @@ export interface HostMetrics {
  */
 export type HostMetricsReport = { status: "available"; metrics: HostMetrics } | { status: "not-available" };
 
+export interface KeptWorktree {
+  path: string;
+  confirmed_dirty: boolean;
+}
+
 export interface DeckSnapshot {
+  /** Recent post-close verdicts received from this deck, retained after its cards disappear. */
+  keptWorktrees?: readonly KeptWorktree[];
   runId: string;
   repo: string;
   /**
@@ -1626,6 +1633,8 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
+  /** Best-effort prediction from the target daemon, not this machine's filesystem. */
+  closeWorktreePreview?: (deckId: string, paneIds: string[], incarnation?: string) => Promise<KeptWorktree | undefined>;
   /**
    * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names: **Upgrade**
    * on a remote deck, **Replace daemon** on the local one. `onEvent` hears the

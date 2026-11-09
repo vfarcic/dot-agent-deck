@@ -486,6 +486,7 @@ export function useDeckRuntime(): DeckRuntimeState {
     dismissCleanupWarning,
     clearError,
     runAction,
+    closeWorktreePreview: bridge.closeWorktreePreview?.bind(bridge),
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),

@@ -2,6 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { CircleStop } from "lucide-react";
 
 import { insideVoicePeer, OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
+import type { KeptWorktree } from "../types";
+import { KeptWorktreeNotices } from "./KeptWorktreeNotice";
 
 /**
  * One irreversible-enough act, described in the terms the user needs to decide.
@@ -16,6 +18,7 @@ export interface ConfirmState {
   label: string;
   busyLabel: string;
   action: () => Promise<void>;
+  worktreePreview?: () => Promise<KeptWorktree | undefined>;
 }
 
 /**
@@ -27,6 +30,18 @@ export interface ConfirmState {
  */
 export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
+  const [preview, setPreview] = useState<{ owner: ConfirmState; kept?: KeptWorktree }>();
+  const checking = Boolean(state.worktreePreview && preview?.owner !== state);
+  useEffect(() => {
+    let active = true;
+    if (state.worktreePreview) {
+      void state.worktreePreview().then(
+        (kept) => { if (active) setPreview({ owner: state, kept }); },
+        () => { if (active) setPreview({ owner: state }); },
+      );
+    }
+    return () => { active = false; };
+  }, [state]);
   /* On the overlay stack (issue #1709), so the rest of the window is fenced
      and voice's "close" is Cancel — rather than closing whatever this is drawn
      over and leaving the question on screen. Except where the voice surface
@@ -50,5 +65,5 @@ export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose
     const asked = state;
     void asked.action().finally(() => { if (shown.current === asked) onClose(); });
   };
-  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p><div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy} onClick={confirm}>{busy ? state.busyLabel : state.label}</button></div></section></div>;
+  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{preview?.owner === state && preview.kept && <KeptWorktreeNotices worktrees={[preview.kept]} />}<div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy || checking} onClick={confirm}>{busy ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button></div></section></div>;
 }

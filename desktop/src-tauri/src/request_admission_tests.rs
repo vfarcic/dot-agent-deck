@@ -51,6 +51,7 @@ const ACTING_OPS: &[&str] = &[
     "start-agent",
     "list-agents",
     "subscribe-events",
+    "dispatch-worktree-close-preview",
 ];
 
 /// When the daemon at the socket is replaced.
@@ -150,6 +151,14 @@ fn listed(id: &str) -> AgentRecord {
 /// replacement would succeed there.
 fn serve(op: &str) -> AttachResponse {
     match op {
+        "dispatch-worktree-close-preview" => {
+            let mut reply = AttachResponse::ok();
+            reply.kept_worktree = Some(dot_agent_deck::issue_dispatch_run::KeptWorktree {
+                path: "/remote/project-dispatch-1674".into(),
+                confirmed_dirty: true,
+            });
+            reply
+        }
         "list-agents" => AttachResponse::agent_records(vec![listed(REUSED_ID)]),
         "start-agent" | "start-prepared-agent" => AttachResponse::with_id("started".into()),
         "post-message" => AttachResponse::with_id("m-posted".into()),
@@ -355,6 +364,41 @@ fn role_options() -> StartAgentOptions {
             crate::dto::mint_desktop_pane_id(),
         )],
         ..Default::default()
+    }
+}
+
+/// Scenario: a close preview asks the deck holding the captured panes. The
+/// matching daemon reports the kept directory; a refused replacement receives
+/// no preview and leaves the ordinary close confirmation available.
+#[tokio::test]
+async fn a_worktree_close_preview_is_bound_to_its_deck_and_admitted() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let _guard = AllowanceGuard::acquire();
+    for (name, replacement, served) in replacements() {
+        let deck = ReplacedDeck::start("close-preview", SwapAt::FirstConnection, replacement);
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        let state = crate::terminal::DesktopState::default();
+        held(&state.daemon, &deck.endpoint()).await;
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        let preview =
+            crate::close_worktree_preview(&state, &wire, vec![PANE.into()], &listed_process())
+                .await
+                .unwrap();
+        assert_eq!(preview.is_some(), served, "{name}");
+        if let Some(kept) = preview {
+            assert_eq!(kept.path, "/remote/project-dispatch-1674");
+            assert!(kept.confirmed_dirty);
+        }
+        let outcome = deck.finish();
+        assert_admitted(
+            name,
+            "the close preview",
+            &outcome,
+            served,
+            served,
+            &["dispatch-worktree-close-preview"],
+        );
     }
 }
 

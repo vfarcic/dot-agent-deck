@@ -32,6 +32,7 @@ import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { deckAttentionText } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
+import { KeptWorktreeNotices } from "./KeptWorktreeNotice";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -60,7 +61,7 @@ export type OverviewAgent = Pick<
   /* PRD #1401 — the badge beside the agent's name. */
   | "pullRequest"
   /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
-  | "incarnation"
+   | "incarnation" | "paneId"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -87,10 +88,11 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId } = agent;
   return {
     id,
     daemonId,
+    paneId,
     displayName,
     cli,
     status,
@@ -817,7 +819,7 @@ export function stopTargetName(agent: OverviewAgent): string {
 }
 
 /** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
-export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void): ConfirmState {
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, preview?: DeckRuntimeState["closeWorktreePreview"]): ConfirmState {
   const name = stopTargetName(agent);
   const roleWarning = agent.tab.kind === "orchestration"
     ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
@@ -827,6 +829,7 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
     body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
     label: "Close agent",
     busyLabel: "Stopping…",
+    ...(preview && agent.paneId ? { worktreePreview: () => preview(agent.daemonId, [agent.paneId!], agent.incarnation) } : {}),
     action: async () => {
       try {
         const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation });
@@ -1437,7 +1440,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction));
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, runtime.closeWorktreePreview));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -1451,6 +1454,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
           label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
           busyLabel: "Stopping…",
+          ...(runtime.closeWorktreePreview ? { worktreePreview: () => runtime.closeWorktreePreview!(deckId, group.agents.flatMap((agent) => agent.paneId ? [agent.paneId] : []), group.agents[0]?.incarnation) } : {}),
           action: () => run({ type: "stop_orchestration", deckId, roles }),
         });
       },
@@ -1930,6 +1934,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
 
       {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. */}
       {deck.connected && <HookBinaryNotices notices={connection.hookBinaryNotices} />}
+      <KeptWorktreeNotices worktrees={deck.snapshot.keptWorktrees} />
 
       <div className="daemon-group-body">
         <DaemonBody

@@ -43,6 +43,7 @@ import type { HandoffEdge,
   DisconnectedReason,
   EvidenceItem,
   HostMetricsReport,
+  KeptWorktree,
   InboxActionResult,
   InboxActionVerb,
   InboxAttentionItem,
@@ -1868,6 +1869,7 @@ export interface DeckBridge {
   connect(): Promise<DeckFleet>;
   subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
   runAction(action: DeckAction): Promise<DeckActionResult>;
+  closeWorktreePreview?(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | undefined>;
   /**
    * Type into one agent's terminal, named by the composite `(deckId, agentId)`.
    *
@@ -2942,6 +2944,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // this used to carry was a placeholder the topbar printed as if it were the
     // checked-out branch (PRD #745 M8).
     worktree: cwd,
+    keptWorktrees: previous?.keptWorktrees,
     // Issue #887: copied through so `projectsRevision` can key on it. Nothing
     // renders it.
     scheduleRevision: dto.scheduleRevision,
@@ -4982,6 +4985,17 @@ export class TauriDeckBridge implements DeckBridge {
     // event produces one within the coalescing window; republishing the last
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
+      // Kept work belongs to the emitting deck, even when another deck is selected.
+      const payload = event.payload as { kind?: unknown; deck?: unknown; path?: unknown; confirmed_dirty?: unknown } | null;
+      if (payload?.kind === "worktree_kept" && typeof payload.deck === "string" && typeof payload.path === "string" && typeof payload.confirmed_dirty === "boolean") {
+        const deck = this.fleet.get(payload.deck);
+        if (deck) {
+          const kept = { path: payload.path, confirmed_dirty: payload.confirmed_dirty };
+          this.fleet.set(payload.deck, { ...deck, keptWorktrees: [...(deck.keptWorktrees ?? []).filter((entry) => entry.path !== kept.path), kept].slice(-10) });
+          onFleet(this.fleetView());
+        }
+        return;
+      }
       // PRD #742 M3 stamped every payload with the deck it came from, and this
       // is the reader that stamp was for: the evidence drawer and the handoff
       // rail are the DECK SCREEN's, which DECISION 1 keeps single-deck, so an
@@ -5631,6 +5645,11 @@ export class TauriDeckBridge implements DeckBridge {
       verb,
       incarnation: target.incarnation ?? null,
     });
+  }
+
+  async closeWorktreePreview(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | undefined> {
+    const invoke = await this.getInvoke();
+    return (await invoke<KeptWorktree | null>("desktop_close_worktree_preview", { deckId, paneIds, incarnation: incarnation ?? null })) ?? undefined;
   }
 
   async upgradeDaemon(deckId: string, onEvent: (event: UpgradeEvent) => void): Promise<UpgradeOutcome> {

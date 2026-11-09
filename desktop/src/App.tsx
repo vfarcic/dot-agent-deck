@@ -36,6 +36,7 @@ import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen,
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
+import { KeptWorktreeNotices } from "./components/KeptWorktreeNotice";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
 import { HandoffRail } from "./components/HandoffRail";
@@ -925,14 +926,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
-    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped);
+    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, runtime.closeWorktreePreview);
     setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
       try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
     } });
     return undefined;
-  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
+  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction, runtime.closeWorktreePreview]);
   const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
     confirmStopAgent: confirmPaneStop,
     reportRefused: (sentence: string) => panelVoiceContext.current?.reportRefused?.(sentence),
@@ -2244,6 +2245,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Close agent",
       busyLabel: "Stopping…",
+      ...(runtime.closeWorktreePreview && selectedAgent.paneId ? { worktreePreview: () => runtime.closeWorktreePreview!(snapshot.connection.deckId ?? "", [selectedAgent.paneId!], selectedAgent.incarnation) } : {}),
       action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
     });
   };
@@ -2590,6 +2592,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
 
         {/* Issue #1637: this deck's agents' hooks run an older dot-agent-deck. Not the banner above — the connection is fine. */}
         {!allDecks && <HookBinaryNotices notices={snapshot.connection.hookBinaryNotices} />}
+        {!allDecks && <KeptWorktreeNotices worktrees={snapshot.keptWorktrees} />}
 
         {allDecks && (
           <section className="workspace-section" aria-label="Select a daemon">

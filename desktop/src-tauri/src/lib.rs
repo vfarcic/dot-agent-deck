@@ -118,6 +118,10 @@ const ROLE_RECONCILE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
 /// resize coalescing the terminal bridge already uses.
 const SNAPSHOT_COALESCE_INTERVAL: Duration = Duration::from_millis(150);
 
+/// Best-effort, including the target deck's connection and handshake. A slow
+/// or unavailable daemon should not hold the close confirmation indefinitely.
+const WORKTREE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Put the launch's per-role commands into the ORCHESTRATION's role order, and
 /// refuse any disagreement about the role set.
 ///
@@ -1826,6 +1830,52 @@ async fn desktop_list_projects(
         .await
         .map_err(|error| safe_message(error.to_string()))?;
     Ok(map_project_listing(listing))
+}
+
+#[tauri::command]
+async fn desktop_close_worktree_preview(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    pane_ids: Vec<String>,
+    incarnation: Option<String>,
+) -> Result<Option<dot_agent_deck::issue_dispatch_run::KeptWorktree>, String> {
+    ensure_main_webview(&webview)?;
+    close_worktree_preview(&state, &deck_id, pane_ids, &Incarnation::from(incarnation)).await
+}
+
+async fn close_worktree_preview(
+    state: &DesktopState,
+    deck_id: &str,
+    pane_ids: Vec<String>,
+    incarnation: &Incarnation,
+) -> Result<Option<dot_agent_deck::issue_dispatch_run::KeptWorktree>, String> {
+    if pane_ids.is_empty() {
+        return Ok(None);
+    }
+    if pane_ids.len() > 256 {
+        return Err("too many panes for a worktree preview".into());
+    }
+    for pane_id in &pane_ids {
+        validate_agent_id(pane_id)?;
+    }
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let query = async {
+        let daemon = state.daemon.trusted(scope.endpoint()).await?;
+        daemon.require_compatible()?;
+        daemon
+            .client
+            .bound_to(incarnation.clone())
+            .dispatch_worktree_close_preview(pane_ids)
+            .await
+            .map_err(|error| safe_message(error.to_string()))
+    };
+    // Like the TUI, an unavailable preview leaves the usual close question.
+    Ok(tokio::time::timeout(WORKTREE_PREVIEW_TIMEOUT, query)
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .flatten())
 }
 
 /// PRD #819 M6: resolve ONE path — a path this daemon listed, or one the user
@@ -6788,6 +6838,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             desktop_get_snapshot,
             desktop_list_projects,
+            desktop_close_worktree_preview,
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
             desktop_list_directories,

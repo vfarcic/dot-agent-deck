@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
 import type { AgentSession, DeckActionResult, DeckFleet, DeckRuntimeState } from "../types";
@@ -17,6 +17,7 @@ function role(deckId: string, id: string, roleName: string, roleIndex: number): 
     tab: { kind: "orchestration", orchestrationId: "orc-loop", name: "loop", displayTitle: "demo-project-orchestrator-1", roleName, roleIndex, isStartRole: roleIndex === 0, cwd: "/home/build/demo-project" },
     inOrchestration: true,
     incarnation: "listed-process-a",
+    paneId: `pane-${id}`,
   };
 }
 
@@ -55,6 +56,39 @@ const row = (deckId: string, agentId: string) => screen.getByTestId(`overview-ag
 const confirmation = () => screen.queryByRole("alertdialog");
 
 describe("stopping from the overview (PRD #1223 U4)", () => {
+  /** Scenario: close one remote role or its whole orchestration. Before confirming, the dialog names the worktree the daemon predicts it will keep; an inconclusive probe does not claim confirmed dirtiness. A clean control carries no warning, and Cancel never stops an agent. */
+  it.each([true, false, undefined])("warns about kept work before a close (dirty=%s)", async (confirmedDirty) => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const preview = vi.fn(async () => confirmedDirty === undefined ? undefined : { path: "/remote/project-dispatch-1674", confirmed_dirty: confirmedDirty });
+    const state = { ...runtime(runAction), closeWorktreePreview: preview };
+    render(<AgentOverview runtime={state} onNavigate={vi.fn()} />);
+    for (const whole of [false, true]) {
+      const close = whole
+        ? screen.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" })
+        : within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent");
+      fireEvent.click(close);
+      await waitFor(() => expect(preview).toHaveBeenLastCalledWith(FIXTURE_REMOTE_DAEMON_ID, whole ? ["pane-41", "pane-42"] : ["pane-41"], "listed-process-a"));
+      if (confirmedDirty === undefined) {
+        expect(confirmation()).not.toHaveTextContent("KEPT");
+      } else {
+        await waitFor(() => expect(confirmation()).toHaveTextContent(confirmedDirty ? "Uncommitted work here is KEPT, not deleted:" : "Uncommitted work here, if any, is KEPT:"));
+        expect(confirmation()).toHaveTextContent("/remote/project-dispatch-1674");
+      }
+      fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+    }
+    expect(runAction).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: after a remote close removes its roles, the dashboard still names the directory the daemon actually kept, under that remote deck rather than the selected local one. */
+  it("reports a kept worktree after its agents have disappeared", () => {
+    const fleet = fleetWithOrchestration().map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID
+      ? { ...deck, agents: [], keptWorktrees: [{ path: "/remote/project-dispatch-1674", confirmed_dirty: true }] }
+      : deck);
+    render(<AgentOverview runtime={runtime(vi.fn(), fleet)} onNavigate={vi.fn()} />);
+    const remote = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === FIXTURE_REMOTE_DAEMON_ID)!;
+    expect(within(remote).getByRole("status")).toHaveTextContent("Uncommitted work here is KEPT, not deleted: /remote/project-dispatch-1674");
+  });
+
   /**
    * Scenario: on the fleet, press the stop control on the planner role's row —
    * an agent on the REMOTE deck. A confirmation names the agent and that daemon;

@@ -157,9 +157,11 @@ The TUI shows the same pull request on the agent's card, as `#1234` with a glyph
 - **Stop one agent:** press the stop control on its row (`Close <name> agent`), or **Close agent** in its full-window pane. The confirmation, `Close <name>?`, names the daemon the stop request goes to. For an orchestration role it warns that the other roles keep running. Press **Close agent**. Closing from the pane returns you to the Dashboard.
 - **Stop every role of an orchestration:** press **Close** on its group header. The confirmation lists every role it will stop. Press **Close all N roles** (or **Close 1 role**).
 
+For a dispatched unit with uncommitted changes, the close confirmation warns **Uncommitted work here is KEPT, not deleted:** and names the directory. After the close, a notice under that daemon on the Dashboard reports the directory that was actually kept, even after the agent rows disappear. If the deck could not check for changes, the notice says **Uncommitted work here, if any, is KEPT:** instead. The Dashboard keeps up to ten recent kept-directory notices per daemon while the app is open; use `dot-agent-deck worktree list` on that daemon's host to check older directories.
+
 **Check it worked:** the row, or the whole group, disappears from the section. If the app cannot confirm that some roles stopped, it says how many may still be running on which daemon, in a message on the Dashboard and in the New agent dialog; open the TUI against that daemon, or run `dot-agent-deck daemon status` on its host, to see what is still there.
 
-In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab.
+In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab. Its confirmation shows the same kept-worktree warning, and its status line reports the kept directory after the close.
 
 ## When a daemon is not there
 
