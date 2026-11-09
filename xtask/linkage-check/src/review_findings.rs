@@ -205,7 +205,8 @@ fn qodo_comment(sha: &str, items: &str, previous: &str) -> Value {
     })
 }
 
-/// Greptile's summary comment with one finding linked to its thread.
+/// Greptile's summary comment with one finding linked to its thread, and a
+/// numbered bold point in its Summary section, which is not a finding.
 fn greptile_comment(title: &str, thread_root: u64) -> Value {
     json!({
         "user": {"login": "greptile-apps[bot]", "type": "Bot"},
@@ -213,7 +214,7 @@ fn greptile_comment(title: &str, thread_root: u64) -> Value {
         "body": format!(
             "<!-- greptile_summary -->\n<h2>Confidence Score: 4/5</h2>\n<h2>Findings</h2>\n\n\
              1. <img alt=\"P1\" src=\"https://greptile-static-assets.s3.amazonaws.com/badges/p1.svg?v=9\" align=\"top\">&nbsp;**{title}** \
-             <a href=\"https://github.com/o/r/pull/42#discussion_r{thread_root}\">▶</a>\n\n<h3>Summary</h3>\nStuff."
+             <a href=\"https://github.com/o/r/pull/42#discussion_r{thread_root}\">▶</a>\n\n<h3>Summary</h3>\n1. **Updated tests** for the change."
         ),
     })
 }
@@ -441,6 +442,10 @@ fn review_findings_005_a_greptile_finding_is_answered_in_the_thread_its_summary_
         text.contains("UNANSWERED=Greptile 1 P1: Rollback hides running agents\n"),
         "{text}"
     );
+    assert!(
+        !text.contains("Updated tests"),
+        "a numbered point in the Summary section is not a finding:\n{text}"
+    );
 
     sb.threads(vec![thread(
         false,
@@ -504,4 +509,105 @@ fn review_findings_008_a_failed_read_is_an_error_not_a_verdict() {
         "{text}"
     );
     assert!(!text.contains("FINDINGS="), "{text}");
+}
+
+#[test]
+fn review_findings_009_each_qodo_item_keeps_its_own_tier() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new().with_registry(&registry_with_only("Qodo"));
+    let items = format!(
+        "{}{}",
+        qodo_item(1, "Action required", "Workers can be lost"),
+        qodo_item(2, "Informational", "A comment is stale")
+    );
+    sb.answer("comments", &json!([qodo_comment(HEAD, &items, "")]));
+    let text = stdout(&sb.run());
+    assert!(
+        text.contains("UNANSWERED=Qodo 1 Action required: Workers can be lost\n"),
+        "{text}"
+    );
+    assert!(
+        text.contains("UNANSWERED=Qodo 2 Informational: A comment is stale\n"),
+        "{text}"
+    );
+}
+
+#[test]
+fn review_findings_010_an_author_that_is_not_an_identifiable_person_answers_nothing() {
+    if !tools_present() {
+        return;
+    }
+    let title = "Workers can be lost";
+    let items = qodo_item(1, "Remediation recommended", title);
+    let sb = Sandbox::new().with_registry(&registry_with_only("Qodo"));
+    // A deleted account: no author on the thread reply, no user on the comment.
+    let mut ghost = comment_node(12, "", "User", "Fixed.");
+    ghost["author"] = Value::Null;
+    sb.threads(vec![thread(
+        false,
+        vec![qodo_thread_root(10, title), ghost],
+    )]);
+    sb.answer(
+        "comments",
+        &json!([
+            qodo_comment(HEAD, &items, ""),
+            json!({"user": null, "body": format!("{title}: fixed")}),
+            json!({"user": {"login": "x"}, "body": format!("{title}: fixed")}),
+        ]),
+    );
+    let text = stdout(&sb.run());
+    assert!(
+        text.contains(&format!(
+            "UNANSWERED=Qodo 1 Remediation recommended: {title}\n"
+        )),
+        "{text}"
+    );
+}
+
+#[test]
+fn review_findings_011_answering_a_longer_title_does_not_answer_a_shorter_one_inside_it() {
+    if !tools_present() {
+        return;
+    }
+    let short = "Workers can be lost";
+    let long = "Workers can be lost on restart";
+    let items = format!(
+        "{}{}",
+        qodo_item(1, "Informational", long),
+        qodo_item(2, "Informational", short)
+    );
+    let sb = Sandbox::new().with_registry(&registry_with_only("Qodo"));
+    // A thread for the longer title is not the shorter one's thread either.
+    sb.threads(vec![thread(true, vec![qodo_thread_root(10, long)])]);
+    sb.answer(
+        "comments",
+        &json!([
+            qodo_comment(HEAD, &items, ""),
+            person_comment(&format!("\"{long}\": fixed in abc123.")),
+        ]),
+    );
+    let text = stdout(&sb.run());
+    assert!(
+        text.contains(&format!("ANSWERED=Qodo 1 thread: {long}\n")),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!("UNANSWERED=Qodo 2 Informational: {short}\n")),
+        "{text}"
+    );
+
+    sb.answer(
+        "comments",
+        &json!([
+            qodo_comment(HEAD, &items, ""),
+            person_comment(&format!("\"{long}\": fixed. \"{short}\": by design.")),
+        ]),
+    );
+    let text = stdout(&sb.run());
+    assert!(
+        text.contains(&format!("ANSWERED=Qodo 2 comment: {short}\n")),
+        "{text}"
+    );
 }

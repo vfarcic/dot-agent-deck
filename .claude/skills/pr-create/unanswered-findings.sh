@@ -27,8 +27,8 @@
 # Which findings: Qodo's are the numbered items of the "Code Review by Qodo"
 # issue comment that names the head commit, above its "Previous reviews"
 # section — every tier, its informational one included, which exists only in
-# that comment. Greptile's are the numbered items under "Findings" in its
-# summary comment; it reviews once, when the PR opens, so that list is its
+# that comment. Greptile's are the numbered items in the "Findings" section of
+# its summary comment, up to the next heading; it reviews once, when the PR opens, so that list is its
 # review of the head too.
 #
 # A finding is answered when any one of these holds:
@@ -37,13 +37,15 @@
 #            naming the resolving commit). Qodo judges that against the code,
 #            so it is the one fix-commit signal that needs no guessing.
 #   thread   the review thread that carries the finding is resolved, or has a
-#            reply from an account that is not a bot. Greptile's summary links
-#            its thread; a Qodo thread is the one opened by Qodo whose text
-#            contains the finding's title.
-#   comment  an issue comment on the PR, from an account that is not a bot,
-#            contains the finding's title (or, for Qodo, its finding id from the
-#            "View" link). This is the way to answer an informational Qodo item,
-#            which has no thread.
+#            reply from a person: an author GitHub reports as a User, so a bot
+#            or a deleted account does not count. Greptile's summary links its
+#            thread; a Qodo thread is the one Qodo opened whose numbered
+#            heading is the finding's title.
+#   comment  an issue comment on the PR by a person contains the finding's
+#            title (or, for Qodo, its finding id from the "View" link). A title
+#            that occurs only inside another finding's longer title does not
+#            count for the shorter one. This is the way to answer an
+#            informational Qodo item, which has no thread.
 #
 # Titles are compared after HTML entities, tags, backslashes and backticks are
 # stripped, case-insensitively, because the same finding is spelled "Exact PTY
@@ -89,7 +91,8 @@ gh api "repos/{owner}/{repo}/issues/$pr/comments" --paginate >"$tmp/comments.raw
   die "cannot read pull request #$pr's comments"
 
 # Every review thread with its comments. Paginated over threads; a thread with
-# more than 100 comments has its later ones unread.
+# more than 100 comments has its later ones unread, which can only report a
+# finding unanswered that was answered there, never the other way round.
 # shellcheck disable=SC2016 # GraphQL variables, not shell ones
 gh api graphql --paginate \
   -f query='query($o:String!,$r:String!,$n:Int!,$endCursor:String){repository(owner:$o,name:$r){
@@ -126,7 +129,7 @@ read_qodo() {
   fi
   awk '
     function flush() {
-      if (num != "") print "Qodo\t" num "\t" sev "\t" title "\t" resolved "\t" fid "\t"
+      if (num != "") print "Qodo\t" num "\t" isev "\t" title "\t" resolved "\t" fid "\t"
       num = ""
     }
     index($0, "<!-- qodo-previous-reviews:start -->") { flush(); exit }
@@ -149,6 +152,7 @@ read_qodo() {
       sub(/<\/summary>.*$/, "", line)
       gsub(/<\/?s>/, "", line)
       title = line
+      isev = sev
       fid = ""
       next
     }
@@ -167,7 +171,9 @@ read_greptile() {
     return
   fi
   awk '
-    /^[0-9]+\. / && index($0, "**") {
+    index($0, "Findings</h2>") { on = 1; next }
+    on && /^<h[1-6]>/ { exit }
+    on && /^[0-9]+\. / && index($0, "**") {
       num = $0; sub(/\..*/, "", num)
       sev = ""
       if (match($0, /alt="P[0-9]"/)) sev = substr($0, RSTART + 5, RLENGTH - 6)
@@ -198,28 +204,33 @@ jq -R -s -r \
            | gsub("&lt;"; "<") | gsub("&gt;"; ">") | gsub("&nbsp;"; " ") | gsub("&amp;"; "&")
            | gsub("[\\\\`]"; "") | gsub("\\s+"; " ") | ltrimstr(" ") | rtrimstr(" ");
   def norm: plain | ascii_downcase;
-  def human: (.__typename // "") != "Bot";
+  def human: . != null and .__typename == "User";
+  def heading: (.body // "") | split("\n") | map(select(test("^[0-9]+\\\\?\\. ")))
+             | (first // "") | sub("^[0-9]+\\\\?\\. "; "") | sub(" *<code>.*$"; "") | norm;
   def answered_thread: .isResolved or ([.comments.nodes[1:][] | select(.author | human)] | length > 0);
   ($comments[0]) as $cs
   | ($threads[0]) as $ts
   | [ split("\n")[] | select(length > 0) | split("\t")
       | { name: .[0], num: .[1], sev: .[2], title: (.[3] | plain), resolved: (.[4] == "yes"),
           fid: .[5], tid: .[6], key: (.[3] | norm) } ]
+  | . as $all
   | map(
       . as $f
+      | [ $all[].key | select(. != $f.key and $f.key != "" and contains($f.key)) ] as $longer
       | ( if $f.resolved then "fixed"
           elif ([ $ts[]
                   | select(
                       if $f.tid != "" then (.comments.nodes[0].databaseId | tostring) == $f.tid
                       else ($f.name == "Qodo" and $f.key != ""
                             and (.comments.nodes[0].author.login // "" | sub("\\[bot\\]$"; "")) == ($qodo | sub("\\[bot\\]$"; ""))
-                            and ((.comments.nodes[0].body // "") | norm | contains($f.key)))
+                            and (.comments.nodes[0] | heading) == $f.key)
                       end)
                   | select(answered_thread) ] | length > 0) then "thread"
           elif ([ $cs[]
-                  | select((.user.type // "") != "Bot")
+                  | select(.user != null and .user.type == "User")
                   | (.body // "") as $b
-                  | select(($f.key != "" and ($b | norm | contains($f.key)))
+                  | (reduce $longer[] as $l ($b | norm; split($l) | join(" | "))) as $text
+                  | select(($f.key != "" and ($text | contains($f.key)))
                            or ($f.fid != "" and ($b | contains($f.fid)))) ] | length > 0) then "comment"
           else "" end ) as $how
       | . + { how: $how } )
