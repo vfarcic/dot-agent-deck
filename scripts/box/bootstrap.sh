@@ -651,13 +651,22 @@ if [ "$RELAY_INSTALL" = 1 ]; then
     } | sha256sum | cut -c1-16
   )"
   # A replacement interrupted after it set the previous relay aside (below)
-  # left it as $RELAY_CONTAINER.prev with no $RELAY_CONTAINER: put it back
-  # first, so the backup is never thrown away.
-  if ! sudo docker container inspect "$RELAY_CONTAINER" >/dev/null 2>&1 \
-     && sudo docker container inspect "$RELAY_CONTAINER.prev" >/dev/null 2>&1; then
-    if [ -f "$RELAY_CONFIG.prev" ]; then mv "$RELAY_CONFIG.prev" "$RELAY_CONFIG"; fi
-    sudo docker rename "$RELAY_CONTAINER.prev" "$RELAY_CONTAINER"
-    echo "  recovered the relay an interrupted run had set aside"
+  # left $RELAY_CONTAINER.prev, and maybe a $RELAY_CONTAINER it had not yet
+  # seen stay up. Settle that first, so the backup is never thrown away: a
+  # running $RELAY_CONTAINER is the replacement that made it, and the backup
+  # is superseded; otherwise the replacement (if any) is dropped and the
+  # backup and its config are put back.
+  if sudo docker container inspect "$RELAY_CONTAINER.prev" >/dev/null 2>&1; then
+    relay_main="$(sudo docker container inspect -f '{{.State.Running}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
+    if [ "$relay_main" = true ]; then
+      sudo docker rm -f "$RELAY_CONTAINER.prev" >/dev/null
+      rm -f "$RELAY_CONFIG.prev"
+    else
+      if [ -n "$relay_main" ]; then sudo docker rm -f "$RELAY_CONTAINER" >/dev/null; fi
+      if [ -f "$RELAY_CONFIG.prev" ]; then mv "$RELAY_CONFIG.prev" "$RELAY_CONFIG"; fi
+      sudo docker rename "$RELAY_CONTAINER.prev" "$RELAY_CONTAINER"
+      echo "  recovered the relay an interrupted run had set aside"
+    fi
   fi
   relay_now="$(sudo docker container inspect -f '{{index .Config.Labels "dad-box.relay"}} {{.State.Running}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
   if [ "$relay_now" = "$relay_fp true" ] || [ "$relay_now" = "$relay_fp false" ]; then
@@ -682,9 +691,6 @@ if [ "$RELAY_INSTALL" = 1 ]; then
     # The config is backed up before the container is touched, so a failed
     # copy stops the run with the old relay still running. Once the old
     # container is set aside, every step goes through the restore below.
-    # (A $RELAY_CONTAINER.prev left beside a $RELAY_CONTAINER is a run's
-    # leftover backup whose replacement got created; it is superseded.)
-    sudo docker rm -f "$RELAY_CONTAINER.prev" >/dev/null 2>&1 || true
     rm -f "$RELAY_CONFIG.prev"
     if [ -f "$RELAY_CONFIG" ]; then cp -p "$RELAY_CONFIG" "$RELAY_CONFIG.prev"; fi
     if [ -n "$relay_now" ]; then
