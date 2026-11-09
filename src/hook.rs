@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use chrono::Utc;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
@@ -180,19 +180,115 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
     }
 }
 
-/// Question payloads do not carry the agent's version. Probe its canonical
-/// command in the hook's environment, bounded so a launcher cannot stall the
-/// permission prompt indefinitely. This measures PATH, not a running process.
+/// Question payloads do not carry the agent's version. Cache the version of
+/// their PATH-resolved command across hook processes, invalidating it when the
+/// executable changes. This measures PATH, not a running process.
 fn question_agent_version(agent: &AgentType) -> Option<(u64, u64, u64)> {
     let program = crate::agent_registry::spec(agent).default_command?;
-    let line = crate::hooks_manage::probe_version_line(
-        std::ffi::OsStr::new(program),
-        std::time::Duration::from_secs(2),
-    )?;
+    let line = question_version_line(program)?;
     line.split_whitespace().find_map(|word| {
         let version = semver::Version::parse(word.strip_prefix('v').unwrap_or(word)).ok()?;
         Some((version.major, version.minor, version.patch))
     })
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct QuestionVersionKey {
+    executable: std::path::PathBuf,
+    modified: std::time::SystemTime,
+    size: u64,
+    path_env: Option<std::ffi::OsString>,
+    #[cfg(unix)]
+    device_inode: (u64, u64),
+}
+
+impl QuestionVersionKey {
+    fn of(executable: &std::path::Path) -> Option<Self> {
+        let metadata = std::fs::metadata(executable).ok()?;
+        Some(Self {
+            executable: executable.to_path_buf(),
+            modified: metadata.modified().ok()?,
+            size: metadata.len(),
+            path_env: std::env::var_os("PATH"),
+            #[cfg(unix)]
+            device_inode: {
+                use std::os::unix::fs::MetadataExt as _;
+                (metadata.dev(), metadata.ino())
+            },
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuestionVersionEntry {
+    key: QuestionVersionKey,
+    line: Option<String>,
+    checked_at: std::time::SystemTime,
+}
+
+/// Keep completed outputs until the executable's identity changes. A failed
+/// or timed-out probe is reused for one minute, so a slow launcher does not
+/// delay each prompt and a transient failure can recover.
+fn question_version_line(program: &str) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let timeout = std::time::Duration::from_secs(2);
+    let probe = |path: &std::ffi::OsStr| crate::hooks_manage::probe_version_line(path, timeout);
+    let executable = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| {
+                #[cfg(windows)]
+                let program = format!("{program}.exe");
+                dir.join(program)
+            })
+            .find(|path| {
+                std::fs::metadata(path).is_ok_and(|metadata| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    }
+                    #[cfg(not(unix))]
+                    metadata.is_file()
+                })
+            })
+            .and_then(|path| std::path::absolute(path).ok())
+    });
+    let Some(key) = executable.as_deref().and_then(QuestionVersionKey::of) else {
+        return probe(std::ffi::OsStr::new(program));
+    };
+    let dir = crate::platform::paths::state_dir().join("question-versions");
+    let digest = Sha256::digest(key.executable.as_os_str().as_encoded_bytes());
+    let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let cache = dir.join(format!("{name}.json"));
+    if let Some(entry) = std::fs::File::open(&cache).ok().and_then(|file| {
+        serde_json::from_reader::<_, QuestionVersionEntry>(file.take(32 * 1024)).ok()
+    }) && entry.key == key
+        && (entry.line.is_some()
+            || entry
+                .checked_at
+                .elapsed()
+                .is_ok_and(|age| age < std::time::Duration::from_secs(60)))
+    {
+        return entry.line;
+    }
+    let line = probe(key.executable.as_os_str());
+    // Do not persist a result if the executable was replaced during the probe.
+    // A cache write failure affects this optimization, not the question.
+    if QuestionVersionKey::of(&key.executable).as_ref() == Some(&key) {
+        let entry = QuestionVersionEntry {
+            key,
+            line: line.clone(),
+            checked_at: std::time::SystemTime::now(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&entry)
+            && crate::config_write_guard::ensure_config_write_allowed(&cache).is_ok()
+            && crate::platform::fsperm::ensure_owner_only_dir(&dir).is_ok()
+        {
+            let _ = crate::agent_hook_config::write_atomic(&dir, &cache, &bytes);
+        }
+    }
+    line
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
@@ -1802,7 +1898,11 @@ fn hook_question(
                 permission_suggestions,
                 permission_mode,
                 now,
-                version_probe(),
+                // Held decisions use the hook's allow/deny channel, not the
+                // versioned key table. Only plan approval needs that table.
+                (tool_name == Some("ExitPlanMode"))
+                    .then(version_probe)
+                    .flatten(),
             )
             .question,
         ),
@@ -6039,6 +6139,19 @@ mod question_tests {
             )
             .unwrap();
         }
+        for name in [
+            "claude-permission-bash.json",
+            "claude-permission-write.json",
+            "claude-ask-user-question-form.json",
+        ] {
+            let event = build_event_typed_with_version(
+                serde_json::from_value(fixture(name)).unwrap(),
+                AgentType::ClaudeCode,
+                &|| panic!("{name}: held answers must not probe the agent version"),
+            )
+            .unwrap();
+            assert_eq!(event.question().unwrap().channel, AnswerChannel::Held);
+        }
     }
 
     fn labels(question: &PendingQuestion, index: usize) -> Vec<&str> {
@@ -6050,7 +6163,7 @@ mod question_tests {
     }
 
     /// Scenario: Claude Code's captured Bash permission prompt becomes a held question with its suggested always grant and keyboard-only auto-mode option.
-    /// Yes, always and No remain hook-answerable on newer minors and majors, while a version below the supported hook minimum stays keyboard-only.
+    /// The permission builder keeps Yes, always and No hook-answerable on newer minors and majors, while an explicitly supplied version below the supported hook minimum stays keyboard-only.
     #[spec("question/detect/001")]
     #[test]
     fn question_detect_001_claude_bash_permission_request() {
@@ -6097,9 +6210,24 @@ mod question_tests {
                 .is_none(),
             "no pane id in a unit test, so nothing to hold for"
         );
+        let payload = fixture("claude-permission-bash.json");
+        // Held hooks no longer discover a version. Exercise the producer's
+        // explicit-version contract directly rather than a probe it skips.
+        let with_version = |version| {
+            crate::question::claude_permission_request(
+                crate::question::mint_question_id(),
+                "Bash",
+                payload.get("tool_input"),
+                None,
+                payload.get("permission_suggestions"),
+                Some("default"),
+                0,
+                version,
+            )
+            .question
+        };
         for version in [Some((2, 1, 136)), Some((2, 2, 0)), Some((3, 0, 0)), None] {
-            let payload = fixture("claude-permission-bash.json");
-            let q = question_for_version(AgentType::ClaudeCode, &payload, version);
+            let q = with_version(version);
             assert_eq!(q.channel, AnswerChannel::Held);
             for (index, behavior) in [(1, "allow"), (2, "allow"), (4, "deny")] {
                 let answers = q
@@ -6130,11 +6258,7 @@ mod question_tests {
                 "auto mode stays keyboard-only"
             );
         }
-        let old = question_for_version(
-            AgentType::ClaudeCode,
-            &fixture("claude-permission-bash.json"),
-            Some((2, 1, 135)),
-        );
+        let old = with_version(Some((2, 1, 135)));
         assert!(
             !old.has_answerable_option(),
             "the pre-existing lower bound still applies"

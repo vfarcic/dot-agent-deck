@@ -9,14 +9,15 @@ use std::os::unix::{fs::PermissionsExt as _, net::UnixListener};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-use dot_agent_deck::question::{AnswerChannel, PendingQuestion, QuestionReply, ReleaseReason};
+use dot_agent_deck::question::{
+    AnswerChannel, PendingQuestion, QuestionKind, QuestionReply, ReleaseReason,
+};
 use serde_json::Value;
 use spec::spec;
 
-fn hook_question(agent: &str, program: &str, output: &str, fixture: &str) -> PendingQuestion {
-    let root = common::harness_tempdir().unwrap();
-    let executable = root.path().join(program);
-    let probe_log = root.path().join("probe.log");
+fn install_version(root: &std::path::Path, program: &str, output: &str) {
+    let executable = root.join(program);
+    let probe_log = root.join("probe.log");
     std::fs::write(
         &executable,
         format!(
@@ -26,7 +27,11 @@ fn hook_question(agent: &str, program: &str, output: &str, fixture: &str) -> Pen
     )
     .unwrap();
     std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let socket = root.path().join("hook.sock");
+}
+
+fn hook_question(root: &std::path::Path, agent: &str, fixture: &str) -> PendingQuestion {
+    let socket = root.join("hook.sock");
+    let _ = std::fs::remove_file(&socket);
     let listener = UnixListener::bind(&socket).unwrap();
     listener.set_nonblocking(true).unwrap();
     let server = std::thread::spawn(move || {
@@ -83,14 +88,12 @@ fn hook_question(agent: &str, program: &str, output: &str, fixture: &str) -> Pen
     let mut child = Command::new(common::contained_deck_binary())
         .args(["hook", "--agent", agent])
         .env_clear()
-        .env("PATH", root.path())
-        .env("HOME", root.path())
+        .env("PATH", root)
+        .env("HOME", root)
+        .env("DOT_AGENT_DECK_STATE_DIR", root.join("state"))
         .env("DOT_AGENT_DECK_SOCKET", socket)
-        .env(
-            "DOT_AGENT_DECK_ATTACH_SOCKET",
-            root.path().join("attach.sock"),
-        )
-        .env("DOT_AGENT_DECK_LOG", root.path().join("deck.log"))
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", root.join("attach.sock"))
+        .env("DOT_AGENT_DECK_LOG", root.join("deck.log"))
         .env("DOT_AGENT_DECK_PANE_ID", "pane-versions")
         .env("DOT_AGENT_DECK_AGENT_ID", "agent-versions")
         .stdin(Stdio::piped())
@@ -118,13 +121,11 @@ fn hook_question(agent: &str, program: &str, output: &str, fixture: &str) -> Pen
         "{}",
         String::from_utf8_lossy(&result.stderr)
     );
-    let question = server.join().unwrap();
-    assert_eq!(std::fs::read_to_string(probe_log).unwrap(), "probe\n");
-    question
+    server.join().unwrap()
 }
 
 /// Scenario: Run the real hook CLI with Codex and Claude version-only stand-ins and captured question payloads.
-/// Newer minors make typed answers keyboard-only, while a verified patch and an unknown version remain answerable; Claude's hook permission answers stay answerable on 2.2.
+/// Newer minors make typed answers keyboard-only, while a verified patch and an unknown version remain answerable; repeated hook processes reuse the version until the executable changes, and held Claude answers do not probe.
 #[spec("question/detect/021")]
 #[test]
 fn question_detect_021_hook_probes_versions_before_offering_typed_answers() {
@@ -133,40 +134,107 @@ fn question_detect_021_hook_probes_versions_before_offering_typed_answers() {
         ("codex-cli 0.161.0", false),
         ("unknown", true),
     ] {
-        let q = hook_question("codex", "codex", version, "codex-permission-request.json");
+        let root = common::harness_tempdir().unwrap();
+        install_version(root.path(), "codex", version);
+        for _ in 0..2 {
+            let q = hook_question(root.path(), "codex", "codex-permission-request.json");
+            assert_eq!(
+                q.channel,
+                if covered {
+                    AnswerChannel::Keys
+                } else {
+                    AnswerChannel::Unsupported
+                },
+                "{version}"
+            );
+            assert_eq!(q.has_answerable_option(), covered, "{version}");
+            assert!(
+                q.questions[0]
+                    .options
+                    .iter()
+                    .all(|o| o.keyboard_only != covered)
+            );
+        }
         assert_eq!(
-            q.channel,
-            if covered {
-                AnswerChannel::Keys
-            } else {
-                AnswerChannel::Unsupported
-            },
-            "{version}"
+            std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
+            "probe\n",
+            "unchanged {version} was probed again"
         );
-        assert_eq!(q.has_answerable_option(), covered, "{version}");
-        assert!(
-            q.questions[0]
-                .options
-                .iter()
-                .all(|o| o.keyboard_only != covered)
+        let (replacement, replacement_channel) = if covered {
+            ("codex-cli 0.161.99", AnswerChannel::Unsupported)
+        } else {
+            ("codex-cli 0.160.0", AnswerChannel::Keys)
+        };
+        install_version(root.path(), "codex", replacement);
+        let q = hook_question(root.path(), "codex", "codex-permission-request.json");
+        assert_eq!(q.channel, replacement_channel);
+        assert_eq!(
+            std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
+            "probe\nprobe\n",
+            "a changed executable was not probed again"
         );
     }
-    let q = hook_question(
-        "claude-code",
-        "claude",
-        "2.2.0 (Claude Code)",
-        "claude-permission-plan.json",
+    let root = common::harness_tempdir().unwrap();
+    install_version(root.path(), "codex", "codex-cli 0.161.0");
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(root.path().join("codex"))
+        .unwrap()
+        .write_all(b"exit 1\n")
+        .unwrap();
+    for _ in 0..2 {
+        let q = hook_question(root.path(), "codex", "codex-permission-request.json");
+        assert_eq!(q.channel, AnswerChannel::Keys, "a failed probe is unknown");
+    }
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
+        "probe\n",
+        "a failed probe must not delay each prompt"
     );
+    let cache = std::fs::read_dir(root.path().join("state/question-versions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut entry: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    entry["checked_at"] = serde_json::to_value(std::time::SystemTime::UNIX_EPOCH).unwrap();
+    std::fs::write(cache, serde_json::to_vec(&entry).unwrap()).unwrap();
+    let q = hook_question(root.path(), "codex", "codex-permission-request.json");
+    assert_eq!(q.channel, AnswerChannel::Keys);
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
+        "probe\nprobe\n",
+        "a transient failure must be retried after expiry"
+    );
+    let root = common::harness_tempdir().unwrap();
+    install_version(root.path(), "claude", "2.2.0 (Claude Code)");
+    let q = hook_question(root.path(), "claude-code", "claude-permission-plan.json");
     assert_eq!(q.channel, AnswerChannel::Unsupported);
     assert!(q.questions[0].options.iter().all(|o| o.keyboard_only));
-    let q = hook_question(
-        "claude-code",
-        "claude",
-        "2.2.0 (Claude Code)",
-        "claude-permission-bash.json",
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
+        "probe\n"
     );
-    assert_eq!(q.channel, AnswerChannel::Held);
-    assert!(!q.questions[0].options[0].keyboard_only);
-    assert!(!q.questions[0].options.last().unwrap().keyboard_only);
-    assert!(q.has_answerable_option());
+    let root = common::harness_tempdir().unwrap();
+    install_version(root.path(), "claude", "2.2.0 (Claude Code)");
+    for fixture in [
+        "claude-permission-bash.json",
+        "claude-permission-write.json",
+        "claude-ask-user-question-form.json",
+    ] {
+        let q = hook_question(root.path(), "claude-code", fixture);
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert!(!q.questions[0].options[0].keyboard_only);
+        assert_eq!(
+            q.questions[0].options.last().unwrap().keyboard_only,
+            q.kind == QuestionKind::Choice,
+            "the form's Chat about this option stays keyboard-only"
+        );
+        assert!(q.has_answerable_option());
+        assert!(
+            !root.path().join("probe.log").exists(),
+            "{fixture}: held answers must not run --version"
+        );
+    }
 }
