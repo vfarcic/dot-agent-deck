@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
 import type { UpgradeOutcome } from "../lib/upgrade";
 import { DISPLAY_LIMITS } from "../lib/displayText";
-import { APP_BEFORE_CLI, CLI_AFTER_APP, LocalUpgradeFlow, upgradeCopies } from "./LocalUpgradeFlow";
+import { APP_BEFORE_CLI, APP_BEFORE_DAEMON, CLI_AFTER_APP, LocalUpgradeFlow, localUpgradeLabel, upgradeCopies } from "./LocalUpgradeFlow";
 import type { UpgradeTarget } from "./UpgradeDialog";
 
 /**
@@ -135,6 +135,34 @@ describe("Upgrade on the Local daemon section while the app is behind (issue #19
     fireEvent.click(screen.getByTestId("self-upgrade-close"));
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: The app is behind, the CLI is current, and the local daemon is older than the app (issue #1962): the dialog covers the app alone, says the relaunched app restarts the daemon, and ends at Relaunch without restarting the daemon here onto the build the old app still runs. */
+  it("local_upgrade_020 offers the app alone when the CLI is current", async () => {
+    const api = { check: vi.fn(), run: vi.fn(async () => swapped), relaunch: vi.fn(async () => undefined) };
+    const deck = runtime();
+    const onClose = vi.fn();
+    render(<LocalUpgradeFlow daemon={daemon} copies={{ check: { ...check, cli: null }, api }} runtime={deck} onClose={onClose} />);
+    expect(screen.getAllByTestId(/^self-upgrade-plan-/).map((section) => section.dataset.testid)).toEqual(["self-upgrade-plan-app"]);
+    expect(screen.getByTestId("self-upgrade-then")).toHaveTextContent(APP_BEFORE_DAEMON);
+    fireEvent.click(screen.getByTestId("self-upgrade-start"));
+    await screen.findByTestId("self-upgrade-result-app");
+    expect(screen.getByTestId("self-upgrade-relaunch")).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("self-upgrade-close"));
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: The Local daemon section's Upgrade names everything it covers, in the order the flow runs it — the app leading, the CLI, the daemon — and the sentence under the app-alone plan fits the dialog whole. */
+  it("local_upgrade_021 names everything the section's Upgrade covers", () => {
+    expect(localUpgradeLabel({ app: true, cli: false, daemon: false })).toBe("Upgrade Agent Deck on this machine");
+    expect(localUpgradeLabel({ app: false, cli: true, daemon: false })).toBe("Upgrade the CLI on this machine");
+    expect(localUpgradeLabel({ app: false, cli: true, daemon: true })).toBe("Upgrade the CLI and the daemon on this machine");
+    expect(localUpgradeLabel({ app: true, cli: false, daemon: true })).toBe("Upgrade Agent Deck and the daemon on this machine");
+    expect(localUpgradeLabel({ app: true, cli: true, daemon: false })).toBe("Upgrade Agent Deck and the CLI on this machine");
+    expect(localUpgradeLabel({ app: true, cli: true, daemon: true })).toBe("Upgrade Agent Deck, the CLI and the daemon on this machine");
+    /* Shown whole: the dialog shortens a longer one. */
+    expect(APP_BEFORE_DAEMON.length).toBeLessThanOrEqual(DISPLAY_LIMITS.message);
   });
 });
 

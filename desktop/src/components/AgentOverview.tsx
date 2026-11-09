@@ -8,7 +8,7 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
+import { appFirst, localUpgradeLabel, LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
@@ -875,8 +875,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   notice?: ReactNode;
   /**
    * Issue #1753 — the app's newer-release check and the calls that upgrade
-   * this machine's CLI, for the Local daemon section's Upgrade. `onClosed`
-   * runs when that flow ends, so the app checks again.
+   * this machine's copies (the app itself when it leads, issue #1962, and the
+   * CLI), for the Local daemon section's Upgrade. `onClosed` runs when that
+   * flow ends, so the app checks again.
    */
   selfUpgrade?: { check?: SelfUpgradeCheck; api?: SelfUpgradeApi; onClosed?: () => void };
 }) {
@@ -1306,8 +1307,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   /**
    * What a deck's Upgrade does, and what its button says. A remote deck's
    * covers its daemon, which runs that host's CLI. The local deck's covers the
-   * CLI on this machine and the local daemon, either of which can be behind
-   * (issue #1753), so its label and tooltip name what is.
+   * copies on this machine — the app when it can upgrade itself or waits for a
+   * relaunch (issue #1962), the CLI, the daemon, any of which can be behind
+   * (issue #1753) — so its label and tooltip name what is.
    */
   const deckUpgrade = (connection: ConnectionView): { onUpgrade?: () => void; upgradeLabel?: string; upgradeTitle?: string } => {
     const daemon: UpgradeTarget | undefined = runtime.upgradeDaemon && upgradeOffered(connection) && connection.deckId !== undefined
@@ -1315,12 +1317,27 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       : undefined;
     const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
     if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
-    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
-    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const self = selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
+    /*
+     * Issue #1962 — the check rides along whenever the app leads it
+     * (`appFirst`: behind and this app can upgrade it, or installed and
+     * waiting for a relaunch), not only when the CLI is behind (issue
+     * #1753), so the app is offered first even when the CLI is current or
+     * none is installed. An app that cannot be upgraded from here stays
+     * with the banner's dialog, which says what to do instead.
+     */
+    const copies = self && (appFirst(self.check) || cliPlan) ? self : undefined;
+    if (!copies) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    /* The button names everything this one upgrade covers, app first (issue #1962). */
+    const app = appFirst(copies.check);
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
-      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
-      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies }),
+      upgradeLabel: localUpgradeLabel({ app, cli: cliPlan !== undefined, daemon: daemon !== undefined }),
+      upgradeTitle: [
+        app ? displayText(copies.check.notice ?? copies.check.app.headline, DISPLAY_LIMITS.message) : undefined,
+        cliPlan ? displayText(cliPlan.headline, DISPLAY_LIMITS.message) : undefined,
+        daemon ? daemonTitle : undefined,
+      ].filter(Boolean).join(" "),
     };
   };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is

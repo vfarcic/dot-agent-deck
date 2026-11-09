@@ -41,6 +41,15 @@ export const APP_BEFORE_CLI = "Agent Deck itself is behind too, so it comes firs
 export const CLI_AFTER_APP = "The dot-agent-deck CLI here is behind too, so it follows Agent Deck, to keep the app, the CLI and the daemon on one release. Once Agent Deck is upgraded, relaunch it: it then restarts an older daemon here, asking first if agents run.";
 
 /**
+ * What the dialog says when the app alone is covered and the local daemon runs
+ * an older release than the app (issue #1962): the Local daemon section's
+ * Upgrade names the daemon too, so its dialog says what becomes of it — the
+ * relaunched app restarts it, never this flow onto the old build the app still
+ * runs.
+ */
+export const APP_BEFORE_DAEMON = "Agent Deck itself is behind, so it comes first, to keep the app, the CLI and the daemon on one release. Once Agent Deck is upgraded, relaunch it: it then restarts an older daemon here, asking first if agents run.";
+
+/**
  * Whether the Local daemon section's Upgrade leads with the app: it is behind
  * and this app can upgrade it, or it is installed and waiting for a relaunch.
  * An app it cannot upgrade (a folder you cannot write, an unsigned app) is
@@ -67,11 +76,31 @@ export function upgradeCopies(check: SelfUpgradeCheck, entry: UpgradeEntry): Sel
   return [...(app ? ["app" as const] : []), ...(cliBehind(check) ? ["cli" as const] : [])];
 }
 
-/** What the dialog says after the plans, about what follows them: nothing to say unless the CLI is covered. */
+/** What the dialog says after the plans, about what follows them: nothing to say unless the CLI is covered, or the app alone covers an older daemon (issue #1962). */
 export function afterCopies(check: SelfUpgradeCheck, copies: readonly SelfCopy[], daemon: UpgradeTarget | undefined, entry: UpgradeEntry): string | undefined {
-  if (!copies.includes("cli")) return undefined;
+  if (!copies.includes("cli")) {
+    /*
+     * Issue #1962 — the app alone, from the Local daemon section whose button
+     * names the daemon too: the dialog says the relaunched app restarts it.
+     * The app's notice (issue #2062) is about the app the user asked about,
+     * so its dialog says nothing here.
+     */
+    return entry === "local" && copies.includes("app") && daemon ? APP_BEFORE_DAEMON : undefined;
+  }
   if (copies.includes("app") && appFirst(check)) return entry === "notice" ? CLI_AFTER_APP : APP_BEFORE_CLI;
   return daemon ? restartAfterCli(daemon) : CLI_LEAVES_DAEMON;
+}
+
+/**
+ * What the Local daemon section's Upgrade calls itself: everything this one
+ * upgrade covers, in the order it runs — Agent Deck when it leads, the CLI
+ * when it is behind, the daemon when it runs an older release than the app —
+ * all on this machine (issue #1962).
+ */
+export function localUpgradeLabel(covers: { app: boolean; cli: boolean; daemon: boolean }): string {
+  const named = [...(covers.app ? ["Agent Deck"] : []), ...(covers.cli ? ["the CLI"] : []), ...(covers.daemon ? ["the daemon"] : [])];
+  const list = named.length < 3 ? named.join(" and ") : `${named.slice(0, -1).join(", ")} and ${named[named.length - 1]}`;
+  return `Upgrade ${list} on this machine`;
 }
 
 /**
@@ -104,6 +133,13 @@ export function afterCopies(check: SelfUpgradeCheck, copies: readonly SelfCopy[]
  * ({@link APP_BEFORE_CLI}). An app that was replaced ends the flow at its
  * Relaunch: the daemon is restarted by the relaunched app, onto the new
  * release, not here onto the build this app still runs.
+ *
+ * Issue #1962 — the Local daemon section hands the check over whenever the
+ * app can upgrade itself or waits for a relaunch ({@link appFirst}), not only
+ * when the CLI is behind, so the app leads even when the CLI is current or
+ * none is installed beside the app; with only the daemon otherwise behind,
+ * its button names it and the dialog says the relaunched app restarts it
+ * ({@link APP_BEFORE_DAEMON}).
  */
 export function LocalUpgradeFlow({ daemon, copies, entry = "local", runtime, onClose }: LocalUpgradeRequest & {
   runtime: Pick<DeckRuntimeState, "upgradeDaemon" | "decideUpgrade">;
