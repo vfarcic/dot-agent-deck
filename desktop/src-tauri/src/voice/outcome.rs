@@ -1570,7 +1570,13 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
     // name a model supplies. Its whole-utterance phrases were handled locally;
     // a sentence merely containing "stop" must not become this command.
     if screen == Screen::Agent && row.id == "stop_agent" {
-        return VoiceOutcome::no_match(transcript);
+        let hint = "To close this agent, say 'close this agent' or press Close agent.";
+        return VoiceOutcome::Unavailable {
+            transcript,
+            action: row.id.clone(),
+            hint: hint.to_string(),
+            sentence: hint.to_string(),
+        };
     }
     if withheld && needs_labels(row) {
         return VoiceOutcome::labels_withheld(transcript, row);
@@ -11311,7 +11317,7 @@ mod tests {
         let deck = run_agents(&resolver, Screen::Deck, &fleet(), "stop the tester").await;
         assert_eq!(
             deck.sentence(),
-            "Not here — stopping an agent works from the agent dashboard or its pane, with the New agent dialog closed."
+            "Not here — named stops work from the agent dashboard with the New agent dialog closed; in a pane with typing off, say 'close this agent' to close the viewed agent."
         );
     }
 
@@ -11634,7 +11640,7 @@ mod tests {
             );
             assert_eq!(
                 stop.sentence(),
-                "Not here — stopping an agent works from the agent dashboard or its pane, with the New agent dialog closed."
+                "Not here — named stops work from the agent dashboard with the New agent dialog closed; in a pane with typing off, say 'close this agent' to close the viewed agent."
             );
             let close = handle_utterance(
                 &resolver,
@@ -13904,7 +13910,8 @@ mod tests {
 
     /// Scenario: with typing mode off, a whole stop or close-agent phrase opens
     /// the viewed agent's close confirmation without asking the model. Longer
-    /// sentences containing those words do not reach that command.
+    /// sentences containing those words do not reach that command; other stop
+    /// requests explain how to close the viewed agent without trusting a model's target.
     #[tokio::test]
     async fn voice_outcome_a_bare_stop_outside_typing_mode_confirms_closing_the_agent() {
         for said in [
@@ -13933,6 +13940,23 @@ mod tests {
                     if action == "stop_agent" && invoke == "confirmStopAgent" && params.is_empty()),
                 "{said}: {:?}",
                 answer.outcome
+            );
+        }
+        for said in [
+            "kill it",
+            "shut it down",
+            "end that agent",
+            "stop the tester",
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("stop_agent").with_param("agent", "tester"),
+            );
+            let outcome = run(&resolver, Screen::Agent, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Unavailable { action, sentence, .. }
+                    if action == "stop_agent" && sentence == "To close this agent, say 'close this agent' or press Close agent."),
+                "{said}: {outcome:?}"
             );
         }
         for said in [

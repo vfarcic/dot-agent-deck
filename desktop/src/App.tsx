@@ -367,10 +367,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const newAgentVoice = useRef<NewAgentVoice | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
-  const [agentStopConfirm, setAgentStopConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation confirmStopAgent opens, not an independently opened capability
+  const [agentStopConfirm, setAgentStopConfirm] = useState<ConfirmState & { ownerView: NonNullable<typeof agentView> }>(); // voice-registry-exempt: the confirmation confirmStopAgent opens, not an independently opened capability
+  useEffect(() => {
+    setAgentStopConfirm((current) => current?.ownerView === agentView ? current : undefined);
+  }, [agentView]);
   // A stopped agent can disappear from the listing before its action replies.
   // In either order, an agent close returns to the Dashboard, even from Daemons.
-  const stoppingView = useRef<typeof agentView>(undefined);
+  const stoppingAttempt = useRef<{ view: NonNullable<typeof agentView> } | undefined>(undefined);
   useEffect(() => {
     if (!agentStopConfirm) return;
     const onKeyDown = (event: KeyboardEvent) => {
@@ -712,7 +715,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   useEffect(() => {
     if (!paneAgentRetired) return;
     // voice-registry-exempt: the stopped subject disappeared; retiring its view is an invariant, not another control
-    if (stoppingView.current === agentView) setView({ kind: "overview" });
+    if (stoppingAttempt.current?.view === agentView) setView({ kind: "overview" });
     else closeAgent();
   }, [paneAgentRetired, agentView, closeAgent]);
   /**
@@ -923,9 +926,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
     const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped);
-    setAgentStopConfirm({ ...question, action: async () => {
-      stoppingView.current = agentView;
-      try { await question.action(); } finally { stoppingView.current = undefined; }
+    setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
+      const attempt = { view: agentView };
+      stoppingAttempt.current = attempt;
+      try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
     } });
     return undefined;
   }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);

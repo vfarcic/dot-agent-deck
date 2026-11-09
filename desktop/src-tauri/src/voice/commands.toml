@@ -2114,7 +2114,7 @@ means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"
 screens     = ["overview", "agent"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "stopping an agent works from the agent dashboard or its pane, with the New agent dialog closed"
+unavailable_hint = "named stops work from the agent dashboard with the New agent dialog closed; in a pane with typing off, say 'close this agent' to close the viewed agent"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
 asks_to     = "stop an agent"
 try_saying  = "stop the agent"
