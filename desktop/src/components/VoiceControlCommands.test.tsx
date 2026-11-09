@@ -4458,6 +4458,8 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(dialog).toHaveTextContent("Close lead?");
     expect(dialog).toHaveTextContent("This closes only lead; the other roles of its orchestration keep running without it.");
     expect(dialog!.closest("[inert]")).toBeNull();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Confirm stopping the open agent — nothing has been stopped yet.");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(STOP_TARGET_GONE);
     expect(runAction).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -4467,6 +4469,69 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(runAction).toHaveBeenCalledExactlyOnceWith({
       type: "stop_agent", deckId: target.daemonId, agentId: target.id, incarnation: target.incarnation,
     });
+  });
+
+  /**
+   * Scenario: from either origin's agent pane, name a different live agent in
+   * a spoken stop. The refusal says that only the open agent can be closed
+   * here and points back to the dashboard; it does not falsely say the named
+   * agent is gone, and neither a confirmation nor a stop action appears.
+   */
+  it.each(["overview", "deck"] as const)("refuses a named stop for another agent from the %s pane without saying it is gone", async (from) => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const open = snapshot.agents[0];
+    const other = snapshot.agents[2];
+    const utterance = `stop ${other.id}`;
+    const answer = dispatch("stop_agent", "confirmStopAgent", `Confirm stopping ${other.id} — nothing has been stopped yet.`, utterance,
+      [{ name: "agent", kind: "agent_ref", spoken: other.id, value: other.id, label: other.displayName }]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => answer);
+    render(<DeckShell runtime={{ ...deck, resolveVoice }} initialView={{ kind: "agent", deckId: open.daemonId, agentId: open.id, from }} />);
+    await turnVoiceOn();
+
+    voice.deliver(utterance);
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Only the agent on screen can be closed from here");
+    expect(screen.getByTestId("voice-report")).not.toHaveTextContent(STOP_TARGET_GONE);
+    expect(confirmation()).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+  });
+
+  /**
+   * Scenario: voice opens Planner while the New agent dialog is still mounted,
+   * then a paramless stop answer arrives. The live dialog check refuses it
+   * instead of opening an unreachable stop confirmation behind the modal.
+   */
+  it("refuses an open-pane stop while the New agent dialog remains mounted", async () => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const target = snapshot.agents[0];
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) => {
+      if (utterance === "stop") {
+        return dispatch("stop_agent", "confirmStopAgent", "Confirm stopping the open agent — nothing has been stopped yet.", utterance, []);
+      }
+      return dispatch("open_agent", "openAgent", `Opening ${target.id}.`, utterance,
+        [{ name: "agent", kind: "agent_ref", spoken: target.id, value: target.id, label: target.displayName }]);
+    });
+    render(<DeckShell runtime={{ ...deck, resolveVoice }} initialView={{ kind: "overview" }} />);
+    await turnVoiceOn();
+    await openDialog();
+
+    voice.deliver(`open ${target.id}`);
+    await completeUtterance();
+    await flush();
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+
+    voice.deliver("stop");
+    await completeUtterance();
+
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(STOP_BEHIND_NEW_AGENT);
+    expect(confirmation()).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-dialog")).toBeInTheDocument();
   });
 
   /** Scenario: a direct spoken stop is still resolving when its named agent is

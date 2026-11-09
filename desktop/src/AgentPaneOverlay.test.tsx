@@ -177,6 +177,25 @@ describe("agent pane overlay", () => {
   });
 
   /**
+   * Scenario: open Planner's close confirmation from either origin and press
+   * Escape. Only the confirmation is cancelled: the agent pane stays open, no
+   * stop action runs, and an overview-origin terminal is not unmounted.
+   */
+  it.each(["overview", "deck"] as const)("cancels only the close confirmation on Escape from the %s pane", (from) => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const deck = runtime({ runAction });
+    render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from }} />);
+
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close Plan / architecture agent" }));
+    fireEvent.keyDown(screen.getByRole("alertdialog"), { key: "Escape" });
+
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(disposesFor("planner")).toBe(0);
+  });
+
+  /**
    * Scenario: open Planner's pane from the deck and close it again. Planner's
    * terminal is built once for the whole round trip and is never disposed, and
    * the element on screen is the same DOM node throughout.

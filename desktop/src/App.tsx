@@ -32,7 +32,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED } from "./components/AgentOverview";
+import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_BEHIND_NEW_AGENT, STOP_TARGET_GONE, STOP_TARGET_NOT_OPEN, STOP_TARGET_RESTARTED } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -1141,8 +1141,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          cannot both publish (PRD #1223 U5). */
       ...overviewVoiceContext.current,
       /* Issue #1402 — while an agent screen is open, its own confirmation is
-         the reachable one; the dashboard behind it is inert. */
-      ...(agentView ? { confirmStopAgent: (target: VoiceDispatchTarget) => agentPaneVoiceContext.current?.confirmStopAgent?.(target) ?? STOP_TARGET_GONE } : {}),
+         the reachable one; the dashboard behind it is inert. A New agent
+         dialog can remain mounted when voice opens the pane, and can appear
+         while an answer is resolving, so re-check its live slot before asking. */
+      ...(agentView ? { confirmStopAgent: (target: VoiceDispatchTarget) => {
+        if (newAgentVoice.current) return STOP_BEHIND_NEW_AGENT;
+        const confirm = agentPaneVoiceContext.current?.confirmStopAgent;
+        return confirm ? confirm(target) : STOP_TARGET_GONE;
+      } } : {}),
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
@@ -1480,7 +1486,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
     stopVoiceChannel.current = {
       confirmStopAgent: (target) => {
         if (confirm) return CONFIRMATION_ALREADY_OPEN;
-        if (target.deckId !== agent.daemonId || target.agentId !== agent.id) return STOP_TARGET_GONE;
+        if (target.deckId !== agent.daemonId || target.agentId !== agent.id) return STOP_TARGET_NOT_OPEN;
         if ("incarnation" in target && !sameIncarnation(target.incarnation, agent.incarnation)) return STOP_TARGET_RESTARTED;
         requestStop();
         return undefined;
@@ -2253,7 +2259,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     stopVoiceChannel.current = agent ? {
       confirmStopAgent: (target) => {
         if (confirmationOpen) return CONFIRMATION_ALREADY_OPEN;
-        if (target.deckId !== agent.daemonId || target.agentId !== agent.id) return STOP_TARGET_GONE;
+        if (target.deckId !== agent.daemonId || target.agentId !== agent.id) return STOP_TARGET_NOT_OPEN;
         if ("incarnation" in target && !sameIncarnation(target.incarnation, agent.incarnation)) return STOP_TARGET_RESTARTED;
         requestAgentStop(agent);
         return undefined;

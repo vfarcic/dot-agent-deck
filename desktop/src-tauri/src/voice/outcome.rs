@@ -3002,7 +3002,11 @@ fn local_intercept(
             || said_whole(transcript.text(), AGENT_CLOSE_PHRASES))
         && let Some(row) = table.row(STOP_AGENT_ROW)
     {
-        let mut outcome = dispatch(row, Vec::new());
+        let mut outcome = if row.callable(screen, directories, new_agent) {
+            dispatch(row, Vec::new())
+        } else {
+            VoiceOutcome::unavailable(transcript.clone(), row)
+        };
         if let VoiceOutcome::Dispatch { sentence, .. } = &mut outcome {
             *sentence =
                 "Confirm stopping the open agent — nothing has been stopped yet.".to_string();
@@ -13948,6 +13952,35 @@ mod tests {
         }
     }
 
+    /// Scenario: the New agent dialog is still declared while an agent pane is
+    /// open and typing mode is off. A bare stop is refused locally with the
+    /// stop row's dialog-closed requirement, without a model call or a stop
+    /// confirmation dispatched behind the modal.
+    #[tokio::test]
+    async fn voice_outcome_an_open_pane_stop_respects_the_new_agent_dialog_requirement() {
+        let resolver = CountingResolver::answering(IntentAnswer::new(STOP_AGENT_ROW));
+        let declared = VoiceNewAgent { form: None };
+        let answer = handle_utterance(
+            &resolver,
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            Some(&declared),
+            Transcript::new("stop"),
+        )
+        .await;
+        let table = table();
+        let row = table.row(STOP_AGENT_ROW).expect("a shipped stop row");
+        assert_eq!(
+            answer.outcome,
+            VoiceOutcome::unavailable(Transcript::new("stop"), row)
+        );
+        assert_eq!(resolver.calls(), 0, "the local stop reached the model");
+        assert_eq!(answer.resolve_ms, None);
+    }
+
     /// Scenario: on the Daemons screen and the dashboard, an interrupt, clear
     /// or scratch phrase is not intercepted locally; it goes to the model,
     /// and a pick of the row is refused with the row's own hint.
@@ -14047,7 +14080,18 @@ mod tests {
         }
         for said in TYPING_STOP_PHRASES {
             let resolver = StubResolver::new().answering(said, IntentAnswer::new(INTERRUPT_ROW));
-            let outcome = run_everything(&resolver, Screen::Agent, said).await;
+            let outcome = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
             assert!(
                 matches!(&outcome, VoiceOutcome::Dispatch { action, .. } if action == STOP_AGENT_ROW),
                 "{said}: {outcome:?}"

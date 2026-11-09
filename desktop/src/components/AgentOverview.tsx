@@ -798,6 +798,8 @@ function rendersAgentRows(connection: ConnectionView): boolean {
 */
 /** The agent a spoken stop named is no longer on the overview. */
 export const STOP_TARGET_GONE = "That agent is not on the dashboard any more, so nothing was closed.";
+/** A spoken stop on an agent screen named an agent other than the one on screen. */
+export const STOP_TARGET_NOT_OPEN = "Only the agent on screen can be closed from here. Go back to the dashboard to close another agent. Nothing was closed.";
 /**
  * PRD #1666 part 2 (G-fix7) — the agent a spoken stop or close named is gone
  * with its deck's restart: the deck now lists an unrelated agent under its id,
