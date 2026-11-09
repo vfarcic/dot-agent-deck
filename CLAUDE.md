@@ -22,7 +22,7 @@
     | --- | --- | --- |
     | always | `cargo test-fast` (alias for `cargo nextest run --workspace`, with `OTEL_SDK_DISABLED=true` set for the tests) — protocol/state tests plus L1 widget/render tests | per task, unchanged |
     | **scoped to the change** | **the tests covering what you touched — any tier, credentialed included** | per task |
-    | CI | lane 1 in full — the `e2e-deterministic` check (or, when `.github/ci-backend` says `rwx`, the `e2e` tasks inside the `RWX: linux` status; docs/develop/rwx.md), which runs `cargo test-e2e`'s selection from one nextest archive in five shards | per PR; **monitor and analyse that run, do not reproduce it locally** |
+    | CI | lane 1 in full — the `e2e-deterministic` check (or, when `.github/ci-backend` says `rwx`, the `e2e` tasks inside the `RWX: linux` status; docs/develop/rwx.md), which builds `cargo test-e2e`'s selection into one nextest archive and runs its e2e part in five shards: the `tests/e2e_*.rs` binaries and the tests that exist only in the `e2e` build, not the fast tier again (`scripts/e2e-shard.sh`, [`docs/develop/e2e-lanes.md`](docs/develop/e2e-lanes.md#what-a-lane-1-shard-runs)) | per PR; **monitor and analyse that run, do not reproduce it locally** |
 
     **For a change that is only mapped text, the first row is what `cargo xtask affected-checks` prints, not `cargo test-fast`** (issue #1575; CLAUDE.md rule 2 has the mapping). Any Rust or build input in the change brings `cargo test-fast` back in full, and so does any path the mapping does not cover. The second row is unchanged either way: the tests covering what you touched are still yours to find and name.
 

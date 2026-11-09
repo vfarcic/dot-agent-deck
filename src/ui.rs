@@ -1944,6 +1944,9 @@ struct UiState {
     keybindings: KeybindingConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
+    /// Issue #2075: the questions this TUI has already sent a notification
+    /// for, as (session id, question id), so each notifies once.
+    question_notified: HashSet<(String, String)>,
     /// Issue #1635: the last release check's plans, mirrored from
     /// `AppState::upgrade_check` each frame. Drives the footer badge and seeds
     /// the upgrade dialog.
@@ -2485,6 +2488,7 @@ impl UiState {
             config,
             keybindings,
             last_bell_status: HashMap::new(),
+            question_notified: HashSet::new(),
             upgrade_check: None,
             upgrade_dialog: None,
             upgrade_installed: None,
@@ -5129,6 +5133,112 @@ fn compute_bell_needed(
     }
 
     (need_bell, new_status_map)
+}
+
+// ---------------------------------------------------------------------------
+// Question reminders (issue #2075)
+// ---------------------------------------------------------------------------
+
+/// The longest question prompt a notification carries, in characters.
+const QUESTION_REMINDER_PROMPT_CHARS: usize = 120;
+
+/// Issue #2075: the questions that have waited `after` or longer and that this
+/// TUI has not yet notified about, as the text of one notification each, in
+/// session order. Each is recorded in `notified`, so a question notifies once
+/// however long it goes on waiting, and one answered sooner never does.
+/// `after` of `None` (the setting at `0`) notifies nothing.
+fn question_reminders(
+    sessions: &HashMap<String, SessionState>,
+    display_names: &HashMap<String, String>,
+    notified: &mut HashSet<(String, String)>,
+    after: Option<chrono::Duration>,
+    now: DateTime<Utc>,
+) -> Vec<String> {
+    let Some(after) = after else {
+        return Vec::new();
+    };
+    let mut ids: Vec<&String> = sessions.keys().collect();
+    ids.sort();
+    let mut texts = Vec::new();
+    for id in ids {
+        let session = &sessions[id];
+        // A question whose answer the daemon accepted and is delivering is
+        // no longer waiting on the user (PR #2208 review).
+        let Some(question) = session
+            .pending_question
+            .as_ref()
+            .filter(|q| !q.answer_queued)
+        else {
+            continue;
+        };
+        let raised = question_raised_at(question, now);
+        if now.signed_duration_since(raised) < after
+            || !notified.insert((id.clone(), question.id.clone()))
+        {
+            continue;
+        }
+        let name = display_names
+            .get(id)
+            .or(session.display_name.as_ref())
+            .cloned()
+            .unwrap_or_else(|| session.agent_type.to_string());
+        let prompt = question
+            .questions
+            .first()
+            .map(|q| q.prompt.as_str())
+            .unwrap_or_default();
+        texts.push(question_reminder_text(
+            &name,
+            prompt,
+            &format_elapsed(raised, now),
+        ));
+    }
+    // Past the limit, keep only the records of questions still waiting: they
+    // are the ones that must not notify again, and the rest would otherwise
+    // pile up for as long as the TUI runs (PR #2208 review).
+    if notified.len() > QUESTION_REMINDER_LEDGER_LIMIT {
+        notified.retain(|(session, question)| {
+            sessions
+                .get(session)
+                .and_then(|s| s.pending_question.as_ref())
+                .is_some_and(|q| &q.id == question)
+        });
+    }
+    texts
+}
+
+/// How many notified questions [`question_reminders`] remembers before it
+/// forgets those no longer waiting.
+const QUESTION_REMINDER_LEDGER_LIMIT: usize = 1000;
+
+/// `Question waiting <age> — <name>: <prompt>`, the prompt cut at
+/// [`QUESTION_REMINDER_PROMPT_CHARS`] and every control character dropped, so
+/// nothing in an agent's text can end the escape sequence it travels in.
+fn question_reminder_text(name: &str, prompt: &str, age: &str) -> String {
+    let clean = |text: &str| -> String {
+        text.chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut prompt = clean(prompt);
+    if prompt.chars().count() > QUESTION_REMINDER_PROMPT_CHARS {
+        prompt = prompt
+            .chars()
+            .take(QUESTION_REMINDER_PROMPT_CHARS - 1)
+            .collect::<String>()
+            + "…";
+    }
+    format!("Question waiting {age} — {}: {prompt}", clean(name))
+}
+
+/// `text` as an OSC 9 desktop notification, which terminals such as iTerm2,
+/// WezTerm and Ghostty show as a system notification. A terminal without OSC 9
+/// support is expected to drop the sequence.
+fn osc9_notification(text: &str) -> String {
+    format!("\x1b]9;{text}\x07")
 }
 
 // ---------------------------------------------------------------------------
@@ -13941,6 +14051,24 @@ pub fn run_tui(
             let _ = std::io::stdout().flush();
         }
 
+        // Issue #2075: one terminal notification per question left unanswered
+        // for `notifications.question_after_minutes`.
+        let reminders = question_reminders(
+            &snapshot.sessions,
+            &ui.display_names,
+            &mut ui.question_notified,
+            ui.config.notifications.question_after(),
+            Utc::now(),
+        );
+        if !reminders.is_empty() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            for text in &reminders {
+                let _ = out.write_all(osc9_notification(text).as_bytes());
+            }
+            let _ = out.flush();
+        }
+
         // Post each orchestration tab's start-role prompt to that role's inbox
         // (`post_orchestrator_prompt`), first sent or re-armed below.
         let orch_now = std::time::Instant::now();
@@ -22631,6 +22759,32 @@ fn render_session_card(
     if seat_in_title {
         title_segments.push((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold));
     }
+    // Issue #2075: a question the agent is waiting on, and how long it has
+    // waited — the desktop tile's badge, in the same words. It ends the title
+    // where the whole title still fits beside it, as the ORCHESTRATOR badge
+    // does, and takes a row of its own below where it does not.
+    let question_badge = if is_placeholder {
+        None
+    } else {
+        session
+            .pending_question
+            .as_ref()
+            .map(|q| question_badge_text(q, now))
+    };
+    let question_style = Style::default()
+        .fg(palette::status_color(&SessionStatus::WaitingForInput))
+        .add_modifier(Modifier::BOLD);
+    let question_in_title = question_badge.as_ref().is_some_and(|badge| {
+        let used: usize = title_segments
+            .iter()
+            .map(|(text, _)| unicode_width::UnicodeWidthStr::width(text.as_str()))
+            .sum();
+        used + unicode_width::UnicodeWidthStr::width(badge.as_str()) < max_title
+    });
+    let question_row = question_badge.is_some() && !question_in_title;
+    if question_in_title && let Some(badge) = &question_badge {
+        title_segments.push((format!("{badge} "), question_style));
+    }
 
     // Issue #442. An UNSELECTED card's border colour is its STATUS, so an idle
     // agent recedes and a working one reads green. A SELECTED card's border
@@ -22842,7 +22996,8 @@ fn render_session_card(
     // [`CARD_AGENT_NOTICE_ROWS`].
     let other_rows = attention.len().saturating_sub(1)
         + usize::from(background.is_some() && !shares_row)
-        + usize::from(seat_row);
+        + usize::from(seat_row)
+        + usize::from(question_row);
     let notice_rows = (inner.height as usize)
         .saturating_sub(density.max_tools() + other_rows)
         .clamp(1, CARD_AGENT_NOTICE_ROWS);
@@ -22872,6 +23027,9 @@ fn render_session_card(
     // attention rows, so at Minimal density a reason keeps the one row.
     if seat_row {
         status_lines.push(plain((CARD_ORCHESTRATOR_BADGE.to_string(), title_bold)));
+    }
+    if question_row && let Some(badge) = question_badge {
+        status_lines.push(plain((badge, question_style)));
     }
 
     let prompts = if density.max_prompts() == 0 {
@@ -23337,6 +23495,25 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
 /// its caller all the way down — the main loop reads the clock once per frame
 /// and the L1 seams take it from the test — so a card snapshot built against a
 /// fixed instant renders the same `Last:` text however long the render takes.
+/// Issue #2075: the badge a card shows while its agent waits on a question:
+/// `QUESTION` and how long the question has waited, in [`format_elapsed`]'s
+/// form, counted from when the agent raised it. The desktop tile shows the
+/// same words.
+fn question_badge_text(question: &crate::question::PendingQuestion, now: DateTime<Utc>) -> String {
+    format!(
+        "QUESTION {}",
+        format_elapsed(question_raised_at(question, now), now)
+    )
+}
+
+/// When `question` was raised, or `now` for a time that cannot be read.
+fn question_raised_at(
+    question: &crate::question::PendingQuestion,
+    now: DateTime<Utc>,
+) -> DateTime<Utc> {
+    DateTime::from_timestamp_millis(question.raised_at_ms).unwrap_or(now)
+}
+
 fn format_elapsed(last_activity: DateTime<Utc>, now: DateTime<Utc>) -> String {
     let delta = now.signed_duration_since(last_activity);
     let total_secs = delta.num_seconds().max(0);
@@ -35771,6 +35948,164 @@ mod tests {
         assert!(title.contains(" · coordinator "), "{card}");
         assert!(!title.contains('…'), "{card}");
         assert!(card.contains("│ORCHESTRATOR "), "{card}");
+    }
+
+    /// A Needs Input session whose agent raised a Bash permission question
+    /// `waited` before `now`.
+    fn session_with_question(waited: chrono::Duration, now: DateTime<Utc>) -> SessionState {
+        let mut session = make_session(SessionStatus::WaitingForInput);
+        session.pending_question = Some(
+            crate::question::claude_permission_request(
+                "q-escalate".to_string(),
+                "Bash",
+                None,
+                Some("touch x".into()),
+                None,
+                None,
+                (now - waited).timestamp_millis(),
+                None,
+            )
+            .question,
+        );
+        session
+    }
+
+    /// Scenario: A card whose agent waits on a question it raised 12 minutes
+    /// ago shows `QUESTION 12m` at the end of its title, as the desktop tile
+    /// does; a card with no question shows no badge; and a card too narrow for
+    /// the badge beside its name shows it, whole, on a row of its own
+    /// (issue #2075).
+    #[spec("question/escalate/001")]
+    #[test]
+    fn question_escalate_001_a_waiting_question_shows_its_age_on_the_card() {
+        let now = Utc::now();
+        let render = |session: &SessionState, name: &str, width: u16| {
+            let name = name.to_string();
+            let backend = ratatui::backend::TestBackend::new(width, 6);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|frame| {
+                    render_session_card(
+                        frame,
+                        frame.area(),
+                        session,
+                        0,
+                        false,
+                        Some(&name),
+                        Some(1),
+                        CardDensity::Compact,
+                        UiMode::Normal,
+                        None,
+                        now,
+                        false,
+                    );
+                })
+                .unwrap();
+            buffer_to_string(terminal.backend().buffer())
+        };
+        let waiting = session_with_question(chrono::Duration::minutes(12), now);
+        let card = render(&waiting, "lead", 74);
+        let title = card.lines().next().unwrap();
+        assert!(title.contains("· lead QUESTION 12m"), "{card}");
+        assert!(title.contains("Needs Input"), "{card}");
+
+        let plain = make_session(SessionStatus::WaitingForInput);
+        assert!(!render(&plain, "lead", 74).contains("QUESTION"));
+
+        let long = "orchestrator-with-a-very-long-role-name";
+        let card = render(&waiting, long, 40);
+        let title = card.lines().next().unwrap();
+        assert!(!title.contains("QUESTION"), "{card}");
+        assert_eq!(
+            card.lines()
+                .filter(|line| line.contains("│QUESTION 12m "))
+                .count(),
+            1,
+            "{card}"
+        );
+    }
+
+    /// Scenario: The TUI's question notifications, on a clock it is handed. A
+    /// question that has waited less than the setting sends nothing; at the
+    /// setting it sends one notification naming the card, the wait and the
+    /// question; it never sends a second for that question; a question answered
+    /// before the setting sends none; and the setting at 0 sends none at all.
+    /// The text keeps no control character that could end the OSC 9 sequence
+    /// it travels in (issue #2075).
+    #[spec("question/escalate/002")]
+    #[test]
+    fn question_escalate_002_a_question_notifies_once_after_its_wait() {
+        let now = Utc::now();
+        let after = Some(chrono::Duration::minutes(10));
+        let mut names = HashMap::new();
+        names.insert("s-1".to_string(), "lead".to_string());
+        let sessions = |waited: Option<chrono::Duration>| {
+            let mut map = HashMap::new();
+            let session = match waited {
+                Some(waited) => session_with_question(waited, now),
+                None => make_session(SessionStatus::Working),
+            };
+            map.insert("s-1".to_string(), session);
+            map
+        };
+        let mut notified = HashSet::new();
+
+        let early = sessions(Some(chrono::Duration::minutes(9)));
+        assert!(question_reminders(&early, &names, &mut notified, after, now).is_empty());
+
+        let due = sessions(Some(chrono::Duration::minutes(10)));
+        let sent = question_reminders(&due, &names, &mut notified, after, now);
+        assert_eq!(sent.len(), 1, "{sent:?}");
+        assert!(
+            sent[0].starts_with("Question waiting 10m — lead: "),
+            "{sent:?}"
+        );
+        assert!(sent[0].contains("Bash"), "{sent:?}");
+        let later = sessions(Some(chrono::Duration::hours(3)));
+        assert!(
+            question_reminders(&later, &names, &mut notified, after, now).is_empty(),
+            "a question notifies once"
+        );
+
+        let mut fresh = HashSet::new();
+        assert!(question_reminders(&early, &names, &mut fresh, after, now).is_empty());
+        let answered = sessions(None);
+        assert!(question_reminders(&answered, &names, &mut fresh, after, now).is_empty());
+        assert!(
+            question_reminders(&due, &names, &mut HashSet::new(), None, now).is_empty(),
+            "0 turns notifications off"
+        );
+
+        // PR #2208 review: a question whose answer is queued for delivery is
+        // not waiting on the user.
+        let mut queued = sessions(Some(chrono::Duration::minutes(30)));
+        queued
+            .get_mut("s-1")
+            .unwrap()
+            .pending_question
+            .as_mut()
+            .unwrap()
+            .answer_queued = true;
+        assert!(question_reminders(&queued, &names, &mut HashSet::new(), after, now).is_empty());
+
+        // PR #2208 review: past the limit, the records of questions no longer
+        // waiting go, and the waiting one's stays, so it does not notify again.
+        let mut full: HashSet<(String, String)> = (0..QUESTION_REMINDER_LEDGER_LIMIT)
+            .map(|i| ("gone".to_string(), format!("q-{i}")))
+            .collect();
+        assert_eq!(
+            question_reminders(&due, &names, &mut full, after, now).len(),
+            1
+        );
+        assert_eq!(full.len(), 1, "only the waiting question's record is kept");
+        assert!(question_reminders(&due, &names, &mut full, after, now).is_empty());
+
+        let text = question_reminder_text("lead", "Run \u{1b}]9;x\u{7} now?\nok", "10m");
+        assert!(!text.chars().any(char::is_control), "{text:?}");
+        assert_eq!(text, "Question waiting 10m — lead: Run ]9;x now? ok");
+        let long = question_reminder_text("lead", &"y".repeat(500), "10m");
+        assert!(long.ends_with('…') && long.chars().count() < 200, "{long}");
+        assert_eq!(osc9_notification("hi"), "\u{1b}]9;hi\u{7}");
     }
 
     /// A session in `status` whose card shows `inbox`, as one the deck has

@@ -39,6 +39,7 @@ import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
+import { questionBadgeText } from "../lib/questionAge";
 import { TerminalViewport } from "./TerminalViewport";
 import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
@@ -406,7 +407,12 @@ export function AgentTile({
      `OVERVIEW_CLOCK_TICK_MS`, so between snapshots the reading advances in
      steps of up to that tick; it never runs ahead of the real span. */
   const background = held ? undefined : agent.background;
-  const now = useTileClock(counting || background?.sinceMs !== undefined);
+  /* Issue #2075 — a question the agent is waiting on, with how long it has
+     waited, on the same clock. Not on a held record: its question may have
+     been answered since, and an age counted from a past reading would claim
+     a wait nobody can vouch for. */
+  const question = held ? undefined : agent.pendingQuestion;
+  const now = useTileClock(counting || background?.sinceMs !== undefined || question?.raisedAtMs !== undefined);
   const uptime = counting ? displayUptime(agent.spawnedAtMs, now) : undefined;
   const backgroundText = displayBackgroundWork(background, now);
   /**
@@ -500,6 +506,8 @@ export function AgentTile({
               {/* Issue #2001 — the name the agent was given or renamed to. */}
               <h2 title={agent.displayName}>{agent.displayName}</h2>
               {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">ORCHESTRATOR</span>}
+              {/* Issue #2075 — the TUI card's badge, in the same words. */}
+              {question && <span className="question-badge" data-testid={`question-badge-${agent.id}`} title="A question is waiting for an answer">{questionBadgeText(question, now)}</span>}
               {/*
                 Issue #1143 — a held record's status is a past reading, so it is
                 worded as one, and the live colour goes with it because a teal

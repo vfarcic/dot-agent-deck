@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { OVERLAY_LAYER, topmostOverlayClose, useInertBackground, VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
+import type { KeptWorktree } from "../lib/worktreeClose";
 
 const STATE: ConfirmState = {
   title: "Close coder?",
@@ -21,6 +22,28 @@ function Page({ onClose }: { onClose: () => void }) {
 /* Issue #1709 — the confirmation is on the overlay stack, so voice's "close"
    (which closes `topmostOverlayClose()`) dismisses it. */
 describe("ConfirmDialog on the overlay stack", () => {
+  /** Scenario: while a worktree preview is pending, Cancel remains available but Close waits. Replacing that question ignores its late answer, and a failed preview lets the new close proceed without claiming that a worktree will be kept. */
+  it("waits for the worktree hint without applying a cancelled hint to another close", async () => {
+    let settle!: (kept: KeptWorktree) => void;
+    const action = vi.fn(async () => {});
+    const first = { ...STATE, action, worktreePreview: () => new Promise<KeptWorktree>((resolve) => { settle = resolve; }) };
+    const onClose = vi.fn();
+    const { rerender } = render(<ConfirmDialog state={first} onClose={onClose} />);
+    const pending = screen.getByRole("button", { name: "Checking worktree…" });
+    expect(pending).toBeDisabled();
+    fireEvent.click(pending);
+    expect(action).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onClose).toHaveBeenCalledOnce();
+    const second = { ...STATE, title: "Close tester?", action, worktreePreview: async () => { throw new Error("daemon unavailable"); } };
+    rerender(<ConfirmDialog state={second} onClose={onClose} />);
+    await act(async () => settle({ path: "/old/dirty", confirmed_dirty: true }));
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("/old/dirty");
+    expect(screen.getByRole("button", { name: "Close agent" })).toBeEnabled();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Close agent" })));
+    expect(action).toHaveBeenCalledOnce();
+  });
+
   /** Scenario: With a confirmation open, the rest of the window is inert and voice's "close" is its Cancel; once it is gone the window is live again. */
   it("fences the window and closes on voice's close", () => {
     const onClose = vi.fn();
