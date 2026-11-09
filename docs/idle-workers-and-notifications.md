@@ -2,7 +2,7 @@
 
 When a worker in an [orchestration](orchestration.md) gets stuck (it stops responding, sits at a prompt, runs out of provider credits, or exits without finishing its task), the deck sends a report to the orchestrator. What the orchestrator does next, such as chasing the worker, handing the task to another role, or telling you, depends on the instructions you give it.
 
-Reports are sent only inside an orchestration: an orchestration tab in the TUI, an **ORCHESTRATION** group on the desktop app's Dashboard, or an orchestration started by a dispatcher or a schedule. A standalone agent and a single-agent schedule get none. The deck does not message you itself; to be notified on your phone, see [Get notified when a run needs you](#get-notified-when-a-run-needs-you).
+Reports are sent only inside an orchestration: an orchestration tab in the TUI, an **ORCHESTRATION** group on the desktop app's Dashboard, or an orchestration started by a dispatcher or a schedule. A standalone agent and a single-agent schedule get none. Apart from one notification for a question an agent has left waiting ([When a question waits](session-management.md#when-a-question-waits)), the deck does not message you itself; to be notified on your phone, see [Get notified when a run needs you](#get-notified-when-a-run-needs-you).
 
 ## The reports
 

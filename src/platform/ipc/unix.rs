@@ -461,6 +461,12 @@ impl IpcClient {
         Ok(())
     }
 
+    /// Issue #2075: let reads block for as long as they take, for a hold that
+    /// has no deadline. The write timeout is left as it was.
+    pub fn clear_read_timeout(&self) -> io::Result<()> {
+        self.0.set_read_timeout(None)
+    }
+
     /// The connected socket itself, for a caller that reads it on a thread of
     /// its own and bounds each write by its own deadline
     /// ([`crate::inbox_oneshot::Connection`]).

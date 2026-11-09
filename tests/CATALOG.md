@@ -3062,7 +3062,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### hooks/install/018 — Claude Code's `PermissionRequest` hook is installed only for a Claude Code that is new enough (PRD #1631).
 - **Layer:** L1/fast unit (`src/hooks_manage.rs`, `install_impl_gated` against an in-memory settings object).
 - **Agent:** none (`claude --version` is not run; the version is given).
-- **Asserts:** Claude Code 2.1.136 or newer gets one deck `PermissionRequest` rule with no matcher and the deck's long `timeout`; 2.1.135 and an unknown version get no key at all, because an older Claude Code given an unknown hook key drops every hook in the file (issue #714); a second install leaves the file as it was; a downgrade removes a stale rule and its key; uninstall sweeps it with its emptied key; the held hook's own deadline is inside that timeout.
+- **Asserts:** Claude Code 2.1.136 or newer gets one deck `PermissionRequest` rule with no matcher and the deck's long `timeout`, which is within the 2^31 - 1 ms a JavaScript timer keeps; a rule an older deck wrote with a one-hour `timeout` is rewritten to it by the next install (issue #2075); 2.1.135 and an unknown version get no key at all, because an older Claude Code given an unknown hook key drops every hook in the file (issue #714); a second install leaves the file as it was; a downgrade removes a stale rule and its key; uninstall sweeps it with its emptied key; the held hook's own deadline is inside that timeout.
 - **Does not assert:** the `claude --version` probe itself (covered by the issue #714 probe tests in the same file); that a real Claude Code honours the timeout (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
@@ -5726,6 +5726,8 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/close/002 — Closing a dispatched card whose worktree holds uncommitted work announces the keep, with its path, both before the keystroke and after it (issue #717).
+
+- **Desktop parity (issue #1674):** `AgentOverviewStop.test.tsx` covers single-agent and whole-team close previews on a remote deck, including clean and inconclusive controls; `AgentPaneOverlay.test.tsx` covers the full-window pane from both screen origins. `ConfirmDialog.test.tsx` covers cancellation and failed previews. `confirm-worktree-layout.spec.ts` covers Cancel and Close staying on screen in a short browser window with a long, scrollable worktree warning, plus no-warning and short-path controls. `bridge.test.ts` and `OverviewRuntimeFailure.test.tsx` cover kept-worktree broadcasts from an unselected deck, reporting after the cards disappear, and notice dismissal across navigation. The Rust `worktree_close_preview_is_admitted_and_returns_the_daemons_report` test covers the preview's admitted request and refused replacement builds. These use scripted daemon replies, not a native desktop window.
 - **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → confirm path against the resulting card.
 - **Agent:** none (`cat` for both the caller pane and the dispatched unit). Deliberate, and the reason is narrower than convenience: the sentence under test is decided by the daemon's worktree registry and one `git status --porcelain`, and no agent participates in either. `dispatch/close/001` next door owns the real-agent close path.
 - **Asserts:** the control close of the caller pane — which owns no worktree — renders no warning at all; the dispatched card's confirmation renders `Uncommitted work here is KEPT, not deleted:` together with the worktree's absolute path BEFORE the destructive answer; after confirming, the status line repeats the path; the daemon record for the card is gone; and the uncommitted file is still on disk, so the promise the deck made was true.
@@ -13028,6 +13030,10 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **question/desktop/032** — `question_desktop_032_a_leading_word_shared_with_allow_once_chooses_it` (PR #1698): "yes", "Yes." and "um, yes please" to Codex's approval, which begin "Yes, proceed" and "Yes, and don't ask again …", choose "Yes, proceed" because only it allows once, and the countdown says "“Yes, proceed” (allow once) — touch codex_b.txt" with no always confirmation; OpenCode's "allow" is Allow once the same way; Claude's "yes and" (two options, neither allowing once), "yes" with two allow-once options, and "allow" against "Allow once" and "Always allow" (a leading part of one only) stay ambiguous; Claude's "yes" is still Yes by its whole label.
 - **question/desktop/033** — `question_desktop_033_a_one_letter_slip_chooses_nothing_on_a_permission_prompt` (issue #1725): on a permission prompt a word must be said as the label has it — OpenCode's "alloy", "alloy once" and "alloy always", Codex's "proced" and Devin's "denys" choose nothing here and go to the (stub) model, whose `not_answer` goes on to command handling, so no countdown starts; said exactly, "allow" and "proceed" still choose; on an ordinary choice, Codex's form, "grean" still chooses Green.
 - **question/desktop/034** — vitest `question/desktop/034: a countdown is called off when its deck stops answering` (`desktop/src/components/VoiceQuestion.test.tsx`, issue #1726): with the countdown running after "yes", the pane stopping taking input because its deck stopped answering calls it off at once, the row says "Nothing was sent — the pane stopped taking input: its deck is not answering.", and nothing is sent when its five seconds would have ended; vitest `question/desktop/034: an answer delivered as its deck stops answering is not cancelled` (PR #1764 review): the question leaving the pane in the same snapshot that blocks it is the question's case, so the answer on its way keeps its lease and the row reports it sent; vitest `question/desktop/034: an answer called off while its words were worked out stays called off` (PR #1764 review): a half-given answer dropped while the pane took no input, its next words still being worked out, is not brought back by them once the pane takes input again — no countdown, nothing sent.
+- **question/desktop/035** — vitest `question/desktop/035: the age reads as the TUI card writes it` (`desktop/src/lib/questionAge.test.ts`, issue #2075): the tile writes a question's age exactly as the TUI card's `format_elapsed` does (`0s`, `3s`, `1m 30s`, `1m`, `1h 5m`, `1h`, no day unit), a clock behind the question's time reads `0s`, and the badge reads `QUESTION <age>`, or `QUESTION` alone for a question with no time.
+- **question/desktop/036** — vitest `question/desktop/036: …`, five tests (`desktop/src/lib/questionNotifier.test.ts`, issue #2075): with the setting at 10 minutes, nothing before ten minutes, one notification at ten and none after; a question answered sooner never notifies and the same question never twice; the setting at 0 posts nothing and a question with no time is skipped; the record of what was notified names the daemon and the pane, and the body is cut at 120 characters; the hook, on a fake timer at the default, posts once, and never when the setting is Off; a question still waiting keeps its record when more than the ledger's 1,000 other questions have been notified, so it never notifies twice; and nothing is posted before the saved settings are read, so a fleet that arrives first cannot notify at the default when the saved setting is Off; a question whose answer is queued, or on a deck the app is not connected to, is not waiting; a post the system refuses is tried again on the next check and, once posted, never again (PR #2208 review). Does not assert that the OS shows the notification.
+- **question/desktop/037** — vitest `question/desktop/037: …`, two tests (`desktop/src/components/AgentTileQuestion.test.tsx`, issue #2075): the tile reads `QUESTION 12m` and `QUESTION 13m` a minute later; a tile with no question has no badge, and an untimed question shows `QUESTION` alone.
+- **question/desktop/038** — vitest `question/desktop/038: defaults to ten minutes, saves the choice, and keeps an absent section absent` (`desktop/src/components/AgentTileQuestion.test.tsx`, issue #2075): Settings → Notifications reads "After 10 minutes", choosing Off saves `questions.notify = 0`; the bridge keeps an absent `[questions]` section absent, keeps and offers a hand-edited 7, and reads -1 as 10.
 
 #### question/hold
 
@@ -13083,15 +13089,15 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 ##### question/hold/008 — Held questions never starve the hook pool, and no question connection outlives its reply.
 - **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with its connection cap cut to two, then its hold budget cut to one).
 - **Agent:** none (`/bin/sh` stand-ins).
-- **Asserts:** with three questions held on a two-slot pool, a completion hook still gets in, clears the first question and releases its producer; past the hold budget a question is not held, its producer is released at once and the card still reads Needs Input; every question connection is closed with its one reply — cleared, not held, superseded or released at the hold deadline — so a producer that keeps its socket open and sends another line has it read by nothing, across more producers than the pool and the budget hold, and a fresh producer still gets in.
+- **Asserts:** with three questions held on a two-slot pool, a completion hook still gets in, clears the first question and releases its producer; past the hold budget a question is not held, its producer is released at once and the card still reads Needs Input; every question connection is closed with its one reply — cleared, not held or superseded — so a producer that keeps its socket open and sends another line has it read by nothing, across more producers than the pool and the budget hold, and a fresh producer still gets in.
 - **Does not assert:** the production numbers (32 and 64).
 - **Platform coverage:** mac+linux.
 
-##### question/hold/009 — The daemon releases a hold at its deadline.
-- **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with a short hold deadline).
+##### question/hold/009 — A held question waits as long as the user takes (issue #2075).
+- **Layer:** L1/fast unit (`src/daemon.rs`, the hook loop with its production limits, a day passed on tokio's paused clock).
 - **Agent:** none (`/bin/sh` stand-in).
-- **Asserts:** a producer that never lets go is released at the deadline, the question is dropped, and a daemon-synthetic release naming it is broadcast.
-- **Does not assert:** the production deadline.
+- **Asserts:** after a day unanswered the daemon has written nothing to the producer and not closed its connection, still holds the question and still shows it on the pane; an answer given then is accepted and reaches the producer. Red before issue #2075, when the daemon released and dropped the question at 3720 s.
+- **Does not assert:** that a producer waits that long (`question/hold/025`, `hooks/install/018`), or a real agent's hook (`question/live/008`).
 - **Platform coverage:** mac+linux.
 
 ##### question/hold/010 — An always-allow too long or too odd to show whole is keyboard-only.
@@ -13195,8 +13201,15 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 ##### question/hold/024 — A producer that never reads its connection cannot pin a hold (issue #1976).
 - **Layer:** L1/fast unit (`src/daemon_held_confirmation_deadline_tests.rs`, `handle_question_signal` called directly over in-memory duplex pipes).
 - **Agent:** none (a `/bin/sh` stand-in pane).
-- **Asserts:** a held question sent with `confirm_hold` on a connection that stays open but whose write side has no room for the `held` line is released at the connection's idle timeout (300 ms in the test, asserted under 2 s), as a producer that hung up is: the handler returns no reply, the hold-budget permit comes back, the hold is no longer registered and the pane shows no pending question. The control, a producer that reads, is told `held` and released at the hold deadline.
+- **Asserts:** a held question sent with `confirm_hold` on a connection that stays open but whose write side has no room for the `held` line is released at the connection's idle timeout (300 ms in the test, asserted under 2 s), as a producer that hung up is: the handler returns no reply, the hold-budget permit comes back, the hold is no longer registered and the pane shows no pending question. The control, a producer that reads, is told `held` and is still held, its question still shown, a second later: a hold has no deadline (issue #2075).
 - **Does not assert:** the stall over a real Unix socket, whose send buffer would have to be filled to within one line of full; the write deadline itself is `write_hook_reply`'s, as for `hooks/ingest/007`.
+- **Platform coverage:** mac+linux.
+
+##### question/hold/025 — A held hook waits until its deadline, or with none until its answer (issue #2075).
+- **Layer:** L1/fast unit (`src/hook.rs`, `hold_question_within_at` against a stand-in socket that says `held` and then nothing).
+- **Agent:** none (a captured Claude Code `AskUserQuestion` form).
+- **Asserts:** with a 2 s deadline, as Claude Code's hook has, the hook gives up at it with no decision and the stand-in sees the connection close; with no deadline, as an `await-answer` child has, it is still waiting four hold-start bounds after `held` and acts on the reply sent then (red if the per-read timeout armed for the hold-start read is left in place); Claude Code's real hold deadline, about 24.8 days, is accepted as a socket read and write timeout; no plain event follows a held question.
+- **Does not assert:** the parent-death exit of a holding producer, or Claude Code's own `timeout` (`hooks/install/018`).
 - **Platform coverage:** mac+linux.
 
 ##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
@@ -13230,7 +13243,7 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 ##### question/live/005 — OpenCode replies through its plugin for permissions and whole forms.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive OpenCode, cheap `common::opencode_test_model()` (default Haiku); a subscription host can override `DOT_AGENT_DECK_OPENCODE_TEST_MODEL` with `openai/gpt-5.6-luna`, while compatible API credentials can use a mini model.
-- **Asserts:** permission options and held channel, a unique sentinel after approval, a two-question form with multiple sizes and appended free-text, one plugin reply and reported Green/Small/Large choices.
+- **Asserts:** permission options and held channel, a unique sentinel after approval, a two-question form with multiple sizes and appended free-text, one plugin reply and reported Green/Small/Large choices. Where OpenCode first asks for the sentinel's directory (`external_directory`, seen on 1.19.0), that prompt is allowed through the client too before the command's own.
 - **Does not assert:** plugin HTTP stale-reply errors or desktop voice.
 - **Platform coverage:** mac+linux.
 
@@ -13240,6 +13253,36 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Asserts:** the select dialog's real labels and pending question, a client answer resolves Blue to the asking extension, the dialog closes and Pi visibly reports the selected value.
 - **Does not assert:** a live model, confirm/input dialogs or Pi's undocumented API stability beyond this installed version.
 - **Platform coverage:** mac+linux; runtime skip when Pi is absent (failure with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
+
+##### question/live/007 — An unanswered Pi question shows its age, notifies once and is still answered (issue #2075).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_pi_questions.rs`), offline and credential-free.
+- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call, not reel-eligible.
+- **Asserts:** with `notifications.question_after_minutes = 1`, the card shows `QUESTION` and the question's age; no OSC 9 notification before a minute, exactly one naming the question after it, and still one five seconds later; the question, still held, is answered Blue through the client and Pi receives it.
+- **Does not assert:** the desktop app's notification (`desktop/src`'s own tests), a terminal showing OSC 9, or a wait past the old one-hour cap.
+- **Platform coverage:** mac+linux; runtime skip when Pi is absent (failure with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
+
+##### question/live/008 — A real Claude prompt left unanswered shows its age, notifies once and is still answered (issue #2075).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
+- **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
+- **Asserts:** the `PermissionRequest` hook the deck installed carries `PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`; with `notifications.question_after_minutes = 1` the card shows `QUESTION` and the prompt's age, exactly one OSC 9 notification arrives after a minute and no second one; the prompt, still held, is allowed through the client and the command creates its sentinel.
+- **Does not assert:** a wait past the old one-hour cap, which would take an hour.
+- **Platform coverage:** mac+linux.
+
+#### question/escalate
+
+##### question/escalate/001 — A waiting question shows its age on the TUI card (issue #2075).
+- **Layer:** L1/fast unit (`src/ui.rs`, `render_session_card` on a `TestBackend`).
+- **Agent:** none (a Needs Input session carrying a Claude Code Bash permission built by the real producer).
+- **Asserts:** a question raised 12 minutes before the card's clock reads `QUESTION 12m` at the end of the title beside the card's name and Needs Input; a card with no pending question shows no badge; a 40-column card with a long name shows the badge whole on a row of its own and not in the title.
+- **Does not assert:** the desktop tile's badge (the desktop's own tests), or the clock advancing in a live deck (`question/live/007`).
+- **Platform coverage:** mac+linux.
+
+##### question/escalate/002 — A question notifies once after its wait (issue #2075).
+- **Layer:** L1/fast unit (`src/ui.rs`, `question_reminders` on a clock it is handed).
+- **Agent:** none.
+- **Asserts:** nothing before the setting's minutes have passed; one notification at them, reading `Question waiting <age> — <card name>: <question>`; none again for the same question however long it waits; none for a question answered sooner; none with the setting at 0; none for a question whose answer is queued for delivery; past 1,000 records only the still-waiting questions' records are kept, so a waiting question does not notify again (PR #2208 review); the text carries no control character that could end its OSC 9 sequence, and a long question is cut with `…`; the OSC 9 framing.
+- **Does not assert:** a terminal showing the notification, or the TUI's main loop writing it (`question/live/007`).
+- **Platform coverage:** mac+linux.
 
 ### Docs cross-reference skips
 

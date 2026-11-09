@@ -1983,6 +1983,23 @@ describe("ControlDeck", () => {
     expect(screen.queryByText("Local daemon started and control channel reconnected.")).not.toBeInTheDocument();
   });
 
+  /** Scenario: close the selected agent from the deck toolbar. Its kept-worktree hint appears before confirmation, but a successful stop alone does not claim the directory was kept: that waits for the cleanup broadcast. */
+  it("previews a toolbar close without turning its prediction into a kept-worktree notice", async () => {
+    const snapshot = createFixtureSnapshot("connected");
+    snapshot.agents[0].paneId = "pane-toolbar";
+    snapshot.agents[0].incarnation = "process-toolbar";
+    const previewWorktreeClose = vi.fn(async () => ({ path: "/remote/dispatch-toolbar", confirmed_dirty: true }));
+    const rt = runtime({ snapshot, previewWorktreeClose });
+    render(<ControlDeck runtime={rt} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close Planner" }));
+    const dialog = screen.getByRole("alertdialog");
+    await waitFor(() => expect(dialog).toHaveTextContent("/remote/dispatch-toolbar"));
+    expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, ["pane-toolbar"], "process-toolbar");
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" })));
+    expect(rt.runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-toolbar" });
+    expect(screen.queryByTestId("worktree-kept-toast")).toBeNull();
+  });
+
   /** Scenario: The narrow layout keeps its agent summary visible, then opens the Events drawer on demand. */
   it("keeps the mobile summary visible on first load and opens Events on demand", () => {
     vi.stubGlobal("matchMedia", vi.fn((query: string) => ({
@@ -2066,8 +2083,9 @@ describe("ControlDeck", () => {
     // states stay pinned with stub sections in
     // `components/SettingsSheet.test.tsx`, so this does not become their only
     // coverage. PRD #741's Daemons row took it to three and PRD #802 M4's Voice
-    // row to four, and PRD #1401's GitHub row to five.
-    expect(SETTINGS_SECTIONS).toHaveLength(5);
+    // row to four, PRD #1401's GitHub row to five, and issue #2075's
+    // Notifications row to six.
+    expect(SETTINGS_SECTIONS).toHaveLength(6);
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();
 

@@ -34,8 +34,10 @@ function fakeDeck(name: string, mode: number): { path: string; marker: string } 
 
 // Starts a receiver whose resolver gives `resolved`, lets it run for a while
 // and stops it; returns how many spawns it resolved the binary for and
-// whether anything was delivered.
-async function run(resolved: () => string | undefined) {
+// whether anything was delivered. With `until`, it keeps running past that
+// window until `until()` holds or 10 s pass, so a case that waits for
+// something to happen does not depend on how fast a loaded machine spawns.
+async function run(resolved: () => string | undefined, until?: () => boolean) {
 	let resolutions = 0;
 	inboxBinary(() => {
 		resolutions += 1;
@@ -46,6 +48,7 @@ async function run(resolved: () => string | undefined) {
 	const receiver = inboxReceiver({ agent: "pi", active: () => on, deliver: () => { delivered += 1; } });
 	receiver.start();
 	await settle(250);
+	for (const deadline = Date.now() + 10_000; until && !until() && Date.now() < deadline; ) await settle(50);
 	const rx = receiver.rx();
 	on = false;
 	receiver.stop();
@@ -86,7 +89,7 @@ test("pi_031 the receiver runs only an absolute path to an executable file", { s
 	});
 	await t.test("an absolute path to an executable, spaces included, is run", async () => {
 		const deck = fakeDeck("dot agent deck", 0o755);
-		await run(() => deck.path);
+		await run(() => deck.path, () => existsSync(deck.marker));
 		assert.equal(existsSync(deck.marker), true, "the absolute executable did not run");
 	});
 });

@@ -90,12 +90,22 @@ pub const PERMISSION_REQUEST_HOOK: &str = "PermissionRequest";
 /// version is treated as older.
 pub const PERMISSION_REQUEST_MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 136);
 
-/// PRD #1631: the `timeout`, in seconds, the deck writes on its
-/// `PermissionRequest` hook. Claude Code's default is 600 s, after which it
-/// cancels the hook and goes ahead as if there were none — so a user who
-/// leaves a prompt for longer still answers it by keyboard. An hour is a
-/// choice, not a measured maximum.
-pub const PERMISSION_REQUEST_HOOK_TIMEOUT_SECS: u64 = 3600;
+/// PRD #1631, issue #2075: the `timeout`, in seconds, the deck writes on its
+/// `PermissionRequest` hook, which holds the question for as long as Claude
+/// Code lets it so the deck can answer it however long it waits. Claude Code's
+/// default is 600 s, after which it cancels the hook and goes ahead as if there
+/// were none, leaving its dialog to the keyboard.
+///
+/// Claude Code sets no maximum of its own: its settings schema takes any
+/// positive `timeout`, its command hooks run under `timeout * 1000` ms with no
+/// clamp (read in 2.1.319's bundle), and 2,147,483 s, 2,147,484 s and
+/// 4,000,000 s all left a 4 s hook to finish untouched under 2.1.319 (measured
+/// 2026-11-09 with `claude -p`). The one ceiling is the JavaScript timer behind
+/// it: 2^31 - 1 ms is the longest delay every runtime keeps, and Node fires a
+/// longer one almost at once. This is that ceiling in whole seconds, about
+/// 24.8 days. The 3600 s cancellations issue #2075 measured were the deck's
+/// own earlier `timeout`.
+pub const PERMISSION_REQUEST_HOOK_TIMEOUT_SECS: u64 = 2_147_483;
 
 /// The version-gated hook keys an install writes for one Claude Code (issues
 /// #714 and PRD #1631).
@@ -2445,6 +2455,26 @@ mod tests {
             ClaudeHookGates::for_version(Some((2, 1, 289))),
         );
         assert_eq!(settings, before);
+
+        // Issue #2075: a rule an older deck wrote with its one-hour `timeout`
+        // is rewritten by the next install, so an upgrade holds a question for
+        // as long as Claude Code allows rather than an hour.
+        let mut upgraded = before.clone();
+        upgraded["hooks"][PERMISSION_REQUEST_HOOK][0]["hooks"][0]["timeout"] = 3600.into();
+        install_impl_gated(
+            &mut upgraded,
+            binary,
+            ClaudeHookGates::for_version(Some((2, 1, 289))),
+        );
+        assert_eq!(
+            upgraded["hooks"][PERMISSION_REQUEST_HOOK][0]["hooks"][0]["timeout"],
+            PERMISSION_REQUEST_HOOK_TIMEOUT_SECS
+        );
+        assert_eq!(upgraded, before);
+        assert!(
+            PERMISSION_REQUEST_HOOK_TIMEOUT_SECS * 1000 <= i32::MAX as u64,
+            "a JavaScript timer longer than 2^31 - 1 ms fires at once"
+        );
 
         for older in [Some((2, 1, 135)), None] {
             let mut fresh = serde_json::json!({});

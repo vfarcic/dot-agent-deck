@@ -2404,13 +2404,19 @@ async fn probe_010_releases_follow_the_release_table_on_the_production_driver() 
     assert_reached(&reached, 1);
 }
 
-/// Scenario: The generated release-table scripts of `probe_010_releases_follow_the_release_table_on_the_production_driver`, over a longer, different run of seeds, each release-table tuple the oracle requires reached at least three times.
+// Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+// build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
 #[cfg(feature = "e2e")]
-#[spec("inbox/probe/010")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn probe_010_the_long_run_follows_the_release_table() {
-    let reached = run_seeds(1_001..=1_000 + LONG_SEEDS).await;
-    assert_reached(&reached, 3);
+mod e2e_only {
+    use super::*;
+
+    /// Scenario: The generated release-table scripts of `probe_010_releases_follow_the_release_table_on_the_production_driver`, over a longer, different run of seeds, each release-table tuple the oracle requires reached at least three times.
+    #[spec("inbox/probe/010")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn probe_010_the_long_run_follows_the_release_table() {
+        let reached = run_seeds(1_001..=1_000 + LONG_SEEDS).await;
+        assert_reached(&reached, 3);
+    }
 }
 
 /// The fast tier's seeds, and lane 1's (the audit's U3-9: each seed takes
