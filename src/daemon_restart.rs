@@ -1449,50 +1449,97 @@ mod tests {
     /// Scenario: the target leaves a child behind that keeps its stdout open
     /// and writes to it every 50ms — and the target itself exits with a failure,
     /// exits successfully, or hangs past the deadline. Each check is refused
-    /// within its bound, and the reader has closed its end of the pipe: the
-    /// child's next write fails with `EPIPE` and it records that in a marker
-    /// file. A reader still blocked in `read` would keep taking those writes,
-    /// so the marker would never appear (issue #1615).
+    /// within its bound, by the path its case takes, and the reader has closed
+    /// its end of the pipe: the child's next write fails with `EPIPE` and it
+    /// records that in a marker file. A reader still blocked in `read` would
+    /// keep taking those writes, so the marker would never appear (issue #1615).
+    ///
+    /// On a loaded machine, and on macOS for the first run of any freshly
+    /// written file, the target can still be starting when its bound runs out
+    /// (issue #2183). Then the writer never exists, or the failing and
+    /// succeeding targets never reach their own exit, and the attempt tests
+    /// nothing; it is run again, a bounded number of times. The writer records
+    /// that it started, so an attempt that did set the scenario up and still
+    /// leaves the pipe open fails.
     #[cfg(unix)]
     #[test]
     fn the_version_reader_is_stopped_when_a_child_keeps_stdout_open() {
+        const ATTEMPTS: usize = 5;
+        // After the deadline the check stops the target without waiting for
+        // it and gives the reader a moment for its final read: the bound is
+        // the timeout plus that, with room for the reader's poll.
+        const PAST_THE_DEADLINE: Duration = Duration::from_secs(2);
         let dir = tempfile::tempdir().unwrap();
-        for (name, ending, timeout) in [
-            ("fails", "exit 3", RESTART_VERIFY_TIMEOUT),
+        for (name, ending, timeout, path_taken) in [
+            (
+                "fails",
+                "exit 3",
+                RESTART_VERIFY_TIMEOUT,
+                "it exited with exit status: 3",
+            ),
             (
                 "succeeds",
                 "echo 'dot-agent-deck 0.46.0'; exit 0",
                 Duration::from_millis(500),
+                "its output did not close",
             ),
-            ("hangs", "exec sleep 30", Duration::from_millis(500)),
+            (
+                "hangs",
+                "exec sleep 30",
+                Duration::from_millis(500),
+                "it did not exit within",
+            ),
         ] {
-            let marker = dir.path().join(format!("{name}.epipe"));
-            // The writer ignores SIGPIPE so a closed pipe is an error status
-            // it can act on, and gives up after ~20s so a regression leaves no
-            // process behind for long.
-            let body = format!(
-                "(trap '' PIPE; i=0; while [ $i -lt 400 ]; do \
-                   echo tick || {{ : > '{}'; exit 0; }}; \
-                   i=$((i+1)); sleep 0.05; done) &\n{ending}",
-                marker.display()
-            );
-            let p = script(dir.path(), name, &body, 0o755);
-            let started = Instant::now();
-            let err = verify_restart_target(&p, None, timeout).unwrap_err();
-            assert_eq!(err.0, RestartRefusalReason::TargetDidNotAnswer, "{name}");
-            assert!(
-                started.elapsed() < Duration::from_secs(8),
-                "{name}: the bound must hold: {:?}",
-                started.elapsed()
-            );
-            let until = Instant::now() + Duration::from_secs(10);
-            while !marker.exists() && Instant::now() < until {
-                std::thread::sleep(Duration::from_millis(20));
+            let mut ran = false;
+            for attempt in 0..ATTEMPTS {
+                let marker = dir.path().join(format!("{name}-{attempt}.epipe"));
+                let began = dir.path().join(format!("{name}-{attempt}.started"));
+                // The writer ignores SIGPIPE so a closed pipe is an error
+                // status it can act on, and gives up after ~20s so a
+                // regression leaves no process behind for long.
+                let body = format!(
+                    "(: > '{}'; trap '' PIPE; i=0; while [ $i -lt 400 ]; do \
+                       echo tick || {{ : > '{}'; exit 0; }}; \
+                       i=$((i+1)); sleep 0.05; done) &\n{ending}",
+                    began.display(),
+                    marker.display()
+                );
+                let p = script(dir.path(), &format!("{name}-{attempt}"), &body, 0o755);
+                let started = Instant::now();
+                let err = verify_restart_target(&p, None, timeout).unwrap_err();
+                let took = started.elapsed();
+                assert_eq!(err.0, RestartRefusalReason::TargetDidNotAnswer, "{name}");
+                assert!(
+                    took < timeout + PAST_THE_DEADLINE,
+                    "{name}: the bound must hold: {took:?} ({})",
+                    err.1
+                );
+                // A writer forked just before the kill can start a moment
+                // after the check returned, so give it a short while to show.
+                let returned = Instant::now();
+                let until = returned + Duration::from_secs(10);
+                while !marker.exists() && Instant::now() < until {
+                    if !began.exists() && returned.elapsed() > Duration::from_secs(2) {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                if !began.exists() || !err.1.contains(path_taken) {
+                    // The scenario was not set up: run it again.
+                    continue;
+                }
+                assert!(
+                    marker.exists(),
+                    "{name}: the reader must close the pipe once the check returns ({})",
+                    err.1
+                );
+                ran = true;
+                break;
             }
             assert!(
-                marker.exists(),
-                "{name}: the reader must close the pipe once the check returns ({})",
-                err.1
+                ran,
+                "{name}: in {ATTEMPTS} attempts the target never got as far as starting \
+                 its writer and reaching its own ending, so the scenario never ran"
             );
         }
     }
