@@ -1449,7 +1449,46 @@ fn codex_patch_path(patch: &str) -> Option<String> {
 /// tests (and any Claude caller) stay unchanged.
 #[cfg(test)]
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
-    build_event_typed(input, AgentType::ClaudeCode)
+    build_event_typed_with_version(input, AgentType::ClaudeCode, None)
+}
+
+/// Look up the agent on the hook's PATH when this payload raises a question
+/// answered by keys. A failed probe leaves the version unknown; held-hook
+/// answers and ordinary status events need no version process.
+fn question_agent_version(
+    agent: &AgentType,
+    input: &ClaudeCodeHookInput,
+) -> Option<(u64, u64, u64)> {
+    let program = match (
+        agent,
+        input.hook_event_name.as_str(),
+        input.tool_name.as_deref(),
+    ) {
+        (AgentType::ClaudeCode, "PermissionRequest", Some("ExitPlanMode")) => "claude",
+        (AgentType::Codex, "PermissionRequest", Some(_))
+        | (AgentType::Codex, "PreToolUse", Some("request_user_input")) => "codex",
+        (AgentType::Devin, "PermissionRequest", Some(_)) => "devin",
+        _ => return None,
+    };
+    let output = crate::hooks_manage::probe_version_line(
+        std::ffi::OsStr::new(program),
+        std::time::Duration::from_secs(3),
+    )?;
+    parse_question_agent_version(agent, &output)
+}
+
+/// The version word from the CLI's first line; malformed output stays unknown.
+fn parse_question_agent_version(agent: &AgentType, output: &str) -> Option<(u64, u64, u64)> {
+    let output = output.trim();
+    let version = match agent {
+        AgentType::Codex => output.strip_prefix("codex-cli ").unwrap_or(output),
+        AgentType::Devin => output.strip_prefix("Devin CLI ").unwrap_or(output),
+        _ => output,
+    }
+    .split_whitespace()
+    .next()?;
+    let version = semver::Version::parse(version.strip_prefix('v').unwrap_or(version)).ok()?;
+    Some((version.major, version.minor, version.patch))
 }
 
 /// Build an [`AgentEvent`] from a Claude-compatible hook payload, stamping the
@@ -1458,6 +1497,15 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
 /// builder, differing only in the stamped identity and the Codex-aware
 /// `extract_tool_detail` arms.
 fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
+    let version = question_agent_version(&agent_type, &input);
+    build_event_typed_with_version(input, agent_type, version)
+}
+
+fn build_event_typed_with_version(
+    input: ClaudeCodeHookInput,
+    agent_type: AgentType,
+    version: Option<(u64, u64, u64)>,
+) -> Option<AgentEvent> {
     let ClaudeCodeHookInput {
         session_id,
         hook_event_name,
@@ -1711,6 +1759,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.get("tool_use_id").map(String::as_str),
         extra.get("permission_suggestions"),
         extra.get("permission_mode").and_then(Value::as_str),
+        version,
     );
 
     let mut event = AgentEvent {
@@ -1746,8 +1795,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
 ///   [`crate::question::codex_request_user_input`].
 /// - Devin `PermissionRequest` → [`crate::question::devin_permission_request`].
 ///
-/// The agent's version is not in any of these payloads, so the tables are used
-/// as verified (`None`).
+/// Key-answered questions receive the version probed on the hook's PATH;
+/// a failed or unreadable probe keeps the unknown-version fallback.
 #[allow(clippy::too_many_arguments)]
 fn hook_question(
     agent_type: &AgentType,
@@ -1758,6 +1807,7 @@ fn hook_question(
     tool_use_id: Option<&str>,
     permission_suggestions: Option<&Value>,
     permission_mode: Option<&str>,
+    version: Option<(u64, u64, u64)>,
 ) -> Option<crate::question::PendingQuestion> {
     let now = Utc::now().timestamp_millis();
     let id = crate::question::mint_question_id;
@@ -1771,7 +1821,7 @@ fn hook_question(
                 permission_suggestions,
                 permission_mode,
                 now,
-                None,
+                version,
             )
             .question,
         ),
@@ -1787,18 +1837,18 @@ fn hook_question(
                 tool_detail,
                 command.as_deref(),
                 now,
-                None,
+                version,
             ))
         }
         (AgentType::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
-            crate::question::codex_request_user_input(tool_use_id, tool_input, now, None)
+            crate::question::codex_request_user_input(tool_use_id, tool_input, now, version)
         }
         (AgentType::Devin, "PermissionRequest") => Some(crate::question::devin_permission_request(
             id(),
             tool_name?,
             tool_detail,
             now,
-            None,
+            version,
         )),
         _ => None,
     }
@@ -5953,6 +6003,40 @@ mod question_tests {
     };
     use spec::spec;
 
+    #[test]
+    fn question_versions_parse_cli_output_without_guessing_malformed_versions() {
+        for (agent, output, expected) in [
+            (
+                AgentType::ClaudeCode,
+                "2.1.319 (Claude Code)",
+                Some((2, 1, 319)),
+            ),
+            (
+                AgentType::ClaudeCode,
+                "2.2.0-beta.1 (Claude Code)",
+                Some((2, 2, 0)),
+            ),
+            (AgentType::Codex, "codex-cli 0.161.0", Some((0, 161, 0))),
+            (AgentType::Codex, "0.160.99", Some((0, 160, 99))),
+            (AgentType::Devin, "3000.11.3", Some((3000, 11, 3))),
+            (
+                AgentType::Devin,
+                "Devin CLI v3000.12.0",
+                Some((3000, 12, 0)),
+            ),
+            (AgentType::Codex, "codex-cli 0.161", None),
+            (AgentType::Codex, "codex-cli 0.161.0.1", None),
+            (AgentType::ClaudeCode, "warning: update to 2.2.0", None),
+            (AgentType::ClaudeCode, "", None),
+        ] {
+            assert_eq!(
+                parse_question_agent_version(&agent, output),
+                expected,
+                "{output}"
+            );
+        }
+    }
+
     fn fixture(name: &str) -> Value {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/agent-questions")
@@ -5964,7 +6048,7 @@ mod question_tests {
     fn event_for(agent: AgentType, payload: &Value) -> AgentEvent {
         let input: ClaudeCodeHookInput =
             serde_json::from_value(payload.clone()).expect("a Claude-shaped payload");
-        build_event_typed(input, agent).expect("the payload maps to an event")
+        build_event_typed_with_version(input, agent, None).expect("the payload maps to an event")
     }
 
     fn question_for(agent: AgentType, payload: &Value) -> PendingQuestion {
@@ -5986,7 +6070,7 @@ mod question_tests {
     /// Permission question: Yes, "Yes, and always allow access to <dir> from
     /// this project" with the directory as its scope, the keyboard-only "Yes,
     /// and switch to auto mode" Claude draws for Bash in the default mode, and
-    /// No.
+    /// No; on Claude 2.2 those held answers remain voice-answerable.
     #[spec("question/detect/001")]
     #[test]
     fn question_detect_001_claude_bash_permission_request() {
@@ -6033,6 +6117,42 @@ mod question_tests {
                 .is_none(),
             "no pane id in a unit test, so nothing to hold for"
         );
+        let payload = fixture("claude-permission-bash.json");
+        let future = crate::question::claude_permission_request(
+            "future-permission".into(),
+            "Bash",
+            payload.get("tool_input"),
+            q.tool.as_ref().unwrap().detail.clone(),
+            payload.get("permission_suggestions"),
+            Some("default"),
+            1,
+            Some((2, 2, 0)),
+        )
+        .question;
+        assert_eq!(future.channel, AnswerChannel::Held);
+        assert_eq!(future.questions, q.questions);
+        for index in [1, 2, 4] {
+            let answers = future
+                .validate(
+                    &[crate::question::QuestionAnswer {
+                        question_index: 0,
+                        option_indices: vec![index],
+                        text: None,
+                    }],
+                    true,
+                )
+                .expect("a hook answer does not type an unverified key");
+            let reply = QuestionReply::answered(&future.id, answers);
+            assert!(
+                crate::question::claude_decision(
+                    &future,
+                    payload.get("tool_input"),
+                    payload.get("permission_suggestions"),
+                    &reply,
+                )
+                .is_some()
+            );
+        }
     }
 
     /// Scenario: Claude Code 2.1.296 asks to run a Bash command in the default
@@ -6178,7 +6298,7 @@ mod question_tests {
     /// Scenario: A two-question `AskUserQuestion` form, the second
     /// multi-select, becomes a held Choice question with both questions, each
     /// followed by Claude Code's own "Type something." (free text) and "Chat
-    /// about this" (keyboard-only).
+    /// about this" (keyboard-only); the appended free-text answer stays available on Claude 2.2.
     #[spec("question/detect/003")]
     #[test]
     fn question_detect_003_claude_ask_user_question_form() {
@@ -6202,11 +6322,53 @@ mod question_tests {
         assert!(!appended[0].keyboard_only);
         assert!(appended[1].keyboard_only);
         assert_eq!(q.tool.as_ref().unwrap().name, "AskUserQuestion");
+        let payload = fixture("claude-ask-user-question-form.json");
+        let future = crate::question::claude_permission_request(
+            "future-form".into(),
+            "AskUserQuestion",
+            payload.get("tool_input"),
+            None,
+            None,
+            None,
+            1,
+            Some((2, 2, 0)),
+        )
+        .question;
+        assert_eq!(future.channel, AnswerChannel::Held);
+        assert_eq!(future.questions, q.questions);
+        let answers = future
+            .validate(
+                &[
+                    crate::question::QuestionAnswer {
+                        question_index: 0,
+                        option_indices: vec![4],
+                        text: Some("Purple".into()),
+                    },
+                    crate::question::QuestionAnswer {
+                        question_index: 1,
+                        option_indices: vec![1, 3],
+                        text: None,
+                    },
+                ],
+                false,
+            )
+            .expect("held form and its appended free-text answer remain available");
+        let decision = crate::question::claude_decision(
+            &future,
+            payload.get("tool_input"),
+            None,
+            &QuestionReply::answered(&future.id, answers),
+        )
+        .unwrap();
+        assert_eq!(
+            decision["hookSpecificOutput"]["decision"]["updatedInput"]["answers"]["Which colour?"],
+            "Purple"
+        );
     }
 
     /// Scenario: Claude Code's plan approval is a Plan question answered by
     /// keys, not held — a hook decision does not dismiss the plan dialog — with
-    /// its third option keyboard-only.
+    /// its third option keyboard-only; past the verified minor the whole plan is keyboard-only.
     #[spec("question/detect/004")]
     #[test]
     fn question_detect_004_claude_plan_is_keys_and_not_held() {
@@ -6237,12 +6399,50 @@ mod question_tests {
         )
         .unwrap();
         assert_eq!(keys, vec!["2"]);
+        for (version, covered) in [
+            (Some((2, 1, 135)), false),
+            (Some((2, 1, 136)), true),
+            (Some((2, 1, 999)), true),
+            (Some((2, 2, 0)), false),
+            (Some((3, 0, 0)), false),
+            (None, true),
+        ] {
+            let built = crate::question::claude_permission_request(
+                "versioned-plan".into(),
+                "ExitPlanMode",
+                payload.get("tool_input"),
+                None,
+                None,
+                None,
+                1,
+                version,
+            );
+            assert!(!built.hold);
+            assert_eq!(
+                built.question.channel,
+                if covered {
+                    AnswerChannel::Keys
+                } else {
+                    AnswerChannel::Unsupported
+                }
+            );
+            assert_eq!(
+                built.question.questions[0].options[0].keyboard_only,
+                !covered
+            );
+            assert_eq!(
+                built.question.questions[0].options[1].keyboard_only,
+                !covered
+            );
+            assert!(built.question.questions[0].options[2].keyboard_only);
+        }
     }
 
     /// Scenario: Codex 0.160.0's captured `PreToolUse` for a two-question
     /// `request_user_input` stays a ToolStart but carries a Choice question
     /// whose id is the call's `tool_use_id`, answered by keys, each question
     /// ending in a keyboard-only "None of the above".
+    /// On the newer 0.161 minor the form is keyboard-only.
     #[spec("question/detect/005")]
     #[test]
     fn question_detect_005_codex_request_user_input_form() {
@@ -6263,11 +6463,40 @@ mod question_tests {
         assert_eq!(labels(&q, 1), vec!["Small", "Large", "None of the above"]);
         assert!(q.questions[1].options[2].keyboard_only);
         assert!(q.questions.iter().all(|q| !q.multi_select));
+        let payload = fixture("codex-request-user-input.json");
+        let future = crate::question::codex_request_user_input(
+            payload.get("tool_use_id").and_then(Value::as_str),
+            payload.get("tool_input"),
+            1,
+            Some((0, 161, 0)),
+        )
+        .unwrap();
+        assert_eq!(future.channel, AnswerChannel::Unsupported);
+        assert!(
+            future
+                .validate(
+                    &[
+                        crate::question::QuestionAnswer {
+                            question_index: 0,
+                            option_indices: vec![1],
+                            text: None
+                        },
+                        crate::question::QuestionAnswer {
+                            question_index: 1,
+                            option_indices: vec![1],
+                            text: None
+                        },
+                    ],
+                    false
+                )
+                .is_err()
+        );
     }
 
     /// Scenario: A Codex `PermissionRequest` becomes a Permission question
     /// answered by the keys `1`, `p` and `3`, and Codex's `Interrupt` hook — what
     /// fires after a keyboard "No" — reads as Idle.
+    /// Past the verified minor, its permission options stay visible but a voice answer is refused.
     #[spec("question/detect/006")]
     #[test]
     fn question_detect_006_codex_permission_keys_and_interrupt() {
@@ -6303,6 +6532,54 @@ mod question_tests {
                 .is_some_and(|s| s.contains("touch codex_b.txt"))
         );
         assert_eq!(map_event_type("Interrupt"), Some(EventType::Idle));
+
+        for (version, covered) in [
+            (None, true),
+            (Some((0, 160, 0)), true),
+            (Some((0, 160, 99)), true),
+            (Some((0, 159, 99)), false),
+            (Some((0, 161, 0)), false),
+            (Some((1, 0, 0)), false),
+        ] {
+            let question = crate::question::codex_permission_request(
+                "versioned-permission".into(),
+                "shell",
+                Some("touch codex_b.txt".into()),
+                Some("touch codex_b.txt"),
+                1,
+                version,
+            );
+            assert_eq!(
+                question.channel,
+                if covered {
+                    AnswerChannel::Keys
+                } else {
+                    AnswerChannel::Unsupported
+                },
+                "Codex {version:?} must not use unverified menu keys"
+            );
+            assert_eq!(labels(&question, 0), labels(&q, 0));
+            assert!(
+                question.questions[0]
+                    .options
+                    .iter()
+                    .all(|o| o.keyboard_only != covered)
+            );
+            assert_eq!(
+                question
+                    .validate(
+                        &[crate::question::QuestionAnswer {
+                            question_index: 0,
+                            option_indices: vec![1],
+                            text: None,
+                        }],
+                        false
+                    )
+                    .is_ok(),
+                covered,
+                "voice answer on Codex {version:?}"
+            );
+        }
     }
 
     /// Scenario: A Devin `PermissionRequest` becomes a Permission question

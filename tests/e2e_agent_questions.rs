@@ -175,8 +175,8 @@ fn question_live_003_claude_keyboard_deny_refuses_late_answer() {
 }
 
 /// Scenario: Codex on a cheap model asks to run a command outside its read-only sandbox;
-/// approve through the client and observe the sentinel. Switch to Plan mode,
-/// answer a two-question form through keys, and see both answers reported.
+/// approve through the client and observe the sentinel, or on an unverified minor prove the refusal and answer by keyboard.
+/// Switch to Plan mode, answer a two-question form the same way, and see both answers reported.
 #[spec("question/live/004")]
 #[test]
 fn question_live_004_codex_permission_and_whole_form_by_keys() {
@@ -191,6 +191,28 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         )
     });
     skip_unless!(common::check_codex_available());
+    let version = std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    let line = String::from_utf8(version.stdout).unwrap();
+    let version = semver::Version::parse(
+        line.trim()
+            .strip_prefix("codex-cli ")
+            .unwrap_or(line.trim()),
+    )
+    .unwrap();
+    let covered = dot_agent_deck::agent_registry::CODEX_QUESTIONS.covers(Some((
+        version.major,
+        version.minor,
+        version.patch,
+    )));
+    let channel = if covered {
+        AnswerChannel::Keys
+    } else {
+        AnswerChannel::Unsupported
+    };
     let target = common::harness_tempdir().unwrap();
     let sentinel = target.path().join("question_codex_93de612b.txt");
     let command = format!(
@@ -218,7 +240,7 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         "Ask Codex to do anything",
     );
     let q = pending(&deck, &id, QuestionKind::Permission);
-    assert_eq!(q.channel, AnswerChannel::Keys);
+    assert_eq!(q.channel, channel, "Codex {version}");
     assert_eq!(
         q.questions[0]
             .options
@@ -234,10 +256,16 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
     visible(&deck, "Yes, proceed");
     visible(&deck, "No, and tell Codex what to do differently");
     assert!(!sentinel.exists());
-    assert_eq!(
-        answer(&deck, &id, &q, vec![selection(0, &[1])]),
-        AnswerReport::Answered
-    );
+    let report = answer(&deck, &id, &q, vec![selection(0, &[1])]);
+    if covered {
+        assert_eq!(report, AnswerReport::Answered);
+    } else {
+        assert_eq!(report, AnswerReport::Refused(AnswerRefusal::KeyboardOnly));
+        assert!(q.questions[0].options.iter().all(|o| o.keyboard_only));
+        assert!(!sentinel.exists(), "refused voice answer ran the command");
+        visible(&deck, "1. Yes, proceed");
+        deck.send_keys(b"1");
+    }
     assert!(
         common::wait_until(TURN, || sentinel.is_file()),
         "Codex command did not run:\n{}",
@@ -275,13 +303,19 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         "Ask Codex to do anything",
     );
     let q = pending(&deck, &id, QuestionKind::Choice);
-    assert_eq!(q.channel, AnswerChannel::Keys);
+    assert_eq!(q.channel, channel, "Codex {version}");
     assert_form(&q, false, "None of the above");
     visible(&deck, "None of the above");
-    assert_eq!(
-        answer(&deck, &id, &q, vec![selection(0, &[2]), selection(1, &[3])]),
-        AnswerReport::Answered
-    );
+    let report = answer(&deck, &id, &q, vec![selection(0, &[2]), selection(1, &[3])]);
+    if covered {
+        assert_eq!(report, AnswerReport::Answered);
+    } else {
+        assert_eq!(report, AnswerReport::Refused(AnswerRefusal::Unsupported));
+        visible(&deck, "2. Green");
+        deck.send_keys(b"2");
+        visible(&deck, "3. Large");
+        deck.send_keys(b"3");
+    }
     finished(&deck, &id);
     visible(&deck, "Green|Large");
 }

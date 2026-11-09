@@ -12598,7 +12598,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
 - **Layer:** L1/fast unit (`src/hook.rs`, the hook CLI's event builder on a captured Claude Code 2.1.289 payload, `tests/fixtures/agent-questions/claude-permission-bash.json`).
 - **Agent:** none (captured payload).
-- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id.
+- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id. On Claude 2.2 the held allow-once, always and deny options still validate and produce hook decisions.
 - **Does not assert:** that Claude Code draws exactly these labels — they come from the option table and are pinned by `question/live/*`.
 - **Platform coverage:** mac+linux.
 
@@ -12612,28 +12612,28 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/003 — A two-question `AskUserQuestion` form becomes a held Choice question with Claude Code's appended options.
 - **Layer:** L1/fast unit (`src/hook.rs`, `claude-ask-user-question-form.json`, reconstructed in the observed shape).
 - **Agent:** none.
-- **Asserts:** both questions with their prompts, headers and options, the second multi-select, and each followed by "Type something." (free text) and "Chat about this" (keyboard-only); channel held; the tool named so its own `ToolEnd` clears it.
+- **Asserts:** both questions with their prompts, headers and options, the second multi-select, and each followed by "Type something." (free text) and "Chat about this" (keyboard-only); channel held; the tool named so its own `ToolEnd` clears it. On Claude 2.2 the appended free-text answer still validates and appears in the hook decision.
 - **Does not assert:** that a real two-question form's payload matches the reconstruction (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/004 — Claude Code's plan approval is answered by keys and not held.
-- **Layer:** L1/fast unit (`src/hook.rs`, captured `ExitPlanMode` payload).
+- **Layer:** L1/fast unit (`src/hook.rs`, captured `ExitPlanMode` payload), and L2 lane 1 (`tests/e2e_question_versions.rs`, the real hook CLI with version-only executables on its isolated PATH).
 - **Agent:** none.
-- **Asserts:** a Plan question on the keys channel, its third option keyboard-only, the hook not holding it (a hook decision does not dismiss the plan dialog), and "manually approve" answered by the key `2`.
+- **Asserts:** a Plan question on the keys channel, its third option keyboard-only, the hook not holding it (a hook decision does not dismiss the plan dialog), and "manually approve" answered by the key `2`. Versions below 2.1.136 or past 2.1.x make the plan keyboard-only; patches above the verified patch and an unknown version stay covered. Through the CLI, 2.1.999 permits keys and 2.2.0 refuses them, while the same versions' Bash permission requests still print a hook allow decision.
 - **Does not assert:** the key `1`, which is inferred.
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/005 — Codex's `request_user_input` form rides its `ToolStart` and is answered by keys.
 - **Layer:** L1/fast unit (`src/hook.rs`, captured Codex 0.160.0 `PreToolUse`).
 - **Agent:** none.
-- **Asserts:** the event stays a `ToolStart` and carries a Choice question whose id and tool use id are the call's `tool_use_id`; each question ends in a keyboard-only "None of the above"; none is multi-select.
+- **Asserts:** the event stays a `ToolStart` and carries a Choice question whose id and tool use id are the call's `tool_use_id`; each question ends in a keyboard-only "None of the above"; none is multi-select. On Codex 0.161.0 the form uses the unsupported channel and refuses a client answer.
 - **Does not assert:** the keys themselves (`question/answer/003`).
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/006 — A Codex approval is answered by `1`, `p` and `3`, and Codex's `Interrupt` reads as Idle.
-- **Layer:** L1/fast unit (`src/hook.rs`, reconstructed Codex `PermissionRequest`).
+- **Layer:** L1/fast unit (`src/hook.rs`, reconstructed Codex `PermissionRequest`), and L2 lane 1 (`tests/e2e_question_versions.rs`, the real hook CLI with a version-only Codex on its isolated PATH).
 - **Agent:** none.
-- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle.
+- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle. Versions below 0.160.0 or past 0.160.x retain the labels but mark the options keyboard-only, use the unsupported channel and refuse answers; a patch above the verified patch and an unknown version remain covered. Through the CLI, for permission prompts and forms, 0.160.99 permits keys, 0.161.0 refuses them, and unreadable version output keeps the unknown-version fallback.
 - **Does not assert:** that Codex accepts those keys (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
@@ -12652,9 +12652,9 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/009 — A Devin permission request uses the docs-derived table, Allow once and Deny only.
-- **Layer:** L1/fast unit (`src/hook.rs`).
+- **Layer:** L1/fast unit (`src/hook.rs`), and L2 lane 1 (`tests/e2e_question_versions.rs`, the real hook CLI with a version-only Devin and a Claude-shaped permission fixture).
 - **Agent:** none (Devin is not logged in on any measured host).
-- **Asserts:** a Permission question on the keys channel with Devin's eight documented options, of which only Allow once and Deny are answerable.
+- **Asserts:** a Permission question on the keys channel with Devin's eight documented options, of which only Allow once and Deny are answerable. Through the CLI those answers are available on 3000.11.3 and keyboard-only on 3000.12.0.
 - **Does not assert:** anything about a real Devin: the table is documentation-derived and untested.
 - **Platform coverage:** mac+linux.
 
@@ -13210,10 +13210,10 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a keyboard allow or another client's simultaneous answer.
 - **Platform coverage:** mac+linux.
 
-##### question/live/004 — Codex approval and two-question Plan form accept the daemon's keys.
+##### question/live/004 — Codex approval and two-question Plan form accept verified keys or remain keyboard-answerable on an unverified minor.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Codex, cheap `common::codex_test_model()` (default gpt-5.1-codex-mini), read-only sandbox and on-request approvals.
-- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; client answers both questions and Codex reports Green/Large.
+- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; on a covered version client answers both questions and Codex reports Green/Large. On an unverified minor, client approval and form answers are refused, the permission's table options are keyboard-only and the refused approval creates no sentinel; answering the displayed choices by keyboard then completes the same command and form.
 - **Does not assert:** always-allow persistence or free-text notes.
 - **Platform coverage:** mac+linux.
 
