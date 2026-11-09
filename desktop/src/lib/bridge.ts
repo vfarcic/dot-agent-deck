@@ -4046,6 +4046,10 @@ export class TauriDeckBridge implements DeckBridge {
    * healthy deck.
    */
   private fleet = new Map<string, DeckSnapshot>();
+  // Broadcast history survives Refresh and a deck's first snapshot; snapshots
+  // do not replay past kept-worktree events. Membership still prunes it below.
+  private keptWorktrees = new Map<string, readonly KeptWorktree[]>();
+  private observedDeckIds?: ReadonlySet<string>;
   /**
    * Which deck the single-deck surfaces are bound to.
    *
@@ -4837,8 +4841,12 @@ export class TauriDeckBridge implements DeckBridge {
   private pruneFleet(observed: readonly string[] | undefined): void {
     if (!Array.isArray(observed) || observed.length === 0) return;
     const keep = new Set(observed);
+    this.observedDeckIds = keep;
     this.fleet.forEach((_, deckId) => {
       if (!keep.has(deckId)) this.fleet.delete(deckId);
+    });
+    this.keptWorktrees.forEach((_, deckId) => {
+      if (!keep.has(deckId)) this.keptWorktrees.delete(deckId);
     });
   }
 
@@ -4870,6 +4878,7 @@ export class TauriDeckBridge implements DeckBridge {
       selected ? this.evidence : undefined,
       selected ? this.handoffs : undefined,
     );
+    snapshot.keptWorktrees = this.keptWorktrees.get(dto.connection.deckId);
     this.agentIndex = snapshot.agents;
     /*
       PRD #742 M4 reset membership here because this was the ONLY moment a
@@ -4889,6 +4898,7 @@ export class TauriDeckBridge implements DeckBridge {
     this.fleet.set(dto.connection.deckId, snapshot);
     this.adoptUnconfigured(dto);
     this.adoptObserved(dto);
+    this.pruneFleet(dto.fleet);
     return this.fleetView();
   }
 
@@ -4940,6 +4950,7 @@ export class TauriDeckBridge implements DeckBridge {
       selected ? this.evidence : undefined,
       selected ? this.handoffs : undefined,
     );
+    mapped.keptWorktrees = this.keptWorktrees.get(deckId);
     this.fleet.set(deckId, mapped);
     /*
       AFTER the set, deliberately: a watcher that is itself being torn down can
@@ -4988,10 +4999,13 @@ export class TauriDeckBridge implements DeckBridge {
       // Kept work belongs to the emitting deck, even when another deck is selected.
       const payload = event.payload as { kind?: unknown; deck?: unknown; path?: unknown; confirmed_dirty?: unknown } | null;
       if (payload?.kind === "worktree_kept" && typeof payload.deck === "string" && typeof payload.path === "string" && typeof payload.confirmed_dirty === "boolean") {
+        if (this.observedDeckIds && !this.observedDeckIds.has(payload.deck)) return;
+        const kept = { path: payload.path, confirmed_dirty: payload.confirmed_dirty };
+        const history = [...(this.keptWorktrees.get(payload.deck) ?? []).filter((entry) => entry.path !== kept.path), kept].slice(-10);
+        this.keptWorktrees.set(payload.deck, history);
         const deck = this.fleet.get(payload.deck);
         if (deck) {
-          const kept = { path: payload.path, confirmed_dirty: payload.confirmed_dirty };
-          this.fleet.set(payload.deck, { ...deck, keptWorktrees: [...(deck.keptWorktrees ?? []).filter((entry) => entry.path !== kept.path), kept].slice(-10) });
+          this.fleet.set(payload.deck, { ...deck, keptWorktrees: history });
           onFleet(this.fleetView());
         }
         return;

@@ -82,25 +82,86 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
-  /** Scenario: another observed deck reports a kept directory after its agents close. The notice belongs to that deck, survives its next empty listing, and does not enter the selected deck's evidence. */
-  it("retains kept worktree broadcasts on the emitting deck after its cards disappear", async () => {
+  /** Scenario: two observed decks report kept directories, including a remote notice before its first listing or during Refresh. Their notices remain on the right Dashboard groups after Refresh and the next empty listing. */
+  it.each(["before bootstrap", "before first listing", "after first listing", "during Refresh", "after Refresh"])("retains kept worktree broadcasts on the emitting deck: %s", async (arrival) => {
     const { TauriDeckBridge } = await import("./bridge");
     const bridge = new TauriDeckBridge();
     const onFleet = vi.fn();
+    const local = structuredClone(snapshot);
+    local.fleet = [snapshot.connection.deckId!, "remote"];
+    invoke.mockImplementation(async (command: string) => command === "desktop_bootstrap" ? local : { ok: true });
+    await bridge.subscribe(onFleet, vi.fn());
+    const remote = structuredClone(local);
+    remote.connection.deckId = "remote";
+    const kept = { path: "/remote/project-dispatch-1674", confirmed_dirty: false };
+    const localKept = { path: "/local/project-dispatch-1674", confirmed_dirty: true };
+    const emitKept = () => listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", deck: "remote", ...kept } });
+    try {
+      listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", deck: local.connection.deckId, ...localKept } });
+      if (arrival === "before bootstrap") emitKept();
+      const connected = await bridge.connect();
+      expect(connected[0].keptWorktrees).toEqual([localKept]);
+      if (arrival === "before first listing") emitKept();
+      listeners.get("desktop://snapshot")?.({ payload: remote });
+      if (arrival === "after first listing") emitKept();
+      if (arrival === "before bootstrap" || arrival === "before first listing" || arrival === "after first listing") {
+        const listed = onFleet.mock.calls.at(-1)![0] as DeckFleet;
+        expect(listed.find((deck) => deck.connection.deckId === "remote")?.keptWorktrees).toEqual([kept]);
+      }
+
+      let finishRefresh!: (dto: DesktopSnapshotDto) => void;
+      invoke.mockImplementationOnce(() => new Promise<DesktopSnapshotDto>((resolve) => { finishRefresh = resolve; }));
+      const refreshing = bridge.connect();
+      await vi.waitFor(() => expect(finishRefresh).toBeTypeOf("function"));
+      if (arrival === "during Refresh") emitKept();
+      finishRefresh(local);
+      const refreshed = await refreshing;
+      // Bootstrap returns only the local deck: it is the control for the remote history.
+      expect(refreshed[0].keptWorktrees).toEqual([localKept]);
+      if (arrival === "after Refresh") emitKept();
+      remote.agents = [];
+      listeners.get("desktop://snapshot")?.({ payload: remote });
+      const fleet = onFleet.mock.calls.at(-1)![0] as DeckFleet;
+      expect(fleet.find((deck) => deck.connection.deckId === "remote")?.keptWorktrees).toEqual([kept]);
+      expect(fleet.find((deck) => deck.connection.deckId === local.connection.deckId)?.keptWorktrees).toEqual([localKept]);
+    } finally {
+      await bridge.dispose();
+    }
+  });
+
+  /** Scenario: a remote deck reports repeated kept directories before its first listing. The Dashboard keeps its ten latest paths, but forgets them when the deck leaves observation, including late events and a later return. */
+  it.each(["snapshot", "Refresh"])("bounds kept worktree history and discards departed decks on %s", async (departure) => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const onFleet = vi.fn();
+    const local = structuredClone(snapshot);
+    local.fleet = [snapshot.connection.deckId!, "remote"];
+    invoke.mockImplementation(async (command: string) => command === "desktop_bootstrap" ? local : { ok: true });
     await bridge.subscribe(onFleet, vi.fn());
     await bridge.connect();
-    const remote = structuredClone(snapshot);
+    const remote = structuredClone(local);
     remote.connection.deckId = "remote";
-    remote.fleet = [snapshot.connection.deckId!, "remote"];
-    listeners.get("desktop://snapshot")?.({ payload: remote });
-    const kept = { path: "/remote/project-dispatch-1674", confirmed_dirty: false };
-    listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", deck: "remote", ...kept } });
     remote.agents = [];
-    listeners.get("desktop://snapshot")?.({ payload: remote });
-    const fleet = onFleet.mock.calls.at(-1)![0] as DeckFleet;
-    expect(fleet.find((deck) => deck.connection.deckId === "remote")?.keptWorktrees).toEqual([kept]);
-    expect(fleet.find((deck) => deck.connection.deckId === snapshot.connection.deckId)?.keptWorktrees).toBeUndefined();
-    await bridge.dispose();
+    const kept = Array.from({ length: 11 }, (_, index) => ({ path: `/remote/dispatch-${index}`, confirmed_dirty: false }));
+    const emitKept = (entry: typeof kept[number]) => listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", deck: "remote", ...entry } });
+    try {
+      kept.forEach(emitKept);
+      const updated = { ...kept[1], confirmed_dirty: true };
+      emitKept(updated);
+      listeners.get("desktop://snapshot")?.({ payload: remote });
+      const fleet = onFleet.mock.calls.at(-1)![0] as DeckFleet;
+      expect(fleet.find((deck) => deck.connection.deckId === "remote")?.keptWorktrees).toEqual([...kept.slice(2), updated]);
+
+      local.fleet = [local.connection.deckId!];
+      if (departure === "Refresh") await bridge.connect();
+      else listeners.get("desktop://snapshot")?.({ payload: local });
+      emitKept(kept[0]);
+      listeners.get("desktop://snapshot")?.({ payload: remote });
+      const returned = onFleet.mock.calls.at(-1)![0] as DeckFleet;
+      expect(returned.find((deck) => deck.connection.deckId === "remote")?.keptWorktrees).toBeUndefined();
+    } finally {
+      await bridge.dispose();
+    }
   });
 
   /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence; keyboard input rejects as not attached and no PTY bytes move. */
