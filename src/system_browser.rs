@@ -901,9 +901,16 @@ mod tests {
             shown,
             "Opening https://github.com/o/r/pull/5 in the browser"
         );
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(30)).unwrap(),
-            "Opened https://github.com/o/r/pull/5"
+        // Either settled outcome of a launch that went through: on a loaded
+        // macOS box the first launch of a freshly written script can outlast
+        // `LAUNCH_GRACE` (its first-launch assessment took 8-10 s, PR #2177),
+        // and the watch then settles as still running. What this test is
+        // about is that the launch was allowed and its watch freed the slot.
+        let settled = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(
+            settled == "Opened https://github.com/o/r/pull/5"
+                || settled == "Opening https://github.com/o/r/pull/5 in the browser",
+            "the launch after a freed slot went through: {settled}"
         );
         assert!(
             SLOTS.claim().is_some(),
