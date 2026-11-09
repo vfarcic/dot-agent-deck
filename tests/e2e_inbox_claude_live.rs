@@ -139,6 +139,7 @@ impl Claude {
     /// installs its editor helper into (`support/claude_installed.rs`), so
     /// the production tick checks a touched input box. Run only where
     /// [`installed::checkable`] holds.
+    #[cfg(target_os = "linux")]
     fn installed() -> Self {
         let installed = installed::Installed::new(&[]);
         installed.assert_installed();
@@ -151,32 +152,38 @@ impl Claude {
 
     /// The input box's text, `None` while it isn't drawn (as during the
     /// deck's check, when Claude Code hands the box to the helper).
+    #[cfg(target_os = "linux")]
     fn input_box(&self) -> Option<String> {
         installed::input_box(&self.pane_grid())
     }
 
     /// The ops that reached the pane's writer since byte `since` of the log.
+    #[cfg(target_os = "linux")]
     fn ops(&self, since: usize) -> Vec<installed::Op> {
         installed::ops_in(self.log().get(since..).unwrap_or(""))
     }
 
     /// The doorbell tick's checks since byte `since` of the log, each its
     /// outcome's text.
+    #[cfg(target_os = "linux")]
     fn checks(&self, since: usize) -> Vec<String> {
         installed::checks_in(self.log().get(since..).unwrap_or(""))
     }
 
     /// What the person typed into the pane since byte `since` of the log.
+    #[cfg(target_os = "linux")]
     fn human_in(&self, since: usize) -> String {
         installed::human_in(self.log().get(since..).unwrap_or(""), &self.pane.agent)
     }
 
     /// Read the agent's composer using its actual PTY geometry, rather than
     /// interpreting its bytes at the stand-in's fixed size.
+    #[cfg(target_os = "linux")]
     fn pane_grid(&self) -> String {
         self.pane_frame().0
     }
 
+    #[cfg(target_os = "linux")]
     fn pane_frame(&self) -> (String, (u16, u16)) {
         let record = self.record();
         let raw = common::pane_snapshot_on(self.deck.attach_socket_path(), &self.pane.agent);
@@ -192,6 +199,7 @@ impl Claude {
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn composer(&self) -> Option<String> {
         if self
             .pane_grid()
@@ -211,6 +219,7 @@ impl Claude {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn expect_composer(&self, expected: &str) {
         assert!(
             common::wait_until(Duration::from_secs(10), || self.composer().as_deref()
@@ -221,6 +230,7 @@ impl Claude {
         );
     }
 
+    #[cfg(target_os = "linux")]
     fn forwarded(&self, since: usize, payload: &str) -> bool {
         self.log().get(since..).unwrap_or("").lines().any(|line| {
             line.contains("STREAM_IN forwarded to PTY writer")

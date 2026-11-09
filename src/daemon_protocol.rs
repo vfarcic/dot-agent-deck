@@ -4764,7 +4764,7 @@ pub struct ComposerCapDrops {
 
 /// How long `observer-hold` waits for a pass already running to finish
 /// before answering that it hasn't (Q105b.2).
-#[cfg(feature = "e2e")]
+#[cfg(all(feature = "e2e", target_os = "linux"))]
 const OBSERVER_HOLD_BOUND: Duration = Duration::from_secs(30);
 
 /// PRD #1666 part 3 (Q105b.2): `agent`'s observer status, read and

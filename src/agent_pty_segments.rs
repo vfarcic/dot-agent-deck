@@ -135,6 +135,9 @@ pub(crate) enum ProbeAsk {
 
 /// What a probe request did.
 #[cfg(any(target_os = "linux", feature = "e2e"))]
+// Off Linux the `e2e` build keeps the type for the wire, but only Linux code
+// constructs these variants.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
     /// Not due by the generation's schedule: nothing was scheduled,
