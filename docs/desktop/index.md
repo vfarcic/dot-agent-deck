@@ -32,7 +32,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
 | Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
 | Upgrade the app to a newer release, and the `dot-agent-deck` CLI on this machine with it when that is behind too | The upgrade button at the bottom of the rail, or **Upgrade…** on the Dashboard's banner | [Upgrade the app](#upgrade-the-app) |
-| Upgrade the `dot-agent-deck` CLI and the daemon on this machine while the app is current | **Upgrade** on the **Local daemon** section of the Dashboard | [Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine) |
+| Upgrade this machine's copies, starting with the app when it can upgrade itself or needs a relaunch | **Upgrade** on the **Local daemon** section of the Dashboard | [Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
 | Sign out of GitHub in the app's pull request page | **Settings → GitHub** | [Settings → GitHub](settings.md#github) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
