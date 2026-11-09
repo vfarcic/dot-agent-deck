@@ -12599,6 +12599,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Layer:** L1/fast unit (`src/hook.rs`, the hook CLI's event builder on a captured Claude Code 2.1.289 payload, `tests/fixtures/agent-questions/claude-permission-bash.json`).
 - **Agent:** none (captured payload).
 - **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id.
+- **Version coverage:** Yes, the suggested always grant and No validate and map to hook decisions on 2.2 and 3.0 as well as the supported minimum; auto mode stays keyboard-only, and the lower hook-version bound is preserved.
 - **Does not assert:** that Claude Code draws exactly these labels — they come from the option table and are pinned by `question/live/*`.
 - **Platform coverage:** mac+linux.
 
@@ -12613,6 +12614,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Layer:** L1/fast unit (`src/hook.rs`, `claude-ask-user-question-form.json`, reconstructed in the observed shape).
 - **Agent:** none.
 - **Asserts:** both questions with their prompts, headers and options, the second multi-select, and each followed by "Type something." (free text) and "Chat about this" (keyboard-only); channel held; the tool named so its own `ToolEnd` clears it.
+- **Version coverage:** on Claude 2.2 the held form's appended free-text answer stays answerable and Chat about this stays keyboard-only.
 - **Does not assert:** that a real two-question form's payload matches the reconstruction (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
@@ -12634,6 +12636,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Layer:** L1/fast unit (`src/hook.rs`, reconstructed Codex `PermissionRequest`).
 - **Agent:** none.
 - **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle.
+- **Version coverage:** 0.160.0, later patches and an unknown version retain answerable options; older versions and newer minors/majors have unsupported channels and keyboard-only options, refused by validation.
 - **Does not assert:** that Codex accepts those keys (`question/live/*`).
 - **Platform coverage:** mac+linux.
 
@@ -12735,6 +12738,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Asserts:** Claude Code's `PermissionRequest` names no call and fingerprints its input like the call's `PreToolUse`, and unlike another command's; applied to state, the question ties to that call, survives the other call's `PostToolUse` on Needs Input, and clears on its own. OpenCode's `permission.asked` puts `tool.callID` in `tool.use_id`, a `tool.execute.after` carries its `call_id` as `tool_use_id`, and only the matching call's end clears it.
 - **Does not assert:** live agents running parallel calls; Codex's `PreToolUse` and `PermissionRequest` inputs agreeing.
 - **Platform coverage:** mac+linux.
+##### question/detect/021 — The hook CLI discovers the agent version before offering typed answers.
+- **Layer:** L2 real-binary subprocess (`tests/e2e_question_versions.rs`), lane 1.
+- **Agent:** none (version-only shell stand-ins for Codex and Claude Code; a socket stand-in captures and releases the hook's question).
+- **Asserts:** the hook probes once with `--version`; Codex 0.160.99 remains answerable, 0.161.0 is unsupported with keyboard-only options, and an unparseable version keeps the unknown-version fallback; Claude 2.2 plan approval becomes keyboard-only while its held permission answers remain answerable.
+- **Does not assert:** the version of a running process when PATH or the installed agent changed; microphone, voice matching or rendering; a real agent accepting an answer.
+- **Platform coverage:** mac+linux.
+
 #### question/state
 
 ##### question/state/001 — A question event sets the pending question and Needs Input.
@@ -13210,10 +13220,10 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a keyboard allow or another client's simultaneous answer.
 - **Platform coverage:** mac+linux.
 
-##### question/live/004 — Codex approval and two-question Plan form accept the daemon's keys.
+##### question/live/004 — Codex approval and a two-question Plan form use verified keys or fall back to the keyboard.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Codex, cheap `common::codex_test_model()` (default gpt-5.1-codex-mini), read-only sandbox and on-request approvals.
-- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; client answers both questions and Codex reports Green/Large.
+- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; on a covered agent version client answers succeed, and outside it the permission answer is refused as keyboard-only and the form as unsupported, after which real keyboard input completes both; Codex reports Green/Large.
 - **Does not assert:** always-allow persistence or free-text notes.
 - **Platform coverage:** mac+linux.
 

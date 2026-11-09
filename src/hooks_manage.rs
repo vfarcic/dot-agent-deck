@@ -295,6 +295,21 @@ fn probe_claude_version(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
 ) -> (bool, Option<String>) {
+    let line = probe_version_line(program, timeout);
+    (
+        line.as_deref()
+            .is_some_and(claude_version_accepts_stop_failure),
+        line,
+    )
+}
+
+/// Run a version-only command with the same bounded stdout and process-tree
+/// cleanup as the Claude install probe. Question hooks reuse it for the agent
+/// command resolved on their PATH; failure leaves the version unknown.
+pub(crate) fn probe_version_line(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> Option<String> {
     let mut command = std::process::Command::new(program);
     command
         .arg("--version")
@@ -308,7 +323,7 @@ fn probe_claude_version(
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return (false, None),
+        Err(_) => return None,
     };
     // Windows has no process group to spawn into: contain the tree in a Job
     // Object instead, so `kill_probe` reaps a launcher's helpers too (Qodo on
@@ -326,7 +341,7 @@ fn probe_claude_version(
         // Deadline passed with no line. The child is not reaped yet (a zombie
         // at worst), so its pid still names its group.
         kill_probe(&mut child, &tree);
-        return (false, None);
+        return None;
     };
     // The line is in; it counts only if the child also exits on its own
     // within what is left of the deadline. A version command that prints a
@@ -335,23 +350,19 @@ fn probe_claude_version(
     // `PATH` resolves to, and a wrong `true` disables every deck hook.
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) => return None,
             Ok(None) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
             _ => {
                 kill_probe(&mut child, &tree);
-                return (false, None);
+                return None;
             }
         }
     }
     let output = String::from_utf8_lossy(&output);
-    let line = output.lines().next().map(|l| l.trim().to_string());
-    (
-        line.as_deref()
-            .is_some_and(claude_version_accepts_stop_failure),
-        line,
-    )
+    output.lines().next().map(|l| l.trim().to_string())
 }
 
 /// Read the version probe's stdout on the calling thread until a newline, EOF,
@@ -2658,6 +2669,17 @@ mod tests {
         crate::test_isolation::write_script(&path, body).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_version_command_does_not_supply_a_version_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = stand_in_claude(dir.path(), "#!/bin/sh\nprintf '2.1.300\\n'\nexit 1\n");
+        assert_eq!(
+            probe_version_line(program.as_os_str(), std::time::Duration::from_secs(2)),
+            None
+        );
     }
 
     /// Issue #714 (audit A2): a stand-in `claude` that exits at once but leaves
