@@ -1440,7 +1440,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, worktreeClosePreview(runtime, deck.connection, [agent], deck.agents)));
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, worktreeClosePreview(runtime, deck.connection, [agent])));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -1452,7 +1452,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         setConfirm({
           title: `Close ${title}?`,
           body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
-          preview: worktreeClosePreview(runtime, deck.connection, group.agents, deck.agents),
+          preview: worktreeClosePreview(runtime, deck.connection, group.agents),
           label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
           busyLabel: "Stopping…",
           action: () => run({ type: "stop_orchestration", deckId, roles }),

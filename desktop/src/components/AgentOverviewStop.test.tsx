@@ -91,7 +91,8 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
    * Scenario: closing a dispatched unit whose worktree is dirty asks the daemon
    * for a preview before the close can be confirmed. While that request is in
    * flight the destructive button waits; its answer then warns in the dialog,
-   * using the TUI's words and naming the directory that will be kept.
+   * using the TUI's words and naming the directory that will be kept. The
+   * daemon's answer wins even when a sibling listed at dialog-open has since closed.
    */
   it("warns before closing a dispatched unit whose worktree will be kept", async () => {
     let answer!: (kept: { path: string; confirmedDirty: boolean } | undefined) => void;
@@ -105,9 +106,9 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(within(dialog).getByRole("button", { name: "Close agent" })).toBeDisabled();
     expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41"], "listed-process-a");
 
-    await act(async () => { answer({ path: "/home/build/demo-project-dispatch-issue-1674", confirmedDirty: true }); });
+    await act(async () => { answer({ path: "/home/build/demo-project", confirmedDirty: true }); });
     expect(dialog).toHaveTextContent("Uncommitted work here is KEPT, not deleted:");
-    expect(dialog).toHaveTextContent("/home/build/demo-project-dispatch-issue-1674");
+    expect(dialog).toHaveTextContent("/home/build/demo-project");
     expect(within(dialog).getByRole("button", { name: "Close agent" })).toBeEnabled();
   });
 
@@ -124,9 +125,9 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41", "pane-42"], "listed-process-a");
   });
 
-  /** Scenario: closing only one role while its sibling still uses the same worktree cannot keep or remove that tree, so the sibling-safe preview shows no warning. */
+  /** Scenario: closing only one role while its sibling still uses the same worktree cannot keep or remove that tree, so the daemon answers with no kept-tree preview. */
   it("does not forecast a kept worktree while a surviving role still uses it", async () => {
-    const previewWorktreeClose = vi.fn(async () => ({ path: "/home/build/demo-project", confirmedDirty: true }));
+    const previewWorktreeClose = vi.fn(async () => undefined);
     const current = { ...runtime(vi.fn()), previewWorktreeClose } as DeckRuntimeState;
     render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
 

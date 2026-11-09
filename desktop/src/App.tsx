@@ -926,7 +926,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
-    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, worktreeClosePreview(runtime, paneDeck.connection, [paneAgent], paneDeck.agents));
+    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, worktreeClosePreview(runtime, paneDeck.connection, [paneAgent]));
     setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
@@ -2243,7 +2243,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     setConfirm({
       title: `Close ${selectedAgent.role}?`,
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
-      preview: worktreeClosePreview(runtime, snapshot.connection, [selectedAgent], snapshot.agents),
+      preview: worktreeClosePreview(runtime, snapshot.connection, [selectedAgent]),
       label: "Close agent",
       busyLabel: "Stopping…",
       action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },

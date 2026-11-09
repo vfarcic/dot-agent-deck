@@ -305,6 +305,16 @@ async fn kept_worktree_preview_with(
             continue;
         }
         seen.push(worktree.clone());
+        let survivor = records.iter().any(|record| {
+            record
+                .pane_id_env
+                .as_ref()
+                .is_none_or(|pane_id| !pane_ids.contains(pane_id))
+                && worktree_of_record(record).as_deref() == Some(worktree.as_path())
+        });
+        if survivor {
+            continue;
+        }
         let policy = worktrees
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4601,6 +4611,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn kept_worktree_preview_is_silent_while_an_unclosed_sibling_uses_the_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-team");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        std::fs::write(wt.join("scratch.txt"), "work from the closing role").unwrap();
+
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", &wt), pane_in("pane-2", &wt)];
+
+        assert_eq!(
+            kept_worktree_preview(&records, &reg, &["pane-1".to_string()], PROBE).await,
+            None,
+            "the surviving sibling keeps the worktree open, so this close cannot keep it"
+        );
+        assert!(
+            kept_worktree_preview(
+                &records,
+                &reg,
+                &["pane-1".to_string(), "pane-2".to_string()],
+                PROBE
+            )
+            .await
+            .is_some(),
+            "closing every role still previews their shared dirty worktree"
+        );
+        assert!(
+            kept_worktree_preview(&records[..1], &reg, &["pane-1".to_string()], PROBE)
+                .await
+                .is_some(),
+            "a sibling that has already closed is absent from the current records"
+        );
+    }
+
+    #[tokio::test]
     async fn kept_worktree_preview_is_silent_for_a_clean_tree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
@@ -4691,6 +4737,7 @@ mod tests {
 
         let panes = vec![
             "not-a-pane-the-daemon-knows".to_string(),
+            "role-0".to_string(),
             "role-1".to_string(),
         ];
         let kept = kept_worktree_preview(&records, &reg, &panes, PROBE)
