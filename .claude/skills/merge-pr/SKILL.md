@@ -1,6 +1,6 @@
 ---
 name: merge-pr
-description: 'Merge one pull request into `main` in this repo, then watch `main` until its CI for that merge has finished, and own a red. Confirms the PR is approved for its current head and every required check passed, runs the overlap check (has `main` changed the PR''s files since its CI ran), merges pinned to the checked head, and waits for the push run of the merge commit. Use whenever you are about to run `gh pr merge` in this repo for any reason, by hand or from inside another skill: `/issue-queue`''s bug-fix units, `/land-prs`, `/code-cleanup` and any other skill that merges point here instead of carrying their own copy. Not for arming auto-merge (`gh pr merge --auto`), where nobody is present after the merge; `/pr-create` covers that.'
+description: 'Merge one pull request into `main` in this repo, then watch `main` until its CI for that merge has finished, and own a red. Confirms the PR is approved for its current head and every required check passed, runs the overlap check (has `main` changed the PR''s files since its CI ran), merges pinned to the checked head, and waits for the push run of the merge commit. Use whenever you are about to run `gh pr merge` in this repo for any reason, by hand or from inside another skill: `/issue-queue`''s bug-fix units, `/land-prs`, `/code-cleanup` and any other skill that merges point here instead of carrying their own copy. Agents never arm auto-merge (`gh pr merge --auto`) in this repo (CLAUDE.md rule 8); this skill is how they merge.'
 user-invocable: true
 ---
 
