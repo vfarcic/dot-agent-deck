@@ -9535,15 +9535,18 @@ pub mod child_lifetime_bound;
 ///
 /// A test binary that also runs as a fixture child (a copy of itself
 /// standing in for an agent, chosen by an environment variable before
-/// libtest starts) names that entry point, so it runs first, before the
-/// harness scrubs the deck variables the child was spawned with:
+/// libtest starts) names that entry point, and the constructor calls it once
+/// the harness is set up — the entry uses harness helpers, and reads its own
+/// initial environment back from `/proc/self/environ` for what the detach
+/// removed:
 ///
 /// ```ignore
-/// dot_agent_deck_test_harness::link!(before = live::native_entry);
+/// dot_agent_deck_test_harness::link!(then = live::native_entry);
 /// ```
 ///
 /// A separate constructor would not do: the order two constructors run in is
-/// not something either can rely on.
+/// not something either can rely on, and these binaries failed on Linux when
+/// the entry ran first.
 ///
 /// It does three things. It names this crate `common` at the test crate's
 /// root, so `common::…` and `crate::common::…` paths read as they did when the
@@ -9568,9 +9571,9 @@ pub mod child_lifetime_bound;
 #[macro_export]
 macro_rules! link {
     () => {
-        $crate::link!(before = $crate::__no_fixture_entry);
+        $crate::link!(then = $crate::__no_fixture_entry);
     };
-    (before = $entry:path) => {
+    (then = $entry:path) => {
         #[allow(unused_imports)]
         use $crate as common;
         #[allow(unused_imports)]
@@ -9581,10 +9584,6 @@ macro_rules! link {
             /// #2083): see `dot_agent_deck_test_harness::link!`.
             #[ctor(unsafe)]
             fn __dot_agent_deck_test_harness_before_main() {
-                // A binary that also runs as a fixture child picks that role
-                // here, before the harness touches the environment the child
-                // was handed; the normal test process returns from it.
-                $entry();
                 // SAFETY: this is a pre-main constructor, so no other thread
                 // exists yet — the condition both functions document.
                 unsafe {
@@ -9595,6 +9594,10 @@ macro_rules! link {
                     env!("CARGO_BIN_EXE_dot-agent-deck"),
                     env!("DAD_BUILD_ID"),
                 );
+                // A binary that also runs as a fixture child picks that role
+                // here, with the harness already set up; the normal test
+                // process returns from it.
+                $entry();
             }
         }
     };

@@ -6,10 +6,9 @@
 //! that use them are S-20b's and S-20c's.
 
 // The fixture child is selected by its private environment before libtest
-// parses an agent's injected arguments, and before the harness's own pre-main
-// set-up scrubs the deck variables it was spawned with. The normal test
-// process returns from it.
-dot_agent_deck_test_harness::link!(before = live::native_entry);
+// parses an agent's injected arguments, once the harness's pre-main set-up has
+// run. The normal test process returns from it.
+dot_agent_deck_test_harness::link!(then = live::native_entry);
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]
