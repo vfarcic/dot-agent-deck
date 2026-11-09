@@ -8,7 +8,7 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
+import { appFirst, LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
@@ -1253,10 +1253,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
-  /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */
+  /** Issue #1753 — Upgrade on the Local daemon section: the app, the CLI, the daemon, or any of them together. */
   const [localUpgrade, setLocalUpgrade] = useState<LocalUpgradeRequest>();
   /* The CLI's plan while it is behind and this app can upgrade it. */
   const cliPlan = selfUpgrade?.api ? cliBehind(selfUpgrade.check) : undefined;
+  /* The app's plan while the Local daemon section must lead with it (issue #1962). */
+  const appPlan = selfUpgrade?.check && selfUpgrade.api && appFirst(selfUpgrade.check) ? selfUpgrade.check.app : undefined;
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
    * order they render, as one sequence. Declared whenever they are on screen
@@ -1315,12 +1317,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       : undefined;
     const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
     if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
-    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
-    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const copies = selfUpgrade?.check && selfUpgrade.api && (cliPlan || (appPlan && daemon)) ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
+    if (!copies) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const covered = [appPlan ? "Agent Deck" : undefined, cliPlan ? "the CLI" : undefined, daemon ? "the daemon" : undefined].filter((name): name is string => name !== undefined);
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
-      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
-      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies }),
+      upgradeLabel: `Upgrade ${covered.length > 1 ? `${covered.slice(0, -1).join(", ")} and ` : ""}${covered.at(-1)} on this machine`,
+      upgradeTitle: [appPlan ? displayText(appPlan.headline, DISPLAY_LIMITS.message) : undefined, cliPlan ? displayText(cliPlan.headline, DISPLAY_LIMITS.message) : undefined, daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
     };
   };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
