@@ -95,6 +95,10 @@ To watch or talk to one agent:
 4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
 5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
+To end the agent instead, press the red **Close agent** button with the stop icon in the pane's header. The same `Close <name>?` confirmation as on the Dashboard asks before stopping it. **Cancel** (or `Escape`) leaves the agent and its pane open; confirming stops that agent and returns you to the Dashboard. For an orchestration role, the confirmation warns that this closes just that role: the other roles keep running, leaving the orchestration one role short. To close the whole orchestration, return to the Dashboard and use **Close** on its group header.
+
+With voice on and typing mode off, say **"stop"**, **"stop it"**, **"stop that"** or **"close this agent"** on its own to open that confirmation; you still confirm by hand. In typing mode, "stop" interrupts the agent's turn instead of ending its session. Say "typing off" before asking to close the agent. See [Voice Control](voice.md#interrupt-clear-and-scratch-that). In the TUI, enter command mode (`Ctrl+D`), select the agent's card on the dashboard and press `Ctrl+W`, then choose **Close**. On an orchestration tab, that key asks to close the whole orchestration instead.
+
 The TUI copies differently: a mouse drag in a pane copies when you release the button, whichever agent is running, and when an agent copies something itself, the TUI passes that on to your terminal too. Whether either reaches your clipboard depends on your terminal, which has to let programs set the clipboard. Some ask first or need it turned on, such as tmux, which needs `set-clipboard on`.
 
 In either client, some agents (Codex and Pi among them) copy straight to the clipboard of the machine they run on, and ask the terminal only when that fails or when they run over SSH. When the daemon runs on another machine that has its own clipboard, such an agent's copy lands on that machine's clipboard, not yours.
@@ -103,7 +107,7 @@ The pane's header names the agent by the name its row shows, which is its role's
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
-![An agent's full-window pane: the header reads Desktop implementation with a RUNNING status and codex below it, with a close control on the right; under it the agent's assignment and a row of time, token, cost and context readings, each with its label on the same line, then the Terminal tab showing the agent's live output: the files it read and edited, a test run that passed, and its summary](/img/agent-pane-desktop.png)
+![An agent's full-window pane: Desktop implementation is running, with a red Close agent stop-icon button and a separate Back to dashboard cross in the header; its assignment, readings and Terminal tab appear below, with the agent's live output](/img/agent-pane-desktop.png)
 
 What can go wrong in the pane:
 
@@ -150,7 +154,7 @@ The TUI shows the same pull request on the agent's card, as `#1234` with a glyph
 
 ## Closing agents and orchestrations
 
-- **Stop one agent:** press the stop control on its row (`Close <name> agent`). The confirmation, `Close <name>?`, names the daemon the stop request goes to. Press **Close agent**.
+- **Stop one agent:** press the stop control on its row (`Close <name> agent`), or **Close agent** in its full-window pane. The confirmation, `Close <name>?`, names the daemon the stop request goes to. For an orchestration role it warns that the other roles keep running. Press **Close agent**. Closing from the pane returns you to the Dashboard.
 - **Stop every role of an orchestration:** press **Close** on its group header. The confirmation lists every role it will stop. Press **Close all N roles** (or **Close 1 role**).
 
 **Check it worked:** the row, or the whole group, disappears from the section. If the app cannot confirm that some roles stopped, it says how many may still be running on which daemon, in a message on the Dashboard and in the New agent dialog; open the TUI against that daemon, or run `dot-agent-deck daemon status` on its host, to see what is still there.

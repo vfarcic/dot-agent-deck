@@ -1295,7 +1295,7 @@ async fn rollback_dispatched_worktree(
     branch: &str,
 ) -> RollbackOutcome {
     let live = crate::issue_dispatch_run::agents_rooted_in_worktree(
-        &registry.agent_records(),
+        &registry.agent_records_for_worktree_cleanup(),
         worktree_dir,
     );
     if live > 0 {

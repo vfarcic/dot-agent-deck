@@ -850,6 +850,12 @@ pub enum AgentPtyError {
     Resize(String),
     #[error("Agent {0} not found")]
     NotFound(String),
+    /// The registry generation was retired and its force-kill was issued, but
+    /// the OS had not reported the child's exit when the bounded reap expired.
+    #[error(
+        "could not confirm that agent {id} exited within the reap deadline; it may still be running (force-kill reported no error: {kill_reported_ok})"
+    )]
+    TerminationUnconfirmed { id: String, kill_reported_ok: bool },
     /// Caller-supplied spawn metadata failed validation. Surfaced to the
     /// attach client via `AttachResponse::err` so a malformed spawn fails
     /// loudly instead of silently dropping the bad field (PRD #76 M2.12
@@ -9764,6 +9770,47 @@ pub(crate) const PANE_CLOSE_RECREATE_TIMEOUT: Duration =
 /// resolves within one tick of the close it is waiting on.
 const PANE_CLOSE_SETTLE_POLL: Duration = Duration::from_millis(50);
 
+/// The process-owned parts of a generation whose close retired its record but
+/// whose child has not confirmed an exit. Keeping the child and its process
+/// group lets a later close retry the bounded reap instead of starting over
+/// with no handle or mistaking the retired record for a confirmed exit.
+struct UnconfirmedChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    process_group: crate::platform::proc::AgentProcessGroup,
+    removal: Arc<RemovalEvidence>,
+}
+
+/// The cleanup and directory-ownership metadata of an unconfirmed child. This
+/// entry stays visible while a retry has `child` checked out, so a concurrent
+/// unit close and worktree removal still see that the generation is unresolved.
+struct UnconfirmedAgent {
+    record: AgentRecord,
+    root_dirs: Vec<PathBuf>,
+    child: Option<UnconfirmedChild>,
+    kill_reported_ok: bool,
+    /// Set when a successor claims the pane, mirroring
+    /// [`RunningAgent::pane_handed_over`] for cleanup authorization.
+    pane_handed_over: bool,
+}
+
+/// The process-owned fields the shared shutdown kill/reap passes need. Both a
+/// registered agent and a retained unconfirmed child drain into this shape.
+struct ShutdownChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    process_group: crate::platform::proc::AgentProcessGroup,
+    pane_id_env: Option<String>,
+}
+
+impl From<RunningAgent> for ShutdownChild {
+    fn from(agent: RunningAgent) -> Self {
+        Self {
+            child: agent.child,
+            process_group: agent.process_group,
+            pane_id_env: agent.pane_id_env,
+        }
+    }
+}
+
 struct RegistryInner {
     next_id: u64,
     /// PRD #1487 re-check R2: respawns between lifting their old record out
@@ -9810,6 +9857,10 @@ struct RegistryInner {
     /// never silently overwrite somebody else's constraint.
     next_viewer_id: u64,
     agents: HashMap<String, RunningAgent>,
+    /// Retired generations whose children have not confirmed an exit. They do
+    /// not occupy their pane or block a successor, but remain close members and
+    /// keep their working directories protected until a retry collects an exit.
+    unconfirmed_agents: HashMap<String, UnconfirmedAgent>,
     /// Issue #1077 — every pane id this daemon has ever issued a hook capability
     /// token for, kept for the life of the daemon and deliberately NOT derived
     /// from `agents`.
@@ -10526,6 +10577,7 @@ impl AgentPtyRegistry {
                 focused_client: None,
                 next_viewer_id: 1,
                 agents: HashMap::new(),
+                unconfirmed_agents: HashMap::new(),
                 hook_token_panes: HashSet::new(),
                 #[cfg(unix)]
                 prepared_pane_dirs: HashMap::new(),
@@ -12402,8 +12454,8 @@ impl AgentPtyRegistry {
     /// against anything armed in the window) and then clears the closing mark.
     ///
     /// `closed` distinguishes the outcomes but the rollback is deliberately
-    /// asymmetric: on a FAILED close the pane is un-marked so the still-live
-    /// agent can be delegated to again, but the records swept at `begin` are
+    /// asymmetric: on a FAILED close the pane is un-marked so a live agent can
+    /// be delegated to again, but the records swept at `begin` are
     /// **not** restored. Losing a watch fails safe (no idle prompt for a worker
     /// whose pane we just tried to kill); resurrecting one could nag about a
     /// delegation whose pane the user explicitly asked to close.
@@ -14744,6 +14796,11 @@ impl AgentPtyRegistry {
                     agent.pane_handed_over = true;
                 }
             }
+            for agent in inner.unconfirmed_agents.values_mut() {
+                if agent.record.pane_id_env.as_deref() == Some(claimed.as_str()) {
+                    agent.pane_handed_over = true;
+                }
+            }
         }
 
         let pty = guard.take();
@@ -15230,8 +15287,8 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #868: the agent id currently registered for `pane_id_env`,
-    /// INCLUDING one whose child has already exited — unlike
-    /// [`Self::pane_current_agent_id`], which filters those out and so
+    /// INCLUDING one whose child has exited or whose exit is unconfirmed —
+    /// unlike [`Self::pane_current_agent_id`], which filters those out and so
     /// answers `None` for exactly the pane `pane restart`/`pane spawn` most
     /// need to inspect: one whose current agent has already crashed. Mirrors
     /// [`Self::respawn_agent_for_pane_declared`]'s own no-exited-filter
@@ -15250,6 +15307,16 @@ impl AgentPtyRegistry {
             .iter()
             .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env) && !a.pane_handed_over)
             .map(|(id, _)| id.clone())
+            .or_else(|| {
+                inner
+                    .unconfirmed_agents
+                    .iter()
+                    .find(|(_, agent)| {
+                        agent.record.pane_id_env.as_deref() == Some(pane_id_env)
+                            && !agent.pane_handed_over
+                    })
+                    .map(|(id, _)| id.clone())
+            })
     }
 
     /// PRD #1666 §2.8 (auditor R9T-A01): whether the generation `agent_id`,
@@ -15343,17 +15410,111 @@ impl AgentPtyRegistry {
             })
     }
 
-    /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
-    /// streaming subscribers will observe their broadcast receiver close
-    /// shortly after (once the reader thread sees EOF and drops its bus
-    /// reference).
+    /// Retry the bounded termination of a child whose earlier close returned
+    /// [`AgentPtyError::TerminationUnconfirmed`]. `None` means `id` has no such
+    /// retired record. The metadata entry stays in the registry while the child
+    /// is checked out, so membership and directory-removal checks continue to
+    /// see an unresolved generation throughout this attempt.
+    fn close_unconfirmed_agent(&self, id: &str) -> Option<Result<(), AgentPtyError>> {
+        let (pending, kill_reported_ok, pane_id) = {
+            let mut inner = self.inner.lock();
+            let entry = inner.unconfirmed_agents.get_mut(id)?;
+            if self.shutting_down.load(Ordering::SeqCst) {
+                // Shutdown owns settlement from here. Leaving the child in its
+                // entry lets its bounded drain see it, and prevents a stream of
+                // new checkouts from keeping that drain waiting indefinitely.
+                return Some(Err(AgentPtyError::TerminationUnconfirmed {
+                    id: id.to_string(),
+                    kill_reported_ok: entry.kill_reported_ok,
+                }));
+            }
+            (
+                entry.child.take(),
+                entry.kill_reported_ok,
+                entry.record.pane_id_env.clone(),
+            )
+        };
+        let Some(mut pending) = pending else {
+            // Another retry owns the child right now. Its result is not yet
+            // known, so this attempt cannot report a confirmed exit either.
+            return Some(Err(AgentPtyError::TerminationUnconfirmed {
+                id: id.to_string(),
+                kill_reported_ok,
+            }));
+        };
+        #[cfg(test)]
+        {
+            let hold = self.close_reap_holds.lock().unwrap().remove(id);
+            if let Some((reached, release)) = hold {
+                let _ = reached.send(());
+                let _ = release.recv();
+            }
+        }
+        let termination = crate::platform::proc::terminate_child_with_grace_and_wait(
+            &mut pending.child,
+            AGENT_TERMINATE_GRACE,
+            &pending.process_group,
+            FORCE_REAP_DEADLINE,
+        );
+        let termination = match termination {
+            crate::platform::proc::ChildTermination::Unreaped { .. }
+                if self.shutting_down.load(Ordering::SeqCst) =>
+            {
+                // Shutdown's settle window can expire before a checked-out
+                // retry returns. Give the child its shutdown attempt here too,
+                // still bounded, rather than restoring it without one.
+                crate::platform::proc::terminate_child_with_grace_and_wait(
+                    &mut pending.child,
+                    Duration::ZERO,
+                    &pending.process_group,
+                    FORCE_REAP_DEADLINE,
+                )
+            }
+            other => other,
+        };
+        pending.removal.record_reaped(&mut pending.child);
+        self.change_notify.notify_one();
+        match termination {
+            crate::platform::proc::ChildTermination::Reaped => {
+                self.inner.lock().unconfirmed_agents.remove(id);
+                Some(Ok(()))
+            }
+            crate::platform::proc::ChildTermination::Unreaped { kill_reported_ok } => {
+                tracing::warn!(
+                    agent_id = %id,
+                    pane_id = ?pane_id,
+                    pid = ?pending.child.process_id(),
+                    kill_reported_ok,
+                    deadline_ms = FORCE_REAP_DEADLINE.as_millis() as u64,
+                    "single-agent reap retry gave up: the child never reported an exit within the deadline; it may still be running"
+                );
+                let mut inner = self.inner.lock();
+                let entry = inner
+                    .unconfirmed_agents
+                    .get_mut(id)
+                    .expect("an unconfirmed entry outlives its checked-out child");
+                entry.child = Some(pending);
+                entry.kill_reported_ok = kill_reported_ok;
+                Some(Err(AgentPtyError::TerminationUnconfirmed {
+                    id: id.to_string(),
+                    kill_reported_ok,
+                }))
+            }
+        }
+    }
+
+    /// Stop an agent and drop its handles. Any streaming subscribers will
+    /// observe their broadcast receiver close shortly after (once the reader
+    /// thread sees EOF and drops its bus reference).
     ///
-    /// PRD #92 F8: the kill path now uses
-    /// [`terminate_child_with_grace_and_wait`] — SIGTERM with a
-    /// 3-second grace before SIGKILL — so a well-behaved agent can
-    /// trap SIGTERM and clean up its own descendants (e.g. the
-    /// `setsid`'d sub-shells Claude Code creates internally).
-    /// Misbehaving agents are still reaped after the grace window.
+    /// PRD #92 F8: the kill path uses [`terminate_child_with_grace_and_wait`] —
+    /// SIGTERM with a 3-second grace before SIGKILL — so a well-behaved agent
+    /// can trap SIGTERM and clean up its own descendants. Issue #1677 bounds the
+    /// final nonblocking reap too: when the OS still reports no exit, the
+    /// generation stays retired and the caller gets `TerminationUnconfirmed`
+    /// rather than waiting forever or reporting a successful stop. Its child and
+    /// cleanup record move to `unconfirmed_agents`, so a later close can retry
+    /// the reap and directory cleanup cannot read the retired generation as gone.
     ///
     /// PRD #92 F9 followup-3: this path used to prune the
     /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
@@ -15382,6 +15543,9 @@ impl AgentPtyRegistry {
             return Err(AgentPtyError::Spawn(format!(
                 "injected close failure for agent {id}"
             )));
+        }
+        if let Some(result) = self.close_unconfirmed_agent(id) {
+            return result;
         }
         let mut closed_pane = None;
         let mut agent = {
@@ -15438,10 +15602,11 @@ impl AgentPtyRegistry {
                 let _ = release.recv();
             }
         }
-        crate::platform::proc::terminate_child_with_grace_and_wait(
+        let termination = crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
             &agent.process_group,
+            FORCE_REAP_DEADLINE,
         );
         agent.removal.record_reaped(&mut agent.child);
         // Notify the idle monitor so it observes the registry shrink
@@ -15450,7 +15615,48 @@ impl AgentPtyRegistry {
         // explicit-close path edge-trigger the monitor without depending
         // on the kernel's PTY drain timing.
         self.change_notify.notify_one();
-        Ok(())
+        match termination {
+            crate::platform::proc::ChildTermination::Reaped => Ok(()),
+            crate::platform::proc::ChildTermination::Unreaped { kill_reported_ok } => {
+                tracing::warn!(
+                    agent_id = %id,
+                    pane_id = ?agent.pane_id_env,
+                    pid = ?agent.child.process_id(),
+                    kill_reported_ok,
+                    deadline_ms = FORCE_REAP_DEADLINE.as_millis() as u64,
+                    "single-agent reap gave up: the child never reported an exit within the \
+                     deadline; its generation is retired, but it may still be running"
+                );
+                let record = Self::cleanup_record(id, &agent);
+                let mut inner = self.inner.lock();
+                // The first termination ran without the registry lock, so a
+                // successor may have claimed the pane after the old record was
+                // removed but before this unconfirmed entry was published.
+                // Re-read that ownership here rather than restoring the stale
+                // spawn-time flag and taking cleanup authority back from it.
+                let pane_handed_over = agent.pane_handed_over
+                    || agent
+                        .pane_id_env
+                        .as_deref()
+                        .is_some_and(|pane| Self::pane_claimed_by_other(&inner, pane, id));
+                let unconfirmed = UnconfirmedAgent {
+                    record,
+                    root_dirs: agent.root_dirs.clone(),
+                    child: Some(UnconfirmedChild {
+                        child: agent.child,
+                        process_group: agent.process_group,
+                        removal: agent.removal,
+                    }),
+                    kill_reported_ok,
+                    pane_handed_over,
+                };
+                inner.unconfirmed_agents.insert(id.to_string(), unconfirmed);
+                Err(AgentPtyError::TerminationUnconfirmed {
+                    id: id.to_string(),
+                    kill_reported_ok,
+                })
+            }
+        }
     }
 
     /// Respawn the agent attached to a given `pane_id_env`: gracefully
@@ -15928,30 +16134,46 @@ impl AgentPtyRegistry {
         // teardown's force phase reaps the descendant tree through (PRD #163 M3),
         // and it is dropped there once the old child is gone.
         let join = tokio::task::spawn_blocking(move || {
-            crate::platform::proc::terminate_child_with_grace_and_wait(
+            let termination = crate::platform::proc::terminate_child_with_grace_and_wait(
                 &mut child,
                 AGENT_TERMINATE_GRACE,
                 &process_group,
+                FORCE_REAP_DEADLINE,
             );
             removal.record_reaped(&mut child);
+            termination
         })
         .await;
-        if let Err(join_err) = join {
-            // The spawn_blocking task ran the SIGTERM → poll → SIGKILL
-            // sequence in `terminate_child_with_grace_and_wait`. A
-            // `JoinError` here means the closure panicked or was
-            // cancelled before returning; the SIGKILL backstop inside
-            // the helper only fires if the closure reached that line.
-            // The helper is panic-free in practice (no panic-prone
-            // calls in its body), so this branch is a defensive log —
-            // the child may or may not have been reaped depending on
-            // where the panic landed.
-            tracing::warn!(
-                pane_id = %pane_id_env,
-                error = %join_err,
-                "respawn: spawn_blocking for terminate panicked or was cancelled; \
-                 proceeding with fresh spawn anyway"
-            );
+        match join {
+            Ok(crate::platform::proc::ChildTermination::Reaped) => {}
+            Ok(crate::platform::proc::ChildTermination::Unreaped { kill_reported_ok }) => {
+                // The old generation is already removed and its blocking task
+                // ends here, before the successor is spawned. Nothing remains
+                // to run late pane cleanup against that successor.
+                tracing::warn!(
+                    pane_id = %pane_id_env,
+                    kill_reported_ok,
+                    "respawn: previous child did not report an exit before the reap deadline; \
+                     proceeding with fresh spawn anyway"
+                );
+            }
+            Err(join_err) => {
+                // The spawn_blocking task ran the SIGTERM → poll → SIGKILL
+                // sequence in `terminate_child_with_grace_and_wait`. A
+                // `JoinError` here means the closure panicked or was
+                // cancelled before returning; the SIGKILL backstop inside
+                // the helper only fires if the closure reached that line.
+                // The helper is panic-free in practice (no panic-prone
+                // calls in its body), so this branch is a defensive log —
+                // the child may or may not have been reaped depending on
+                // where the panic landed.
+                tracing::warn!(
+                    pane_id = %pane_id_env,
+                    error = %join_err,
+                    "respawn: spawn_blocking for terminate panicked or was cancelled; \
+                     proceeding with fresh spawn anyway"
+                );
+            }
         }
 
         // Step 3: spawn a fresh agent with the captured identity.
@@ -17769,7 +17991,17 @@ impl AgentPtyRegistry {
     /// entry survives, or vice versa.
     pub fn child_pid(&self, id: &str) -> Option<u32> {
         let inner = self.inner.lock();
-        inner.agents.get(id).and_then(|a| a.child.process_id())
+        inner
+            .agents
+            .get(id)
+            .and_then(|a| a.child.process_id())
+            .or_else(|| {
+                inner
+                    .unconfirmed_agents
+                    .get(id)
+                    .and_then(|agent| agent.child.as_ref())
+                    .and_then(|pending| pending.child.process_id())
+            })
     }
 
     /// PRD #1666 part 3, round 5-wake: the pid of `id`'s child and when that
@@ -17789,7 +18021,7 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #454: the agent recorded under `id`, INCLUDING one whose child has
-    /// already exited.
+    /// already exited or whose close left its exit unconfirmed.
     ///
     /// [`Self::agent_records`] filters exited entries because it is the
     /// hydration source and a dead entry there materialises a ghost pane. The
@@ -17806,6 +18038,12 @@ impl AgentPtyRegistry {
             .agents
             .get(id)
             .map(|agent| Self::cleanup_record(id, agent))
+            .or_else(|| {
+                inner
+                    .unconfirmed_agents
+                    .get(id)
+                    .map(|agent| agent.record.clone())
+            })
     }
 
     /// PRD #1666 part 3, round 5: the working directory agent `id` was
@@ -17819,26 +18057,45 @@ impl AgentPtyRegistry {
         id: &str,
     ) -> Result<Option<String>, crate::lock_rank::Unavailable> {
         let inner = self.inner.try_lock()?;
-        Ok(inner.agents.get(id).and_then(|agent| agent.cwd.clone()))
+        Ok(inner
+            .agents
+            .get(id)
+            .and_then(|agent| agent.cwd.clone())
+            .or_else(|| {
+                inner
+                    .unconfirmed_agents
+                    .get(id)
+                    .and_then(|agent| agent.record.cwd.clone())
+            }))
     }
 
-    /// PRD #1589: every record, INCLUDING exited ones, each with whether its
-    /// child has exited — the membership a close enumerates, under one
-    /// acquisition. A close has to see a dead role as well as a live one: it is
-    /// still registered, and closing it is what cleans up after it.
-    pub fn agent_records_including_exited(&self) -> Vec<(AgentRecord, bool)> {
+    /// PRD #1589: the registered agent records, including exited ones, plus
+    /// unconfirmed generations, each with whether its child has exited — the
+    /// membership a close enumerates, under one acquisition. A close has to see
+    /// a dead role as well as a live one: it is still registered, and closing it
+    /// is what cleans up after it. An unconfirmed child reads `false` for the
+    /// exited flag, because no exit has been collected, and `true` for the
+    /// third, termination-unconfirmed flag.
+    pub fn agent_records_including_exited(&self) -> Vec<(AgentRecord, bool, bool)> {
         let inner = self.inner.lock();
-        let mut records: Vec<(AgentRecord, bool)> = inner
+        let mut records: Vec<(AgentRecord, bool, bool)> = inner
             .agents
             .iter()
             .map(|(id, agent)| {
                 (
                     Self::cleanup_record(id, agent),
                     agent.exited.load(Ordering::SeqCst),
+                    false,
                 )
             })
             .collect();
-        records.sort_by_key(|(r, _)| r.id.parse::<u64>().unwrap_or(0));
+        records.extend(
+            inner
+                .unconfirmed_agents
+                .values()
+                .map(|agent| (agent.record.clone(), false, true)),
+        );
+        records.sort_by_key(|(r, _, _)| r.id.parse::<u64>().unwrap_or(0));
         records
     }
 
@@ -18207,6 +18464,10 @@ impl AgentPtyRegistry {
             id != excluded
                 && a.pane_id_env.as_deref() == Some(pane_id)
                 && !a.exited.load(Ordering::SeqCst)
+        }) || inner.unconfirmed_agents.iter().any(|(id, agent)| {
+            id != excluded
+                && agent.record.pane_id_env.as_deref() == Some(pane_id)
+                && !agent.pane_handed_over
         }) || inner
             .pending_spawns
             .iter()
@@ -18268,6 +18529,23 @@ impl AgentPtyRegistry {
             })
             .collect();
         records.sort_by_key(|r| r.id.parse::<u64>().unwrap_or(0));
+        records
+    }
+
+    /// The live records plus generations whose exits are still unconfirmed, for
+    /// worktree-liveness checks. Unlike [`Self::agent_records`], this projection
+    /// is not a client hydration source, so retired-but-unresolved generations
+    /// can be included without materialising a pane or changing live routing.
+    /// Confirmed-exited records remain excluded.
+    pub fn agent_records_for_worktree_cleanup(&self) -> Vec<AgentRecord> {
+        let mut records = self.agent_records();
+        let inner = self.inner.lock();
+        records.extend(
+            inner
+                .unconfirmed_agents
+                .values()
+                .map(|agent| agent.record.clone()),
+        );
         records
     }
 
@@ -18566,11 +18844,20 @@ impl AgentPtyRegistry {
         instance: &str,
         is_start_role: bool,
     ) -> String {
-        let id = self.insert_test_agent_with_master(
-            Box::new(IdleTestChild),
-            Some(pane_id),
-            Box::new(IdleTestMaster),
-        );
+        self.insert_test_member_for_test(Box::new(IdleTestChild), pane_id, instance, is_start_role)
+    }
+
+    /// [`Self::insert_idle_member_for_test`] with a caller-supplied child, for
+    /// close tests that need an inert orchestration member whose reap wedges.
+    #[cfg(test)]
+    pub(crate) fn insert_test_member_for_test(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        pane_id: &str,
+        instance: &str,
+        is_start_role: bool,
+    ) -> String {
+        let id = self.insert_test_agent_with_master(child, Some(pane_id), Box::new(IdleTestMaster));
         if let Some(agent) = self.inner.lock().agents.get_mut(&id) {
             agent.tab_membership = Some(TabMembership::Orchestration {
                 name: "team".to_string(),
@@ -18588,6 +18875,22 @@ impl AgentPtyRegistry {
             });
         }
         id
+    }
+
+    /// Give a synthetic orchestration member the shared cwd a real start records
+    /// in its tab membership. Worktree-liveness projections intentionally read
+    /// that field rather than the card cwd learned through `set_agent_label`.
+    #[cfg(test)]
+    pub(crate) fn set_test_member_orchestration_cwd(&self, id: &str, cwd: String) {
+        let mut inner = self.inner.lock();
+        let agent = inner.agents.get_mut(id).expect("synthetic member");
+        let Some(TabMembership::Orchestration {
+            orchestration_cwd, ..
+        }) = &mut agent.tab_membership
+        else {
+            panic!("synthetic member is not an orchestration member");
+        };
+        *orchestration_cwd = Some(cwd);
     }
 
     /// [`Self::insert_test_agent`] with a `pane_id_env`, so a test can assert on
@@ -19275,15 +19578,19 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #1612: whether anything this registry runs or is starting is
-    /// rooted in `dir` — a live agent, a reserved spawn not yet published, or a
-    /// pane in its respawn window, whose working directory or orchestration cwd
-    /// is `dir` or lies inside it.
-    /// Exited agents do not count, matching [`Self::agent_records`].
+    /// rooted in `dir` — a live agent, an unconfirmed child, a reserved spawn
+    /// not yet published, or a pane in its respawn window, whose working
+    /// directory or orchestration cwd is `dir` or lies inside it.
+    /// Confirmed-exited agents do not count, matching [`Self::agent_records`].
     fn dir_in_use_locked(inner: &RegistryInner, dir: &std::path::Path) -> bool {
         let agent_in_dir = inner.agents.values().any(|a| {
             !a.exited.load(Ordering::SeqCst) && a.rooted_dirs().any(|d| path_within(&d, dir))
         });
         agent_in_dir
+            || inner
+                .unconfirmed_agents
+                .values()
+                .any(|agent| agent.root_dirs.iter().any(|d| path_within(d, dir)))
             || inner
                 .pending_spawn_dirs
                 .values()
@@ -19400,18 +19707,27 @@ impl AgentPtyRegistry {
         self.inner.lock().closing_generations.contains(agent_id)
     }
 
-    /// PRD #1589 (auditor SF5): the pane id of the record — live or exited —
-    /// of the generation `agent_id`, read by its key rather than by walking
-    /// the registry.
+    /// PRD #1589 (auditor SF5): the pane id of the record — live, exited or
+    /// unconfirmed — of the generation `agent_id`, read by its key rather than
+    /// by walking the registry.
     pub fn generation_pane(&self, agent_id: &str) -> Option<String> {
         let inner = self.inner.lock();
         #[cfg(test)]
         self.member_visits.fetch_add(1, Ordering::Relaxed);
-        inner.agents.get(agent_id)?.pane_id_env.clone()
+        inner
+            .agents
+            .get(agent_id)
+            .and_then(|agent| agent.pane_id_env.clone())
+            .or_else(|| {
+                inner
+                    .unconfirmed_agents
+                    .get(agent_id)
+                    .and_then(|agent| agent.record.pane_id_env.clone())
+            })
     }
 
-    /// PRD #1589 (auditor SF2/SF5): the pane ids of the records — live or
-    /// exited — that are members of the orchestration `instance`, orchestrator
+    /// PRD #1589 (auditor SF2/SF5): the pane ids of the records — live, exited
+    /// or unconfirmed — that are members of the orchestration `instance`, orchestrator
     /// first and then in spawn order: at most `limit` of them, and whether any
     /// was left out. It walks every record in the registry, keeping at most
     /// `limit + 1` borrowed entries while it does and cloning only the ones it
@@ -19424,17 +19740,25 @@ impl AgentPtyRegistry {
         let mut first: std::collections::BTreeSet<(bool, u64, &str, &str)> =
             std::collections::BTreeSet::new();
         let mut more = false;
-        for (id, agent) in &inner.agents {
+        let registered = inner
+            .agents
+            .iter()
+            .map(|(id, agent)| (id, &agent.pane_id_env, &agent.tab_membership));
+        let unconfirmed = inner
+            .unconfirmed_agents
+            .iter()
+            .map(|(id, agent)| (id, &agent.record.pane_id_env, &agent.record.tab_membership));
+        for (id, pane_id, membership) in registered.chain(unconfirmed) {
             #[cfg(test)]
             self.member_visits.fetch_add(1, Ordering::Relaxed);
-            let Some(pane) = agent.pane_id_env.as_deref() else {
+            let Some(pane) = pane_id.as_deref() else {
                 continue;
             };
-            if orchestration_instance_of(agent.tab_membership.as_ref()) != Some(instance) {
+            if orchestration_instance_of(membership.as_ref()) != Some(instance) {
                 continue;
             }
             let orchestrator = matches!(
-                agent.tab_membership,
+                membership,
                 Some(TabMembership::Orchestration {
                     is_start_role: true,
                     ..
@@ -19617,9 +19941,9 @@ impl AgentPtyRegistry {
     }
 
     /// PRD #1589: finish `instance` if nothing of it is left in this registry
-    /// — no record, live or exited, and no respawn in its remove→replace
-    /// window — and answer whether it did. The check and the finishing are one
-    /// lock hold, the one a spawn publishes under and re-checks
+    /// — no record, live, exited or unconfirmed, and no respawn in its
+    /// remove→replace window — and answer whether it did. The check and the
+    /// finishing are one lock hold, the one a spawn publishes under and re-checks
     /// [`Self::instance_refuses_join_locked`] in: so a role that published
     /// first is seen here and keeps the instance open, and one publishing after
     /// is refused, its child killed. This is what lets a `close` end an
@@ -19635,6 +19959,10 @@ impl AgentPtyRegistry {
             .agents
             .values()
             .any(|agent| member(agent.tab_membership.as_ref()))
+            || inner
+                .unconfirmed_agents
+                .values()
+                .any(|agent| member(agent.record.tab_membership.as_ref()))
             || inner
                 .respawning_members
                 .values()
@@ -19793,6 +20121,14 @@ impl AgentPtyRegistry {
                                 ..
                             }) if id == instance
                         )
+                }) && inner.unconfirmed_agents.values().all(|a| {
+                    !matches!(
+                        &a.record.tab_membership,
+                        Some(TabMembership::Orchestration {
+                            orchestration_id: Some(id),
+                            ..
+                        }) if id == instance
+                    )
                 })
             });
             (instance, all_exited)
@@ -19832,9 +20168,18 @@ impl AgentPtyRegistry {
             _ => None,
         };
         let instance_has_records = instance.as_deref().is_some_and(|instance| {
-            self.inner.lock().agents.values().any(|a| {
+            let inner = self.inner.lock();
+            inner.agents.values().any(|a| {
                 matches!(
                     &a.tab_membership,
+                    Some(TabMembership::Orchestration {
+                        orchestration_id: Some(id),
+                        ..
+                    }) if id == instance
+                )
+            }) || inner.unconfirmed_agents.values().any(|a| {
+                matches!(
+                    &a.record.tab_membership,
                     Some(TabMembership::Orchestration {
                         orchestration_id: Some(id),
                         ..
@@ -20170,8 +20515,8 @@ impl AgentPtyRegistry {
     ///   as long as it stays in that state, which is not a duration this process
     ///   controls or can observe an end to.
     /// * **Nothing downstream reads the statuses.** Both callers only
-    ///   `change_notify.notify_one()` afterwards, and the `RunningAgent`s are
-    ///   dropped when this function returns whichever way it left the loop.
+    ///   `change_notify.notify_one()` afterwards, and the children are dropped
+    ///   when this function returns whichever way it left the loop.
     /// * **Every PRODUCTION caller is on a teardown path.** Enumerated rather
     ///   than asserted, because it is the load-bearing half of this argument:
     ///   under `src/`, outside a `#[cfg(test)]` module, the callers are `Drop for
@@ -20209,7 +20554,7 @@ impl AgentPtyRegistry {
     /// actually available. Before the deadline the same failed kill produced a
     /// loop that never returned, which left the child running too and said
     /// nothing at all.
-    fn force_kill_and_reap_all(agents: Vec<RunningAgent>) {
+    fn force_kill_and_reap_all(agents: Vec<ShutdownChild>) {
         if agents.is_empty() {
             return;
         }
@@ -20218,7 +20563,7 @@ impl AgentPtyRegistry {
         // Pass 1: signal only. Each agent is paired with what its force-kill
         // REPORTED, which pass 2 carries so the give-up below can tell a child
         // the kernel is still tearing down from one that was never signalled.
-        let mut agents: Vec<(RunningAgent, bool)> = agents
+        let mut agents: Vec<(ShutdownChild, bool)> = agents
             .into_iter()
             .map(|mut agent| {
                 let kill_reported_ok = crate::platform::proc::force_kill_child_group(
@@ -20303,19 +20648,53 @@ impl AgentPtyRegistry {
         );
     }
 
-    /// SIGKILL every agent and drain the registry. Idempotent.
-    pub fn shutdown_all(&self) {
-        let agents: Vec<RunningAgent> = {
+    /// Take every child the registry currently owns into the shared shutdown
+    /// shape. A retry can have checked out an unconfirmed child, so wait up to
+    /// one single-agent termination window for that bounded attempt to return
+    /// it. New retries are refused once shutdown starts. If the window expires,
+    /// the retry's own shutdown arm gives the checked-out child its attempt.
+    fn drain_children_for_shutdown(&self) -> Vec<ShutdownChild> {
+        let settle_deadline = Instant::now() + AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE;
+        loop {
             let mut inner = self.inner.lock();
-            inner
+            if inner
+                .unconfirmed_agents
+                .values()
+                .any(|agent| agent.child.is_none())
+                && Instant::now() < settle_deadline
+            {
+                drop(inner);
+                std::thread::sleep(FORCE_REAP_POLL_INTERVAL);
+                continue;
+            }
+            let mut children: Vec<ShutdownChild> = inner
                 .agents
                 .drain()
                 .map(|(_, agent)| {
                     agent.removal.closed();
-                    agent
+                    agent.into()
                 })
-                .collect()
-        };
+                .collect();
+            inner.unconfirmed_agents.retain(|_, agent| {
+                let Some(pending) = agent.child.take() else {
+                    return true;
+                };
+                pending.removal.closed();
+                children.push(ShutdownChild {
+                    child: pending.child,
+                    process_group: pending.process_group,
+                    pane_id_env: agent.record.pane_id_env.clone(),
+                });
+                false
+            });
+            return children;
+        }
+    }
+
+    /// SIGKILL every agent and drain the registry. Idempotent.
+    pub fn shutdown_all(&self) {
+        self.shutting_down.store(true, Ordering::SeqCst);
+        let agents = self.drain_children_for_shutdown();
         Self::force_kill_and_reap_all(agents);
         // Wake the idle monitor if it's parked on `change_notify` — the
         // registry just emptied, so the next gate check should see
@@ -20341,17 +20720,7 @@ impl AgentPtyRegistry {
             // Already shutting down — second-signal idempotency.
             return;
         }
-        let mut agents: Vec<RunningAgent> = {
-            let mut inner = self.inner.lock();
-            inner
-                .agents
-                .drain()
-                .map(|(_, agent)| {
-                    agent.removal.closed();
-                    agent
-                })
-                .collect()
-        };
+        let mut agents = self.drain_children_for_shutdown();
 
         // Phase 1: SIGTERM each child's process group. Some shells
         // (notably the bash/zsh configurations that intercept SIGHUP)
@@ -21273,6 +21642,9 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use crate::platform::proc::test_child::{
+        PHASE_ONE_FALLBACK_KILLS, WEDGE_TEST_BUDGET, WedgeGate, WedgedChild, holds_within,
+    };
     use spec::spec;
     use std::time::Duration;
 
@@ -33495,148 +33867,6 @@ mod spawn_tests {
     // their phase-3 SIGKILL.
     // ---------------------------------------------------------------------
 
-    /// A latch the test flips to let a deliberately-wedged reap finally
-    /// complete, so the shutdown thread can always be joined.
-    #[derive(Debug, Default)]
-    struct WedgeGate {
-        released: Mutex<bool>,
-        wake: std::sync::Condvar,
-    }
-
-    impl WedgeGate {
-        fn is_released(&self) -> bool {
-            *self.released.lock().unwrap()
-        }
-
-        fn block_until_released(&self) {
-            let mut released = self.released.lock().unwrap();
-            while !*released {
-                released = self.wake.wait(released).unwrap();
-            }
-        }
-
-        fn release(&self) {
-            *self.released.lock().unwrap() = true;
-            self.wake.notify_all();
-        }
-    }
-
-    /// A [`portable_pty::Child`] whose *reap* is under the test's control while
-    /// its *kill* is real.
-    ///
-    /// No real process can be coaxed into the shape issue #581 is about — a
-    /// child wedged in uninterruptible kernel I/O, which SIGKILL cannot
-    /// dislodge until the I/O completes — because a real child always returns
-    /// from `wait` once SIGKILL lands. So the wedge is modelled here and only
-    /// here: everything the teardown path *does* (the signal it sends, the pid
-    /// it sends it to) stays production code running against a real process
-    /// group in the Unix test below.
-    #[derive(Debug)]
-    struct WedgedChild {
-        /// Reported to the teardown path as this child's pid. `Some` makes the
-        /// production `killpg(SIGKILL)` land on a real process group; `None`
-        /// drives the documented pid-unavailable fallback, which is
-        /// `Child::kill` on both backends and therefore observable on Windows
-        /// too.
-        pid: Option<u32>,
-        /// How many times the teardown path issued a kill through that
-        /// fallback. A count, not a flag: phase 1's SIGTERM ask reaches the
-        /// same fallback, so only a kill *beyond* [`PHASE_ONE_FALLBACK_KILLS`]
-        /// is phase 3's. (The first draft asserted a flag and passed on the
-        /// unfixed code — phase 1 had already set it for every agent.)
-        kills: Arc<std::sync::atomic::AtomicUsize>,
-        /// Set when the child was actually reaped (by either `wait` or a
-        /// `try_wait` that reported an exit). The fix must not buy signal
-        /// independence by dropping the reap.
-        reaped: Arc<AtomicBool>,
-        /// Until released, `wait` blocks forever and `try_wait` keeps saying
-        /// "still running".
-        gate: Arc<WedgeGate>,
-        /// When set, the blocking `wait` never returns *at all*, however the
-        /// gate stands — the unbounded-`wait` half of the same wedge, which
-        /// only a `try_wait`-based reap can get past.
-        wait_never_returns: bool,
-    }
-
-    impl WedgedChild {
-        fn new(pid: Option<u32>, gate: Arc<WedgeGate>) -> Self {
-            Self {
-                pid,
-                kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                reaped: Arc::new(AtomicBool::new(false)),
-                gate,
-                wait_never_returns: false,
-            }
-        }
-    }
-
-    impl portable_pty::ChildKiller for WedgedChild {
-        fn kill(&mut self) -> std::io::Result<()> {
-            self.kills.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-            unreachable!("no teardown path clones a killer")
-        }
-    }
-
-    impl portable_pty::Child for WedgedChild {
-        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            if !self.gate.is_released() {
-                return Ok(None);
-            }
-            self.reaped.store(true, Ordering::SeqCst);
-            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
-        }
-
-        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-            if self.wait_never_returns {
-                // `park` may wake spuriously, so loop: this call must never
-                // return, which is the whole point of the flag.
-                loop {
-                    std::thread::park();
-                }
-            }
-            self.gate.block_until_released();
-            self.reaped.store(true, Ordering::SeqCst);
-            Ok(portable_pty::ExitStatus::with_exit_code(0))
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            self.pid
-        }
-
-        #[cfg(windows)]
-        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-            None
-        }
-    }
-
-    /// Poll `done` until it holds or `budget` elapses. Returns what it last saw.
-    fn holds_within(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        done()
-    }
-
-    /// How long a phase-3 kill is given to reach every agent before the test
-    /// calls it starved. Generous — it is only ever paid on failure.
-    const WEDGE_TEST_BUDGET: Duration = Duration::from_secs(10);
-
-    /// Kills that phase 1's SIGTERM *ask* contributes per agent for a pid-less
-    /// child, before phase 3 is reached at all: on Unix `killpg` needs a pid and
-    /// so takes the `Child::kill` fallback, while on Windows
-    /// `GenerateConsoleCtrlEvent` skips a pid-less child outright. Phase 3's
-    /// force-kill is the one *on top of* this baseline, so it is the only thing
-    /// a strictly-greater count can be.
-    const PHASE_ONE_FALLBACK_KILLS: usize = if cfg!(unix) { 1 } else { 0 };
-
     /// Issue #581 (regression): phase 3 must force-kill *every* surviving
     /// agent, even when the first one it touches never finishes being reaped.
     ///
@@ -34491,6 +34721,336 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "every agent must still be reaped, not merely signalled"
         );
+    }
+
+    /// Issue #1677: a single-agent close must not park forever in `Child::wait`
+    /// after the force-kill. The gate keeps `try_wait` at `None` until the test
+    /// releases it, while `wait` blocks on the same gate. On the unfixed path the
+    /// watchdog releases the gate so the thread can be joined, then fails the
+    /// bounded-return assertion; on the fixed path the close has already returned
+    /// a truthful error before the gate opens.
+    #[test]
+    fn close_agent_gives_up_on_a_child_that_never_reports_an_exit() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gate = Arc::new(WedgeGate::default());
+        let child = WedgedChild::new(None, gate.clone());
+        let kills = child.kills.clone();
+        let reaped = child.reaped.clone();
+        let id = registry.insert_test_agent_for_pane(Box::new(child), Some("close-wedge"));
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let closing = registry.clone();
+        let close_id = id.clone();
+        let close_thread = std::thread::spawn(move || {
+            let result = closing.close_agent(&close_id).map_err(|e| e.to_string());
+            let _ = result_tx.send(result);
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let returned = holds_within(
+            AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET,
+            || finished.load(Ordering::SeqCst),
+        );
+        let reaped_before_release = reaped.load(Ordering::SeqCst);
+        gate.release();
+        let result = result_rx
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the close answers once the fixture is released");
+        close_thread
+            .join()
+            .expect("the close thread must not panic");
+
+        assert!(
+            returned,
+            "the close never returned — it is parked in the unbounded post-kill `Child::wait`"
+        );
+        let error = result.expect_err("an unconfirmed exit is not a successful close");
+        assert!(
+            error.contains("could not confirm") && error.contains("may still be running"),
+            "the error must say what is unknown without claiming the child is dead: {error}"
+        );
+        assert!(
+            kills.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS,
+            "bounding the reap must not skip the force-kill"
+        );
+        assert!(
+            !reaped_before_release,
+            "the fixture must still be unreaped when the bounded close gives up"
+        );
+        registry.shutdown_all();
+        assert!(
+            reaped.load(Ordering::SeqCst),
+            "shutdown drains a child retained by an earlier unconfirmed close"
+        );
+    }
+
+    /// Issue #1677 review: shutdown overlaps a retry that has checked out the
+    /// unconfirmed child. It must wait for that bounded attempt to settle and
+    /// give the returned child a shutdown kill/reap attempt rather than
+    /// completing while no handle is in the registry.
+    #[test]
+    fn shutdown_accounts_for_a_child_checked_out_by_a_close_retry() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gate = Arc::new(WedgeGate::default());
+        let child = WedgedChild::new(None, gate);
+        let kills = child.kills.clone();
+        let id = registry.insert_test_agent(Box::new(child));
+        assert!(matches!(
+            registry.close_agent(&id),
+            Err(AgentPtyError::TerminationUnconfirmed { .. })
+        ));
+        let kills_after_first_close = kills.load(Ordering::SeqCst);
+        let (retry_reached, release_retry) = registry.hold_close_before_reap_for_test(&id);
+        let (retry_tx, retry_rx) = std::sync::mpsc::channel();
+        let retrying = registry.clone();
+        let retry_id = id.clone();
+        let retry_thread = std::thread::spawn(move || {
+            let result = retrying.close_agent(&retry_id);
+            let _ = retry_tx.send(result);
+        });
+        retry_reached
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the retry checked out the child");
+
+        let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+        let shutdown_finished = Arc::new(AtomicBool::new(false));
+        let done = shutdown_finished.clone();
+        let shutting_down = registry.clone();
+        let shutdown_thread = std::thread::spawn(move || {
+            shutting_down.shutdown_all();
+            done.store(true, Ordering::SeqCst);
+            let _ = shutdown_tx.send(());
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        let shutdown_finished_before_retry = shutdown_finished.load(Ordering::SeqCst);
+        release_retry.send(()).expect("release the retry reap");
+        let retry = retry_rx
+            .recv_timeout(AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET)
+            .expect("the retry answers");
+        retry_thread.join().expect("the retry does not panic");
+        assert!(matches!(
+            retry,
+            Err(AgentPtyError::TerminationUnconfirmed { .. })
+        ));
+        shutdown_rx
+            .recv_timeout(AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET)
+            .expect("shutdown settles after the checked-out retry");
+        shutdown_thread
+            .join()
+            .expect("the shutdown thread does not panic");
+
+        assert!(
+            !shutdown_finished_before_retry,
+            "shutdown must account for the checked-out child before completing"
+        );
+        assert!(
+            kills.load(Ordering::SeqCst) > kills_after_first_close * 2,
+            "the returned child receives a shutdown kill attempt beyond the first close and ordinary retry (first close: {kills_after_first_close})"
+        );
+    }
+
+    /// Issue #1677: the shared `StopAgent` sequence returns its per-agent error,
+    /// drops the caller's cleanup hold, and has no blocking work left that can
+    /// clean up a successor admitted afterwards.
+    #[test]
+    fn stop_agent_reap_timeout_releases_cleanup_and_leaves_a_successor_alone() {
+        const PANE: &str = "stop-wedge-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let gate = Arc::new(WedgeGate::default());
+        let id = registry
+            .insert_test_agent_for_pane(Box::new(WedgedChild::new(None, gate.clone())), Some(PANE));
+        let record = registry.agent_record_any(&id).expect("the wedged record");
+        let cleanup = registry
+            .hold_pane_for_cleanup(PANE, &id)
+            .expect("the stopping generation owns its pane");
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let stopping = registry.clone();
+        let stopping_state = state.clone();
+        let stopping_id = id.clone();
+        let stop_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stop test runtime");
+            let result = runtime.block_on(crate::daemon_protocol::stop_agent_steps(
+                &stopping_id,
+                Some(&record),
+                Some(PANE),
+                &stopping,
+                &stopping_state,
+                &event_tx,
+                crate::dispatched_units::EndReason::Stopped,
+            ));
+            drop(cleanup);
+            let _ = result_tx.send(result);
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let returned = holds_within(
+            AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET,
+            || finished.load(Ordering::SeqCst),
+        );
+        if !returned {
+            // Unblock the unfixed implementation so this regression fails rather
+            // than leaving a thread and its runtime parked forever.
+            gate.release();
+        }
+        let result = result_rx
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the stop answers once the fixture is released");
+        stop_thread.join().expect("the stop thread must not panic");
+        assert!(
+            returned,
+            "StopAgent's shared steps never returned — the blocking reap outlived the request"
+        );
+        let error = result.expect_err("an unconfirmed exit must reach the stop caller");
+        assert!(error.contains("could not confirm"), "{error}");
+        assert!(!registry.pane_close_in_flight(PANE));
+        assert!(!registry.is_pane_closing(PANE));
+
+        let successor_gate = Arc::new(WedgeGate::default());
+        successor_gate.release();
+        let successor = registry.insert_test_agent_for_pane(
+            Box::new(WedgedChild::new(None, successor_gate)),
+            Some(PANE),
+        );
+        gate.release();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(registry.agent_is_live(&successor));
+        assert_eq!(
+            registry.pane_current_agent_id(PANE).as_deref(),
+            Some(successor.as_str())
+        );
+        registry
+            .close_agent(&successor)
+            .expect("the healthy successor closes promptly");
+    }
+
+    /// Issue #1677 review: a successor can claim the pane while the first close
+    /// is reaping outside the registry lock. Inserting the unconfirmed
+    /// predecessor must not hand the pane back to it and deny the successor's
+    /// own cleanup hold.
+    #[test]
+    fn unconfirmed_predecessor_does_not_reclaim_pane_from_successor() {
+        const PANE: &str = "unconfirmed-handover-race-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gate = Arc::new(WedgeGate::default());
+        let id = registry
+            .insert_test_agent_for_pane(Box::new(WedgedChild::new(None, gate.clone())), Some(PANE));
+        let (close_reached, release_close) = registry.hold_close_before_reap_for_test(&id);
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let closing = registry.clone();
+        let close_id = id.clone();
+        let close_thread = std::thread::spawn(move || {
+            let result = closing.close_agent(&close_id);
+            let _ = result_tx.send(result);
+        });
+        close_reached
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the first close removed its record");
+        release_close.send(()).expect("release the first reap");
+
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("the successor publishes while the predecessor is reaping");
+        let first = result_rx
+            .recv_timeout(AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET)
+            .expect("the first close answers");
+        close_thread.join().expect("the first close does not panic");
+        assert!(matches!(
+            first,
+            Err(AgentPtyError::TerminationUnconfirmed { .. })
+        ));
+        gate.release();
+
+        let cleanup = registry.hold_pane_for_cleanup(PANE, &successor);
+        assert!(
+            cleanup.is_some(),
+            "the unconfirmed predecessor must already be handed over to the successor"
+        );
+        drop(cleanup);
+        registry
+            .close_agent(&id)
+            .expect("the predecessor can still be reaped by id");
+        registry
+            .close_agent(&successor)
+            .expect("the successor closes normally");
+    }
+
+    /// Issue #1677 review: a stop whose first reap timed out retains enough of
+    /// the retired generation for the same StopAgent id to be retried. Once the
+    /// child can be reaped, that retry finishes the pane cleanup instead of
+    /// reporting the id unknown and leaving the card registered forever.
+    #[tokio::test]
+    async fn stop_agent_retry_after_reap_finishes_cleans_up_pane() {
+        const PANE: &str = "stop-wedge-retry-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        state.write().await.register_pane(PANE.to_string());
+        state
+            .write()
+            .await
+            .pane_role_map
+            .insert(PANE.to_string(), "coder".to_string());
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let gate = Arc::new(WedgeGate::default());
+        let id = registry
+            .insert_test_agent_for_pane(Box::new(WedgedChild::new(None, gate.clone())), Some(PANE));
+        let record = registry.agent_record_any(&id).expect("the wedged record");
+        let cleanup = registry
+            .hold_pane_for_cleanup(PANE, &id)
+            .expect("the stopping generation owns its pane");
+        let error = crate::daemon_protocol::stop_agent_steps(
+            &id,
+            Some(&record),
+            Some(PANE),
+            &registry,
+            &state,
+            &event_tx,
+            crate::dispatched_units::EndReason::Stopped,
+        )
+        .await
+        .expect_err("the first close cannot confirm the wedged child's exit");
+        drop(cleanup);
+        assert!(error.contains("could not confirm"), "{error}");
+
+        gate.release();
+        let retired = registry
+            .agent_record_any(&id)
+            .expect("an unconfirmed child retains its cleanup record for a retry");
+        let cleanup = registry
+            .hold_pane_for_cleanup(PANE, &id)
+            .expect("no successor owns the retired generation's pane");
+        crate::daemon_protocol::stop_agent_steps(
+            &id,
+            Some(&retired),
+            Some(PANE),
+            &registry,
+            &state,
+            &event_tx,
+            crate::dispatched_units::EndReason::Stopped,
+        )
+        .await
+        .expect("the retry reaps the child and completes the close");
+        drop(cleanup);
+
+        let state = state.read().await;
+        assert!(!state.managed_pane_ids.contains(PANE));
+        assert!(!state.pane_role_map.contains_key(PANE));
+        assert!(registry.agent_record_any(&id).is_none());
     }
 
     // ---------------------------------------------------------------------

@@ -152,12 +152,14 @@ A unit closed with `close` disappears from both clients, and a unit closed in a 
 
 ## When something goes wrong
 
+Stopping an agent has a time limit. If its process does not confirm that it exited, the deck reports that the stop could not be confirmed instead of waiting indefinitely; the process may still be running. In the TUI and desktop app, the close error leaves the card available to inspect. With `close`, every pane whose stop is unconfirmed is listed as a survivor, the command exits `1`, and the deck does not report the unit closed or remove its worktree. Check the process and the daemon log, then retry the same close: the deck keeps the unconfirmed agent's cleanup record so the retry can finish the stop and its cleanup.
+
 | Message | Cause | What to do |
 |---|---|---|
 | `the running daemon (…) is too old for close; nothing was closed` | The daemon was started by an older version of the deck. | Restart it onto this version with `dot-agent-deck daemon restart`, or close from the TUI or the desktop app. |
 | `no daemon is running …; nothing was closed` | No daemon is running for this user. `close` never starts one. | Nothing is running, so there is nothing to close. |
 | `close: …` naming `DOT_AGENT_DECK_PANE_ID`, `DOT_AGENT_DECK_AGENT_ID` or `DOT_AGENT_DECK_PANE_CAPABILITY` | Some of the variables the deck sets in its panes are present and some are missing or empty, so `close` cannot tell whether a person or an agent is asking. It refuses rather than guess. | Run it from a terminal outside the deck, where none of them is set, or from the agent's own pane with the environment the deck gave it. |
-| `PARTIALLY: still running: …` | Some agents of the unit stopped and some did not. | Close the survivors with `--pane`, or from a client. |
+| `PARTIALLY: still running: …` | Some agents of the unit stopped and some did not, or their exits could not be confirmed. | Inspect the named survivors. Close any still listed with `--pane`, or from a client. |
 | An agent's `close --all` lists nothing | That agent dispatched no units that are still running. | Close from a shell instead. |
 
 ## What the agent rules protect against

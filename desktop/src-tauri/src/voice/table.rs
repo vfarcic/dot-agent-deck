@@ -1384,7 +1384,7 @@ mod tests {
                 // The dialog's Discard (#1247): the one close that keeps no draft.
                 ("discard_new_agent", "discardNewAgent", vec!["overview"]),
                 // PRD #802 D5's set: each only opens a confirmation.
-                ("stop_agent", "confirmStopAgent", vec!["overview"]),
+                ("stop_agent", "confirmStopAgent", vec!["overview", "agent"]),
                 (
                     "close_orchestration",
                     "confirmCloseOrchestration",
@@ -2330,7 +2330,9 @@ mod tests {
                 "reading_off",
                 "hush_reading",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
-                "open_pr"
+                "open_pr",
+                // Issue #1402: ask to close the agent shown in the pane.
+                "stop_agent"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable
@@ -2785,7 +2787,15 @@ mod tests {
                 "{id}'s description must say it only asks: {}",
                 row.description
             );
-            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            assert_eq!(
+                row.screens,
+                if *id == "stop_agent" {
+                    vec![Screen::Overview, Screen::Agent]
+                } else {
+                    vec![Screen::Overview]
+                },
+                "{id}"
+            );
         }
         let stop = table.row("stop_agent").expect("present");
         assert_eq!(stop.params[0].kind, ParamKind::AgentRef);
@@ -3013,12 +3023,11 @@ mod tests {
         );
     }
 
-    /// D1's rule as a table property: "close the agent" and its view synonyms
-    /// name no orchestration, so the refuse-only guard keeps every one of them
-    /// from stopping a run whatever the meaning check answers — and neither
-    /// stop row lists "close" among the words it sets aside as its verb.
+    /// D1's model-pick guard: these view phrases name no orchestration and
+    /// neither stop row takes "close" as its reference verb. The agent pane's
+    /// explicit whole-utterance close phrases bypass the model (#1402).
     #[test]
-    fn voice_table_close_the_agent_grounds_only_the_view() {
+    fn voice_table_model_close_picks_keep_the_view_guard() {
         let table = super::table();
         let stop = table.row("stop_agent").expect("present");
         assert!(

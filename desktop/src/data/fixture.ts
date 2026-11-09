@@ -1753,6 +1753,15 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Opening the pull request.",
   },
   {
+    // Issue #1402 — the open agent's close, without inventing an agent-ref resolver.
+    phrases: ["stop", "stop it", "stop that", "stop this agent", "stop the agent", "close agent", "close this agent", "close the agent"],
+    action: "stop_agent",
+    invoke: "confirmStopAgent",
+    screens: ["agent"],
+    unavailableHint: "open the agent's pane to close it by voice in the preview",
+    report: "Confirm closing the open agent — nothing has been stopped yet.",
+  },
+  {
     phrases: ["open it in the browser", "open in browser"],
     action: "open_pr_in_browser",
     invoke: "openPullRequestInBrowser",
@@ -1869,8 +1878,7 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
   /* PRD #1541 — a typing-mode prompt command said with the mode OFF: on the
      agent screen it runs nothing and says to say "typing on" first. On the
      other screens Rust's model answers it, which the preview stands in for
-     with the row's own hint. A bare "stop" is neither: Rust hands it to the
-     model, and here it falls through like any other phrase. */
+      with the row's own hint. A bare "stop" asks to close the agent below. */
   const typingOnly = reserved || fixtureSaidWhole(utterance, FIXTURE_TYPING_STOP_PHRASES)
     ? undefined
     : FIXTURE_VOICE_COMMANDS.find((candidate) => candidate.typingOnly && fixtureSaidWhole(utterance, candidate.phrases));
@@ -1879,6 +1887,8 @@ export function resolveFixtureVoice(utterance: string, screen: VoiceScreen, dict
     const sentence = screen === "agent" ? `${hint[0].toUpperCase()}${hint.slice(1)}.` : `Not here — ${hint}.`;
     return { ...stub, outcome: { kind: "unavailable", transcript: utterance, action: typingOnly.action, hint, sentence } };
   }
+  const agentClose = screen === "agent" ? fixtureReserved(utterance, ["stop_agent"]) : undefined;
+  if (agentClose) return { ...stub, outcome: { kind: "dispatch", transcript: utterance, action: agentClose.action, invoke: agentClose.invoke, params: [], sentence: agentClose.report } };
   if (!reserved && FIXTURE_VOICE_TIE.phrases.includes(spoken)) {
     const hint = "opening an agent works from the Daemons screen or the agent dashboard";
     if (!FIXTURE_VOICE_TIE.screens.includes(screen)) {
