@@ -63,7 +63,7 @@ To change the wait, or turn the notification off:
 - **TUI:** `dot-agent-deck config set notifications.question_after_minutes 30`; `0` turns it off. The TUI sends the notification to your terminal as an OSC 9 notification, which terminals such as iTerm2, WezTerm and Ghostty show as a system notification. A terminal that doesn't support it, or tmux unless it passes the sequence through, shows nothing, and the card's badge is then what tells you.
 - **Desktop app:** **Settings → Notifications**, under "Notify when a question waits": 5, 10, 15, 30 or 60 minutes, or **Off**. It is stored in `desktop.toml` as `notify` under `[questions]`, in minutes, with `0` for off.
 
-Each client has its own setting and sends its own notification, so with both open you get one from each. Restarting the TUI or the desktop app can send a still-waiting question's notification once more.
+Each client has its own setting and sends its own notification, so with both open you get one from each. Neither notifies for a question whose answer the deck is already delivering, and the desktop app does not notify for a daemon it cannot currently reach; if the system refuses a desktop notification, the app tries again. Restarting the TUI or the desktop app can send a still-waiting question's notification once more.
 
 Limits:
 

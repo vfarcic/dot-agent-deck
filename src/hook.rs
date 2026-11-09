@@ -804,6 +804,17 @@ pub const CLAUDE_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_
 /// minutes is nothing against a hold of weeks.
 pub const CLAUDE_HOLD_MARGIN: std::time::Duration = std::time::Duration::from_secs(600);
 
+/// Issue #2075: how long an `await-answer` child waits for its question's
+/// answer. On Unix, as long as the question waits: the child ends when the
+/// plugin or extension stops it or when its parent goes
+/// ([`exit_when_orphaned`]). Elsewhere there is no parent check, so a day
+/// bounds a child that outlives its agent (PR #2208 review).
+pub const AWAIT_ANSWER_DEADLINE: Option<std::time::Duration> = if cfg!(unix) {
+    None
+} else {
+    Some(std::time::Duration::from_secs(86_400))
+};
+
 /// Issue #2075: how often a holding producer checks that the agent that started
 /// it is still its parent. A hold no longer expires, so a producer whose agent
 /// died would otherwise keep its hold, and one of the daemon's
@@ -1102,7 +1113,7 @@ fn opencode_question_event(
 
 fn opencode_await_answer(raw: &str) -> Option<Value> {
     let (event, question, properties) = opencode_question_event(raw)?;
-    let reply = hold_question(&event, None);
+    let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
     crate::question::opencode_reply(&question, &properties, &reply?)
 }
 
@@ -1159,7 +1170,7 @@ fn opencode_hold_acked_at(
     out: &mut dyn std::io::Write,
     ack_line: impl FnOnce() -> Option<String>,
 ) {
-    let (end, stream) = start_hold_at(path, &event, None, HOLD_START_WAIT, true);
+    let (end, stream) = start_hold_at(path, &event, AWAIT_ANSWER_DEADLINE, HOLD_START_WAIT, true);
     let (Some(reply), Some(mut stream)) = (settle_hold(path, &event, end), stream) else {
         return;
     };
@@ -1208,7 +1219,7 @@ fn pi_await_answer(raw: &str) -> Option<Value> {
         None,
     );
     event.set_question(&question);
-    let reply = hold_question(&event, None);
+    let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
     crate::question::pi_value(&dialog, &question, &reply?)
 }
 

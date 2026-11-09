@@ -2,7 +2,7 @@ import { renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DEFAULT_DESKTOP_SETTINGS, type DesktopSettingsDto } from "./bridge";
 import { dueQuestionNotifications, QUESTION_NOTIFY_BODY_LIMIT, type QuestionNotifyLedger, type WaitingQuestion } from "./questionNotifier";
-import { QUESTION_NOTIFY_TICK_MS, useQuestionNotifications } from "../hooks/useQuestionNotifications";
+import { QUESTION_NOTIFY_TICK_MS, useQuestionNotifications, waitingQuestionsOf } from "../hooks/useQuestionNotifications";
 import type { DeckFleet } from "../types";
 
 const RAISED = 1_767_225_600_000;
@@ -97,12 +97,17 @@ describe("the notifier hook (issue #2075)", () => {
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
 
-  function fleetWith(question: { id: string; raisedAtMs?: number } | undefined): DeckFleet {
+  function fleetWith(
+    question: { id: string; raisedAtMs?: number; answerQueued?: boolean } | undefined,
+    status = "connected",
+  ): DeckFleet {
     return [{
+      connection: { status },
       agents: [{
         id: "7", daemonId: "deck-a", displayName: "reviewer",
         pendingQuestion: question && {
           id: question.id, kind: "choice", channel: "held", answerable: true, raisedAtMs: question.raisedAtMs,
+          answerQueued: question.answerQueued,
           questions: [{ prompt: "Which colour?", multiSelect: false, options: [] }],
         },
       }],
@@ -110,23 +115,57 @@ describe("the notifier hook (issue #2075)", () => {
   }
 
   /**
+   * Scenario (question/desktop/036, PR #2208 review): a question whose answer
+   * the daemon has accepted and is delivering is not waiting, and neither is a
+   * question cached from a deck the app is no longer connected to.
+   */
+  it("question/desktop/036: a queued answer and a deck out of reach are not waiting", () => {
+    expect(waitingQuestionsOf(fleetWith({ id: "q-1", raisedAtMs: RAISED }))).toHaveLength(1);
+    expect(waitingQuestionsOf(fleetWith({ id: "q-1", raisedAtMs: RAISED, answerQueued: true }))).toEqual([]);
+    expect(waitingQuestionsOf(fleetWith({ id: "q-1", raisedAtMs: RAISED }, "disconnected"))).toEqual([]);
+  });
+
+  /**
+   * Scenario (question/desktop/036, PR #2208 review): the system refuses the
+   * first notification; the next check tries it again, and once it is posted
+   * no later check posts it a third time.
+   */
+  it("question/desktop/036: a notification that could not be posted is tried again, once posted never again", async () => {
+    const outcomes = [false, true];
+    const post = vi.fn(() => outcomes.shift() ?? true);
+    renderHook(() => useQuestionNotifications(
+      fleetWith({ id: "q-1", raisedAtMs: RAISED }),
+      DEFAULT_DESKTOP_SETTINGS,
+      true,
+      post,
+      () => RAISED + 20 * MINUTE,
+    ));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(post).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(QUESTION_NOTIFY_TICK_MS);
+    expect(post).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(QUESTION_NOTIFY_TICK_MS * 4);
+    expect(post).toHaveBeenCalledTimes(2);
+  });
+
+  /**
    * Scenario (question/desktop/036): the app is open with a question waiting
    * on one agent and the setting at its default of ten minutes; a check on the
    * timer at ten minutes posts one notification, later ticks post nothing, and
    * with the setting at Off nothing is posted at all.
    */
-  it("question/desktop/036: posts once from the timer at the default ten minutes, and never when Off", () => {
+  it("question/desktop/036: posts once from the timer at the default ten minutes, and never when Off", async () => {
     let now = RAISED;
     const post = vi.fn();
     const settings: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
     renderHook(() => useQuestionNotifications(fleetWith({ id: "q-1", raisedAtMs: RAISED }), settings, true, post, () => now));
     expect(post).not.toHaveBeenCalled();
     now = RAISED + 10 * MINUTE;
-    vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS);
+    await vi.advanceTimersByTimeAsync(QUESTION_NOTIFY_TICK_MS);
     expect(post).toHaveBeenCalledTimes(1);
     expect(post).toHaveBeenCalledWith("Question waiting 10m", "reviewer: Which colour?");
     now = RAISED + 60 * MINUTE;
-    vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS * 4);
+    await vi.advanceTimersByTimeAsync(QUESTION_NOTIFY_TICK_MS * 4);
     expect(post).toHaveBeenCalledTimes(1);
 
     const off = vi.fn();
@@ -137,7 +176,7 @@ describe("the notifier hook (issue #2075)", () => {
       off,
       () => RAISED + 600 * MINUTE,
     ));
-    vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS * 4);
+    await vi.advanceTimersByTimeAsync(QUESTION_NOTIFY_TICK_MS * 4);
     expect(off).not.toHaveBeenCalled();
   });
 

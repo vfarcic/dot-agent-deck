@@ -167,10 +167,15 @@ impl NotificationsConfig {
     }
 
     /// How long a question waits before its notification, or `None` when
-    /// notifications are off.
+    /// notifications are off. A value too large for a duration (only a
+    /// hand-edited file can hold one; `config set` refuses it) reads as off
+    /// rather than panicking (PR #2208 review).
     pub fn question_after(&self) -> Option<chrono::Duration> {
         let minutes = i64::try_from(self.question_after_minutes).ok()?;
-        (minutes > 0).then(|| chrono::Duration::minutes(minutes))
+        if minutes <= 0 {
+            return None;
+        }
+        chrono::Duration::try_minutes(minutes)
     }
 }
 
@@ -538,9 +543,17 @@ impl DashboardConfig {
                 Ok(())
             }
             "notifications.question_after_minutes" => {
-                self.notifications.question_after_minutes = value.trim().parse().map_err(|_| {
+                let invalid = || {
                     format!("Invalid {key}: {value:?} (a whole number of minutes; 0 turns it off)")
-                })?;
+                };
+                let minutes: u64 = value.trim().parse().map_err(|_| invalid())?;
+                let in_range = i64::try_from(minutes)
+                    .ok()
+                    .is_some_and(|m| chrono::Duration::try_minutes(m).is_some());
+                if !in_range {
+                    return Err(invalid());
+                }
+                self.notifications.question_after_minutes = minutes;
                 Ok(())
             }
             "auto_config_prompt" => {
@@ -3771,6 +3784,14 @@ timeout_secs = 600
         );
         assert!(dc.set_field(key, "ten").is_err());
         assert!(dc.set_field(key, "-1").is_err());
+        // PR #2208 review: a number past what a duration holds is refused,
+        // and one written into the file by hand reads as off, not a panic.
+        assert!(dc.set_field(key, &u64::MAX.to_string()).is_err());
+        assert!(dc.set_field(key, &i64::MAX.to_string()).is_err());
+        let huge: DashboardConfig =
+            toml::from_str("[notifications]\nquestion_after_minutes = 9223372036854775807")
+                .unwrap();
+        assert_eq!(huge.notifications.question_after(), None);
         assert_eq!(dc.notifications.question_after_minutes, 25);
         dc.set_field(key, "0").unwrap();
         assert_eq!(dc.notifications.question_after(), None);

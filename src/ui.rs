@@ -5162,7 +5162,13 @@ fn question_reminders(
     let mut texts = Vec::new();
     for id in ids {
         let session = &sessions[id];
-        let Some(question) = &session.pending_question else {
+        // A question whose answer the daemon accepted and is delivering is
+        // no longer waiting on the user (PR #2208 review).
+        let Some(question) = session
+            .pending_question
+            .as_ref()
+            .filter(|q| !q.answer_queued)
+        else {
             continue;
         };
         let raised = question_raised_at(question, now);
@@ -5187,8 +5193,23 @@ fn question_reminders(
             &format_elapsed(raised, now),
         ));
     }
+    // Past the limit, keep only the records of questions still waiting: they
+    // are the ones that must not notify again, and the rest would otherwise
+    // pile up for as long as the TUI runs (PR #2208 review).
+    if notified.len() > QUESTION_REMINDER_LEDGER_LIMIT {
+        notified.retain(|(session, question)| {
+            sessions
+                .get(session)
+                .and_then(|s| s.pending_question.as_ref())
+                .is_some_and(|q| &q.id == question)
+        });
+    }
     texts
 }
+
+/// How many notified questions [`question_reminders`] remembers before it
+/// forgets those no longer waiting.
+const QUESTION_REMINDER_LEDGER_LIMIT: usize = 1000;
 
 /// `Question waiting <age> — <name>: <prompt>`, the prompt cut at
 /// [`QUESTION_REMINDER_PROMPT_CHARS`] and every control character dropped, so
@@ -36054,6 +36075,30 @@ mod tests {
             question_reminders(&due, &names, &mut HashSet::new(), None, now).is_empty(),
             "0 turns notifications off"
         );
+
+        // PR #2208 review: a question whose answer is queued for delivery is
+        // not waiting on the user.
+        let mut queued = sessions(Some(chrono::Duration::minutes(30)));
+        queued
+            .get_mut("s-1")
+            .unwrap()
+            .pending_question
+            .as_mut()
+            .unwrap()
+            .answer_queued = true;
+        assert!(question_reminders(&queued, &names, &mut HashSet::new(), after, now).is_empty());
+
+        // PR #2208 review: past the limit, the records of questions no longer
+        // waiting go, and the waiting one's stays, so it does not notify again.
+        let mut full: HashSet<(String, String)> = (0..QUESTION_REMINDER_LEDGER_LIMIT)
+            .map(|i| ("gone".to_string(), format!("q-{i}")))
+            .collect();
+        assert_eq!(
+            question_reminders(&due, &names, &mut full, after, now).len(),
+            1
+        );
+        assert_eq!(full.len(), 1, "only the waiting question's record is kept");
+        assert!(question_reminders(&due, &names, &mut full, after, now).is_empty());
 
         let text = question_reminder_text("lead", "Run \u{1b}]9;x\u{7} now?\nok", "10m");
         assert!(!text.chars().any(char::is_control), "{text:?}");
