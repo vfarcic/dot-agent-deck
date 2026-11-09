@@ -33,6 +33,8 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
+import { worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
+import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -925,7 +927,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
-    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped);
+    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, runtime.previewWorktreeClose);
     setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
@@ -1347,7 +1349,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
@@ -2244,6 +2246,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
       label: "Close agent",
       busyLabel: "Stopping…",
+      worktreePreview: worktreePreview(runtime, snapshot.connection.deckId ?? "", [selectedAgent]),
       action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
     });
   };
@@ -2711,7 +2714,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} />
     </div>
   );
 }
@@ -2737,17 +2740,25 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
   const newestWarning = warnings?.at(-1)?.id;
+  const newestWorktree = worktrees?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, message, restart]);
-  if (!message && !warnings?.length && !restart) return null;
+  }, [newestWarning, newestWorktree, message, restart]);
+  if (!message && !warnings?.length && !restart && !worktrees?.length) return null;
   return (
     <div className="toast-stack" ref={stack}>
+      {worktrees?.map((kept) => (
+        <div key={`worktree-${kept.id}`} className="toast toast-restart" data-testid="worktree-kept-toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body"><span>{displayText(kept.deck, DISPLAY_LIMITS.name)}: <KeptWorktreeText kept={kept} /></span></div>
+          <button aria-label="Dismiss kept worktree notice" onClick={() => onDismissWorktree?.(kept.id)}><X size={14} /></button>
+        </div>
+      ))}
       {warnings?.map((warning) => (
         <div key={warning.id} className="toast" data-testid="cleanup-toast">
           <AlertTriangle size={15} />

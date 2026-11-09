@@ -2,6 +2,7 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
+import { worktreeKeptNotice, type KeptWorktree } from "./worktreeClose";
 import { agentKey, boundAgentKey } from "./agentKey";
 import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
@@ -1815,6 +1816,7 @@ export type DesktopRunActionDto =
  * exactly where they were.
  */
 type FleetListener = (fleet: DeckFleet) => void;
+type WorktreeKeptListener = (notice: import("./worktreeClose").WorktreeKeptNotice) => void;
 type TerminalListener = (event: TerminalChunk) => void;
 
 /**
@@ -1866,7 +1868,8 @@ export interface DeckBridge {
    * and a settings save that touched `[endpoints]` (see `saveSettings`).
    */
   connect(): Promise<DeckFleet>;
-  subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
+  subscribe(onFleet: FleetListener, onTerminal: TerminalListener, onWorktreeKept?: WorktreeKeptListener): Promise<Unsubscribe>;
+  previewWorktreeClose: import("./worktreeClose").WorktreeClosePreview;
   runAction(action: DeckAction): Promise<DeckActionResult>;
   /**
    * Type into one agent's terminal, named by the composite `(deckId, agentId)`.
@@ -3837,6 +3840,10 @@ class FixtureDeckBridge implements DeckBridge {
     return fixtureDesktopFeatures();
   }
 
+  async previewWorktreeClose(): Promise<KeptWorktree | null> {
+    return null;
+  }
+
   /** PRD #1223 M4 — the named fixture deck's options, or `unsupported` for one this preview plays as older. */
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     await Promise.resolve();
@@ -4954,7 +4961,7 @@ export class TauriDeckBridge implements DeckBridge {
     return this.fleetView();
   }
 
-  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
+  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener, onWorktreeKept?: WorktreeKeptListener): Promise<Unsubscribe> {
     const { listen } = await import("@tauri-apps/api/event");
     this.terminalListener = onTerminal;
     this.fleetListener = onFleet;
@@ -4982,6 +4989,8 @@ export class TauriDeckBridge implements DeckBridge {
     // event produces one within the coalescing window; republishing the last
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
+      const kept = worktreeKeptNotice(event.payload);
+      if (kept) onWorktreeKept?.(kept);
       // PRD #742 M3 stamped every payload with the deck it came from, and this
       // is the reader that stamp was for: the evidence drawer and the handoff
       // rail are the DECK SCREEN's, which DECISION 1 keeps single-deck, so an
@@ -5712,6 +5721,11 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOptions>("desktop_new_agent_options", { deckId });
+  }
+
+  async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | null> {
+    const invoke = await this.getInvoke();
+    return invoke<KeptWorktree | null>("desktop_worktree_close_preview", { deckId, paneIds, incarnation });
   }
 
   /** PRD #1223 M6. The deck and the path go through untouched, as for {@link listDirectories}. */

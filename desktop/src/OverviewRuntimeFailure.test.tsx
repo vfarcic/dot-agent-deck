@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { createFixtureSnapshot } from "./data/fixture";
+import { createFixtureFleet, createFixtureSnapshot, FIXTURE_REMOTE_DAEMON_ID } from "./data/fixture";
 import { LaunchCleanupError } from "./lib/actionError";
 import { DEFAULT_DESKTOP_SETTINGS as DEFAULT_SETTINGS, fixtureDesktopFeatures, type DeckBridge } from "./lib/bridge";
 import type { DeckDirectoryListing, NewAgentOptions } from "./types";
@@ -34,7 +34,7 @@ const { bridge } = vi.hoisted(() => ({
     mode: "fixture",
     desktopFeatures: vi.fn(async () => fixtureDesktopFeatures("?experimental=1")),
     connect: vi.fn(),
-    subscribe: vi.fn(async () => () => {}),
+    subscribe: vi.fn<DeckBridge["subscribe"]>(async () => () => {}),
     runAction: vi.fn(),
     sendTerminalInput: vi.fn(async () => {}),
     resizeTerminal: vi.fn(async () => {}),
@@ -101,6 +101,35 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
     bridge.onTerminalGeometry.mockReturnValue(() => {});
     bridge.listDirectories.mockImplementation(async () => structuredClone(HOME));
     bridge.newAgentOptions.mockImplementation(async () => structuredClone(OPTIONS));
+  });
+
+  /** Scenario: a remote unit's cleanup keeps its worktree after the unit disappeared. The Dashboard names the source daemon and directory, preserves two reports across Refresh and navigation, and dismisses just the requested notice. */
+  it("shows kept worktrees after the cards are gone on both dashboard and deck", async () => {
+    const fleet = createFixtureFleet("fleet").map((deck) => ({ ...deck, agents: [] }));
+    bridge.connect.mockResolvedValue(fleet);
+    render(<App />);
+    await waitFor(() => expect(latestRuntime?.fleet).toEqual(fleet));
+    expect(screen.queryByTestId("worktree-kept-toast")).toBeNull();
+    const notify = bridge.subscribe.mock.calls[0][2]!;
+    const path = `/remote/${"long-directory/".repeat(30)}project-dispatch-1674`;
+    act(() => {
+      notify({ deckId: FIXTURE_REMOTE_DAEMON_ID, path, confirmed_dirty: true });
+      notify({ deckId: FIXTURE_REMOTE_DAEMON_ID, path: "/remote/other\u202eworktree", confirmed_dirty: false });
+    });
+    const toasts = screen.getAllByTestId("worktree-kept-toast");
+    expect(toasts[0]).toHaveTextContent("dev@build-box");
+    expect(toasts[0]).toHaveTextContent(path);
+    expect(toasts[0]).toHaveTextContent("Uncommitted work here is KEPT, not deleted:");
+    expect(toasts[1]).toHaveTextContent("Uncommitted work here, if any, is KEPT:");
+    expect(toasts[1]).toHaveTextContent("/remote/otherworktree");
+    await act(async () => latestRuntime!.reconnect());
+    fireEvent.click(screen.getAllByTestId("overview-open-deck")[0]);
+    expect(screen.getAllByTestId("worktree-kept-toast")).toHaveLength(2);
+    fireEvent.click(screen.getAllByRole("button", { name: "Dismiss kept worktree notice" })[0]);
+    expect(screen.getAllByTestId("worktree-kept-toast")).toHaveLength(1);
+    expect(screen.getByTestId("worktree-kept-toast")).toHaveTextContent("/remote/otherworktree");
+    fireEvent.click(screen.getByTestId("open-overview"));
+    expect(screen.getByTestId("worktree-kept-toast")).toHaveTextContent("/remote/otherworktree");
   });
 
   /**
