@@ -32,6 +32,7 @@ import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { deckAttentionText } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
+import { worktreeClosePreview } from "../lib/worktree";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -54,7 +55,7 @@ import { DeckAttention } from "./DeckAttention";
  */
 export type OverviewAgent = Pick<
   AgentSession,
-  "id" | "daemonId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
+  "id" | "daemonId" | "paneId" | "displayName" | "cli" | "status" | "activeTool" | "activeToolDetail" | "toolCount" | "tab" | "lastUserPrompt" | "lastActivityMs" | "spawnedAtMs"
   /* Issue #1496 — read by the dashboard filter, not rendered. */
   | "agentType" | "daemonStatus" | "authoringKind"
   /* PRD #1401 — the badge beside the agent's name. */
@@ -87,10 +88,11 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
+  const { id, daemonId, paneId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
   return {
     id,
     daemonId,
+    paneId,
     displayName,
     cli,
     status,
@@ -817,7 +819,7 @@ export function stopTargetName(agent: OverviewAgent): string {
 }
 
 /** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
-export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void): ConfirmState {
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, preview?: ConfirmState["preview"]): ConfirmState {
   const name = stopTargetName(agent);
   const roleWarning = agent.tab.kind === "orchestration"
     ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
@@ -825,6 +827,7 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   return {
     title: `Close ${name}?`,
     body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
+    ...(preview ? { preview } : {}),
     label: "Close agent",
     busyLabel: "Stopping…",
     action: async () => {
@@ -1437,7 +1440,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction));
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, worktreeClosePreview(runtime, deck.connection, [agent], deck.agents)));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -1449,6 +1452,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         setConfirm({
           title: `Close ${title}?`,
           body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
+          preview: worktreeClosePreview(runtime, deck.connection, group.agents, deck.agents),
           label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
           busyLabel: "Stopping…",
           action: () => run({ type: "stop_orchestration", deckId, roles }),

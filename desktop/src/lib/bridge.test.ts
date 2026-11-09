@@ -100,6 +100,33 @@ describe("TauriDeckBridge", () => {
     await bridge.dispose();
   });
 
+  /** Scenario: a close preview names its deck, panes and daemon process; the daemon's later kept-worktree broadcast reaches the app even when it came from a non-selected deck. */
+  it("requests a worktree close preview and forwards the actual kept-worktree event", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const kept = { path: "/work/issue-1674", confirmedDirty: true };
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_bootstrap") return snapshot;
+      if (command === "desktop_dispatch_worktree_close_preview") return kept;
+      return { ok: true };
+    });
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    const onKept = vi.fn();
+    const unsubscribe = bridge.onWorktreeKept!(onKept);
+
+    await expect(bridge.previewWorktreeClose!("deck-000000000000dec1", ["pane-1", "pane-2"], "process-a")).resolves.toEqual(kept);
+    expect(invoke).toHaveBeenCalledWith("desktop_dispatch_worktree_close_preview", { deckId: "deck-000000000000dec1", paneIds: ["pane-1", "pane-2"], incarnation: "process-a" });
+
+    listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", path: kept.path, confirmed_dirty: true, deck: "deck-000000000000beef" } });
+    expect(onKept).toHaveBeenCalledWith({ ...kept, deckId: "deck-000000000000beef" });
+
+    unsubscribe();
+    listeners.get("desktop://daemon-event")?.({ payload: { kind: "worktree_kept", path: kept.path, confirmed_dirty: true } });
+    expect(onKept).toHaveBeenCalledTimes(1);
+    await bridge.dispose();
+  });
+
   it("maps nullable daemon metadata honestly and uses session IDs for terminal RPCs", async () => {
     const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
     const incompatible = structuredClone(snapshot);

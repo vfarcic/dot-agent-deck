@@ -5,7 +5,7 @@ import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
 import { agentKey, boundAgentKey } from "./agentKey";
 import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
-import { applyHandoffEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
+import { applyHandoffEvent, keptWorktreeFromDaemonEvent, mapDaemonEvent, metadataOf, MAX_LIVE_EVIDENCE, type DaemonHookEvent } from "./daemonEvents";
 import { DISPLAY_LIMITS, displayText } from "./displayText";
 import { agentTurn } from "./promptKeys";
 import { describeEndpoint } from "./endpoints";
@@ -46,6 +46,8 @@ import type { HandoffEdge,
   InboxActionResult,
   InboxActionVerb,
   InboxAttentionItem,
+  KeptWorktree,
+  KeptWorktreeEvent,
   NewAgentOptions,
   NewAgentOrchestrations,
   PromptKeys,
@@ -1825,6 +1827,7 @@ type TerminalListener = (event: TerminalChunk) => void;
  * previous process's grid.
  */
 export type TerminalGeometryListener = (agentId: string, rows: number, cols: number, deckId?: string, incarnation?: string) => void;
+export type WorktreeKeptListener = (event: KeptWorktreeEvent) => void;
 type Unsubscribe = () => void;
 
 interface PendingTerminalAttachment {
@@ -2278,6 +2281,10 @@ export interface DeckBridge {
    * answers `stale` to the second of two clients acting at once.
    */
   inboxAction?(target: AgentTarget, item: { paneId: string; messageId: string; revision: number }, verb: InboxActionVerb): Promise<InboxActionResult>;
+  /** Best-effort close preview; absent in the browser fixture and lightweight test bridges. */
+  previewWorktreeClose?(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | undefined>;
+  /** The daemon's actual kept-worktree reports, from every observed deck. */
+  onWorktreeKept?(listener: WorktreeKeptListener): Unsubscribe;
   dispose(): Promise<void>;
 }
 
@@ -4114,6 +4121,7 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private appliedGeometry = new Map<string, { target: AgentTarget; rows: number; cols: number }>();
   private geometryListeners = new Set<TerminalGeometryListener>();
+  private worktreeKeptListeners = new Set<WorktreeKeptListener>();
   private invoke?: typeof import("@tauri-apps/api/core")["invoke"];
   private lifecycle = 0;
   /**
@@ -4982,6 +4990,10 @@ export class TauriDeckBridge implements DeckBridge {
     // event produces one within the coalescing window; republishing the last
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
+      // Unlike the single-deck evidence drawer, this report belongs on whichever
+      // screen is up: an overview close can target a deck that is not selected.
+      const kept = keptWorktreeFromDaemonEvent(event.payload);
+      if (kept) this.worktreeKeptListeners.forEach((listener) => listener(kept));
       // PRD #742 M3 stamped every payload with the deck it came from, and this
       // is the reader that stamp was for: the evidence drawer and the handoff
       // rail are the DECK SCREEN's, which DECISION 1 keeps single-deck, so an
@@ -5531,6 +5543,17 @@ export class TauriDeckBridge implements DeckBridge {
     return write;
   }
 
+  async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | undefined> {
+    const invoke = await this.getInvoke();
+    const kept = await invoke<KeptWorktree | null>("desktop_dispatch_worktree_close_preview", { deckId, paneIds, incarnation: incarnation ?? null });
+    return kept ?? undefined;
+  }
+
+  onWorktreeKept(listener: WorktreeKeptListener): () => void {
+    this.worktreeKeptListeners.add(listener);
+    return () => { this.worktreeKeptListeners.delete(listener); };
+  }
+
   onTerminalGeometry(listener: TerminalGeometryListener): () => void {
     this.geometryListeners.add(listener);
     // Replay what is already known: an agent can have been constrained by
@@ -5740,6 +5763,7 @@ export class TauriDeckBridge implements DeckBridge {
     // pane nobody is looking at any more.
     this.appliedGeometry.clear();
     this.geometryListeners.clear();
+    this.worktreeKeptListeners.clear();
     this.shown.clear();
     this.warm.clear();
     this.clearAttachSuppression();

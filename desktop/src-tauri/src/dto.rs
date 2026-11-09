@@ -627,6 +627,23 @@ pub enum ConnectionStatus {
     Incompatible,
 }
 
+/// The close-preview answer in the desktop IPC's camelCase DTO convention.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DesktopKeptWorktree {
+    pub path: String,
+    pub confirmed_dirty: bool,
+}
+
+impl From<dot_agent_deck::issue_dispatch_run::KeptWorktree> for DesktopKeptWorktree {
+    fn from(kept: dot_agent_deck::issue_dispatch_run::KeptWorktree) -> Self {
+        Self {
+            path: kept.path,
+            confirmed_dirty: kept.confirmed_dirty,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DesktopAgent {

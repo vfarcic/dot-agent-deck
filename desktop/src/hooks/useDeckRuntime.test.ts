@@ -24,6 +24,8 @@ const { bridge } = vi.hoisted(() => ({
     sendTerminalInput: vi.fn(async () => {}),
     resizeTerminal: vi.fn(async () => {}),
     onTerminalGeometry: vi.fn((_listener: (agentId: string, rows: number, cols: number, deckId?: string, incarnation?: string) => void) => () => {}),
+    onWorktreeKept: vi.fn((_listener: (event: { path: string; confirmedDirty: boolean; deckId?: string }) => void) => () => {}),
+    previewWorktreeClose: vi.fn(),
     setZoom: vi.fn(async (level: number) => level),
     getSettings: vi.fn(async () => ({ settings: {} })),
     saveSettings: vi.fn(async (settings: unknown) => settings),
@@ -62,6 +64,7 @@ describe("useDeckRuntime", () => {
     bridge.connect.mockResolvedValue([createFixtureSnapshot("connected")]);
     bridge.subscribe.mockResolvedValue(() => {});
     bridge.onTerminalGeometry.mockReturnValue(() => {});
+    bridge.onWorktreeKept.mockReturnValue(() => {});
   });
 
   /**
@@ -235,6 +238,25 @@ describe("useDeckRuntime", () => {
 
     expect(result.current.snapshot.connection.deckId).not.toBe(FIXTURE_REMOTE_DAEMON_ID);
     expect(result.current.cleanupWarnings?.map((warning) => warning.deck)).toEqual([deckName(remote.connection), "Local daemon"]);
+  });
+
+  /** Scenario: a kept-worktree broadcast from the non-selected remote deck joins the runtime's toast queue with that deck's name, and only its own dismiss removes it. */
+  it("queues a kept-worktree report with the deck that produced it", async () => {
+    let onKept: ((event: { path: string; confirmedDirty: boolean; deckId?: string }) => void) | undefined;
+    bridge.onWorktreeKept.mockImplementation((listener) => {
+      onKept = listener;
+      return () => {};
+    });
+    bridge.connect.mockResolvedValue(createFixtureFleet("fleet"));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+    const remote = result.current.fleet.find((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)!;
+
+    act(() => onKept!({ path: "/work/issue-1674", confirmedDirty: true, deckId: FIXTURE_REMOTE_DAEMON_ID }));
+    expect(result.current.keptWorktrees).toEqual([{ id: 1, path: "/work/issue-1674", confirmedDirty: true, deck: deckName(remote.connection) }]);
+
+    act(() => result.current.dismissWorktreeKept?.(1));
+    expect(result.current.keptWorktrees).toEqual([]);
   });
 
   /**

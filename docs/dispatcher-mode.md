@@ -153,7 +153,7 @@ Close a unit when you are done with it: its tab or card in a client, or `dot-age
 
 Closing a unit removes that unit's worktree directory. Closing the dispatcher pane removes nothing; it never owned a worktree, and the units it started keep running. Your own repository is not touched either way.
 
-If the unit's worktree has **uncommitted changes** when you close it, the directory is kept on disk so the work can be recovered. In the TUI, the close confirmation warns when that is about to happen and names the directory, and after the close the status line reports what actually happened; a unit whose worktree turned out to be clean is removed without a message. The desktop app does not currently say when a worktree is kept; check with `dot-agent-deck worktree list`. `close` reports what happened to each worktree in its output.
+If the unit's worktree has **uncommitted changes** when you close it, the directory is kept on disk so the work can be recovered. In the TUI and the desktop app, the close confirmation warns when that is about to happen and names the directory. After the close, the TUI's status line or the desktop app's toast reports what actually happened; a unit whose worktree turned out to be clean is removed without a message. `close` reports what happened to each worktree in its output.
 
 The branch `agent/dispatch-<name>` is not deleted when a unit is closed, because it may hold committed work. Dispatching the same name again is therefore refused while that branch exists. Delete it when you are done (`git branch -D agent/dispatch-<name>`), or use a different name.
 

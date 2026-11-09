@@ -90,12 +90,13 @@ import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
-import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
+import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig, WorktreeKeptNotice } from "./types";
 import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
 import { planStoredRoleOrder, reconcileRoleOrder } from "./lib/roleOrder";
+import { keptWorktreeText, worktreeClosePreview } from "./lib/worktree";
 
 const ORCHESTRATION_STORAGE_KEY = modeScopedKey("dot-agent-deck.desktop.orchestration-preview.v1");
 /**
@@ -925,14 +926,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
-    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped);
+    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, worktreeClosePreview(runtime, paneDeck.connection, [paneAgent], paneDeck.agents));
     setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
       try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
     } });
     return undefined;
-  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
+  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction, runtime.previewWorktreeClose]);
   const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
     confirmStopAgent: confirmPaneStop,
     reportRefused: (sentence: string) => panelVoiceContext.current?.reportRefused?.(sentence),
@@ -1347,7 +1348,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} keptWorktrees={runtime.keptWorktrees} onDismissWorktreeKept={runtime.dismissWorktreeKept} restart={restart.notice} onDismissRestart={restart.dismiss} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
@@ -2242,6 +2243,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     setConfirm({
       title: `Close ${selectedAgent.role}?`,
       body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
+      preview: worktreeClosePreview(runtime, snapshot.connection, [selectedAgent], snapshot.agents),
       label: "Close agent",
       busyLabel: "Stopping…",
       action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
@@ -2711,7 +2713,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} keptWorktrees={runtime.keptWorktrees} onDismissWorktreeKept={runtime.dismissWorktreeKept} restart={restartNotice} onDismissRestart={onDismissRestartNotice} />
     </div>
   );
 }
@@ -2737,15 +2739,16 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, keptWorktrees, onDismissWorktreeKept, restart, onDismissRestart }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; keptWorktrees?: readonly WorktreeKeptNotice[]; onDismissWorktreeKept?: (id: number) => void; restart?: string; onDismissRestart?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
   const newestWarning = warnings?.at(-1)?.id;
+  const newestKeptWorktree = keptWorktrees?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, message, restart]);
-  if (!message && !warnings?.length && !restart) return null;
+  }, [newestWarning, newestKeptWorktree, message, restart]);
+  if (!message && !warnings?.length && !keptWorktrees?.length && !restart) return null;
   return (
     <div className="toast-stack" ref={stack}>
       {warnings?.map((warning) => (
@@ -2753,6 +2756,13 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
           <AlertTriangle size={15} />
           <CleanupWarning stops={warning.stops} deck={warning.deck} testId="toast-cleanup-warning" className="toast-body" />
           <button aria-label="Dismiss cleanup warning" onClick={() => onDismissWarning?.(warning.id)}><X size={14} /></button>
+        </div>
+      ))}
+      {keptWorktrees?.map((kept) => (
+        <div key={kept.id} className="toast toast-kept-worktree" data-testid="worktree-kept-toast" role="status">
+          <AlertTriangle size={15} />
+          <div className="toast-body"><span>{keptWorktreeText(kept)}{kept.deck ? ` on ${sanitizeText(kept.deck)}` : ""}</span></div>
+          <button aria-label="Dismiss kept worktree notice" onClick={() => onDismissWorktreeKept?.(kept.id)}><X size={14} /></button>
         </div>
       ))}
       {/* PRD #1666 part 2 (G-fix7c): the agents a deck restart stopped, in a

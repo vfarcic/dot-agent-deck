@@ -95,6 +95,12 @@ reason = "Dismisses a cleanup-warning toast: a dismissal."
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "() => onDismissWorktreeKept?.(kept.id)"
+reason = "Dismisses a kept-worktree toast: a dismissal."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "onDismiss"
 reason = "Dismisses the status toast: a dismissal."
 

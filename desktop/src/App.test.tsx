@@ -1145,6 +1145,26 @@ describe("ControlDeck", () => {
   });
 
   /**
+   * Scenario: the daemon reports after a close that a dispatched worktree was
+   * kept. The desktop shows the same post-close fact as the TUI's status line,
+   * naming the recoverable directory, until its own dismiss is pressed.
+   */
+  it("reports a worktree the daemon kept after a close", () => {
+    const dismissWorktreeKept = vi.fn();
+    render(<ControlDeck runtime={runtime({
+      keptWorktrees: [{ id: 4, path: "/home/dev/project-dispatch-issue-1674\u202E", confirmedDirty: true }],
+      dismissWorktreeKept,
+    })} />);
+
+    const toast = screen.getByTestId("worktree-kept-toast");
+    expect(toast).toHaveTextContent("Uncommitted work here is KEPT, not deleted:");
+    expect(toast).toHaveTextContent("/home/dev/project-dispatch-issue-1674");
+    expect(toast.textContent).not.toContain("\u202E");
+    fireEvent.click(screen.getByLabelText("Dismiss kept worktree notice"));
+    expect(dismissWorktreeKept).toHaveBeenCalledWith(4);
+  });
+
+  /**
    * Scenario (issue #1234 review): warnings pile up oldest first, with the
    * message last, in a stack that scrolls once it is taller than its cap. A
    * newly queued warning must not land below the visible part of it, so the

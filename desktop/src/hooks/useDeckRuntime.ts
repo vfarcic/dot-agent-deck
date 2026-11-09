@@ -12,7 +12,7 @@ import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 const EMPTY_TERMINAL_DATA: Record<string, TerminalBuffer> = {};
-import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer } from "../types";
+import type { AgentTarget, CleanupWarningEntry, DeckAction, DeckFleet, DeckListingOptions, DeckRuntimeState, DeckSnapshot, DesktopFeatures, InboxActionVerb, RuntimeMode, TerminalBuffer, WorktreeKeptNotice } from "../types";
 
 /**
  * The snapshot a runtime starts with, before any deck has answered. Lifted out
@@ -140,6 +140,8 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const [cleanupWarnings, setCleanupWarnings] = useState<readonly CleanupWarningEntry[]>([]);
   const nextCleanupWarningId = useRef(0);
+  const [keptWorktrees, setKeptWorktrees] = useState<readonly WorktreeKeptNotice[]>([]);
+  const nextKeptWorktreeId = useRef(0);
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -269,6 +271,19 @@ export function useDeckRuntime(): DeckRuntimeState {
     };
   }, [adoptFleet, bridge, updateSelected, updateTerminal]);
 
+  useEffect(() => bridge.onWorktreeKept?.((event) => {
+    nextKeptWorktreeId.current += 1;
+    const deckId = event.deckId ?? selectedDeckIdRef.current;
+    const target = fleetRef.current.find((deck) => deck.connection.deckId === deckId);
+    const notice: WorktreeKeptNotice = {
+      id: nextKeptWorktreeId.current,
+      path: event.path,
+      confirmedDirty: event.confirmedDirty,
+      ...(target ? { deck: deckName(target.connection) } : {}),
+    };
+    setKeptWorktrees((current) => [...current, notice]);
+  }), [bridge]);
+
   const runAction = useCallback(async (action: DeckAction) => {
     setError(undefined);
     const sentToDeckId = selectedDeckIdRef.current;
@@ -310,6 +325,12 @@ export function useDeckRuntime(): DeckRuntimeState {
   const dismissCleanupWarning = useCallback((id: number) => {
     setCleanupWarnings((current) => (current.some((entry) => entry.id === id) ? current.filter((entry) => entry.id !== id) : current));
   }, []);
+  const dismissWorktreeKept = useCallback((id: number) => {
+    setKeptWorktrees((current) => (current.some((entry) => entry.id === id) ? current.filter((entry) => entry.id !== id) : current));
+  }, []);
+  const previewWorktreeClose = useMemo(() => (typeof bridge.previewWorktreeClose === "function"
+    ? (deckId: string, paneIds: string[], incarnation?: string) => bridge.previewWorktreeClose!(deckId, paneIds, incarnation)
+    : undefined), [bridge]);
 
   const getSettings = useCallback(() => bridge.getSettings(), [bridge]);
   // Stable for the lifetime of the bridge: `useZoom` holds it across a
@@ -484,8 +505,11 @@ export function useDeckRuntime(): DeckRuntimeState {
     error,
     cleanupWarnings,
     dismissCleanupWarning,
+    keptWorktrees,
+    dismissWorktreeKept,
     clearError,
     runAction,
+    ...(previewWorktreeClose ? { previewWorktreeClose } : {}),
     ...(upgradeDaemon ? { upgradeDaemon } : {}),
     ...(decideUpgrade ? { decideUpgrade } : {}),
     ...(inboxAction ? { inboxAction } : {}),

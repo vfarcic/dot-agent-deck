@@ -3606,6 +3606,31 @@ impl DaemonClient {
         }
     }
 
+    /// Ask whether closing `pane_ids` would keep a dispatched worktree with
+    /// uncommitted work. The daemon owns the removal policy and, for a remote
+    /// deck, the filesystem too; an older daemon's refusal is returned to the
+    /// caller, whose confirmation treats this best-effort preview as absent.
+    pub async fn dispatch_worktree_close_preview(
+        &self,
+        pane_ids: &[String],
+    ) -> Result<Option<crate::issue_dispatch_run::KeptWorktree>, ClientError> {
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::DispatchWorktreeClosePreview {
+                pane_ids: pane_ids.to_vec(),
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(resp.error.unwrap_or_else(|| {
+                "dispatch-worktree-close-preview failed".into()
+            })));
+        }
+        Ok(resp.kept_worktree)
+    }
+
     /// Stop agent `id`. On a gated handle the request goes only to a daemon
     /// admitted on its own connection (PRD #1666 part 2): agent ids are a
     /// per-daemon counter, so a replacement the client would refuse may hold an
@@ -4980,6 +5005,54 @@ mod tests {
             .list_agents()
             .await
             .expect("a fresh connection is still served");
+    }
+
+    /// Scenario: a desktop close confirmation asks for two panes' worktree
+    /// preview. The exact pane set reaches the existing daemon verb, and its
+    /// kept path and dirty verdict reach the caller unchanged.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dispatch_worktree_close_preview_sends_panes_and_returns_the_kept_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("preview.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind scripted daemon");
+        let kept = crate::issue_dispatch_run::KeptWorktree {
+            path: "/work/issue-1674".into(),
+            confirmed_dirty: true,
+        };
+        let answer = kept.clone();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept preview client");
+            let (kind, payload) = read_frame(&mut stream)
+                .await
+                .expect("read preview request")
+                .expect("preview request frame");
+            assert_eq!(kind, KIND_REQ);
+            let request: AttachRequest = serde_json::from_slice(&payload).expect("decode preview");
+            match request {
+                AttachRequest::DispatchWorktreeClosePreview { pane_ids } => {
+                    assert_eq!(pane_ids, vec!["pane-1".to_string(), "pane-2".to_string()]);
+                }
+                other => panic!("expected worktree close preview, got {other:?}"),
+            }
+            crate::daemon_protocol::write_resp(
+                &mut stream,
+                &AttachResponse {
+                    kept_worktree: Some(answer),
+                    ..AttachResponse::ok()
+                },
+            )
+            .await
+            .expect("answer preview");
+        });
+
+        let client = DaemonClient::new(socket);
+        let preview = client
+            .dispatch_worktree_close_preview(&["pane-1".into(), "pane-2".into()])
+            .await
+            .expect("preview answer");
+        assert_eq!(preview, Some(kept));
+        server.await.expect("scripted daemon finishes");
     }
 
     #[cfg(unix)]

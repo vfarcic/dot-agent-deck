@@ -1,4 +1,4 @@
-import type { EvidenceItem, HandoffEdge, Verdict } from "../types";
+import type { EvidenceItem, HandoffEdge, KeptWorktreeEvent, Verdict } from "../types";
 import { INBOX_WORDS, terminationText } from "./inboxWords";
 
 /**
@@ -81,6 +81,20 @@ function verdictFor(eventType: string): Verdict {
   if (eventType === "error" || eventType === "quota_blocked") return "ERROR";
   if (HUMAN_EVENTS.has(eventType)) return "HUMAN";
   return "INFO";
+}
+
+/** The daemon's authoritative post-close kept-worktree report, not an evidence row. */
+export function keptWorktreeFromDaemonEvent(payload: unknown): KeptWorktreeEvent | undefined {
+  if (!payload || typeof payload !== "object") return undefined;
+  const event = payload as Record<string, unknown>;
+  if (event.kind !== "worktree_kept") return undefined;
+  const path = text(event.path);
+  if (!path || typeof event.confirmed_dirty !== "boolean") return undefined;
+  return {
+    path,
+    confirmedDirty: event.confirmed_dirty,
+    ...(typeof event.deck === "string" && event.deck ? { deckId: event.deck } : {}),
+  };
 }
 
 /** Extracts the string-map metadata an event carries, if any. */

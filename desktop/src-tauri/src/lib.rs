@@ -82,13 +82,13 @@ use crate::agent_view::{AgentView, RECONCILE_INTERVAL};
 use crate::daemon_bridge::{DaemonLinks, bootstrap, get_snapshot, snapshot_with, trusted_daemon};
 use crate::dto::{
     BootstrapOptions, COMMAND_MAX_BYTES, ConnectionStatus, DesktopAction, DesktopActionError,
-    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopListingOptions,
-    DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
-    DesktopResolvedProject, DesktopSnapshot, OrchestrationRoleInput, TerminalAttachResult,
-    desktop_agent_registry, ensure_desktop_orchestration_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
-    validate_dimensions, validate_orchestration_shape, validate_pasted_project_path,
-    validate_start_fields,
+    DesktopActionResult, DesktopAgentOption, DesktopDirectoryListing, DesktopKeptWorktree,
+    DesktopListingOptions, DesktopNewAgentOptions, DesktopNewAgentOrchestrations,
+    DesktopProjectListing, DesktopResolvedProject, DesktopSnapshot, OrchestrationRoleInput,
+    TerminalAttachResult, desktop_agent_registry, ensure_desktop_orchestration_platform_supported,
+    map_project_listing, map_resolved_project, mint_desktop_pane_id, safe_message,
+    selected_endpoint, validate_agent_id, validate_dimensions, validate_orchestration_shape,
+    validate_pasted_project_path, validate_start_fields,
 };
 use crate::secrets::{
     KeychainSecretStore, Secret, SecretError, SecretId, SecretStatus, SecretStore,
@@ -102,6 +102,8 @@ const WATCH_RETRY_DELAY: Duration = Duration::from_secs(1);
 const COORDINATOR_DELIVERY_RPC_TIMEOUT: Duration = Duration::from_secs(4);
 /// How long the post-failure lookup of a role's start may take.
 const ROLE_RECONCILE_RPC_TIMEOUT: Duration = Duration::from_secs(2);
+/// Matches the TUI's close-preview budget; failure simply omits the warning.
+const WORKTREE_CLOSE_PREVIEW_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Minimum spacing between full-snapshot refreshes driven by the daemon event
 /// stream.
@@ -4977,6 +4979,47 @@ async fn rename_agent_action(
         .map_err(|error| safe_message(error.to_string()))
 }
 
+/// Ask the daemon on `deck_id` whether this close would keep a dispatched
+/// worktree. The preview is best-effort: an old, busy or unreachable daemon
+/// produces no warning rather than a new error surface in the close dialog.
+async fn worktree_close_preview_action(
+    state: &DesktopState,
+    deck_id: &str,
+    pane_ids: &[String],
+    incarnation: &Incarnation,
+) -> Result<Option<DesktopKeptWorktree>, String> {
+    if pane_ids.is_empty() {
+        return Ok(None);
+    }
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let preview = async {
+        let daemon = state.daemon.trusted(scope.endpoint()).await?;
+        daemon.require_compatible()?;
+        daemon
+            .client
+            .bound_to(incarnation.clone())
+            .dispatch_worktree_close_preview(pane_ids)
+            .await
+            .map_err(|error| error.to_string())
+    };
+    match tokio::time::timeout(WORKTREE_CLOSE_PREVIEW_TIMEOUT, preview).await {
+        Ok(Ok(kept)) => Ok(kept.map(DesktopKeptWorktree::from)),
+        Ok(Err(_)) | Err(_) => Ok(None),
+    }
+}
+
+#[tauri::command]
+async fn desktop_dispatch_worktree_close_preview(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    pane_ids: Vec<String>,
+    incarnation: Incarnation,
+) -> Result<Option<DesktopKeptWorktree>, String> {
+    ensure_main_webview(&webview)?;
+    worktree_close_preview_action(&state, &deck_id, &pane_ids, &incarnation).await
+}
+
 /// Stop one agent on the selected deck, and tear down **that deck's** terminal
 /// session for it.
 ///
@@ -6808,6 +6851,7 @@ pub fn run() {
             desktop_test_endpoint,
             desktop_set_zoom,
             desktop_run_action,
+            desktop_dispatch_worktree_close_preview,
             desktop_upgrade_daemon,
             desktop_upgrade_decide,
             self_upgrade::desktop_self_upgrade_check,

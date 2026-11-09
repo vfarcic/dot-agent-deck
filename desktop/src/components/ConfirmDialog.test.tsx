@@ -87,6 +87,24 @@ describe("ConfirmDialog on the overlay stack", () => {
     expect(onClose).toHaveBeenCalledTimes(1);
   });
 
+  /** Scenario: a slow preview for one confirmation answers after another has opened; only the newer preview may change what the user sees or enable Close. */
+  it("applies a preview only to the confirmation that asked for it", async () => {
+    let answerFirst!: (body: string) => void;
+    let answerSecond!: (body: string) => void;
+    const first = { ...STATE, preview: () => new Promise<string>((resolve) => { answerFirst = resolve; }) } as ConfirmState;
+    const second = { ...STATE, title: "Close tester?", preview: () => new Promise<string>((resolve) => { answerSecond = resolve; }) } as ConfirmState;
+    const { rerender } = render(<ConfirmDialog state={first} onClose={vi.fn()} />);
+    rerender(<ConfirmDialog state={second} onClose={vi.fn()} />);
+
+    await act(async () => { answerFirst("first worktree"); });
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("first worktree");
+    expect(screen.getByRole("button", { name: "Close agent" })).toBeDisabled();
+
+    await act(async () => { answerSecond("second worktree"); });
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("second worktree");
+    expect(screen.getByRole("button", { name: "Close agent" })).toBeEnabled();
+  });
+
   /** Scenario: The voice surface's own "Always allow?" confirmation stays off the stack: it fences nothing and "close" does not reach it, as before. */
   it("stays off the stack inside the voice surface", () => {
     const onClose = vi.fn();

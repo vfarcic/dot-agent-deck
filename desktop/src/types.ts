@@ -1576,6 +1576,23 @@ export interface CleanupWarningEntry {
   deck?: string;
 }
 
+/** A dispatched worktree a close kept on disk, as the daemon reports it. */
+export interface KeptWorktree {
+  path: string;
+  confirmedDirty: boolean;
+}
+
+/** The daemon's post-close broadcast, with the deck its watcher stamped on it. */
+export interface KeptWorktreeEvent extends KeptWorktree {
+  deckId?: string;
+}
+
+/** One kept-worktree report in the runtime's dismissible toast queue. */
+export interface WorktreeKeptNotice extends KeptWorktree {
+  id: number;
+  deck?: string;
+}
+
 export interface DeckRuntimeState {
   mode: RuntimeMode;
   /**
@@ -1615,6 +1632,10 @@ export interface DeckRuntimeState {
   cleanupWarnings?: readonly CleanupWarningEntry[];
   /** Remove one entry of {@link cleanupWarnings} — the user's explicit dismissal. */
   dismissCleanupWarning?: (id: number) => void;
+  /** Worktrees the daemon reported keeping after a close, oldest first. */
+  keptWorktrees?: readonly WorktreeKeptNotice[];
+  /** Remove one entry of {@link keptWorktrees} — the user's explicit dismissal. */
+  dismissWorktreeKept?: (id: number) => void;
   /**
    * Drop the last action's error (issue #1046). The cleanup warnings are
    * untouched — see {@link cleanupWarnings}.
@@ -1626,6 +1647,8 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
+  /** Ask the daemon whether closing these panes will keep a dispatched worktree. */
+  previewWorktreeClose?: (deckId: string, paneIds: string[], incarnation?: string) => Promise<KeptWorktree | undefined>;
   /**
    * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names: **Upgrade**
    * on a remote deck, **Replace daemon** on the local one. `onEvent` hears the

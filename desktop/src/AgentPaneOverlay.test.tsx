@@ -360,6 +360,22 @@ describe("agent pane overlay", () => {
     expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
   });
 
+  /** Scenario: the full-window agent pane's close confirmation uses the same kept-worktree preview as the dashboard row, addressed to the viewed pane. */
+  it("warns about a kept worktree when closing from the agent pane", async () => {
+    const initial = runtime();
+    const snapshot = {
+      ...initial.snapshot,
+      connection: { ...initial.snapshot.connection, incarnation: "process-a" },
+      agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", ...(agent.id === "planner" ? { paneId: "pane-planner" } : {}) })),
+    };
+    const previewWorktreeClose = vi.fn(async () => ({ path: "/work/kept-planner", confirmedDirty: true }));
+    render(<DeckShell runtime={runtime({ snapshot, fleet: [snapshot], previewWorktreeClose })} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from: "overview" }} />);
+
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    expect(await screen.findByText(/Uncommitted work here is KEPT, not deleted:/)).toHaveTextContent("/work/kept-planner");
+    expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, ["pane-planner"], "process-a");
+  });
+
   /** Scenario: an agent disappears while its close confirmation is awaiting a click. The pane and its confirmation close together, without sending the captured stop request. */
   it.each(["overview", "deck"] as const)("dismisses an unconfirmed close when its agent retires from %s", (from) => {
     const rt = runtime();

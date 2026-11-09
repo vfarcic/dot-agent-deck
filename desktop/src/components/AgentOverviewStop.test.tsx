@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
 import type { AgentSession, DeckActionResult, DeckFleet, DeckRuntimeState } from "../types";
@@ -14,6 +14,7 @@ import { AgentOverview, agentKey } from "./AgentOverview";
 function role(deckId: string, id: string, roleName: string, roleIndex: number): AgentSession {
   return {
     ...createFixtureStartedAgent({ id, daemonId: deckId, displayName: roleName, command: "claude", cwd: "/home/build/demo-project" }),
+    paneId: `pane-${id}`,
     tab: { kind: "orchestration", orchestrationId: "orc-loop", name: "loop", displayTitle: "demo-project-orchestrator-1", roleName, roleIndex, isStartRole: roleIndex === 0, cwd: "/home/build/demo-project" },
     inOrchestration: true,
     incarnation: "listed-process-a",
@@ -84,6 +85,56 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", incarnation: "listed-process-a" });
     expect(confirmation()).toBeNull();
+  });
+
+  /**
+   * Scenario: closing a dispatched unit whose worktree is dirty asks the daemon
+   * for a preview before the close can be confirmed. While that request is in
+   * flight the destructive button waits; its answer then warns in the dialog,
+   * using the TUI's words and naming the directory that will be kept.
+   */
+  it("warns before closing a dispatched unit whose worktree will be kept", async () => {
+    let answer!: (kept: { path: string; confirmedDirty: boolean } | undefined) => void;
+    const previewWorktreeClose = vi.fn(() => new Promise<{ path: string; confirmedDirty: boolean } | undefined>((resolve) => { answer = resolve; }));
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const current = { ...runtime(runAction), previewWorktreeClose } as DeckRuntimeState;
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent"));
+    const dialog = confirmation()!;
+    expect(within(dialog).getByRole("button", { name: "Close agent" })).toBeDisabled();
+    expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41"], "listed-process-a");
+
+    await act(async () => { answer({ path: "/home/build/demo-project-dispatch-issue-1674", confirmedDirty: true }); });
+    expect(dialog).toHaveTextContent("Uncommitted work here is KEPT, not deleted:");
+    expect(dialog).toHaveTextContent("/home/build/demo-project-dispatch-issue-1674");
+    expect(within(dialog).getByRole("button", { name: "Close agent" })).toBeEnabled();
+  });
+
+  /** Scenario: a whole-orchestration close previews every role's pane and warns about their shared dirty worktree. */
+  it("previews every pane when closing a whole orchestration", async () => {
+    const previewWorktreeClose = vi.fn(async () => ({ path: "/home/build/demo-project", confirmedDirty: false }));
+    const current = { ...runtime(vi.fn()), previewWorktreeClose } as DeckRuntimeState;
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" }));
+    const dialog = confirmation()!;
+    await screen.findByText(/Uncommitted work here, if any, is KEPT:/);
+    expect(dialog).toHaveTextContent("/home/build/demo-project");
+    expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, ["pane-41", "pane-42"], "listed-process-a");
+  });
+
+  /** Scenario: closing only one role while its sibling still uses the same worktree cannot keep or remove that tree, so the sibling-safe preview shows no warning. */
+  it("does not forecast a kept worktree while a surviving role still uses it", async () => {
+    const previewWorktreeClose = vi.fn(async () => ({ path: "/home/build/demo-project", confirmedDirty: true }));
+    const current = { ...runtime(vi.fn()), previewWorktreeClose } as DeckRuntimeState;
+    render(<AgentOverview runtime={current} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent"));
+    const dialog = confirmation()!;
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "Close agent" })).toBeEnabled());
+    expect(previewWorktreeClose).toHaveBeenCalledOnce();
+    expect(dialog).not.toHaveTextContent("KEPT");
   });
 
   /**
