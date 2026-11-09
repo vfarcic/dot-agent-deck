@@ -8,7 +8,7 @@ import type { DeckRuntimeState, DeckSnapshot } from "../types";
 import { AgentOverview } from "./AgentOverview";
 import { SelfUpgradeDialog } from "./SelfUpgradeDialog";
 import type { SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
-import { CLI_LEAVES_DAEMON } from "./LocalUpgradeFlow";
+import { APP_BEFORE_CLI, CLI_LEAVES_DAEMON } from "./LocalUpgradeFlow";
 
 /**
  * PRD #1487 M5 — Upgrade on a deck's card on the agent dashboard (D9). The
@@ -249,6 +249,88 @@ describe("Upgrade on the Local daemon section (issue #1753)", () => {
 
     await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, expect.any(Function)));
     expect(await screen.findByTestId("upgrade-outcome")).toHaveTextContent("The daemon on this machine now runs 0.45.0");
+  });
+
+  const currentCli: SelfUpgradePlan = { ...cliPlan, current: "0.45.0", action: "up-to-date", actionable: false, confirmQuestion: null, headline: "dot-agent-deck CLI is up to date (v0.45.0)." };
+  const olderAppHeadline = "Agent Deck (desktop app): update available: v0.45.0 (current: v0.44.0)";
+  const olderApp: SelfUpgradePlan = { ...check().app, current: "0.44.0", headline: olderAppHeadline, action: "swap-app", actionable: true, confirmQuestion: "Upgrade Agent Deck (desktop app) to v0.45.0?", lines: [{ text: olderAppHeadline, command: null }] };
+  const swapped: SelfUpgradeResult = { copy: "app", ok: true, installed: true, relaunch: true, lines: [{ text: "Agent Deck v0.45.0 is installed. Relaunch to run it.", command: null }] };
+  const appCheck = (cli: SelfUpgradePlan | null, waiting: boolean): SelfUpgradeCheck => ({ ...check(cli), app: olderApp, updateAvailable: !waiting, notice: waiting ? swapped.lines[0].text : olderAppHeadline, installed: waiting ? swapped : null });
+
+  for (const [cliState, cli] of [["behind", cliPlan], ["current", currentCli], ["absent", null]] as const) {
+    /** Scenario: Upgrade on the Local daemon section leads with an older app, or its pending Relaunch, whether the CLI is behind, current or absent. The button names the app and its hover text explains its state; finishing the upgrade leaves the old daemon for the relaunched app. */
+    it.each([false, true])(`local_upgrade_002 offers the app first with the CLI ${cliState}, waiting for relaunch: %s`, async (waiting) => {
+      const fleet = olderLocal().map((deck) => deck.connection.deckKind === "local" ? { ...deck, connection: { ...deck.connection, upgradeOffer: { kind: "offered" as const, from: "0.43.0", to: "0.44.0" } } } : deck);
+      const deck = runtime(fleet);
+      const api = { check: vi.fn(), run: vi.fn(async (copy: string) => copy === "app" ? swapped : brewed), relaunch: vi.fn(async () => undefined) };
+      const onClosed = vi.fn();
+      const checked = appCheck(cli, waiting);
+      render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: checked, api, onClosed }} />);
+
+      const button = within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade");
+      fireEvent.click(button);
+      expect(screen.getByTestId("self-upgrade-plan-app")).toBeVisible();
+      expect(button).toHaveAccessibleName(cliState === "behind" ? "Upgrade the app, the CLI and the daemon on this machine" : "Upgrade the app and the daemon on this machine");
+      expect(button).toHaveAttribute("title", [checked.notice, cliState === "behind" ? cliHeadline : undefined, "Its daemon runs 0.43.0; this app is 0.44.0."].filter(Boolean).join(" "));
+      if (!waiting) {
+        expect(screen.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "app");
+        expect(screen.getByTestId("self-upgrade-cancel")).toHaveFocus();
+        fireEvent.click(screen.getByTestId("self-upgrade-start"));
+        expect(api.run).toHaveBeenCalledWith("app", 9);
+      }
+      expect(await screen.findByTestId("self-upgrade-result-app")).toHaveTextContent("Relaunch to run it.");
+      if (cliState === "behind") {
+        expect(screen.getByTestId("self-upgrade-then")).toHaveTextContent(APP_BEFORE_CLI);
+        expect(screen.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "cli");
+        fireEvent.click(screen.getByTestId("self-upgrade-start"));
+        await screen.findByTestId("self-upgrade-result-cli");
+      } else {
+        expect(screen.queryByTestId("self-upgrade-plan-cli")).not.toBeInTheDocument();
+        expect(screen.queryByTestId("self-upgrade-then")).not.toBeInTheDocument();
+      }
+      expect(api.run).toHaveBeenCalledTimes(Number(!waiting) + Number(cliState === "behind"));
+      fireEvent.click(screen.getByTestId("self-upgrade-relaunch"));
+      expect(api.relaunch).toHaveBeenCalledTimes(1);
+      fireEvent.click(screen.getByTestId("self-upgrade-close"));
+      expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+      expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+      expect(onClosed).toHaveBeenCalledTimes(1);
+    });
+  }
+
+  /** Scenario: The app alone needs an upgrade and the local daemon matches the running app. The Local daemon section offers the app; cancelling its question closes without upgrading or restarting anything. */
+  it("local_upgrade_003 offers the app alone and Cancel ends the upgrade", () => {
+    const deck = runtime(createFixtureFleet("upgrade"));
+    const api = selfApi();
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: appCheck(currentCli, false), api }} />);
+    const button = within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade");
+    expect(button).toHaveAccessibleName("Upgrade the app on this machine");
+    expect(button).toHaveAttribute("title", olderAppHeadline);
+    fireEvent.click(button);
+    expect(screen.getByTestId("self-upgrade-confirm")).toHaveAttribute("data-copy", "app");
+    fireEvent.click(screen.getByTestId("self-upgrade-cancel"));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(api.run).not.toHaveBeenCalled();
+    expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+  });
+
+  /** Scenario: With a current or absent CLI, an app that is current or needs a manual upgrade still opens the older daemon's own confirmation. Opening and cancelling it starts no upgrade. */
+  it.each([["current", currentCli], ["absent", null]] as const)("local_upgrade_002 keeps the daemon-only confirmation with the CLI %s and no app upgrade", (_state, cli) => {
+    const manual: SelfUpgradePlan = { ...olderApp, action: "manual-download", actionable: false, confirmQuestion: null };
+    for (const checked of [check(cli), { ...appCheck(cli, false), app: manual }]) {
+      const deck = runtime(olderLocal());
+      const api = selfApi();
+      const { unmount } = render(<AgentOverview runtime={deck} onNavigate={vi.fn()} selfUpgrade={{ check: checked, api }} />);
+      const button = within(group(FIXTURE_DAEMON_ID)).getByTestId("daemon-upgrade");
+      expect(button).toHaveAccessibleName("Upgrade the daemon on this machine");
+      fireEvent.click(button);
+      expect(screen.getByTestId("upgrade-dialog")).toHaveAttribute("data-phase", "confirm");
+      expect(screen.queryByTestId("self-upgrade-dialog")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("upgrade-cancel"));
+      expect(api.run).not.toHaveBeenCalled();
+      expect(deck.upgradeDaemon).not.toHaveBeenCalled();
+      unmount();
+    }
   });
 
   /** Scenario: Both are behind and the user cancels the CLI's question: the whole Upgrade ends having changed nothing — no CLI upgrade and no daemon restart. */
