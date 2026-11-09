@@ -8,10 +8,11 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
+import { LocalUpgradeFlow, type LocalUpgradeRequest, upgradeCopies } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
+import { noticeOf } from "./SelfUpgradeNotice";
 import { HostMetricsButton } from "./HostMetricsPanel";
 import { chooseHostDeck } from "../lib/hostMetrics";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
@@ -1257,6 +1258,21 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [localUpgrade, setLocalUpgrade] = useState<LocalUpgradeRequest>();
   /* The CLI's plan while it is behind and this app can upgrade it. */
   const cliPlan = selfUpgrade?.api ? cliBehind(selfUpgrade.check) : undefined;
+  /* The app's own notice — its headline while it is behind, the relaunch prompt once it waits for one — for the button's title while the flow covers the app. */
+  const appNotice = noticeOf(selfUpgrade?.check);
+  /*
+   * Issue #1962 — the self-upgrade check this machine's Upgrade hands to the
+   * flow whenever it covers a copy of Agent Deck here: the CLI while it is
+   * behind (issue #1753), or the app whenever it can upgrade itself or waits
+   * for a relaunch — not only when the CLI is behind, which was PR #1961's
+   * one case. With the check handed over, the flow leads with the app
+   * (`upgradeCopies`), so a daemon older than the app is restarted by the
+   * relaunched app onto the new release rather than here onto the build this
+   * app still runs.
+   */
+  const localCopies = selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
+  /* The copies that flow covers, in the order it offers them, so the button names what it opens. */
+  const localCovered = localCopies ? upgradeCopies(localCopies.check, "local") : [];
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
    * order they render, as one sequence. Declared whenever they are on screen
@@ -1305,9 +1321,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const confirmationOpen = confirm !== undefined || upgrade !== undefined || localUpgrade !== undefined;
   /**
    * What a deck's Upgrade does, and what its button says. A remote deck's
-   * covers its daemon, which runs that host's CLI. The local deck's covers the
-   * CLI on this machine and the local daemon, either of which can be behind
-   * (issue #1753), so its label and tooltip name what is.
+   * covers its daemon, which runs that host's CLI. The local deck's covers
+   * the copies of Agent Deck on this machine — the app and the CLI — and the
+   * local daemon, any of which can be behind (issues #1753, #1959, #1962),
+   * so its label and tooltip name what is.
    */
   const deckUpgrade = (connection: ConnectionView): { onUpgrade?: () => void; upgradeLabel?: string; upgradeTitle?: string } => {
     const daemon: UpgradeTarget | undefined = runtime.upgradeDaemon && upgradeOffered(connection) && connection.deckId !== undefined
@@ -1315,12 +1332,25 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       : undefined;
     const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
     if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
-    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
-    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    /* Issue #1753 — this machine's Upgrade is offered while the CLI or the daemon is behind; an app that is behind alone has the banner and the rail instead. */
+    if (!daemon && !localCovered.includes("cli")) return {};
+    /* Issue #1962 — while the app can upgrade itself, or waits for a relaunch, the flow covers it first even when the CLI is current. */
+    if (!localCovered.length) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    /*
+     * What the button names, in the order the flow runs: the copies it
+     * covers, then the daemon when it is behind — an app that leads leaves
+     * the daemon to the relaunched app, so it is named for what the whole
+     * upgrade covers rather than for a step this flow runs.
+     */
+    const named = [...localCovered.map((copy) => (copy === "app" ? "the app" : "the CLI")), ...(daemon ? ["the daemon"] : [])];
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
-      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
-      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies: localCopies }),
+      upgradeLabel: `Upgrade ${named.length > 1 ? `${named.slice(0, -1).join(", ")} and ` : ""}${named[named.length - 1]} on this machine`,
+      upgradeTitle: [
+        localCovered.includes("app") && appNotice ? displayText(appNotice, DISPLAY_LIMITS.message) : undefined,
+        cliPlan ? displayText(cliPlan.headline, DISPLAY_LIMITS.message) : undefined,
+        daemon ? daemonTitle : undefined,
+      ].filter(Boolean).join(" "),
     };
   };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
@@ -1652,7 +1682,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                 crate says its daemon runs an older release than the app — on
                 the local deck too since issue #1636, as a restart onto this
                 app's build — and, on the local deck since issue #1753, when
-                this machine's CLI is behind, whatever the daemon runs.
+                this machine's CLI is behind, whatever the daemon runs. Since
+                issue #1962 it also leads with the app whenever the app can
+                upgrade itself or waits for a relaunch, so an older daemon
+                follows the relaunched app rather than this app's older build.
               */
               {...deckUpgrade(deck.snapshot.connection)}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
