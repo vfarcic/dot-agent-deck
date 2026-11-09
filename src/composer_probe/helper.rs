@@ -1692,8 +1692,11 @@ pub mod seam {
         std::fs::read_dir("/proc/self/task").map_or(0, Iterator::count)
     }
 
+    // Issue #2091: `e2e_only…`, because lane 1's shards select a test that
+    // exists only in the `e2e` build by that name (`scripts/e2e-shard.sh`,
+    // linkage-check rule 19).
     #[cfg(test)]
-    mod tests {
+    mod e2e_only_tests {
         use super::*;
 
         fn seams(trace: &std::path::Path, pause: &std::path::Path) -> Seams {
@@ -1713,8 +1716,8 @@ pub mod seam {
         /// is a directory) passes with nothing written, and says so in the
         /// trace rather than as `resume` (the audit's U3-10). The seam, and
         /// so this unit, compiles only with the `e2e` feature: it runs in
-        /// lane 1 (`cargo test-e2e`, which CI's `e2e-deterministic` runs
-        /// from its whole archive), not in `cargo test-fast`.
+        /// lane 1 (`cargo test-e2e`; in CI, the `e2e` shards select it by its
+        /// module's name), not in `cargo test-fast`.
         #[test]
         fn a_pause_that_cannot_wait_is_traced_as_failed() {
             let dir = tempfile::tempdir().unwrap();

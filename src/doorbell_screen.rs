@@ -1492,8 +1492,11 @@ mod claude_tests {
     }
 }
 
+// Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+// build by this module's name prefix (`scripts/e2e-shard.sh`, linkage-check
+// rule 19).
 #[cfg(all(test, feature = "e2e"))]
-mod standin_tests {
+mod e2e_only_standin_tests {
     use super::*;
 
     fn env(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
