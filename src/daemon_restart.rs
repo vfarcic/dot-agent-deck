@@ -1507,13 +1507,9 @@ mod tests {
                 let p = script(dir.path(), &format!("{name}-{attempt}"), &body, 0o755);
                 let started = Instant::now();
                 let err = verify_restart_target(&p, None, timeout).unwrap_err();
+                let returned_at = std::time::SystemTime::now();
                 let took = started.elapsed();
                 assert_eq!(err.0, RestartRefusalReason::TargetDidNotAnswer, "{name}");
-                assert!(
-                    took < timeout + PAST_THE_DEADLINE,
-                    "{name}: the bound must hold: {took:?} ({})",
-                    err.1
-                );
                 // A writer forked just before the kill can start a moment
                 // after the check returned, so give it a short while to show.
                 let returned = Instant::now();
@@ -1524,10 +1520,37 @@ mod tests {
                     }
                     std::thread::sleep(Duration::from_millis(20));
                 }
-                if !began.exists() || !err.1.contains(path_taken) {
-                    // The scenario was not set up: run it again.
+                if !began.exists() {
+                    // The writer never existed: nothing held the pipe open.
                     continue;
                 }
+                if !err.1.contains(path_taken) {
+                    // One other outcome means the scenario was not set up: a
+                    // target slow to start reached the deadline before its own
+                    // ending. Any other refusal is a finding, never a retry.
+                    assert!(
+                        path_taken != "it did not exit within"
+                            && err.1.contains("it did not exit within"),
+                        "{name}: refused for an unexpected reason: {}",
+                        err.1
+                    );
+                    continue;
+                }
+                // The bound, counted from when the target was running: the
+                // check's deadline starts before its `spawn`, which returns
+                // only once the exec has happened, and an exec stalled by the
+                // machine (macOS's first-launch assessment) is not time the
+                // check spent. The writer's start marks the target running.
+                let running_from = std::fs::metadata(&began)
+                    .and_then(|meta| meta.modified())
+                    .expect("the writer's start time");
+                let checked_for = returned_at.duration_since(running_from).unwrap_or_default();
+                assert!(
+                    checked_for < timeout + PAST_THE_DEADLINE,
+                    "{name}: the bound must hold: {checked_for:?} after the target \
+                     started ({took:?} in all) ({})",
+                    err.1
+                );
                 assert!(
                     marker.exists(),
                     "{name}: the reader must close the pipe once the check returns ({})",

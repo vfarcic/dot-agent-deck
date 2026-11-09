@@ -9714,6 +9714,7 @@ if (asked("hang") !== 2) throw new Error("hang not asked again: " + calls);
     fn opencode_plugin_ancestry_lookup_stays_bounded_when_the_client_ignores_abort() {
         let Some(payloads) = run_plugin_driver(
             r#"
+import { createRequire, syncBuiltinESMExports } from "module";
 const calls = [];
 const client = { session: { get: ({ path, signal }) => {
   const call = { id: path.id, signal };
@@ -9730,18 +9731,36 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 const expectCalls = (n, why) => {
   if (calls.length !== n) throw new Error(why + ": " + calls.length + " requests: " + calls.map((c) => c.id));
 };
-// The idle report must not wait for a lookup. These never settle until the
-// driver settles them, and the driver is blocked in `idle` meanwhile, so a
-// report that waited would wait forever: the check is that it returns at all.
-// The watchdog turns that hang into a failure. It is not a speed bound: a report includes a synchronous run of
-// the recorder, whose time depends on the machine's load (issue #2183).
+// The idle report must not wait for a lookup: it is sent within 1000 ms of
+// its own work. That work includes a synchronous run of the recorder through
+// `execFileSync`, whose time is the machine's (load, and on macOS the first
+// launch of a fresh file), not the plugin's (issue #2183). So the plugin's
+// `execFileSync` is timed, and that time is left out of the bound. A report
+// that waited on a lookup that never settles would never return; the
+// watchdog turns that into a failure.
+const childProcess = createRequire(import.meta.url)("child_process");
+const realExecFileSync = childProcess.execFileSync;
+let inChildren = 0;
+childProcess.execFileSync = (...args) => {
+  const began = Date.now();
+  try {
+    return realExecFileSync(...args);
+  } finally {
+    inChildren += Date.now() - began;
+  }
+};
+syncBuiltinESMExports();
 const idle = async (s) => {
   const watchdog = setTimeout(() => {
     console.error("the idle report for " + s + " never returned");
     process.exit(13);
   }, 20000);
+  const started = Date.now();
+  const childrenBefore = inChildren;
   await send("session.status", { sessionID: s, status: { type: "idle" } });
   clearTimeout(watchdog);
+  const own = Date.now() - started - (inChildren - childrenBefore);
+  if (own > 1000) throw new Error("the idle report for " + s + " waited " + own + " ms");
 };
 const turn = async (s, m, text) => {
   await assistant(s, m);
