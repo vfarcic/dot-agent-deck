@@ -12741,7 +12741,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/021 — The hook CLI discovers the agent version before offering typed answers.
 - **Layer:** L2 real-binary subprocess (`tests/e2e_question_versions.rs`), lane 1.
 - **Agent:** none (version-only shell stand-ins for Codex and Claude Code; a socket stand-in captures and releases the hook's question).
-- **Asserts:** separate hook processes reuse the version probe for an unchanged executable and probe again after a same-size edit; failed probes keep the unknown-version fallback, are reused briefly and are retried after cache expiry; Codex 0.160.99 remains answerable, 0.161.0 is unsupported with keyboard-only options, and an unparseable version keeps the unknown-version fallback; Claude 2.2 plan approval becomes keyboard-only while its held Bash, Write and form answers remain answerable without running a version command.
+- **Asserts:** separate hook processes reuse the version probe for an unchanged executable and probe again after a same-size edit; failed probes keep the unknown-version fallback, are reused briefly and are retried after cache expiry; a successful probe also expires when an unchanged launcher delegates to an upgraded target; Codex 0.160.99 remains answerable, 0.161.0 is unsupported with keyboard-only options, and an unparseable version keeps the unknown-version fallback; Claude 2.2 plan approval becomes keyboard-only while its held Bash, Write and form answers remain answerable without running a version command.
 - **Does not assert:** the version of a running process when PATH or the installed agent changed; microphone, voice matching or rendering; a real agent accepting an answer.
 - **Platform coverage:** mac+linux.
 

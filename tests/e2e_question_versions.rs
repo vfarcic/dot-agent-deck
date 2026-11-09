@@ -124,6 +124,18 @@ fn hook_question(root: &std::path::Path, agent: &str, fixture: &str) -> PendingQ
     server.join().unwrap()
 }
 
+fn expire_version_cache(root: &std::path::Path) {
+    let cache = std::fs::read_dir(root.join("state/question-versions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let mut entry: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
+    entry["checked_at"] = serde_json::to_value(std::time::SystemTime::UNIX_EPOCH).unwrap();
+    std::fs::write(cache, serde_json::to_vec(&entry).unwrap()).unwrap();
+}
+
 /// Scenario: Run the real hook CLI with Codex and Claude version-only stand-ins and captured question payloads.
 /// Newer minors make typed answers keyboard-only, while a verified patch and an unknown version remain answerable; repeated hook processes reuse the version until the executable changes, and held Claude answers do not probe.
 #[spec("question/detect/021")]
@@ -136,7 +148,7 @@ fn question_detect_021_hook_probes_versions_before_offering_typed_answers() {
     ] {
         let root = common::harness_tempdir().unwrap();
         install_version(root.path(), "codex", version);
-        for _ in 0..2 {
+        for phase in ["cold", "cached"] {
             let q = hook_question(root.path(), "codex", "codex-permission-request.json");
             assert_eq!(
                 q.channel,
@@ -145,7 +157,7 @@ fn question_detect_021_hook_probes_versions_before_offering_typed_answers() {
                 } else {
                     AnswerChannel::Unsupported
                 },
-                "{version}"
+                "{version}, {phase}"
             );
             assert_eq!(q.has_answerable_option(), covered, "{version}");
             assert!(
@@ -182,30 +194,54 @@ fn question_detect_021_hook_probes_versions_before_offering_typed_answers() {
         .unwrap()
         .write_all(b"exit 1\n")
         .unwrap();
-    for _ in 0..2 {
+    for phase in ["cold", "cached"] {
         let q = hook_question(root.path(), "codex", "codex-permission-request.json");
-        assert_eq!(q.channel, AnswerChannel::Keys, "a failed probe is unknown");
+        assert_eq!(
+            q.channel,
+            AnswerChannel::Keys,
+            "a {phase} failed probe is unknown"
+        );
     }
     assert_eq!(
         std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
         "probe\n",
         "a failed probe must not delay each prompt"
     );
-    let cache = std::fs::read_dir(root.path().join("state/question-versions"))
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let mut entry: Value = serde_json::from_slice(&std::fs::read(&cache).unwrap()).unwrap();
-    entry["checked_at"] = serde_json::to_value(std::time::SystemTime::UNIX_EPOCH).unwrap();
-    std::fs::write(cache, serde_json::to_vec(&entry).unwrap()).unwrap();
+    expire_version_cache(root.path());
     let q = hook_question(root.path(), "codex", "codex-permission-request.json");
     assert_eq!(q.channel, AnswerChannel::Keys);
     assert_eq!(
         std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
         "probe\nprobe\n",
         "a transient failure must be retried after expiry"
+    );
+    let root = common::harness_tempdir().unwrap();
+    install_version(root.path(), "codex-real", "codex-cli 0.160.99");
+    let launcher = root.path().join("codex");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nexec '{}' \"$@\"\n",
+            root.path().join("codex-real").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let q = hook_question(root.path(), "codex", "codex-permission-request.json");
+    assert_eq!(q.channel, AnswerChannel::Keys);
+    install_version(root.path(), "codex-real", "codex-cli 0.161.99");
+    // The launcher's identity did not move with its target's upgrade. Even a
+    // successful cached output must expire rather than bless that target forever.
+    expire_version_cache(root.path());
+    let q = hook_question(root.path(), "codex", "codex-permission-request.json");
+    assert_eq!(
+        q.channel,
+        AnswerChannel::Unsupported,
+        "an unchanged launcher kept its old version after cache expiry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.path().join("probe.log")).unwrap(),
+        "probe\nprobe\n"
     );
     let root = common::harness_tempdir().unwrap();
     install_version(root.path(), "claude", "2.2.0 (Claude Code)");

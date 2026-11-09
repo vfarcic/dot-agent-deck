@@ -226,9 +226,9 @@ struct QuestionVersionEntry {
     checked_at: std::time::SystemTime,
 }
 
-/// Keep completed outputs until the executable's identity changes. A failed
-/// or timed-out probe is reused for one minute, so a slow launcher does not
-/// delay each prompt and a transient failure can recover.
+/// Reuse probe outputs for at most one minute, invalidating earlier when the
+/// executable changes. A stable launcher can delegate to an upgraded binary
+/// without changing its own metadata, so successful outputs expire too.
 fn question_version_line(program: &str) -> Option<String> {
     use sha2::{Digest as _, Sha256};
 
@@ -264,11 +264,10 @@ fn question_version_line(program: &str) -> Option<String> {
     if let Some(entry) = std::fs::File::open(&cache).ok().and_then(|file| {
         serde_json::from_reader::<_, QuestionVersionEntry>(file.take(32 * 1024)).ok()
     }) && entry.key == key
-        && (entry.line.is_some()
-            || entry
-                .checked_at
-                .elapsed()
-                .is_ok_and(|age| age < std::time::Duration::from_secs(60)))
+        && entry
+            .checked_at
+            .elapsed()
+            .is_ok_and(|age| age < std::time::Duration::from_secs(60))
     {
         return entry.line;
     }
