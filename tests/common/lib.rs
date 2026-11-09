@@ -9594,13 +9594,13 @@ ctor::declarative::ctor! {
             child_lifetime_bound::pin_before_main();
         }
         // Cargo builds no `dot-agent-deck` binary for this crate's own tests
-        // and sets no `CARGO_BIN_EXE_*` for them, so register where the root
-        // package's build puts it: `target/<profile>/`, the parent of this
-        // binary's `deps/` directory. Nothing here launches it; the tests
-        // that reach this path only reason about where it lives.
+        // (a dependency's binaries are not built) and sets no
+        // `CARGO_BIN_EXE_*` for them, so there is no deck to register. These
+        // tests never launch one; the ones that reach this path link or copy
+        // it into the harness root and reason about where it lives. So
+        // register this test binary itself: a file that always exists, even
+        // in a fresh target directory where nothing else was built.
         let deck = std::env::current_exe()
-            .ok()
-            .and_then(|exe| Some(exe.parent()?.parent()?.join("dot-agent-deck")))
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
         register_test_crate(Box::leak(deck.into_boxed_str()), "harness-unit-tests");
