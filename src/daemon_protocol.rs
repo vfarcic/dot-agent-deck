@@ -7338,23 +7338,26 @@ async fn handle_connection(
                         // arm-time prediction.
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
-                            if !crate::issue_dispatch_run::worktree_still_in_use(
-                                &registry.agent_records(),
-                                &worktree,
-                            ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
-                                &worktree_registry,
-                                &worktree,
-                            ) && let Some(kept) = crate::issue_dispatch_run::remove_worktree(
-                                &worktree,
-                                &entry.clone_dir,
-                                entry.policy,
-                            )
-                            .await
+                            // EOF alone does not release a failed stop's cwd.
+                            // Hold the directory through removal, as CloseAgents does.
+                            if let Some(_removal_hold) = registry.hold_dir_for_removal(&worktree)
+                                && let Some(entry) = crate::issue_dispatch_run::take_worktree(
+                                    &worktree_registry,
+                                    &worktree,
+                                )
+                                && let Some(kept) = crate::issue_dispatch_run::remove_worktree(
+                                    &worktree,
+                                    &entry.clone_dir,
+                                    entry.policy,
+                                )
+                                .await
                             {
                                 // Errs only when nothing is subscribed (a
                                 // standalone daemon), which is not a failure.
                                 let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
                             }
+                            #[cfg(test)]
+                            registry.pause_point("stop-worktree-cleaned").await;
                         });
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?

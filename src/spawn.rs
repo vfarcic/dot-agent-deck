@@ -1468,8 +1468,9 @@ async fn roll_back_partial_orchestration(
 /// so, as `StopAgent` does, each pane is closed under a cleanup hold
 /// ([`AgentPtyRegistry::hold_pane_for_cleanup`]): its pane-scoped cleanup runs
 /// only while no other generation claims the pane, and then the pane's
-/// sessions go and its closure is announced to every attached client
-/// (`event_tx`). The unit the agent belonged to ends as a stop ends it.
+/// sessions go and its closure is announced to attached clients (`event_tx`)
+/// after a confirmed stop. An unconfirmed child keeps its routing, session and
+/// unit for a later close attempt.
 pub(crate) async fn close_started_agents(
     registry: &Arc<AgentPtyRegistry>,
     state: Option<&crate::state::SharedState>,
@@ -1501,9 +1502,8 @@ pub(crate) async fn close_started_agents(
         registry.begin_pane_close(pane);
     }
 
-    // `close_agent` runs the synchronous SIGTERM-with-grace loop
-    // (`terminate_child_with_grace_and_wait`, up to `AGENT_TERMINATE_GRACE` per
-    // child), so it must not run on a Tokio worker thread — same reasoning as the
+    // `close_agent` runs a synchronous grace and bounded force-reap per child,
+    // so it must not run on a Tokio worker thread — same reasoning as the
     // `StopAgent` handler's `spawn_blocking` hop.
     let registry_for_close = registry.clone();
     let ids: Vec<String> = started.iter().map(|a| a.id.clone()).collect();
@@ -1516,17 +1516,20 @@ pub(crate) async fn close_started_agents(
             .collect::<Vec<_>>()
     })
     .await;
+    let mut survivors: std::collections::HashSet<String> =
+        started.iter().map(|a| a.id.clone()).collect();
     match closed {
         Ok(outcomes) => {
             for (id, outcome) in outcomes {
-                if let Err(e) = outcome {
-                    // `NotFound` is ordinary here — the child may have exited on
-                    // its own between spawning and the failure of a later role.
-                    tracing::warn!(
+                match outcome {
+                    Ok(()) | Err(crate::agent_pty::AgentPtyError::NotFound(_)) => {
+                        survivors.remove(&id);
+                    }
+                    Err(e) => tracing::warn!(
                         agent_id = %id,
                         error = %e,
-                        "spawn rollback: could not close an already-started role"
-                    );
+                        "spawn rollback: role remains registered for a later close attempt"
+                    ),
                 }
             }
         }
@@ -1539,23 +1542,32 @@ pub(crate) async fn close_started_agents(
         }
     }
 
-    // Drop the routing identity these panes were given as each spawn landed
+    // For confirmed stops, drop the routing identity given as each spawn landed
     // (`register_orchestration_role`, above), and any session the agents' hooks
     // created on them. Done AFTER the children are gone so a live child is never
     // missing its `pane_role_map` entry — the inverse ordering is exactly the
     // inconsistency issue #454 closed.
     if let Some(state) = state {
         let mut guard = state.write().await;
-        for pane in &held_panes {
-            guard.unregister_pane(pane);
-            guard.remove_sessions_for_pane(pane);
+        for (agent, hold) in started.iter().zip(&holds) {
+            if let Some(hold) = hold
+                && !survivors.contains(&agent.id)
+            {
+                guard.unregister_pane(hold.pane_id());
+                guard.remove_sessions_for_pane(hold.pane_id());
+            }
         }
     }
-    for pane in &held_panes {
-        registry.finish_pane_close(pane, true);
+    for (agent, hold) in started.iter().zip(&holds) {
+        if let Some(hold) = hold {
+            registry.finish_pane_close(hold.pane_id(), !survivors.contains(&agent.id));
+        }
     }
     for (record, hold) in records.iter().zip(&holds) {
         let Some(record) = record else { continue };
+        if survivors.contains(&record.id) {
+            continue;
+        }
         if let (Some(tx), Some(hold)) = (event_tx, hold) {
             surface_attach_stopped_agent(tx, record, hold.pane_id());
         }
@@ -3289,6 +3301,114 @@ mod tests {
             registry.dispatched_units().live().count(),
             0,
             "the unit the spawn recorded has ended"
+        );
+    }
+
+    /// Scenario: Rollback stops a healthy role but cannot confirm the other role's exit. The survivor keeps its role routing and session, receives no pane-closed announcement, and is closeable on retry; the healthy role's state and card are removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unconfirmed_spawn_rollback_preserves_the_surviving_roles_state() {
+        use crate::platform::proc::test_child::{ExitGate, ReleaseOnDrop, UnreapableChild};
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state = Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, mut events) = broadcast::channel(1024);
+        let handle = spawn_dispatched_unit(
+            closable_orchestration_request(dir.path(), "rollback-survivor"),
+            &registry,
+            &SilentNotifier,
+            Some(&event_tx),
+            true,
+            Some(&state),
+            crate::dispatched_units::UnitOrigin {
+                name: "rollback-survivor".into(),
+                worktree: dir.path().to_path_buf(),
+                branch: "agent/rollback-survivor".into(),
+                clone_dir: dir.path().to_path_buf(),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".into(),
+                    agent_id: "nobody".into(),
+                },
+            },
+            crate::dispatch_return::DispatchCaller {
+                pane_id: "disp".into(),
+                agent_id: "nobody".into(),
+                unit_name: "rollback-survivor".into(),
+            },
+        )
+        .await
+        .unwrap();
+        let unit = handle.unit_id.as_ref().expect("a dispatched unit");
+        let survivor = &handle.agents[0];
+        let healthy = &handle.agents[1];
+        while let Ok(msg) = events.try_recv() {
+            if let BroadcastMsg::Event(event) = msg {
+                state.write().await.apply_event(event);
+            }
+        }
+        let gate = Arc::new(ExitGate::default());
+        let _release = ReleaseOnDrop(gate.clone());
+        let mut real_child =
+            registry.swap_child_for_test(&survivor.id, Box::new(UnreapableChild(gate.clone())));
+        close_started_agents(&registry, Some(&state), Some(&event_tx), &handle.agents).await;
+        real_child.kill().unwrap();
+        real_child.wait().unwrap();
+        assert!(registry.agent_record_any(&survivor.id).is_some());
+        assert!(registry.agent_record_any(&healthy.id).is_none());
+        assert!(
+            registry.dispatched_units().get(unit).is_some(),
+            "rollback must not end the survivor's unit"
+        );
+        let guard = state.read().await;
+        assert!(
+            guard.pane_role_map.contains_key(&survivor.pane_id),
+            "rollback must retain routing for the unconfirmed child"
+        );
+        assert!(
+            guard
+                .sessions
+                .values()
+                .any(|s| s.pane_id.as_deref() == Some(&survivor.pane_id)),
+            "the survivor's card must stay"
+        );
+        assert!(!guard.pane_role_map.contains_key(&healthy.pane_id));
+        assert!(
+            !guard
+                .sessions
+                .values()
+                .any(|s| s.pane_id.as_deref() == Some(&healthy.pane_id))
+        );
+        drop(guard);
+        assert!(!registry.pane_close_in_flight(&survivor.pane_id));
+        let mut closed = Vec::new();
+        while let Ok(msg) = events.try_recv() {
+            if let BroadcastMsg::Event(event) = msg
+                && event.is_daemon_pane_closed()
+            {
+                closed.push(event.pane_id.unwrap());
+            }
+        }
+        assert_eq!(closed.as_slice(), std::slice::from_ref(&healthy.pane_id));
+        gate.release();
+        close_started_agents(
+            &registry,
+            Some(&state),
+            Some(&event_tx),
+            std::slice::from_ref(survivor),
+        )
+        .await;
+        assert!(registry.agent_record_any(&survivor.id).is_none());
+        assert!(registry.dispatched_units().get(unit).is_none());
+        assert!(
+            !state
+                .read()
+                .await
+                .pane_role_map
+                .contains_key(&survivor.pane_id)
         );
     }
 

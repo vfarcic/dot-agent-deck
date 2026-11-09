@@ -72,21 +72,6 @@ fn reap_child_with_deadline(
     }
 }
 
-/// Legacy respawn teardown: preserve its blocking-reap contract. Stops use
-/// [`terminate_child_with_grace_and_reap`] so an unconfirmed exit is returned
-/// to their caller instead. Respawn has already dismantled its old record and
-/// needs a separate survivor-ownership change before it can give up that reap.
-pub fn terminate_child_with_grace_and_wait(
-    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
-    grace: std::time::Duration,
-    group: &AgentProcessGroup,
-) {
-    if terminate_child_with_grace_and_reap(child, grace, group, std::time::Duration::ZERO).is_err()
-    {
-        let _ = child.wait();
-    }
-}
-
 pub use scan::{
     CLAUDE_BASH_TOOL_SHAPE, CommandLine, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape,
     command_line_targets, descendant_shell_activity, descendants, detached_descendants,

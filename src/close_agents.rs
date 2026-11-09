@@ -3643,73 +3643,125 @@ mod tests {
     /// Scenario: auditor S3 — an orchestration's roles share one worktree.
     /// Closing one role by `--pane --force` while its sibling still runs there
     /// removes nothing and reports no verdict; closing the last role by
-    /// `--pane` ends the unit and removes the worktree.
+    /// `--pane` ends the unit and removes the worktree. If the first role's stop
+    /// is unconfirmed and its PTY then closes, stopping the healthy sibling must
+    /// leave their shared worktree protected until the survivor is reaped.
     #[tokio::test]
     async fn the_last_role_closed_by_pane_cleans_the_shared_worktree() {
-        let deck = Deck::new().await;
-        let repo = deck.dir.path().join("repo-team");
-        let wt = deck.dir.path().join("repo-team-dispatch");
-        init_repo_with_worktree(deck.dir.path(), &repo, &wt);
-        crate::issue_dispatch_run::record_worktree(
-            &deck.worktrees,
-            &wt,
-            &repo,
-            crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
-        );
-        let o = deck
-            .start_in(
-                "t-o",
-                "sleep 30",
-                Some(("orch-s3", "orchestrator", true)),
+        use crate::platform::proc::test_child::{ExitGate, ReleaseOnDrop, UnreapableChild};
+        for (unconfirmed, stop_sibling) in [(false, false), (true, false), (true, true)] {
+            let deck = Deck::new().await;
+            let repo = deck.dir.path().join("repo-team");
+            let wt = deck.dir.path().join("repo-team-dispatch");
+            init_repo_with_worktree(deck.dir.path(), &repo, &wt);
+            crate::issue_dispatch_run::record_worktree(
+                &deck.worktrees,
                 &wt,
-            )
-            .await;
-        let w = deck
-            .start_in("t-w", "sleep 30", Some(("orch-s3", "coder", false)), &wt)
-            .await;
-        let id = deck.registry.dispatched_units().register(NewUnit {
-            name: "team-s3".into(),
-            worktree: wt.clone(),
-            branch: "wt".into(),
-            clone_dir: repo,
-            dispatcher: Dispatcher {
-                pane_id: "disp".into(),
-                agent_id: "nobody".into(),
-            },
-            kind: UnitKind::Orchestration {
-                orchestration_id: "orch-s3".into(),
-                name: "team".into(),
-                terminal_pane_id: "t-o".into(),
-                terminal_agent_id: o.clone(),
-            },
-            dispatched_at_ms: 1,
-        });
-        deck.report_done("t-o", &o);
-        let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
+                &repo,
+                crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+            );
+            let o = deck
+                .start_in(
+                    "t-o",
+                    "sleep 30",
+                    Some(("orch-s3", "orchestrator", true)),
+                    &wt,
+                )
+                .await;
+            let w = deck
+                .start_in("t-w", "sleep 30", Some(("orch-s3", "coder", false)), &wt)
+                .await;
+            let id = deck.registry.dispatched_units().register(NewUnit {
+                name: "team-s3".into(),
+                worktree: wt.clone(),
+                branch: "wt".into(),
+                clone_dir: repo,
+                dispatcher: Dispatcher {
+                    pane_id: "disp".into(),
+                    agent_id: "nobody".into(),
+                },
+                kind: UnitKind::Orchestration {
+                    orchestration_id: "orch-s3".into(),
+                    name: "team".into(),
+                    terminal_pane_id: "t-o".into(),
+                    terminal_agent_id: o.clone(),
+                },
+                dispatched_at_ms: 1,
+            });
+            deck.report_done("t-o", &o);
+            let pane = |p: &str| CloseSelector::Pane { pane_id: p.into() };
 
-        let report = deck.close(pane("t-o"), None, true, false).await;
-        let target = &report.targets[0];
-        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
-        assert_eq!(
-            target.forced_over,
-            vec![CloseRefusalReason::StrandsOrchestration]
-        );
-        assert_eq!(target.worktree_verdict, None, "a sibling still uses it");
-        assert!(wt.exists());
-        assert!(deck.registry.dispatched_units().get(&id).is_some());
+            let gate = Arc::new(ExitGate::default());
+            let _release = ReleaseOnDrop(gate.clone());
+            if unconfirmed {
+                let mut real_child = deck
+                    .registry
+                    .swap_child_for_test(&o, Box::new(UnreapableChild(gate.clone())));
+                let result = deck.client.stop_agent(&o).await;
+                real_child.kill().unwrap();
+                real_child.wait().unwrap();
+                wait_exited(&deck.registry, &o).await;
+                assert!(result.is_err(), "the first role's stop is unconfirmed");
+            } else {
+                let report = deck.close(pane("t-o"), None, true, false).await;
+                let target = &report.targets[0];
+                assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+                assert_eq!(
+                    target.forced_over,
+                    vec![CloseRefusalReason::StrandsOrchestration]
+                );
+                assert_eq!(target.worktree_verdict, None, "a sibling still uses it");
+                assert!(wt.exists());
+                assert!(deck.registry.dispatched_units().get(&id).is_some());
+            }
 
-        let report = deck.close(pane("t-w"), None, false, false).await;
-        let target = &report.targets[0];
-        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
-        assert_eq!(
-            target.worktree_verdict.as_ref().map(|v| v.verdict),
-            Some(WorktreeVerdictKind::Removed),
-            "{target:?}"
-        );
-        assert!(!wt.exists());
-        assert!(!deck.live(&w));
-        assert!(deck.registry.dispatched_units().get(&id).is_none());
-        deck.shutdown().await;
+            let report = if stop_sibling {
+                let (checked, release) = deck.registry.pause_at_for_test("stop-worktree-cleaned");
+                deck.client
+                    .stop_agent(&w)
+                    .await
+                    .expect("stop the healthy sibling");
+                tokio::time::timeout(Duration::from_secs(10), checked)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                release.send(()).unwrap();
+                None
+            } else {
+                let report = deck.close(pane("t-w"), None, unconfirmed, false).await;
+                let target = &report.targets[0];
+                assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+                Some(report)
+            };
+            if unconfirmed {
+                // Neither PTY EOF nor a healthy sibling's stop proves the retained
+                // child's exit. Both close routes must keep its shared directory.
+                assert!(wt.exists(), "a survivor must not lose its shared worktree");
+                assert!(deck.registry.dir_in_use(&wt));
+                assert!(deck.registry.hold_dir_for_removal(&wt).is_none());
+                assert!(deck.worktrees.lock().unwrap().contains_key(&wt));
+                gate.release();
+                let (cleaned, release) = deck.registry.pause_at_for_test("stop-worktree-cleaned");
+                deck.client.stop_agent(&o).await.expect("retry after exit");
+                tokio::time::timeout(Duration::from_secs(10), cleaned)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert!(!wt.exists(), "confirmed retry can remove the worktree");
+                release.send(()).unwrap();
+            } else {
+                let target = &report.as_ref().unwrap().targets[0];
+                assert_eq!(
+                    target.worktree_verdict.as_ref().map(|v| v.verdict),
+                    Some(WorktreeVerdictKind::Removed),
+                    "{target:?}"
+                );
+                assert!(!wt.exists());
+                assert!(!deck.live(&w));
+                assert!(deck.registry.dispatched_units().get(&id).is_none());
+            }
+            deck.shutdown().await;
+        }
     }
 
     /// Scenario: review on PR #1681 — an orchestration's only worker is

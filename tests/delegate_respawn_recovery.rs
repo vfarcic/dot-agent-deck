@@ -264,14 +264,7 @@ async fn wait_for_pane_record_to_clear(
 /// dispatch task's start on that constant and nobody questioned the size,
 /// because the name said it was about a child.)
 ///
-/// **The ~3 s this relies on is a property of `close_agent` specifically, not of
-/// the stand-in alone** (issue #1148). The close terminates the child while
-/// still holding its whole `RunningAgent` — PTY master included — so a
-/// `trap '' TERM` worker really does survive to the SIGKILL backstop here. The
-/// RESPAWN leg drops the master BEFORE terminating, which hands the same worker
-/// EOF on stdin and ends it in milliseconds; that asymmetry is what
-/// `delegate/034` was wrecked by, and it is why its stand-in reads nothing at
-/// all while `/022`'s is a `cat`.
+/// The close retains the PTY master through termination, so this SIGTERM-ignoring worker survives to the force-kill backstop. Respawn now retains its record through the bounded reap too; `/034` keeps its non-reading fixture from issue #1148, when respawn dropped the master before termination and `cat` could exit on EOF before a poll observed the gap.
 async fn close_pane_into_its_grace_window(
     registry: &AgentPtyRegistry,
     attach_path: &std::path::Path,
@@ -1265,7 +1258,7 @@ enum RespawnGap {
 /// [`delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back`].
 /// Two properties, both needed. "No record for this pane" is MONOTONIC for the
 /// rest of the gap: the respawn is parked in
-/// `terminate_child_with_grace_and_wait` and is the only thing that can publish
+/// `terminate_child_with_grace_and_reap` and is the only thing that can publish
 /// onto the pane, so once true the state cannot be left until the respawn
 /// itself leaves it — the same argument [`wait_for_pane_record_to_clear`]
 /// makes for the close window. And it lasts ~3 s against a 5 ms poll, so a
@@ -1339,28 +1332,9 @@ const STARVED_STOPAGENT_HOLD: Duration = Duration::from_secs(5);
 async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_role_back() {
     use std::os::unix::fs::PermissionsExt;
 
-    // Issue #1148: NOT `delegate/022`'s stand-in, and the difference is the
-    // whole of why that one could not hold this gap open.
-    //
-    // `/022`'s worker is `trap '' TERM` + `exec cat`, and against `close_agent`
-    // that is exactly right: the close terminates the child while still HOLDING
-    // its `RunningAgent`, PTY master included, so a SIGTERM-ignoring `cat` has
-    // nothing to end it and the close spends the full `AGENT_TERMINATE_GRACE`.
-    //
-    // The RESPAWN leg is not shaped like that. `respawn_agent_for_pane_declared`
-    // deliberately `drop`s the writer and the master BEFORE it terminates — so
-    // that any I/O blocked on the PTY unblocks first — and closing the master
-    // hands the child EOF on its stdin. A `cat` then exits **0**, of its own
-    // accord, with the SIGTERM it is ignoring never mattering at all. Measured:
-    // the old child's exit status on this path is `(success, 0)`, never a
-    // signal, and the terminate returns after ONE 50 ms `try_wait` tick rather
-    // than after 3 s. That made this test's gap ~50 ms instead of ~3 s, and
-    // when the child's exit happened to land before the terminate helper's
-    // immediate FIRST `try_wait` — a sub-millisecond scheduling race, which is
-    // why the failure was load-sensitive — the gap collapsed to **2.57 ms** and
-    // the 5 ms poll below stepped straight over it. That is issue #1148.
-    //
-    // So this worker reads nothing at all: it ignores TERM and HUP (a `trap ''`
+    // Keep issue #1148's non-reading fixture: before bounded respawn retained
+    // the record through termination, dropping the master could end a `cat`
+    // on EOF and collapse the polling window. This worker ignores TERM and HUP (a `trap ''`
     // disposition is `SIG_IGN`, which `execve` preserves, so the `sleep` that
     // replaces the shell inherits both) and then sleeps. Losing the PTY is not
     // an event for it, no signal the grace phase sends can end it, and it
@@ -1413,7 +1387,7 @@ async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_
     delegate(&fx, "list the files in this directory").await;
 
     // The gap: the respawn has lifted the record out and is now inside
-    // `terminate_child_with_grace_and_wait`, which the stand-in makes spend the
+    // `terminate_child_with_grace_and_reap`, which the stand-in makes spend the
     // full three seconds. "The record has gone" is the observable edge of it, so
     // the hold lands inside the gap by construction rather than by arithmetic.
     //
@@ -1430,9 +1404,7 @@ async fn delegate_034_a_hold_taken_after_the_record_was_lifted_still_brings_the_
              see the gap — so the gap is no longer the ~3 s of `AGENT_TERMINATE_GRACE` this \
              scenario needs, and the hold below would be taken after the spawn it is supposed to \
              refuse. The stand-in has stopped surviving the respawn's terminate: see the fixture \
-             above, and note that the respawn drops the PTY master before terminating, so a \
-             worker that READS its PTY exits on EOF at once however many signals it traps \
-             (issue #1148). records = {records:?}",
+             above and its TERM/HUP traps. records = {records:?}",
             delegated = fx.worker_agent_id,
             records = fx.daemon.registry.agent_records()
         ),
