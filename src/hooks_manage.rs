@@ -305,6 +305,21 @@ fn probe_claude_version(
     program: &std::ffi::OsStr,
     timeout: std::time::Duration,
 ) -> (bool, Option<String>) {
+    let line = probe_version_line(program, timeout);
+    (
+        line.as_deref()
+            .is_some_and(claude_version_accepts_stop_failure),
+        line,
+    )
+}
+
+/// Run a version-only command with the same bounded stdout and process-tree
+/// cleanup as the Claude install probe. Question hooks reuse it for the agent
+/// command resolved on their PATH; failure leaves the version unknown.
+pub(crate) fn probe_version_line(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> Option<String> {
     let mut command = std::process::Command::new(program);
     command
         .arg("--version")
@@ -318,7 +333,7 @@ fn probe_claude_version(
     }
     let mut child = match command.spawn() {
         Ok(child) => child,
-        Err(_) => return (false, None),
+        Err(_) => return None,
     };
     // Windows has no process group to spawn into: contain the tree in a Job
     // Object instead, so `kill_probe` reaps a launcher's helpers too (Qodo on
@@ -335,8 +350,8 @@ fn probe_claude_version(
     let Some(output) = output else {
         // Deadline passed with no line. The child is not reaped yet (a zombie
         // at worst), so its pid still names its group.
-        kill_probe(&mut child, &tree);
-        return (false, None);
+        let _ = kill_probe(&mut child, &tree);
+        return None;
     };
     // The line is in; it counts only if the child also exits on its own
     // within what is left of the deadline. A version command that prints a
@@ -344,24 +359,30 @@ fn probe_claude_version(
     // that never printed: the line alone does not prove which Claude Code
     // `PATH` resolves to, and a wrong `true` disables every deck hook.
     loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if std::time::Instant::now() < deadline => {
+        match probe_leader_exited(&mut child) {
+            Ok(true) => {
+                // Keep the Unix leader unreaped until its group is signalled:
+                // a launcher can exit while a helper still holds stdout.
+                let status = kill_probe(&mut child, &tree)?;
+                if !status.success() {
+                    return None;
+                }
+                break;
+            }
+            Ok(false) if std::time::Instant::now() < deadline => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            _ => {
-                kill_probe(&mut child, &tree);
-                return (false, None);
+            Ok(false) => {
+                let _ = kill_probe(&mut child, &tree);
+                return None;
             }
+            // An unobservable leader may already have been reaped (ECHILD),
+            // so its pid must not be used to signal a process group.
+            Err(_) => return None,
         }
     }
     let output = String::from_utf8_lossy(&output);
-    let line = output.lines().next().map(|l| l.trim().to_string());
-    (
-        line.as_deref()
-            .is_some_and(claude_version_accepts_stop_failure),
-        line,
-    )
+    output.lines().next().map(|l| l.trim().to_string())
 }
 
 /// Read the version probe's stdout on the calling thread until a newline, EOF,
@@ -485,11 +506,47 @@ fn wait_for_probe_output(
 #[cfg(not(windows))]
 struct ProbeTree;
 
-/// Kill a version probe that outlived its deadline — its whole tree first (the
-/// process group on Unix, the Job Object on Windows) — and reap it. Must run
-/// before the child is reaped, while its pid still names its group.
+/// Observe the probe's exit without reaping its Unix leader, keeping its pid
+/// reserved until the remaining process group has been signalled.
+#[cfg(unix)]
+fn probe_leader_exited(child: &mut std::process::Child) -> io::Result<bool> {
+    loop {
+        // SAFETY: a zeroed siginfo_t is a valid waitid out-parameter. WNOWAIT
+        // leaves this child waitable; WNOHANG leaves si_pid zero while it runs.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let result = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.id() as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if result == 0 {
+            // SAFETY: waitid filled info, or left it zeroed for a running child.
+            return Ok(unsafe { info.si_pid() } != 0);
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+}
+
+/// Windows retains the Job Object independently of the leader's exit status.
+#[cfg(not(unix))]
+fn probe_leader_exited(child: &mut std::process::Child) -> io::Result<bool> {
+    child.try_wait().map(|status| status.is_some())
+}
+
+/// Terminate a version probe's remaining tree (the process group on Unix, the
+/// Job Object on Windows) and reap its leader. On Unix, call before reaping
+/// even on normal exit, while the leader's pid still reserves its group id.
 #[cfg(not(windows))]
-fn kill_probe(child: &mut std::process::Child, _tree: &ProbeTree) {
+fn kill_probe(
+    child: &mut std::process::Child,
+    _tree: &ProbeTree,
+) -> Option<std::process::ExitStatus> {
     #[cfg(unix)]
     // SAFETY: `kill(2)` with a negative pid signals the process group that
     // `process_group(0)` gave the child, whose id is the child's pid. The
@@ -498,17 +555,20 @@ fn kill_probe(child: &mut std::process::Child, _tree: &ProbeTree) {
         libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
     }
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()
 }
 
 /// [`kill_probe`] on Windows: terminate the Job Object the probe was adopted
 /// into, which reaps every process that joined it, then the direct child in
 /// case adoption failed.
 #[cfg(windows)]
-fn kill_probe(child: &mut std::process::Child, tree: &crate::platform::proc::AgentProcessGroup) {
+fn kill_probe(
+    child: &mut std::process::Child,
+    tree: &crate::platform::proc::AgentProcessGroup,
+) -> Option<std::process::ExitStatus> {
     tree.terminate_tree("claude version probe");
     let _ = child.kill();
-    let _ = child.wait();
+    child.wait().ok()
 }
 
 /// Every hook type the deck may have installed, gated or not — what uninstall
@@ -2690,6 +2750,17 @@ mod tests {
         path
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_version_command_does_not_supply_a_version_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = stand_in_claude(dir.path(), "#!/bin/sh\nprintf '2.1.300\\n'\nexit 1\n");
+        assert_eq!(
+            probe_version_line(program.as_os_str(), std::time::Duration::from_secs(2)),
+            None
+        );
+    }
+
     /// Issue #714 (audit A2): a stand-in `claude` that exits at once but leaves
     /// a background child holding its stdout open, having printed no complete
     /// line. The probe answers unknown within its bound instead of waiting for
@@ -2843,18 +2914,58 @@ mod tests {
     #[test]
     fn the_version_probe_reads_the_line_without_waiting_for_eof() {
         let dir = tempfile::tempdir().unwrap();
-        let claude = stand_in_claude(
-            dir.path(),
-            "#!/bin/sh\nsleep 3 &\necho '2.1.300 (Claude Code)'\nexit 0\n",
-        );
-        let started = std::time::Instant::now();
-        let outcome = probe_claude_version(claude.as_os_str(), std::time::Duration::from_secs(10));
-        assert_eq!(outcome, (true, Some("2.1.300 (Claude Code)".to_string())));
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(2),
-            "the probe waited {:?} for a pipe it did not need",
-            started.elapsed()
-        );
+        let pid_file = dir.path().join("helper.pid");
+        for status in [0, 1] {
+            let claude = stand_in_claude(
+                dir.path(),
+                &format!(
+                    "#!/bin/sh\nsleep 15 &\necho $! > '{}'\necho '2.1.300 (Claude Code)'\nexit {status}\n",
+                    pid_file.display()
+                ),
+            );
+            let started = std::time::Instant::now();
+            let outcome =
+                probe_claude_version(claude.as_os_str(), std::time::Duration::from_secs(10));
+            assert_eq!(
+                outcome,
+                if status == 0 {
+                    (true, Some("2.1.300 (Claude Code)".to_string()))
+                } else {
+                    (false, None)
+                }
+            );
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "the probe waited {:?} for a pipe it did not need",
+                started.elapsed()
+            );
+            let helper: i32 = std::fs::read_to_string(&pid_file)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let running = || {
+                #[cfg(target_os = "linux")]
+                if std::fs::read_to_string(format!("/proc/{helper}/stat")).is_ok_and(|stat| {
+                    stat.rsplit_once(") ")
+                        .is_some_and(|(_, rest)| rest.starts_with('Z'))
+                }) {
+                    return false;
+                }
+                // SAFETY: signal zero checks existence without signalling the recorded helper.
+                unsafe { libc::kill(helper, 0) == 0 }
+            };
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while running() && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // An unfixed probe leaves a helper capped at fifteen seconds; do not
+            // signal a recorded pid that could have been reused after it exited.
+            assert!(
+                !running(),
+                "a helper outlived the version probe's exit {status}"
+            );
+        }
         assert_eq!(
             probe_claude_version(
                 dir.path().join("missing").as_os_str(),
