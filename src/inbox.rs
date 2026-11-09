@@ -13,10 +13,11 @@
 //! under a time-limited claim.
 //!
 //! **States.** A message is `queued` until a consumer takes it (`fetched`), and
-//! `acknowledged` once an ack arrives. A fetch positively not handed returns it
-//! to `queued`; otherwise its attempt model decides whether to repeat it or make
-//! it uncertain. The `max_deliver` bound and a bound agent's exit can make it
-//! `undeliverable`. An offer's ack is a claim (`claimed`), which ends in
+//! `acknowledged` once an ack arrives. A fetch returns it to `queued` when every
+//! attempt of the current assignment is positively not handed and delivery
+//! budget remains; otherwise its attempt model decides whether to repeat it or
+//! make it uncertain. The `max_deliver` bound and a bound agent's exit can make
+//! it `undeliverable`. An offer's ack is a claim (`claimed`), which ends in
 //! `acknowledged` on completion or returns the offer to its pool, excluding
 //! everyone who held it before. A message in `fetched` or `claimed` is never
 //! handed to a second consumer.
