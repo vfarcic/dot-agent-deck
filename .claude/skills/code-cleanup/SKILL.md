@@ -90,7 +90,7 @@ This is the rule that matters most. A cleanup unit that always finds something t
 
 ## Step 0: bring the base up to date
 
-Every unit is cut from this checkout's `HEAD` (`dispatch` has no base option). Apply the [`dispatch-base`](../dispatch-base/SKILL.md) skill as written: it fetches, fast-forwards `main` when there is no local work to move, or reports which precondition blocked it and lets the runner decide. When the end-of-run step ("At the end of a dispatch run") calls this skill, its item 1 has just done this, so do not repeat it.
+Every unit is cut from this checkout's `HEAD` (`dispatch` has no base option). Apply the [`dispatch-base`](../dispatch-base/SKILL.md) skill as written: it fetches, fast-forwards `main` when there is no local work to move, or reports which precondition blocked it and lets the runner decide, and it checks for an open `main-red` issue: a cleanup unit is never the one to fix a red `main`, so name the issue in each unit's task as owned elsewhere. When the end-of-run step ("At the end of a dispatch run") calls this skill, its item 1 has just done this, so do not repeat it.
 
 ## Step 1: resolve identity and make sure the label exists
 

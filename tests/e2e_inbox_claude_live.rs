@@ -1,4 +1,8 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
+// Most of this file's tests are Linux only (the deck installs its editor
+// helper there and nowhere else), so off Linux the helpers they share go
+// unused; this keeps the macOS build of the file linting clean.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 //! Interactive Claude inbox delivery, with a real Haiku agent in an attached PTY.
 mod common;
@@ -139,6 +143,7 @@ impl Claude {
     /// installs its editor helper into (`support/claude_installed.rs`), so
     /// the production tick checks a touched input box. Run only where
     /// [`installed::checkable`] holds.
+    #[cfg(target_os = "linux")]
     fn installed() -> Self {
         let installed = installed::Installed::new(&[]);
         installed.assert_installed();

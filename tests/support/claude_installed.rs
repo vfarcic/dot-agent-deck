@@ -203,6 +203,8 @@ impl Installed {
 
     /// The pane was installed: Claude Code's `VISUAL` and `EDITOR` name the
     /// deck's helper, and it has a generation and a tool environment file.
+    /// Linux only, as installation and `composer_probe::instance` are.
+    #[cfg(target_os = "linux")]
     pub fn assert_installed(&self) {
         let helper = dot_agent_deck::composer_probe::instance::HELPER_NAME;
         for name in ["VISUAL", "EDITOR"] {

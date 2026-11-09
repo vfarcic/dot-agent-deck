@@ -59,6 +59,15 @@ on:
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
+    inputs:
+      # Issue #2073: runs `notify-main-red` on a dispatch with DRY_RUN=1, so its
+      # wiring (permissions, env, the verdict from `needs`, the script's reads)
+      # can be exercised from a branch. A push to `main` is the only real input,
+      # and a PR cannot produce one.
+      notify_main_red_dry_run:
+        description: Also run notify-main-red, writing nothing (DRY_RUN=1)
+        type: boolean
+        default: false
 
 # Issue #1088 — cancel a superseded run only where the superseded run is waste.
 #
@@ -2103,16 +2112,41 @@ jobs:
   # `completed/failure`, and told nobody, while five more PRs merged on top of a
   # red main. A run conclusion nobody opens is not a notification.
   #
-  # FIRES ONLY ON A FAILED POST-MERGE RUN ON MAIN. `github.event_name == 'push'`
-  # excludes the `merge_group` checks (a queue failure stops that merge on its
-  # own, and the PR's author is already looking) and every `pull_request` run (a
-  # red PR is the author's, not main's), and `github.ref` pins it to main since
-  # the `push:` trigger could grow another branch later.
+  # RUNS ON EVERY POST-MERGE RUN ON MAIN, green ones included (issue #2073).
+  # `github.event_name == 'push'` excludes the `merge_group` checks (a queue
+  # failure stops that merge on its own, and the PR's author is already looking)
+  # and every `pull_request` run (a red PR is the author's, not main's), and
+  # `github.ref` pins it to main since the `push:` trigger could grow another
+  # branch later. It ran only on a failed run until issue #2073; it now runs on a
+  # green one too, because a green run is what closes the "main is red" issue.
   #
-  # `contains(needs.*.result, 'failure')` rather than `failure()` so the condition
-  # reads as what it means, and so a CANCELLED job does not page anyone —
-  # `cancelled` is not `failure`, and after the concurrency change above a
-  # post-merge run should not be cancelled at all.
+  # The verdict is read from `needs` in the step: `red` when any job it needs
+  # FAILED, `green` when none failed and none was cancelled, and no verdict when
+  # one was cancelled with none failed — a CANCELLED job neither pages anyone
+  # nor closes the issue, and after the concurrency change above a post-merge
+  # run should not be cancelled at all.
+  #
+  # THE ISSUE is what reaches someone: `scripts/main-red-issue.sh` opens ONE
+  # issue labelled `main-red` on a red run (or comments on the one already open,
+  # or reopens one closed in the last 24 hours, so a flaky red/green/red stays in
+  # one thread), and closes it when a run at or after every red commit it
+  # recorded goes green. A red on a commit that a later green push run already
+  # superseded, and a green on a commit older than a recorded red, change
+  # nothing — runs finish out of order and a re-run of an old commit can go
+  # either way. Its header has the lifecycle, and `scripts/test-main-red-issue.sh`
+  # runs it through those cases against a fake `gh`. The dispatching skills read
+  # that issue before they dispatch (`.claude/skills/dispatch-base`).
+  #
+  # No `concurrency:` group on this job, on purpose: GitHub keeps one pending
+  # job per group and CANCELS the older pending one when a third arrives, and a
+  # cancelled job here would turn a green main run `cancelled`, which
+  # `tag-release.yml` refuses to release. Two red runs racing to open the issue
+  # are settled by the script instead: each keeps the lowest-numbered open
+  # `main-red` issue and closes its own if it is not that one.
+  #
+  # `issues: write` is granted to this job alone, and only push runs on `main`
+  # and `workflow_dispatch` runs (where the step forces DRY_RUN=1, so it writes
+  # nothing) reach the step; no `pull_request` run does.
   #
   # `needs` lists EVERY other job, not just the five required contexts. A red
   # `nix`, `devbox`, `desktop-web`, `desktop-browser` or `windows-cross-check`
@@ -2122,11 +2156,13 @@ jobs:
   # missing from `needs` is a job whose failure notifies nobody, which is the
   # defect this whole job exists to fix, reintroduced one job at a time.
   #
-  # NEVER FAILS THE BUILD. `scripts/notify.sh` always exits 0 — a lost
-  # notification is not a workflow event (see its header) — and nothing here
-  # parses its output or retries it. The `::error::` annotation and the step
-  # summary are written FIRST and unconditionally, so the run itself carries the
-  # commit and the failing job names whether or not the send goes out.
+  # NEVER FAILS THE BUILD, and that matters more now that it runs on green
+  # runs: `scripts/notify.sh` and `scripts/main-red-issue.sh` both always exit 0
+  # — a lost notification is not a workflow event (see their headers) — and
+  # nothing here parses their output or retries them. On a red run the
+  # `::error::` annotation and the step summary are written FIRST and
+  # unconditionally, so the run itself carries the commit and the failing job
+  # names whether or not the send or the issue goes out.
   #
   # CREDENTIALS: this job reads `secrets.TELEGRAM_BOT_TOKEN` and
   # `secrets.TELEGRAM_CHAT_ID`, which makes it the one job in this file with a
@@ -2137,8 +2173,9 @@ jobs:
   # returns 0. That is stated here rather than left to be discovered, because a
   # notification path that silently never fires is the defect this job exists to
   # fix. Registering the two secrets is a repository-admin act, like the merge
-  # queue setting; until it happens the annotation and the summary are the whole
-  # of the alert.
+  # queue setting; the send is kept so it works the day they are registered.
+  # Until then the `main-red` issue is the alert (issue #2073), and the
+  # annotation and the summary are what the run itself carries.
   notify-main-red:
     needs:
       - changes
@@ -2161,15 +2198,23 @@ jobs:
       - devbox
     if: >-
       always()
-      && github.event_name == 'push'
-      && github.ref == 'refs/heads/main'
-      && contains(needs.*.result, 'failure')
+      && (
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+        || (github.event_name == 'workflow_dispatch' && inputs.notify_main_red_dry_run)
+      )
     runs-on: ubuntu-latest
+    # Job-level permissions REPLACE the workflow's, so `contents: read` is
+    # restated. `issues: write` opens, comments on and closes the `main-red`
+    # issue; `actions: read` lets the script read the latest green push run.
+    permissions:
+      contents: read
+      issues: write
+      actions: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-      - name: Say which commit and which job broke main
+      - name: Say which commit and which job broke main, and keep the main-red issue in step
         env:
           # `toJSON(needs)` is the only route to the failing job NAMES: an
           # expression can test `needs.*.result` but cannot map a result back to
@@ -2179,25 +2224,44 @@ jobs:
           COMMIT_SHA: ${{ github.sha }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          # Every write becomes a printed command on a `workflow_dispatch` run.
+          DRY_RUN: ${{ github.event_name == 'push' && 'live' || '1' }}
         run: |
           set -uo pipefail   # deliberately NOT -e: a red main must still be reported
 
           failed="$(printf '%s' "$NEEDS_JSON" \
             | jq -r '[to_entries[] | select(.value.result == "failure") | .key] | join(", ")' \
             || true)"
+          cancelled="$(printf '%s' "$NEEDS_JSON" \
+            | jq -r '[to_entries[] | select(.value.result == "cancelled") | .key] | join(", ")' \
+            || true)"
           subject="$(git log -1 --format=%s 2>/dev/null || true)"
 
-          message="$(printf 'dot-agent-deck CI — main is RED\ncommit: %s %s\nfailed: %s\n%s\n' \
-            "${COMMIT_SHA:0:8}" "${subject:-(subject unavailable)}" \
-            "${failed:-(job names unavailable)}" "$RUN_URL")"
+          if [ -n "$failed" ]; then
+            message="$(printf 'dot-agent-deck CI — main is RED\ncommit: %s %s\nfailed: %s\n%s\n' \
+              "${COMMIT_SHA:0:8}" "${subject:-(subject unavailable)}" \
+              "$failed" "$RUN_URL")"
 
-          # Unconditional, and before the send: this is what survives an unset or
-          # revoked token. Fenced because the step summary is rendered as
-          # Markdown, which would otherwise reflow the four lines into one. A
-          # TILDE fence rather than a backtick one: backticks inside a
-          # single-quoted string are a command substitution to shellcheck, and
-          # actionlint runs shellcheck over every `run:` block in this file.
-          printf '### main is red\n\n~~~\n%s\n~~~\n' "$message" >> "$GITHUB_STEP_SUMMARY"
-          echo "::error title=main is red::${COMMIT_SHA:0:8} — failed: ${failed:-unknown} — ${RUN_URL}"
+            # Unconditional, and before the send: this is what survives an unset or
+            # revoked token. Fenced because the step summary is rendered as
+            # Markdown, which would otherwise reflow the four lines into one. A
+            # TILDE fence rather than a backtick one: backticks inside a
+            # single-quoted string are a command substitution to shellcheck, and
+            # actionlint runs shellcheck over every `run:` block in this file.
+            printf '### main is red\n\n~~~\n%s\n~~~\n' "$message" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error title=main is red::${COMMIT_SHA:0:8} — failed: ${failed} — ${RUN_URL}"
 
-          scripts/notify.sh "$message"
+            # A dispatch only exercises the wiring: no Telegram message for it.
+            if [ "$GITHUB_EVENT_NAME" = push ]; then scripts/notify.sh "$message"; fi
+            verdict=red
+          elif [ -n "$cancelled" ]; then
+            echo "cancelled with no failure (${cancelled}) — no verdict, the main-red issue is left as it is"
+            exit 0
+          else
+            verdict=green
+          fi
+
+          COMMIT_SUBJECT="$subject" FAILED_JOBS="$failed" scripts/main-red-issue.sh "$verdict" || true

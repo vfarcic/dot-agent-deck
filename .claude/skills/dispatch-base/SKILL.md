@@ -1,6 +1,6 @@
 ---
 name: dispatch-base
-description: 'Bring the base that every dispatched unit is cut from up to date before the first `dot-agent-deck dispatch` of a batch in this repo, and check the base `dispatch` reports afterwards. Fetches, fast-forwards `main` when there is no local work to move, and otherwise leaves the checkout alone and reports which precondition failed and how far `HEAD` is from `origin/main`. Use whenever you are about to run `dot-agent-deck dispatch` in this repo for any reason: an ad-hoc "start X as a separate line of work" in a dispatcher pane, `/issue-queue`, `/prd-queue`, `/pr-review-queue`, `/code-cleanup`, or any other skill that dispatches. Those skills point here instead of carrying their own copy.'
+description: 'Bring the base that every dispatched unit is cut from up to date before the first `dot-agent-deck dispatch` of a batch in this repo, and check the base `dispatch` reports afterwards. Fetches, fast-forwards `main` when there is no local work to move, and otherwise leaves the checkout alone and reports which precondition failed and how far `HEAD` is from `origin/main`. Also checks for an open `main-red` issue, so a red `main` is seen and owned by one unit rather than fixed by several. Use whenever you are about to run `dot-agent-deck dispatch` in this repo for any reason: an ad-hoc "start X as a separate line of work" in a dispatcher pane, `/issue-queue`, `/prd-queue`, `/pr-review-queue`, `/code-cleanup`, or any other skill that dispatches. Those skills point here instead of carrying their own copy.'
 user-invocable: true
 ---
 
@@ -36,6 +36,24 @@ git rev-list --left-right --count HEAD...origin/main   # "0  6" is 0 ahead, 6 be
 ```
 
 A skill that fetched in an earlier step of its own does not need to fetch again, as long as nothing has run in between that could have moved `origin/main`.
+
+## Check whether `main` is red
+
+**Read this with step 1, before the first dispatch of a batch.** While `main`'s post-merge CI is red, the `notify-main-red` job in `.github/workflows/ci.yml` keeps an issue open with the label `main-red` (issue #2073; [`scripts/main-red-issue.sh`](../../../scripts/main-red-issue.sh) has its lifecycle): it opens one on a red push run, records later reds on the one already open, and closes it once a push run at or after every red commit it recorded goes green.
+
+```bash
+gh issue list --repo vfarcic/dot-agent-deck --label main-red --state open --json number,title,url,assignees,updatedAt
+gh pr list --repo vfarcic/dot-agent-deck --state open --search '<n> in:body' --json number,title,url   # for an open issue <n>: a PR already fixing it
+```
+
+**An empty list does not prove `main` is green.** The issue appears only when a run *finishes*, and a run on `main` takes as long as its slowest job, so a red still running is not there yet; nor is one whose job could not reach the API, since the script never fails a run. When the batch depends on it, read `main`'s latest push runs yourself (`gh run list --workflow ci.yml --branch main --event push --limit 3`).
+
+**When an issue is open, say so to the runner before the first dispatch**, in the same place a [step 3](#step-3--otherwise-leave-the-checkout-alone-and-report) refusal goes: the issue, the failing jobs it names, and who owns it. Every unit cut now starts from a red commit, and CLAUDE.md rule 6 makes a red a unit meets that unit's to fix — so without this, every unit in the batch can start the same fix (the duplicate pair #1594/#1595 is what that looks like). What to do depends on whether the red is owned:
+
+- **Owned** — the issue has an assignee, or an open PR names it. Put one line in every unit's task: `main` is red, tracked by #<n>, being fixed by <owner or PR>; a unit that meets that red names #<n> in its report and leaves the fix there (rule 6's "check whether an open PR already fixes it" is this case).
+- **Unowned** — nobody is assigned and no PR names it. The red is the first thing the batch should fix, by **one** unit. Offer the runner that unit (for `/issue-queue`, #<n> is then an ordinary candidate it takes first); its task starts with `gh issue edit <n> --add-assignee @me`, so the next dispatcher sees the red as owned, and every other unit's task carries the "owned" line above naming that unit.
+
+**Do not stop the batch over it.** As with a step 3 refusal, the runner chooses: dispatch now onto the red base, fix the red first and dispatch after it, or defer the batch. Take their answer rather than picking one.
 
 ## Step 2 — Fast-forward when there is no local work to move
 
