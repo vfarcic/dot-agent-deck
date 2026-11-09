@@ -86,9 +86,8 @@ fn signal_child_pgroup_or_fallback(
         // fallback below uses `portable_pty::Child::kill`, which sends SIGHUP
         // — strictly weaker than the requested `signal` (typically SIGTERM or
         // SIGKILL) and limited to the direct child (no process-group
-        // semantics, so descendants leak). The caller's subsequent
-        // `child.wait()` is unbounded — that's acceptable for the same "this
-        // branch is practically unreachable" reason.
+        // semantics, so descendants leak). The caller's bounded `try_wait`
+        // polling cannot prove that this weaker kill ended the child either.
         //
         // Auditor #5: emit a warn-level event so a descendant leak surfaced
         // via this fallback is at least observable.
@@ -121,9 +120,10 @@ fn signal_child_pgroup_or_fallback(
 /// with SIGKILL and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
 /// ignore SIGHUP — leaving the subsequent `wait()` to block forever. SIGKILL
-/// cannot be caught or ignored, so the kernel tears the process down and
-/// `wait()` returns promptly. Callers should drop the master/writer/reader
-/// handles before invoking this so any I/O blocked on the PTY unblocks first.
+/// cannot be caught or ignored, although a child in uninterruptible I/O can
+/// still delay the `wait`; callers that need a bound use the polling teardown
+/// below instead. Callers should drop the master/writer/reader handles before
+/// invoking this so any I/O blocked on the PTY unblocks first.
 ///
 /// `_group` is the cross-platform teardown handle (PRD #163 M3) and is unused on
 /// Unix — see [`AgentProcessGroup`]; the process group `killpg` addresses is
@@ -176,15 +176,18 @@ pub fn force_kill_child_group(
 
 /// SIGTERM-then-SIGKILL escalation used by the single-pane Ctrl+W path. Sends
 /// `SIGTERM` to the child's process group, polls `try_wait` until the child
-/// exits or `grace` elapses, then sends `SIGKILL` as the backstop and reaps the
-/// child.
+/// exits or `grace` elapses, then sends `SIGKILL` as the backstop. The final
+/// reap also polls `try_wait`, for at most `reap_deadline`: SIGKILL cannot
+/// dislodge a child stuck in uninterruptible I/O, so a blocking `wait` here
+/// could hold the stop request forever.
 ///
 /// `_group` is unused on Unix (see [`force_kill_child_and_wait`]).
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
     _group: &AgentProcessGroup,
-) {
+    reap_deadline: Duration,
+) -> super::ChildTermination {
     // Phase 1: SIGTERM the process group.
     signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
 
@@ -196,7 +199,7 @@ pub fn terminate_child_with_grace_and_wait(
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return super::ChildTermination::Reaped,
             Ok(None) => {}
             Err(_) => break,
         }
@@ -204,9 +207,15 @@ pub fn terminate_child_with_grace_and_wait(
     }
 
     // Phase 3: SIGKILL backstop. Reaches survivors regardless of
-    // SIGTERM-trapping state.
-    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
-    let _ = child.wait();
+    // SIGTERM-trapping state, then gives the kernel a bounded window to report
+    // the exit. A timeout abandons status collection, never the kill request.
+    let kill_reported_ok =
+        signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
+    if super::reap_child_with_deadline(child, reap_deadline) {
+        super::ChildTermination::Reaped
+    } else {
+        super::ChildTermination::Unreaped { kill_reported_ok }
+    }
 }
 
 /// SIGTERM the child's process group without waiting (the daemon-wide

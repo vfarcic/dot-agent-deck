@@ -3562,7 +3562,8 @@ pub struct CloseTarget {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
-    /// For [`CloseOutcome::PartiallyClosed`]: the pane ids still running.
+    /// For [`CloseOutcome::PartiallyClosed`] and [`CloseOutcome::Failed`]: pane
+    /// ids whose stop failed or could not be confirmed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub survivors: Vec<String>,
     /// The refusals `force` overrode for this target.
@@ -5944,8 +5945,8 @@ pub(crate) async fn stop_agent_steps(
     // atomically marks the pane closing and drops every outstanding
     // delegation that touches it — as the worker AND as the
     // orchestrator. Three defects close here: the old cancellation ran
-    // only AFTER `close_agent`, so a timer firing during the up-to-3s
-    // SIGTERM grace window injected the very nudge a deliberate close
+    // only AFTER `close_agent`, so a timer firing during the bounded
+    // SIGTERM-and-reap window injected the very nudge a deliberate close
     // exists to suppress; it was keyed by worker pane only, so closing
     // an ORCHESTRATOR left every worker's timer armed against a pane id
     // a later, unrelated agent could inherit; and it left a window in
@@ -5965,8 +5966,8 @@ pub(crate) async fn stop_agent_steps(
     // PRD #92 F8 followup (auditor #1): `close_agent` runs the
     // synchronous SIGTERM-with-grace loop in
     // `terminate_child_with_grace_and_wait`, which calls
-    // `std::thread::sleep` for up to 3 s while polling the
-    // child's `try_wait`. Calling that from inside the async
+    // `std::thread::sleep` through the graceful and bounded-reap windows while
+    // polling the child's `try_wait`. Calling that from inside the async
     // attach-connection task would block a Tokio worker thread
     // for the duration of the grace window — under load this
     // can starve other connections. Mirror the
@@ -6031,9 +6032,12 @@ pub(crate) async fn stop_agent_steps(
             Ok(())
         }
         Err(msg) => {
-            // PRD #126: the close failed, so the agent is still live. Roll the
-            // transition back by clearing the closing mark — future delegates
-            // to this pane can arm again. The records swept at `begin` are
+            // PRD #126: the close was not confirmed, so success-only pane and
+            // unit cleanup must not run. Roll the transition back by clearing
+            // the closing mark — future delegates to this pane can arm again.
+            // A reap timeout reaches this arm after retiring the generation;
+            // it does not claim the child is dead or reinsert that retired record.
+            // The records swept at `begin` are
             // deliberately NOT restored: losing a watch fails safe,
             // resurrecting one could nag about a pane the user explicitly
             // asked to close.
@@ -7339,7 +7343,7 @@ async fn handle_connection(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             if !crate::issue_dispatch_run::worktree_still_in_use(
-                                &registry.agent_records(),
+                                &registry.agent_records_for_worktree_cleanup(),
                                 &worktree,
                             ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
                                 &worktree_registry,
