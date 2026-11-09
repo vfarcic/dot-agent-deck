@@ -156,7 +156,7 @@ fn serve(op: &str) -> AttachResponse {
         "post-message" => AttachResponse::with_id("m-posted".into()),
         "dispatch-worktree-close-preview" => {
             let mut reply = AttachResponse::ok();
-            reply.kept_worktree = Some(dot_agent_deck::issue_dispatch_run::KeptWorktree {
+            reply.kept_worktree = Some(dot_agent_deck::daemon_protocol::KeptWorktree {
                 path: "/remote/project-dispatch".into(),
                 confirmed_dirty: true,
             });

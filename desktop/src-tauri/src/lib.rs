@@ -4985,7 +4985,7 @@ async fn desktop_worktree_close_preview(
     deck_id: String,
     pane_ids: Vec<String>,
     incarnation: Incarnation,
-) -> Result<Option<dot_agent_deck::issue_dispatch_run::KeptWorktree>, String> {
+) -> Result<Option<dot_agent_deck::daemon_protocol::KeptWorktree>, String> {
     ensure_main_webview(&webview)?;
     Ok(worktree_close_preview_on(&state, &deck_id, pane_ids, incarnation).await)
 }
@@ -4995,7 +4995,7 @@ async fn worktree_close_preview_on(
     deck_id: &str,
     pane_ids: Vec<String>,
     incarnation: Incarnation,
-) -> Option<dot_agent_deck::issue_dispatch_run::KeptWorktree> {
+) -> Option<dot_agent_deck::daemon_protocol::KeptWorktree> {
     if pane_ids.is_empty() {
         return None;
     }
