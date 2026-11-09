@@ -8,19 +8,21 @@
 //! so the semantics are deterministic under test.
 //!
 //! The semantics are JetStream-shaped (decision 1 of the PRD): globally unique
-//! ids that double as dedup keys, explicit acknowledgement, redelivery bounded
-//! by a `max_deliver` of hand-overs, and offers that go to one taker at a time
-//! under a time-limited claim.
+//! ids that double as dedup keys, explicit acknowledgement, bounded
+//! redelivery, and offers that go to one taker at a time under a time-limited
+//! claim.
 //!
 //! **States.** A message is `queued` until a consumer takes it (`fetched`), and
 //! `acknowledged` once an ack arrives. A fetched message carries no deadline of
 //! its own (PRD #1666 part 3, H5 removed the store's ack-wait): its
 //! generation's attempt model (`crate::inbox_attempts`) decides what becomes of
-//! it — every attempt positively not handed queues it again, a possession that
-//! lapses repeats it, and after `max_deliver` hand-overs it becomes
-//! `undeliverable`, as it does when its bound agent exits. An offer's ack is a
-//! claim (`claimed`), which ends in `acknowledged` on completion or returns the
-//! offer to its pool, excluding everyone who held it before. A message in
+//! it — every attempt positively not handed queues it again, and after
+//! `max_deliver` such requeues it becomes `undeliverable`, as it does when its
+//! bound agent exits; a possession that lapses repeats it within the model's
+//! attempt budget, and a message that cannot go on becomes `uncertain`, for
+//! the user to decide. An offer's ack is a claim (`claimed`), which ends in
+//! `acknowledged` on completion or returns the offer to its pool, excluding
+//! everyone who held it before. A message in
 //! `fetched` or `claimed` is never handed to a second consumer.
 //!
 //! **Bounds.** Every limit in [`InboxLimits`] refuses explicitly ([`PostError`]):
@@ -40,10 +42,13 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::deck_identity::{DeckId, is_valid_deck_id};
 
-/// Ack-wait: how long a fetched message waits for its ack before it is
-/// redelivered.
+/// The default [`InboxLimits::ack_wait`]: since PRD #1666 part 3's H5 a
+/// fetched message has no deadline of its own — the receipt attempt model
+/// reads it as its hook hold, one-shot grant lifetime, resume window and
+/// once-waiter idle grace.
 pub const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(60);
-/// Hand-overs after which an unacknowledged message is undeliverable.
+/// The default [`InboxLimits::max_deliver`]: requeues after positive
+/// not-handed reports before a message becomes undeliverable.
 pub const DEFAULT_MAX_DELIVER: u32 = 5;
 /// Queued plus fetched messages one recipient pane may hold.
 pub const DEFAULT_MAX_PER_RECIPIENT: usize = 256;
@@ -439,7 +444,9 @@ pub enum AckHow {
 pub enum UndeliverableReason {
     /// The bound agent exited while the message was still owed to it.
     AgentExited,
-    /// `max_deliver` hand-overs, none acknowledged.
+    /// The delivery limit `max_deliver`: a message requeued that many times
+    /// with every attempt positively not handed, or an offer that many
+    /// holders returned without a claim.
     MaxDeliver,
     /// A newer message replaced it before it was acknowledged.
     Superseded,
@@ -718,10 +725,15 @@ pub struct InboxLimits {
     /// it nowhere — since PRD #1666 part 3's H5 a fetched message has no
     /// deadline of its own.
     pub ack_wait: Duration,
-    /// Hand-overs without an acknowledgement before a message becomes
-    /// undeliverable: the store applies it to an offer its holder returns
-    /// (`return_offer`), and the receipt attempt model counts a message's
-    /// requeues against it before the engine retires the copy.
+    /// The delivery limit. The receipt attempt model counts a message's
+    /// requeues against it — a requeue follows a positive not-handed
+    /// report for every attempt of the assignment — and at the limit the
+    /// engine retires the copy as undeliverable; the store applies it to
+    /// an offer its holder returns (`return_offer`), counting the offer's
+    /// assignments. A hand-out that may have reached the agent is bounded
+    /// separately, by the attempt model's `max_attempts` and
+    /// `max_auto_repeats`, and a message that cannot go on ends
+    /// `Uncertain`, for the user to decide, not `undeliverable`.
     pub max_deliver: u32,
     pub max_per_recipient: usize,
     pub max_messages: usize,

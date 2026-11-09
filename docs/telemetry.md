@@ -300,7 +300,7 @@ One span per task an orchestrator delegates to a role, from when the deck puts t
 | `deck.orchestration.id` | The orchestration, as on `agent.run`. |
 | `deck.handoff.worker.run.id` | The `deck.run.id` of the worker's run that did the task: the one that sent the report, else the one the task was given to. Join on it to see what the worker did. |
 | `deck.handoff.outcome` | `reported` when the report arrived; `undeliverable` when the task never reached its worker; `superseded` when a newer task to the same role replaced it before the worker acknowledged it; `daemon_shutdown` when the daemon stopped first; `unknown` when the orchestrator's run ended with no report, or the hand-off was still open after a day. |
-| `deck.handoff.undeliverable.reason` | Why the task never reached its worker, for `undeliverable`: `agent_exited` (the worker exited first), `max_deliver` (it was handed out too many times without being acknowledged), `cancelled` (you cancelled its delivery) or `inbox_shut` (the daemon was stopping). |
+| `deck.handoff.undeliverable.reason` | Why the task never reached its worker, for `undeliverable`: `agent_exited` (the worker exited first), `max_deliver` (it came back too many times without being acknowledged), `cancelled` (you cancelled its delivery) or `inbox_shut` (the daemon was stopping). |
 
 Events on the span:
 
