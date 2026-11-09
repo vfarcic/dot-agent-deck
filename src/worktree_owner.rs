@@ -571,6 +571,48 @@ pub fn write_marker(
 /// leaves the leftover to the successor.
 pub const ABANDONED_SPAWN_FILENAME: &str = "dot-agent-deck-abandoned-spawn";
 
+/// A failed stop is not an empty abandoned worktree. Keep its explanation in
+/// git metadata so a successor reports the failure instead of treating it as a
+/// successful claim or automatically removing it. Confirmed worktree removal
+/// deletes this record with the metadata directory.
+const UNCONFIRMED_SPAWN_FILENAME: &str = "dot-agent-deck-unconfirmed-spawn";
+
+pub fn mark_unconfirmed_spawn(
+    worktree_path: &Path,
+    creator: &Creator,
+    survivors: &[String],
+) -> Result<(), String> {
+    let dir = git_dir_of(worktree_path)
+        .ok_or_else(|| "could not resolve the retained worktree's git metadata".to_string())?;
+    let message = format!(
+        "{} {} could not confirm termination of agents: {}. These IDs belong to the daemon \
+         that attempted the start. The worktree {} is kept. \
+         Confirm those agents have stopped, then remove this worktree before retrying.",
+        creator.kind,
+        creator.subject,
+        survivors.join(", "),
+        worktree_path.display()
+    );
+    std::fs::write(dir.join(UNCONFIRMED_SPAWN_FILENAME), message)
+        .map_err(|e| format!("could not persist the failed-stop record: {e}"))
+}
+
+/// A persistent failed-stop record requires explicit recovery, even when the
+/// new daemon has no record of the old processes. An unreadable or torn record
+/// also prevents automatic reclamation; it does not establish a safe stop.
+pub fn unconfirmed_spawn_failure(worktree_path: &Path) -> Option<String> {
+    let dir = git_dir_of(worktree_path)?;
+    match std::fs::read_to_string(dir.join(UNCONFIRMED_SPAWN_FILENAME)) {
+        Ok(message) if !message.trim().is_empty() => Some(message),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        _ => Some(format!(
+            "the failed-stop record for {} is unreadable; confirm its agents have stopped, \
+             then remove the worktree before retrying",
+            worktree_path.display()
+        )),
+    }
+}
+
 /// The prefix of what [`mark_abandoned_spawn`] writes: which creator
 /// abandoned the worktree. The generation follows it.
 fn abandoned_spawn_prefix(creator: &Creator) -> String {
@@ -626,6 +668,13 @@ pub fn mark_abandoned_spawn(worktree_path: &Path, creator: &Creator) -> Result<S
 /// (`None`), which is the fail-safe direction.
 pub fn abandoned_spawn_generation(worktree_path: &Path, creator: &Creator) -> Option<String> {
     let git_dir = git_dir_of(worktree_path)?;
+    if git_dir
+        .join(UNCONFIRMED_SPAWN_FILENAME)
+        .try_exists()
+        .unwrap_or(true)
+    {
+        return None;
+    }
     if !reads_as_claim(&git_dir.join(OWNER_MARKER_FILENAME)) {
         return None;
     }

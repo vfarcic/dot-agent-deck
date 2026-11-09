@@ -667,19 +667,32 @@ async fn settle_failed_issue_spawn(
     worktree_dir: &Path,
     creator: Creator,
 ) -> Result<IssueOutcome, String> {
-    if !e.is_daemon_restarting() {
-        if e.rollback_survivors().is_empty() {
-            take_worktree(worktrees, worktree_dir);
-        }
-        return Err(e.to_string());
-    }
     if !e.rollback_survivors().is_empty() {
-        tracing::warn!(
-            error = %e,
-            worktree = %worktree_dir.display(),
-            "issue spawn deferred for restart; keeping the survivors' worktree and cleanup record"
-        );
-        return Ok(IssueOutcome::DeferredForRestart);
+        // This is a failed stop even if its original cause was a restart.
+        // Keep the directory and its cleanup entry, and persist the reason so
+        // the next daemon does not silently skip the issue as already claimed.
+        let recorded = worktrees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(worktree_dir);
+        let mut message = e.to_string();
+        if recorded {
+            let dir = worktree_dir.to_path_buf();
+            let survivors = e.rollback_survivors().to_vec();
+            let marked = tokio::task::spawn_blocking(move || {
+                crate::worktree_owner::mark_unconfirmed_spawn(&dir, &creator, &survivors)
+            })
+            .await
+            .unwrap_or_else(|join| Err(join.to_string()));
+            if let Err(why) = marked {
+                message.push_str(&format!("; {why}; after confirming the agents stopped, remove {} manually before retrying", worktree_dir.display()));
+            }
+        }
+        return Err(message);
+    }
+    if !e.is_daemon_restarting() {
+        take_worktree(worktrees, worktree_dir);
+        return Err(e.to_string());
     }
     // Only a worktree this attempt recorded is ours to remove.
     let Some(entry) = take_worktree(worktrees, worktree_dir) else {
@@ -810,6 +823,20 @@ async fn reclaim_abandoned_spawn_paced(
     before_lock: impl std::future::Future<Output = ()>,
     before_remove: impl std::future::Future<Output = ()>,
 ) -> Reclaim {
+    let dir = worktree_dir.to_path_buf();
+    match tokio::task::spawn_blocking(move || {
+        crate::worktree_owner::unconfirmed_spawn_failure(&dir)
+    })
+    .await
+    {
+        Ok(Some(message)) => return Reclaim::Failed(message),
+        Err(error) => {
+            return Reclaim::Failed(format!(
+                "could not check the worktree's failed-stop record: {error}"
+            ));
+        }
+        Ok(None) => {}
+    }
     let Some(generation) =
         abandoned_generation_if_unused(worktree_dir, &creator, worktrees, agents).await
     else {
@@ -4189,8 +4216,9 @@ mod tests {
         assert!(wt2.exists(), "and leaves its tree as before");
 
         // A rollback survivor keeps its worktree and cleanup record for both
-        // error classes; enriching a restart still defers, rather than fails.
-        for restarting in [false, true] {
+        // error classes. The failed stop is reported even when its cause was
+        // a restart, and a new daemon reads that failure from disk.
+        for restarting in [true, false] {
             record_worktree(&reg, &wt2, &repo, RemovalPolicy::Force);
             let error = crate::spawn::SpawnError::Rollback {
                 error: Box::new(if restarting {
@@ -4203,17 +4231,52 @@ mod tests {
             let outcome =
                 settle_failed_issue_spawn(error, &reg, &wt2, Creator::issue_dispatch("nightly", 8))
                     .await;
-            if restarting {
-                assert_eq!(outcome, Ok(IssueOutcome::DeferredForRestart));
-            } else {
-                assert!(outcome.unwrap_err().contains("unreaped-worker"));
-            }
+            assert!(
+                outcome.is_err(),
+                "a survivor is a failed stop, not a deferred start: {outcome:?}"
+            );
+            assert!(outcome.unwrap_err().contains("unreaped-worker"));
             assert!(wt2.exists(), "an unconfirmed stop cannot authorize removal");
             assert!(
                 reg.lock().unwrap().contains_key(&wt2),
                 "the survivor still needs its cleanup record"
             );
+            let successor = reclaim_abandoned_spawn(
+                &wt2,
+                &repo,
+                Creator::issue_dispatch("nightly", 8),
+                &new_worktree_registry(),
+                &AgentPtyRegistry::new(),
+            )
+            .await;
+            assert!(
+                matches!(successor, Reclaim::Failed(ref message) if message.contains("unreaped-worker")),
+                "a successor must report the failed stop rather than silently skipping or reclaiming: {successor:?}"
+            );
+            assert!(wt2.exists());
         }
+        // Even a stale abandoned-spawn mark must not authorize automatic
+        // removal of a tree whose stop was never confirmed.
+        let creator = Creator::issue_dispatch("nightly", 8);
+        crate::worktree_owner::write_marker(&wt2, "wt2", &creator).unwrap();
+        crate::worktree_owner::mark_abandoned_spawn(&wt2, &creator).unwrap();
+        assert!(!crate::worktree_owner::is_abandoned_spawn_of(
+            &wt2, &creator
+        ));
+
+        // Recovery is explicit: after the operator confirms the old agents
+        // stopped, removing the worktree also removes its failed-stop record.
+        assert!(
+            remove_worktree(&wt2, &repo, RemovalPolicy::Force)
+                .await
+                .is_none()
+        );
+        let recreated = crate::git_env::fixture_git(&repo, tmp.path())
+            .args(["worktree", "add", "-q", &wt2.to_string_lossy(), "wt2"])
+            .output()
+            .unwrap();
+        assert!(recreated.status.success());
+        assert!(crate::worktree_owner::unconfirmed_spawn_failure(&wt2).is_none());
     }
 
     /// Scenario: a restart refuses the issue's spawn, and the repository's

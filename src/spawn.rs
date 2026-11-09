@@ -149,10 +149,8 @@ pub enum SpawnError {
     OrchestratorContext(crate::orchestrator_context::ContextPublishError),
     /// PRD #1487 re-check, reviewer R3: a restart of the daemon holds its
     /// admission freeze, so the agent was refused for now — not a failure of
-    /// this spawn. Nothing was left running (an orchestration rolled back what
-    /// it had started), and no `SpawnFailed` was raised: an unattended caller
-    /// defers instead — retrying if the restart is called off, and leaving the
-    /// work to the next fire of the successor daemon if it goes ahead.
+    /// this spawn. An unattended caller defers when rollback left no survivors;
+    /// unconfirmed stops travel in `Rollback` and require recovery before retry.
     #[error("failed to spawn agent: {}", crate::agent_pty::ADMISSION_FROZEN_REASON)]
     DaemonRestarting,
     /// A failed start whose rollback could not confirm these agents stopped.
@@ -179,6 +177,12 @@ impl SpawnError {
             Self::Rollback { survivors, .. } => survivors,
             _ => &[],
         }
+    }
+
+    /// A retry can start the whole request again only when rollback left no
+    /// unconfirmed stops; preserving the cause alone does not authorize it.
+    pub fn can_retry_after_restart(&self) -> bool {
+        self.is_daemon_restarting() && self.rollback_survivors().is_empty()
     }
 }
 
@@ -3644,6 +3648,10 @@ mod tests {
             "the refusal is classified as a restart, not a failure: {err:?}"
         );
         assert!(
+            err.can_retry_after_restart(),
+            "an empty rollback can be retried"
+        );
+        assert!(
             err.to_string().contains("the daemon is restarting"),
             "and still says why: {err}"
         );
@@ -3749,6 +3757,10 @@ mod tests {
             "the error must name the survivor: {error}"
         );
         assert_eq!(error.rollback_survivors(), std::slice::from_ref(&agent.id));
+        assert!(
+            !error.can_retry_after_restart(),
+            "a survivor must not be duplicated when admission resumes"
+        );
     }
 
     /// Issue #1065: an orchestration whose coordinator context cannot be

@@ -1464,7 +1464,7 @@ fn make_schedule_callback(
                     // it is not reported as one: retried if the restart is called
                     // off, and left to the successor daemon's next fire if it
                     // goes ahead.
-                    Err(e) if e.is_daemon_restarting() => {
+                    Err(e) if e.can_retry_after_restart() => {
                         info!(
                             task = %req.task_name,
                             error = %e,
@@ -1480,6 +1480,15 @@ fn make_schedule_callback(
                         info!(task = %req.task_name, "restart called off; firing again");
                     }
                     Err(e) => {
+                        if e.is_daemon_restarting() && !e.rollback_survivors().is_empty() {
+                            crate::scheduler::Notifier::notify(
+                                &notifier,
+                                crate::scheduler::NotifyEvent::SpawnFailed {
+                                    task: req.task_name.clone(),
+                                    message: e.to_string(),
+                                },
+                            );
+                        }
                         // Already surfaced via the notifier; log for the operator.
                         warn!(error = %e, "scheduled spawn failed");
                         break;
