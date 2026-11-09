@@ -2794,8 +2794,8 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
-  /** Scenario: a stop confirmation opens in the overview behind an open agent
-   * pane. It pre-empts dictation, and dismissing it returns to idle rather than
+  /** Scenario: the pane's Close agent button opens its stop confirmation.
+   * It pre-empts dictation, and dismissing it returns to idle rather than
    * silently resuming the earlier mode. */
   it("ends dictation when a D5 confirmation opens and never resumes it", async () => {
     const voice = microphone([]);
@@ -2809,12 +2809,55 @@ describe("sticky dictation in the open agent pane", () => {
     await completeUtterance();
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     expect(deck.sendTerminalInput).not.toHaveBeenCalled();
+  });
+});
+
+describe("closing the viewed agent by voice", () => {
+  beforeEach(() => { window.localStorage.clear(); vi.useFakeTimers(); });
+  afterEach(() => vi.useRealTimers());
+
+  /** Scenario: with typing off, say stop over a remote agent's pane. The same confirmation as its button names that remote agent and sends nothing until confirmed. */
+  it("confirms the pane's agent on its own daemon", async () => {
+    const voice = microphone(["stop"]);
+    const resolveVoice = vi.fn(async () => dispatch("stop_agent", "confirmStopAgent", "Confirm closing this agent.", "stop"));
+    const fleet = createFixtureFleet("fleet");
+    const remote = fleet.find((entry) => entry.connection.deckId === FIXTURE_REMOTE_DAEMON_ID)!;
+    const agent = remote.agents[0];
+    const deck = runtime(resolveVoice, voice, { snapshot: fleet[0], fleet });
+    render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview" }} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    const dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("dev@build-box");
+    expect(deck.runAction).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" })));
+    expect(deck.runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation });
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByTestId("overview-refresh")).toBeVisible();
+  });
+
+  /** Scenario: say stop, then open another agent while speech is resolving. The late answer must not open a close confirmation for the new pane. */
+  it("does not retarget a late bare stop to a different pane", async () => {
+    const voice = microphone(["stop"]);
+    let finish!: (answer: VoiceResultDto) => void;
+    const resolveVoice = vi.fn(() => new Promise<VoiceResultDto>((resolve) => { finish = resolve; }));
+    const deck = runtime(resolveVoice, voice);
+    render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" }} />);
+    await turnVoiceOn();
+    await completeUtterance();
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
+    await act(async () => finish(dispatch("stop_agent", "confirmStopAgent", "Confirm closing this agent.", "stop")));
+    await flush();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByTestId("agent-pane-overlay")).toHaveAccessibleName("Builder agent");
+    expect(deck.runAction).not.toHaveBeenCalled();
   });
 });
 

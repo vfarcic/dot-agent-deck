@@ -4,7 +4,7 @@ import { desktopFeaturesOf } from "../types";
 import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
-import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
+import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentVoiceChannel, type VoiceActionContext, type VoiceDispatchTarget, type VoiceOverviewChannel } from "../lib/voiceActions";
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
@@ -816,6 +816,33 @@ export function stopTargetName(agent: OverviewAgent): string {
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
 
+/** The shell serves the open pane's Close agent control through the same registry entry as voice. */
+export const AgentStopContext = createContext<Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused"> | undefined>(undefined);
+
+/** The overview row and the full-screen pane share the question and the stop action. */
+export function agentStopConfirmation(runtime: DeckRuntimeState, agent: OverviewAgent, onStopped?: () => void): ConfirmState | undefined {
+  const deck = runtime.fleet.find((entry) => entry.connection.deckId === agent.daemonId);
+  if (!deck) return undefined;
+  const name = stopTargetName(agent);
+  const roleNotice = agent.tab.kind === "orchestration"
+    ? " This closes only this role, leaving the orchestration without it. To close the whole orchestration, use its Close control on the dashboard."
+    : "";
+  return {
+    title: `Close ${name}?`,
+    body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.${roleNotice} To interrupt its turn instead, say “typing on”, then “stop”.`,
+    label: "Close agent",
+    busyLabel: "Stopping…",
+    action: async () => {
+      try {
+        const result = await runtime.runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation });
+        if (result.ok) onStopped?.();
+      } catch {
+        // The runtime renders the refusal in its error toast.
+      }
+    },
+  };
+}
+
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
@@ -1404,16 +1431,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     };
     return {
       stopAgent: (agent) => {
-        const deck = deckOf(agent.daemonId);
-        if (!deck) return;
-        const name = stopTargetName(agent);
-        setConfirm({
-          title: `Close ${name}?`,
-          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
-          label: "Close agent",
-          busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
-        });
+        setConfirm(agentStopConfirmation(runtime, agent));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;

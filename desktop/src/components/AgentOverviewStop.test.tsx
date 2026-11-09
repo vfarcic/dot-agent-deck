@@ -71,6 +71,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     fireEvent.click(stop);
     expect(confirmation()).toHaveTextContent("Close planner?");
     expect(confirmation()).toHaveTextContent("dev@build-box");
+    expect(confirmation()).toHaveTextContent("This closes only this role, leaving the orchestration without it.");
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();

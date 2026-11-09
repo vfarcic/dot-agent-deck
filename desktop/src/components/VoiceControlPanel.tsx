@@ -2168,14 +2168,28 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
    */
   const dispatching = useRef<VoiceContext | undefined>(undefined);
   const dispatchDeclared = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declared: VoiceContext) => {
+    if (outcome.invoke === "confirmStopAgent" && declared.screen === "agent" && outcome.params.length === 0) {
+      const was = declared.pane;
+      const now = current();
+      if (!was || !showsAgent(now.pane, paneAddress(was)) || !sameIncarnation(was.incarnation, now.pane.incarnation) || incarnationsDiffer(was.spawnedAtMs, now.pane.spawnedAtMs) || now.confirmation) {
+        refusedRef.current = true;
+        setProblem(voiceNothingRan("the pane changed or a confirmation is open"));
+        return {};
+      }
+    }
     /* Restored rather than cleared (review round 5), so a dispatch nested in
        another cannot drop the outer one's declaration on its way out. */
     const outer = dispatching.current;
     dispatching.current = declared;
     try {
+      // A local Close agent phrase names the pane as it was when heard, not
+      // whichever pane happens to be open when speech finishes resolving.
+      const params = outcome.invoke === "confirmStopAgent" && declared.screen === "agent" && outcome.params.length === 0 && declared.pane
+        ? [{ name: "agent", kind: "agent_ref" as const, spoken: "", value: declared.pane.agentId, label: declared.pane.label, deckId: declared.pane.deckId, incarnation: declared.pane.incarnation }]
+        : outcome.params;
       /* G-fix7: every agent the outcome names, bound to the process that
          listed it at the declaration (the gate above held it there). */
-      return onDispatch({ ...outcome, params: bindAgentParams(outcome.params, declared) }, declared.directories, declared.newAgent);
+      return onDispatch({ ...outcome, params: bindAgentParams(params, declared) }, declared.directories, declared.newAgent);
     } finally {
       dispatching.current = outer;
       /* PR #1451 round 3, change 4 — what voice just did may have changed the
@@ -2190,7 +2204,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          command. Do not downgrade it. */
       window.setTimeout(hearNumbers, 0);
     }
-  }, [hearNumbers, onDispatch]);
+  }, [current, hearNumbers, onDispatch]);
   /** The pane seams' gate: the dispatch's declaration against now, for writes to `aim`. */
   const paneLost = useCallback((aim: AgentAddress) => contextLost(dispatching.current ?? current(), current(), { pane: aim }), [current]);
   /**

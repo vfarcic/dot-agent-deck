@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   CircleDot,
+  CircleStop,
   FileCode2,
   GitCompareArrows,
   Handshake,
@@ -34,7 +35,8 @@ import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } f
 import { blockedReasonText } from "../lib/blockedReason";
 import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
-import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
+import { AgentStopContext, OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
+import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
@@ -354,6 +356,7 @@ export function AgentTile({
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
   const openPullRequest = useContext(OpenPullRequest);
+  const stopAgent = useContext(AgentStopContext);
   /* PRD #1666 part 2 (G-fix6): keystrokes and sizes carry the incarnation of
      the record this tile renders, so they reach the session attached for that
      process and never one attached for a restarted deck's agent of the same
@@ -614,6 +617,16 @@ export function AgentTile({
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
+          )}
+          {overlay && stopAgent && (
+            <button
+              className="button danger compact"
+              type="button"
+              disabled={held || mode === "live" && noTerminal !== undefined}
+              title="Stop this agent and return to the dashboard"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmStopAgent.run(stopAgent, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><CircleStop size={14} />Close agent</button>
           )}
           {onClose && (
             <button

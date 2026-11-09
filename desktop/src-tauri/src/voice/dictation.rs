@@ -308,12 +308,23 @@ pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrup
 /// dictation mode is on** (PRD #1541 M1 decision 4).
 ///
 /// A list of their own rather than part of [`INTERRUPT_PHRASES`], because the
-/// two halves differ outside the mode: there a bare *"stop"* is NOT answered
-/// locally at all — it keeps today's model answer (`stop_agent`, which is not
-/// callable on the agent screen) and issue #1402 owns what it should become —
-/// while *"interrupt"* is answered with "say typing on first". *"stop typing"*
+/// two halves differ outside the mode: on the agent screen a bare *"stop"*
+/// opens the Close agent confirmation, while *"interrupt"* is answered with
+/// "say typing on first". *"stop typing"*
 /// and *"stop listening"* are different whole phrases and keep their meanings.
 pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];
+
+/// Whole-utterance ways to end the viewed agent with typing mode off (#1402).
+/// Typing mode does not reserve these: it types them as prompt text.
+pub const CLOSE_AGENT_PHRASES: [&str; 7] = [
+    "close this agent",
+    "close the agent",
+    "close agent",
+    "stop this agent",
+    "stop the agent",
+    "end this agent",
+    "end the agent",
+];
 
 /// What starts reading mode for the open agent (PRD #1497), said as the whole
 /// utterance.

@@ -114,6 +114,67 @@ describe("agent pane overlay", () => {
     window.localStorage.clear();
   });
 
+  /** Scenario: close the viewed agent from either origin. Cancel preserves the pane; confirmation targets that agent, and its disappearance returns to the overview. */
+  it.each(["overview", "deck"] as const)("confirms Close agent from %s and returns to the overview", async (from) => {
+    const state = runtime();
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from };
+    const { rerender } = render(<DeckShell runtime={state} initialView={view} />);
+    const pane = screen.getByTestId("agent-pane-overlay");
+    fireEvent.click(within(pane).getByRole("button", { name: "Close agent" }));
+    let dialog = screen.getByRole("alertdialog");
+    expect(dialog).toHaveTextContent("Close Plan / architecture?");
+    expect(dialog.closest("[inert]")).toBeNull();
+    expect(pane.closest("[inert]")).not.toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    expect(state.runAction).not.toHaveBeenCalled();
+    expect(pane).toBeVisible();
+
+    fireEvent.click(within(pane).getByRole("button", { name: "Close agent" }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(pane).toBeVisible();
+    expect(state.runAction).not.toHaveBeenCalled();
+
+    fireEvent.click(within(pane).getByRole("button", { name: "Close agent" }));
+    dialog = screen.getByRole("alertdialog");
+    await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" })));
+    expect(state.runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: undefined });
+    const snapshot = { ...state.snapshot, agents: state.snapshot.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<DeckShell runtime={{ ...state, snapshot, fleet: [snapshot] }} initialView={view} />);
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-refresh")).toBeVisible();
+  });
+
+  /** Scenario: a daemon refuses Close agent. The confirmation closes, while the agent pane remains usable and Back to dashboard still leaves the agent running. */
+  it("keeps the pane after a refused close and distinguishes Back to dashboard", async () => {
+    const runAction = vi.fn(async () => { throw new Error("stop refused"); });
+    render(<DeckShell runtime={runtime({ runAction })} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" }} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    await act(async () => fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" })));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Back to dashboard" }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(runAction).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: a stop removes the agent before its reply arrives. The pane and confirmation disappear together, including when opened from the deck. */
+  it("returns to the overview if the agent disappears before the close reply", async () => {
+    let finish!: (result: DeckActionResult) => void;
+    const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { finish = resolve; }));
+    const state = runtime({ runAction });
+    const { rerender } = render(<DeckShell runtime={state} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "deck" }} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Close agent" }));
+    expect(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Stopping…" })).toBeDisabled();
+    const snapshot = { ...state.snapshot, agents: state.snapshot.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<DeckShell runtime={{ ...state, snapshot, fleet: [snapshot] }} />);
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByTestId("overview-refresh")).toBeVisible();
+    await act(async () => finish({ ok: true }));
+  });
+
   /**
    * Scenario: start directly in Planner's pane once from each origin. The same
    * real AgentTile component mounts at overlay presentation in both paths, so

@@ -34,6 +34,24 @@ import { enterDeck } from "./support/overview";
  * already selected — which is why this one is a peer and the selector is not.
  */
 test.describe("the agent pane is a real modal", () => {
+  /** Scenario: open the viewed agent's Close confirmation, cancel it, then confirm. The dialog is clickable above the pane and a successful close returns to the dashboard. */
+  test("closes the viewed agent through a reachable confirmation", async ({ page }) => {
+    await page.goto("/?fixture=1&state=docs");
+    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    const pane = page.getByTestId("agent-pane-overlay");
+    await pane.getByRole("button", { name: "Close agent", exact: true }).click();
+    const dialog = page.getByRole("alertdialog");
+    await expect(dialog).toContainText("Close Desktop implementation?");
+    await expect(pane).toHaveAttribute("inert", "");
+    await dialog.getByRole("button", { name: "Cancel" }).click();
+    await expect(pane).toBeVisible();
+    await pane.getByRole("button", { name: "Close agent", exact: true }).click();
+    await dialog.getByRole("button", { name: "Close agent", exact: true }).click();
+    await expect(pane).toHaveCount(0);
+    await expect(page.getByTestId("overview-refresh")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Open Desktop implementation agent" })).toHaveCount(0);
+  });
+
   /** Scenario: open a PR from the full-screen agent pane in a real browser. The frontmost toolbar accepts focus and clicks while the underlying pane is inert. */
   test("keeps the PR toolbar interactive above the agent pane", async ({ page }) => {
     await page.goto("/?fixture=1&state=docs-pr");

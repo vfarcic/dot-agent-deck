@@ -1002,14 +1002,15 @@ meaning     = "whole"
 # (`voice::dictation::INTERRUPT_PHRASES`, `CLEAR_PROMPT_PHRASES`,
 # `SCRATCH_PHRASES`), and on the other screens the row is not callable and
 # renders its hint. A model pick of one of them in other words — or of
-# `interrupt_agent` for a bare "stop" (`TYPING_STOP_PHRASES`), which outside
-# typing mode keeps the model's answer it has today (issue #1402 owns it) — is
+# `interrupt_agent` for a bare "stop" (`TYPING_STOP_PHRASES`) — is
 # refused by `handle_utterance_with_dictation` with the same "typing on"
 # sentence, whatever the meaning check says. Until PRD #1733 a whole-utterance
 # word list equal to the local lists was a first wall in front of that one;
 # the meaning check, read as "whole", is that wall now. Inside typing mode
 # `outcome::dictation_intercept` dispatches them from the dictation lists,
 # ahead of typing the utterance.
+# With typing mode off on the agent screen, the bare stops instead open the
+# Close agent confirmation locally (#1402), unless Reading claims them first.
 #
 # The descriptions still name every phrase (linkage-check rule 14), which is
 # also what the discovery overlay shows the user.
@@ -2038,11 +2039,13 @@ meaning     = "whole"
 # are the first to carry it.
 #
 # **Their words are the destructive reading, and only that** (PRD #1223, D1):
-# "close" is a VIEW word (`close`) — `stop_agent`'s description disclaims it,
+# On the dashboard "close" is a VIEW word (`close`); the agent screen's
+# whole-utterance close-agent phrases are handled locally (#1402).
+# `stop_agent`'s model-facing description disclaims it,
 # and `close_orchestration` refuses any sentence that does not name the
 # orchestration or the run (`must_name`), whatever the meaning check says.
 #
-# **`stop_agent` is the one control whose label is not its voice phrase.**
+# **On the dashboard, `stop_agent`'s label is not its voice phrase.**
 # Issue #1045 renamed the dashboard row's button to "Close <name> agent",
 # because Close is the glossary's word for ending one agent. Reading that label
 # aloud is not a stop: the meaning check is told a close means the view
@@ -2101,18 +2104,23 @@ shut it down, end that agent, terminate the one that is stuck. Set `agent` the w
 does. It never stops anything by itself: the app shows the same confirmation the row's button shows
 and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
 urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
-"close the tester" close the VIEW (`close`) and stop nothing, on every screen and even with nothing
+"close the tester" close the VIEW (`close`) and stop nothing on the dashboard, even with nothing
 open to close, although this row's button is labelled Close — and a start is its opposite: never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
-means SHOW the tester (`open_agent`) and stops nothing."""
+means SHOW the tester (`open_agent`) and stops nothing. On the agent screen with typing mode off,
+the whole utterances "stop", "stop it", "stop that", "close this agent", "close the agent",
+"close agent", "stop this agent", "stop the agent", "end this agent" and "end the agent"
+open this same confirmation for the viewed agent; these phrases are handled locally, not chosen
+from agent names. Typing mode keeps its own interrupt and dictation meanings."""
 invoke      = "confirmStopAgent"
-screens     = ["overview"]
+screens     = ["overview", "agent"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "stopping an agent works from the agent dashboard, with the New agent dialog closed"
+unavailable_hint = "close an agent from the dashboard or its pane, with typing mode off and other dialogs closed"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
 asks_to     = "stop an agent"
 try_saying  = "stop {agent}"
-# PRD #1733: refused whenever "close" is said — D1 in code. See the column.
+# PRD #1733: a model pick is refused when "close" is said. The pane's fixed
+# close-agent phrases dispatch before model selection (#1402).
 must_not_say = ["close"]
 action_words = ["stop", "kill", "shut down", "shut it down", "end", "terminate"]
 

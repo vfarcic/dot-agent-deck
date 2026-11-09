@@ -472,8 +472,9 @@ export type VoiceActionContext = {
    * did not because they are destructive, their target may be off-screen, and
    * an orchestration close takes several roles at once.
    *
-   * - `confirmStopAgent` — the overview row's Stop, for the agent an
-   *   `agent_ref` resolved to: the same confirmation that button opens.
+    * - `confirmStopAgent` — Close agent on the overview row or the open pane:
+    *   the same confirmation that button opens. A pane phrase is bound to the
+    *   agent viewed when it was heard rather than resolved from a name.
    * - `confirmCloseOrchestration` — an orchestration card's Close, for the
    *   card an `orchestration_ref` resolved to (`target.orchestrationAgentId`):
    *   the same confirmation, naming every role it will stop.
@@ -1204,12 +1205,12 @@ export const VOICE_ACTIONS = {
   /* PRD #802 D5 — the two rows that STOP something. Each entry calls a member
      that can only OPEN a confirmation (see the members' own comment on
      `VoiceActionContext`), so voice never reaches `runAction` for a stop: the
-     confirmation's button does, pressed by hand. The manual controls — a
-     row's Stop, a card's Close — keep exactly the behaviour they had and do
-     not route through these. */
+     confirmation's button does, pressed by hand. The pane's Close agent uses
+     this entry too; the overview row and orchestration card retain their own
+     control callbacks. */
 
   confirmStopAgent: {
-    label: "Ask to close one agent on the dashboard",
+    label: "Ask to close one agent",
     voice: true,
     needs: ["confirmStopAgent", "reportRefused"],
     run: (context: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">, target: VoiceDispatchTarget) => {

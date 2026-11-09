@@ -36,7 +36,7 @@ dot-agent-deck is one product with two clients — the terminal TUI and the desk
 
 ### Ending an agent versus leaving its view
 
-Two desktop controls act on an agent from different places: the dashboard row's control ends the agent, and the full-window agent view's control only dismisses the view. Issue #1045 named them by the glossary's words. The row's control is **"Close {name} agent"**, because **Close** is the word for ending one agent; the full-window view's dismiss is **"Back to dashboard"**, because it ends nothing and the Dashboard is where it returns to. The busy label while a close is in flight stays "Stopping…": it describes what the daemon is doing, not the name of the action.
+The dashboard row's **"Close {name} agent"** and the full-window pane's **"Close agent"** end the agent after confirmation. The pane uses a stop icon for that action, beside a separate **"Back to dashboard"** dismiss control that leaves the agent running. The busy label while a close is in flight stays "Stopping…": it describes what the daemon is doing, not the name of the action.
 
 ### Checked and already aligned
 
