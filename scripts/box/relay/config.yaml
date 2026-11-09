@@ -1,0 +1,90 @@
+# Host metrics, plus a local OTLP relay for the deck and its agents. The deck
+# and agents send to http://127.0.0.1:4318 (~/.config/dot-agent-deck/otel.env);
+# this forwards to Honeycomb, dropping Codex's and OpenCode's high-volume
+# internal spans (2026-10-27: ~3.3M of ~3.6M events a day at 5 units).
+receivers:
+  hostmetrics:
+    root_path: /hostfs
+    collection_interval: 30s
+    scrapers:
+      cpu:
+        metrics:
+          system.cpu.utilization:
+            enabled: true
+      load: {}
+      memory:
+        metrics:
+          system.memory.utilization:
+            enabled: true
+      disk: {}
+      filesystem:
+        exclude_fs_types:
+          fs_types: [autofs, binfmt_misc, bpf, cgroup2, configfs, debugfs, devpts, devtmpfs, fusectl, hugetlbfs, mqueue, nsfs, overlay, proc, procfs, pstore, rpc_pipefs, securityfs, selinuxfs, squashfs, sysfs, tracefs, tmpfs]
+          match_type: strict
+        exclude_mount_points:
+          # mounts the Collector's non-root user cannot stat (the mini PC's build disk)
+          mount_points: [".*/home/vfarcic/code$"]
+          match_type: regexp
+      network: {}
+      paging: {}
+      processes: {}
+  otlp:
+    protocols:
+      http:
+        endpoint: 127.0.0.1:4318
+
+processors:
+  batch: {}
+  resourcedetection/host:
+    detectors: [system]
+    system:
+      hostname_sources: [os]
+  # Sub-millisecond spans emitted per streamed chunk, per DB query or per
+  # bookkeeping step; the request- and tool-level spans above them are kept.
+  filter/agent-internals:
+    error_mode: ignore
+    traces:
+      span:
+        - 'resource.attributes["service.name"] == "codex_cli_rs" and IsMatch(name, "^(handle_responses|receiving|append_items|persist_rollout_items|realtime_conversation\\.running_state|fs\\.get_metadata|fs\\.read_file|auth|environments\\.snapshot)$")'
+        - 'resource.attributes["service.name"] == "opencode" and IsMatch(name, "^(sql\\.execute|SessionProcessor\\.readToolCall|SessionProcessor\\.ensureToolCall|Session\\.getPart|Plugin\\.trigger|Config\\.get|FileSystem\\.existsSafe|State\\.reload\\.update)$")'
+
+exporters:
+  otlphttp/hostmetrics:
+    endpoint: https://api.honeycomb.io
+    headers:
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+      x-honeycomb-dataset: host-metrics
+  # Same headers the deck and agents sent with directly: datasets follow service.name.
+  otlphttp/agents:
+    endpoint: https://api.honeycomb.io
+    headers:
+      x-honeycomb-team: ${env:HONEYCOMB_API_KEY}
+  # Everything also goes to Dash0 (2026-10-31, for #1980's analysis), into its
+  # default dataset. Each exporter queues and retries on its own, so an outage
+  # at one backend does not hold up the other.
+  otlphttp/dash0:
+    endpoint: ${env:DASH0_ENDPOINT}
+    headers:
+      Authorization: Bearer ${env:DASH0_AUTH_TOKEN}
+
+service:
+  pipelines:
+    metrics/host:
+      receivers: [hostmetrics]
+      processors: [resourcedetection/host, batch]
+      exporters: [otlphttp/hostmetrics, otlphttp/dash0]
+    traces:
+      receivers: [otlp]
+      processors: [filter/agent-internals, batch]
+      exporters: [otlphttp/agents, otlphttp/dash0]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/agents, otlphttp/dash0]
+    metrics/agents:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/agents, otlphttp/dash0]
+  telemetry:
+    metrics:
+      level: none

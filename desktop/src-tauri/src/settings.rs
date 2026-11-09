@@ -348,6 +348,39 @@ pub struct ZoomSettings {
     pub level: ZoomLevel,
 }
 
+/// The `[questions]` section — issue #2075's tenant, stored here.
+///
+/// One field, `notify`: how many minutes a question an agent asked may wait
+/// unanswered before the app posts ONE operating-system notification for it.
+/// `0` turns the notification off. One word, per rule 2 of this module's
+/// docs, so the TOML key and the webview's JSON key are the same bytes. A `u32` of whole minutes, because that is what the
+/// user sets and what the webview counts against; an out-of-range value is
+/// not possible to write in a way that matters (a `u32` of minutes is longer
+/// than any session).
+///
+/// **An `Option` on [`DesktopSettings`]**, for `voice`'s reason: `None` is
+/// "this client said nothing about notifications", so a webview that does not
+/// send the section cannot reset the user's choice through the merge. An
+/// absent section reads as [`DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuestionSettings {
+    pub notify: u32,
+}
+
+/// Issue #2075: what an absent `[questions]` section, or one without the
+/// key, means. Ten minutes: past the four answers the issue measured (19 s to
+/// 4.7 min), well short of the 3.5 to 6 hour waits it is about.
+pub const DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES: u32 = 10;
+
+impl Default for QuestionSettings {
+    fn default() -> Self {
+        Self {
+            notify: DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES,
+        }
+    }
+}
+
 /// The `[voice]` section — PRD #802's tenant, stored here.
 ///
 /// # One choice plus two stages, and why the stages are nested
@@ -1492,6 +1525,10 @@ pub struct DesktopSettings {
     /// [`normalizeDesktopSettings`]: https://github.com/vfarcic/dot-agent-deck/blob/main/desktop/src/lib/bridge.ts
     pub voice: Option<VoiceSettings>,
     pub zoom: ZoomSettings,
+    /// Issue #2075's tenant: when to notify about a question nobody has
+    /// answered. **An `Option`, for `voice`'s reason** — see
+    /// [`QuestionSettings`].
+    pub questions: Option<QuestionSettings>,
 }
 
 impl Default for DesktopSettings {
@@ -1502,6 +1539,7 @@ impl Default for DesktopSettings {
             endpoints: None,
             voice: None,
             zoom: ZoomSettings::default(),
+            questions: None,
         }
     }
 }
@@ -8194,6 +8232,9 @@ mod tests {
         // that did not send one, and the merge would then write that default
         // over a choice the user had made. So the TOML below is unchanged for
         // a second time, and the JSON gains `"voice": null`.
+        //
+        // Issue #2075's `[questions]` is the third, for the same reason: the
+        // TOML is unchanged again and the JSON gains `"questions": null`.
         const FRESH: &str =
             "version = 1\n\n[appearance]\nmode = \"system\"\n\n[zoom]\nlevel = 1.0\n";
         let rendered = toml_edit::ser::to_string_pretty(&DesktopSettings::default()).unwrap();
@@ -8219,6 +8260,7 @@ mod tests {
                 "endpoints": null,
                 "voice": null,
                 "zoom": { "level": 1.0 },
+                "questions": null,
             })
         );
         for mode in [

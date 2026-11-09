@@ -1,6 +1,7 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
+import { worktreePreview } from "../lib/worktreeClose";
 import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
@@ -8,7 +9,7 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
+import { appFirst, LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
@@ -60,7 +61,7 @@ export type OverviewAgent = Pick<
   /* PRD #1401 — the badge beside the agent's name. */
   | "pullRequest"
   /* PRD #1666 part 2 — sent back with a stop, so it reaches the daemon process that listed the agent. */
-  | "incarnation"
+  | "incarnation" | "paneId"
 > & {
   /**
    * HONEST, and optional exactly as `AgentSession.cwd` is. It was optional here
@@ -87,7 +88,7 @@ export type OverviewAgent = Pick<
 };
 
 export function toOverviewAgent(agent: AgentSession): OverviewAgent {
-  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation } = agent;
+  const { id, daemonId, displayName, cli, status, cwd, activeTool, activeToolDetail, toolCount, tab, lastUserPrompt, lastActivityMs, spawnedAtMs, writeLease, agentType, daemonStatus, authoringKind, pullRequest, incarnation, paneId } = agent;
   return {
     id,
     daemonId,
@@ -108,6 +109,7 @@ export function toOverviewAgent(agent: AgentSession): OverviewAgent {
     writeLease: writeLease === "unknown" ? undefined : writeLease,
     ...(pullRequest ? { pullRequest } : {}),
     ...(incarnation ? { incarnation } : {}),
+    ...(paneId ? { paneId } : {}),
   };
 }
 
@@ -816,6 +818,29 @@ export function stopTargetName(agent: OverviewAgent): string {
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
 }
 
+/** One-agent close flow shared by the dashboard row and full-window pane (issue #1402). The target is captured when the question opens, including its daemon process. */
+export function stopAgentConfirmation(agent: OverviewAgent, connection: ConnectionView, runAction: DeckRuntimeState["runAction"], onStopped?: () => void, previewWorktreeClose?: DeckRuntimeState["previewWorktreeClose"]): ConfirmState {
+  const name = stopTargetName(agent);
+  const roleWarning = agent.tab.kind === "orchestration"
+    ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
+    : "";
+  return {
+    title: `Close ${name}?`,
+    body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
+    label: "Close agent",
+    busyLabel: "Stopping…",
+    worktreePreview: worktreePreview({ previewWorktreeClose }, agent.daemonId, [agent]),
+    action: async () => {
+      try {
+        const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation });
+        if (result.ok) onStopped?.();
+      } catch {
+        // The runtime files the refusal under its global error; keep the agent's view.
+      }
+    },
+  };
+}
+
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
@@ -1306,8 +1331,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   /**
    * What a deck's Upgrade does, and what its button says. A remote deck's
    * covers its daemon, which runs that host's CLI. The local deck's covers the
-   * CLI on this machine and the local daemon, either of which can be behind
-   * (issue #1753), so its label and tooltip name what is.
+   * app when it can upgrade itself or waits for a relaunch, the CLI on this
+   * machine and the local daemon (issues #1753, #1959 and #1962), so its label
+   * and tooltip name what is behind.
    */
   const deckUpgrade = (connection: ConnectionView): { onUpgrade?: () => void; upgradeLabel?: string; upgradeTitle?: string } => {
     const daemon: UpgradeTarget | undefined = runtime.upgradeDaemon && upgradeOffered(connection) && connection.deckId !== undefined
@@ -1315,12 +1341,20 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       : undefined;
     const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
     if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
-    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
-    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const check = selfUpgrade?.check;
+    if (!check || !selfUpgrade.api || (!cliPlan && !(daemon && appFirst(check)))) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const copies = { check, api: selfUpgrade.api };
+    const withApp = appFirst(check);
+    const targets = [withApp ? "Agent Deck" : undefined, cliPlan ? "the CLI" : undefined, daemon ? "the daemon" : undefined].filter((target): target is string => Boolean(target));
+    const targetLabel = targets.length === 3 ? `${targets[0]}, ${targets[1]} and ${targets[2]}` : targets.join(" and ");
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
-      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
-      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies }),
+      upgradeLabel: `Upgrade ${targetLabel} on this machine`,
+      upgradeTitle: [
+        withApp ? displayText(check.notice ?? check.app.headline, DISPLAY_LIMITS.message) : undefined,
+        cliPlan ? displayText(cliPlan.headline, DISPLAY_LIMITS.message) : undefined,
+        daemon ? daemonTitle : undefined,
+      ].filter(Boolean).join(" "),
     };
   };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
@@ -1406,14 +1440,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        const name = stopTargetName(agent);
-        setConfirm({
-          title: `Close ${name}?`,
-          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
-          label: "Close agent",
-          busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
-        });
+        setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, runtime.previewWorktreeClose));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -1427,6 +1454,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
           label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
           busyLabel: "Stopping…",
+          worktreePreview: worktreePreview(runtime, deckId, group.agents),
           action: () => run({ type: "stop_orchestration", deckId, roles }),
         });
       },

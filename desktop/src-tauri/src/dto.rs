@@ -1049,6 +1049,13 @@ pub struct DesktopPendingQuestion {
     /// it as queued. Its outcome is a settlement, never this clearing.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub answer_queued: bool,
+    /// Issue #2075: when the agent raised the question, in milliseconds since
+    /// the Unix epoch, as its producer stamped it. The tile's `QUESTION <age>`
+    /// badge and the one notification after N minutes count from it. Absent
+    /// when the daemon reported no time (`0`), so the webview shows no age
+    /// rather than one counted from 1970.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raised_at_ms: Option<i64>,
 }
 
 /// The tool a [`DesktopPendingQuestion`] asks about.
@@ -1198,6 +1205,7 @@ pub(crate) fn map_pending_question(
         answerable,
         revision: question.revision,
         answer_queued: question.answer_queued,
+        raised_at_ms: (question.raised_at_ms > 0).then_some(question.raised_at_ms),
     }
 }
 

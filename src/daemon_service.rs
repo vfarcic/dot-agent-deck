@@ -49,8 +49,8 @@ pub const IDLE_SHUTDOWN_ENV: (&str, &str) = ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS"
 /// the same endpoints, files and state as one started from that shell: the
 /// path overrides a daemon reads (`docs/configuration.md`, "Paths and
 /// endpoints", less the client-only ones) and the XDG directories they
-/// default under. Credentials are deliberately not here: the deck never
-/// writes them into a file.
+/// default under. Credentials are deliberately not here: `daemon install`
+/// does not copy them into the service file.
 pub const CARRIED_ENV: &[&str] = &[
     "DOT_AGENT_DECK_SOCKET",
     "DOT_AGENT_DECK_ATTACH_SOCKET",
@@ -64,6 +64,14 @@ pub const CARRIED_ENV: &[&str] = &[
     "DOT_AGENT_DECK_BIN",
     "XDG_CONFIG_HOME",
     "XDG_STATE_HOME",
+];
+
+/// Non-path overrides saved from the installing shell. Keep these separate
+/// from [`CARRIED_ENV`], whose values must be absolute paths; their consumers
+/// interpret the scalar values when the daemon uses them.
+pub const CARRIED_SCALAR_ENV: &[&str] = &[
+    crate::doorbell_switch::CLAUDE_ENV,
+    crate::doorbell_switch::CODEX_ENV,
 ];
 
 /// The service manager `daemon install` targets.
@@ -126,9 +134,11 @@ pub struct ServiceSpec {
 /// The environment written into the service: [`IDLE_SHUTDOWN_ENV`], then each
 /// carried variable `lookup` finds set and non-empty, in a fixed order.
 ///
-/// A carried value must be an absolute path: a relative one would resolve
-/// against the service's working directory, not the shell's, and so name a
-/// different socket.
+/// [`CARRIED_ENV`] and manager-specific path values must be absolute: a
+/// relative one would resolve against the service's working directory, not
+/// the shell's, and so name a different socket. [`CARRIED_SCALAR_ENV`] values
+/// are carried as written, without path validation. The renderers reject
+/// control characters and escape values for their service format.
 pub fn carried_env(
     manager: ServiceManager,
     lookup: impl Fn(&str) -> Option<String>,
@@ -148,6 +158,11 @@ pub fn carried_env(
             ));
         }
         env.push((name.to_string(), value));
+    }
+    for name in CARRIED_SCALAR_ENV {
+        if let Some(value) = lookup(name).filter(|v| !v.is_empty()) {
+            env.push((name.to_string(), value));
+        }
     }
     Ok(env)
 }
@@ -777,11 +792,32 @@ mod tests {
         }
     }
 
+    fn spec_with_doorbell_overrides(manager: ServiceManager) -> ServiceSpec {
+        ServiceSpec {
+            env: carried_env(manager, |name| match name {
+                "DOT_AGENT_DECK_DOORBELL_CLAUDE" => Some("0".into()),
+                "DOT_AGENT_DECK_DOORBELL_CODEX" => Some("off".into()),
+                _ => None,
+            })
+            .unwrap(),
+            ..spec()
+        }
+    }
+
     #[test]
     fn systemd_unit_runs_serve_restarts_on_failure_and_starts_with_the_user_manager() {
-        let unit = render_systemd_unit(&spec()).unwrap();
+        let unit =
+            render_systemd_unit(&spec_with_doorbell_overrides(ServiceManager::Systemd)).unwrap();
         assert!(unit.contains("ExecStart=\"/home/u/.local/bin/dot-agent-deck\" daemon serve\n"));
         assert!(unit.contains("Environment=\"DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0\"\n"));
+        assert!(
+            unit.contains("Environment=\"DOT_AGENT_DECK_DOORBELL_CLAUDE=0\"\n"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("Environment=\"DOT_AGENT_DECK_DOORBELL_CODEX=off\"\n"),
+            "{unit}"
+        );
         assert!(unit.contains("Restart=on-failure\n"));
         assert!(!unit.contains("Restart=always"));
         assert!(unit.contains("WantedBy=default.target\n"));
@@ -814,6 +850,25 @@ mod tests {
         assert!(render_systemd_unit(&bad).is_err());
         assert!(render_launchd_plist(&bad, Path::new("/h")).is_err());
         assert!(render_launchd_plist(&spec(), Path::new("/h\n")).is_err());
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            for name in [
+                "DOT_AGENT_DECK_DOORBELL_CLAUDE",
+                "DOT_AGENT_DECK_DOORBELL_CODEX",
+            ] {
+                let bad = ServiceSpec {
+                    env: carried_env(manager, |key| {
+                        (key == name).then(|| "0\nRestart=always".into())
+                    })
+                    .unwrap(),
+                    ..spec()
+                };
+                assert!(render_systemd_unit(&bad).is_err(), "{manager:?}: {name}");
+                assert!(
+                    render_launchd_plist(&bad, Path::new("/h")).is_err(),
+                    "{manager:?}: {name}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -821,7 +876,7 @@ mod tests {
         let plist = render_launchd_plist(
             &ServiceSpec {
                 binary: "/Users/a&b/<bin>/dot-agent-deck".into(),
-                env: spec().env,
+                env: spec_with_doorbell_overrides(ServiceManager::Launchd).env,
             },
             Path::new("/Users/u"),
         )
@@ -835,6 +890,14 @@ mod tests {
         assert!(plist.contains("<key>RunAtLoad</key>\n  <true/>"));
         assert!(
             plist.contains("<key>DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS</key>\n    <string>0</string>")
+        );
+        assert!(
+            plist.contains("<key>DOT_AGENT_DECK_DOORBELL_CLAUDE</key>\n    <string>0</string>"),
+            "{plist}"
+        );
+        assert!(
+            plist.contains("<key>DOT_AGENT_DECK_DOORBELL_CODEX</key>\n    <string>off</string>"),
+            "{plist}"
         );
         assert!(plist.contains(&format!("<string>{LAUNCHD_LABEL}</string>")));
     }
@@ -896,6 +959,32 @@ mod tests {
         })
         .unwrap_err();
         assert!(err.contains("DOT_AGENT_DECK_STATE_DIR"), "{err}");
+    }
+
+    #[test]
+    fn carried_env_preserves_nonempty_doorbell_scalars_and_omits_empty_ones() {
+        for manager in [ServiceManager::Systemd, ServiceManager::Launchd] {
+            for name in [
+                "DOT_AGENT_DECK_DOORBELL_CLAUDE",
+                "DOT_AGENT_DECK_DOORBELL_CODEX",
+            ] {
+                for value in [
+                    "0", "false", "off", "1", "true", "on", " OFF ", "invalid", "",
+                ] {
+                    let env = carried_env(manager, |key| (key == name).then(|| value.to_string()))
+                        .unwrap();
+                    let expected = if value.is_empty() {
+                        spec().env
+                    } else {
+                        vec![
+                            (IDLE_SHUTDOWN_ENV.0.into(), IDLE_SHUTDOWN_ENV.1.into()),
+                            (name.into(), value.into()),
+                        ]
+                    };
+                    assert_eq!(env, expected, "{manager:?}: {name}={value:?}");
+                }
+            }
+        }
     }
 
     #[test]

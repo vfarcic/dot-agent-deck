@@ -14,9 +14,15 @@ The daemon owns an in-memory inbox. Restarting it loses inbox contents. Messages
 | `claimed` | An offer has a time-limited owner. Completion settles it; release, expiry or owner exit returns it to the pool. |
 | `undeliverable` | Delivery limit reached, recipient exited, inbox closed or message superseded. The reason determines whether a card notice is owed. |
 
-One budgeted hand-over carries at most 16 blocks (`inbox_prompt::MAX_IDS`), the most ids Claude's prompt hook reads from one prompt, so no block is in context unacknowledged (PR #1735 fifth review, N1). The default ack-wait is 60 seconds and `max_deliver` is 5. Retry preserves the id; consumers should act on an id once. Dedup remembers up to 4096 ids for ten minutes. The pending limits are 256 per recipient and 4096 daemon-wide, with a 1 MiB body limit; a bound refuses explicitly rather than evicting pending work. Terminal history retains at most 64 messages per pane, 1024 daemon-wide and 16 MiB of bodies, evicting the oldest terminal messages first. Terminal bodies expire after one hour while summaries remain within the count bounds; closing a pane drops its terminal history. Pending work is not trimmed to make history space. Stored subjects are one line of at most 200 characters.
+One budgeted hand-over carries at most 16 blocks (`inbox_prompt::MAX_IDS`), the most ids Claude's prompt hook reads from one prompt, so no block is in context unacknowledged (PR #1735 fifth review, N1). The receipt attempt model controls retries, not a fetched-message deadline in the store ([Receipt timing and retry bounds](#receipt-timing-and-retry-bounds)). Retry preserves the id; consumers should act on an id once. Dedup remembers up to 4096 ids for ten minutes. The pending limits are 256 per recipient and 4096 daemon-wide, with a 1 MiB body limit; a bound refuses explicitly rather than evicting pending work. Terminal history retains at most 64 messages per pane, 1024 daemon-wide and 16 MiB of bodies, evicting the oldest terminal messages first. Terminal bodies expire after one hour while summaries remain within the count bounds; closing a pane drops its terminal history. Pending work is not trimmed to make history space. Stored subjects are one line of at most 200 characters.
 
 Publish fans out copies with one id, with state per recipient. Subscription resolution excludes the sender and stays inside the sender's orchestration instance or dispatch tree. Offers go to one eligible subscriber at a time; acknowledging an offer claims it. The default claim is 30 minutes, with a 60-second minimum and 24-hour maximum. Release, expiry and owner exit exclude the former holder from subsequent assignment. Publish and offer share a per-agent budget of 60 per minute; deck-generated messages are exempt.
+
+### Receipt timing and retry bounds
+
+`InboxLimits::ack_wait` and `max_deliver` remain active: `InboxHub::new` passes them to `inbox_attempts::Limits`. The default ack-wait is 60 seconds. It supplies receipt timings including the resume-answer window, a once waiter's idle grace, a hook receiver's hold, a one-shot grant's lifetime, caps-file staging and revoke resends. It does not give `MessageState::Fetched` a deadline: `Inbox::tick` leaves fetched messages alone, and `Inbox::next_deadline` covers claims and unfetched offer assignments.
+
+When every attempt was positively not handed, `AttemptModel::finalize` counts a return to queued and makes the message undeliverable on reaching `max_deliver` (5 by default), or the total attempt bound. `inbox_engine::sync` mirrors that decision through `Inbox::requeue_receipt` or `Inbox::retire`; the store does not run an ack-wait retry loop. A lapse after a possible hand-over follows possession and receipt evidence instead, with separate `MAX_AUTO_REPEATS` (2) and `MAX_ATTEMPTS` (6) budgets, and can become `Uncertain` rather than undeliverable. The store also uses `max_deliver` to bound offer assignments in `Inbox::return_offer`.
 
 ### Delegated-task retirement
 
@@ -240,8 +246,8 @@ These are developer and test tunings, not ordinary setup requirements. Daemon-re
 
 | Variable | Default | Reader and meaning |
 |---|---|---|
-| `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` | `60000` | Daemon: the attempt model's ack-wait: a once waiter's idle grace, a hook receiver's hold and a one-shot grant's lifetime. No fetched message has a store deadline of its own. |
-| `DOT_AGENT_DECK_INBOX_MAX_DELIVER` | `5` | Daemon: maximum unacknowledged hand-overs. |
+| `DOT_AGENT_DECK_INBOX_ACK_WAIT_MS` | `60000` | Daemon: receipt attempt timing, including resume answers, once-waiter idle grace, hook holds, one-shot grants, caps-file staging and revoke resends. Not a store-level fetched-message deadline ([Receipt timing and retry bounds](#receipt-timing-and-retry-bounds)). |
+| `DOT_AGENT_DECK_INBOX_MAX_DELIVER` | `5` | Daemon: attempt-model returns after every attempt was positively not handed; also bounds store-level offer assignments. Separate attempt and automatic-repeat budgets apply ([Receipt timing and retry bounds](#receipt-timing-and-retry-bounds)). |
 | `DOT_AGENT_DECK_INBOX_MAX_PER_RECIPIENT` | `256` | Daemon: pending work per recipient. |
 | `DOT_AGENT_DECK_INBOX_MAX_MESSAGES` | `4096` | Daemon: live messages overall. |
 | `DOT_AGENT_DECK_INBOX_MAX_BODY_BYTES` | `1048576` | Daemon: body size limit. |

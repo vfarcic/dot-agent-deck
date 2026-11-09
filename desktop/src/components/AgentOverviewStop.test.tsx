@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID } from "../data/fixture";
 import type { AgentSession, DeckActionResult, DeckFleet, DeckRuntimeState } from "../types";
@@ -17,6 +17,7 @@ function role(deckId: string, id: string, roleName: string, roleIndex: number): 
     tab: { kind: "orchestration", orchestrationId: "orc-loop", name: "loop", displayTitle: "demo-project-orchestrator-1", roleName, roleIndex, isStartRole: roleIndex === 0, cwd: "/home/build/demo-project" },
     inOrchestration: true,
     incarnation: "listed-process-a",
+    paneId: `pane-${id}`,
   };
 }
 
@@ -55,6 +56,34 @@ const row = (deckId: string, agentId: string) => screen.getByTestId(`overview-ag
 const confirmation = () => screen.queryByRole("alertdialog");
 
 describe("stopping from the overview (PRD #1223 U4)", () => {
+  /** Scenario: close a remote dispatched agent or its whole team. The confirmation names the worktree the daemon predicts will be kept; an ordinary close has no warning, and an inconclusive probe does not claim confirmed uncommitted changes. */
+  it.each(["agent", "orchestration"] as const)("previews the kept worktree before closing a remote %s", async (kind) => {
+    const path = "/home/build/project-dispatch-1674";
+    const preview = vi.fn<NonNullable<DeckRuntimeState["previewWorktreeClose"]>>(async () => ({ path, confirmed_dirty: true }));
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const rt = { ...runtime(runAction), previewWorktreeClose: preview };
+    render(<AgentOverview runtime={rt} onNavigate={vi.fn()} />);
+    const open = () => fireEvent.click(kind === "agent"
+      ? within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")
+      : screen.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" }));
+    open();
+    await waitFor(() => expect(confirmation()).toHaveTextContent(path));
+    expect(confirmation()).toHaveTextContent("Uncommitted work here is KEPT, not deleted:");
+    expect(preview).toHaveBeenCalledWith(FIXTURE_REMOTE_DAEMON_ID, kind === "agent" ? ["pane-41"] : ["pane-41", "pane-42"], "listed-process-a");
+    expect(runAction).not.toHaveBeenCalled();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+
+    preview.mockResolvedValueOnce({ path, confirmed_dirty: false });
+    open();
+    await waitFor(() => expect(confirmation()).toHaveTextContent("Uncommitted work here, if any, is KEPT:"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+
+    preview.mockResolvedValueOnce(null);
+    open();
+    await waitFor(() => expect(within(confirmation()!).getByRole("button", { name: kind === "agent" ? "Close agent" : "Close all 2 roles" })).toBeEnabled());
+    expect(confirmation()).not.toHaveTextContent("KEPT");
+  });
+
   /**
    * Scenario: on the fleet, press the stop control on the planner role's row —
    * an agent on the REMOTE deck. A confirmation names the agent and that daemon;
@@ -71,6 +100,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     fireEvent.click(stop);
     expect(confirmation()).toHaveTextContent("Close planner?");
     expect(confirmation()).toHaveTextContent("dev@build-box");
+    expect(confirmation()).toHaveTextContent("This closes only this role, leaving the orchestration one role short. Other roles keep running.");
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();

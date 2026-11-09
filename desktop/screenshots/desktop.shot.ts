@@ -119,6 +119,7 @@ desktopScenario("agent-pane", async (page) => {
   await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
   await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   await expect(page.locator(".xterm-screen canvas").first()).toBeVisible();
+  await expect(page.getByTestId("agent-pane-overlay").getByRole("button", { name: "Close agent", exact: true })).toBeVisible();
 });
 
 desktopScenario("agent-messaging", async (page) => {
