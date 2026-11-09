@@ -850,6 +850,8 @@ pub enum AgentPtyError {
     Resize(String),
     #[error("Agent {0} not found")]
     NotFound(String),
+    #[error("Agent termination could not be confirmed: {0}")]
+    TerminationUnconfirmed(String),
     /// Caller-supplied spawn metadata failed validation. Surfaced to the
     /// attach client via `AttachResponse::err` so a malformed spawn fails
     /// loudly instead of silently dropping the bad field (PRD #76 M2.12
@@ -1025,7 +1027,7 @@ pub struct AgentPty {
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
 /// fallback used by the single-pane Ctrl+W path
-/// ([`crate::platform::proc::terminate_child_with_grace_and_wait`]) and as the
+/// ([`crate::platform::proc::terminate_child_with_grace_and_reap`]) and as the
 /// poll budget in the daemon-wide [`AgentPtyRegistry::shutdown_all_graceful`].
 /// 3 s matches the F1 graceful-shutdown grace, which is the natural
 /// sibling. Hardcoded as a constant for now (one symbol to find) rather
@@ -1115,6 +1117,8 @@ const FORCE_REAP_DEADLINE_DIVISOR: u64 = 2;
 /// How long [`AgentPtyRegistry::force_kill_and_reap_all`]'s reap pass polls a
 /// SIGKILLed child before giving up on it (issue #1118). Twenty ticks of
 /// [`FORCE_REAP_POLL_INTERVAL`] as the three inputs stand today.
+/// Single-agent close uses the same force-reap budget, retaining an unconfirmed
+/// child's record and reporting failure instead of abandoning its handle.
 ///
 /// **Derived from the budget the daemon's stop clients allow it, not picked
 /// round.** Each of those clients (see [`DAEMON_STOP_POLL_BUDGET`]) asks the
@@ -15343,17 +15347,18 @@ impl AgentPtyRegistry {
             })
     }
 
-    /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
-    /// streaming subscribers will observe their broadcast receiver close
-    /// shortly after (once the reader thread sees EOF and drops its bus
-    /// reference).
+    /// Try to stop and reap an agent, retiring its input handles. A confirmed
+    /// stop drops its record; streaming subscribers observe their receiver close
+    /// once the reader thread sees EOF and drops its bus reference.
     ///
     /// PRD #92 F8: the kill path now uses
-    /// [`terminate_child_with_grace_and_wait`] — SIGTERM with a
+    /// [`crate::platform::proc::terminate_child_with_grace_and_reap`] — SIGTERM with a
     /// 3-second grace before SIGKILL — so a well-behaved agent can
     /// trap SIGTERM and clean up its own descendants (e.g. the
     /// `setsid`'d sub-shells Claude Code creates internally).
-    /// Misbehaving agents are still reaped after the grace window.
+    /// After escalation the reap polls for `FORCE_REAP_DEADLINE`. If exit is
+    /// still unconfirmed, the retired record is retained for a later close or
+    /// shutdown to reap, and the caller receives an error rather than success.
     ///
     /// PRD #92 F9 followup-3: this path used to prune the
     /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
@@ -15438,11 +15443,26 @@ impl AgentPtyRegistry {
                 let _ = release.recv();
             }
         }
-        crate::platform::proc::terminate_child_with_grace_and_wait(
+        let result = crate::platform::proc::terminate_child_with_grace_and_reap(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
             &agent.process_group,
+            FORCE_REAP_DEADLINE,
         );
+        if let Err(error) = result {
+            let detail = format!(
+                "agent={id} pid={:?}: {error}; it may still be running; retry closing it",
+                agent.child.process_id()
+            );
+            tracing::warn!(agent_id = %id, error = %detail, "agent stop gave up waiting for exit");
+            // Keep the child handle and record for retry, without triggering
+            // this close's worktree cleanup. This task has finished: no detached
+            // reaper can later perform pane-scoped cleanup after the caller
+            // releases its hold.
+            self.inner.lock().agents.insert(id.to_string(), agent);
+            self.change_notify.notify_one();
+            return Err(AgentPtyError::TerminationUnconfirmed(detail));
+        }
         agent.removal.record_reaped(&mut agent.child);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
@@ -18555,6 +18575,14 @@ impl AgentPtyRegistry {
         self.insert_test_agent_for_pane(child, None)
     }
 
+    /// Publish synthetic PTY EOF independently of the child's eventual exit.
+    #[cfg(test)]
+    pub(crate) fn note_test_agent_eof(&self, id: &str) {
+        self.inner.lock().agents[id]
+            .exited
+            .store(true, Ordering::SeqCst);
+    }
+
     /// PRD #1589 test seam: register an inert member of orchestration
     /// `instance` holding `pane_id` — a record with no process and no PTY
     /// behind it ([`IdleTestChild`], [`IdleTestMaster`]), so a test can give an
@@ -18566,11 +18594,19 @@ impl AgentPtyRegistry {
         instance: &str,
         is_start_role: bool,
     ) -> String {
-        let id = self.insert_test_agent_with_master(
-            Box::new(IdleTestChild),
-            Some(pane_id),
-            Box::new(IdleTestMaster),
-        );
+        self.insert_member_for_test(Box::new(IdleTestChild), pane_id, instance, is_start_role)
+    }
+
+    /// An inert orchestration member with a caller-controlled reap response.
+    #[cfg(test)]
+    pub(crate) fn insert_member_for_test(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        pane_id: &str,
+        instance: &str,
+        is_start_role: bool,
+    ) -> String {
+        let id = self.insert_test_agent_with_master(child, Some(pane_id), Box::new(IdleTestMaster));
         if let Some(agent) = self.inner.lock().agents.get_mut(&id) {
             agent.tab_membership = Some(TabMembership::Orchestration {
                 name: "team".to_string(),

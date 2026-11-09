@@ -158,6 +158,7 @@ A unit closed with `close` disappears from both clients, and a unit closed in a 
 | `no daemon is running …; nothing was closed` | No daemon is running for this user. `close` never starts one. | Nothing is running, so there is nothing to close. |
 | `close: …` naming `DOT_AGENT_DECK_PANE_ID`, `DOT_AGENT_DECK_AGENT_ID` or `DOT_AGENT_DECK_PANE_CAPABILITY` | Some of the variables the deck sets in its panes are present and some are missing or empty, so `close` cannot tell whether a person or an agent is asking. It refuses rather than guess. | Run it from a terminal outside the deck, where none of them is set, or from the agent's own pane with the environment the deck gave it. |
 | `PARTIALLY: still running: …` | Some agents of the unit stopped and some did not. | Close the survivors with `--pane`, or from a client. |
+| `termination could not be confirmed` | The deck could not confirm that the agent exited. It may still be running. The TUI and desktop app report the stop as failed; `close` reports a failure or partial close and names the survivors. | Check the agent's machine for stuck I/O, then try closing it again. The unit's worktree is kept while its stop remains unconfirmed. Other units can still be closed. |
 | An agent's `close --all` lists nothing | That agent dispatched no units that are still running. | Close from a shell instead. |
 
 ## What the agent rules protect against

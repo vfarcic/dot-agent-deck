@@ -2042,6 +2042,153 @@ mod tests {
         })
     }
 
+    /// Scenario: a child cannot finish exiting after termination. StopAgent and
+    /// close must answer with a failure, retain the survivor for retry, and
+    /// release their pane and admission holds before the child becomes reapable.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stop_and_close_give_up_on_an_unreapable_child() {
+        use crate::platform::proc::test_child::{ExitGate, ReleaseOnDrop, UnreapableChild};
+
+        for route in ["stop", "generation", "instance"] {
+            let deck = Deck::new().await;
+            let gate = Arc::new(ExitGate::default());
+            let _release = ReleaseOnDrop(gate.clone());
+            let child = Box::new(UnreapableChild(gate.clone()));
+            let agent = if route == "instance" {
+                deck.registry
+                    .insert_member_for_test(child, "wedged-pane", "wedged-instance", true)
+            } else {
+                deck.registry
+                    .insert_test_agent_for_pane(child, Some("wedged-pane"))
+            };
+            let unit = if route == "instance" {
+                deck.orch_unit(
+                    "wedged-unit",
+                    ("disp", "nobody"),
+                    "wedged-instance",
+                    "wedged-pane",
+                    &agent,
+                )
+            } else {
+                deck.single_unit("wedged-unit", ("disp", "nobody"), "wedged-pane", &agent)
+            };
+            let healthy = (route == "instance").then(|| {
+                deck.registry
+                    .insert_idle_member_for_test("healthy-pane", "wedged-instance", false)
+            });
+            deck.report_done("wedged-pane", &agent);
+            let started = std::time::Instant::now();
+            let outcome = tokio::time::timeout(Duration::from_secs(6), async {
+                if route == "stop" {
+                    let error = deck
+                        .client
+                        .stop_agent(&agent)
+                        .await
+                        .expect_err("not reaped");
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("termination could not be confirmed"),
+                        "{error}"
+                    );
+                } else {
+                    let report = deck.close(by_name("wedged-unit"), None, false, false).await;
+                    let target = &report.targets[0];
+                    assert_eq!(
+                        target.outcome,
+                        if healthy.is_some() {
+                            CloseOutcome::PartiallyClosed
+                        } else {
+                            CloseOutcome::Failed
+                        },
+                        "{target:?}"
+                    );
+                    assert_eq!(target.survivors, ["wedged-pane"]);
+                    assert_eq!(target.panes[0].stopped, Some(false));
+                    assert!(
+                        target
+                            .error
+                            .as_deref()
+                            .unwrap()
+                            .contains("termination could not be confirmed")
+                    );
+                }
+            })
+            .await;
+            assert!(
+                outcome.is_ok(),
+                "{route} waited for the child's blocking wait instead of answering within a deadline"
+            );
+            assert!(
+                started.elapsed()
+                    >= crate::agent_pty::AGENT_TERMINATE_GRACE
+                        + crate::agent_pty::FORCE_REAP_DEADLINE
+            );
+            assert!(!gate.waited.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(
+                deck.registry.agent_record_any(&agent).is_some(),
+                "retain the unconfirmed child for retry"
+            );
+            assert!(deck.registry.dispatched_units().get(&unit).is_some());
+            wait_until("the stop releases its pane cleanup hold", || {
+                !deck.registry.pane_close_in_flight("wedged-pane")
+            })
+            .await;
+            assert!(!deck.registry.is_generation_closing(&agent));
+            assert!(!deck.registry.is_instance_closing("wedged-instance"));
+            if let Some(healthy) = healthy {
+                assert!(
+                    deck.registry.agent_record_any(&healthy).is_none(),
+                    "a wedged first member must not prevent its sibling from stopping"
+                );
+                // Exercise admission, not just the guard's inspection helper.
+                let admitted = deck
+                    .start(
+                        "new-role",
+                        "sleep 30",
+                        Some(("wedged-instance", "worker", false)),
+                    )
+                    .await;
+                assert!(deck.live(&admitted));
+            }
+
+            // PTY EOF may precede process exit. Admit a successor before the
+            // old child can be reaped, then let that old generation finish.
+            deck.registry.note_test_agent_eof(&agent);
+            let successor_instance = if route == "instance" {
+                "wedged-instance"
+            } else {
+                "successor-instance"
+            };
+            let successor = deck
+                .start(
+                    "wedged-pane",
+                    "sleep 30",
+                    Some((successor_instance, "orchestrator", true)),
+                )
+                .await;
+            gate.release();
+            deck.client
+                .stop_agent(&agent)
+                .await
+                .expect("retry after exit");
+            assert!(deck.live(&successor));
+            assert_eq!(
+                deck.registry.pane_current_agent_id("wedged-pane"),
+                Some(successor)
+            );
+            assert!(
+                deck.state
+                    .read()
+                    .await
+                    .pane_role_map
+                    .contains_key("wedged-pane"),
+                "the old reap must not unregister its successor's role"
+            );
+            deck.shutdown().await;
+        }
+    }
+
     async fn wait_exited(registry: &AgentPtyRegistry, agent: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while registry.agent_is_live(agent) {

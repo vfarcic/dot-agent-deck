@@ -11,7 +11,7 @@ use std::process::{Command, Output};
 use std::time::Duration;
 
 use common::TuiDeck;
-use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
+use dot_agent_deck::agent_pty::{AGENT_TERMINATE_GRACE, AgentRecord, TabMembership};
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use dot_agent_deck::event::AgentType;
 use spec::spec;
@@ -36,11 +36,15 @@ impl Drop for CloseDeck {
 
 impl CloseDeck {
     fn new() -> Self {
+        Self::with_term_resistant_probe(false)
+    }
+
+    fn with_term_resistant_probe(resist_term: bool) -> Self {
         let scratch = common::race_safe_tempdir();
         let probe = scratch.path().join("close-probe.py");
         std::fs::write(
             &probe,
-            r#"import json, os, pathlib, subprocess, sys
+            r#"import json, os, pathlib, signal, subprocess, sys
 identity = {key: os.environ[key] for key in (
     "DOT_AGENT_DECK_PANE_ID", "DOT_AGENT_DECK_AGENT_ID", "DOT_AGENT_DECK_PANE_CAPABILITY")}
 path = pathlib.Path(sys.argv[1]) / (identity["DOT_AGENT_DECK_PANE_ID"] + ".json")
@@ -51,17 +55,28 @@ temporary.replace(path)
 subprocess.run([sys.argv[2], "hook", "--agent", "claude-code"],
     input=json.dumps({"hook_event_name": "SessionStart", "session_id": "close-probe-" + identity["DOT_AGENT_DECK_PANE_ID"]}),
     text=True, check=True, stdout=subprocess.DEVNULL)
+if len(sys.argv) > 3:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+path.with_suffix(".ready").write_text("ready")
 print("CLOSE-PROBE-READY", flush=True)
+if len(sys.argv) > 3:
+    for line in sys.stdin:
+        print(line, end="", flush=True)
+    sys.exit(0)
 os.execvp("cat", ["cat"])
 "#,
         )
         .expect("write identity-recording stand-in");
         let quote = |p: &Path| format!("'{}'", p.display().to_string().replace('\'', "'\\''"));
+        // Keep the resistant probe as the direct PTY child: an outer shell
+        // could exit on SIGTERM and hide the force-kill path being tested.
         let command = format!(
-            "python3 -u {} {} {}",
+            "{}python3 -u {} {} {}{}",
+            if resist_term { "exec " } else { "" },
             quote(&probe),
             quote(scratch.path()),
-            quote(Path::new(env!("CARGO_BIN_EXE_dot-agent-deck")))
+            quote(Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))),
+            if resist_term { " resist-term" } else { "" },
         );
         let encoded = toml::Value::String(command.clone()).to_string();
         let config = scratch.path().join("config.toml");
@@ -118,6 +133,7 @@ os.execvp("cat", ["cat"])
 
     fn probe_ready(&self, record: &AgentRecord) -> bool {
         self.identity_path(record).is_file()
+            && self.identity_path(record).with_extension("ready").is_file()
             && record
                 .live
                 .as_ref()
@@ -538,15 +554,21 @@ fn close_verb_006_dirty_worktree_is_kept_and_explained() {
 }
 
 /// Scenario: Stop a completed team's orchestrator through the existing stop
-/// path, then close the dispatch by name. Its remaining worker still resolves
-/// and closes, and the caller stays alive.
+/// path, then close the dispatch by name, with both roles ignoring SIGTERM.
+/// Each stop must answer within a bound, the team's tab disappears, and the caller stays alive.
 #[spec("dispatch/close-verb/007")]
 #[test]
 fn close_verb_007_team_still_resolves_after_orchestrator_stops() {
-    let mut test = CloseDeck::new();
+    let mut test = CloseDeck::with_term_resistant_probe(true);
     let caller = test.open_caller("caller");
     let members = test.dispatch(&caller, "surviving-team", true);
     test.report_done(&members[0]);
+    let label = match &members[0].tab_membership {
+        Some(TabMembership::Orchestration { name, .. }) => name.clone(),
+        _ => panic!("dispatched team has no tab membership"),
+    };
+    test.deck.wait_for_string(&label);
+    let started = std::time::Instant::now();
     let stopped = common::attach_request_on(
         test.deck.attach_socket_path(),
         &AttachRequest::StopAgent {
@@ -555,16 +577,47 @@ fn close_verb_007_team_still_resolves_after_orchestrator_stops() {
     )
     .expect("existing StopAgent reply");
     assert!(stopped.ok, "StopAgent setup refused: {:?}", stopped.error);
+    assert!(
+        started.elapsed() >= AGENT_TERMINATE_GRACE,
+        "the SIGTERM-resistant direct child must spend the grace window before escalation; took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "StopAgent took {:?}",
+        started.elapsed()
+    );
     test.assert_gone(&members[..1]);
     test.assert_present(&members[1..]);
+    let started = std::time::Instant::now();
     let output = test.close(Some(&caller), &["surviving-team"]);
     assert_exit("close surviving workers by unit name", &output, 0);
+    assert!(
+        started.elapsed() >= AGENT_TERMINATE_GRACE,
+        "close must also reach the force-kill backstop; took {:?}",
+        started.elapsed()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(6),
+        "close took {:?}",
+        started.elapsed()
+    );
     assert!(
         output_text(&output).contains("closed"),
         "{}",
         output_text(&output)
     );
     test.assert_gone(&members);
+    assert!(
+        common::wait_until(WAIT, || !test
+            .deck
+            .snapshot_grid()
+            .lines()
+            .take(5)
+            .any(|line| line.contains(&label))),
+        "closed team's tab remains visible\n{}",
+        test.deck.snapshot_grid()
+    );
     test.assert_present(&[caller]);
 }
 

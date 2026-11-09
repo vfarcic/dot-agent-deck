@@ -86,9 +86,8 @@ fn signal_child_pgroup_or_fallback(
         // fallback below uses `portable_pty::Child::kill`, which sends SIGHUP
         // — strictly weaker than the requested `signal` (typically SIGTERM or
         // SIGKILL) and limited to the direct child (no process-group
-        // semantics, so descendants leak). The caller's subsequent
-        // `child.wait()` is unbounded — that's acceptable for the same "this
-        // branch is practically unreachable" reason.
+        // semantics, so descendants can leak). Close polls for the direct
+        // child's exit with a deadline, regardless of this fallback.
         //
         // Auditor #5: emit a warn-level event so a descendant leak surfaced
         // via this fallback is at least observable.
@@ -120,10 +119,11 @@ fn signal_child_pgroup_or_fallback(
 /// Forcefully terminate the child *and every descendant in its process group*
 /// with SIGKILL and reap it. SIGKILL is preferred over
 /// `portable_pty::Child::kill()` (which sends SIGHUP) because a shell can
-/// ignore SIGHUP — leaving the subsequent `wait()` to block forever. SIGKILL
-/// cannot be caught or ignored, so the kernel tears the process down and
-/// `wait()` returns promptly. Callers should drop the master/writer/reader
-/// handles before invoking this so any I/O blocked on the PTY unblocks first.
+/// ignore SIGHUP — leaving the subsequent `wait()` to block forever. Even
+/// SIGKILL can leave `wait()` blocked on uninterruptible I/O; deadline-aware
+/// callers use [`terminate_child_with_grace_and_reap`] instead. Drop the
+/// master/writer/reader handles before invoking this so any I/O blocked on the
+/// PTY unblocks first.
 ///
 /// `_group` is the cross-platform teardown handle (PRD #163 M3) and is unused on
 /// Unix — see [`AgentProcessGroup`]; the process group `killpg` addresses is
@@ -133,8 +133,8 @@ pub fn force_kill_child_and_wait(
     group: &AgentProcessGroup,
 ) {
     // Deliberately discarded: the blocking `wait()` immediately below is this
-    // caller's own answer to "did it land?", which a single-agent caller can
-    // afford and `force_kill_and_reap_all` cannot.
+    // caller's own answer to "did it land?". The deadline-aware close path and
+    // `force_kill_and_reap_all` poll instead.
     let _ = force_kill_child_group(child, group);
     let _ = child.wait();
 }
@@ -176,15 +176,16 @@ pub fn force_kill_child_group(
 
 /// SIGTERM-then-SIGKILL escalation used by the single-pane Ctrl+W path. Sends
 /// `SIGTERM` to the child's process group, polls `try_wait` until the child
-/// exits or `grace` elapses, then sends `SIGKILL` as the backstop and reaps the
-/// child.
+/// exits or `grace` elapses, then sends `SIGKILL` as the backstop and polls for
+/// its exit for at most `reap_timeout`. An error leaves termination unconfirmed.
 ///
 /// `_group` is unused on Unix (see [`force_kill_child_and_wait`]).
-pub fn terminate_child_with_grace_and_wait(
+pub fn terminate_child_with_grace_and_reap(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
     _group: &AgentProcessGroup,
-) {
+    reap_timeout: Duration,
+) -> std::io::Result<()> {
     // Phase 1: SIGTERM the process group.
     signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
 
@@ -196,7 +197,7 @@ pub fn terminate_child_with_grace_and_wait(
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return Ok(()),
             Ok(None) => {}
             Err(_) => break,
         }
@@ -205,8 +206,14 @@ pub fn terminate_child_with_grace_and_wait(
 
     // Phase 3: SIGKILL backstop. Reaches survivors regardless of
     // SIGTERM-trapping state.
-    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
-    let _ = child.wait();
+    let kill_reported_ok =
+        signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
+    super::reap_child_with_deadline(child, reap_timeout).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("{error} (kill_reported_ok={kill_reported_ok})"),
+        )
+    })
 }
 
 /// SIGTERM the child's process group without waiting (the daemon-wide

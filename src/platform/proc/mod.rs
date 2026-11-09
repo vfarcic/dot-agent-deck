@@ -44,6 +44,49 @@ mod unix;
 #[cfg(windows)]
 mod windows;
 
+/// Collect the direct child's exit without entering its blocking `wait`.
+/// The caller keeps ownership until this returns, including on timeout/error.
+fn reap_child_with_deadline(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    timeout: std::time::Duration,
+) -> std::io::Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return Ok(()),
+            Ok(None) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error),
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "child did not report an exit within {} ms after force-kill",
+                    timeout.as_millis()
+                ),
+            ));
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+    }
+}
+
+/// Legacy respawn teardown: preserve its blocking-reap contract. Stops use
+/// [`terminate_child_with_grace_and_reap`] so an unconfirmed exit is returned
+/// to their caller instead. Respawn has already dismantled its old record and
+/// needs a separate survivor-ownership change before it can give up that reap.
+pub fn terminate_child_with_grace_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    grace: std::time::Duration,
+    group: &AgentProcessGroup,
+) {
+    if terminate_child_with_grace_and_reap(child, grace, group, std::time::Duration::ZERO).is_err()
+    {
+        let _ = child.wait();
+    }
+}
+
 pub use scan::{
     CLAUDE_BASH_TOOL_SHAPE, CommandLine, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape,
     command_line_targets, descendant_shell_activity, descendants, detached_descendants,
@@ -154,14 +197,14 @@ pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
     force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
     process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    terminate_child_with_grace_and_reap, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
     force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
     process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    terminate_child_with_grace_and_reap, terminate_pid,
 };
 
 /// PRD #1666 part 3, round 5-wake (plan §1.3): the session process `pid`
@@ -273,6 +316,66 @@ pub fn ancestry_with(pid: u32, root: u32, parent_of: impl Fn(u32) -> Option<u32>
 /// handle.
 #[cfg(test)]
 pub(crate) mod test_child {
+    /// A child whose exit cannot be observed until the test releases it.
+    #[derive(Debug, Default)]
+    pub(crate) struct ExitGate {
+        released: std::sync::Mutex<bool>,
+        ready: std::sync::Condvar,
+        pub(crate) waited: std::sync::atomic::AtomicBool,
+    }
+
+    impl ExitGate {
+        pub(crate) fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.ready.notify_all();
+        }
+    }
+
+    /// Releases even on assertion failure, so a regressed blocking wait can unwind.
+    pub(crate) struct ReleaseOnDrop(pub(crate) std::sync::Arc<ExitGate>);
+
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+
+    #[derive(Debug)]
+    pub(crate) struct UnreapableChild(pub(crate) std::sync::Arc<ExitGate>);
+
+    impl portable_pty::ChildKiller for UnreapableChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(NoopKiller)
+        }
+    }
+
+    impl portable_pty::Child for UnreapableChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok((*self.0.released.lock().unwrap())
+                .then(|| portable_pty::ExitStatus::with_exit_code(0)))
+        }
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            self.0
+                .waited
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let mut released = self.0.released.lock().unwrap();
+            while !*released {
+                released = self.0.ready.wait(released).unwrap();
+            }
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
     /// Wraps a real OS child. `Debug` is required by the `portable_pty` traits.
     #[derive(Debug)]
     pub(crate) struct StdChild(pub(crate) std::process::Child);
@@ -324,6 +427,27 @@ pub(crate) mod test_child {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A child that becomes reapable inside the force-reap window succeeds
+    /// without ever using its blocking wait; an immediate deadline still polls.
+    #[test]
+    fn bounded_reap_collects_a_late_exit_and_an_already_exited_child() {
+        let gate = std::sync::Arc::new(test_child::ExitGate::default());
+        let _release = test_child::ReleaseOnDrop(gate.clone());
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(test_child::UnreapableChild(gate.clone()));
+        let releasing = gate.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            releasing.release();
+        });
+        let result = reap_child_with_deadline(&mut child, std::time::Duration::from_secs(2));
+        release.join().unwrap();
+        result.expect("reap a child that finishes exiting before the deadline");
+        reap_child_with_deadline(&mut child, std::time::Duration::ZERO)
+            .expect("even a zero budget polls once");
+        assert!(!gate.waited.load(std::sync::atomic::Ordering::SeqCst));
+    }
 
     /// R2-fix4 (U2): a walk that runs out of steps is told apart from one
     /// that ends outside the root's tree, and from one that cannot read a
@@ -417,7 +541,7 @@ mod tests {
 
         let grace = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
-        terminate_child_with_grace_and_wait(&mut child, grace, &group);
+        terminate_child_with_grace_and_reap(&mut child, grace, &group, grace).unwrap();
         assert!(
             started.elapsed() < grace,
             "an already-exited child must not cost the full grace window (took {:?})",

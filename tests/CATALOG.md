@@ -5781,8 +5781,9 @@ without depending on the config struct API.
 
 ##### dispatch/close-verb/007 — A dispatched team remains closeable by name after its orchestrator closes first.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
-- **Agent:** none — identity-recording `cat` roles.
-- **Asserts:** existing `StopAgent` removes the completed team's orchestrator while its worker stays registered; close by dispatch name exits 0 and removes that worker while retaining the dispatcher.
+- **Agent:** none — identity-recording Python roles that ignore SIGTERM.
+- **Asserts:** existing `StopAgent` removes the completed team's orchestrator while its worker stays registered; close by dispatch name exits 0, removes that worker and its TUI tab, and retains the dispatcher. Both requests spend the termination grace before escalation and answer within six seconds despite the ignored SIGTERM. The socket-level unit regression `close_agents::tests::stop_and_close_give_up_on_an_unreapable_child` covers a child whose nonblocking reap cannot confirm exit: StopAgent and generation/instance closes report failure or survivors, stop a healthy sibling, release holds, admit a new role, allow retry and preserve a successor admitted before the old child becomes reapable.
+- **Does not assert:** a real process stuck in uninterruptible I/O; the releasable unit-test child supplies that otherwise nondeterministic condition.
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/close-verb/008 — An interactive Haiku dispatcher closes the completed single unit it dispatched, through the real close CLI. [reel]
