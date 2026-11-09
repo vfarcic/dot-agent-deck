@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   CircleDot,
+  CircleStop,
   FileCode2,
   GitCompareArrows,
   Handshake,
@@ -39,6 +40,7 @@ import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
 import { TerminalViewport } from "./TerminalViewport";
+import { VOICE_ACTIONS, type VoiceActionContext } from "../lib/voiceActions";
 
 const tabs: { id: PanelTab; label: string; icon: typeof SquareTerminal }[] = [
   { id: "terminal", label: "Terminal", icon: SquareTerminal },
@@ -267,6 +269,8 @@ export interface AgentTileProps {
    * The wrapper that positions the tile is what supplies it.
    */
   onClose?: () => void;
+  /** Ask to end the agent, separately from the view-only Back control (issue #1402). */
+  stopContext?: Pick<VoiceActionContext, "confirmStopAgent" | "reportRefused">;
   /**
    * PRD #1666 §6.4 — Retry or Cancel one deck message the tile lists, at the
    * revision it shows. Supplied only where a daemon can answer: without it the
@@ -350,6 +354,7 @@ export function AgentTile({
   onOpen,
   panePresent,
   onClose,
+  stopContext,
   onInboxAction,
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
@@ -614,6 +619,14 @@ export function AgentTile({
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
+          )}
+          {stopContext && (
+            <button
+              className="agent-stop-control"
+              title="Close agent"
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={() => VOICE_ACTIONS.confirmStopAgent.run(stopContext, { deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, from: "overview" })}
+            ><CircleStop size={14} aria-hidden="true" /> Close agent</button>
           )}
           {onClose && (
             <button

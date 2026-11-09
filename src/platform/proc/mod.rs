@@ -50,6 +50,36 @@ pub use scan::{
     fill_command_lines, qualifying_command_sessions, shell_tool_candidates,
 };
 
+/// What a single-agent teardown learned about the direct child's exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildTermination {
+    /// `try_wait` collected an exit status.
+    Reaped,
+    /// The child still had not reported an exit when the reap deadline expired.
+    /// The kill flag says whether the forced-termination mechanism reported an
+    /// error; `true` is not proof that the child has exited or will exit.
+    Unreaped { kill_reported_ok: bool },
+}
+
+/// Poll a direct child's exit without ever entering its potentially unbounded
+/// blocking `wait`. Errors are not evidence of an exit, so they keep polling
+/// until the same deadline as a child that reports `None`.
+fn reap_child_with_deadline(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    deadline: std::time::Duration,
+) -> bool {
+    let deadline = std::time::Instant::now() + deadline;
+    loop {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Result of delivering the daemon-stop graceful signal to a PID via
 /// [`terminate_pid`].
 ///
@@ -319,6 +349,125 @@ pub(crate) mod test_child {
             None
         }
     }
+
+    /// A latch the test flips to let a deliberately-wedged reap finally
+    /// complete, so a teardown thread can always be joined.
+    #[derive(Debug, Default)]
+    pub(crate) struct WedgeGate {
+        released: std::sync::Mutex<bool>,
+        wake: std::sync::Condvar,
+    }
+
+    impl WedgeGate {
+        fn is_released(&self) -> bool {
+            *self.released.lock().unwrap()
+        }
+
+        pub(crate) fn block_until_released(&self) {
+            let mut released = self.released.lock().unwrap();
+            while !*released {
+                released = self.wake.wait(released).unwrap();
+            }
+        }
+
+        pub(crate) fn release(&self) {
+            *self.released.lock().unwrap() = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// A [`portable_pty::Child`] whose *reap* is under the test's control while
+    /// its *kill* is observable. It models a child stuck in uninterruptible
+    /// kernel I/O, which no ordinary test process can reproduce deterministically.
+    #[derive(Debug)]
+    pub(crate) struct WedgedChild {
+        /// `Some` makes Unix's production `killpg` target that process group;
+        /// `None` drives the portable `Child::kill` fallback on both backends.
+        pub(crate) pid: Option<u32>,
+        /// A count because phase 1's graceful ask also uses the fallback on Unix.
+        pub(crate) kills: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        /// Set when either `wait` or `try_wait` actually collects an exit.
+        pub(crate) reaped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        /// Until released, `wait` blocks and `try_wait` reports no exit.
+        pub(crate) gate: std::sync::Arc<WedgeGate>,
+        /// Models a blocking `wait` that never returns even after `try_wait` can
+        /// collect the child, proving the teardown uses nonblocking polling.
+        pub(crate) wait_never_returns: bool,
+    }
+
+    impl WedgedChild {
+        pub(crate) fn new(pid: Option<u32>, gate: std::sync::Arc<WedgeGate>) -> Self {
+            Self {
+                pid,
+                kills: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+                reaped: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                gate,
+                wait_never_returns: false,
+            }
+        }
+    }
+
+    impl portable_pty::ChildKiller for WedgedChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            self.kills.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            unreachable!("no teardown path clones a killer")
+        }
+    }
+
+    impl portable_pty::Child for WedgedChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            if !self.gate.is_released() {
+                return Ok(None);
+            }
+            self.reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            if self.wait_never_returns {
+                loop {
+                    std::thread::park();
+                }
+            }
+            self.gate.block_until_released();
+            self.reaped.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            self.pid
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    /// Poll `done` until it holds or `budget` elapses. Returns what it last saw.
+    pub(crate) fn holds_within(
+        budget: std::time::Duration,
+        mut done: impl FnMut() -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + budget;
+        while std::time::Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// How long a wedged teardown gets before its test calls it hung.
+    pub(crate) const WEDGE_TEST_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// Kills phase 1 contributes for a pid-less child before the force phase.
+    pub(crate) const PHASE_ONE_FALLBACK_KILLS: usize = if cfg!(unix) { 1 } else { 0 };
 }
 
 #[cfg(test)]
@@ -417,7 +566,12 @@ mod tests {
 
         let grace = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
-        terminate_child_with_grace_and_wait(&mut child, grace, &group);
+        terminate_child_with_grace_and_wait(
+            &mut child,
+            grace,
+            &group,
+            std::time::Duration::from_secs(1),
+        );
         assert!(
             started.elapsed() < grace,
             "an already-exited child must not cost the full grace window (took {:?})",

@@ -1197,9 +1197,18 @@ const AGENT_TARGETING_KINDS: ReadonlySet<string> = new Set(["agent_ref", "orches
  * so a stop resolved before a same-id replacement, or before the selected deck
  * changed, cannot open its confirmation for the agent that is there now.
  */
-function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly VoiceResolvedParamDto[]): Lost | undefined {
+function dispatchLost(was: VoiceContext, now: VoiceContext, params: readonly VoiceResolvedParamDto[], invoke?: string): Lost | undefined {
   const lost = contextLost(was, now, { answer: true });
   if (lost) return lost;
+  // Issue #1402: a whole "stop" names the pane implicitly. Hold it to the
+  // subject heard, without requiring an editable or visible terminal to close it.
+  if (invoke === "confirmStopAgent" && was.screen === "agent" && !params.some((param) => param.kind === "agent_ref")) {
+    if (!was.pane || !showsAgent(now.pane, { ...was.pane, incarnation: was.pane.incarnation })) return { code: "pane", why: "the pane on screen changed" };
+    if (!sameIncarnation(was.pane.incarnation, now.pane.incarnation)) return { code: "restarted", why: AGENT_GONE_AFTER_RESTART };
+    if (incarnationsDiffer(was.pane.spawnedAtMs, now.pane.spawnedAtMs)) return { code: "replaced", why: "the agent in the pane was replaced" };
+    const moved = contextLost(was, now, { agent: was.pane });
+    if (moved) return moved;
+  }
   /* PR #1451 (Qodo) — a deck named in the outcome is chosen relative to the
      deck selected when it was declared; once that moved, the choice is stale
      whatever it names, exactly as an agent target on the old deck is. */
@@ -3058,7 +3067,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     /* PR #1451 round 3 review (Qodo) — held to the context the number was
        said in, like a resolved dispatch: an agent entry to the deck and the
        incarnation declared then. */
-    const lost = dispatchLost(declared, current(), outcome.params);
+    const lost = dispatchLost(declared, current(), outcome.params, outcome.invoke);
     if (lost) {
       setProblem(refusal(lost));
       return;
@@ -3242,7 +3251,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
        says has moved on since the first utterance was declared. An agent or
        orchestration entry names its agent by id on the selected deck, which
        alone cannot tell a same-id replacement apart. */
-    const lost = dispatchLost(offer.declared, current(), [...(offer.outcome.params ?? []), ...(chosen ? [chosen] : [])]);
+    const lost = dispatchLost(offer.declared, current(), [...(offer.outcome.params ?? []), ...(chosen ? [chosen] : [])], offer.outcome.invoke);
     if (lost) {
       setProblem(choiceRefusal(lost));
       return;
@@ -3441,7 +3450,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
          declared, exactly as a chosen entry is: a stop resolved before a
          same-id replacement or a deck change must not open the confirmation
          for whatever agent carries that id now. */
-      const lost = dispatchLost(declared, current(), answer.outcome.kind === "dispatch" ? answer.outcome.params : []);
+      const lost = dispatchLost(declared, current(), answer.outcome.kind === "dispatch" ? answer.outcome.params : [], answer.outcome.kind === "dispatch" ? answer.outcome.invoke : undefined);
       if (lost) {
         if (lost.code !== "mode" || declaredDictation === undefined) setProblem(answerRefusal(lost));
         return;
@@ -3486,7 +3495,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
         const own = await resolveVoice(alone);
         if (!ours()) return;
         if (!HOLDABLE_OUTCOMES.has(own.outcome.kind)) {
-          const ownLost = dispatchLost(declared, current(), own.outcome.kind === "dispatch" ? own.outcome.params : []);
+          const ownLost = dispatchLost(declared, current(), own.outcome.kind === "dispatch" ? own.outcome.params : [], own.outcome.kind === "dispatch" ? own.outcome.invoke : undefined);
           if (ownLost) {
             setProblem(answerRefusal(ownLost));
             return;

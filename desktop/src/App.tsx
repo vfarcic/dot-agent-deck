@@ -32,7 +32,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, DASHBOARD_COVERED, modalOpen } from "./components/AgentOverview";
+import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -76,7 +76,7 @@ import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, Voic
 import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoicePages";
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
-import { agentKey, boundAgentKey } from "./lib/agentKey";
+import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -367,6 +367,21 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const newAgentVoice = useRef<NewAgentVoice | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
+  const [agentStopConfirm, setAgentStopConfirm] = useState<ConfirmState & { ownerView: NonNullable<typeof agentView> }>(); // voice-registry-exempt: the confirmation confirmStopAgent opens, not an independently opened capability
+  useEffect(() => {
+    setAgentStopConfirm((current) => current?.ownerView === agentView ? current : undefined);
+  }, [agentView]);
+  // A stopped agent can disappear from the listing before its action replies.
+  // In either order, an agent close returns to the Dashboard, even from Daemons.
+  const stoppingAttempt = useRef<{ view: NonNullable<typeof agentView> } | undefined>(undefined);
+  useEffect(() => {
+    if (!agentStopConfirm) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !overlayAbove(document.querySelector(".confirm-dialog"))) { event.stopImmediatePropagation(); setAgentStopConfirm(undefined); }
+    };
+    window.addEventListener("keydown", onKeyDown, true);
+    return () => window.removeEventListener("keydown", onKeyDown, true);
+  }, [agentStopConfirm]);
   /**
    * Back, and the whole of it. The destination is read off the view rather
    * than popped from a stack, so an agent view that was never navigated TO —
@@ -417,7 +432,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   useEffect(() => {
     if (!agentView) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !prBrowserOpen.current) closeAgentView();
+      if (event.key === "Escape" && !prBrowserOpen.current && !overlayAbove(document.querySelector(".agent-pane-overlay"))) closeAgentView();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -698,8 +713,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const paneAgentRetired = agentView !== undefined && paneDeckAttachable && paneAgent === undefined;
   useEffect(() => {
-    if (paneAgentRetired) closeAgent();
-  }, [paneAgentRetired, closeAgent]);
+    if (!paneAgentRetired) return;
+    // voice-registry-exempt: the stopped subject disappeared; retiring its view is an invariant, not another control
+    if (stoppingAttempt.current?.view === agentView) setView({ kind: "overview" });
+    else closeAgent();
+  }, [paneAgentRetired, agentView, closeAgent]);
   /**
    * PRD #1401 — the in-app pull request browser: whose pull request is open,
    * and the view it was opened over.
@@ -899,7 +917,26 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * voice gate because it can ask whether to stop agents.
    */
   const localUpgrade = useLocalUpgradeAtStart(runtime);
-  const confirmationOpen = screenConfirmationOpen || localUpgrade.target !== undefined;
+  const confirmationOpen = screenConfirmationOpen || localUpgrade.target !== undefined || agentStopConfirm !== undefined;
+  const confirmPaneStop = useCallback((target: VoiceDispatchTarget): string | undefined => {
+    if (confirmationOpen) return CONFIRMATION_ALREADY_OPEN;
+    if (overlayAbove(document.querySelector(".agent-pane-overlay"))) return "Close what is open over the agent first. Nothing was closed.";
+    if (!agentView || !paneAgent || !paneDeckAttachable || !paneDeck || target.deckId !== agentView.deckId || target.agentId !== agentView.agentId) return STOP_TARGET_GONE;
+    if ("incarnation" in target && !sameIncarnation(target.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
+    // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
+    const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
+    const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped);
+    setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
+      const attempt = { view: agentView };
+      stoppingAttempt.current = attempt;
+      try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
+    } });
+    return undefined;
+  }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
+  const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
+    confirmStopAgent: confirmPaneStop,
+    reportRefused: (sentence: string) => panelVoiceContext.current?.reportRefused?.(sentence),
+  } : undefined;
 
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and
@@ -1137,6 +1174,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The overview's, which is never mounted beside the deck, so the two
          cannot both publish (PRD #1223 U5). */
       ...overviewVoiceContext.current,
+      ...(agentView ? { confirmStopAgent: confirmPaneStop } : {}),
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
@@ -1217,7 +1255,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, confirmPaneStop, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1292,7 +1330,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
+        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} stopContext={agentStopContext} onTabShown={setPaneTab} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1313,7 +1351,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1348,6 +1386,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} update={<SelfUpgradeRailButton check={selfUpgrade} onOpen={openSelfUpgrade} />} />
         {screenNode}
+        {agentStopConfirm && <ConfirmDialog state={agentStopConfirm} onClose={() => setAgentStopConfirm(undefined)} />}
         {selfUpgradeDaemon && selfUpgrade && selfUpgradeApi && <LocalUpgradeFlow entry="notice" copies={{ check: selfUpgrade, api: selfUpgradeApi }} daemon={selfUpgradeDaemon.daemon} runtime={runtime} onClose={() => { setSelfUpgradeDaemon(undefined); recheckSelfUpgrade(); }} />}
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
@@ -1445,7 +1484,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, stopContext, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; stopContext?: AgentTileProps["stopContext"]; onTabShown?: (tab: PanelTab) => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
@@ -1511,6 +1550,7 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
          `presentation`. */
       onEvidenceSelect={() => undefined}
       onClose={onClose}
+      stopContext={stopContext}
     />
   );
 }
@@ -1557,7 +1597,7 @@ function tileVoiceName(agent: AgentSession): string {
  * Closed, the wrapper is `display: contents`, so `.agent-tile` remains the
  * grid item it has always been and the deck's layout is untouched.
  */
-function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean; offPage?: boolean }) {
+function AgentPaneFrame({ open, offPage, onOpen, onClose, stopContext, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean; offPage?: boolean }) {
   /*
     The `aria-modal` below is a claim about the whole interface, and until the
     PRD's security audit it was false: the base screen is deliberately still
@@ -1587,10 +1627,11 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentT
       <AgentTile
         {...tile}
         presentation={open ? "overlay" : "tile"}
-        /* One control at a time, and by construction: the pane that is open
-           offers Close and the tiles behind it offer Open. */
+        /* The open pane offers Back to dashboard; the tiles behind it offer Open.
+           Its agent-ending control is separate from that view-only navigation. */
         onOpen={open ? undefined : onOpen}
         onClose={open ? onClose : undefined}
+        stopContext={open ? stopContext : undefined}
       />
     </div>
   );
@@ -1632,7 +1673,7 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -2631,6 +2672,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   */
                   onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck", incarnation: agent.incarnation }))}
                   onClose={onCloseAgent && (() => VOICE_ACTIONS.closeAgentView.run(voiceContext))}
+                  stopContext={stopContext}
                 />
               ))}
             </div>

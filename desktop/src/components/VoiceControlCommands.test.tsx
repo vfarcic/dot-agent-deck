@@ -4433,6 +4433,30 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id });
   });
 
+  /** Scenario: with typing off, a whole spoken stop on the agent screen opens the same confirmation as Close agent. Cancelling leaves its pane open; confirming closes the viewed role alone and returns to the dashboard. */
+  it.each(["stop", "stop it", "stop that", "close this agent"])("confirms %s on the agent screen without stopping anything by voice alone", async (utterance) => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const target = snapshot.agents[0];
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("stop_agent", "confirmStopAgent", "Confirm closing the open agent — nothing has been stopped yet.", utterance));
+    render(<DeckShell runtime={{ ...deck, resolveVoice }} initialView={{ kind: "agent", deckId: target.daemonId, agentId: target.id, from: "overview" }} />);
+    await turnVoiceOn();
+    voice.deliver(utterance);
+    await completeUtterance();
+    expect(confirmation()).toHaveTextContent("Close lead?");
+    expect(confirmation()).toHaveTextContent("leaving the orchestration one role short");
+    expect(runAction).not.toHaveBeenCalled();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    voice.deliver(utterance);
+    await completeUtterance();
+    await act(async () => fireEvent.click(within(confirmation()!).getByRole("button", { name: "Close agent" })));
+    await flush();
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: target.daemonId, agentId: target.id });
+    expect(screen.queryByTestId("agent-pane-overlay")).toBeNull();
+    expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
+  });
+
   /** Scenario: a direct spoken stop is still resolving when its named agent is
    * replaced under the same id or the selected deck changes to another agent
    * with that id. Neither stop confirmation may open for the new target. */

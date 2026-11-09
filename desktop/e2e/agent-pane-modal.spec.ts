@@ -34,6 +34,28 @@ import { enterDeck } from "./support/overview";
  * already selected — which is why this one is a peer and the selector is not.
  */
 test.describe("the agent pane is a real modal", () => {
+  /** Scenario: Close agent opens an interactive confirmation above the inert pane; Escape cancels it without leaving the pane, and confirming returns to the dashboard with that agent removed. */
+  test("closes the viewed agent through a reachable confirmation, then returns to the dashboard", async ({ page }) => {
+    await page.goto("/?fixture=1&state=docs");
+    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
+    const pane = page.getByTestId("agent-pane-overlay");
+    const stop = pane.getByRole("button", { name: "Close agent", exact: true });
+    await stop.click();
+    const confirmation = page.getByRole("alertdialog");
+    await expect(confirmation).toContainText("Close Desktop implementation?");
+    expect(await confirmation.evaluate((node) => node.closest("[inert]") !== null)).toBe(false);
+    await expect(confirmation).toBeFocused();
+    await page.keyboard.press("Escape");
+    await expect(confirmation).toHaveCount(0);
+    await expect(pane).toBeVisible();
+    await stop.click();
+    await confirmation.getByRole("button", { name: "Close agent", exact: true }).click();
+    await expect(pane).toHaveCount(0);
+    await expect(confirmation).toHaveCount(0);
+    await expect(page.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Open Desktop implementation agent" })).toHaveCount(0);
+  });
+
   /** Scenario: open a PR from the full-screen agent pane in a real browser. The frontmost toolbar accepts focus and clicks while the underlying pane is inert. */
   test("keeps the PR toolbar interactive above the agent pane", async ({ page }) => {
     await page.goto("/?fixture=1&state=docs-pr");
