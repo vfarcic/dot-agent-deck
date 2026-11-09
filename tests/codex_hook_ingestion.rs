@@ -63,11 +63,20 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
                 stream
                     .read_to_string(&mut line)
                     .expect("read emitted Codex AgentEvent");
+                let mut frame: serde_json::Value =
+                    serde_json::from_str(line.trim()).expect("parse emitted Codex frame");
+                // Issue #1724: a keys-answerable question makes the hook ask
+                // the daemon's capabilities first, on a connection of its own.
+                // This stub models a daemon from before that answer — the ask
+                // times out and the question is built as verified, which is
+                // the fallback these tests pin — so the capabilities frame is
+                // skipped and the question frame after it is the one read.
+                if frame["message_type"] == "hook_capabilities" {
+                    continue;
+                }
                 // PRD #1631 (audit A9): a frame carrying a question leaves the
                 // hook as an unheld `question` message, so it goes through the
                 // daemon's provenance gate; its event is what is asserted.
-                let mut frame: serde_json::Value =
-                    serde_json::from_str(line.trim()).expect("parse emitted Codex frame");
                 if frame["message_type"] == "question" {
                     assert_eq!(frame["hold"], false, "a keys-answered question is not held");
                     frame = frame["event"].take();

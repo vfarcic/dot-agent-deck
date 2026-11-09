@@ -107,6 +107,19 @@ fn invoke_hook(agent: &str, payload: &Value) -> AgentEvent {
                 std::io::BufRead::read_line(&mut std::io::BufReader::new(&mut stream), &mut line)
                     .expect("read emitted AgentEvent");
                 let value: Value = serde_json::from_str(line.trim()).expect("parse emitted line");
+                // Issue #1724: a keys-answerable question (a Codex permission,
+                // here) makes the hook ask the daemon's capabilities first, on
+                // a connection of its own. Answer it as a daemon from before
+                // that answer — no `agent_release`, so the question is built
+                // as verified — and keep waiting for the frame this reads.
+                if value["message_type"] == "hook_capabilities" {
+                    stream
+                        .write_all(
+                            b"{\"task_scoped_completion\":1,\"input_mode_report\":1,\"dispatch_launch\":1}\n",
+                        )
+                        .expect("answer the capabilities question");
+                    continue;
+                }
                 if value["message_type"] == "question" {
                     stream
                         .write_all(b"{\"question_id\":\"\",\"outcome\":\"released\",\"reason\":\"cleared\"}\n")

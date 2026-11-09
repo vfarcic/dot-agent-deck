@@ -7403,6 +7403,13 @@ async fn run_hook_loop_with_limits(
                                     };
                                     #[cfg(not(target_os = "linux"))]
                                     let composer_probe = None;
+                                    // Issue #1724: the pane's latched release,
+                                    // for the hook's question tables — only to
+                                    // a connection the provenance gate
+                                    // attests, like the composer probe above.
+                                    let agent_release = attested_agent
+                                        .as_deref()
+                                        .and_then(|agent| pty_registry.latched_release(agent));
                                     // PRD #1666 part 3, round 5 (plan D1): the
                                     // question, answered on this connection,
                                     // which then carries the mutation.
@@ -7421,6 +7428,7 @@ async fn run_hook_loop_with_limits(
                                         dispatch_launch: Some(
                                             crate::event::DISPATCH_LAUNCH,
                                         ),
+                                        agent_release,
                                         ..Default::default()
                                     };
                                     if let Ok(json) = serde_json::to_string(&reply) {
@@ -17477,6 +17485,101 @@ mod hook_provenance_audit_tests {
         registry.shutdown_all();
     }
 
+    /// Scenario: A pane spawned as Codex draws Codex's start-up header, so the
+    /// daemon latches its release, and a hook building a keys-answerable
+    /// question asks the capabilities question with the pane's token: the
+    /// answer names the latched release, which is what bounds the hook's
+    /// question tables past the minor they were verified on. The same question
+    /// without the token answers none, and so does one for a pane spawned as
+    /// Claude Code that drew the Codex header: a release the tables cannot be
+    /// bounded by reads as unknown, and the tables cover an unknown version.
+    #[spec("question/state/010")]
+    #[tokio::test]
+    async fn question_state_010_the_capabilities_answer_names_the_latched_release() {
+        use crate::event::{DaemonMessage, HookCapabilitiesReply, HookCapabilitiesRequest};
+        use tokio::io::AsyncBufReadExt;
+        const CODEX_PANE: &str = "pane-release-codex";
+        const CLAUDE_PANE: &str = "pane-release-claude";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let spawn_as = |pane: &str, agent_type: crate::event::AgentType| {
+            registry
+                .spawn_agent(SpawnOptions {
+                    command: Some(MODE_SHELL),
+                    env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane.to_string())],
+                    agent_type: Some(agent_type),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn a stand-in")
+        };
+        let codex = spawn_as(CODEX_PANE, crate::event::AgentType::Codex);
+        let claude = spawn_as(CLAUDE_PANE, crate::event::AgentType::ClaudeCode);
+        let codex_token = registry.hook_token_of(&codex).expect("the token");
+        let deck = ModeDeck::start(registry.clone()).await;
+        let header = deck.dir.path().join("codex-header.bin");
+        std::fs::write(
+            &header,
+            "\x1b[2;3H>_ \x1b[1mOpenAI Codex\x1b[22m\x1b[2m (v0.164.0)\x1b[22m\r\n",
+        )
+        .unwrap();
+        let latch = |agent: &str| {
+            matches!(
+                registry.release_capture(agent).unwrap().0,
+                crate::release_scanner::ScanLatch::Latched { .. }
+            )
+        };
+        for agent in [&codex, &claude] {
+            deck.type_line(agent, &format!("cat '{}'", header.display()))
+                .await;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !latch(agent) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the header never latched for {agent}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        async fn ask(deck: &ModeDeck, pane: &str, token: Option<&str>) -> HookCapabilitiesReply {
+            let question = DaemonMessage::HookCapabilities(HookCapabilitiesRequest {
+                pane_id: pane.to_string(),
+                token: token.map(str::to_string),
+            });
+            let mut stream = UnixStream::connect(&deck.deck.sock).await.expect("connect");
+            stream
+                .write_all(format!("{}\n", serde_json::to_string(&question).unwrap()).as_bytes())
+                .await
+                .unwrap();
+            let mut answer = String::new();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                tokio::io::BufReader::new(&mut stream).read_line(&mut answer),
+            )
+            .await
+            .expect("the daemon answers the question")
+            .unwrap();
+            serde_json::from_str::<HookCapabilitiesReply>(answer.trim()).unwrap()
+        }
+
+        let attested = ask(&deck, CODEX_PANE, Some(&codex_token)).await;
+        assert_eq!(attested.agent_release, Some((0, 164, 0)), "{attested:?}");
+        let unattested = ask(&deck, CODEX_PANE, None).await;
+        assert_eq!(unattested.agent_release, None, "{unattested:?}");
+        let claude_token = registry.hook_token_of(&claude).expect("the token");
+        let other_agent = ask(&deck, CLAUDE_PANE, Some(&claude_token)).await;
+        assert_eq!(
+            other_agent.agent_release, None,
+            "a Codex header on a Claude Code pane is not its release: {other_agent:?}"
+        );
+        assert_eq!(
+            registry.latched_release(&codex),
+            Some((0, 164, 0)),
+            "the registry lookup the answer rests on"
+        );
+        deck.deck.handle.abort();
+        registry.shutdown_all();
+    }
+
     /// Every broadcast waiting on `events`, counted and dropped.
     fn broadcasts(events: &mut broadcast::Receiver<BroadcastMsg>) -> u64 {
         let mut count = 0;
@@ -19530,8 +19633,10 @@ mod question_hold_tests {
         });
 
         // What the hook process builds; the pane and agent come from the
-        // environment the deck spawned it with, stood in for here.
-        let mut event = crate::hook::hook_payload_event(agent_label, raw)
+        // environment the deck spawned it with, stood in for here. No release
+        // is asked for: the hook only asks for a keys-answerable question, and
+        // this helper drives the held path.
+        let mut event = crate::hook::hook_payload_event(agent_label, raw, None)
             .expect("the payload maps to an event");
         event.pane_id = Some(PANE.to_string());
         event.agent_id = Some(agent.clone());

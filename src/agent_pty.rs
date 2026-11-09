@@ -2212,8 +2212,9 @@ impl AgentBus {
     }
 
     /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
-    /// latched so far. Takes the output lock.
-    #[cfg(target_os = "linux")]
+    /// latched so far. Takes the output lock. Not platform-gated: the latch
+    /// itself is, but reading it is pure (issue #1724's capabilities answer
+    /// reads it on every platform).
     fn latched_for(&self, agent: &AgentType) -> crate::doorbell_activation::LatchedRelease {
         self.state.lock().unwrap().release.latched_for(agent)
     }
@@ -13075,6 +13076,30 @@ impl AgentPtyRegistry {
     )> {
         let inner = self.inner.lock();
         inner.agents.get(agent_id).map(|agent| agent.bus.release())
+    }
+
+    /// Issue #1724: the release latched from `agent_id`'s start-up header, as
+    /// the agent type that generation runs — its spawn's
+    /// ([`RunningAgent::spawn_agent_type`]), else the first one its own hooks
+    /// reported ([`Self::reported_agent_type`]). `None` when the header was
+    /// not latched, or was another agent's: a question from such a pane reads
+    /// as a version its tables cover, exactly as before the deck knew one.
+    /// Read by the hook-socket capabilities answer
+    /// ([`crate::event::HookCapabilitiesReply::agent_release`]), so the hook
+    /// can bound its question tables by the version the pane actually runs.
+    pub fn latched_release(&self, agent_id: &str) -> Option<(u64, u64, u64)> {
+        let inner = self.inner.lock();
+        let agent = inner.agents.get(agent_id)?;
+        let agent_type = agent
+            .spawn_agent_type
+            .clone()
+            .or_else(|| agent.agent_type.clone())?;
+        match agent.bus.latched_for(&agent_type) {
+            crate::doorbell_activation::LatchedRelease::Known(release) => {
+                Some((release.major, release.minor, release.patch))
+            }
+            _ => None,
+        }
     }
 
     /// PRD #1666 part 3, round 5-wake (plan §1.3): store a wrapper's input-mode

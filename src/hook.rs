@@ -142,8 +142,14 @@ fn lenient_string_map<'de, D: Deserializer<'de>>(
 /// (which keys on the event's type, tool and detail) and the snapshot's
 /// `pending_question` all come from this one parse, never from a second parse
 /// of the same payload. `None` for a payload that does not parse or maps to no
-/// event.
-pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent> {
+/// event. `version` is the agent's release, when known (issue #1724): it
+/// bounds the question's option tables, and `None` reads as a version they
+/// cover.
+pub(crate) fn hook_payload_event(
+    agent: &str,
+    input: &str,
+    version: Option<(u64, u64, u64)>,
+) -> Option<AgentEvent> {
     match agent {
         "opencode" => {
             let hook_input: OpenCodeHookInput = serde_json::from_str(input).ok()?;
@@ -156,7 +162,7 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
         // `extract_tool_detail` arms (`shell`, `apply_patch`) sharpen the detail.
         "codex" => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::Codex)
+            build_event_typed(hook_input, AgentType::Codex, version)
         }
         // Devin CLI ships a Claude-Code-compatible hooks engine too, so its
         // command hooks POST the SAME stdin JSON shape ([`ClaudeCodeHookInput`])
@@ -165,11 +171,11 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
         // `command`, which the `extract_tool_detail` `"exec"` arm sharpens.
         "devin" => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::Devin)
+            build_event_typed(hook_input, AgentType::Devin, version)
         }
         _ => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::ClaudeCode)
+            build_event_typed(hook_input, AgentType::ClaudeCode, version)
         }
     }
 }
@@ -180,9 +186,25 @@ pub fn handle_hook(agent: &str) -> ExitCode {
         _ => return ExitCode::SUCCESS,
     };
 
-    let Some(mut event) = hook_payload_event(agent, &input) else {
+    let Some(mut event) = hook_payload_event(agent, &input, None) else {
         return ExitCode::SUCCESS;
     };
+
+    // Issue #1724: a question the deck would answer by typing is re-built with
+    // the release the daemon latched from this pane's start-up header, so its
+    // table's verified range can bound the keys and digits it types — past the
+    // minor the table was verified on, those answers are keyboard-only until
+    // the table is re-verified. Held and plugin-answered questions are left
+    // alone: their answers are delivered as decisions, which type nothing and
+    // stay answerable whatever the version.
+    if event
+        .question()
+        .is_some_and(|q| q.channel == crate::question::AnswerChannel::Keys)
+        && let Some(release) = pane_agent_release()
+        && let Some(rebuilt) = hook_payload_event(agent, &input, Some(release))
+    {
+        event = rebuilt;
+    }
 
     // PRD #1666 S6: what Claude Code's own hooks do for the deck's inbox, in a
     // deck pane only — every Claude session runs these global hooks.
@@ -725,6 +747,40 @@ pub fn extract_opencode_turn_reply(payload: &Value) -> Option<crate::daemon_prot
 /// because Codex draws its approval prompt only after its `PermissionRequest`
 /// hook exits [observed on 0.160.0].
 const UNHELD_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Issue #1724: how long a hook building a keys-answerable question waits for
+/// the daemon's answer to its release question ([`pane_agent_release`]). A
+/// daemon that knows the field answers with its latched release at once; this
+/// bound is what an OLDER daemon, or a wedged one, costs before the hook gives
+/// up and builds the question as verified (`None`), exactly as it did before
+/// the deck knew a release. Asked only for a question the deck would answer by
+/// typing, so plain events and hook-held prompts pay nothing.
+const RELEASE_QUESTION_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Issue #1724: this pane's agent release, as the daemon's release scanner
+/// latched it from the generation's start-up header — asked over the hook
+/// socket like every other capability, with this pane's token, so only a
+/// connection the daemon attests is answered. `None` — no pane in the
+/// environment, no daemon answer, or no header of this pane's agent latched —
+/// reads as a version the question tables cover, which is what the deck
+/// assumed before it could ask.
+fn pane_agent_release() -> Option<(u64, u64, u64)> {
+    let pane_id = std::env::var(DOT_AGENT_DECK_PANE_ID).ok()?;
+    let request =
+        crate::event::DaemonMessage::HookCapabilities(crate::event::HookCapabilitiesRequest {
+            pane_id,
+            token: crate::hook_provenance::token_from_env(),
+        });
+    let json = serde_json::to_string(&request).ok()?;
+    match request_from_socket_at(&client_socket_path(), &json, Some(RELEASE_QUESTION_WAIT)) {
+        SocketReply::Line(line) => {
+            serde_json::from_str::<crate::event::HookCapabilitiesReply>(line.trim())
+                .ok()?
+                .agent_release
+        }
+        _ => None,
+    }
+}
 
 /// Whether `event` raises a question or reports one answered — the metadata
 /// the daemon accepts only from a message its provenance gate attested.
@@ -1449,15 +1505,21 @@ fn codex_patch_path(patch: &str) -> Option<String> {
 /// tests (and any Claude caller) stay unchanged.
 #[cfg(test)]
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
-    build_event_typed(input, AgentType::ClaudeCode)
+    build_event_typed(input, AgentType::ClaudeCode, None)
 }
 
 /// Build an [`AgentEvent`] from a Claude-compatible hook payload, stamping the
 /// given `agent_type`. PRD #20 W1 parameterized this over the agent type so the
 /// Codex hook path (which posts the SAME payload shape) reuses the whole
 /// builder, differing only in the stamped identity and the Codex-aware
-/// `extract_tool_detail` arms.
-fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
+/// `extract_tool_detail` arms. `version` is the agent's release, when known
+/// (issue #1724); it bounds the question's option tables, and `None` reads as
+/// a version they cover.
+fn build_event_typed(
+    input: ClaudeCodeHookInput,
+    agent_type: AgentType,
+    version: Option<(u64, u64, u64)>,
+) -> Option<AgentEvent> {
     let ClaudeCodeHookInput {
         session_id,
         hook_event_name,
@@ -1711,6 +1773,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.get("tool_use_id").map(String::as_str),
         extra.get("permission_suggestions"),
         extra.get("permission_mode").and_then(Value::as_str),
+        version,
     );
 
     let mut event = AgentEvent {
@@ -1746,8 +1809,10 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
 ///   [`crate::question::codex_request_user_input`].
 /// - Devin `PermissionRequest` → [`crate::question::devin_permission_request`].
 ///
-/// The agent's version is not in any of these payloads, so the tables are used
-/// as verified (`None`).
+/// The agent's version is not in any of these payloads. `version` is the
+/// release the daemon latched from this pane's start-up header, when the hook
+/// could ask for one (issue #1724); `None` reads as a version the tables
+/// cover, which is how the tables were used before.
 #[allow(clippy::too_many_arguments)]
 fn hook_question(
     agent_type: &AgentType,
@@ -1758,6 +1823,7 @@ fn hook_question(
     tool_use_id: Option<&str>,
     permission_suggestions: Option<&Value>,
     permission_mode: Option<&str>,
+    version: Option<(u64, u64, u64)>,
 ) -> Option<crate::question::PendingQuestion> {
     let now = Utc::now().timestamp_millis();
     let id = crate::question::mint_question_id;
@@ -1771,7 +1837,7 @@ fn hook_question(
                 permission_suggestions,
                 permission_mode,
                 now,
-                None,
+                version,
             )
             .question,
         ),
@@ -1787,18 +1853,18 @@ fn hook_question(
                 tool_detail,
                 command.as_deref(),
                 now,
-                None,
+                version,
             ))
         }
         (AgentType::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
-            crate::question::codex_request_user_input(tool_use_id, tool_input, now, None)
+            crate::question::codex_request_user_input(tool_use_id, tool_input, now, version)
         }
         (AgentType::Devin, "PermissionRequest") => Some(crate::question::devin_permission_request(
             id(),
             tool_name?,
             tool_detail,
             now,
-            None,
+            version,
         )),
         _ => None,
     }
@@ -5377,9 +5443,12 @@ mod tests {
         // convenience wrapper, which hardcodes `AgentType::ClaudeCode`) so
         // this actually exercises the `agent_type == AgentType::ClaudeCode`
         // gate — deleting that condition would break no other test.
-        let non_claude_code =
-            build_event_typed(payload("SessionStart", Some("clear")), AgentType::Codex)
-                .expect("SessionStart maps to an event");
+        let non_claude_code = build_event_typed(
+            payload("SessionStart", Some("clear")),
+            AgentType::Codex,
+            None,
+        )
+        .expect("SessionStart maps to an event");
         assert!(
             !non_claude_code
                 .metadata
@@ -5633,7 +5702,7 @@ mod tests {
         let mut codex = claude_payload("StopFailure");
         codex.error = Some("billing_error".into());
         assert_eq!(
-            build_event_typed(codex, AgentType::Codex)
+            build_event_typed(codex, AgentType::Codex, None)
                 .unwrap()
                 .event_type,
             EventType::Error
@@ -5724,7 +5793,7 @@ mod tests {
             let mut input = claude_payload(event);
             input.transcript_path = Some("/h/.codex/sessions/rollout-a.jsonl".into());
             input.turn_id = Some("t1".into());
-            build_event_typed(input, AgentType::Codex).unwrap()
+            build_event_typed(input, AgentType::Codex, None).unwrap()
         };
         let prompt = codex("UserPromptSubmit");
         assert_eq!(prompt.metadata[CODEX_TURN_ID_METADATA_KEY], "t1");
@@ -5750,7 +5819,7 @@ mod tests {
         let mut long = claude_payload("UserPromptSubmit");
         long.turn_id = Some("x".repeat(crate::codex_rollout_tail::MAX_METADATA_BYTES + 1));
         assert!(
-            !build_event_typed(long, AgentType::Codex)
+            !build_event_typed(long, AgentType::Codex, None)
                 .unwrap()
                 .metadata
                 .contains_key(CODEX_TURN_ID_METADATA_KEY)
@@ -5861,7 +5930,8 @@ mod tests {
         let key = crate::event::SUBAGENT_ID_METADATA_KEY;
 
         for agent_type in [AgentType::ClaudeCode, AgentType::Codex] {
-            let event = build_event_typed(payload("a7c1".into()), agent_type.clone()).unwrap();
+            let event =
+                build_event_typed(payload("a7c1".into()), agent_type.clone(), None).unwrap();
             assert_eq!(
                 event.metadata.get(key).map(String::as_str),
                 Some("a7c1"),
@@ -5877,7 +5947,7 @@ mod tests {
 
         // Devin's hook input has no such field; a future one of unknown meaning
         // must not start suppressing its card's status.
-        let devin = build_event_typed(payload("a7c1".into()), AgentType::Devin).unwrap();
+        let devin = build_event_typed(payload("a7c1".into()), AgentType::Devin, None).unwrap();
         assert!(!devin.is_from_subagent());
 
         // Issue #1678: an empty id is a subagent's still — the key's presence
@@ -5962,9 +6032,17 @@ mod question_tests {
     }
 
     fn event_for(agent: AgentType, payload: &Value) -> AgentEvent {
+        event_for_version(agent, payload, None)
+    }
+
+    fn event_for_version(
+        agent: AgentType,
+        payload: &Value,
+        version: Option<(u64, u64, u64)>,
+    ) -> AgentEvent {
         let input: ClaudeCodeHookInput =
             serde_json::from_value(payload.clone()).expect("a Claude-shaped payload");
-        build_event_typed(input, agent).expect("the payload maps to an event")
+        build_event_typed(input, agent, version).expect("the payload maps to an event")
     }
 
     fn question_for(agent: AgentType, payload: &Value) -> PendingQuestion {
@@ -7195,6 +7273,43 @@ mod question_tests {
         assert_eq!(pending(&state).as_deref(), props["id"].as_str());
         state.apply_event(opencode("tool.execute.after", Some(&call), None));
         assert_eq!(pending(&state), None);
+    }
+
+    /// Scenario: The hook parses Codex's captured `PermissionRequest` with the
+    /// release the daemon latched from the pane's start-up header — first one
+    /// past the minor the table was verified on (0.161 past 0.160), then one
+    /// inside it, then none at all, as when no header latched. Past the minor
+    /// the question the hook builds is keyboard-only with an unsupported
+    /// channel, so the deck types nothing it has not verified; inside the
+    /// minor, and with no release known, the approval stays answerable by keys
+    /// exactly as before.
+    #[spec("question/detect/021")]
+    #[test]
+    fn question_detect_021_the_latched_release_bounds_the_codex_table() {
+        let payload = fixture("codex-permission-request.json");
+        let past = event_for_version(AgentType::Codex, &payload, Some((0, 161, 0)))
+            .question()
+            .expect("the payload still raises a question");
+        assert_eq!(past.channel, AnswerChannel::Unsupported);
+        assert!(
+            past.questions[0].options.iter().all(|o| o.keyboard_only),
+            "the labels are still the best the deck knows, but nothing is typed"
+        );
+
+        let inside = event_for_version(AgentType::Codex, &payload, Some((0, 160, 5)))
+            .question()
+            .expect("the payload still raises a question");
+        assert_eq!(inside.channel, AnswerChannel::Keys);
+        assert!(inside.questions[0].options.iter().all(|o| !o.keyboard_only));
+
+        let unknown = question_for(AgentType::Codex, &payload);
+        assert_eq!(unknown.channel, AnswerChannel::Keys);
+        assert!(
+            unknown.questions[0]
+                .options
+                .iter()
+                .all(|o| !o.keyboard_only)
+        );
     }
 }
 

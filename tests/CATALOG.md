@@ -12593,6 +12593,20 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Does not assert:** the producer setting the mark (`question/detect/019`); the desktop's handling of it (`question/desktop/031`).
 - **Platform coverage:** mac+linux.
 
+##### question/model/009 — Past the verified minor, Codex's typed answers become keyboard-only.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Codex command approval and a `request_user_input` form built by the deck's own producers).
+- **Asserts:** an approval built with a release past the minor the table was verified on (0.161 past 0.160) lists every option keyboard-only with the channel `unsupported`, and refuses an answer as `keyboard_only`; a patch release inside the verified minor (0.160.7) stays on `keys` and `answer_keys` types `1`; a release below `verified_from` (0.150) marks everything keyboard-only; `None` stays covered; a form past the verified minor loses its `keys` channel, its digits being the table's verified behaviour.
+- **Does not assert:** the release reaching the producer (`question/detect/021`, `question/state/010`); live Codex prompts (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
+##### question/model/010 — Past the verified minor, Claude Code's hook-delivered answers stay answerable.
+- **Layer:** L1/fast unit (`src/question.rs`).
+- **Agent:** none (a Claude Code Bash permission, an `AskUserQuestion` and an `ExitPlanMode` built by the deck's own producers, and a Devin permission).
+- **Asserts:** at 2.2 — past the minor the tables were verified on (2.1) — the Bash permission and the `AskUserQuestion` stay held with every option answerable and validate resolves the answer, while plan approval, answered by keys, becomes keyboard-only with the channel `unsupported` and is refused as `keyboard_only`; a 2.1 patch newer than the verified release still answers the plan by keys; Devin past 3000.11 loses its keys channel.
+- **Does not assert:** the release reaching the producer (`question/detect/021`, `question/state/010`); live Claude Code prompts (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
 #### question/detect
 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
@@ -12735,6 +12749,14 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Asserts:** Claude Code's `PermissionRequest` names no call and fingerprints its input like the call's `PreToolUse`, and unlike another command's; applied to state, the question ties to that call, survives the other call's `PostToolUse` on Needs Input, and clears on its own. OpenCode's `permission.asked` puts `tool.callID` in `tool.use_id`, a `tool.execute.after` carries its `call_id` as `tool_use_id`, and only the matching call's end clears it.
 - **Does not assert:** live agents running parallel calls; Codex's `PreToolUse` and `PermissionRequest` inputs agreeing.
 - **Platform coverage:** mac+linux.
+
+##### question/detect/021 — The latched release bounds the Codex table.
+- **Layer:** L1/fast unit (`src/hook.rs`, the captured `codex-permission-request.json`).
+- **Agent:** none (captured payload).
+- **Asserts:** the hook's own builder, given the release the daemon latched from the pane's start-up header, builds the approval keyboard-only with the channel `unsupported` past the minor the table was verified on (0.161 past 0.160); a patch inside the minor (0.160.5) and no release at all stay on `keys` with every option answerable.
+- **Does not assert:** the hook asking the daemon for the release over the socket (`question/state/010`); a live Codex pane's header latching (`question/live/*`).
+- **Platform coverage:** mac+linux.
+
 #### question/state
 
 ##### question/state/001 — A question event sets the pending question and Needs Input.
@@ -12799,6 +12821,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Asserts:** one fitting call ties the question to it; two calls with the same input leave it untied and the first end clears it; no `ToolStart` seen, and a tool end naming no call, fall back to the tool-name match; an earlier call that already ended and a subagent's call with the same input are not candidates; an `AskUserQuestion` tied to its call clears on its own end even when its input was rewritten.
 - **Does not assert:** a `ToolStart` applied after its `PermissionRequest` (untied, falls back by name).
 - **Platform coverage:** mac+linux.
+
+##### question/state/010 — The capabilities answer names the pane's latched release.
+- **Layer:** L1/fast unit (`src/daemon.rs`, the real hook socket over a real spawned pane).
+- **Agent:** none (stand-in shells typed a Codex start-up header, one spawned as Codex and one as Claude Code).
+- **Asserts:** a hook asking the capabilities question with the pane's token is answered with the release the daemon latched from the generation's start-up header (Codex 0.164.0), which is what bounds the hook's question tables; the same question without the token answers none, and so does one for a pane whose header was another agent's, so an unattested or foreign release reads as unknown and the tables cover it.
+- **Does not assert:** the hook acting on the answer (`question/detect/021`); a live Codex pane (`question/live/*`).
+- **Platform coverage:** mac+linux (the Unix-socket hook-loop harness).
 
 #### question/answer
 

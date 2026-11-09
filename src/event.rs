@@ -4405,6 +4405,14 @@ pub struct HookCapabilitiesReply {
     /// named it, so a daemon that would ignore them gets no dispatch at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch_launch: Option<u32>,
+    /// Issue #1724: the release the daemon latched from the asking pane's
+    /// start-up header, for the agent type that generation runs — the version
+    /// the hook's question tables are bounded by. `None` when the connection
+    /// is not attested, or no header of that agent was latched (nothing seen,
+    /// another agent's, a conflict, or a scanner that closed before one), which
+    /// reads as a version the tables cover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_release: Option<(u64, u64, u64)>,
     /// On a refusal (the provenance gate), its stable code and sentence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,

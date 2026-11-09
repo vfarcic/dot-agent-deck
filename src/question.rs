@@ -789,7 +789,11 @@ impl PendingQuestion {
 /// The table options for `menu` that apply under `when`, as question options
 /// numbered from `first_index`. A table that does not cover `version` lists its
 /// options keyboard-only: the labels are still the best the deck knows, but
-/// it does not send keys or decisions it has not verified.
+/// it does not send keys or decisions it has not verified. A version past the
+/// minor of `verified_on` (issue #1724) marks only the options the deck would
+/// type — the ones carrying keys — keyboard-only: an answer delivered as a
+/// hook decision or a plugin reply stays answerable, because nothing is typed
+/// for it either way.
 fn table_options(
     tables: Option<&QuestionTables>,
     menu: MenuKind,
@@ -802,12 +806,15 @@ fn table_options(
         return Vec::new();
     };
     let covered = tables.covers(version);
+    let keys_covered = tables.covers_keys(version);
     tables
         .menu(menu)
         .iter()
         .filter(|option| when(option.when))
         .enumerate()
-        .map(|(i, option)| table_option(option, first_index + i as u32, covered, fill))
+        .map(|(i, option)| {
+            table_option(option, first_index + i as u32, covered, keys_covered, fill)
+        })
         .collect()
 }
 
@@ -815,6 +822,7 @@ fn table_option(
     option: &TableOption,
     index: u32,
     covered: bool,
+    keys_covered: bool,
     fill: &dyn Fn(&str) -> String,
 ) -> QuestionOption {
     QuestionOption {
@@ -822,7 +830,7 @@ fn table_option(
         label: fill(option.label),
         description: None,
         role: option.role,
-        keyboard_only: option.keyboard_only || !covered,
+        keyboard_only: option.keyboard_only || !covered || (option.keys.is_some() && !keys_covered),
         scope: option.scope.map(fill),
         maybe_hidden: option.maybe_hidden,
     }
@@ -899,14 +907,18 @@ fn agent_tables(agent: &AgentType) -> Option<&'static QuestionTables> {
 }
 
 /// When a table's version range does not cover the agent, a keys channel has
-/// nothing verified to type.
+/// nothing verified to type. Issue #1724: the range is `verified_from` up to
+/// the minor of `verified_on` — past that minor the keys were never verified,
+/// so the channel is refused until the table is re-verified. A held or
+/// plugin-replied channel is never downgraded here: its answers are delivered
+/// as decisions, which type nothing.
 fn channel_for(
     tables: Option<&QuestionTables>,
     version: Option<(u64, u64, u64)>,
     channel: AnswerChannel,
 ) -> AnswerChannel {
     match (channel, tables) {
-        (AnswerChannel::Keys, Some(tables)) if !tables.covers(version) => {
+        (AnswerChannel::Keys, Some(tables)) if !tables.covers_keys(version) => {
             AnswerChannel::Unsupported
         }
         (AnswerChannel::Keys, None) => AnswerChannel::Unsupported,
@@ -1135,8 +1147,9 @@ fn claude_offers_auto_mode(tool_name: &str, permission_mode: Option<&str>) -> bo
 ///   `permission_mode`, Claude's keyboard-only "Yes, and switch to auto mode",
 ///   and No; held.
 ///
-/// `version` is the Claude Code version when known; the hook does not know it,
-/// and passes `None`.
+/// `version` is the Claude Code version when known. The hook passes the
+/// release the daemon latched from the pane's start-up header, when it
+/// answered one (issue #1724); `None` reads as a version the tables cover.
 #[allow(clippy::too_many_arguments)]
 pub fn claude_permission_request(
     id: String,
@@ -3334,6 +3347,207 @@ mod tests {
         assert_eq!(certain, vec![true, true, false, false]);
         let plain = &unmarked.questions[0];
         assert!(plain.options.iter().all(|o| plain.number_certain(o)));
+    }
+
+    /// Scenario: Codex's command approval is asked of a pane whose release the
+    /// daemon latched past the minor the table was verified on (0.161 past
+    /// 0.160), and of one still inside it (a 0.160 patch), and of one older
+    /// than the table describes. Past the minor every option is keyboard-only
+    /// and the keys channel is unsupported, so nothing is typed; a patch
+    /// release inside the verified minor stays answerable by keys; below the
+    /// table's oldest version everything is keyboard-only, as it always was.
+    /// A Plan-mode form past the minor loses its keys channel too, since its
+    /// digits are what the table verified.
+    #[spec("question/model/009")]
+    #[test]
+    fn question_model_009_past_the_verified_minor_codex_answers_become_keyboard_only() {
+        let approval = |version| {
+            codex_permission_request(
+                "q-codex".into(),
+                "shell",
+                Some("npm install --save-dev msw".into()),
+                Some("npm install --save-dev msw"),
+                1,
+                version,
+            )
+            .sanitized()
+            .expect("still shown")
+        };
+
+        let past = approval(Some((0, 161, 0)));
+        assert_eq!(past.channel, AnswerChannel::Unsupported, "the keys channel");
+        assert!(
+            past.questions[0].options.iter().all(|o| o.keyboard_only),
+            "every option the deck would type is keyboard-only"
+        );
+        assert!(!past.has_answerable_option());
+        assert_eq!(
+            past.validate(&[answer(0, &[1], None)], false),
+            Err(AnswerRefusal::KeyboardOnly),
+            "a typed answer is refused as keyboard-only, not sent"
+        );
+
+        let patch = approval(Some((0, 160, 7)));
+        assert_eq!(patch.channel, AnswerChannel::Keys);
+        assert!(patch.questions[0].options.iter().all(|o| !o.keyboard_only));
+        let resolved = ResolvedAnswer {
+            question_index: 0,
+            option_indices: vec![1],
+            labels: vec!["Yes, proceed".into()],
+            roles: vec![OptionRole::AllowOnce],
+            text: None,
+        };
+        assert_eq!(
+            answer_keys(&AgentType::Codex, &patch, &[resolved]),
+            Ok(vec!["1".to_string()]),
+            "a patch inside the verified minor still types"
+        );
+
+        let below = approval(Some((0, 150, 0)));
+        assert_eq!(below.channel, AnswerChannel::Unsupported);
+        assert!(below.questions[0].options.iter().all(|o| o.keyboard_only));
+
+        let unknown = approval(None);
+        assert_eq!(unknown.channel, AnswerChannel::Keys);
+        assert!(
+            unknown.questions[0]
+                .options
+                .iter()
+                .all(|o| !o.keyboard_only)
+        );
+
+        let form_input = serde_json::json!({"questions": [
+            {"id": "only", "question": "Which?", "options": [{"label": "Red"}, {"label": "Green"}]},
+        ]});
+        let form =
+            codex_request_user_input(Some("call_past"), Some(&form_input), 1, Some((0, 161, 0)))
+                .expect("a form")
+                .sanitized()
+                .expect("still shown");
+        assert_eq!(
+            form.channel,
+            AnswerChannel::Unsupported,
+            "the form's digits are the table's verified behaviour too"
+        );
+    }
+
+    /// Scenario: Claude Code 2.2 asks a Bash permission and a multiple-choice
+    /// question, and asks to approve a plan. The permission and the question
+    /// are answered through the held hook, so past the verified minor (2.1)
+    /// their options stay voice-answerable; the plan approval is answered by
+    /// keys, so past that minor it is keyboard-only. A 2.1 release newer than
+    /// the one verified still answers the plan by keys. Devin past its
+    /// verified minor loses its keys channel too.
+    #[spec("question/model/010")]
+    #[test]
+    fn question_model_010_past_the_verified_minor_claudes_hook_answers_stay_answerable() {
+        let permission = claude_permission_request(
+            "q-claude".into(),
+            "Bash",
+            None,
+            Some("touch notes.txt".into()),
+            None,
+            None,
+            1,
+            Some((2, 2, 0)),
+        )
+        .question
+        .sanitized()
+        .expect("still shown");
+        assert_eq!(permission.channel, AnswerChannel::Held);
+        assert!(
+            permission.questions[0]
+                .options
+                .iter()
+                .all(|o| !o.keyboard_only),
+            "a hook allow/deny stays answerable past the verified minor"
+        );
+        assert_eq!(
+            permission.validate(&[answer(0, &[1], None)], false),
+            Ok(vec![ResolvedAnswer {
+                question_index: 0,
+                option_indices: vec![1],
+                labels: vec!["Yes".into()],
+                roles: vec![OptionRole::AllowOnce],
+                text: None,
+            }]),
+            "the held hook still delivers it"
+        );
+
+        let ask_input = serde_json::json!({"questions": [
+            {"question": "Colour?", "header": "Colour", "options": [{"label": "Red"}, {"label": "Green"}]},
+        ]});
+        let asked = claude_permission_request(
+            "q-ask".into(),
+            "AskUserQuestion",
+            Some(&ask_input),
+            None,
+            None,
+            None,
+            1,
+            Some((2, 2, 0)),
+        )
+        .question
+        .sanitized()
+        .expect("still shown");
+        assert_eq!(asked.channel, AnswerChannel::Held);
+        assert!(
+            asked.questions[0].options.iter().any(|o| !o.keyboard_only),
+            "the choices and Type something. stay answerable"
+        );
+
+        let plan = |version| {
+            claude_permission_request(
+                "q-plan".into(),
+                "ExitPlanMode",
+                None,
+                None,
+                None,
+                None,
+                1,
+                version,
+            )
+            .question
+            .sanitized()
+            .expect("still shown")
+        };
+        let plan_past = plan(Some((2, 2, 0)));
+        assert_eq!(plan_past.channel, AnswerChannel::Unsupported);
+        assert!(
+            plan_past.questions[0]
+                .options
+                .iter()
+                .all(|o| o.keyboard_only),
+            "plan approval is answered by keys, so past the verified minor it is keyboard-only"
+        );
+        assert_eq!(
+            plan_past.validate(&[answer(0, &[1], None)], false),
+            Err(AnswerRefusal::KeyboardOnly)
+        );
+        let plan_patch = plan(Some((2, 1, 400)));
+        assert_eq!(
+            plan_patch.channel,
+            AnswerChannel::Keys,
+            "a patch inside the verified minor still answers by keys"
+        );
+        assert!(
+            plan_patch.questions[0]
+                .options
+                .iter()
+                .any(|o| !o.keyboard_only)
+        );
+
+        let devin = devin_permission_request(
+            "q-devin".into(),
+            "exec",
+            Some("cargo publish".into()),
+            1,
+            Some((3000, 12, 0)),
+        )
+        .sanitized()
+        .expect("still shown");
+        assert_eq!(devin.channel, AnswerChannel::Unsupported);
+        assert!(devin.questions[0].options.iter().all(|o| o.keyboard_only));
     }
 
     /// Scenario: Every shape an answer can be wrong in is refused with the

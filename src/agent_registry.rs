@@ -379,11 +379,15 @@ pub type StrandedLineRecogniser =
 pub struct QuestionTables {
     /// The oldest version these tables are known to describe. A version below
     /// it lists the table's options keyboard-only and refuses the keys channel.
-    /// An unknown version (no producer reports one today) is treated as covered:
+    /// An unknown version (no producer reports one) is treated as covered:
     /// the lane-2 tests are the guard.
     pub verified_from: (u64, u64, u64),
-    /// The newest version the tables were verified on, for the docs and for
-    /// whoever next measures them.
+    /// The newest version the tables were verified on. A version past its
+    /// major.minor lists the options the deck would type keyboard-only and
+    /// refuses the keys channel (issue #1724) until the tables are
+    /// re-verified; answers delivered as a hook decision or a plugin reply
+    /// stay answerable past it. A patch release inside the verified minor
+    /// stays covered.
     pub verified_on: (u64, u64, u64),
     pub menus: &'static [MenuTable],
 }
@@ -402,6 +406,19 @@ impl QuestionTables {
     /// is.
     pub fn covers(&self, version: Option<(u64, u64, u64)>) -> bool {
         version.is_none_or(|v| v >= self.verified_from)
+    }
+
+    /// Whether the deck may answer from these tables by typing on `version`
+    /// (issue #1724): an unknown version (`None`) is one the tables describe,
+    /// and a known one is only within `verified_from` and the minor of
+    /// `verified_on` — past that minor the keys and digit mappings were never
+    /// verified, so answers the deck would type wait for a re-verification.
+    /// Answers delivered as a hook decision or a plugin reply type nothing,
+    /// so [`Self::covers`] alone governs them.
+    pub fn covers_keys(&self, version: Option<(u64, u64, u64)>) -> bool {
+        version.is_none_or(|v| {
+            v >= self.verified_from && (v.0, v.1) <= (self.verified_on.0, self.verified_on.1)
+        })
     }
 }
 
