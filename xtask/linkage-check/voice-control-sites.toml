@@ -29,6 +29,12 @@
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "() => onDismissWorktree?.(kept.id)"
+reason = "Dismisses one informational kept-worktree notice; the close itself already uses the shared voice confirmation path. This is a notification dismissal, not a new capability."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "() => setPaletteOpen(true)"
 reason = "The deck's Command button: opens the command palette, a pointer/keyboard launcher whose entries all dispatch through VOICE_ACTIONS. Voice is its own launcher; `list_commands` shows what can be said."
 

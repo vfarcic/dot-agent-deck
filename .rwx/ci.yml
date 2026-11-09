@@ -287,14 +287,10 @@ tasks:
     env:
       SHARD: ${{ parallel.shard }}
     run: |
-      # `lifecycle/version/001` runs a nested cold `cargo build` (72-370s in CI)
-      # and set the floor of whichever partition drew it, so it runs alone in
-      # its own shard and the other four split the rest of the tier.
-      if [ "$SHARD" = version ]; then
-        set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
-      else
-        set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
-      fi
+      # `scripts/e2e-shard.sh` holds what each shard selects, for ci.yml too:
+      # the `tests/e2e_*.rs` binaries and the `e2e_only…` modules, not the
+      # fast tier the `test` task already ran (issue #2091), with
+      # `lifecycle/version/001` alone in the `version` shard.
       # Extracted into the workspace, so `target/` lands where the tests'
       # compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
       # Under scripts/rwx-export-root.sh: a task's `/` is overlayfs, which the
@@ -304,9 +300,9 @@ tasks:
       # rule accepts (docs/develop/rwx.md, "The export chain"). GitHub's
       # runners need no such step (their root is ext4), so ci.yml runs the
       # tier without it.
-      scripts/rwx-export-root.sh \
+      scripts/rwx-export-root.sh scripts/e2e-shard.sh "$SHARD" \
         cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
-        --extract-to . --extract-overwrite --retries 1 "$@"
+        --extract-to . --extract-overwrite --retries 1
     outputs:
       # Nothing uses a partition's filesystem; uploading it cost 5 minutes.
       filesystem: false

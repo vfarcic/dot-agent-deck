@@ -1215,7 +1215,9 @@ jobs:
   # checkout. One test, `lifecycle/version/001`, runs a nested cold
   # `cargo build` (72-370s in CI) and had set the floor of whichever partition
   # drew it, so it runs alone in its own shard and the other four split the
-  # rest with `--partition count:N/4`. Measured on 2026-10-18 against the
+  # rest with `--partition count:N/4`. The archive holds the fast tier too, and
+  # the shards skip it: they run the `tests/e2e_*.rs` binaries and the
+  # `e2e_only…` modules (`scripts/e2e-shard.sh`, issue #2091). Measured on 2026-10-18 against the
   # single-job layout on the same commits: ~12.6 minutes to a Linux verdict
   # instead of ~20.
   e2e-build:
@@ -1371,16 +1373,16 @@ jobs:
       #
       # The archive is extracted into the checkout, so `target/` lands where the
       # tests' compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
+      #
+      # What each shard selects — the `tests/e2e_*.rs` binaries and the
+      # `e2e_only…` modules, not the fast tier again — is in
+      # `scripts/e2e-shard.sh`, which `.rwx/ci.yml` calls too (issue #2091).
       - env:
           SHARD: ${{ matrix.shard }}
         run: |
-          if [ "$SHARD" = version ]; then
-            set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
-          else
-            set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
-          fi
-          cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
-            --extract-to . --extract-overwrite --retries 1 "$@"
+          scripts/e2e-shard.sh "$SHARD" \
+            cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+            --extract-to . --extract-overwrite --retries 1
       # Issue #564: keep THIS attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos`. It matters more here than anywhere else in this file:

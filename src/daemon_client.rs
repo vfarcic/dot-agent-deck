@@ -3626,6 +3626,28 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Ask what closing these panes would keep, on the admitted daemon process.
+    /// Uses the existing v8 request; callers bound their best-effort UI hint.
+    pub async fn dispatch_worktree_close_preview(
+        &self,
+        pane_ids: Vec<String>,
+    ) -> Result<Option<crate::issue_dispatch_run::KeptWorktree>, ClientError> {
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::DispatchWorktreeClosePreview { pane_ids },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error
+                    .unwrap_or_else(|| "worktree close preview failed".into()),
+            ));
+        }
+        Ok(resp.kept_worktree)
+    }
+
     /// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection.
     /// Returns once the daemon has confirmed the subscription with a
     /// successful RESP — subsequent frames on the wire are `KIND_EVENT`

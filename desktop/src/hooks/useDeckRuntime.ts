@@ -8,6 +8,7 @@ import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
+import type { WorktreeKeptEntry } from "../lib/worktreeClose";
 import type { VoiceNumberedListDto } from "../lib/voiceNumbers";
 import type { UpgradeChoice, UpgradeEvent } from "../lib/upgrade";
 import type { QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
@@ -140,6 +141,10 @@ export function useDeckRuntime(): DeckRuntimeState {
    */
   const [cleanupWarnings, setCleanupWarnings] = useState<readonly CleanupWarningEntry[]>([]);
   const nextCleanupWarningId = useRef(0);
+  const [worktreeKept, setWorktreeKept] = useState<readonly WorktreeKeptEntry[]>([]);
+  const nextWorktreeId = useRef(0);
+  const dismissWorktreeKept = useCallback((id: number) => setWorktreeKept((current) => current.filter((entry) => entry.id !== id)), []);
+  const previewWorktreeClose = useCallback<NonNullable<DeckRuntimeState["previewWorktreeClose"]>>((deckId, paneIds, incarnation) => bridge.previewWorktreeClose(deckId, paneIds, incarnation), [bridge]);
   // PTY bytes deliberately bypass React state. Routing every output chunk
   // through setState re-rendered the whole deck per chunk per agent — with six
   // streaming agents the main thread spent its time reconciling instead of
@@ -247,6 +252,12 @@ export function useDeckRuntime(): DeckRuntimeState {
         unsubscribe = await bridge.subscribe(
           (next) => active && adoptFleet(next),
           (event) => active && updateTerminal(event),
+          (notice) => {
+            if (!active) return;
+            const deck = fleetRef.current.find((item) => item.connection.deckId === notice.deckId);
+            const entry = { ...notice, id: ++nextWorktreeId.current, deck: deck ? deckName(deck.connection) : notice.deckId };
+            setWorktreeKept((current) => [...current, entry]);
+          },
         );
         if (!active) {
           unsubscribe();
@@ -491,6 +502,9 @@ export function useDeckRuntime(): DeckRuntimeState {
     ...(inboxAction ? { inboxAction } : {}),
     sendTerminalInput,
     resizeTerminal,
+    previewWorktreeClose,
+    worktreeKept,
+    dismissWorktreeKept,
     setShownTerminals,
     reconnect,
     listProjects,
