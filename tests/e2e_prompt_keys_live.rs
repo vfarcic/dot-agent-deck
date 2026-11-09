@@ -22,7 +22,7 @@
 //! that genuine turns deliver final replies to a subscribed client, with
 //! OpenCode, Codex and Pi delivering each turn only once.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::{Duration, Instant};
 

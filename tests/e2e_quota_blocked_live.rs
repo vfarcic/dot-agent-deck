@@ -2,7 +2,7 @@
 
 //! Real-agent checks for non-quota API failures in the Blocked status path.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

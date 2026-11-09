@@ -2,7 +2,7 @@
 
 //! Synthetic L2 coverage for history-only input delivery and visible feedback.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;

@@ -10,7 +10,7 @@
 //! `ReloadSchedules` handler replies with `ok = true` and the names of the
 //! currently-registered ENABLED tasks in `AttachResponse.agents`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 #[path = "support/inbox_view.rs"]
 mod view;

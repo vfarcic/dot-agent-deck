@@ -58,7 +58,7 @@
 //! No operation installs in production, sets permission, supplies an empty
 //! observation, publishes an arm, or resets the Schedule. No real agent runs.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]

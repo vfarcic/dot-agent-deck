@@ -16,6 +16,8 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Where a feeder parks.
+// Off Linux only the `Output*` points exist, which trips the prefix lint.
+#[cfg_attr(not(target_os = "linux"), allow(clippy::enum_variant_names))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StampPoint {
     /// `OutputHook::on_output`: the push's offset advanced, its stamp not

@@ -196,7 +196,7 @@ const SHARED_VAR_TMP: &str = "/var/tmp";
 /// The longest `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` any test in this
 /// repository pins — the orphan window [`DEAD_PID_MIN_AGE`] is derived from.
 ///
-/// The harness default is 300 s (`tests/common/mod.rs` pins it at both
+/// The harness default is 300 s (`tests/common/lib.rs` pins it at both
 /// `env_clear` sites, and `tests/common/child_lifetime_bound.rs` clamps an
 /// ambient value to it), but a test may legitimately pin a longer one for
 /// itself: `orchestration_dispatch_002` pins **900** so the daemon outlives
@@ -226,7 +226,7 @@ pub(crate) const MAX_PINNED_ORPHAN_CAP_SECS: u64 = 900;
 /// not the same thing as the tree being unreferenced.
 ///
 /// The name carries the *test process's* PID, but the processes that test
-/// spawned do not die with it. `tests/common/mod.rs` says so at the group-kill
+/// spawned do not die with it. `tests/common/lib.rs` says so at the group-kill
 /// site: "The deck's own lazy-spawned daemon setsid's into a separate session
 /// and escapes this group — its `DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS` cap is
 /// the net for that." `src/daemon_attach.rs` runs `setsid(2)` in `pre_exec` so
@@ -343,7 +343,7 @@ struct VettedRoot {
 
 /// The private, UID-scoped parent the harness puts its per-process roots in.
 ///
-/// Mirrors `private_parent_name()` in `tests/common/mod.rs`, duplicated rather
+/// Mirrors `private_parent_name()` in `tests/common/lib.rs`, duplicated rather
 /// than shared because an xtask crate cannot depend on an integration-test
 /// module. Unix-only and `cfg`-gated to match the harness exactly: on Windows
 /// `/var/tmp` is a root-relative path on the current drive that the harness

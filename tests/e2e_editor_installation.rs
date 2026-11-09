@@ -2,7 +2,7 @@
 
 //! Installation contracts at the real spawn boundary. All agents are Python
 //! stand-ins; no real editor, agent, user configuration or production endpoint.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

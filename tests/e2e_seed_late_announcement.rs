@@ -3,7 +3,7 @@
 //! Lane-1 TUI seed coverage: late or missed SessionStart cannot lose an inbox
 //! seed.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;

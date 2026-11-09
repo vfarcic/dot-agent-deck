@@ -20,7 +20,7 @@
 //! current offset. The nonempty-master test below must fail on that mutant;
 //! the mutation is not part of production and is not claimed executed yet.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/pty_frontier.rs"]
 mod fixture;
 #[path = "support/inbox_doorbell.rs"]

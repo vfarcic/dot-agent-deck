@@ -12,7 +12,7 @@
 //!
 //! Lane 1 — no real agent is involved anywhere, so this runs in CI on every PR.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{TuiDeck, write_hook_line};
 use spec::spec;

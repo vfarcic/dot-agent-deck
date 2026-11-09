@@ -5,7 +5,7 @@
 //! second, fixed-size client records the same live card before and after it
 //! attaches the agent's pane.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::cell::RefCell;
 use std::time::Duration;

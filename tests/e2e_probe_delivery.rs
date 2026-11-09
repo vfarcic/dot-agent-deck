@@ -4,7 +4,7 @@
 //! Uses S-20's read-only observations and ordinary scheduling requests. No
 //! test operation supplies an empty observation, opens a gate or forces a ring.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]

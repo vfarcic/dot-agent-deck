@@ -29,7 +29,7 @@
 //! `DOT_AGENT_DECK_REUSE_DEBOUNCE_MS` environment variable (milliseconds), so
 //! reuse/003 runs fast without a real ~5s wait. It sets the window to 2000.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;

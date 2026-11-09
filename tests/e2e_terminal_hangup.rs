@@ -26,7 +26,7 @@
 //! Linux-only: this scenario uses Linux's controlling-terminal behaviour. The
 //! L1 tests in `crate::terminal_hangup` cover macOS's hangup detection.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::Read as _;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};

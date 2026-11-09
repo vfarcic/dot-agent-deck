@@ -135,7 +135,7 @@
 //! Decision 6: gated behind the `e2e` feature so `cargo test-fast` never
 //! compiles it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

@@ -1,7 +1,7 @@
-#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
+#![cfg(all(feature = "e2e", feature = "e2e-live", target_os = "linux"))]
 
 //! Interactive Claude inbox delivery, with a real Haiku agent in an attached PTY.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/claude_installed.rs"]

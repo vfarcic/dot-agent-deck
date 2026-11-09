@@ -2,7 +2,7 @@
 
 //! PTY-attached close-confirmation coverage for dashboard cards.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

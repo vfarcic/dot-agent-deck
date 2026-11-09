@@ -35,7 +35,7 @@
 //! native stand-in as Armable; the production launcher/interpreter binding
 //! work stays in Q35-22. A missing e2e binding must be reported explicitly.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]

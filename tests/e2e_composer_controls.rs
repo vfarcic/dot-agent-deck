@@ -5,7 +5,7 @@
 //! refuse what they must. A smoke test of the controls themselves; the rows
 //! that use them are S-20b's and S-20c's.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]

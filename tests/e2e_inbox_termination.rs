@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! Truthful user-facing termination notices from synthetic pane commands.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]

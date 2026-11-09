@@ -1113,7 +1113,7 @@ fn first_durable_path_match(
 
 /// `current_exe()`, or — only under the `e2e` feature, and only once
 /// [`set_test_current_exe_override`] has been called — the injected test
-/// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/mod.rs`)
+/// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/lib.rs`)
 /// calls the setter with the built deck binary — a link to
 /// `env!("CARGO_BIN_EXE_dot-agent-deck")` outside the checkout — before driving
 /// `handle_delegate`, because a `handle_delegate` run entirely in-process

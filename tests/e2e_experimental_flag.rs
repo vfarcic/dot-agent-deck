@@ -21,7 +21,7 @@
 //! footer do not exist yet — and NOT run per-task (CLAUDE.md rule 5: the L2 suite is
 //! the pre-PR gate, not the per-task gate).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

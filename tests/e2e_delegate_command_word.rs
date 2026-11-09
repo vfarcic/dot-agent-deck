@@ -16,7 +16,7 @@
 //! for is an agent copying the line out of its task file; the real-agent end
 //! of that is `delegate_work_done_chain_claude`, in lane 2.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

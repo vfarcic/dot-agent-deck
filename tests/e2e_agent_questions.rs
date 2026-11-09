@@ -3,7 +3,7 @@
 //! Real interactive agents answering permission prompts and whole forms.
 //! Cost: short turns on cheap models; requires the developer's credentials.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "common/questions.rs"]
 mod questions;
 

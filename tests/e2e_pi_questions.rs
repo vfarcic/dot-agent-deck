@@ -2,7 +2,7 @@
 
 //! Credential-free Pi extension dialog: no prompt and no model request.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "common/questions.rs"]
 mod questions;
 

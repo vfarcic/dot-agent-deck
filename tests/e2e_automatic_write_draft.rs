@@ -3,13 +3,14 @@
 //! Attached-TUI draft regressions retargeted from typed task delivery to the
 //! inbox doorbell. Synthetic panes spend no real-agent credential.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 
 use common::TuiDeck;
 use inbox::*;
 use spec::spec;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 fn launch_with(extra: &[(&str, &str)]) -> (TuiDeck, Pane) {
