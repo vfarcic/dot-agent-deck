@@ -17951,12 +17951,23 @@ impl AgentPtyRegistry {
             "worker blocked by a usage limit",
             text,
         ) {
-            Ok(_) => tracing::info!(
-                worker_pane_id = %worker_pane_id,
-                role = %notice.role,
-                "quota: reported a delegated worker blocked by a provider usage limit to the \
-                 orchestrator"
-            ),
+            Ok(_) => {
+                tracing::info!(
+                    worker_pane_id = %worker_pane_id,
+                    role = %notice.role,
+                    "quota: reported a delegated worker blocked by a provider usage limit to the \
+                     orchestrator"
+                );
+                // Issue #2099: the orchestrator has been told its task will
+                // likely not complete, which ends the task's hand-off.
+                crate::telemetry::observe_worker_stopped(
+                    self.telemetry(),
+                    &self
+                        .inbox()
+                        .open_tasks_of_generation(worker_pane_id, worker_agent_id),
+                    crate::telemetry::handoff::Stopped::Blocked,
+                );
+            }
             Err(error) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %notice.role,

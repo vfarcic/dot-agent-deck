@@ -19,7 +19,13 @@
 //!   `agent.handoff.read` span, a child of the hand-off's span that starts
 //!   where the hand-off ended;
 //! - the task found undeliverable ends it `undeliverable`, with the inbox's
-//!   reason, or `superseded` when that reason is a newer task replacing it.
+//!   reason, or `superseded` when that reason is a newer task replacing it;
+//! - the deck telling the orchestrator that the task's worker stopped — its
+//!   turn ended on an error, or on a provider usage limit — ends it
+//!   `worker_failed` or `worker_blocked` (issue #2099;
+//!   [`super::observe_worker_stopped`]). The worker still owes the task, and a
+//!   report it sends later is not counted on the ended span: the hand-off says
+//!   what the orchestrator was told, when it was told.
 //!
 //! **Why the read is a span of its own.** The hand-off ends when the report
 //! arrives, so it measures the worker's side whatever the orchestrator does
@@ -98,6 +104,12 @@ pub enum Outcome {
     /// Its orchestrator's run ended with no report, or the hand-off was
     /// evicted.
     Unknown,
+    /// Issue #2099: the deck told the orchestrator the worker's turn ended on
+    /// an error with the task still owed.
+    WorkerFailed,
+    /// Issue #2099: the deck told the orchestrator the worker is blocked by a
+    /// provider usage limit or credit pool with the task still owed.
+    WorkerBlocked,
     /// The daemon shut down with no report.
     DaemonShutdown,
 }
@@ -109,6 +121,8 @@ impl Outcome {
             Outcome::Undeliverable(_) => "undeliverable",
             Outcome::Superseded => "superseded",
             Outcome::Unknown => "unknown",
+            Outcome::WorkerFailed => "worker_failed",
+            Outcome::WorkerBlocked => "worker_blocked",
             Outcome::DaemonShutdown => "daemon_shutdown",
         }
     }
@@ -179,6 +193,18 @@ pub enum Change {
         pane: String,
         agent: Option<String>,
     },
+    /// Issue #2099: the deck told the orchestrator that the worker owing task
+    /// `0` stopped, as `1` says.
+    Stopped(String, Stopped),
+}
+
+/// Issue #2099: why the deck reported a worker that owes a task as stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stopped {
+    /// Its turn ended on an error.
+    Failed,
+    /// Its provider refused it for a usage limit or credit pool.
+    Blocked,
 }
 
 impl Change {
@@ -215,7 +241,10 @@ impl Change {
     /// The message this change is about.
     pub fn message_id(&self) -> Option<&str> {
         match self {
-            Change::Taken(id) | Change::Acknowledged(id) | Change::Undeliverable(id, _) => Some(id),
+            Change::Taken(id)
+            | Change::Acknowledged(id)
+            | Change::Undeliverable(id, _)
+            | Change::Stopped(id, _) => Some(id),
             Change::Report { report, .. } => Some(report),
             Change::Uncorrelated { .. } => None,
         }
@@ -374,6 +403,7 @@ impl Handoffs {
         if let Change::Taken(id)
         | Change::Acknowledged(id)
         | Change::Undeliverable(id, _)
+        | Change::Stopped(id, _)
         | Change::Report { task: id, .. } = &change
             && self.ended_ids.contains(id)
         {
@@ -409,6 +439,16 @@ impl Handoffs {
                 let outcome = match reason {
                     Some(UndeliverableReason::Superseded) => Outcome::Superseded,
                     other => Outcome::Undeliverable(other),
+                };
+                self.end(&id, outcome, now, finished);
+            }
+            Change::Stopped(id, stopped) => {
+                if !self.open.contains_key(&id) {
+                    return false;
+                }
+                let outcome = match stopped {
+                    Stopped::Failed => Outcome::WorkerFailed,
+                    Stopped::Blocked => Outcome::WorkerBlocked,
                 };
                 self.end(&id, outcome, now, finished);
             }
@@ -973,6 +1013,50 @@ mod tests {
             Some("agent_exited")
         );
         assert!(span.events.is_empty());
+    }
+
+    #[test]
+    fn a_stopped_worker_ends_the_handoff_with_why_and_once() {
+        // Issue #2099: the deck telling the orchestrator its worker failed
+        // ends the hand-off there, not when the orchestrator's run ends.
+        for (stopped, outcome) in [
+            (Stopped::Failed, "worker_failed"),
+            (Stopped::Blocked, "worker_blocked"),
+        ] {
+            let mut tracker = team("worker-1");
+            post(&mut tracker, 10);
+            tracker.observe_inbox(&notice(WORKER, TASK, StateName::Acknowledged), 12);
+            tracker.observe_worker_stopped(&[TASK.to_string()], stopped, 20);
+            let span = only_handoff(&mut tracker);
+            assert_eq!(text(&span, AttrKey::HandoffOutcome), Some(outcome));
+            assert_eq!(span.end_unix_nanos, 20);
+            assert_eq!(tracker.handoffs_held(), (0, 0));
+            // A later report, a second stop or the run's end ends nothing more.
+            tracker.observe_inbox(&report(TASK, "worker-1"), 30);
+            tracker.observe_worker_stopped(&[TASK.to_string()], Stopped::Failed, 31);
+            assert!(handoffs(&tracker.take_finished()).is_empty());
+        }
+        // Control: a reported task is not turned into a stopped one.
+        let mut tracker = team("worker-1");
+        post(&mut tracker, 10);
+        tracker.observe_inbox(&report(TASK, "worker-1"), 15);
+        tracker.observe_worker_stopped(&[TASK.to_string()], Stopped::Failed, 20);
+        let spans = tracker.take_finished();
+        assert_eq!(handoffs(&spans).len(), 1, "{spans:?}");
+        assert_eq!(
+            text(handoffs(&spans)[0], AttrKey::HandoffOutcome),
+            Some("reported")
+        );
+    }
+
+    #[test]
+    fn a_stop_that_overtakes_the_post_is_applied_when_it_arrives() {
+        let mut tracker = team("worker-1");
+        tracker.observe_worker_stopped(&[TASK.to_string()], Stopped::Blocked, 9);
+        assert_eq!(tracker.handoffs_held(), (0, 1));
+        post(&mut tracker, 10);
+        let span = only_handoff(&mut tracker);
+        assert_eq!(text(&span, AttrKey::HandoffOutcome), Some("worker_blocked"));
     }
 
     #[test]
