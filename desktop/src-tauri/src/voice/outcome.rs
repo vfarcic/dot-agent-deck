@@ -2981,13 +2981,16 @@ fn local_intercept(
     // No meaning check here, and none is needed: nothing observed reaches
     // this function, and each path below dispatches only for the whole
     // utterance being one of a fixed list of the app's own phrases (or, for
-    // dictation, opening with one), which is the request itself.
-    let dispatch = |row: &CommandRow, params: Vec<ResolvedParam>| {
+    // dictation, opening with one), which is the request itself. The sentence
+    // is an argument rather than always `report(row, &params)` because the
+    // one path that resolves no params — the open agent's stop — cannot use
+    // the row's report, which names the agent it stopped.
+    let dispatch = |row: &CommandRow, params: Vec<ResolvedParam>, sentence: String| {
         if !row.callable_on(screen) {
             return VoiceOutcome::unavailable(transcript.clone(), row);
         }
         VoiceOutcome::Dispatch {
-            sentence: report(row, &params),
+            sentence,
             transcript: transcript.clone(),
             action: row.id.clone(),
             invoke: row.invoke.clone(),
@@ -3005,7 +3008,7 @@ fn local_intercept(
         if said_whole(transcript.text(), phrases.iter().copied())
             && let Some(row) = table.row(row_id)
         {
-            return Some(dispatch(row, Vec::new()));
+            return Some(dispatch(row, Vec::new(), report(row, &[])));
         }
     }
 
@@ -3019,13 +3022,24 @@ fn local_intercept(
     // the target in. Only where the row is callable as a whole (`callable`,
     // requirements included), so the New agent dialog still withholds it
     // where that dialog can be open.
+    //
+    // The sentence is not the row's report, which names the agent it stopped
+    // (`{agent}`): this path resolved none — the table cannot know which
+    // agent the pane on screen is for — and `report` leaves an unsupplied
+    // placeholder in the sentence, so the user was shown "Confirm stopping
+    // {agent}" (PR review). This path says what it did without the name, and
+    // the confirmation it opens names the agent.
     if screen == Screen::Agent
         && let Some(row) = table.row(STOP_AGENT_ROW)
         && row.callable(screen, directories, new_agent)
         && (said_whole(transcript.text(), TYPING_STOP_PHRASES)
             || said_whole(transcript.text(), CLOSE_AGENT_PHRASES))
     {
-        return Some(dispatch(row, Vec::new()));
+        return Some(dispatch(
+            row,
+            Vec::new(),
+            "Confirm stopping the open agent — nothing has been stopped yet.".to_string(),
+        ));
     }
 
     // PRD #1541: the typing-mode prompt commands, said with typing mode OFF on
@@ -3059,13 +3073,13 @@ fn local_intercept(
         )
         && said_whole(transcript.text(), CLOSE_OVER_DIALOG_PHRASES)
     {
-        return Some(dispatch(row, Vec::new()));
+        return Some(dispatch(row, Vec::new(), report(row, &[])));
     }
 
     if said_whole(transcript.text(), SUBMIT_PHRASES)
         && let Some(row) = table.row(SUBMIT_ROW)
     {
-        return Some(dispatch(row, Vec::new()));
+        return Some(dispatch(row, Vec::new(), report(row, &[])));
     }
 
     // The send phrases beyond that list — "go ahead", "that is the end",
@@ -3080,7 +3094,7 @@ fn local_intercept(
         && row.callable(screen, directories, new_agent)
         && said_whole(transcript.text(), SUBMIT_WHERE_CALLABLE_PHRASES)
     {
-        return Some(dispatch(row, Vec::new()));
+        return Some(dispatch(row, Vec::new(), report(row, &[])));
     }
 
     let opener = opening_with(transcript.text(), &DICTATION_OPENERS)?;
@@ -3097,18 +3111,17 @@ fn local_intercept(
         .params
         .iter()
         .find(|spec| spec.name == DICTATE_PARAM && spec.kind == ParamKind::SpokenPrefix)?;
-    Some(dispatch(
-        row,
-        vec![ResolvedParam {
-            name: spec.name.clone(),
-            kind: spec.kind,
-            spoken: opener.to_string(),
-            value: typed.to_string(),
-            label: typed.to_string(),
-            deck_identity: None,
-            names: Vec::new(),
-        }],
-    ))
+    let params = vec![ResolvedParam {
+        name: spec.name.clone(),
+        kind: spec.kind,
+        spoken: opener.to_string(),
+        value: typed.to_string(),
+        label: typed.to_string(),
+        deck_identity: None,
+        names: Vec::new(),
+    }];
+    let sentence = report(row, &params);
+    Some(dispatch(row, params, sentence))
 }
 
 /// The value the model put under another row's name for a daemon, for a
@@ -13919,6 +13932,15 @@ mod tests {
                 "{said}: {:?}",
                 answer.outcome
             );
+            /* The sentence a user is shown: the row's report names the agent
+            it stopped (`{agent}`), and this dispatch resolved none, so a
+            report built from no params would show the placeholder itself
+            (PR review). */
+            assert_eq!(
+                answer.outcome.sentence(),
+                "Confirm stopping the open agent — nothing has been stopped yet.",
+                "{said}: the report must not show an unreplaced placeholder"
+            );
             assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
         }
     }
@@ -13950,6 +13972,11 @@ mod tests {
                     if action == "stop_agent" && params.is_empty()),
                 "{said}: {:?}",
                 answer.outcome
+            );
+            assert_eq!(
+                answer.outcome.sentence(),
+                "Confirm stopping the open agent — nothing has been stopped yet.",
+                "{said}: the report must not show an unreplaced placeholder"
             );
         }
         // Politeness aside, the same request; a sentence that says anything

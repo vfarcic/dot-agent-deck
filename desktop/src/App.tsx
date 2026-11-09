@@ -415,6 +415,18 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * `paneAgentRetired` below closes the view back to the screen it came from.
    */
   const [paneStop, setPaneStop] = useState<ConfirmState>();
+  /* Issue #1402 review — the pane's stop confirmation belongs to the pane and
+     never outlives it. The view closes when its agent retires or is replaced
+     under it (`paneAgentRetired` below) or when the user leaves; whichever
+     way it goes, the confirmation goes with it, so no captured `stop_agent`
+     for an agent the screen no longer shows is left answerable over the
+     screen the pane was opened from. Clearing only on the view's absence
+     keeps this out of the confirm path, where the dialog closes itself when
+     the action it ran settles. */
+  useEffect(() => {
+    // voice-registry-exempt: an invariant, not a control — the pane's stop confirmation is cleared with the view it belongs to, and nothing is opened
+    if (!agentView) setPaneStop(undefined);
+  }, [agentView]);
   /** The pane's own `stop_agent`, swallowed on failure exactly as the overview's stop run does: the runtime files the error. */
   const runPaneStopAction = useCallback(async (action: Parameters<DeckRuntimeState["runAction"]>[0]) => {
     try {
@@ -458,11 +470,24 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   useEffect(() => {
     if (!agentView) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && !prBrowserOpen.current) closeAgentView();
+      if (event.key !== "Escape" || prBrowserOpen.current) return;
+      /* Issue #1402 review — the pane's stop confirmation is drawn OVER the
+         pane, so `Escape` cancels it first and the pane stays open under it;
+         only with nothing to cancel does the key close the pane, as before.
+         The dialog fences the pane while it is up, but `inert` takes the
+         background out of the tab order and hit testing — it cannot stop a
+         `window` listener — so without this the key closed the pane and left
+         the confirmation answerable over the screen beneath. */
+      if (paneStop !== undefined) {
+        // voice-registry-exempt: a dismissal — Escape cancels the open confirmation, exactly as its own Cancel button does
+        setPaneStop(undefined);
+        return;
+      }
+      closeAgentView();
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [agentView, closeAgentView]);
+  }, [agentView, closeAgentView, paneStop]);
   const base = agentView?.from ?? view.kind;
   /**
    * Issue #1197 — the one rail, and the overlays it shows as open. Held here
@@ -1188,8 +1213,14 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          pane's Close agent button opens — on both pane origins, since the
          deck screen publishes no stop member of its own. It refuses a target
          that is not the open pane's agent: the dashboard rows behind the
-         pane are fenced, and voice acts on what is on screen. */
-      ...(agentView && paneDeck && paneAgent && !paneAgentReplaced
+         pane are fenced, and voice acts on what is on screen.
+         Published whenever the pane is open, NOT only while its agent
+         resolves: a pane whose daemon stopped answering keeps its view (the
+         held record below) with no `paneAgent`, and a handler that vanished
+         with the record left the overview's own member serving stops for the
+         fenced rows behind the pane (PR review) — so the missing, replaced
+         and unreachable cases are refused INSIDE, in words. */
+      ...(agentView
         ? {
           confirmStopAgent: (target: VoiceDispatchTarget): string | undefined => {
             if (paneStop !== undefined) return CONFIRMATION_ALREADY_OPEN;
@@ -1283,7 +1314,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, paneAgentReplaced, paneDeck, paneStop, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, runPaneStopAction, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, paneDeck, paneStop, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, runPaneStopAction, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */

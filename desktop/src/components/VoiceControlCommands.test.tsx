@@ -4443,14 +4443,17 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
    * bare "stop", which resolves to `stop_agent` naming no agent. The open
    * pane's agent is what a stop means there: the pane's own Close agent
    * confirmation opens over it, and confirming sends one `stop_agent` for that
-   * agent. Nothing is stopped until then, exactly as on the dashboard.
+   * agent. Nothing is stopped until then, exactly as on the dashboard. The
+   * report names no agent either — Rust cannot know which one the pane shows —
+   * so it says "the open agent" rather than showing an unreplaced `{agent}`
+   * placeholder (PR review).
    */
   it("opens the pane's own confirmation for a spoken stop on the agent screen", async () => {
     const voice = microphone([]);
     const snapshot = createFixtureSnapshot("connected");
     const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
     const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) =>
-      dispatch("stop_agent", "confirmStopAgent", "Confirm stopping planner — nothing has been stopped yet.", utterance));
+      dispatch("stop_agent", "confirmStopAgent", "Confirm stopping the open agent — nothing has been stopped yet.", utterance));
     const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], runAction });
     if (!snapshot.connection.deckId) throw new Error("fixture deck id missing");
     render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: snapshot.connection.deckId, agentId: "planner", from: "deck" }} />);
@@ -4459,6 +4462,7 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     voice.deliver("stop");
     await completeUtterance();
 
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Confirm stopping the open agent — nothing has been stopped yet.");
     const dialog = confirmation();
     expect(dialog).not.toBeNull();
     expect(dialog).toHaveTextContent("Close Plan / architecture?");
@@ -4498,6 +4502,53 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     expect(confirmation()).toBeNull();
     expect(runAction).not.toHaveBeenCalled();
     expect(screen.getByTestId("voice-report")).toHaveTextContent("Only the agent on screen can be closed from here, so nothing was closed.");
+  });
+
+  /**
+   * Scenario (issue #1402 review): the pane is open over the dashboard and
+   * its own daemon has stopped answering, so the pane keeps its last record
+   * and offers no stop of its own. A spoken stop naming an agent of the
+   * other, connected daemon — whose row is fenced behind the pane — is
+   * refused in words: the pane's stop member stays published while the pane
+   * is open precisely so the dashboard's cannot serve a hidden row through
+   * it, and the pane's own target is unreachable.
+   */
+  it("refuses a spoken stop for an agent behind the pane whose own daemon is not answering", async () => {
+    const voice = microphone([]);
+    const connected = createFixtureSnapshot("connected");
+    const silent: DeckSnapshot = {
+      ...connected,
+      connection: { ...connected.connection, status: "disconnected", message: "No daemon is listening on the configured socket." },
+      agents: [],
+    };
+    const second = {
+      ...connected,
+      connection: { ...connected.connection, deckId: "deck-second" },
+      agents: connected.agents.map((agent) => ({ ...agent, daemonId: "deck-second" })),
+    };
+    const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) =>
+      dispatch("stop_agent", "confirmStopAgent", "Confirm stopping builder — nothing has been stopped yet.", utterance,
+        [{ name: "agent", kind: "agent_ref", spoken: "builder", value: "builder", label: "builder" }]));
+    const deck = runtime(resolveVoice, voice, { snapshot: connected, fleet: [connected], runAction });
+    if (!connected.connection.deckId) throw new Error("fixture deck id missing");
+    const pane = { kind: "agent" as const, deckId: connected.connection.deckId, agentId: "planner", from: "overview" as const };
+    const { rerender } = render(<DeckShell runtime={deck} initialView={pane} />);
+    await turnVoiceOn();
+
+    // The pane's daemon goes silent; the selected deck becomes the other,
+    // connected one, so a spoken name resolves against ITS agents.
+    rerender(<DeckShell runtime={{ ...deck, snapshot: second, fleet: [silent, second] }} initialView={pane} />);
+    await flush();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+
+    voice.deliver("stop builder");
+    await completeUtterance();
+
+    expect(confirmation()).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent(STOP_TARGET_GONE);
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
   });
 
   /** Scenario: a direct spoken stop is still resolving when its named agent is

@@ -176,6 +176,51 @@ describe("the agent screen's Close agent (issue #1402)", () => {
   });
 
   /**
+   * Scenario: the pane's stop confirmation is open and the user presses
+   * `Escape`. The confirmation is what is on top of the pane, so the key
+   * cancels it and the pane stays open under it — not the pane closing and
+   * leaving the confirmation answerable over the dashboard, which is what
+   * the pane's own `Escape` listener did before the confirmation was routed
+   * ahead of it (PR review).
+   */
+  it("Escape cancels the open confirmation and keeps the pane", () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AppDeckShell runtime={runtime({ runAction })} initialView={overviewPane("planner")} />);
+
+    fireEvent.click(paneStop());
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
+    expect(runAction).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: the pane's stop confirmation is open when the daemon stops
+   * listing the agent — it ended on its own, or another client stopped it —
+   * so the pane closes back to the dashboard. The confirmation goes with it:
+   * nothing is left answerable over the dashboard for an agent the screen no
+   * longer shows (PR review).
+   */
+  it("takes the confirmation with it when the agent retires beneath it", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const connected = createFixtureSnapshot("connected");
+    const { rerender } = render(<AppDeckShell runtime={runtime({ runAction }, connected)} initialView={overviewPane("planner")} />);
+
+    fireEvent.click(paneStop());
+    expect(screen.getByRole("alertdialog")).toBeVisible();
+
+    const stopped = { ...connected, agents: connected.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<AppDeckShell runtime={runtime({ runAction }, stopped)} initialView={overviewPane("planner")} />);
+    await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument());
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(screen.getByTestId("overview-table-region")).toBeVisible();
+    expect(runAction).not.toHaveBeenCalled();
+  });
+
+  /**
    * Scenario: the daemon refuses the stop. The confirmation still closes (the
    * runtime has filed the failure under its global error) and the pane stays:
    * the agent was not ended, so the view must not close either.
