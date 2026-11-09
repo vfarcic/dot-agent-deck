@@ -770,6 +770,16 @@ impl VoiceOutcome {
         }
     }
 
+    /// A model-selected stop in a pane needs the local phrases, not the
+    /// dashboard's named-agent example from `try_saying`.
+    fn pane_stop_phrase_required(transcript: Transcript, row: &CommandRow) -> Self {
+        Self::ActionUngrounded {
+            sentence: "Nothing was stopped. To close the agent you are viewing, say “close this agent” or “stop” on its own.".to_string(),
+            action: row.id.clone(),
+            transcript,
+        }
+    }
+
     /// The action exists and needs names the voice settings withhold (PRD
     /// #1223, audit finding A1) — [`VoiceOutcome::unavailable`]'s shape with
     /// [`LABELS_WITHHELD_HINT`] in place of the row's own hint.
@@ -1376,12 +1386,7 @@ fn decide(picked: &Picked<'_>, judged: &Judged<'_>) -> VoiceOutcome {
     // agent. Its whole-utterance phrases dispatch in local_intercept; a model
     // pick here must not turn a sentence containing "stop" into a close.
     if screen == Screen::Agent && row.id == "stop_agent" {
-        return VoiceOutcome::action_ungrounded(
-            transcript,
-            row,
-            Refusal::NotAlone(None),
-            &answer.params,
-        );
+        return VoiceOutcome::pane_stop_phrase_required(transcript, row);
     }
     // Whether the user's words ask for the pick, or for the reading taken in
     // its place. A pick they do not ask for is refused here — unless it
@@ -13972,11 +13977,14 @@ mod tests {
     }
 
     /// Scenario: the model picks stop_agent for sentences mentioning stop.
-    /// On the agent screen they dispatch nothing, even with a positive meaning
-    /// vote; the same sentence in typing mode is prompt text.
+    /// On the agent screen they dispatch nothing and suggest the pane's working
+    /// whole-utterance phrases, even with a positive meaning vote; the same
+    /// sentence in typing mode is prompt text.
     #[tokio::test]
     async fn voice_outcome_stop_in_a_sentence_never_closes_the_open_agent() {
         for said in [
+            "stop the tester",
+            "kill it",
             "stop the build when tests fail",
             "please stop it from logging so much",
             "close this agent after checking the logs",
@@ -14002,6 +14010,11 @@ mod tests {
                 !matches!(answer.outcome, VoiceOutcome::Dispatch { .. }),
                 "{said}: {:?}",
                 answer.outcome
+            );
+            assert_eq!(
+                answer.outcome.sentence(),
+                "Nothing was stopped. To close the agent you are viewing, say “close this agent” or “stop” on its own.",
+                "{said}"
             );
             assert_eq!(typed(&in_typing_mode(said).await.outcome), said);
         }
