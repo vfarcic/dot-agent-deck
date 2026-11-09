@@ -141,6 +141,12 @@ const QUIET_ROW: &str = "hush_reading";
 const SUBMIT_WHERE_CALLABLE_LIST: &str = "SUBMIT_WHERE_CALLABLE_PHRASES";
 const CLOSE_OVER_DIALOG_LIST: &str = "CLOSE_OVER_DIALOG_PHRASES";
 const CLOSE_ROW: &str = "close";
+/// Issue #1402 — the close-an-agent forms that end the OPEN agent on its own
+/// screen, answered locally with `stop_agent`. The bare "stop" forms beside
+/// them are [`TYPING_STOP_LIST`], a list of their own for the typing-mode
+/// split.
+const CLOSE_AGENT_LIST: &str = "CLOSE_AGENT_PHRASES";
+const STOP_AGENT_ROW: &str = "stop_agent";
 
 /// The rule sentence, quoted in every failure.
 ///
@@ -372,6 +378,7 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
         (QUIET_LIST, QUIET_ROW),
         (SUBMIT_WHERE_CALLABLE_LIST, SUBMIT_ROW),
         (CLOSE_OVER_DIALOG_LIST, CLOSE_ROW),
+        (CLOSE_AGENT_LIST, STOP_AGENT_ROW),
     ]
     .into_iter()
     .map(|(name, row_id)| (name, list(name, findings), row_id))

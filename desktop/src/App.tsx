@@ -32,7 +32,7 @@ import {
   X,
   Zap,
 } from "lucide-react";
-import { AgentOverview, DASHBOARD_COVERED, modalOpen } from "./components/AgentOverview";
+import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, stopAgentConfirm, STOP_TARGET_GONE, STOP_TARGET_RESTARTED } from "./components/AgentOverview";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
@@ -76,7 +76,7 @@ import { DialogNumbered, useNumberedList, useNumbersShown, VoiceChoiceOpen, Voic
 import { usePager, VoicePagingContext, type VoicePaging } from "./hooks/useVoicePages";
 import { NO_NUMBERED_LIST, sameNumberedSections, type VoiceNumberedEntryDto, type VoiceNumberedListDto, type VoiceNumberedSectionDto } from "./lib/voiceNumbers";
 import { offPageSentence, offPageTarget, pageMarker, pageSlice, pageTurnRefusal, type VoiceOffPageItem, type VoicePager } from "./lib/voicePages";
-import { agentKey, boundAgentKey } from "./lib/agentKey";
+import { agentKey, boundAgentKey, sameIncarnation } from "./lib/agentKey";
 import { dashboardFilterFromParams } from "./lib/dashboardFilter";
 import { VOICE_ACTIONS, dispatchVoiceAction, saysCommand, type DashboardScroll, type DeckOverlay, type NewAgentVoice, type VoiceContextChannel, type VoiceDispatchContext, type VoiceDispatchTarget, type VoiceOverviewContext, type VoicePanelContext, type VoiceScreenContext, type PullRequestContext } from "./lib/voiceActions";
 import { terminalInputState, unreachableDeckTerminalState } from "./lib/terminalInput";
@@ -187,6 +187,12 @@ const SWITCH_DECK_INVOKE: keyof typeof VOICE_ACTIONS = "switchDeck";
 const FILTER_DASHBOARD_INVOKE: keyof typeof VOICE_ACTIONS = "filterDashboard";
 /** The Settings sheet as `SettingsSheet` renders it, for asking the fence's stack whether anything is drawn over it. */
 const SETTINGS_PANEL = "[data-testid='settings-panel']";
+/**
+ * Issue #1402 — a spoken stop on the agent screen named an agent other than
+ * the one whose pane is open. The dashboard rows behind the pane are fenced,
+ * so voice cannot act on them; the sentence says what to do instead.
+ */
+const PANE_STOP_NOT_OPEN_AGENT = "Only the agent on screen can be closed from here, so nothing was closed. Close the pane first to close another agent.";
 
 /**
  * Issue #1198 — what a view that names the deck is shown as while the deck is
@@ -390,6 +396,41 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * two dispatches on one click.
    */
   const closeAgentView = useCallback(() => VOICE_ACTIONS.closeAgentView.run({ closeAgentView: closeAgent }), [closeAgent]);
+  /**
+   * Issue #1402 — the agent screen's Close agent, and its confirmation.
+   *
+   * Held by the shell because it is the one component both pane origins
+   * render under: the overview's sibling pane directly, and the deck's
+   * promoted tile through `DeckSurface`. One `ConfirmState` for the button
+   * and for a spoken stop, built by the shared `stopAgentConfirm`, so the
+   * copy and the `stop_agent` deck action cannot drift between the surfaces
+   * that offer them.
+   *
+   * The dialog renders at the shell level, above the pane on the overlay stack
+   * (`ConfirmDialog` joins it at the dialog layer), so it — and not the fenced
+   * screen behind the pane — is what the user answers. A failure is filed by
+   * the runtime under its global error, whose toast sits behind the pane's
+   * inert fence while the pane is open and is seen once the pane closes; the
+   * success path needs no toast, because the deck stops listing the agent and
+   * `paneAgentRetired` below closes the view back to the screen it came from.
+   */
+  const [paneStop, setPaneStop] = useState<ConfirmState>();
+  /** The pane's own `stop_agent`, swallowed on failure exactly as the overview's stop run does: the runtime files the error. */
+  const runPaneStopAction = useCallback(async (action: Parameters<DeckRuntimeState["runAction"]>[0]) => {
+    try {
+      await runtime.runAction(action);
+    } catch {
+      // Filed by the runtime under its global error — with the roles it could
+      // not confirm beside it — which a toast renders once it is reachable.
+    }
+  }, [runtime.runAction]);
+  /** Open the pane's stop confirmation for `agent`, naming the deck it is on. */
+  const stopPaneAgent = useCallback((agent: AgentSession) => {
+    const deck = runtime.fleet.find((entry) => entry.connection.deckId === agent.daemonId);
+    if (!deck) return;
+    // voice-registry-exempt: the pane's Close agent button reaches this capability prop, which opens the same confirmation the shell's `confirmStopAgent` context member opens for voice — one capability, two controls, and neither stops anything by itself
+    setPaneStop(stopAgentConfirm(agent, deck.connection, runPaneStopAction));
+  }, [runtime.fleet, runPaneStopAction]);
   /**
    * `Escape`, bound at `window` because the pane has no single focusable owner
    * — focus is usually inside xterm's helper textarea, which swallows keys
@@ -899,7 +940,10 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * voice gate because it can ask whether to stop agents.
    */
   const localUpgrade = useLocalUpgradeAtStart(runtime);
-  const confirmationOpen = screenConfirmationOpen || localUpgrade.target !== undefined;
+  /* Issue #1402 — the pane's stop confirmation counts like any other D5
+     confirmation: while it is open it outranks dictation, and `close` answers
+     it as Cancel rather than reaching past it. */
+  const confirmationOpen = screenConfirmationOpen || localUpgrade.target !== undefined || paneStop !== undefined;
 
   /**
    * PRD #1497 decisions 1–3 of 2026-10-09 — reading: the Settings switch, and
@@ -1137,6 +1181,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The overview's, which is never mounted beside the deck, so the two
          cannot both publish (PRD #1223 U5). */
       ...overviewVoiceContext.current,
+      /* Issue #1402 — while an agent pane is open, a stop means the OPEN
+         agent. Served by the shell and spread after the overview's own
+         member (which, with no pane open, stops a dashboard row), so a
+         spoken stop on the agent screen opens the same confirmation the
+         pane's Close agent button opens — on both pane origins, since the
+         deck screen publishes no stop member of its own. It refuses a target
+         that is not the open pane's agent: the dashboard rows behind the
+         pane are fenced, and voice acts on what is on screen. */
+      ...(agentView && paneDeck && paneAgent && !paneAgentReplaced
+        ? {
+          confirmStopAgent: (target: VoiceDispatchTarget): string | undefined => {
+            if (paneStop !== undefined) return CONFIRMATION_ALREADY_OPEN;
+            if (!agentView || !paneDeck || !paneAgent) return STOP_TARGET_GONE;
+            if (target.deckId !== agentView.deckId || target.agentId !== agentView.agentId) return PANE_STOP_NOT_OPEN_AGENT;
+            /* The view's binding refuses a restarted deck's agent under the
+               same id, exactly as the overview's spoken stop does. */
+            if (viewBound(agentView) && !sameIncarnation(agentView.incarnation, paneAgent.incarnation)) return STOP_TARGET_RESTARTED;
+            setPaneStop(stopAgentConfirm(paneAgent, paneDeck.connection, runPaneStopAction));
+            return undefined;
+          },
+        }
+        : {}),
       /* After the deck's, and the two sets are disjoint by construction — see
          `VoicePanelContext`, which is a narrow `Pick` precisely so a screen and
          the voice surface can never offer the same member. */
@@ -1217,7 +1283,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     if (!dispatchVoiceAction(outcome.invoke, context, target)) return undefined;
     // voice-registry-exempt: the Undo beside a voice report, restoring exactly the view that dispatch replaced
     return moved ? { undo: () => setView(previous) } : {};
-  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, screen, selectedDeckId, setOverlay, view]);
+  }, [agentView, base, closeAgent, confirmationOpen, dialogLayerUp, features.showDeck, onPrBrowserPage, overlaysOpen.settings, paneAgent, paneAgentReplaced, paneDeck, paneStop, prBrowser, prBrowserHost, pullRequestContext, railContext, readPager, runPaneStopAction, screen, selectedDeckId, setOverlay, view]);
   /** PRD #1223 — what the directory browser shows, read at declaration time. */
   const readDirectories = useCallback(() => newAgentVoice.current?.directories, []);
   /** PRD #1223 — what the New agent dialog shows besides its browser, while it is open. */
@@ -1292,7 +1358,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           one live `TerminalViewport` for the agent, which is the property M3
           actually requires.
         */}
-        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onTabShown={setPaneTab} />}
+        {agentView && paneDeck && paneAgentShown && !paneAgentReplaced && <OverviewAgentPane runtime={runtime} view={agentView} deck={paneDeck} agent={paneAgentShown} held={heldPaneAgent} attached={paneDeckAttachable} onClose={closeAgentView} onStopAgent={paneDeckAttachable && paneAgent ? () => stopPaneAgent(paneAgent) : undefined} onTabShown={setPaneTab} />}
         {/*
           PRD #1223 audit W2 — the runtime's last failure, on THIS screen too.
 
@@ -1313,7 +1379,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} onStopPaneAgent={stopPaneAgent} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1348,6 +1414,9 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
         <NavigationRail screen={screen} overlays={overlaysOpen} context={railContext} connection={runtime.snapshot.connection} features={features} onShowShortcuts={screen === "deck" ? () => setOverlay("deck", "shortcuts", true) : undefined} update={<SelfUpgradeRailButton check={selfUpgrade} onOpen={openSelfUpgrade} />} />
         {screenNode}
+        {/* Issue #1402 — the agent screen's Close agent confirmation, over whichever screen the pane is on: rendered after it, so at the same dialog layer the later element paints on top and the fence makes it the one thing reachable. */}
+        {/* voice-registry-exempt: the pane's stop confirmation's own Cancel — a dismissal */}
+        {paneStop && <ConfirmDialog state={paneStop} onClose={() => setPaneStop(undefined)} />}
         {selfUpgradeDaemon && selfUpgrade && selfUpgradeApi && <LocalUpgradeFlow entry="notice" copies={{ check: selfUpgrade, api: selfUpgradeApi }} daemon={selfUpgradeDaemon.daemon} runtime={runtime} onClose={() => { setSelfUpgradeDaemon(undefined); recheckSelfUpgrade(); }} />}
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
@@ -1445,7 +1514,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
  * attributed to another. The pane reaching its own deck is what made that
  * unnecessary rather than merely unwise.
  */
-function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onTabShown?: (tab: PanelTab) => void }) {
+function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose, onStopAgent, onTabShown }: { runtime: DeckRuntimeState; view: Extract<DeckView, { kind: "agent" }>; deck: DeckSnapshot; agent: AgentSession; held?: HeldAgentRecord; attached: boolean; onClose: () => void; onStopAgent?: () => void; onTabShown?: (tab: PanelTab) => void }) {
   const [tab, setTab] = useState<PanelTab>("terminal"); // voice-registry-exempt: the pane-over-the-overview's own tab strip, a control inside one pane
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   /* PR #1451 — the voice panel's view of which tab is shown (see `paneTab`). */
@@ -1511,6 +1580,12 @@ function OverviewAgentPane({ runtime, view, deck, agent, held, attached, onClose
          `presentation`. */
       onEvidenceSelect={() => undefined}
       onClose={onClose}
+      /* Issue #1402 — the pane's Close agent, offered only while the agent's
+         deck is answering: a deck with no live link reports no agents, so
+         nothing the app can reach is running to stop, and the pane itself is
+         already saying the deck is not answering. The confirmation it opens
+         is the shell's, shared with the deck-origin pane and with voice. */
+      onStopAgent={onStopAgent}
     />
   );
 }
@@ -1557,7 +1632,7 @@ function tileVoiceName(agent: AgentSession): string {
  * Closed, the wrapper is `display: contents`, so `.agent-tile` remains the
  * grid item it has always been and the deck's layout is untouched.
  */
-function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean; offPage?: boolean }) {
+function AgentPaneFrame({ open, offPage, onOpen, onClose, onStopAgent, ...tile }: Omit<AgentTileProps, "presentation"> & { open: boolean; offPage?: boolean }) {
   /*
     The `aria-modal` below is a claim about the whole interface, and until the
     PRD's security audit it was false: the base screen is deliberately still
@@ -1591,6 +1666,9 @@ function AgentPaneFrame({ open, offPage, onOpen, onClose, ...tile }: Omit<AgentT
            offers Close and the tiles behind it offer Open. */
         onOpen={open ? undefined : onOpen}
         onClose={open ? onClose : undefined}
+        /* The stop is the pane's alone for the same reason (issue #1402): a
+           tile that is not open is stopped from its dashboard row. */
+        onStopAgent={open ? onStopAgent : undefined}
       />
     </div>
   );
@@ -1632,7 +1710,7 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, onStopPaneAgent, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; /** Issue #1402 — open the shell's stop confirmation for the agent whose pane is open over this screen. */ onStopPaneAgent?: (agent: AgentSession) => void; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -2198,13 +2276,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       });
       return;
     }
-    setConfirm({
-      title: `Close ${selectedAgent.role}?`,
-      body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.`,
-      label: "Close agent",
-      busyLabel: "Stopping…",
-      action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
-    });
+    setConfirm(
+      /* Issue #1402 — the shared builder, so the deck toolbar's confirmation,
+         the dashboard row's and the agent screen's are one in copy and in the
+         deck action they send: it names the daemon, and for one role of an
+         orchestration it says the rest of the run keeps running. */
+      stopAgentConfirm(selectedAgent, snapshot.connection, async (action) => {
+        await perform(action, `${selectedAgent.role} close requested.`);
+      }),
+    );
   };
 
   /**
@@ -2631,6 +2711,10 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                   */
                   onOpen={onNavigate && (() => VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "deck", incarnation: agent.incarnation }))}
                   onClose={onCloseAgent && (() => VOICE_ACTIONS.closeAgentView.run(voiceContext))}
+                  /* Issue #1402 — the pane's Close agent over this screen,
+                     opening the shell's confirmation; `AgentPaneFrame` offers
+                     it to the open pane alone. */
+                  onStopAgent={onStopPaneAgent && (() => onStopPaneAgent(agent))}
                 />
               ))}
             </div>

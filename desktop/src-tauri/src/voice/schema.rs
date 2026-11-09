@@ -781,7 +781,8 @@ mod tests {
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
                 // The D5 stops: on the overview with the New agent dialog
-                // closed (#1260), and each only opens a confirmation.
+                // closed (#1260), and `stop_agent` on the agent's own screen
+                // too (issue #1402) — each only opens a confirmation.
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), true),
             ]
@@ -837,7 +838,9 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
-                ("stop_agent".to_string(), false),
+                // Issue #1402: ending the open agent, behind its confirmation —
+                // callable here because no New agent dialog is declared.
+                ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), false),
             ]
         );

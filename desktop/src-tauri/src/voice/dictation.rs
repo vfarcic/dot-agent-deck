@@ -55,7 +55,9 @@
 //! lists in this file are the documented exception (the 2026-10-20 decision on
 //! issue #1733): the send phrases ([`SUBMIT_PHRASES`],
 //! [`SUBMIT_WHERE_CALLABLE_PHRASES`]), the close over the New agent dialog
-//! ([`CLOSE_OVER_DIALOG_PHRASES`]), and the dictation, typing-mode and
+//! ([`CLOSE_OVER_DIALOG_PHRASES`]), the stop that ends the OPEN agent on its
+//! own screen ([`TYPING_STOP_PHRASES`], [`CLOSE_AGENT_PHRASES`], issue #1402),
+//! and the dictation, typing-mode and
 //! reading phrases. They are not a check on a model's pick: no model is asked
 //! at all.
 //!
@@ -308,12 +310,34 @@ pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrup
 /// dictation mode is on** (PRD #1541 M1 decision 4).
 ///
 /// A list of their own rather than part of [`INTERRUPT_PHRASES`], because the
-/// two halves differ outside the mode: there a bare *"stop"* is NOT answered
-/// locally at all — it keeps today's model answer (`stop_agent`, which is not
-/// callable on the agent screen) and issue #1402 owns what it should become —
-/// while *"interrupt"* is answered with "say typing on first". *"stop typing"*
-/// and *"stop listening"* are different whole phrases and keep their meanings.
+/// two halves differ outside the mode: there *"interrupt"* is answered with
+/// "say typing on first", while a bare *"stop"* ends the OPEN agent — issue
+/// #1402 answers these forms on the agent screen with `stop_agent`, behind
+/// its confirmation, through the local intercept in `outcome.rs` (they are
+/// not the model's to answer there, so they are not in `interrupt_agent`'s
+/// description the way the interrupt forms are).
+/// *"stop typing"* and *"stop listening"* are different whole phrases and keep
+/// their meanings.
 pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];
+
+/// What asks to end the OPEN agent on its own screen, with typing mode off
+/// (issue #1402) — said as the whole utterance.
+///
+/// Typing mode decides what a word means (PRD #1541 M1 decision 2): with the
+/// mode on the user is talking to the agent about its prompt, so none of these
+/// are commands there — everything the mode does not answer itself is typed,
+/// and ending an agent stays out of reach until the user says "typing off".
+/// Whole-utterance equality, for [`SUBMIT_PHRASES`]' reason: *"stop the build
+/// when tests fail"* and *"close the agent view"* are not here and keep their
+/// own answers — the first is the model's, the second closes the VIEW
+/// (`close`). The bare *"stop"* forms beside these are [`TYPING_STOP_PHRASES`],
+/// a list of their own for the reason above.
+pub const CLOSE_AGENT_PHRASES: [&str; 4] = [
+    "stop this agent",
+    "stop the agent",
+    "close this agent",
+    "close the agent",
+];
 
 /// What starts reading mode for the open agent (PRD #1497), said as the whole
 /// utterance.

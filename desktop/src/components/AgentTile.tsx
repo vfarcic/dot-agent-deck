@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   CircleDot,
+  CircleStop,
   FileCode2,
   GitCompareArrows,
   Handshake,
@@ -34,7 +35,7 @@ import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } f
 import { blockedReasonText } from "../lib/blockedReason";
 import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
-import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
+import { OVERVIEW_CLOCK_TICK_MS, stopTargetName } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
 import { OpenPullRequest } from "../lib/prBrowser";
@@ -268,6 +269,21 @@ export interface AgentTileProps {
    */
   onClose?: () => void;
   /**
+   * Issue #1402 — stop the agent this pane shows, behind the confirmation the
+   * overview's row opens (`stopAgentConfirm`), and the pane closes with the
+   * agent once the deck stops listing it.
+   *
+   * A capability rather than a `presentation` branch, for `onClose`'s reason:
+   * the affordance exists exactly when a parent can honour it — the pane's two
+   * wrappers, which own a confirmation — and a tile rendered by a caller with
+   * no stop to offer (every standalone `ControlDeck` in the tests) must not
+   * show a control that does nothing. The stop icon and the `Close <name>`
+   * wording are the overview row's own, so the two controls read as one
+   * across surfaces; the ✕ beside it stays the view's back, titled "Back to
+   * dashboard", and the confirmation is what makes the wrong click cheap.
+   */
+  onStopAgent?: () => void;
+  /**
    * PRD #1666 §6.4 — Retry or Cancel one deck message the tile lists, at the
    * revision it shows. Supplied only where a daemon can answer: without it the
    * rows show no buttons, as a control that does nothing must not exist.
@@ -350,6 +366,7 @@ export function AgentTile({
   onOpen,
   panePresent,
   onClose,
+  onStopAgent,
   onInboxAction,
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
@@ -614,6 +631,24 @@ export function AgentTile({
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
+          )}
+          {/*
+            Issue #1402 — stop the agent this pane shows, and the pane closes
+            with it once the deck stops listing it. The accessible name and
+            title are the overview row's own (`Close <name> agent`), so the two
+            controls read as one across surfaces; the stop icon keeps it
+            unmistakable beside the ✕, which only returns to the dashboard.
+            The name is `stopTargetName`'s sanitised copy, as the row's is.
+          */}
+          {onStopAgent && (
+            <button
+              className="agent-pane-control"
+              data-testid="agent-pane-stop-agent"
+              aria-label={`Close ${stopTargetName(agent)} agent`}
+              title={`Close ${stopTargetName(agent)}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={onStopAgent}
+            ><CircleStop size={14} /></button>
           )}
           {onClose && (
             <button

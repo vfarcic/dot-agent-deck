@@ -810,10 +810,49 @@ export const CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — ans
 /** The New agent dialog is modal, so a stop's confirmation could not be reached behind it. */
 export const STOP_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was stopped.";
 
-/** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
-export function stopTargetName(agent: OverviewAgent): string {
+/**
+ * What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role.
+ *
+ * Takes the few fields it reads rather than {@link OverviewAgent}, so the
+ * agent screen's pane — which holds an `AgentSession`, not the overview's
+ * honest subset — names the agent exactly as the overview's row does
+ * (issue #1402). One function is what keeps the two spellings together.
+ */
+export function stopTargetName(agent: Pick<OverviewAgent, "displayName" | "id" | "tab">): string {
   const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
   return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
+}
+
+/**
+ * Issue #1402 — the one confirmation every control that closes ONE agent
+ * opens: a dashboard row's Stop, the deck toolbar's Close, the agent screen's
+ * Close agent, and the spoken stop that reaches any of them. Built here,
+ * beside the copy it shares, so the surfaces cannot drift in wording or in
+ * the deck action they send: the same `stop_agent` goes to the daemon the
+ * agent is ON, never the selected one, carrying the process the record showed
+ * when the confirmation opened.
+ *
+ * For a role of an orchestration the body says what closing one role leaves
+ * behind — the rest of the run keeps going — because that is a different
+ * outcome from closing a standalone agent, and the confirmation is where the
+ * difference has to be said.
+ */
+export function stopAgentConfirm(
+  agent: Pick<OverviewAgent, "id" | "daemonId" | "displayName" | "tab" | "incarnation">,
+  deck: ConnectionView,
+  run: (action: Parameters<DeckRuntimeState["runAction"]>[0]) => Promise<void>,
+): ConfirmState {
+  const name = stopTargetName(agent);
+  const role = agent.tab.kind === "orchestration"
+    ? ` This closes only this one role — the rest of the ${displayIdentity(orchestrationTitle(agent.tab), DISPLAY_LIMITS.name, "this orchestration")} orchestration keeps running.`
+    : "";
+  return {
+    title: `Close ${name}?`,
+    body: `This sends a stop request to ${name} on ${deckName(deck)}.${role} Unsaved terminal work may be interrupted.`,
+    label: "Close agent",
+    busyLabel: "Stopping…",
+    action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
+  };
 }
 
 /**
@@ -1406,14 +1445,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        const name = stopTargetName(agent);
-        setConfirm({
-          title: `Close ${name}?`,
-          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
-          label: "Close agent",
-          busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
-        });
+        /* Issue #1402 — the shared builder, so the row's confirmation and the
+           agent screen's (and voice's) are one confirmation in copy and in
+           the deck action they send. */
+        setConfirm(stopAgentConfirm(agent, deck.connection, run));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -2522,8 +2557,11 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
  * every other surface (the TUI, the deck, the CLI) calls them by. The voice
  * matches the screen's other absences: "no active tool", "socket path not
  * reported".
+ *
+ * Takes only the `id` it reads, for `stopTargetName`'s reason: the agent
+ * screen's pane names an agent the same way the overview's row does.
  */
-function unnamedAgentLabel(agent: OverviewAgent): string {
+function unnamedAgentLabel(agent: Pick<OverviewAgent, "id">): string {
   const id = displayText(agent.id, DISPLAY_LIMITS.toolName);
   return rendersBlank(id) ? "unnamed agent" : `unnamed agent ${id}`;
 }

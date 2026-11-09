@@ -93,7 +93,8 @@ To watch or talk to one agent:
 2. Type into the terminal as you would into the TUI's pane. [Keys typed into an agent's terminal](settings.md#keys-typed-into-an-agents-terminal) says which keys reach the agent, including your platform's editing and paste shortcuts.
 3. When the agent's output is longer than the terminal, a scrollbar stays on the terminal's right edge, so you can see that there is more above and how far back you are. Scroll up to read earlier output.
 4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
-5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
+5. Press **Back to dashboard** (✕), or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
+6. To stop the agent itself, press **Close <name>** — the stop symbol beside the ✕, labelled like the row's stop control on the Dashboard. The confirmation is the same one the Dashboard row's control opens: `Close <name>?`, naming the daemon the stop request goes to, and saying, for one role of an orchestration, that only this role closes while the rest of the run keeps running. Press **Close agent**. When the daemon stops listing the agent, the pane closes with it and you are back on the screen you opened it from — the Dashboard or the Daemons screen — so a stopped agent never leaves an empty pane behind. The control is absent while the pane's daemon is not answering: there is nothing it could reach to stop, and the pane is already saying the daemon is not answering.
 
 The TUI copies differently: a mouse drag in a pane copies when you release the button, whichever agent is running, and when an agent copies something itself, the TUI passes that on to your terminal too. Whether either reaches your clipboard depends on your terminal, which has to let programs set the clipboard. Some ask first or need it turned on, such as tmux, which needs `set-clipboard on`.
 
@@ -103,13 +104,14 @@ The pane's header names the agent by the name its row shows, which is its role's
 
 Between the header and the terminal, the pane shows the agent's assignment and two readings: **TIME**, how long the agent has been running (hover it for the exact time it started), and **TOOLS**, how many tool calls it has reported. TIME reads `—` when the daemon did not say when it started the agent.
 
-![An agent's full-window pane: the header reads Desktop implementation with a RUNNING status and codex below it, with a close control on the right; under it the agent's assignment and a row of time, token, cost and context readings, each with its label on the same line, then the Terminal tab showing the agent's live output: the files it read and edited, a test run that passed, and its summary](/img/agent-pane-desktop.png)
+![An agent's full-window pane: the header reads Desktop implementation with a RUNNING status and codex below it, with a stop control and a close control on the right; under it the agent's assignment and a row of time, token, cost and context readings, each with its label on the same line, then the Terminal tab showing the agent's live output: the files it read and edited, a test run that passed, and its summary](/img/agent-pane-desktop.png)
 
 What can go wrong in the pane:
 
 - **"No terminal here: the desktop has no live connection to <daemon>…"**: the agent's daemon stopped answering. The header then shows the last status the app saw. The terminal comes back on its own when the daemon answers again.
 - **"Terminal input unavailable: this agent has no live terminal, only its history"**, or **"Terminal input unavailable: this agent has no live terminal"**: the pane shows the agent's output but cannot take typing, so the terminal is read-only and this line stays under it. In the TUI, the same words appear in the status line when you press `Enter` on that agent's card or press that card's number, and the dashboard stays where it is. If the agent's terminal stops being live while you are typing into it, the TUI shows the same words when you next type, drops that typing and goes back to command mode.
 - **"[agent-deck] Input not delivered: <why>"**, written into the terminal: the daemon turned down what you just typed, so it did not reach the agent. The reason says why, for example `the agent has exited` or `the agent in this pane was replaced or closed`. In the TUI, the status line shows the same sentence without the `[agent-deck]` prefix, `Input not delivered: <why>`, and the TUI goes back to command mode, so the keys you press next are not sent to the pane.
+- **A stop from the pane did not stop the agent**: the pane stays open, because nothing was ended. The daemon's refusal is the message on the Dashboard's corner; while the pane is open that message sits behind it, so close the pane (✕) to read it.
 
 ## Pull requests
 
@@ -150,10 +152,10 @@ The TUI shows the same pull request on the agent's card, as `#1234` with a glyph
 
 ## Closing agents and orchestrations
 
-- **Stop one agent:** press the stop control on its row (`Close <name> agent`). The confirmation, `Close <name>?`, names the daemon the stop request goes to. Press **Close agent**.
+- **Stop one agent:** press the stop control on its row (`Close <name> agent`), or **Close <name>** in its pane while you are looking at it. The confirmation, `Close <name>?`, names the daemon the stop request goes to, and says, for one role of an orchestration, that only this role closes while the rest of the run keeps running. Press **Close agent**.
 - **Stop every role of an orchestration:** press **Close** on its group header. The confirmation lists every role it will stop. Press **Close all N roles** (or **Close 1 role**).
 
-**Check it worked:** the row, or the whole group, disappears from the section. If the app cannot confirm that some roles stopped, it says how many may still be running on which daemon, in a message on the Dashboard and in the New agent dialog; open the TUI against that daemon, or run `dot-agent-deck daemon status` on its host, to see what is still there.
+**Check it worked:** the row, or the whole group, disappears from the section — and an open pane of the agent closes with it. If the app cannot confirm that some roles stopped, it says how many may still be running on which daemon, in a message on the Dashboard and in the New agent dialog; open the TUI against that daemon, or run `dot-agent-deck daemon status` on its host, to see what is still there.
 
 In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab.
 

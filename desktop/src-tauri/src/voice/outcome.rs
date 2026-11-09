@@ -46,10 +46,10 @@ use serde::{Deserialize, Serialize};
 use super::choice::{ChoiceLive, MAX_CHOICES};
 use super::command_text::grounded_command_text;
 use super::dictation::{
-    CLEAR_PROMPT_PHRASES, CLOSE_OVER_DIALOG_PHRASES, DICTATION_OFF_PHRASES, DICTATION_ON_PHRASES,
-    DICTATION_OPENERS, INTERRUPT_PHRASES, QUIET_PHRASES, READING_OFF_PHRASES, READING_ON_PHRASES,
-    SCRATCH_PHRASES, SUBMIT_PHRASES, SUBMIT_WHERE_CALLABLE_PHRASES, TRAILING_SEND_PHRASES,
-    TYPING_STOP_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
+    CLEAR_PROMPT_PHRASES, CLOSE_AGENT_PHRASES, CLOSE_OVER_DIALOG_PHRASES, DICTATION_OFF_PHRASES,
+    DICTATION_ON_PHRASES, DICTATION_OPENERS, INTERRUPT_PHRASES, QUIET_PHRASES, READING_OFF_PHRASES,
+    READING_ON_PHRASES, SCRATCH_PHRASES, SUBMIT_PHRASES, SUBMIT_WHERE_CALLABLE_PHRASES,
+    TRAILING_SEND_PHRASES, TYPING_STOP_PHRASES, VOICE_OFF_PHRASES, opening_with, strip_opening,
 };
 use super::filter::grounded_filter_text;
 use super::meaning::{Ballot, MeaningRequest, MeaningVerdict, Place, Strictness, every_action};
@@ -100,6 +100,12 @@ const INTERRUPT_ROW: &str = "interrupt_agent";
 const CLEAR_PROMPT_ROW: &str = "clear_prompt";
 const SCRATCH_ROW: &str = "scratch_that";
 const TYPING_MODE_ROWS: [&str; 3] = [INTERRUPT_ROW, CLEAR_PROMPT_ROW, SCRATCH_ROW];
+/// Issue #1402 — the stop that ends the OPEN agent on its own screen, with
+/// typing mode off: the bare "stop" forms and the close-an-agent phrases
+/// ([`TYPING_STOP_PHRASES`], [`CLOSE_AGENT_PHRASES`]) dispatch it locally, for
+/// the pane's agent, behind its confirmation. On the dashboard the row is the
+/// model's to pick, exactly as it was.
+const STOP_AGENT_ROW: &str = "stop_agent";
 /// PRD #1497 — reading mode's pair and the row that silences the app's speech,
 /// dispatched by [`reading_intercept`] ahead of every other path.
 const READING_ON_ROW: &str = "reading_on";
@@ -3003,11 +3009,30 @@ fn local_intercept(
         }
     }
 
+    // Issue #1402 — ending the OPEN agent from its own screen, with typing
+    // mode off: the bare "stop" forms and the close-an-agent phrases are the
+    // whole utterance, so a sentence that merely contains "stop" is never
+    // taken for the command, and they are answered here rather than by the
+    // model — a misheard "stop" costs one dismissal and ends nothing, because
+    // the dispatch only opens the row's confirmation. Dispatched with no
+    // params: the app knows which agent the pane on screen is for and fills
+    // the target in. Only where the row is callable as a whole (`callable`,
+    // requirements included), so the New agent dialog still withholds it
+    // where that dialog can be open.
+    if screen == Screen::Agent
+        && let Some(row) = table.row(STOP_AGENT_ROW)
+        && row.callable(screen, directories, new_agent)
+        && (said_whole(transcript.text(), TYPING_STOP_PHRASES)
+            || said_whole(transcript.text(), CLOSE_AGENT_PHRASES))
+    {
+        return Some(dispatch(row, Vec::new()));
+    }
+
     // PRD #1541: the typing-mode prompt commands, said with typing mode OFF on
     // the agent screen, run nothing and say how to reach them. Only there —
     // on another screen these words are the model's to answer, which renders
-    // the row's own hint — and never for a bare "stop" (`TYPING_STOP_PHRASES`
-    // is not consulted here), which keeps today's model answer (issue #1402).
+    // the row's own hint — and never for a bare "stop", which the block above
+    // answered with the stop row (issue #1402).
     if screen == Screen::Agent
         && let Some(row) = typing_mode_row(table, transcript.text(), false)
     {
@@ -11279,7 +11304,7 @@ mod tests {
         let deck = run_agents(&resolver, Screen::Deck, &fleet(), "stop the tester").await;
         assert_eq!(
             deck.sentence(),
-            "Not here — stopping an agent works from the agent dashboard, with the New agent dialog closed."
+            "Not here — stopping an agent works from the agent dashboard or from its agent's own screen, with the New agent dialog closed."
         );
     }
 
@@ -11602,7 +11627,7 @@ mod tests {
             );
             assert_eq!(
                 stop.sentence(),
-                "Not here — stopping an agent works from the agent dashboard, with the New agent dialog closed."
+                "Not here — stopping an agent works from the agent dashboard or from its agent's own screen, with the New agent dialog closed."
             );
             let close = handle_utterance(
                 &resolver,
@@ -13868,10 +13893,12 @@ mod tests {
     }
 
     /// Scenario: with typing mode OFF in an agent's pane, a bare "stop",
-    /// "stop it" or "stop that" is not intercepted: it reaches the model as it
-    /// did before, whose `stop_agent` answer is refused as not available here.
+    /// "stop it" or "stop that" is answered locally with `stop_agent` — issue
+    /// #1402: it ends the OPEN agent, behind that row's confirmation, and the
+    /// model is never asked. The dispatch names no agent; the app knows which
+    /// agent the pane on screen is for and fills the target in.
     #[tokio::test]
-    async fn voice_outcome_a_bare_stop_outside_typing_mode_keeps_the_model_answer() {
+    async fn voice_outcome_a_bare_stop_outside_typing_mode_ends_the_open_agent() {
         for said in TYPING_STOP_PHRASES {
             let resolver = CountingResolver::answering(IntentAnswer::new("stop_agent"));
             let answer = handle_utterance(
@@ -13885,13 +13912,95 @@ mod tests {
                 Transcript::new(said),
             )
             .await;
-            assert_eq!(resolver.calls(), 1, "{said} was not asked of the model");
+            assert_eq!(resolver.calls(), 0, "{said} was asked of the model");
             assert!(
-                matches!(&answer.outcome, VoiceOutcome::Unavailable { action, hint, .. }
-                    if action == "stop_agent" && hint != TYPING_MODE_FIRST_HINT),
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, params, .. }
+                    if action == "stop_agent" && params.is_empty()),
                 "{said}: {:?}",
                 answer.outcome
             );
+            assert_eq!(answer.resolve_ms, None, "{said} measured a backend call");
+        }
+    }
+
+    /// Scenario (issue #1402): on an agent's own screen, "stop this agent",
+    /// "stop the agent", "close this agent" and "close the agent" — said as
+    /// the whole utterance, politeness aside — dispatch `stop_agent` locally
+    /// for the open agent, while "close the agent view" and "close the agent
+    /// pane" do not: those close the VIEW and are the model's to answer. A
+    /// sentence that merely contains the request is never the command.
+    #[tokio::test]
+    async fn voice_outcome_closing_the_open_agent_on_its_screen_is_a_local_stop() {
+        for said in CLOSE_AGENT_PHRASES {
+            let resolver = CountingResolver::answering(IntentAnswer::new("close"));
+            let answer = handle_utterance(
+                &resolver,
+                table(),
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await;
+            assert_eq!(resolver.calls(), 0, "{said} was asked of the model");
+            assert!(
+                matches!(&answer.outcome, VoiceOutcome::Dispatch { action, params, .. }
+                    if action == "stop_agent" && params.is_empty()),
+                "{said}: {:?}",
+                answer.outcome
+            );
+        }
+        // Politeness aside, the same request; a sentence that says anything
+        // more is not the command, and the view words keep their own answer.
+        let polite = handle_utterance(
+            &CountingResolver::answering(IntentAnswer::new("close")),
+            table(),
+            Screen::Agent,
+            &fleet(),
+            &[],
+            None,
+            None,
+            Transcript::new("Okay, stop this agent please."),
+        )
+        .await;
+        assert!(
+            matches!(&polite.outcome, VoiceOutcome::Dispatch { action, params, .. }
+                if action == "stop_agent" && params.is_empty()),
+            "politeneness must not change the answer: {:?}",
+            polite.outcome
+        );
+        for said in [
+            "stop this agent and the writer too",
+            "stop the build when tests fail",
+            "close the agent view",
+            "close the agent pane",
+        ] {
+            assert!(
+                local_intercept(table(), Screen::Agent, None, None, &Transcript::new(said))
+                    .is_none(),
+                "{said} must not be answered as a local stop"
+            );
+        }
+    }
+
+    /// Scenario (issue #1402): the local stop is the agent screen's alone. On
+    /// the dashboard and the Daemons screen a bare "stop" is the model's to
+    /// answer, as it was before — the dashboard has no open agent to end.
+    #[tokio::test]
+    async fn voice_outcome_the_local_stop_fires_only_on_the_agent_screen() {
+        for screen in [Screen::Deck, Screen::Overview] {
+            for said in TYPING_STOP_PHRASES
+                .iter()
+                .copied()
+                .chain(CLOSE_AGENT_PHRASES.iter().copied())
+            {
+                assert!(
+                    local_intercept(table(), screen, None, None, &Transcript::new(said)).is_none(),
+                    "{said} on {screen:?} must not be answered as a local stop"
+                );
+            }
         }
     }
 
@@ -13968,8 +14077,9 @@ mod tests {
     /// Scenario: the three prompt commands are agent-only whole-sentence rows
     /// whose descriptions name every phrase the local paths answer, and a
     /// model pick of `interrupt_agent` for a bare "stop" outside typing mode —
-    /// which the local list deliberately does not hold — is refused with the
-    /// "typing on" hint even when the meaning check accepts it.
+    /// which the local stop answers first on the real table (issue #1402), so
+    /// the guard is pinned against a table without that row — is refused with
+    /// the "typing on" hint even when the meaning check accepts it.
     #[tokio::test]
     async fn voice_outcome_prompt_command_grounding_is_the_local_list() {
         for (row_id, phrases) in [
@@ -13993,9 +14103,36 @@ mod tests {
                 );
             }
         }
+        // A model pick of `interrupt_agent` for a bare "stop" outside typing
+        // mode can no longer happen on the real table — the local stop answers
+        // those forms first (issue #1402) — so the guard is pinned against a
+        // table without the stop row, which is the shape that reaches it.
+        let interrupt_only = CommandTable::parse(
+            "[[commands]]\n\
+             id = \"interrupt_agent\"\n\
+             invoke = \"interruptAgent\"\n\
+             description = \"Interrupt the open agent\"\n\
+             screens = [\"agent\"]\n\
+             unavailable_hint = \"open a pane first\"\n\
+             report = \"Interrupted.\"\n\
+             asks_to = \"interrupt the agent\"\n\
+             try_saying = \"interrupt\"\n",
+        )
+        .expect("a valid table");
         for said in TYPING_STOP_PHRASES {
             let resolver = StubResolver::new().answering(said, IntentAnswer::new(INTERRUPT_ROW));
-            let outcome = run_everything(&resolver, Screen::Agent, said).await;
+            let outcome = handle_utterance(
+                &resolver,
+                &interrupt_only,
+                Screen::Agent,
+                &fleet(),
+                &[],
+                None,
+                None,
+                Transcript::new(said),
+            )
+            .await
+            .outcome;
             assert!(
                 matches!(&outcome, VoiceOutcome::Unavailable { hint, .. } if hint == TYPING_MODE_FIRST_HINT),
                 "{said}: {outcome:?}"
@@ -17163,12 +17300,16 @@ mod tests {
         }
     }
 
-    /// Scenario: with an agent's pane open the user says "Close the agent" —
-    /// the phrase that was taken as a stop. It closes the VIEW (D1).
+    /// Scenario: with an agent's pane open the user says "close the agent
+    /// screen", "close the agent view" or "close the agent pane" — the view
+    /// words. They close the VIEW (D1). "Close the agent" and "close this
+    /// agent" are the exception issue #1402 decided the other way on that
+    /// screen: they end the OPEN agent, locally, behind the stop's
+    /// confirmation (pinned by
+    /// `voice_outcome_closing_the_open_agent_on_its_screen_is_a_local_stop`).
     #[tokio::test]
     async fn voice_outcome_close_the_agent_closes_the_view() {
         for said in [
-            "Close the agent",
             "close the agent screen",
             "close the agent view",
             "close the agent pane",

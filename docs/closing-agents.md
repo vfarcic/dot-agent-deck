@@ -146,7 +146,7 @@ The TUI and the desktop app close the same things and clean up worktrees the sam
 
 **TUI:** select the card on the dashboard, or go to the orchestration's tab, and press `Ctrl+W` in command mode, or click the card's `[Close]` button or the tab's `[×]`. Choose **Close** in the confirmation. If the unit's worktree has uncommitted changes, the confirmation says it will be kept and names it, and the status line reports what happened after the close. See [Keyboard Shortcuts](keyboard-shortcuts.md).
 
-**Desktop:** press the stop control on the agent's row and then **Close agent**, or **Close** on an orchestration's group header and then **Close all N roles**. See [Desktop App → Dashboard](desktop/dashboard.md#closing-agents-and-orchestrations). The desktop app does not currently say when a worktree was kept; check with `dot-agent-deck worktree list`.
+**Desktop:** press the stop control on the agent's row, or **Close <name>** in its pane, and then **Close agent**; or **Close** on an orchestration's group header and then **Close all N roles**. See [Desktop App → Dashboard](desktop/dashboard.md#closing-agents-and-orchestrations). The desktop app does not currently say when a worktree was kept; check with `dot-agent-deck worktree list`.
 
 A unit closed with `close` disappears from both clients, and a unit closed in a client is gone from `close --all`.
 

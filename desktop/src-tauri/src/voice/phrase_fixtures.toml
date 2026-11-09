@@ -1607,34 +1607,52 @@ screen = "agent"
 action = "scratch_that"
 outcome = "unavailable"
 
-# **A bare "stop" outside typing mode is NOT intercepted** and keeps today's
-# answer: the model's `stop_agent`, which is not callable on the agent screen
-# (issue #1402 owns what it should become). NOT measured when added — no
-# `OPENAI_API_KEY` on the box that wrote them — and pinned on `stop_agent`'s
-# own `heard_as` "stop" and the `stop-the-agent` precedent; a run that finds
-# the model answering otherwise should re-pin them, as long as the answer is
-# not `interrupt_agent`.
+# **A bare "stop" outside typing mode ends the OPEN agent** (issue #1402):
+# `stop_agent` is callable on the agent screen, and the local intercept
+# answers these forms with it for the open pane's agent, behind its
+# confirmation — no model is asked, so these pin the local answer. NOT
+# measured when they were `unavailable` (no `OPENAI_API_KEY` on the box that
+# wrote them); a run that finds the model answering otherwise should re-pin
+# them, as long as the answer is not `interrupt_agent`.
 
 [[fixtures]]
 name = "idle-bare-stop"
 utterance = "stop"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "idle-bare-stop-it"
 utterance = "stop it"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "idle-bare-stop-that"
 utterance = "stop that"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
+
+# The close-an-agent forms on the agent screen are the local stop's too
+# (issue #1402): the whole utterance, and only there — everywhere else a close
+# is the VIEW word and D1 holds.
+
+[[fixtures]]
+name = "close-this-agent-on-its-screen"
+utterance = "close this agent"
+screen = "agent"
+action = "stop_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-the-agent-on-its-screen"
+utterance = "close the agent"
+screen = "agent"
+action = "stop_agent"
+outcome = "dispatch"
 
 # On another screen the prompt commands are the model's to answer, and the row
 # is not callable there. Model-facing, like the dictation `unavailable` pair.

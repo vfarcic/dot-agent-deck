@@ -1431,7 +1431,8 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    /* Issue #1402: the pane's own Close agent is the reachable stop while the pane is open (the dashboard row behind it is inert), so it is what opens the confirmation here. */
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-pane-stop-agent"));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1459,7 +1460,8 @@ describe("typing into the open agent", () => {
     await completeUtterance();
     expect(resolveVoice).toHaveBeenCalledWith(said);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    /* Issue #1402: the pane's own Close agent is the reachable stop while the pane is open (the dashboard row behind it is inert), so it is what opens the confirmation here. */
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-pane-stop-agent"));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1489,7 +1491,8 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    /* Issue #1402: the pane's own Close agent is the reachable stop while the pane is open (the dashboard row behind it is inert), so it is what opens the confirmation here. */
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-pane-stop-agent"));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => { settleTyped(); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -2794,9 +2797,9 @@ describe("sticky dictation in the open agent pane", () => {
     expect(deck.sendTerminalInput).toHaveBeenCalledWith({ deckId, agentId: coderId }, "unsent words ");
   });
 
-  /** Scenario: a stop confirmation opens in the overview behind an open agent
-   * pane. It pre-empts dictation, and dismissing it returns to idle rather than
-   * silently resuming the earlier mode. */
+  /** Scenario: the pane's own Close agent confirmation opens over an open
+   * agent pane. It pre-empts dictation, and dismissing it returns to idle
+   * rather than silently resuming the earlier mode. */
   it("ends dictation when a D5 confirmation opens and never resumes it", async () => {
     const voice = microphone([]);
     const resolveVoice: ResolveVoice = vi.fn(async (said: string) => said === "type on" ? modeOn : inModeText(said));
@@ -2809,7 +2812,8 @@ describe("sticky dictation in the open agent pane", () => {
     await completeUtterance();
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    /* Issue #1402: the pane's own Close agent is the reachable stop while the pane is open (the dashboard row behind it is inert), so it is what opens the confirmation here. */
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByTestId("agent-pane-stop-agent"));
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
@@ -4431,6 +4435,69 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     await flush();
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id });
+  });
+
+  /**
+   * Scenario (issue #1402): Planner's pane is open over the Daemons screen —
+   * the origin that publishes no stop member of its own — and the user says a
+   * bare "stop", which resolves to `stop_agent` naming no agent. The open
+   * pane's agent is what a stop means there: the pane's own Close agent
+   * confirmation opens over it, and confirming sends one `stop_agent` for that
+   * agent. Nothing is stopped until then, exactly as on the dashboard.
+   */
+  it("opens the pane's own confirmation for a spoken stop on the agent screen", async () => {
+    const voice = microphone([]);
+    const snapshot = createFixtureSnapshot("connected");
+    const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) =>
+      dispatch("stop_agent", "confirmStopAgent", "Confirm stopping planner — nothing has been stopped yet.", utterance));
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], runAction });
+    if (!snapshot.connection.deckId) throw new Error("fixture deck id missing");
+    render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: snapshot.connection.deckId, agentId: "planner", from: "deck" }} />);
+    await turnVoiceOn();
+
+    voice.deliver("stop");
+    await completeUtterance();
+
+    const dialog = confirmation();
+    expect(dialog).not.toBeNull();
+    expect(dialog).toHaveTextContent("Close Plan / architecture?");
+    expect(dialog).toHaveTextContent("This sends a stop request to Plan / architecture on Local daemon.");
+    expect(runAction).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close agent" }));
+      await Promise.resolve();
+    });
+    await flush();
+    expect(runAction).toHaveBeenCalledTimes(1);
+    expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: "planner", incarnation: undefined });
+  });
+
+  /**
+   * Scenario (issue #1402): Planner's pane is open and the user says "stop
+   * builder", naming an agent whose row is fenced behind the pane. Voice acts
+   * on what is on screen, so nothing is closed and the report says why — the
+   * dashboard behind the pane is not acted on through it.
+   */
+  it("refuses a spoken stop that names an agent other than the one on screen", async () => {
+    const voice = microphone([]);
+    const snapshot = createFixtureSnapshot("connected");
+    const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
+    const resolveVoice: ResolveVoice = vi.fn(async (utterance: string) =>
+      dispatch("stop_agent", "confirmStopAgent", "Confirm stopping builder — nothing has been stopped yet.", utterance,
+        [{ name: "agent", kind: "agent_ref", spoken: "builder", value: "builder", label: "builder" }]));
+    const deck = runtime(resolveVoice, voice, { snapshot, fleet: [snapshot], runAction });
+    if (!snapshot.connection.deckId) throw new Error("fixture deck id missing");
+    render(<DeckShell runtime={deck} initialView={{ kind: "agent", deckId: snapshot.connection.deckId, agentId: "planner", from: "deck" }} />);
+    await turnVoiceOn();
+
+    voice.deliver("stop builder");
+    await completeUtterance();
+
+    expect(confirmation()).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+    expect(screen.getByTestId("voice-report")).toHaveTextContent("Only the agent on screen can be closed from here, so nothing was closed.");
   });
 
   /** Scenario: a direct spoken stop is still resolving when its named agent is

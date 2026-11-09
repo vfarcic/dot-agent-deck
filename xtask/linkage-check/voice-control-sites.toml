@@ -387,6 +387,12 @@ reason = "The open pane's close X: forwards `onClose`, which DeckSurface wires t
 [[site]]
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
+code = "onStopAgent"
+reason = "The open pane's Close agent: forwards `onStopAgent`, which App.tsx wires to the shell's stop confirmation — the same one voice raises with `stop_agent` (`confirmStopAgent`, issue #1402)."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
 code = "() => onTabChange(id)"
 reason = "Gap: switches the tile's tab (terminal, output, hand-offs). No row picks a tile tab."
 
