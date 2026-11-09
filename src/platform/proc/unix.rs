@@ -222,8 +222,10 @@ pub fn terminate_child_with_grace_and_wait(
     }
 
     // Phase 3: SIGKILL backstop. Reaches survivors regardless of
-    // SIGTERM-trapping state.
-    signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
+    // SIGTERM-trapping state. Whether it reported landing travels in the
+    // `GaveUp` outcome (issue #1677 review), so a refused kill is never
+    // described as a landed one.
+    let killed = signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
 
     // Phase 4 (issue #1677): reap with nonblocking polling under a deadline,
     // never a bare blocking `wait()`. The cadence matches phase 2 and
@@ -239,7 +241,7 @@ pub fn terminate_child_with_grace_and_wait(
             Ok(None) => {}
         }
         if std::time::Instant::now() >= deadline {
-            return TerminateReap::GaveUp;
+            return TerminateReap::GaveUp { killed };
         }
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -463,7 +463,9 @@ pub fn terminate_child_with_grace_and_wait(
     }
 
     // Phase 3: guaranteed backstop — reaches survivors *and* descendants
-    // regardless of whether anything honoured the CTRL_BREAK.
+    // regardless of whether anything honoured the CTRL_BREAK. Whether it
+    // reported landing travels in the `GaveUp` outcome (issue #1677 review),
+    // so a refused kill is never described as a landed one.
     if child_exited {
         // `try_wait` already reaped the direct child, so there is no process for
         // the single-process fallback to kill and no status left to `wait` for —
@@ -473,7 +475,7 @@ pub fn terminate_child_with_grace_and_wait(
         group.terminate_tree("graceful-close-terminate-job-after-child-exit");
         return TerminateReap::Reaped;
     }
-    reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
+    let killed = reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
     // Phase 4 (issue #1677): reap with nonblocking polling under a deadline,
     // never a bare blocking `wait()`. `Err` counts as collected: it means
     // there is no status left to ask for — the same reading the Unix twin
@@ -487,7 +489,7 @@ pub fn terminate_child_with_grace_and_wait(
             Ok(None) => {}
         }
         if std::time::Instant::now() >= deadline {
-            return TerminateReap::GaveUp;
+            return TerminateReap::GaveUp { killed };
         }
         std::thread::sleep(Duration::from_millis(50));
     }

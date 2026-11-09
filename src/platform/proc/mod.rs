@@ -68,12 +68,23 @@ pub enum TerminateReap {
     /// window, or after the SIGKILL backstop within the reap deadline.
     Reaped,
     /// The SIGKILL backstop was issued but the child never reported an exit
-    /// within the reap deadline. The child is left un-reaped: dropping it
-    /// abandons the status collection (a zombie on Unix until this process
-    /// exits; the kernel releases the object on Windows), and — the point of
-    /// the bound — no late `wait()` of this child can ever run, so no late
+    /// within the reap deadline. The child is left un-reaped: the status
+    /// collection is abandoned (a zombie on Unix until this process exits;
+    /// the kernel releases the object on Windows), and — the point of the
+    /// bound — no blocking `wait()` of this child can ever run, so no late
     /// cleanup can tear down a successor that has since claimed the pane.
-    GaveUp,
+    ///
+    /// `killed` is whether the final force-kill reported landing — the same
+    /// NEGATIVE signal `force_kill_child_group` documents for its own return:
+    /// `true` means nothing reported a failure (the `killpg`/`TerminateJobObject`
+    /// call succeeded, the group was already gone, or the practically
+    /// unreachable pid-unavailable fallback fired without an error), not that
+    /// the process is dead; `false` means the signal itself was refused, so
+    /// the abandoned child may still be running rather than merely
+    /// unfinished-exiting. The give-up's readers carry it into their warnings
+    /// and keep their prose from describing a refused kill as a landed one
+    /// (issue #1677 review).
+    GaveUp { killed: bool },
 }
 
 /// Result of delivering the daemon-stop graceful signal to a PID via

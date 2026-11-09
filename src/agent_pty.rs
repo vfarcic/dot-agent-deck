@@ -850,18 +850,23 @@ pub enum AgentPtyError {
     Resize(String),
     #[error("Agent {0} not found")]
     NotFound(String),
-    /// Issue #1677: the agent was removed from the registry and its child
-    /// SIGKILLed, but the child never reported an exit within the stop's reap
-    /// deadline ([`TERMINATE_REAP_DEADLINE`]) — the uninterruptible-I/O shape,
-    /// where the kernel has not finished tearing the process down. The close is
-    /// reported as a failure rather than a success so the stop's callers (the
-    /// TUI's and the desktop's close, and the `close` verb, which lists the
-    /// pane as a survivor) can tell a stopped agent from one that may still be
-    /// shutting down; the abandoned child is left un-reaped, and nothing of
-    /// the pane it held is torn down after the fact.
+    /// Issue #1677: the agent was removed from the registry and a force kill
+    /// issued on its child, but the child never reported an exit within the
+    /// stop's reap deadline ([`TERMINATE_REAP_DEADLINE`]) — the
+    /// uninterruptible-I/O shape, where the kernel has not finished tearing
+    /// the process down. The close is reported as a failure rather than a
+    /// success so the stop's callers (the TUI's and the desktop's close, and
+    /// the `close` verb, which lists the pane as a survivor) can tell a
+    /// stopped agent from one that may still be shutting down; the abandoned
+    /// child is left un-reaped, and nothing of the pane it held is torn down
+    /// after the fact. The message deliberately says the kill was *issued*
+    /// rather than *landed*: whether the force-kill reported landing is
+    /// carried in the daemon's warn log (issue #1677 review), because a
+    /// refused kill must not be described as a delivered one.
     #[error(
-        "Agent {0} was stopped and its child killed, but its exit could not be confirmed \
-            within the reap deadline; it is left un-reaped and may still be shutting down"
+        "Agent {0} was stopped and a force kill issued on its child, but its exit could not be \
+            confirmed within the reap deadline; it is left un-reaped and may still be shutting \
+            down"
     )]
     ReapGaveUp(String),
     /// Caller-supplied spawn metadata failed validation. Surfaced to the
@@ -9841,6 +9846,27 @@ pub(crate) const PANE_CLOSE_RECREATE_TIMEOUT: Duration =
 /// resolves within one tick of the close it is waiting on.
 const PANE_CLOSE_SETTLE_POLL: Duration = Duration::from_millis(50);
 
+/// Issue #1677 (review): a child whose reap gave up — its record is gone and
+/// a force kill was issued on it, but its exit was never confirmed within
+/// [`TERMINATE_REAP_DEADLINE`]. The child OBJECT is retained here (not
+/// dropped, as the pre-review code did) for exactly one purpose: a
+/// nonblocking `try_wait` that observes whether the process has finally
+/// exited, which is also what releases the entry — and, on Unix, collects the
+/// zombie. Nothing ever blocking-waits on it, and nothing of the pane it held
+/// is touched: the only call made on the child is `try_wait`.
+///
+/// Its rooted directories stay counted by
+/// [`AgentPtyRegistry::dir_in_use`] until that observation confirms the exit,
+/// so the deck's worktree removals — which gate on that check — refuse to
+/// delete a directory the abandoned process still occupies: the contract
+/// (issue #1612) says "anything this registry runs", and a child the registry
+/// spawned and has not seen exit is exactly that, however long the kernel
+/// takes over its teardown.
+struct AbandonedChild {
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+    dirs: Vec<PathBuf>,
+}
+
 struct RegistryInner {
     next_id: u64,
     /// PRD #1487 re-check R2: respawns between lifting their old record out
@@ -10089,6 +10115,11 @@ struct RegistryInner {
     /// orchestration whose only remaining role is mid-respawn has no record,
     /// and is not therefore gone.
     respawning_members: HashMap<String, AgentRecord>,
+    /// Issue #1677 (review): the children whose reaps gave up, keyed by the
+    /// stopped generation's agent id — see [`AbandonedChild`]. Their rooted
+    /// directories stay counted as in use until a nonblocking `try_wait`
+    /// observes the exit, which is also what retires the entry.
+    abandoned_children: HashMap<String, AbandonedChild>,
     /// Issue #454 round-3 review (blocker 1): panes whose SCOPED CLEANUP is
     /// currently in progress, keyed by pane id.
     ///
@@ -10623,6 +10654,7 @@ impl AgentPtyRegistry {
                 ended_instances: VecDeque::new(),
                 respawning_dirs: HashMap::new(),
                 respawning_members: HashMap::new(),
+                abandoned_children: HashMap::new(),
                 cleanup_holds: HashSet::new(),
                 exit_waiters: HashMap::new(),
                 input_discarded: HashMap::new(),
@@ -15441,13 +15473,15 @@ impl AgentPtyRegistry {
     /// finishes exiting (uninterruptible I/O) costs this call the grace plus
     /// that deadline and no more — where before it parked in a blocking
     /// `wait()` forever, holding the stop path and every hold it keeps. On
-    /// the give-up the agent is already out of the registry and the child
-    /// already SIGKILLed, but the close still answers
+    /// the give-up the agent is already out of the registry and the force
+    /// kill already issued, but the close still answers
     /// [`AgentPtyError::ReapGaveUp`]: the one thing that could not be
     /// confirmed is the exit, and that is exactly what a stop's caller needs
-    /// to know. The abandoned child is dropped un-reaped, so no late `wait()`
-    /// of it can ever run and no late cleanup can touch a successor that has
-    /// since claimed the pane.
+    /// to know. The abandoned child is retained un-reaped (see
+    /// [`AbandonedChild`]): no blocking `wait()` of it can ever run, no late
+    /// cleanup can touch a successor that has since claimed the pane, and its
+    /// rooted directories stay counted as in use until a nonblocking
+    /// `try_wait` observes the exit.
     ///
     /// PRD #92 F9 followup-3: this path used to prune the
     /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
@@ -15547,22 +15581,37 @@ impl AgentPtyRegistry {
         self.change_notify.notify_one();
         match reap {
             crate::platform::proc::TerminateReap::Reaped => Ok(()),
-            crate::platform::proc::TerminateReap::GaveUp => {
+            crate::platform::proc::TerminateReap::GaveUp { killed } => {
                 // Issue #1677: the child never confirmed its exit within the
-                // reap deadline. `agent` (and with it the child) is dropped by
-                // this return, so the status collection is abandoned rather
+                // reap deadline, so the status collection is abandoned rather
                 // than parked on — the trade `force_kill_and_reap_all` takes
                 // on the daemon-wide path, here on the single-agent one. The
                 // pid travels in the warn and the error so an operator can
-                // `ps` what state the child is actually stuck in.
+                // `ps` what state the child is actually stuck in, and
+                // `kill_reported` tells a child the kernel has not finished
+                // tearing down from one the force-kill itself was refused
+                // for (issue #1677 review).
                 let pid = agent.child.process_id();
+                let pane = agent.pane_id_env.clone();
+                // Issue #1677 (review): the child OBJECT is retained (not
+                // dropped) so its rooted directories stay counted by
+                // `dir_in_use` until a nonblocking `try_wait` observes the
+                // exit — see `AbandonedChild`. Nothing blocking ever waits on
+                // it, and nothing of the pane it held is touched.
+                let dirs: Vec<PathBuf> = agent.rooted_dirs().collect();
+                let child = agent.child;
+                self.inner
+                    .lock()
+                    .abandoned_children
+                    .insert(id.to_string(), AbandonedChild { child, dirs });
                 tracing::warn!(
                     agent_id = %id,
-                    pane = ?agent.pane_id_env,
+                    pane = ?pane,
                     pid = ?pid,
+                    kill_reported = killed,
                     grace_ms = AGENT_TERMINATE_GRACE.as_millis() as u64,
                     deadline_ms = TERMINATE_REAP_DEADLINE.as_millis() as u64,
-                    "close_agent: the SIGKILLed child never reported an exit within the reap \
+                    "close_agent: the force-killed child never reported an exit within the reap \
                      deadline; it is left un-reaped and the close is reported as failed"
                 );
                 Err(AgentPtyError::ReapGaveUp(id.to_string()))
@@ -15717,7 +15766,7 @@ impl AgentPtyRegistry {
         const OCCUPANT_CHECKS: usize = 3;
         let mut checks = 0;
         #[allow(unused_variables)]
-        let (removed, verified_dir, agent_id) = loop {
+        let (removed, verified_dir, agent_id, dirs) = loop {
             checks += 1;
             let checked = self
                 .inner
@@ -15867,8 +15916,11 @@ impl AgentPtyRegistry {
                 .close_release(crate::release_scanner::WindowClose::Retired);
             // Issue #1612: the pane keeps its working directory in use while it
             // has neither a record nor a reservation. Released with the ticket.
-            let dirs = removed.rooted_dirs().collect();
-            inner.respawning_dirs.insert(agent_id.clone(), dirs);
+            let dirs: Vec<PathBuf> = removed.rooted_dirs().collect();
+            // Issue #1677 (review): `dirs` stays in scope past the ticket — a
+            // reap that gives up retains the old child under these same
+            // directories, so they survive the ticket's release.
+            inner.respawning_dirs.insert(agent_id.clone(), dirs.clone());
             inner
                 .respawning_members
                 .insert(agent_id.clone(), removed_record);
@@ -15880,7 +15932,7 @@ impl AgentPtyRegistry {
             // this same lock, so an unwind with the guard still held would
             // deadlock on it.
             inner.respawns_in_flight += 1;
-            break (removed, verified_dir, agent_id);
+            break (removed, verified_dir, agent_id, dirs);
         };
         // Counted in flight from the lock hold above until this function
         // returns — the replacement published, or the respawn failed — so a
@@ -16043,7 +16095,9 @@ impl AgentPtyRegistry {
         let removal = Arc::clone(&in_flight.removal);
         // The process group moves onto the blocking task too — it is what the
         // teardown's force phase reaps the descendant tree through (PRD #163 M3),
-        // and it is dropped there once the old child is gone.
+        // and it is dropped there once the old child is gone. The child itself
+        // comes BACK from the task: a reap that gives up retains it (issue
+        // #1677 review), so its directories survive the ticket's release.
         let join = tokio::task::spawn_blocking(move || {
             let reap = crate::platform::proc::terminate_child_with_grace_and_wait(
                 &mut child,
@@ -16052,7 +16106,7 @@ impl AgentPtyRegistry {
                 &process_group,
             );
             removal.record_reaped(&mut child);
-            reap
+            (reap, child)
         })
         .await;
         match join {
@@ -16061,17 +16115,27 @@ impl AgentPtyRegistry {
             // within TERMINATE_REAP_DEADLINE and the respawn proceeds. That is
             // safe, not just bounded: the old child's PTY was dropped above,
             // the replacement gets a fresh PTY and pid, and the abandoned
-            // child is dropped un-reaped inside the same task, so nothing of
-            // it can touch the pane after the successor claims it.
-            Ok(crate::platform::proc::TerminateReap::GaveUp) => {
+            // child is retained un-reaped for nonblocking observation only
+            // (issue #1677 review — see `AbandonedChild`), so nothing of it
+            // can touch the pane after the successor claims it while its
+            // rooted directories still count as in use.
+            Ok((crate::platform::proc::TerminateReap::GaveUp { killed }, child)) => {
+                self.inner.lock().abandoned_children.insert(
+                    in_flight.agent_id.clone(),
+                    AbandonedChild {
+                        child,
+                        dirs: dirs.clone(),
+                    },
+                );
                 tracing::warn!(
                     pane_id = %pane_id_env,
+                    kill_reported = killed,
                     deadline_ms = TERMINATE_REAP_DEADLINE.as_millis() as u64,
                     "respawn: the old child never reported an exit within the reap deadline; \
                      it is left un-reaped and the fresh spawn proceeds anyway"
                 );
             }
-            Ok(crate::platform::proc::TerminateReap::Reaped) => {}
+            Ok((crate::platform::proc::TerminateReap::Reaped, _child)) => {}
             Err(join_err) => {
                 // The spawn_blocking task ran the SIGTERM → poll → SIGKILL
                 // sequence in `terminate_child_with_grace_and_wait`. A
@@ -19448,12 +19512,29 @@ impl AgentPtyRegistry {
         inner.pending_spawn_dirs.remove(id);
     }
 
+    /// Issue #1677 (review): retire every abandoned child a nonblocking
+    /// `try_wait` can confirm has exited, so its directories stop counting as
+    /// in use and (on Unix) its zombie is collected. Called from
+    /// [`Self::dir_in_use_locked`] — so it runs when a worktree removal asks
+    /// `dir_in_use` or takes `hold_dir_for_removal`, never on a hot path —
+    /// and under the registry lock, which the `WNOHANG`/handle-query syscall
+    /// each observation costs does not measurably extend. `Err` retires the
+    /// entry too: it means there is no status left to ask for, the same
+    /// reading the terminate helper's reap loops give their `Err`.
+    fn settle_abandoned_children_locked(inner: &mut RegistryInner) {
+        inner
+            .abandoned_children
+            .retain(|_, abandoned| matches!(abandoned.child.try_wait(), Ok(None)));
+    }
+
     /// Issue #1612: whether anything this registry runs or is starting is
-    /// rooted in `dir` — a live agent, a reserved spawn not yet published, or a
-    /// pane in its respawn window, whose working directory or orchestration cwd
-    /// is `dir` or lies inside it.
+    /// rooted in `dir` — a live agent, a reserved spawn not yet published, a
+    /// pane in its respawn window, or a child whose reap gave up and whose
+    /// exit has not been observed yet (issue #1677 review) — whose working
+    /// directory or orchestration cwd is `dir` or lies inside it.
     /// Exited agents do not count, matching [`Self::agent_records`].
-    fn dir_in_use_locked(inner: &RegistryInner, dir: &std::path::Path) -> bool {
+    fn dir_in_use_locked(inner: &mut RegistryInner, dir: &std::path::Path) -> bool {
+        Self::settle_abandoned_children_locked(inner);
         let agent_in_dir = inner.agents.values().any(|a| {
             !a.exited.load(Ordering::SeqCst) && a.rooted_dirs().any(|d| path_within(&d, dir))
         });
@@ -19464,6 +19545,10 @@ impl AgentPtyRegistry {
                 .chain(inner.respawning_dirs.values())
                 .flatten()
                 .any(|d| path_within(d, dir))
+            || inner
+                .abandoned_children
+                .values()
+                .any(|a| a.dirs.iter().any(|d| path_within(d, dir)))
     }
 
     /// Issue #1612: [`Self::dir_in_use_locked`], asked under one acquisition of
@@ -19471,7 +19556,7 @@ impl AgentPtyRegistry {
     /// reservation and its record, because its reservation is released under
     /// the same acquisition that publishes it.
     pub fn dir_in_use(&self, dir: &std::path::Path) -> bool {
-        Self::dir_in_use_locked(&self.inner.lock(), dir)
+        Self::dir_in_use_locked(&mut self.inner.lock(), dir)
     }
 
     /// Issue #1612: authorise deleting `dir`. `None` when anything this
@@ -19489,7 +19574,7 @@ impl AgentPtyRegistry {
     /// ([`path_within`]).
     pub fn hold_dir_for_removal(&self, dir: &std::path::Path) -> Option<DirRemovalHold<'_>> {
         let mut inner = self.inner.lock();
-        if Self::dir_in_use_locked(&inner, dir) {
+        if Self::dir_in_use_locked(&mut inner, dir) {
             return None;
         }
         inner.removal_holds.push(dir.to_path_buf());
@@ -34760,6 +34845,112 @@ mod spawn_tests {
         registry
             .close_agent(&other)
             .expect("a released child closes cleanly");
+    }
+
+    /// Issue #1677 (review, regression): a close that gives up on a child's
+    /// reap must keep that child's rooted directories counted as in use, and
+    /// release them only once a nonblocking observation confirms the exit —
+    /// otherwise, once every other agent rooted there has stopped, a worktree
+    /// removal sees the abandoned process's directory as free and deletes it
+    /// under a process the kernel has not finished tearing down.
+    ///
+    /// Pre-fix this test fails at the first assertion: the close had already
+    /// removed the record, nothing else held the directory, and `dir_in_use`
+    /// read the abandoned child's working directory as unused.
+    #[test]
+    fn a_gave_up_close_keeps_the_childs_directories_in_use_until_its_exit_is_observed() {
+        let registry = AgentPtyRegistry::new();
+        let dir = tempfile::tempdir().expect("tempdir for the abandoned child's cwd");
+
+        let gate = Arc::new(WedgeGate::default());
+        let id = registry.insert_test_agent_for_pane(
+            Box::new(WedgedChild::new(None, Arc::clone(&gate))),
+            Some("pane-1677-abandoned-close-dirs"),
+        );
+        if let Some(agent) = registry.inner.lock().agents.get_mut(&id) {
+            agent.cwd = Some(dir.path().to_string_lossy().into_owned());
+        }
+
+        let closed = registry.close_agent(&id);
+        assert!(
+            closed.is_err(),
+            "the wedged child's close gives up: {closed:?}"
+        );
+        assert!(
+            registry.dir_in_use(dir.path()),
+            "the abandoned child's working directory stays in use — the registry ran a process \
+             there whose exit was never confirmed, and the directory-use contract (issue #1612) \
+             refuses to delete under anything this registry runs"
+        );
+
+        // The release is observation-based, not permanent: once the child
+        // finally reports an exit, the next directory-use check retires the
+        // entry (and, on Unix, collects the zombie).
+        gate.release();
+        assert!(
+            !registry.dir_in_use(dir.path()),
+            "a confirmed exit releases the directory"
+        );
+    }
+
+    /// Issue #1677 (review, regression): a respawn whose predecessor's reap
+    /// gave up keeps the predecessor's directories represented in the
+    /// directory-use checks after the respawn ticket ends. The replacement's
+    /// record covers them only while the replacement lives; once it is stopped
+    /// cleanly, the abandoned predecessor is the only thing rooted there, and a
+    /// unit close that reaches `git worktree remove` must still see the
+    /// directory as in use.
+    ///
+    /// Pre-fix this test fails at the second assertion: the ticket's drop had
+    /// released `respawning_dirs`, the replacement was cleanly reaped, and the
+    /// abandoned predecessor was invisible to `dir_in_use`.
+    #[tokio::test]
+    async fn a_gave_up_respawn_keeps_the_predecessors_directories_in_use() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let dir = tempfile::tempdir().expect("tempdir for the abandoned predecessor's cwd");
+        const PANE: &str = "pane-1677-abandoned-respawn-dirs";
+
+        let gate = Arc::new(WedgeGate::default());
+        let id = registry.insert_test_agent_for_pane(
+            Box::new(WedgedChild::new(None, Arc::clone(&gate))),
+            Some(PANE),
+        );
+        if let Some(agent) = registry.inner.lock().agents.get_mut(&id) {
+            agent.cwd = Some(dir.path().to_string_lossy().into_owned());
+            // The pane id travels in `spawn_env` on a real record (the initial
+            // `spawn_agent` call placed it there), so the replacement must see
+            // it there too — the respawn replays exactly this list.
+            agent.spawn_env = vec![(DOT_AGENT_DECK_PANE_ID.to_string(), PANE.to_string())];
+        }
+
+        // The respawn proceeds past the gave-up predecessor and publishes a
+        // live replacement rooted in the same directory.
+        let replacement = registry
+            .respawn_agent_for_pane(PANE, "sleep 30")
+            .await
+            .expect("the respawn proceeds past a gave-up predecessor");
+        assert!(
+            registry.dir_in_use(dir.path()),
+            "the live replacement keeps its working directory in use"
+        );
+
+        // Stop the replacement cleanly: the respawn ticket is long gone, so
+        // the directory is held by nothing but the abandoned predecessor.
+        registry
+            .close_agent(&replacement)
+            .expect("the replacement stops cleanly");
+        assert!(
+            registry.dir_in_use(dir.path()),
+            "the abandoned predecessor's directory stays in use after the respawn ticket ended \
+             and the replacement stopped — the predecessor's exit was never confirmed"
+        );
+
+        // And the same observation-based release as the close path.
+        gate.release();
+        assert!(
+            !registry.dir_in_use(dir.path()),
+            "a confirmed exit releases the directory"
+        );
     }
 
     /// Control for the test above: the ordinary shutdown — every child reapable —

@@ -5941,7 +5941,12 @@ async fn pause_before_seed_post(pane_id: &str) {
 /// `tokio::time::timeout` wraps the `spawn_blocking` join on purpose: timing
 /// out the join would release the guards while the blocking task kept running
 /// and could do its late cleanup after a successor claimed the pane. The bound
-/// lives inside the reap, so the task itself returns.
+/// lives inside the reap, so the task itself returns. The give-up arm also
+/// unregisters the pane's routing identity (issue #1677 review): the record is
+/// gone, so nothing else would ever take it down, and a stale role entry both
+/// kept the pane a delegate target and refused every later spawn of the role
+/// as already running — while the failure answer still reports the
+/// unconfirmed exit.
 pub(crate) async fn stop_agent_steps(
     id: &str,
     stopping_record: Option<&AgentRecord>,
@@ -5990,6 +5995,18 @@ pub(crate) async fn stop_agent_steps(
     let id_for_close = id.to_string();
     let close_result =
         tokio::task::spawn_blocking(move || registry_for_close.close_agent(&id_for_close)).await;
+    // Issue #1677 (review): the give-up must stay distinguishable from a
+    // failed close of a still-registered agent, because the Err arm below has
+    // to clean up after the one and not the other. `ReapGaveUp` means the
+    // record was removed by THIS close and the pane cleanup hold was held
+    // throughout, so no successor can have claimed the pane and the pane's
+    // state routing is this stop's to take down. Every other error leaves the
+    // record where it is (or, for `NotFound`, may name a pane a successor
+    // holds — issue #505), so those arms must not touch the state maps.
+    let gave_up = matches!(
+        &close_result,
+        Ok(Err(crate::agent_pty::AgentPtyError::ReapGaveUp(_)))
+    );
     let close_outcome: Result<(), String> = match close_result {
         Ok(Ok(())) => Ok(()),
         Ok(Err(e)) => Err(e.to_string()),
@@ -6042,6 +6059,27 @@ pub(crate) async fn stop_agent_steps(
             }
             Ok(())
         }
+        Err(msg) if gave_up => {
+            // Issue #1677 (review): the close gave up on the child's reap, so
+            // the agent's record is already gone — but its pane's ROUTING
+            // identity is not, and nothing else will ever take it down: a
+            // retry of this stop answers `NotFound` against the removed
+            // record, so the stale entry would sit in `pane_role_map` forever.
+            // That made the stopped worker a delegate target for a pane with
+            // no agent, and — because the role-spawn admission reads exactly
+            // that map — refused every later spawn of the role as "already
+            // running". Unregister the pane under the same guarantee the Ok
+            // arm has (the caller's pane-cleanup hold is still up, so no
+            // successor has claimed the pane), keep the failure answer so
+            // `StopAgent` and the `close` verb still report the unconfirmed
+            // exit, and deliberately do NOT broadcast the pane closed or end
+            // the unit: the close's own report names the pane as a survivor.
+            if let Some(pane_id) = pane_id_env {
+                state.write().await.unregister_pane(pane_id);
+                registry.finish_pane_close(pane_id, false);
+            }
+            Err(msg)
+        }
         Err(msg) => {
             // PRD #126: the close failed, so the agent is still live. Roll the
             // transition back by clearing the closing mark — future delegates
@@ -6049,16 +6087,6 @@ pub(crate) async fn stop_agent_steps(
             // deliberately NOT restored: losing a watch fails safe,
             // resurrecting one could nag about a pane the user explicitly
             // asked to close.
-            //
-            // Issue #1677: "still live" now has one exception, and the path
-            // below is still right for it. A reap given up on
-            // (`AgentPtyError::ReapGaveUp`) means the agent's record is
-            // already gone and its child was SIGKILLed but never confirmed
-            // exited. The pane may by now hold a successor — which is exactly
-            // the shape `finish_pane_close(…, false)` documents for a failed
-            // close whose record was already removed (issue #505): the mark is
-            // cleared, nothing is restored, and the caller's report names the
-            // pane as a survivor.
             if let Some(pane_id) = pane_id_env {
                 registry.finish_pane_close(pane_id, false);
             }
@@ -11688,6 +11716,38 @@ mod tests {
             .hold_pane_for_cleanup(PANE, &wedged)
             .expect("the pane is the wedged agent's to give up");
 
+        // Issue #1677 review: the pane's routing identity, as a spawn of the
+        // role would have registered it — the orchestrator's pane and the
+        // wedged worker's pane, one instance. The gave-up stop must take the
+        // worker's entry down too, or the stale role stays a delegate target
+        // for a pane with no agent behind it and refuses every later spawn of
+        // the role as already running (`handle_spawn_role_with_state` reads
+        // exactly this map for its `still_live` check).
+        const ORCH_PANE: &str = "pane-1677-stop-steps-orch";
+        let identity = crate::state::OrchestrationIdentity {
+            id: "instance-1677".to_string(),
+            name: "team".to_string(),
+        };
+        {
+            let mut guard = state.write().await;
+            guard.register_orchestration_role(
+                ORCH_PANE,
+                "orchestrator",
+                true,
+                identity.clone(),
+                None,
+            );
+            guard.register_orchestration_role(PANE, "worker", false, identity, None);
+        }
+        assert_eq!(
+            state
+                .read()
+                .await
+                .delegate_targets(ORCH_PANE, &["worker".to_string()]),
+            vec![("worker".to_string(), PANE.to_string())],
+            "before the stop, the wedged member's pane is the role's delegate target"
+        );
+
         let bound = crate::agent_pty::AGENT_TERMINATE_GRACE
             + crate::agent_pty::TERMINATE_REAP_DEADLINE
             + Duration::from_secs(10);
@@ -11722,6 +11782,19 @@ mod tests {
         assert!(
             !registry.is_agent_still_registered(&wedged),
             "the wedged agent's record is gone, so nothing of it can speak for the pane"
+        );
+        // Issue #1677 review: the routing identity went with the record. A
+        // stale entry here would keep the pane a delegate target and block
+        // every later spawn of the role as already running; retrying the stop
+        // cannot clean it up, because the agent is no longer registered.
+        assert!(
+            state
+                .read()
+                .await
+                .delegate_targets(ORCH_PANE, &["worker".to_string()])
+                .is_empty(),
+            "the gave-up stop must unregister the pane's routing identity, not only the closing \
+             mark — the record is gone, so nothing else would ever take it down"
         );
         // The handler releases the cleanup hold after its reply; do the same
         // before a successor claims the pane.
