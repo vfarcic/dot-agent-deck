@@ -50,6 +50,32 @@ pub use scan::{
     fill_command_lines, qualifying_command_sessions, shell_tool_candidates,
 };
 
+/// Issue #1677 — what [`terminate_child_with_grace_and_wait`] established
+/// about the child it was asked to stop.
+///
+/// The distinction is the fix's whole surface: before it, the helper's
+/// SIGKILL backstop ended in a bare blocking `wait()`, so a child that never
+/// finished exiting (uninterruptible kernel I/O — D state — is the real-world
+/// shape) held the single-agent stop path forever, along with the holds that
+/// path keeps: the TUI's and the desktop's close, the `close` verb's
+/// generation/instance admission gates, and the pane cleanup hold. The helper
+/// now reaps with nonblocking polling under a deadline, exactly as the
+/// daemon-wide `force_kill_and_reap_all` has since issue #1118, and reports
+/// which of the two ways the reap ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TerminateReap {
+    /// The child's exit status was collected — inside the SIGTERM grace
+    /// window, or after the SIGKILL backstop within the reap deadline.
+    Reaped,
+    /// The SIGKILL backstop was issued but the child never reported an exit
+    /// within the reap deadline. The child is left un-reaped: dropping it
+    /// abandons the status collection (a zombie on Unix until this process
+    /// exits; the kernel releases the object on Windows), and — the point of
+    /// the bound — no late `wait()` of this child can ever run, so no late
+    /// cleanup can tear down a successor that has since claimed the pane.
+    GaveUp,
+}
+
 /// Result of delivering the daemon-stop graceful signal to a PID via
 /// [`terminate_pid`].
 ///
@@ -417,7 +443,15 @@ mod tests {
 
         let grace = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
-        terminate_child_with_grace_and_wait(&mut child, grace, &group);
+        let outcome = terminate_child_with_grace_and_wait(
+            &mut child,
+            grace,
+            // A deadline of its own, so this test pins the helper's contract
+            // rather than one caller's budget (issue #1677).
+            std::time::Duration::from_millis(500),
+            &group,
+        );
+        assert_eq!(outcome, TerminateReap::Reaped);
         assert!(
             started.elapsed() < grace,
             "an already-exited child must not cost the full grace window (took {:?})",

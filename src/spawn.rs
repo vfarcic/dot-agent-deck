@@ -1502,9 +1502,10 @@ pub(crate) async fn close_started_agents(
     }
 
     // `close_agent` runs the synchronous SIGTERM-with-grace loop
-    // (`terminate_child_with_grace_and_wait`, up to `AGENT_TERMINATE_GRACE` per
-    // child), so it must not run on a Tokio worker thread — same reasoning as the
-    // `StopAgent` handler's `spawn_blocking` hop.
+    // (`terminate_child_with_grace_and_wait`, up to `AGENT_TERMINATE_GRACE`
+    // plus its bounded reap per child — issue #1677), so it must not run on a
+    // Tokio worker thread — same reasoning as the `StopAgent` handler's
+    // `spawn_blocking` hop.
     let registry_for_close = registry.clone();
     let ids: Vec<String> = started.iter().map(|a| a.id.clone()).collect();
     let closed = tokio::task::spawn_blocking(move || {

@@ -12228,11 +12228,11 @@ pub async fn handle_spawn_role_with_state(
         if !still_live.is_empty() {
             drop(state_guard);
             // `close_agent` runs the synchronous SIGTERM-with-grace loop,
-            // which blocks for up to `AGENT_TERMINATE_GRACE` on
-            // `std::thread::sleep`. This function is awaited directly on the
-            // daemon's hook-connection task, so calling it inline would
-            // block a Tokio worker thread for the duration — hop it onto
-            // `spawn_blocking`.
+            // which blocks for up to `AGENT_TERMINATE_GRACE` plus its bounded
+            // SIGKILL reap (issue #1677) on `std::thread::sleep`. This
+            // function is awaited directly on the daemon's hook-connection
+            // task, so calling it inline would block a Tokio worker thread
+            // for the duration — hop it onto `spawn_blocking`.
             let registry_for_close = registry.clone();
             let id_for_close = agent_id.clone();
             let _ =

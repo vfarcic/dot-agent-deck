@@ -227,6 +227,13 @@ mod test_paths;
 // deterministic were private to one of them.
 #[cfg(test)]
 mod test_pty_wait;
+// Issue #1677: test-only, and shared for the same reason as the three above —
+// the wedged-child fixture (a child whose `try_wait` stays `None` and whose
+// `wait` blocks) was private to `agent_pty`'s own test module, and the stop
+// and close regressions for that issue live in `daemon_protocol` and
+// `close_agents`.
+#[cfg(test)]
+pub(crate) mod test_wedged_child;
 pub mod turn_reply;
 pub mod ui;
 // Issue #670: the one implementation of the control-character / Unicode-bidi

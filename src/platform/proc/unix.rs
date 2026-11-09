@@ -5,6 +5,8 @@
 
 use std::time::Duration;
 
+use super::TerminateReap;
+
 // ---------------------------------------------------------------------------
 // Agent process-group teardown (lifted from agent_pty.rs).
 // ---------------------------------------------------------------------------
@@ -86,9 +88,10 @@ fn signal_child_pgroup_or_fallback(
         // fallback below uses `portable_pty::Child::kill`, which sends SIGHUP
         // — strictly weaker than the requested `signal` (typically SIGTERM or
         // SIGKILL) and limited to the direct child (no process-group
-        // semantics, so descendants leak). The caller's subsequent
-        // `child.wait()` is unbounded — that's acceptable for the same "this
-        // branch is practically unreachable" reason.
+        // semantics, so descendants leak). The caller's subsequent reap is
+        // bounded by its reap deadline (issue #1677) either way — that holds
+        // for this branch too, for the same "this branch is practically
+        // unreachable" reason.
         //
         // Auditor #5: emit a warn-level event so a descendant leak surfaced
         // via this fallback is at least observable.
@@ -177,14 +180,29 @@ pub fn force_kill_child_group(
 /// SIGTERM-then-SIGKILL escalation used by the single-pane Ctrl+W path. Sends
 /// `SIGTERM` to the child's process group, polls `try_wait` until the child
 /// exits or `grace` elapses, then sends `SIGKILL` as the backstop and reaps the
-/// child.
+/// child — for at most `reap_deadline` (issue #1677).
 ///
 /// `_group` is unused on Unix (see [`force_kill_child_and_wait`]).
+///
+/// **The reap is bounded, and CAN be given up** (issue #1677) — the same
+/// trade the daemon-wide `force_kill_and_reap_all` has taken since #1118,
+/// adapted to the single-agent path. After the SIGKILL lands there is nothing
+/// this function can still do to make the child exit sooner: a child stuck in
+/// uninterruptible kernel I/O answers `Ok(None)` for exactly as long as it
+/// stays in that state, which is not a duration this process controls. So
+/// after `reap_deadline` the status collection is abandoned and
+/// [`TerminateReap::GaveUp`] returned, rather than parking in the bare
+/// blocking `wait()` this helper used to end on — a wait that held the
+/// caller's stop path (and its pane-cleanup and admission holds) forever. An
+/// abandoned child is un-reaped, not un-killed: the SIGKILL was issued before
+/// the deadline could expire, and dropping the child means no late `wait()`
+/// of it can ever run.
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
+    reap_deadline: Duration,
     _group: &AgentProcessGroup,
-) {
+) -> TerminateReap {
     // Phase 1: SIGTERM the process group.
     signal_child_pgroup_or_fallback(child, libc::SIGTERM, "graceful-close-sigterm");
 
@@ -196,7 +214,7 @@ pub fn terminate_child_with_grace_and_wait(
     let deadline = std::time::Instant::now() + grace;
     while std::time::Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => return TerminateReap::Reaped,
             Ok(None) => {}
             Err(_) => break,
         }
@@ -206,7 +224,25 @@ pub fn terminate_child_with_grace_and_wait(
     // Phase 3: SIGKILL backstop. Reaches survivors regardless of
     // SIGTERM-trapping state.
     signal_child_pgroup_or_fallback(child, libc::SIGKILL, "graceful-close-sigkill");
-    let _ = child.wait();
+
+    // Phase 4 (issue #1677): reap with nonblocking polling under a deadline,
+    // never a bare blocking `wait()`. The cadence matches phase 2 and
+    // `force_kill_and_reap_all`'s reap pass. `Err` counts as collected: it
+    // means there is no status left to ask for (the same reading
+    // `force_kill_and_reap_all`'s `retain_mut` gives its `Err`), which is not
+    // the never-exiting shape this deadline exists for.
+    let deadline = std::time::Instant::now() + reap_deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return TerminateReap::Reaped,
+            Err(_) => return TerminateReap::Reaped,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return TerminateReap::GaveUp;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// SIGTERM the child's process group without waiting (the daemon-wide

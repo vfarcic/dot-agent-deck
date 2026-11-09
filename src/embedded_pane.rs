@@ -2959,7 +2959,10 @@ const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 /// buffer for SIGKILL delivery, child reap, and RPC round-trip on a
 /// loaded system. Anything longer is a real daemon hang and the user
 /// gets the "stop-agent timed out" error message with a retry hint.
-const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// `pub(crate)` because the daemon side derives its single-agent reap
+/// deadline from this window (issue #1677): a stop whose child's reap
+/// has to be given up on must still answer inside it.
+pub(crate) const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// PRD #241 M2: is this `stop-agent` failure the daemon telling us that
 /// **this exact agent id** is already gone?

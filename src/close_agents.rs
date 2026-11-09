@@ -2220,6 +2220,168 @@ mod tests {
         deck.shutdown().await;
     }
 
+    /// Scenario (issue #1677): a dispatched orchestration is closed while one
+    /// of its workers is a child that never finishes exiting — the D-state
+    /// shape, modelled by a wedged child whose `try_wait` stays `None` and
+    /// whose `wait` blocks. The close must answer within the terminate
+    /// helper's bounds instead of waiting forever, report that worker
+    /// truthfully as a survivor beside the roles that did stop, release its
+    /// admission holds — the instance takes a new role again, and the unit is
+    /// closeable again rather than "already in progress" — and a generation
+    /// admitted afterwards must not be torn down by any late reap.
+    #[tokio::test]
+    async fn a_close_of_a_wedged_member_is_bounded_reports_a_survivor_and_re_admits() {
+        let deck = Deck::new().await;
+        let mut rx = deck.event_tx.subscribe();
+        let dispatcher = deck.start("disp", "sleep 30", None).await;
+        let orch = deck
+            .start(
+                "w-orch",
+                "sleep 30",
+                Some(("orch-1677", "orchestrator", true)),
+            )
+            .await;
+        let (wedged, gate) =
+            deck.registry
+                .insert_wedged_member_for_test("w-stuck", "orch-1677", "coder", false);
+        deck.orch_unit(
+            "team-1677",
+            ("disp", &dispatcher),
+            "orch-1677",
+            "w-orch",
+            &orch,
+        );
+        deck.report_done("w-orch", &orch);
+        let claim = deck.claim("disp", &dispatcher);
+
+        let bound = crate::agent_pty::AGENT_TERMINATE_GRACE
+            + crate::agent_pty::TERMINATE_REAP_DEADLINE
+            + Duration::from_secs(10);
+        let report = tokio::time::timeout(
+            bound,
+            deck.close(by_name("team-1677"), Some(claim), false, false),
+        )
+        .await
+        .expect(
+            "the close never answered — a member whose child never finishes exiting still \
+             holds it, which is exactly issue #1677",
+        );
+
+        let target = &report.targets[0];
+        assert_eq!(
+            target.outcome,
+            CloseOutcome::PartiallyClosed,
+            "a close with one stopped and one unconfirmable pane is partial: {target:?}"
+        );
+        assert_eq!(target.survivors, vec!["w-stuck".to_string()]);
+        assert!(
+            target
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("could not be confirmed"),
+            "the report must say the survivor's exit could not be confirmed: {:?}",
+            target.error
+        );
+        let stuck = target
+            .panes
+            .iter()
+            .find(|p| p.pane_id.as_deref() == Some("w-stuck"))
+            .expect("the wedged pane is listed");
+        assert_eq!(
+            stuck.stopped,
+            Some(false),
+            "the survivor's pane reports its stop as unconfirmed, not as stopped"
+        );
+        let stopped_orch = target
+            .panes
+            .iter()
+            .find(|p| p.pane_id.as_deref() == Some("w-orch"))
+            .expect("the orchestrator's pane is listed");
+        assert_eq!(stopped_orch.stopped, Some(true));
+        assert!(
+            !deck.live(&orch),
+            "the orchestrator stopped cleanly — the survivor is only the unconfirmable pane"
+        );
+        assert!(
+            !deck.registry.is_agent_still_registered(&wedged),
+            "the wedged member's record is gone from the registry"
+        );
+        assert!(
+            !deck.registry.is_instance_closing("orch-1677"),
+            "the instance admission gate is released — a partially closed instance is not mid-close"
+        );
+        assert!(
+            deck.registry
+                .dispatched_units()
+                .unit_of_instance("orch-1677")
+                .is_some(),
+            "the unit stays live and closeable while one pane is a survivor"
+        );
+
+        // A generation admitted afterwards: a new role joins the instance the
+        // close held, which the stuck close used to refuse forever.
+        let joined = deck
+            .start(
+                "w-joined",
+                "sleep 30",
+                Some(("orch-1677", "coder-2", false)),
+            )
+            .await;
+
+        // Nothing tears it down after the fact: release the wedge (the
+        // abandoned child would now answer any late `try_wait`/`wait`), give a
+        // late cleanup a poll tick or two to land in, and require the joined
+        // role untouched — live, and its pane never announced closed.
+        gate.release();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            deck.live(&joined),
+            "a generation admitted after the gave-up close must not be torn down by a late reap"
+        );
+        let closed_panes: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Event(e) if e.is_daemon_pane_closed() => {
+                    e.pane_id.clone().map(|p| (p, e.agent_id))
+                }
+                _ => None,
+            })
+            .collect();
+        let stuck_announced = closed_panes.iter().any(|(pane, _)| pane == "w-stuck");
+        let joined_announced = closed_panes.iter().any(|(pane, _)| pane == "w-joined");
+        assert!(
+            !stuck_announced && !joined_announced,
+            "neither the survivor's nor the joined pane may be announced closed by a late \
+             cleanup: {closed_panes:?}"
+        );
+
+        // The unit is closeable again — not "already in progress". The second
+        // close finds the joined role as its member and stops it cleanly.
+        let report = deck
+            .close(
+                by_name("team-1677"),
+                Some(deck.claim("disp", &dispatcher)),
+                false,
+                false,
+            )
+            .await;
+        let target = &report.targets[0];
+        assert_ne!(
+            target.outcome,
+            CloseOutcome::Refused,
+            "the unit's closing admission was released with the first close's answer: {target:?}"
+        );
+        assert!(
+            !target
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("already in progress"),
+            "a second close must not be refused as in progress: {target:?}"
+        );
+        deck.shutdown().await;
+    }
+
     /// Scenario: a dispatched orchestration has reported done and every role
     /// reads Idle, but its worker still has a background command running.
     /// Named by dispatch name, by unit id or by `--orchestration-of`, a dry run

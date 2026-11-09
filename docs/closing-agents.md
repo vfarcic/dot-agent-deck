@@ -158,6 +158,7 @@ A unit closed with `close` disappears from both clients, and a unit closed in a 
 | `no daemon is running …; nothing was closed` | No daemon is running for this user. `close` never starts one. | Nothing is running, so there is nothing to close. |
 | `close: …` naming `DOT_AGENT_DECK_PANE_ID`, `DOT_AGENT_DECK_AGENT_ID` or `DOT_AGENT_DECK_PANE_CAPABILITY` | Some of the variables the deck sets in its panes are present and some are missing or empty, so `close` cannot tell whether a person or an agent is asking. It refuses rather than guess. | Run it from a terminal outside the deck, where none of them is set, or from the agent's own pane with the environment the deck gave it. |
 | `PARTIALLY: still running: …` | Some agents of the unit stopped and some did not. | Close the survivors with `--pane`, or from a client. |
+| `PARTIALLY: still running: …` where the error says an exit `could not be confirmed within the reap deadline` | The agent was stopped and its process killed, but the process had not finished exiting when the deck stopped waiting — a process stuck on storage that has gone away, for example. The deck answers within a few seconds rather than waiting it out. | The pane's agent is gone from the deck and the process finishes exiting on its own. Close the unit again once it has, or from a client. |
 | An agent's `close --all` lists nothing | That agent dispatched no units that are still running. | Close from a shell instead. |
 
 ## What the agent rules protect against

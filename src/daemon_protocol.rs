@@ -5930,6 +5930,18 @@ async fn pause_before_seed_post(pane_id: &str) {
 /// releases it after this returns. On success the agent's unit, if it was one
 /// and this was its last pane, ends with `end_reason`. On failure the closing
 /// mark is rolled back and the error returned.
+///
+/// Issue #1677: the whole sequence is bounded by the terminate helper's own
+/// deadlines — `AGENT_TERMINATE_GRACE` for the SIGTERM phase, then
+/// [`crate::agent_pty::TERMINATE_REAP_DEADLINE`] for the SIGKILLed child's
+/// reap. A child that never finishes exiting makes the close answer with a
+/// failure (see [`crate::agent_pty::AgentPtyError::ReapGaveUp`]) inside that
+/// bound instead of parking here forever, which is what releases the caller's
+/// pane-cleanup hold and — for `CloseAgents` — the unit's admission gates. No
+/// `tokio::time::timeout` wraps the `spawn_blocking` join on purpose: timing
+/// out the join would release the guards while the blocking task kept running
+/// and could do its late cleanup after a successor claimed the pane. The bound
+/// lives inside the reap, so the task itself returns.
 pub(crate) async fn stop_agent_steps(
     id: &str,
     stopping_record: Option<&AgentRecord>,
@@ -5966,13 +5978,13 @@ pub(crate) async fn stop_agent_steps(
     // synchronous SIGTERM-with-grace loop in
     // `terminate_child_with_grace_and_wait`, which calls
     // `std::thread::sleep` for up to 3 s while polling the
-    // child's `try_wait`. Calling that from inside the async
+    // child's `try_wait`, plus a bounded SIGKILL reap (issue #1677,
+    // `TERMINATE_REAP_DEADLINE`). Calling that from inside the async
     // attach-connection task would block a Tokio worker thread
-    // for the duration of the grace window — under load this
-    // can starve other connections. Mirror the
-    // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
-    // onto a `spawn_blocking` pool task, await the
-    // `JoinHandle`, and surface a join error as a failed
+    // for the duration — under load this can starve other
+    // connections. Mirror the `KIND_SHUTDOWN` handler's pattern:
+    // hop the blocking work onto a `spawn_blocking` pool task,
+    // await the `JoinHandle`, and surface a join error as a failed
     // close.
     let registry_for_close = registry.clone();
     let id_for_close = id.to_string();
@@ -6037,6 +6049,16 @@ pub(crate) async fn stop_agent_steps(
             // deliberately NOT restored: losing a watch fails safe,
             // resurrecting one could nag about a pane the user explicitly
             // asked to close.
+            //
+            // Issue #1677: "still live" now has one exception, and the path
+            // below is still right for it. A reap given up on
+            // (`AgentPtyError::ReapGaveUp`) means the agent's record is
+            // already gone and its child was SIGKILLed but never confirmed
+            // exited. The pane may by now hold a successor — which is exactly
+            // the shape `finish_pane_close(…, false)` documents for a failed
+            // close whose record was already removed (issue #505): the mark is
+            // cleared, nothing is restored, and the caller's report names the
+            // pane as a survivor.
             if let Some(pane_id) = pane_id_env {
                 registry.finish_pane_close(pane_id, false);
             }
@@ -11632,6 +11654,127 @@ mod tests {
 
         registry.shutdown_all();
         server.abort();
+    }
+
+    /// Issue #1677 (regression): a `StopAgent` whose child never finishes
+    /// exiting — the D-state shape, modelled by a wedged child whose
+    /// `try_wait` stays `None` and whose `wait` blocks — must answer within
+    /// the terminate helper's bounds instead of parking forever, report the
+    /// failure truthfully, release its cleanup holds, and leave the pane
+    /// claimable by a successor that nothing later tears down.
+    ///
+    /// The pre-fix code did not fail this test, it HUNG: `close_agent` spent
+    /// the SIGTERM grace, issued the SIGKILL, then blocked in `child.wait()`
+    /// with no deadline, holding the pane-cleanup hold with it. The successor
+    /// half is the point of the fix's ownership ordering: the give-up drops
+    /// the child un-reaped inside the stop itself, so no late `wait()` of it
+    /// can run after a successor has claimed the pane — asserted here by
+    /// releasing the wedge AFTER the successor is live and checking nothing
+    /// of the successor goes away.
+    #[tokio::test]
+    async fn stop_agent_steps_gives_up_on_a_wedged_child_and_frees_the_pane() {
+        const PANE: &str = "pane-1677-stop-steps";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (event_tx, mut rx) = broadcast::channel(64);
+        let state: SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+
+        let (wedged, gate) =
+            registry.insert_wedged_member_for_test(PANE, "instance-1677", "worker", false);
+        let record = registry
+            .agent_record_any(&wedged)
+            .expect("a record for the wedged member");
+        let hold = registry
+            .hold_pane_for_cleanup(PANE, &wedged)
+            .expect("the pane is the wedged agent's to give up");
+
+        let bound = crate::agent_pty::AGENT_TERMINATE_GRACE
+            + crate::agent_pty::TERMINATE_REAP_DEADLINE
+            + Duration::from_secs(10);
+        let outcome = tokio::time::timeout(
+            bound,
+            stop_agent_steps(
+                &wedged,
+                Some(&record),
+                Some(PANE),
+                &registry,
+                &state,
+                &event_tx,
+                crate::dispatched_units::EndReason::Stopped,
+            ),
+        )
+        .await
+        .expect(
+            "the stop never answered — a child that never finishes exiting still pins \
+             `stop_agent_steps`, which is exactly issue #1677",
+        );
+        let Err(msg) = outcome else {
+            panic!("the stop must report the give-up as a failure, got {outcome:?}");
+        };
+        assert!(
+            msg.contains("could not be confirmed"),
+            "the failure must say the child's exit could not be confirmed, got: {msg}"
+        );
+        assert!(
+            !registry.is_pane_closing(PANE),
+            "the closing mark must be rolled back — the pane is not mid-close any more"
+        );
+        assert!(
+            !registry.is_agent_still_registered(&wedged),
+            "the wedged agent's record is gone, so nothing of it can speak for the pane"
+        );
+        // The handler releases the cleanup hold after its reply; do the same
+        // before a successor claims the pane.
+        drop(hold);
+
+        // A successor generation claims the pane — the admission the stuck
+        // stop used to hold closed forever.
+        let successor = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("sleep 30"),
+                env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                    crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                    PANE.to_string(),
+                )]),
+                ..SpawnOptions::default()
+            })
+            .expect("the pane is claimable again once the stop has answered");
+        assert_eq!(
+            registry.pane_current_agent_id(PANE).as_deref(),
+            Some(successor.as_str())
+        );
+
+        // Nothing tears the successor down after the fact: release the wedge
+        // (the abandoned child would now answer any late `try_wait`/`wait`),
+        // give a late cleanup a poll tick or two to land in, and require the
+        // successor untouched — still registered, still the pane's agent, and
+        // no pane-closed announcement for the pane it holds.
+        gate.release();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            registry.is_agent_still_registered(&successor),
+            "a generation admitted after the gave-up stop must not be torn down by a late reap"
+        );
+        assert_eq!(
+            registry.pane_current_agent_id(PANE).as_deref(),
+            Some(successor.as_str()),
+            "the successor still owns the pane"
+        );
+        let announced: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|msg| match msg {
+                BroadcastMsg::Event(e) if e.is_daemon_pane_closed() => Some(e),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            announced.is_empty(),
+            "nothing may announce the successor's pane closed: {announced:#?}"
+        );
+
+        registry
+            .close_agent(&successor)
+            .expect("close the successor");
+        registry.shutdown_all();
     }
 
     /// PR #1735 third review, finding 1: a start whose seed is refused after

@@ -88,7 +88,7 @@ use windows_sys::Win32::System::Threading::{
     PROCESS_TERMINATE, TerminateProcess,
 };
 
-use super::{TerminateSignal, checked_target_pid};
+use super::{TerminateReap, TerminateSignal, checked_target_pid};
 
 /// Exit code stamped on a process/tree we tore down ourselves. Matches the PRD's
 /// `TerminateProcess(OpenProcess(pid), 1)` and reads as "killed, did not exit on
@@ -410,7 +410,8 @@ pub fn force_kill_child_group(
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
 /// ask with `CTRL_BREAK_EVENT`, poll `try_wait` until the child exits or `grace`
-/// elapses, then `TerminateJobObject` as the unconditional backstop and reap.
+/// elapses, then `TerminateJobObject` as the unconditional backstop and reap —
+/// for at most `reap_deadline` (issue #1677).
 ///
 /// Structurally identical to the Unix `SIGTERM` → poll → `SIGKILL` sequence
 /// (same 50 ms poll cadence, same "an early exiter is not penalised by the
@@ -427,11 +428,22 @@ pub fn force_kill_child_group(
 /// that spawns a tool process and exits (a shell wrapper, a launcher, `cmd /c`)
 /// leaves that tool process running *inside the job*, and nothing else will ever
 /// reap it. So an exited child still gets a `TerminateJobObject`.
+///
+/// **The reap is bounded, and CAN be given up** (issue #1677) — the same trade
+/// as the Unix twin and the daemon-wide `force_kill_and_reap_all` (#1118): a
+/// child the kernel has not finished tearing down answers `Ok(None)` for as
+/// long as it stays that way, so past `reap_deadline` the status collection is
+/// abandoned and [`TerminateReap::GaveUp`] returned, rather than parking in
+/// the bare blocking `wait()` this helper used to end on. An abandoned child
+/// is un-reaped, not un-terminated: the job was terminated before the deadline
+/// could expire, and dropping the child closes its handle so the kernel
+/// releases the process object when it finally exits.
 pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
+    reap_deadline: Duration,
     group: &AgentProcessGroup,
-) {
+) -> TerminateReap {
     // Phase 1: ask the agent's process group to stop.
     best_effort_ctrl_break(child.process_id(), "graceful-close-ctrl-break");
 
@@ -459,10 +471,26 @@ pub fn terminate_child_with_grace_and_wait(
         // terminated. `terminate_tree` is a no-op-safe call on a job whose
         // processes have all exited.
         group.terminate_tree("graceful-close-terminate-job-after-child-exit");
-        return;
+        return TerminateReap::Reaped;
     }
     reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
-    let _ = child.wait();
+    // Phase 4 (issue #1677): reap with nonblocking polling under a deadline,
+    // never a bare blocking `wait()`. `Err` counts as collected: it means
+    // there is no status left to ask for — the same reading the Unix twin
+    // gives its `Err` — which is not the never-exiting shape this deadline
+    // exists for.
+    let deadline = std::time::Instant::now() + reap_deadline;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return TerminateReap::Reaped,
+            Err(_) => return TerminateReap::Reaped,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return TerminateReap::GaveUp;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The daemon-wide `shutdown_all_graceful` "SIGTERM phase" for one agent: ask
@@ -1040,7 +1068,13 @@ mod tests {
 
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(crate::platform::proc::test_child::StdChild(doomed));
-        terminate_child_with_grace_and_wait(&mut child, Duration::from_secs(3), &group);
+        let outcome = terminate_child_with_grace_and_wait(
+            &mut child,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+            &group,
+        );
+        assert_eq!(outcome, TerminateReap::Reaped);
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut reaped = false;
