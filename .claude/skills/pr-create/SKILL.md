@@ -1,6 +1,6 @@
 ---
 name: pr-create
-description: Take committed work from a branch to a verified pull request — push, open the PR, settle CI and the automated review, answer and resolve every finding, and hand off. Never merges; arms auto-merge only when nothing downstream gates the merge. Use when work on a branch is finished and needs to become a reviewed PR, whether or not a PRD started it.
+description: Take committed work from a branch to a verified pull request — push, open the PR, settle CI and the automated review, answer and resolve every finding, and hand off. Never merges and never arms auto-merge. Use when work on a branch is finished and needs to become a reviewed PR, whether or not a PRD started it.
 user-invocable: true
 ---
 
@@ -10,7 +10,7 @@ Owns one arc: **committed work on a branch → a PR that is green, reviewed, and
 
 Out of scope on purpose:
 
-- **Merging.** Nothing here merges. Arm auto-merge and hand off — CLAUDE.md rule 8: nobody merges their own unapproved PR, and for an admin that succeeds *silently* rather than failing, which is how the gate decays into ceremony.
+- **Merging.** Nothing here merges or arms auto-merge; it hands off. CLAUDE.md rule 8: nobody merges their own unapproved PR (for an admin that succeeds *silently* rather than failing, which is how the gate decays into ceremony), and agents never arm auto-merge. An approved PR is merged through [`merge-pr`](../merge-pr/SKILL.md) by an agent whose task says to merge, or by a person.
 - **Closing the issue.** `Closes #<n>` in the PR body does it on merge.
 - **Implementation.** If a finding needs a code change, make it; if it needs a decision you cannot make, say so on the thread.
 
@@ -105,15 +105,7 @@ Push fixes **before** requesting review (step 2). Greptile does not re-review �
 
 Report and stop: PR URL, check status, each finding and what you did about it (with `unanswered-findings.sh`'s final `UNANSWERED_COUNT=` and the unresolved-thread count, both taken after the last `wait-reviews.sh`), each red you met and whether it was fixed or quarantined, and whether an automated review was obtained at all.
 
-**Arm auto-merge only when nothing downstream gates the merge.** `gh pr merge <n> --auto --squash` waits for exactly what a manual merge needs — the approval, the **required** checks, every thread resolved — so against a bare hand-off it is not a bypass.
-
-**It is not a way to wait for a check that is not required.** The required contexts here were `build`, `build-macos`, `build-windows`, `security` and `e2e-deterministic` (verified 2026-09-22 against `gh api repos/vfarcic/dot-agent-deck/rules/branches/main`, ruleset rules only; the classic protection on `main` requires none), and `scripts/apply-branch-protection.sh`'s default adds `RWX: linux` for the RWX switch; read the ruleset rather than this list; everything else on the page — `renovate/stability-days`, `Greptile Review`, `notify-main-red` — holds nothing, on either path. Armed at hand-off, before the approval, the PR reads `BLOCKED`, `gh` arms it, and GitHub merges it the moment the approval lands, pending unrequired check or not — `autoMergeRequest` is set, so nothing looks wrong. Run after the approval with only an unrequired check outstanding, the PR is already mergeable (`UNSTABLE`) and `gh` drops the flag and merges on the spot, because `isImmediatelyMergeable` counts `UNSTABLE` (`pkg/cmd/pr/merge/merge.go:593` and `:826`, at gh v2.100.0): exit 0, silent when stdout is not a terminal, and `gh pr view <n> --json autoMergeRequest` reading `null` *after* the call is the tell. #1208, already approved, landed a lockfile update inside Renovate's stability window that second way (#1222). So read `gh pr checks <n>` **before** arming; if an unrequired check is pending and matters, do not arm — poll that check and merge when it passes, or leave the PR disarmed for a person. CLAUDE.md rule 8.
-
-It *is* a bypass when your caller has a gate of its own after this step. The orchestrated PRD workflow is exactly that shape: `.dot-agent-deck.toml` runs this skill at step 5, then builds a demo reel at step 6, then asks the **user** for an explicit merge go-ahead at step 7. Arming here would land the PR the moment the approval arrived — during step 6, with nobody present — and nothing later can un-arm it, because re-running this skill only arms it again.
-
-**Auto-merge also skips the overlap check** (`/merge-pr`'s "The overlap check before a merge", `.claude/skills/merge-pr/SKILL.md`) **and the watch of `main`'s run after the merge**: GitHub merges when the approval lands, and nobody looks then at what `main` gained meanwhile in the files this PR changes, nor at `main`'s CI afterwards, where `notify-main-red` is the only signal. Running the check before arming, and updating the branch when it lists anything, covers only what `main` holds at that moment.
-
-So the default is **do not arm**; arm only when you are the last gate. If you were told to stop before merge, that is your answer: report and leave it disarmed.
+**Do not arm auto-merge** (CLAUDE.md rule 8). GitHub would merge the PR the moment the approval lands, with nobody present to run `/merge-pr`'s overlap check first ("The overlap check before a merge", `.claude/skills/merge-pr/SKILL.md`) or to watch `main`'s CI run for the merge commit and fix a red. When your task says to take the PR to merged, do it through `/merge-pr` once it is approved; otherwise stop at the PR.
 
 ## Reference
 

@@ -287,14 +287,10 @@ tasks:
     env:
       SHARD: ${{ parallel.shard }}
     run: |
-      # `lifecycle/version/001` runs a nested cold `cargo build` (72-370s in CI)
-      # and set the floor of whichever partition drew it, so it runs alone in
-      # its own shard and the other four split the rest of the tier.
-      if [ "$SHARD" = version ]; then
-        set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
-      else
-        set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
-      fi
+      # `scripts/e2e-shard.sh` holds what each shard selects, for ci.yml too:
+      # the `tests/e2e_*.rs` binaries and the `e2e_only…` modules, not the
+      # fast tier the `test` task already ran (issue #2091), with
+      # `lifecycle/version/001` alone in the `version` shard.
       # Extracted into the workspace, so `target/` lands where the tests'
       # compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
       # Under scripts/rwx-export-root.sh: a task's `/` is overlayfs, which the
@@ -304,9 +300,9 @@ tasks:
       # rule accepts (docs/develop/rwx.md, "The export chain"). GitHub's
       # runners need no such step (their root is ext4), so ci.yml runs the
       # tier without it.
-      scripts/rwx-export-root.sh \
+      scripts/rwx-export-root.sh scripts/e2e-shard.sh "$SHARD" \
         cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
-        --extract-to . --extract-overwrite --retries 1 "$@"
+        --extract-to . --extract-overwrite --retries 1
     outputs:
       # Nothing uses a partition's filesystem; uploading it cost 5 minutes.
       filesystem: false
@@ -330,7 +326,7 @@ tasks:
       # A pinned rustup-init, checked against its published SHA-256 before it
       # runs; nothing downloaded is piped into a shell. A version bump needs
       # the new checksum (`rustup-init.sha256` beside the binary).
-      curl -fsSLo /tmp/rustup-init \
+      curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 -o /tmp/rustup-init \
         "https://static.rust-lang.org/rustup/archive/${RUSTUP_VERSION}/x86_64-unknown-linux-gnu/rustup-init"
       echo "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init" | sha256sum -c -
       chmod +x /tmp/rustup-init
@@ -471,7 +467,7 @@ tasks:
       # The release tarball, checked against its published SHA-256, and its own
       # installer run from the unpacked copy; a version bump needs the new
       # checksum (`<tarball>.sha256` beside it).
-      curl -fsSLo /tmp/nix.tar.xz \
+      curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 -o /tmp/nix.tar.xz \
         "https://releases.nixos.org/nix/nix-${NIX_VERSION}/nix-${NIX_VERSION}-x86_64-linux.tar.xz"
       echo "ff66236d2f7e2a21f3350e73668e021ac6a8881ef277a38e16e952bfb22718c3  /tmp/nix.tar.xz" | sha256sum -c -
       tar -xJf /tmp/nix.tar.xz -C /tmp
@@ -502,7 +498,17 @@ tasks:
       scripts/check-pin-lockstep.sh
       # The release binary, checked against its published SHA-256 (the
       # release's checksums.txt), rather than the get.jetify.com script.
-      curl -fsSLo /tmp/devbox.tar.gz \
+      # Issue #2160: a single HTTP 504 from this download turned the run red.
+      # `--retry 5 --retry-all-errors` makes up to six attempts on any failure
+      # (5xx, connection reset, timeout) with curl's doubling backoff
+      # (1s, 2s, 4s, 8s, 16s); `-S` prints each error and `-f` keeps the
+      # task failing with the last one once the attempts are spent.
+      # `--retry-max-time 120` stops a server's long `Retry-After` from
+      # holding the task: curl then gives up without a file, and exits 0
+      # doing so (curl 8.17, measured), so the SHA-256 check below is what
+      # fails the task then. The rustup and nix downloads above carry the
+      # same flags.
+      curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 -o /tmp/devbox.tar.gz \
         "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
       echo "13a9c9ca15ffef279f5c37694e7feeeeaed93d7ab7b0a69c7b4301a06bcd21ba  /tmp/devbox.tar.gz" | sha256sum -c -
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox

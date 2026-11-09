@@ -4977,6 +4977,45 @@ async fn rename_agent_action(
         .map_err(|error| safe_message(error.to_string()))
 }
 
+/// A best-effort hint on the close dialog, bounded like the TUI's preview.
+#[tauri::command]
+async fn desktop_worktree_close_preview(
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+    pane_ids: Vec<String>,
+    incarnation: Incarnation,
+) -> Result<Option<dot_agent_deck::daemon_protocol::KeptWorktree>, String> {
+    ensure_main_webview(&webview)?;
+    Ok(worktree_close_preview_on(&state, &deck_id, pane_ids, incarnation).await)
+}
+
+async fn worktree_close_preview_on(
+    state: &DesktopState,
+    deck_id: &str,
+    pane_ids: Vec<String>,
+    incarnation: Incarnation,
+) -> Option<dot_agent_deck::daemon_protocol::KeptWorktree> {
+    if pane_ids.is_empty() {
+        return None;
+    }
+    tokio::time::timeout(Duration::from_millis(500), async {
+        let scope = crate::dto::DeckScope::resolve(Some(deck_id)).ok()?;
+        let daemon = state.daemon.trusted(scope.endpoint()).await.ok()?;
+        daemon.require_compatible().ok()?;
+        daemon
+            .client
+            .bound_to(incarnation)
+            .dispatch_worktree_close_preview(pane_ids)
+            .await
+            .ok()
+            .flatten()
+    })
+    .await
+    .ok()
+    .flatten()
+}
+
 /// Stop one agent on the selected deck, and tear down **that deck's** terminal
 /// session for it.
 ///
@@ -6665,6 +6704,9 @@ pub fn run() {
         // Issue #1403: the terminal copy chord's clipboard write. The page may
         // only write through it (`capabilities/default.json`).
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Issue #2075: the one notification for a question left unanswered.
+        // The page may only post through it (`capabilities/default.json`).
+        .plugin(tauri_plugin_notification::init())
         // PRD #744: apply the stored zoom before the webview has run any of our
         // JavaScript, so a user at 150% does not watch the app paint at 100%
         // and then jump. That is the whole reason this leg exists Rust-side;
@@ -6786,6 +6828,7 @@ pub fn run() {
     });
     let app = app
         .invoke_handler(tauri::generate_handler![
+            desktop_worktree_close_preview,
             desktop_get_snapshot,
             desktop_list_projects,
             desktop_resolve_project,

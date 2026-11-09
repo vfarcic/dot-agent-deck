@@ -4,7 +4,7 @@ use std::io::Write as _;
 use std::process::ExitCode;
 
 use chrono::Utc;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 
 use crate::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID};
@@ -156,7 +156,9 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
         // `extract_tool_detail` arms (`shell`, `apply_patch`) sharpen the detail.
         "codex" => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::Codex)
+            build_event_typed_with_version(hook_input, AgentType::Codex, &|| {
+                question_agent_version(&AgentType::Codex)
+            })
         }
         // Devin CLI ships a Claude-Code-compatible hooks engine too, so its
         // command hooks POST the SAME stdin JSON shape ([`ClaudeCodeHookInput`])
@@ -165,13 +167,127 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
         // `command`, which the `extract_tool_detail` `"exec"` arm sharpens.
         "devin" => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::Devin)
+            build_event_typed_with_version(hook_input, AgentType::Devin, &|| {
+                question_agent_version(&AgentType::Devin)
+            })
         }
         _ => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::ClaudeCode)
+            build_event_typed_with_version(hook_input, AgentType::ClaudeCode, &|| {
+                question_agent_version(&AgentType::ClaudeCode)
+            })
         }
     }
+}
+
+/// Question payloads do not carry the agent's version. Cache the version of
+/// their PATH-resolved command across hook processes, invalidating it when the
+/// executable changes. This measures PATH, not a running process.
+fn question_agent_version(agent: &AgentType) -> Option<(u64, u64, u64)> {
+    let program = crate::agent_registry::spec(agent).default_command?;
+    let line = question_version_line(program)?;
+    line.split_whitespace().find_map(|word| {
+        let version = semver::Version::parse(word.strip_prefix('v').unwrap_or(word)).ok()?;
+        Some((version.major, version.minor, version.patch))
+    })
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Eq)]
+struct QuestionVersionKey {
+    executable: std::path::PathBuf,
+    modified: std::time::SystemTime,
+    size: u64,
+    path_env: Option<std::ffi::OsString>,
+    #[cfg(unix)]
+    device_inode: (u64, u64),
+}
+
+impl QuestionVersionKey {
+    fn of(executable: &std::path::Path) -> Option<Self> {
+        let metadata = std::fs::metadata(executable).ok()?;
+        Some(Self {
+            executable: executable.to_path_buf(),
+            modified: metadata.modified().ok()?,
+            size: metadata.len(),
+            path_env: std::env::var_os("PATH"),
+            #[cfg(unix)]
+            device_inode: {
+                use std::os::unix::fs::MetadataExt as _;
+                (metadata.dev(), metadata.ino())
+            },
+        })
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct QuestionVersionEntry {
+    key: QuestionVersionKey,
+    line: Option<String>,
+    checked_at: std::time::SystemTime,
+}
+
+/// Reuse probe outputs for at most one minute, invalidating earlier when the
+/// executable changes. A stable launcher can delegate to an upgraded binary
+/// without changing its own metadata, so successful outputs expire too.
+fn question_version_line(program: &str) -> Option<String> {
+    use sha2::{Digest as _, Sha256};
+
+    let timeout = std::time::Duration::from_secs(2);
+    let probe = |path: &std::ffi::OsStr| crate::hooks_manage::probe_version_line(path, timeout);
+    let executable = std::env::var_os("PATH").and_then(|path| {
+        std::env::split_paths(&path)
+            .map(|dir| {
+                #[cfg(windows)]
+                let program = format!("{program}.exe");
+                dir.join(program)
+            })
+            .find(|path| {
+                std::fs::metadata(path).is_ok_and(|metadata| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+                    }
+                    #[cfg(not(unix))]
+                    metadata.is_file()
+                })
+            })
+            .and_then(|path| std::path::absolute(path).ok())
+    });
+    let Some(key) = executable.as_deref().and_then(QuestionVersionKey::of) else {
+        return probe(std::ffi::OsStr::new(program));
+    };
+    let dir = crate::platform::paths::state_dir().join("question-versions");
+    let digest = Sha256::digest(key.executable.as_os_str().as_encoded_bytes());
+    let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    let cache = dir.join(format!("{name}.json"));
+    if let Some(entry) = std::fs::File::open(&cache).ok().and_then(|file| {
+        serde_json::from_reader::<_, QuestionVersionEntry>(file.take(32 * 1024)).ok()
+    }) && entry.key == key
+        && entry
+            .checked_at
+            .elapsed()
+            .is_ok_and(|age| age < std::time::Duration::from_secs(60))
+    {
+        return entry.line;
+    }
+    let line = probe(key.executable.as_os_str());
+    // Do not persist a result if the executable was replaced during the probe.
+    // A cache write failure affects this optimization, not the question.
+    if QuestionVersionKey::of(&key.executable).as_ref() == Some(&key) {
+        let entry = QuestionVersionEntry {
+            key,
+            line: line.clone(),
+            checked_at: std::time::SystemTime::now(),
+        };
+        if let Ok(bytes) = serde_json::to_vec(&entry)
+            && crate::config_write_guard::ensure_config_write_allowed(&cache).is_ok()
+            && crate::platform::fsperm::ensure_owner_only_dir(&dir).is_ok()
+        {
+            let _ = crate::agent_hook_config::write_atomic(&dir, &cache, &bytes);
+        }
+    }
+    line
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
@@ -228,7 +344,8 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     if !matches!(agent, "opencode" | "codex" | "devin")
         && let Some(held) = claude_held_question(&event, &input)
     {
-        let reply = hold_question(&event, CLAUDE_HOLD_DEADLINE);
+        exit_when_orphaned();
+        let reply = hold_question(&event, Some(CLAUDE_HOLD_DEADLINE));
         if let Some(decision) = reply.as_ref().and_then(|reply| {
             crate::question::claude_decision(
                 &held.question,
@@ -785,20 +902,58 @@ fn send_question_unheld_at(
     UnheldSend::Plain
 }
 
-/// PRD #1631: how long a held Claude Code `PermissionRequest` hook waits for
-/// the daemon — 3570 s, ending 30 s BEFORE the 3600 s `timeout` the deck
-/// installs the hook with
-/// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`]), so the hook
-/// exits on its own before Claude Code cancels it. Either way Claude Code then
-/// behaves as if there were no hook, and its dialog, on screen all along, is
-/// still answerable by keyboard [observed on 2.1.289].
-pub const CLAUDE_HOLD_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS - 30);
+/// PRD #1631, issue #2075: how long a held Claude Code `PermissionRequest`
+/// hook waits for the daemon. It ends [`CLAUDE_HOLD_MARGIN`] before the
+/// `timeout` the deck installs the hook with
+/// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`], about 24.8
+/// days, the longest Claude Code keeps a hook), so the hook exits on its own
+/// before Claude Code cancels it. Either way Claude Code then behaves as if
+/// there were no hook, and its dialog, on screen all along, is still
+/// answerable by keyboard [observed on 2.1.289].
+pub const CLAUDE_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
+    crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS - CLAUDE_HOLD_MARGIN.as_secs(),
+);
 
-/// How long an `await-answer` child waits. The plugin and the extension stop it
-/// as soon as the agent reports the question answered another way, so this is
-/// only a backstop.
-pub const AWAIT_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Issue #2075: how long before Claude Code's `timeout` the held hook stops
+/// waiting. Thirty seconds was not enough on a loaded Linux host, where every
+/// unanswered hook in 60 days was cancelled at the `timeout` instead; ten
+/// minutes is nothing against a hold of weeks.
+pub const CLAUDE_HOLD_MARGIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Issue #2075: how long an `await-answer` child waits for its question's
+/// answer. On Unix, as long as the question waits: the child ends when the
+/// plugin or extension stops it or when its parent goes
+/// ([`exit_when_orphaned`]). Elsewhere there is no parent check, so a day
+/// bounds a child that outlives its agent (PR #2208 review).
+pub const AWAIT_ANSWER_DEADLINE: Option<std::time::Duration> = if cfg!(unix) {
+    None
+} else {
+    Some(std::time::Duration::from_secs(86_400))
+};
+
+/// Issue #2075: how often a holding producer checks that the agent that started
+/// it is still its parent. A hold no longer expires, so a producer whose agent
+/// died would otherwise keep its hold, and one of the daemon's
+/// `MAX_HELD_QUESTIONS`, for as long as the hold lasts.
+pub const ORPHAN_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Issue #2075: end this process once the process that started it is gone, so
+/// a producer holding a question for an agent that died lets go of it. Unix
+/// only: elsewhere the hold ends when the daemon clears the agent's question.
+fn exit_when_orphaned() {
+    #[cfg(unix)]
+    {
+        let parent = std::os::unix::process::parent_id();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(ORPHAN_POLL);
+                if std::os::unix::process::parent_id() != parent {
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+}
 
 /// What a held Claude Code hook needs to turn the daemon's answer into its
 /// decision: the question, and the payload fields the decision echoes back.
@@ -828,7 +983,8 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
 }
 
 /// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
-/// and wait up to `deadline` for the daemon's reply, falling back to a plain
+/// and wait up to `deadline` for the daemon's reply — with no deadline, until
+/// the daemon replies or the connection closes — falling back to a plain
 /// event when the hold never starts ([`settle_hold`]). `None` when no
 /// [`crate::question::QuestionReply`] came back. That is a missing line — no
 /// daemon, a closed connection, the deadline — or a line that arrived but does
@@ -841,7 +997,7 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
 /// naming another question.
 fn hold_question(
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
 ) -> Option<crate::question::QuestionReply> {
     hold_question_at(&client_socket_path(), event, deadline)
 }
@@ -914,7 +1070,7 @@ fn send_plain_at(path: &std::path::Path, event: &AgentEvent) {
 fn hold_question_at(
     path: &std::path::Path,
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
 ) -> Option<crate::question::QuestionReply> {
     hold_question_within_at(path, event, deadline, HOLD_START_WAIT)
 }
@@ -924,7 +1080,7 @@ fn hold_question_at(
 fn hold_question_within_at(
     path: &std::path::Path,
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
     start_wait: std::time::Duration,
 ) -> Option<crate::question::QuestionReply> {
     let (end, _) = start_hold_at(path, event, deadline, start_wait, false);
@@ -934,13 +1090,14 @@ fn hold_question_within_at(
 /// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
 /// that asks the daemon to confirm the hold, and wait for how it ends: up to
 /// `start_wait` for the daemon's first line, then, once it says `held`, up to
-/// `deadline` (counted from the start) for the reply. The connection comes
+/// `deadline` (counted from the start) for the reply, or with no `deadline`
+/// until the reply or the connection's end (issue #2075). The connection comes
 /// back with a reply, so a producer that acknowledges (`ack`) can write its
 /// acknowledgement on it.
 fn start_hold_at(
     path: &std::path::Path,
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
     start_wait: std::time::Duration,
     ack: bool,
 ) -> (HoldEnd, Option<crate::platform::ipc::IpcClient>) {
@@ -960,18 +1117,19 @@ fn start_hold_at(
         return (HoldEnd::Unstarted, None);
     };
     let started = std::time::Instant::now();
-    let until = started + deadline;
-    let start_by = until.min(started + start_wait);
-    let Ok(mut stream) =
-        crate::platform::ipc::IpcClient::connect_timeout(path, start_wait.min(deadline))
-    else {
+    let until = deadline.map(|deadline| started + deadline);
+    let start_by = until.map_or(started + start_wait, |until| {
+        until.min(started + start_wait)
+    });
+    let first_wait = deadline.map_or(start_wait, |deadline| start_wait.min(deadline));
+    let Ok(mut stream) = crate::platform::ipc::IpcClient::connect_timeout(path, first_wait) else {
         return (HoldEnd::Unstarted, None);
     };
     // No half-close after the write: the daemon reads a held connection for
     // EOF to learn that the producer stopped waiting (Claude Code kills the
     // hook when the keyboard answers No [observed]), so a half-close would
     // read as exactly that the moment the request landed.
-    if stream.set_timeouts(deadline).is_err()
+    if stream.set_timeouts(deadline.unwrap_or(start_wait)).is_err()
         || !matches!(
             write_request_line(&mut stream, format!("{json}\n").as_bytes()),
             RequestWrite::Written
@@ -981,14 +1139,19 @@ fn start_hold_at(
     }
     let mut carry = Vec::new();
     let mut next_reply = |stream: &mut crate::platform::ipc::IpcClient, by| {
-        read_reply_line_carrying(stream, Some(by), &mut carry)
+        read_reply_line_carrying(stream, by, &mut carry)
             .ok()
             .and_then(|line| serde_json::from_str::<QuestionReply>(&line).ok())
     };
-    match next_reply(&mut stream, start_by) {
+    match next_reply(&mut stream, Some(start_by)) {
         Some(reply) if reply.outcome == ReplyOutcome::Held => {}
         Some(reply) => return (HoldEnd::Reply(reply), Some(stream)),
         None => return (HoldEnd::Unstarted, None),
+    }
+    // With no deadline the wait is unbounded, so the per-read timeout the
+    // hold-start read armed must go, or it would end the hold seconds in.
+    if until.is_none() && stream.clear_read_timeout().is_err() {
+        return (HoldEnd::Ended, None);
     }
     match next_reply(&mut stream, until) {
         Some(reply) => (HoldEnd::Reply(reply), Some(stream)),
@@ -1008,6 +1171,9 @@ fn start_hold_at(
 /// With `ack` (the OpenCode plugin) the question is the FIRST line of stdin,
 /// and the answer is acknowledged: see [`opencode_await_answer_acked_at`].
 pub fn handle_await_answer(agent: &str, question_arg: Option<&str>, ack: bool) -> ExitCode {
+    // Issue #2075: the child waits for as long as the question does, so it
+    // must not outlive the plugin or extension that started it.
+    exit_when_orphaned();
     if ack && agent == "opencode" && question_arg.is_none() {
         let mut first = String::new();
         if std::io::stdin().read_line(&mut first).is_ok() && !first.trim().is_empty() {
@@ -1445,11 +1611,16 @@ fn codex_patch_path(patch: &str) -> Option<String> {
 }
 
 /// Claude-Code hook builder — the [`AgentType::ClaudeCode`] specialization of
-/// [`build_event_typed`]. Kept as a thin wrapper so the existing Claude unit
-/// tests (and any Claude caller) stay unchanged.
+/// [`build_event_typed_with_version`], with no version probe for unit tests.
 #[cfg(test)]
 fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
     build_event_typed(input, AgentType::ClaudeCode)
+}
+
+/// Build an unversioned event in tests without reaching an installed agent.
+#[cfg(test)]
+fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
+    build_event_typed_with_version(input, agent_type, &|| None)
 }
 
 /// Build an [`AgentEvent`] from a Claude-compatible hook payload, stamping the
@@ -1457,7 +1628,11 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
 /// Codex hook path (which posts the SAME payload shape) reuses the whole
 /// builder, differing only in the stamped identity and the Codex-aware
 /// `extract_tool_detail` arms.
-fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
+fn build_event_typed_with_version(
+    input: ClaudeCodeHookInput,
+    agent_type: AgentType,
+    version_probe: &dyn Fn() -> Option<(u64, u64, u64)>,
+) -> Option<AgentEvent> {
     let ClaudeCodeHookInput {
         session_id,
         hook_event_name,
@@ -1711,6 +1886,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.get("tool_use_id").map(String::as_str),
         extra.get("permission_suggestions"),
         extra.get("permission_mode").and_then(Value::as_str),
+        version_probe,
     );
 
     let mut event = AgentEvent {
@@ -1746,8 +1922,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
 ///   [`crate::question::codex_request_user_input`].
 /// - Devin `PermissionRequest` → [`crate::question::devin_permission_request`].
 ///
-/// The agent's version is not in any of these payloads, so the tables are used
-/// as verified (`None`).
+/// Probe the version when building a question, not for ordinary status events.
 #[allow(clippy::too_many_arguments)]
 fn hook_question(
     agent_type: &AgentType,
@@ -1758,6 +1933,7 @@ fn hook_question(
     tool_use_id: Option<&str>,
     permission_suggestions: Option<&Value>,
     permission_mode: Option<&str>,
+    version_probe: &dyn Fn() -> Option<(u64, u64, u64)>,
 ) -> Option<crate::question::PendingQuestion> {
     let now = Utc::now().timestamp_millis();
     let id = crate::question::mint_question_id;
@@ -1771,7 +1947,11 @@ fn hook_question(
                 permission_suggestions,
                 permission_mode,
                 now,
-                None,
+                // Held decisions use the hook's allow/deny channel, not the
+                // versioned key table. Only plan approval needs that table.
+                (tool_name == Some("ExitPlanMode"))
+                    .then(version_probe)
+                    .flatten(),
             )
             .question,
         ),
@@ -1787,18 +1967,18 @@ fn hook_question(
                 tool_detail,
                 command.as_deref(),
                 now,
-                None,
+                version_probe(),
             ))
         }
         (AgentType::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
-            crate::question::codex_request_user_input(tool_use_id, tool_input, now, None)
+            crate::question::codex_request_user_input(tool_use_id, tool_input, now, version_probe())
         }
         (AgentType::Devin, "PermissionRequest") => Some(crate::question::devin_permission_request(
             id(),
             tool_name?,
             tool_detail,
             now,
-            None,
+            version_probe(),
         )),
         _ => None,
     }
@@ -5973,6 +6153,56 @@ mod question_tests {
             .expect("the event carries a question")
     }
 
+    fn question_for_version(
+        agent: AgentType,
+        payload: &Value,
+        version: Option<(u64, u64, u64)>,
+    ) -> PendingQuestion {
+        build_event_typed_with_version(
+            serde_json::from_value(payload.clone()).unwrap(),
+            agent,
+            &|| version,
+        )
+        .unwrap()
+        .question()
+        .unwrap()
+    }
+
+    #[test]
+    fn ordinary_status_hooks_do_not_probe_the_agent_version() {
+        for event in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+        ] {
+            build_event_typed_with_version(
+                serde_json::from_value(serde_json::json!({
+                    "session_id": "s", "hook_event_name": event,
+                    "tool_name": "Bash", "tool_input": {"command": "true"},
+                }))
+                .unwrap(),
+                AgentType::ClaudeCode,
+                &|| panic!("{event} must not probe the agent version"),
+            )
+            .unwrap();
+        }
+        for name in [
+            "claude-permission-bash.json",
+            "claude-permission-write.json",
+            "claude-ask-user-question-form.json",
+        ] {
+            let event = build_event_typed_with_version(
+                serde_json::from_value(fixture(name)).unwrap(),
+                AgentType::ClaudeCode,
+                &|| panic!("{name}: held answers must not probe the agent version"),
+            )
+            .unwrap();
+            assert_eq!(event.question().unwrap().channel, AnswerChannel::Held);
+        }
+    }
+
     fn labels(question: &PendingQuestion, index: usize) -> Vec<&str> {
         question.questions[index]
             .options
@@ -5981,12 +6211,8 @@ mod question_tests {
             .collect()
     }
 
-    /// Scenario: Claude Code 2.1.289's captured `PermissionRequest` for a Bash
-    /// command, whose first suggestion is `addDirectories`, becomes a held
-    /// Permission question: Yes, "Yes, and always allow access to <dir> from
-    /// this project" with the directory as its scope, the keyboard-only "Yes,
-    /// and switch to auto mode" Claude draws for Bash in the default mode, and
-    /// No.
+    /// Scenario: Claude Code's captured Bash permission prompt becomes a held question with its suggested always grant and keyboard-only auto-mode option.
+    /// The permission builder keeps Yes, always and No hook-answerable on newer minors and majors, while an explicitly supplied version below the supported hook minimum stays keyboard-only.
     #[spec("question/detect/001")]
     #[test]
     fn question_detect_001_claude_bash_permission_request() {
@@ -6032,6 +6258,59 @@ mod question_tests {
             claude_held_question(&event, &fixture("claude-permission-bash.json").to_string())
                 .is_none(),
             "no pane id in a unit test, so nothing to hold for"
+        );
+        let payload = fixture("claude-permission-bash.json");
+        // Held hooks no longer discover a version. Exercise the producer's
+        // explicit-version contract directly rather than a probe it skips.
+        let with_version = |version| {
+            crate::question::claude_permission_request(
+                crate::question::mint_question_id(),
+                "Bash",
+                payload.get("tool_input"),
+                None,
+                payload.get("permission_suggestions"),
+                Some("default"),
+                0,
+                version,
+            )
+            .question
+        };
+        for version in [Some((2, 1, 136)), Some((2, 2, 0)), Some((3, 0, 0)), None] {
+            let q = with_version(version);
+            assert_eq!(q.channel, AnswerChannel::Held);
+            for (index, behavior) in [(1, "allow"), (2, "allow"), (4, "deny")] {
+                let answers = q
+                    .validate(
+                        &[crate::question::QuestionAnswer {
+                            question_index: 0,
+                            option_indices: vec![index],
+                            text: None,
+                        }],
+                        true,
+                    )
+                    .unwrap();
+                let reply = QuestionReply::answered(&q.id, answers);
+                let decision = crate::question::claude_decision(
+                    &q,
+                    payload.get("tool_input"),
+                    payload.get("permission_suggestions"),
+                    &reply,
+                )
+                .unwrap();
+                assert_eq!(
+                    decision["hookSpecificOutput"]["decision"]["behavior"], behavior,
+                    "{version:?}"
+                );
+            }
+            assert!(
+                q.questions[0].options[2].keyboard_only,
+                "auto mode stays keyboard-only"
+            );
+        }
+        let old = with_version(Some((2, 1, 135)));
+        assert!(
+            !old.has_answerable_option(),
+            "the pre-existing lower bound still applies"
         );
     }
 
@@ -6202,11 +6481,24 @@ mod question_tests {
         assert!(!appended[0].keyboard_only);
         assert!(appended[1].keyboard_only);
         assert_eq!(q.tool.as_ref().unwrap().name, "AskUserQuestion");
+        let newer = question_for_version(
+            AgentType::ClaudeCode,
+            &fixture("claude-ask-user-question-form.json"),
+            Some((2, 2, 0)),
+        );
+        assert_eq!(newer.channel, AnswerChannel::Held);
+        assert!(newer.questions.iter().all(|q| {
+            let free_text = q
+                .options
+                .iter()
+                .find(|o| o.role == OptionRole::FreeText)
+                .unwrap();
+            free_text.answerable() && q.options.last().unwrap().keyboard_only
+        }));
     }
 
-    /// Scenario: Claude Code's plan approval is a Plan question answered by
-    /// keys, not held — a hook decision does not dismiss the plan dialog — with
-    /// its third option keyboard-only.
+    /// Scenario: Claude Code's plan approval is answered by keys and not held, with its third option keyboard-only.
+    /// Verified patches remain answerable, while versions below the supported minimum or past the verified minor fall back to the keyboard.
     #[spec("question/detect/004")]
     #[test]
     fn question_detect_004_claude_plan_is_keys_and_not_held() {
@@ -6237,12 +6529,28 @@ mod question_tests {
         )
         .unwrap();
         assert_eq!(keys, vec!["2"]);
+        for (version, covered) in [
+            (Some((2, 1, 135)), false),
+            (Some((2, 1, 136)), true),
+            (Some((2, 1, 999)), true),
+            (Some((2, 2, 0)), false),
+            (Some((3, 0, 0)), false),
+            (None, true),
+        ] {
+            let q = question_for_version(AgentType::ClaudeCode, &payload, version);
+            assert_eq!(
+                q.has_answerable_option(),
+                covered,
+                "Claude plan {version:?}"
+            );
+            assert_eq!(q.questions[0].options[0].keyboard_only, !covered);
+            assert_eq!(q.questions[0].options[1].keyboard_only, !covered);
+            assert!(q.questions[0].options[2].keyboard_only);
+        }
     }
 
-    /// Scenario: Codex 0.160.0's captured `PreToolUse` for a two-question
-    /// `request_user_input` stays a ToolStart but carries a Choice question
-    /// whose id is the call's `tool_use_id`, answered by keys, each question
-    /// ending in a keyboard-only "None of the above".
+    /// Scenario: Codex's captured two-question form stays a ToolStart carrying a Choice question whose id names its tool call, with appended keyboard-only notes.
+    /// The verified version is answered by keys; a newer minor leaves the form keyboard-only.
     #[spec("question/detect/005")]
     #[test]
     fn question_detect_005_codex_request_user_input_form() {
@@ -6263,11 +6571,17 @@ mod question_tests {
         assert_eq!(labels(&q, 1), vec!["Small", "Large", "None of the above"]);
         assert!(q.questions[1].options[2].keyboard_only);
         assert!(q.questions.iter().all(|q| !q.multi_select));
+        let newer = question_for_version(
+            AgentType::Codex,
+            &fixture("codex-request-user-input.json"),
+            Some((0, 161, 0)),
+        );
+        assert_eq!(newer.channel, AnswerChannel::Unsupported);
+        assert!(!newer.has_answerable_option());
     }
 
-    /// Scenario: A Codex `PermissionRequest` becomes a Permission question
-    /// answered by the keys `1`, `p` and `3`, and Codex's `Interrupt` hook — what
-    /// fires after a keyboard "No" — reads as Idle.
+    /// Scenario: A Codex permission prompt is answered by `1`, `p` and `3` on a covered version, and its keyboard-denial Interrupt reads as Idle.
+    /// Older versions and newer minors or majors are keyboard-only, while verified patches and an unknown version retain the answers.
     #[spec("question/detect/006")]
     #[test]
     fn question_detect_006_codex_permission_keys_and_interrupt() {
@@ -6303,12 +6617,61 @@ mod question_tests {
                 .is_some_and(|s| s.contains("touch codex_b.txt"))
         );
         assert_eq!(map_event_type("Interrupt"), Some(EventType::Idle));
+
+        // A newer patch of the verified minor is covered, but a different
+        // minor/major must not type a menu whose keys were never verified.
+        for (version, covered) in [
+            (None, true),
+            (Some((0, 159, 9)), false),
+            (Some((0, 160, 0)), true),
+            (Some((0, 160, 99)), true),
+            (Some((0, 161, 0)), false),
+            (Some((1, 0, 0)), false),
+        ] {
+            let q = crate::question::codex_permission_request(
+                "q-version".into(),
+                "shell",
+                Some("touch codex_b.txt".into()),
+                Some("touch codex_b.txt"),
+                1,
+                version,
+            );
+            assert_eq!(
+                q.channel,
+                if covered {
+                    AnswerChannel::Keys
+                } else {
+                    AnswerChannel::Unsupported
+                },
+                "Codex {version:?}"
+            );
+            assert!(
+                q.questions[0]
+                    .options
+                    .iter()
+                    .all(|o| o.keyboard_only != covered)
+            );
+            assert_eq!(q.has_answerable_option(), covered);
+            for index in 1..=3 {
+                let result = q.validate(
+                    &[crate::question::QuestionAnswer {
+                        question_index: 0,
+                        option_indices: vec![index],
+                        text: None,
+                    }],
+                    true,
+                );
+                if covered {
+                    assert!(result.is_ok());
+                } else {
+                    assert_eq!(result, Err(crate::question::AnswerRefusal::KeyboardOnly));
+                }
+            }
+        }
     }
 
-    /// Scenario: A Devin `PermissionRequest` becomes a Permission question
-    /// from the docs-derived table in which only Allow once and Deny are
-    /// answerable; the four "allow for …" scopes and the two edit options are
-    /// keyboard-only.
+    /// Scenario: Devin's docs-derived permission table offers Allow once and Deny, leaving the unverified grant and edit options keyboard-only.
+    /// A newer minor makes the whole prompt keyboard-only.
     #[spec("question/detect/009")]
     #[test]
     fn question_detect_009_devin_permission_is_docs_derived() {
@@ -6328,6 +6691,9 @@ mod question_tests {
             .collect();
         assert_eq!(answerable, vec!["Allow once", "Deny"]);
         assert_eq!(q.questions[0].options.len(), 8);
+        let newer = question_for_version(AgentType::Devin, &payload, Some((3000, 12, 0)));
+        assert_eq!(newer.channel, AnswerChannel::Unsupported);
+        assert!(newer.questions[0].options.iter().all(|o| o.keyboard_only));
     }
 
     /// Scenario: A Pi extension's `select`, `confirm` and `input` dialogs, as
@@ -6891,7 +7257,7 @@ mod question_tests {
         let decision = |answers: &[(u32, &[u32], Option<&str>)]| {
             let reply = QuestionReply::answered(&q.id, resolved(&q, answers));
             let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&reply).unwrap()));
-            let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10));
+            let got = hold_question_at(&path, &event, Some(std::time::Duration::from_secs(10)));
             let sent: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
             assert_eq!(sent["message_type"], "question");
             assert_eq!(sent["hold"], true);
@@ -6924,7 +7290,8 @@ mod question_tests {
         let reply =
             QuestionReply::answered(&q.id, resolved(&q, &[(0, &[2], None), (1, &[1, 3], None)]));
         let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&reply).unwrap()));
-        let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10)).unwrap();
+        let got =
+            hold_question_at(&path, &event, Some(std::time::Duration::from_secs(10))).unwrap();
         server.join().unwrap();
         let decision =
             crate::question::claude_decision(&q, form.get("tool_input"), None, &got).unwrap();
@@ -6962,7 +7329,7 @@ mod question_tests {
         let (event, q) = held_event(&payload);
         let decide = |reply: Option<String>| {
             let (_dir, path, server) = stub_daemon(reply);
-            let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10));
+            let got = hold_question_at(&path, &event, Some(std::time::Duration::from_secs(10)));
             server.join().unwrap();
             got.and_then(|reply| {
                 crate::question::claude_decision(&q, payload.get("tool_input"), None, &reply)
@@ -6983,7 +7350,7 @@ mod question_tests {
             hold_question_at(
                 &missing.path().join("absent.sock"),
                 &event,
-                std::time::Duration::from_secs(2)
+                Some(std::time::Duration::from_secs(2))
             )
             .is_none()
         );
@@ -7055,7 +7422,7 @@ mod question_tests {
                 (serde_json::from_str::<Value>(&sent).unwrap(), plain)
             });
             let started = Instant::now();
-            let got = hold_question_within_at(&path, &event, DEADLINE, START_WAIT);
+            let got = hold_question_within_at(&path, &event, Some(DEADLINE), START_WAIT);
             let took = started.elapsed();
             returned.send(()).unwrap();
             let (sent, plain) = server.join().unwrap();
@@ -7095,6 +7462,98 @@ mod question_tests {
             plain.is_none(),
             "a question the daemon held is already on the card: {plain:?}"
         );
+    }
+
+    /// Scenario: A held Claude Code `AskUserQuestion` hook meets a daemon that
+    /// says it holds the question and then says nothing more, as the daemon
+    /// does while nobody answers. With a deadline, as Claude Code's hook has,
+    /// the hook stops waiting at it and closes the connection, so it exits
+    /// before Claude Code's hook `timeout` cancels it; that deadline, weeks
+    /// long, is one the socket accepts. With no deadline, as an `await-answer`
+    /// child has, the hook is still waiting long after the hold-start read's
+    /// timeout, and the answer the daemon sends then is the one it acts on
+    /// (issue #2075).
+    #[cfg(unix)]
+    #[spec("question/hold/025")]
+    #[test]
+    fn question_hold_025_an_unanswered_hold_waits_until_its_deadline_or_its_answer() {
+        use std::io::{BufRead as _, Read as _};
+        use std::time::{Duration, Instant};
+        const START_WAIT: Duration = Duration::from_millis(500);
+        const DEADLINE: Duration = Duration::from_secs(2);
+        let payload = fixture("claude-ask-user-question-form.json");
+        let (event, q) = held_event(&payload);
+        let held = serde_json::to_string(&QuestionReply::held(&q.id)).unwrap();
+        // `answer_after`: write the reply that long after `held`, or never.
+        let run = |deadline: Option<Duration>, answer_after: Option<Duration>| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hook.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let held = held.clone();
+            let released = serde_json::to_string(&QuestionReply::released(
+                &q.id,
+                ReleaseReason::AnsweredElsewhere,
+            ))
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut sent = String::new();
+                reader.read_line(&mut sent).unwrap();
+                writeln!(reader.get_mut(), "{held}").unwrap();
+                if let Some(after) = answer_after {
+                    std::thread::sleep(after);
+                    writeln!(reader.get_mut(), "{released}").unwrap();
+                }
+                // The hook ending its wait is an EOF.
+                let mut rest = Vec::new();
+                let _ = reader.read_to_end(&mut rest);
+                let eof_at = Instant::now();
+                listener.set_nonblocking(true).unwrap();
+                (eof_at, listener.accept().is_ok())
+            });
+            let started = Instant::now();
+            let got = hold_question_within_at(&path, &event, deadline, START_WAIT);
+            let took = started.elapsed();
+            let (eof_at, plain_sent) = server.join().unwrap();
+            assert!(
+                !plain_sent,
+                "a question the daemon held is already on the card"
+            );
+            (got, took, eof_at.duration_since(started))
+        };
+
+        let (got, took, eof) = run(Some(DEADLINE), None);
+        assert_eq!(got, None, "no decision for an unanswered question");
+        assert!(
+            took >= DEADLINE && took < DEADLINE + Duration::from_secs(1),
+            "the hook stopped waiting after {took:?}, not at its {DEADLINE:?} deadline"
+        );
+        assert!(
+            eof < DEADLINE + Duration::from_secs(1),
+            "the daemon saw the held connection close only after {eof:?}"
+        );
+
+        // No deadline: still waiting four hold-start bounds after `held`, so
+        // the reply sent then is received rather than the hold ending early.
+        let late = START_WAIT * 4;
+        let (got, took, _) = run(None, Some(late));
+        assert_eq!(
+            got.map(|reply| reply.outcome),
+            Some(crate::question::ReplyOutcome::Released),
+            "a hold with no deadline ended before the daemon's reply {late:?} in"
+        );
+        assert!(took >= late, "the reply came back after only {took:?}");
+
+        // Claude Code's real deadline is one the socket takes as a timeout:
+        // a refusal there would turn every held question into a plain one.
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(CLAUDE_HOLD_DEADLINE))
+            .expect("the socket takes Claude Code's hold deadline as a read timeout");
+        client
+            .set_write_timeout(Some(CLAUDE_HOLD_DEADLINE))
+            .expect("the socket takes Claude Code's hold deadline as a write timeout");
     }
 
     /// Scenario: Claude Code's captured Bash `PermissionRequest` names no call,

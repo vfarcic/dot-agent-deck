@@ -29,6 +29,12 @@
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "() => onDismissWorktree?.(kept.id)"
+reason = "Dismisses one informational kept-worktree notice; the close itself already uses the shared voice confirmation path. This is a notification dismissal, not a new capability."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "() => setPaletteOpen(true)"
 reason = "The deck's Command button: opens the command palette, a pointer/keyboard launcher whose entries all dispatch through VOICE_ACTIONS. Voice is its own launcher; `list_commands` shows what can be said."
 
@@ -919,6 +925,14 @@ file = "desktop/src/components/NewAgentDialog.tsx"
 handler = "onClick"
 code = "requestDiscard"
 reason = "New agent Discard; voice does the same with `discard_new_agent`."
+
+# --- desktop/src/components/NotificationsPanel.tsx ---
+
+[[site]]
+file = "desktop/src/components/NotificationsPanel.tsx"
+handler = "onChange"
+code = "(event) => onSave({ ...settings, questions: { notify: Number(event.target.value) } })"
+reason = "Settings → Notifications question-wait select (issue #2075); a per-field preference edit inside the Settings sheet, which voice opens (`open_settings`, whose description names notifications) — like the Zoom and Appearance rows, no row sets the value itself."
 
 # --- desktop/src/components/OutputReader.tsx ---
 
