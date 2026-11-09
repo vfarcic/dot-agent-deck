@@ -576,16 +576,33 @@ fn status_032_a_removal_nothing_recorded_is_unknown() {
     assert_eq!(termination.wire(), PaneTermination::Unknown);
 }
 
-/// Issue #2028 (review U2): spawn `sh -c 'sleep 1; exit 7'` on `pane`, as the
-/// deck's wrapper with `report` noted for it when `wrapper` is set, and hold
-/// its reader before its capture. Returns once the reader reached that hold,
-/// with the generation ended by itself, and the hold's release.
+/// Issue #2028 (review U2): spawn a command that exits with 7 on `pane`, as
+/// the deck's wrapper with `report` noted for it when `wrapper` is set, and
+/// hold its reader before its capture. Returns once the reader reached that
+/// hold and the child's exit status is there to be read, with the generation
+/// ended by itself, and the hold's release.
+///
+/// The reader's EOF is not the child's exit: the terminal hangs up before
+/// the exiting child can be waited on, and a loaded machine stretches that
+/// gap (the flake on `main`: the capture read `ConnectionEnded`). A close or
+/// respawn that removed the record inside it would find no status, and with
+/// its reap held, the capture would rightly read the stream's end rather
+/// than the exit these tests are about. So the command closes its terminal
+/// half a second before it exits, opening that gap on every run, and this
+/// waits for the status: without the wait these tests fail every time
+/// rather than now and then. `exec` keeps the shell the deck runs it under
+/// from holding the terminal open.
 fn ended_by_itself(
     registry: &Arc<AgentPtyRegistry>,
     pane: &str,
     wrapper: Option<Option<&str>>,
 ) -> (String, std::sync::mpsc::Sender<()>) {
-    let agent = spawn_on(registry, pane, "sh -c 'sleep 1; exit 7'");
+    let agent = spawn_on(
+        registry,
+        pane,
+        "exec sh -c 'sleep 1; exec <&- >&- 2>&-; sleep 0.5; exit 7'",
+    );
+    let removal = Arc::clone(&registry.inner.lock().agents[&agent].removal);
     let (reached, release) = hold_capture(registry, &agent);
     if let Some(report) = wrapper {
         registry
@@ -602,6 +619,15 @@ fn ended_by_itself(
     reached
         .recv_timeout(Duration::from_secs(20))
         .expect("the reader reached its capture");
+    // Polled on the record, which keeps the status once it has it.
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while registry.exit_status_after_eof(&agent, &removal).is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "test prerequisite: the child exited"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert!(
         registry.is_agent_still_registered(&agent),
         "test prerequisite: the generation ended by itself"
