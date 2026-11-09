@@ -2427,14 +2427,15 @@ fn stamp_question_revision(
     event.set_question(&question);
 }
 
-/// PRD #1631 (audit A6): how long the daemon holds a question for its producer
-/// before it lets go on its own. Every shipped producer stops waiting first —
-/// Claude Code's hook at [`crate::hook::CLAUDE_HOLD_DEADLINE`] (3570 s) and an
-/// `await-answer` child at [`crate::hook::AWAIT_ANSWER_DEADLINE`] (3600 s) — so
-/// this is the backstop for a producer that does not: past it the hold is
-/// released, the question is dropped and every attached client is told, exactly
-/// as when a producer's connection closes.
-pub const QUESTION_HOLD_DEADLINE: Duration = Duration::from_secs(3600 + 120);
+// Issue #2075: the daemon holds a question for its producer for as long as the
+// question waits. No deck-side timeout releases a hold: one ends when the
+// question is answered, cleared, superseded, refused a hold, or when its
+// producer's connection closes (the agent cancelled the hook, answered by
+// keyboard, or exited). Every shipped producer waits as long as its agent lets
+// it: Claude Code's hook until [`crate::hook::CLAUDE_HOLD_DEADLINE`], just
+// short of the longest hook `timeout` Claude Code keeps, and an `await-answer`
+// child until its parent agent goes. [`MAX_HELD_QUESTIONS`] bounds how many
+// are held at once.
 
 /// PRD #1631 (audit A6): the most questions the daemon holds at once, across
 /// every pane. A held question does NOT occupy one of the
@@ -2469,7 +2470,6 @@ const HELD_CONNECTION_READ_CAP: usize = 1024;
 struct HookLoopLimits {
     idle_timeout: Duration,
     max_connections: usize,
-    hold_deadline: Duration,
     max_holds: usize,
     ack_wait: Duration,
     /// Issue #1664: how long an earlier connection that has sent nothing can
@@ -2482,7 +2482,6 @@ impl HookLoopLimits {
         Self {
             idle_timeout,
             max_connections: MAX_CONCURRENT_HOOK_CONNECTIONS,
-            hold_deadline: QUESTION_HOLD_DEADLINE,
             max_holds: MAX_HELD_QUESTIONS,
             ack_wait: HELD_REPLY_ACK_WAIT,
             event_order_wait: crate::hook_event_order::PREDECESSOR_WAIT,
@@ -2500,7 +2499,6 @@ struct QuestionConnection<'a, R, W> {
     /// (audit A6).
     slot: &'a mut Option<tokio::sync::OwnedSemaphorePermit>,
     holds: &'a Arc<tokio::sync::Semaphore>,
-    hold_deadline: Duration,
     /// The bound on the `held` line's write: the connection's idle timeout,
     /// as for every other reply on it (issue #1976).
     write_timeout: Duration,
@@ -2536,8 +2534,8 @@ struct QuestionConnection<'a, R, W> {
 /// pane's pending one at this registration's revision, or it was not accepted
 /// (it did not survive sanitizing, or the event was refused) and the producer
 /// is released at once. Once held, the connection gives its hook-pool slot back
-/// and waits under [`MAX_HELD_QUESTIONS`] and the hold deadline instead (audit
-/// A6). A producer that asked (`QuestionSignal::confirm_hold`) is told at
+/// and waits under [`MAX_HELD_QUESTIONS`] instead (audit A6), with no deadline
+/// of its own (issue #2075). A producer that asked (`QuestionSignal::confirm_hold`) is told at
 /// that point, with a `held` line, so it can tell this daemon from an older one
 /// that never answers a `question` at all.
 ///
@@ -2640,7 +2638,7 @@ where
     {
         // Issue #1976: a producer that cannot be written to within the idle
         // timeout is released as one that hung up, so it cannot park this
-        // handler, and its hold-budget permit, before the deadline below.
+        // handler, and its hold-budget permit, with nothing to end the wait.
         drop_held_question(
             state,
             event_tx,
@@ -2661,10 +2659,6 @@ where
         _ = gone => {
             drop_held_question(state, event_tx, registry, &pane_id, &id, hold.generation, "the producer stopped waiting before an answer").await;
             None
-        }
-        _ = tokio::time::sleep(conn.hold_deadline) => {
-            drop_held_question(state, event_tx, registry, &pane_id, &id, hold.generation, "the daemon's hold deadline passed").await;
-            Some(reply(QuestionReply::released(&id, ReleaseReason::Cleared)))
         }
     }
 }
@@ -2771,7 +2765,7 @@ pub async fn register_and_publish_held(
 }
 
 /// PRD #1631: drop a held question that will not be answered — its producer's
-/// connection closed, or its hold deadline passed — when the hold
+/// connection closed or its `held` line could not be written — when the hold
 /// `generation` registered is still the one in place. Told to every attached
 /// client, not only applied here: a client still showing the question would
 /// offer an answer the daemon can only refuse. The event names the question
@@ -7775,7 +7769,6 @@ async fn run_hook_loop_with_limits(
                                             writer: &mut write_half,
                                             slot: &mut permit,
                                             holds: &hold_limit,
-                                            hold_deadline: limits.hold_deadline,
                                             write_timeout: idle_timeout,
                                         },
                                     )
@@ -9487,7 +9480,6 @@ mod hook_ingestion_tests {
                 writer: &mut writer,
                 slot: &mut slot,
                 holds: &holds,
-                hold_deadline: Duration::from_secs(5),
                 write_timeout: Duration::from_secs(5),
             },
         )
@@ -20385,8 +20377,8 @@ mod question_hold_tests {
     /// gets in, clears that question and lets its producer go — held questions
     /// give their pool slot back. With the hold budget cut to one, a question
     /// past it still turns the card Needs Input but is not held or offered.
-    /// Every question connection ends with its reply — cleared, not held,
-    /// superseded or released at the deadline — so a producer that keeps its
+    /// Every question connection ends with its reply — cleared, not held or
+    /// superseded — so a producer that keeps its
     /// socket open and sends more has it read by nothing, however many do.
     #[spec("question/hold/008")]
     #[tokio::test]
@@ -20477,14 +20469,13 @@ mod question_hold_tests {
         }
 
         // Past both bounds: more producers than the pool holds connections and
-        // the budget holds questions, each released — superseded, or at the
-        // hold deadline — and each keeping its socket open afterwards. Every
+        // the budget holds questions, each released — superseded, or cleared
+        // by its tool's end — and each keeping its socket open afterwards. Every
         // one is closed with its reply, so none can go on sending lines that
         // nothing accounts for, and the pool still serves a fresh hook.
         let deck = Deck::start(HookLoopLimits {
             max_connections: 2,
             max_holds: 2,
-            hold_deadline: Duration::from_millis(300),
             ..limits()
         })
         .await;
@@ -20503,16 +20494,28 @@ mod question_hold_tests {
                 Some(crate::question::ReleaseReason::Superseded)
             );
             assert!(closed, "round {round}: a superseded hold's connection ends");
+            // The agent's tool ends: a plain `PostToolUse`, its hook token
+            // presented, clears the replacement.
+            let mut done = question_event(&agent.id, "unused");
+            done.metadata.clear();
+            done.event_type = EventType::ToolEnd;
+            done.pane_id = Some(agent.pane.clone());
+            done.session_id = format!("{}-session", agent.pane);
+            let mut stream = UnixStream::connect(&deck.sock).await.expect("connect");
+            let line = format!(
+                "{}\n",
+                crate::event::agent_event_line(&done, Some(&agent.token)).unwrap()
+            );
+            stream.write_all(line.as_bytes()).await.unwrap();
+            stream.flush().await.unwrap();
+            drop(stream);
             let (reply, closed) = reply_then_closed(replacement, &sneaked).await;
             assert_eq!(
                 reply.reason,
                 Some(crate::question::ReleaseReason::Cleared),
-                "round {round}: released at the deadline"
+                "round {round}: released when its tool ended"
             );
-            assert!(
-                closed,
-                "round {round}: a deadline release ends its connection"
-            );
+            assert!(closed, "round {round}: a cleared hold's connection ends");
             kept_open.push(agent);
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -20655,46 +20658,56 @@ mod question_hold_tests {
         );
     }
 
-    /// Scenario: A producer holds a question and never lets go. When the
-    /// daemon's own hold deadline passes, the producer is told to stop waiting,
-    /// the question is dropped, and every attached client is told — so nothing
-    /// waits on the daemon forever.
+    /// Scenario: A producer holds a question and nobody answers it. With the
+    /// daemon's production limits, a whole day passes on a paused clock: the
+    /// daemon neither lets the producer go nor drops the question, so the card
+    /// still shows it, and an answer given at the end of that day reaches the
+    /// producer (issue #2075: before, the daemon dropped it after an hour).
     #[spec("question/hold/009")]
     #[tokio::test]
-    async fn question_hold_009_the_daemon_releases_a_hold_at_its_deadline() {
-        let deck = Deck::start(HookLoopLimits {
-            hold_deadline: Duration::from_millis(300),
-            ..limits()
-        })
-        .await;
-        let mut events = deck.event_tx.subscribe();
+    async fn question_hold_009_a_held_question_waits_as_long_as_the_user_takes() {
+        use tokio::io::AsyncReadExt as _;
+        let deck = Deck::start(limits()).await;
         let a = deck.agent("pane-a9").await;
-        let producer = deck.hold(&a, "q-deadline").await;
-        deck.until_held(&a, "q-deadline").await;
-        let reply = reply_on(producer).await.expect("released at the deadline");
-        assert_eq!(reply.outcome, ReplyOutcome::Released);
+        let mut producer = deck.hold(&a, "q-long-wait").await;
+        deck.until_held(&a, "q-long-wait").await;
+
+        tokio::time::pause();
+        for _ in 0..24 {
+            tokio::time::advance(Duration::from_secs(3600)).await;
+            for _ in 0..20 {
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let mut early = [0u8; 1];
+        let nothing_yet =
+            tokio::time::timeout(Duration::from_millis(200), producer.read(&mut early)).await;
         assert!(
-            !deck
-                .registry
+            nothing_yet.is_err(),
+            "the daemon wrote to or closed the producer's connection after a day unanswered: \
+             {nothing_yet:?}"
+        );
+        assert!(
+            deck.registry
                 .question_holds()
-                .is_held(&a.pane, "q-deadline")
+                .is_held(&a.pane, "q-long-wait"),
+            "the daemon let go of a question nobody had answered"
         );
         assert_eq!(
             deck.state.read().await.pending_question_id_on_pane(&a.pane),
-            None
+            Some("q-long-wait".to_string()),
+            "the card no longer shows the question after a day"
         );
-        let released = loop {
-            let msg = tokio::time::timeout(Duration::from_secs(10), events.recv())
-                .await
-                .expect("the release is broadcast")
-                .expect("broadcast open");
-            if let BroadcastMsg::Event(event) = msg
-                && event.resolved_question_id() == Some("q-deadline")
-            {
-                break event;
-            }
-        };
-        assert!(released.is_daemon_synthetic());
+        deck.answer(&a, "q-long-wait")
+            .await
+            .expect("a question that waited a day is still answerable");
+        let reply = reply_on(producer)
+            .await
+            .expect("the answer reaches the producer");
+        assert_eq!(reply.outcome, ReplyOutcome::Answered);
     }
 
     /// Scenario: A producer that reports whether the agent took the answer —

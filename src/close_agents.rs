@@ -497,6 +497,10 @@ impl Resolved {
 struct Member {
     record: AgentRecord,
     exited: bool,
+    /// A previous close retired this generation but could not reap its child.
+    /// It still needs the stop attempt, but a successor may own its pane's
+    /// cleanup authority, just as it can for an exited generation.
+    termination_unconfirmed: bool,
 }
 
 /// Step 5's membership: generation-bound registry records, including exited
@@ -505,11 +509,15 @@ fn enumerate(scope: &Scope, registry: &AgentPtyRegistry) -> Vec<Member> {
     let mut members: Vec<Member> = registry
         .agent_records_including_exited()
         .into_iter()
-        .filter(|(record, _)| match scope {
+        .filter(|(record, _, _)| match scope {
             Scope::Instance(id) => instance_of(record) == Some(id.as_str()),
             Scope::Generation(id) => &record.id == id,
         })
-        .map(|(record, exited)| Member { record, exited })
+        .map(|(record, exited, termination_unconfirmed)| Member {
+            record,
+            exited,
+            termination_unconfirmed,
+        })
         .collect();
     // Orchestrator first, then spawn order: an orchestrator stopped first
     // cannot `pane spawn` while its workers go down.
@@ -1138,6 +1146,7 @@ fn aborted_respawn_member(record: AgentRecord) -> Member {
     Member {
         record,
         exited: true,
+        termination_unconfirmed: false,
     }
 }
 
@@ -1290,6 +1299,7 @@ async fn close_one(
             .map(|record| Member {
                 record,
                 exited: false,
+                termination_unconfirmed: false,
             }),
     );
     let (target_facts, statuses) =
@@ -1457,7 +1467,7 @@ async fn close_one(
                 Some(hold) => holds.push((member.record.id.clone(), hold)),
                 // A retired generation whose pane another member now holds is
                 // stopped without pane cleanup, exactly as `StopAgent` does.
-                None if member.exited => {}
+                None if member.exited || member.termination_unconfirmed => {}
                 None => {
                     preflight_error = Some(format!(
                         "pane {} is being closed by another request",
@@ -1867,6 +1877,18 @@ mod tests {
             orch: Option<(&str, &str, bool)>,
             cwd: &std::path::Path,
         ) -> String {
+            self.try_start_in(pane, command, orch, cwd)
+                .await
+                .expect("start an agent through the attach socket")
+        }
+
+        async fn try_start_in(
+            &self,
+            pane: &str,
+            command: &str,
+            orch: Option<(&str, &str, bool)>,
+            cwd: &std::path::Path,
+        ) -> Result<String, crate::daemon_client::ClientError> {
             let cwd = cwd.to_string_lossy().into_owned();
             let tab_membership = orch.map(|(id, role, start)| TabMembership::Orchestration {
                 name: "team".to_string(),
@@ -1886,7 +1908,6 @@ mod tests {
                     ..StartAgentOptions::default()
                 })
                 .await
-                .expect("start an agent through the attach socket")
         }
 
         fn claim(&self, pane: &str, agent: &str) -> CallerClaim {
@@ -2499,6 +2520,301 @@ mod tests {
         let report = deck.close(by_name("team-2"), None, false, false).await;
         assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
         assert!(!deck.live(&worker));
+        deck.shutdown().await;
+    }
+
+    /// Issue #1677: one member whose exit can never be confirmed makes the close
+    /// partial rather than closed, releases the instance and pane holds, and
+    /// leaves no late teardown behind to remove a successor.
+    #[test]
+    fn an_unreaped_member_is_a_survivor_and_cannot_tear_down_its_successor() {
+        use crate::platform::proc::test_child::{
+            WEDGE_TEST_BUDGET, WedgeGate, WedgedChild, holds_within,
+        };
+
+        const PANE: &str = "o-coder";
+        const INSTANCE: &str = "orch-reap-timeout";
+        let gate = std::sync::Arc::new(WedgeGate::default());
+        let worker_gate = gate.clone();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = finished.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("close test runtime");
+            let result = runtime.block_on(async move {
+                let deck = Deck::new().await;
+                let healthy_gate = std::sync::Arc::new(WedgeGate::default());
+                healthy_gate.release();
+                let orch = deck.registry.insert_test_member_for_test(
+                    Box::new(WedgedChild::new(None, healthy_gate)),
+                    "o-orch",
+                    INSTANCE,
+                    true,
+                );
+                let worker = deck.registry.insert_test_member_for_test(
+                    Box::new(WedgedChild::new(None, worker_gate.clone())),
+                    PANE,
+                    INSTANCE,
+                    false,
+                );
+                deck.orch_unit(
+                    "team-reap-timeout",
+                    ("disp", "nobody"),
+                    INSTANCE,
+                    "o-orch",
+                    &orch,
+                );
+                let worktree = deck.dir.path().join("wt-team-reap-timeout");
+                std::fs::create_dir(&worktree).expect("create the unit worktree");
+                deck.registry
+                    .set_agent_label(&worker, None, Some(worktree.to_string_lossy().into_owned()))
+                    .expect("root the wedged member in its unit worktree");
+                deck.registry.set_test_member_orchestration_cwd(
+                    &worker,
+                    worktree.to_string_lossy().into_owned(),
+                );
+                deck.report_done("o-orch", &orch);
+                let mut events = deck.event_tx.subscribe();
+                let report = deck
+                    .close(by_name("team-reap-timeout"), None, false, false)
+                    .await;
+                let holds_released = !deck.registry.is_instance_closing(INSTANCE)
+                    && !deck.registry.pane_close_in_flight("o-orch")
+                    && !deck.registry.pane_close_in_flight(PANE);
+                let cleanup_projection_protects_worktree =
+                    crate::issue_dispatch_run::worktree_still_in_use(
+                        &deck.registry.agent_records_for_worktree_cleanup(),
+                        &worktree,
+                    );
+                // The retry must still meet the unconfirmed member. Treating its
+                // retired registry entry as proof of exit would report the unit
+                // closed and permit its worktree to be removed under the child.
+                let retry = deck
+                    .close(by_name("team-reap-timeout"), None, false, false)
+                    .await;
+                let unit_remains = deck
+                    .registry
+                    .dispatched_units()
+                    .unit_of_instance(INSTANCE)
+                    .is_some();
+                let worktree_held = deck.registry.hold_dir_for_removal(&worktree).is_none();
+                let successor = deck
+                    .try_start_in(
+                        PANE,
+                        "sleep 30",
+                        Some((INSTANCE, "coder", false)),
+                        deck.dir.path(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
+
+                // A JoinHandle-timeout-only implementation is still blocked in
+                // the old child here. Releasing it now exposes any late pane or
+                // unit cleanup after the successor has been admitted.
+                worker_gate.release();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let successor_live = successor
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|id| deck.registry.agent_is_live(id));
+                let successor_owns_pane = successor.as_ref().ok().is_some_and(|id| {
+                    deck.registry.pane_current_agent_id(PANE).as_deref() == Some(id.as_str())
+                });
+                let successor_state_survives = {
+                    let state = deck.state.read().await;
+                    state.managed_pane_ids.contains(PANE)
+                        && state.pane_role_map.get(PANE).map(String::as_str) == Some("coder")
+                };
+                let mut late_pane_close = false;
+                while let Ok(message) = events.try_recv() {
+                    if let BroadcastMsg::Event(event) = message
+                        && event.is_daemon_pane_closed()
+                        && event.pane_id.as_deref() == Some(PANE)
+                    {
+                        late_pane_close = true;
+                    }
+                }
+                deck.shutdown().await;
+                (
+                    report,
+                    retry,
+                    unit_remains,
+                    worktree_held,
+                    cleanup_projection_protects_worktree,
+                    holds_released,
+                    successor,
+                    successor_live,
+                    successor_owns_pane,
+                    successor_state_survives,
+                    late_pane_close,
+                )
+            });
+            let _ = result_tx.send(result);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let returned = holds_within(
+            crate::agent_pty::AGENT_TERMINATE_GRACE
+                + crate::agent_pty::FORCE_REAP_DEADLINE
+                + WEDGE_TEST_BUDGET,
+            || finished.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        if !returned {
+            gate.release();
+        }
+        let result = result_rx
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the close answers once the fixture is released");
+        close_thread
+            .join()
+            .expect("the close thread must not panic");
+        assert!(
+            returned,
+            "CloseAgents never returned — one member's blocking reap held the whole close"
+        );
+        let (
+            report,
+            retry,
+            unit_remains,
+            worktree_held,
+            cleanup_projection_protects_worktree,
+            holds_released,
+            successor,
+            successor_live,
+            successor_owns_pane,
+            successor_state_survives,
+            late_pane_close,
+        ) = result;
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::PartiallyClosed, "{target:?}");
+        assert_eq!(target.survivors, vec![PANE.to_string()]);
+        assert!(
+            target
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id.as_deref() == Some(PANE) && pane.stopped == Some(false)),
+            "the unconfirmed member must be reported per pane: {target:?}"
+        );
+        assert!(
+            target
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not confirm")),
+            "the report must carry the truthful termination failure: {target:?}"
+        );
+        let retry_target = &retry.targets[0];
+        assert_eq!(
+            retry_target.outcome,
+            CloseOutcome::Failed,
+            "{retry_target:?}"
+        );
+        assert_eq!(retry_target.survivors, vec![PANE.to_string()]);
+        assert!(
+            retry_target
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not confirm")),
+            "a wedged retry must not confuse a missing live record with a confirmed exit: {retry_target:?}"
+        );
+        assert!(unit_remains, "an unconfirmed child keeps its unit live");
+        assert!(
+            worktree_held,
+            "an unconfirmed child keeps its worktree protected from removal"
+        );
+        assert!(
+            cleanup_projection_protects_worktree,
+            "StopAgent and dispatch rollback liveness checks also see the unconfirmed child"
+        );
+        assert!(
+            holds_released,
+            "a failed close releases its admission holds"
+        );
+        let successor = successor.expect("a successor is admitted after the failed close");
+        assert!(successor_live, "the successor {successor} remains live");
+        assert!(successor_owns_pane, "the successor keeps its pane");
+        assert!(
+            successor_state_survives,
+            "late predecessor cleanup must not unregister the successor"
+        );
+        assert!(
+            !late_pane_close,
+            "late predecessor cleanup must not announce the successor's pane closed"
+        );
+    }
+
+    /// Issue #1677 review: an unresolved predecessor and its live successor are
+    /// both close members. The predecessor retries its own child without taking
+    /// the successor's pane-cleanup hold or turning that ownership into a
+    /// preflight error; the successor still receives the ordinary full cleanup.
+    #[tokio::test]
+    async fn an_unconfirmed_predecessor_can_be_closed_with_its_successor() {
+        use crate::platform::proc::test_child::{WedgeGate, WedgedChild};
+
+        const PANE: &str = "o-orch";
+        const INSTANCE: &str = "orch-retry-with-successor";
+        let deck = Deck::new().await;
+        let gate = std::sync::Arc::new(WedgeGate::default());
+        let predecessor = deck.registry.insert_test_member_for_test(
+            Box::new(WedgedChild::new(None, gate.clone())),
+            PANE,
+            INSTANCE,
+            true,
+        );
+        deck.orch_unit(
+            "team-retry-with-successor",
+            ("disp", "nobody"),
+            INSTANCE,
+            PANE,
+            &predecessor,
+        );
+        deck.report_done(PANE, &predecessor);
+        let first = deck
+            .close(by_name("team-retry-with-successor"), None, false, false)
+            .await;
+        assert_eq!(first.targets[0].outcome, CloseOutcome::Failed);
+
+        let successor = deck
+            .try_start_in(
+                PANE,
+                "sleep 30",
+                Some((INSTANCE, "orchestrator", true)),
+                deck.dir.path(),
+            )
+            .await
+            .expect("the failed close releases the pane for a successor");
+        let retry = deck
+            .close(by_name("team-retry-with-successor"), None, false, false)
+            .await;
+        let target = &retry.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::PartiallyClosed, "{target:?}");
+        assert_eq!(target.survivors, vec![PANE.to_string()]);
+        assert!(
+            target
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("could not confirm")),
+            "the predecessor remains a truthful survivor, not a cleanup-hold error: {target:?}"
+        );
+        assert!(deck.registry.agent_record_any(&predecessor).is_some());
+        assert!(deck.registry.agent_record_any(&successor).is_none());
+        assert!(!deck.state.read().await.managed_pane_ids.contains(PANE));
+        assert!(
+            deck.registry
+                .dispatched_units()
+                .unit_of_instance(INSTANCE)
+                .is_some(),
+            "the unresolved predecessor keeps the unit live"
+        );
+
+        gate.release();
+        let final_close = deck
+            .close(by_name("team-retry-with-successor"), None, false, false)
+            .await;
+        assert_eq!(final_close.targets[0].outcome, CloseOutcome::Closed);
+        assert!(deck.registry.agent_record_any(&predecessor).is_none());
         deck.shutdown().await;
     }
 
@@ -4322,8 +4638,8 @@ mod tests {
             .registry
             .agent_records_including_exited()
             .into_iter()
-            .filter(|(r, _)| ids.contains(&r.id))
-            .map(|(r, _)| r.id)
+            .filter(|(r, _, _)| ids.contains(&r.id))
+            .map(|(r, _, _)| r.id)
             .collect();
         assert!(left.is_empty(), "every role was stopped: {left:?}");
         deck.shutdown().await;

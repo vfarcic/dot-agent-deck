@@ -27,7 +27,7 @@ dot-agent-deck is one product with two clients — the terminal TUI and the desk
 | Agent status `WaitingForInput` | **Needs Input** | the TUI stats bar's "waiting" | the card status and the stats bar ("2 needs input") | pending #1043 (see [Exceptions](#known-exceptions)) | `SessionStatus::WaitingForInput` |
 | The orchestrator handing work to a role | **delegate** / **delegation** | desktop "HANDOFFS", "handoff", and the edge status "dispatched" | `dot-agent-deck delegate` | "DELEGATIONS", "Live delegations", "delegated" | the `delegate` message and CLI |
 | What agents report while they work | **event** | desktop "Evidence", "Transition evidence", "Run evidence", "EVENT LEDGER" | hook events | "Events", the events drawer | `AgentEvent`, `EventType`, `subscribe-events` |
-| Ending one agent | **Close** | desktop "Stop agent" | "Close agent", "Close selected agent?" | "Close {name} agent" on a dashboard row, its confirmation "Close {name}?" / "Close agent"; "Close {name} orchestration" and "Close all N roles" for an orchestration | `stop-agent` (the verb on the wire is unchanged) |
+| Ending one agent | **Close** | desktop "Stop agent" | "Close agent", "Close selected agent?" | "Close {name} agent" on a dashboard row, "Close agent" in the agent pane, their confirmation "Close {name}?" / "Close agent"; "Close {name} orchestration" and "Close all N roles" for an orchestration | `stop-agent` (the verb on the wire is unchanged) |
 | Ending the daemon | **Stop** | — | the quit dialog's Stop, "shut down agents and daemon" | "Stop daemon" | `stop-daemon`, `dot-agent-deck daemon stop` |
 | Bringing up one agent | **New Agent** / **create** | desktop "Start agent" | "New Agent", "Created agent {id}" | "New agent", "Create agent" | `start-agent` |
 | Bringing up an orchestration | **activate** | desktop "Start orchestration", "Launch live loop", "Launch {name}?", "launch a workflow" | "Activated orchestration: {name}" | "Activate orchestration", "Activate {name}?", "activate again" | `prepare-orchestration` then `start-prepared-agent` per role |
@@ -36,7 +36,7 @@ dot-agent-deck is one product with two clients — the terminal TUI and the desk
 
 ### Ending an agent versus leaving its view
 
-Two desktop controls act on an agent from different places: the dashboard row's control ends the agent, and the full-window agent view's control only dismisses the view. Issue #1045 named them by the glossary's words. The row's control is **"Close {name} agent"**, because **Close** is the word for ending one agent; the full-window view's dismiss is **"Back to dashboard"**, because it ends nothing and the Dashboard is where it returns to. The busy label while a close is in flight stays "Stopping…": it describes what the daemon is doing, not the name of the action.
+The dashboard row's **"Close {name} agent"** and the full-window pane's stop-icon **"Close agent"** end the agent after the same confirmation. The pane's separate cross is **"Back to dashboard"**: it dismisses the view and ends nothing. **Close** stays the word for ending one agent; in voice, the agent pane's whole "close this agent" asks for that confirmation with typing off, while a bare "close" dismisses what is on top. The busy label while a close is in flight stays "Stopping…": it describes what the daemon is doing, not the name of the action.
 
 ### Checked and already aligned
 

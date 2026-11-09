@@ -410,7 +410,8 @@ pub fn force_kill_child_group(
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
 /// ask with `CTRL_BREAK_EVENT`, poll `try_wait` until the child exits or `grace`
-/// elapses, then `TerminateJobObject` as the unconditional backstop and reap.
+/// elapses, then `TerminateJobObject` as the unconditional backstop. The final
+/// reap is bounded by `reap_deadline` and never enters blocking `Child::wait`.
 ///
 /// Structurally identical to the Unix `SIGTERM` → poll → `SIGKILL` sequence
 /// (same 50 ms poll cadence, same "an early exiter is not penalised by the
@@ -431,7 +432,8 @@ pub fn terminate_child_with_grace_and_wait(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
     group: &AgentProcessGroup,
-) {
+    reap_deadline: Duration,
+) -> super::ChildTermination {
     // Phase 1: ask the agent's process group to stop.
     best_effort_ctrl_break(child.process_id(), "graceful-close-ctrl-break");
 
@@ -454,15 +456,19 @@ pub fn terminate_child_with_grace_and_wait(
     // regardless of whether anything honoured the CTRL_BREAK.
     if child_exited {
         // `try_wait` already reaped the direct child, so there is no process for
-        // the single-process fallback to kill and no status left to `wait` for —
+        // the single-process fallback to kill and no status left to collect —
         // but its descendants may still be in the job, so the job is still
         // terminated. `terminate_tree` is a no-op-safe call on a job whose
         // processes have all exited.
         group.terminate_tree("graceful-close-terminate-job-after-child-exit");
-        return;
+        return super::ChildTermination::Reaped;
     }
-    reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
-    let _ = child.wait();
+    let kill_reported_ok = reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
+    if super::reap_child_with_deadline(child, reap_deadline) {
+        super::ChildTermination::Reaped
+    } else {
+        super::ChildTermination::Unreaped { kill_reported_ok }
+    }
 }
 
 /// The daemon-wide `shutdown_all_graceful` "SIGTERM phase" for one agent: ask
@@ -1040,7 +1046,12 @@ mod tests {
 
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(crate::platform::proc::test_child::StdChild(doomed));
-        terminate_child_with_grace_and_wait(&mut child, Duration::from_secs(3), &group);
+        terminate_child_with_grace_and_wait(
+            &mut child,
+            Duration::from_secs(3),
+            &group,
+            Duration::from_secs(1),
+        );
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut reaped = false;

@@ -309,8 +309,8 @@ pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrup
 ///
 /// A list of their own rather than part of [`INTERRUPT_PHRASES`], because the
 /// two halves differ outside the mode: there a bare *"stop"* is NOT answered
-/// locally at all — it keeps today's model answer (`stop_agent`, which is not
-/// callable on the agent screen) and issue #1402 owns what it should become —
+/// as an interrupt — on the agent screen it opens the agent-close confirmation
+/// (issue #1402), after reading's silence controls have had their turn —
 /// while *"interrupt"* is answered with "say typing on first". *"stop typing"*
 /// and *"stop listening"* are different whole phrases and keep their meanings.
 pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];

@@ -837,7 +837,7 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
-                ("stop_agent".to_string(), false),
+                ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), false),
             ]
         );

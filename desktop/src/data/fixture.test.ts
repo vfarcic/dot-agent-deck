@@ -148,11 +148,12 @@ describe("browser fixture prompt commands (PRD #1541)", () => {
     });
   });
 
-  /** Scenario: with typing mode off, a bare stop is not taken as an interrupt or a typing-mode hint. */
-  it.each(rustPhrases("TYPING_STOP_PHRASES"))("leaves %s alone outside typing mode", (said) => {
-    const outcome = resolveFixtureVoice(said, "agent", false).outcome;
-    expect(outcome.kind === "unavailable" && outcome.hint === hint).toBe(false);
-    expect(outcome.kind === "dispatch" && outcome.action === "interrupt_agent").toBe(false);
+  /** Scenario: with typing off, the shipped whole close-agent phrases open its confirmation in the browser preview too; typing mode still interprets bare stop as interrupt and types the other phrases. */
+  it.each(rustPhrases("CLOSE_AGENT_PHRASES", outcomeSource))("asks to close the agent for %s only outside typing mode", (said) => {
+    expect(fixturePhrases("stop_agent")).toEqual(rustPhrases("CLOSE_AGENT_PHRASES", outcomeSource));
+    expect(resolveFixtureVoice(`okay, ${said} please`, "agent", false).outcome).toMatchObject({ kind: "dispatch", action: "stop_agent", invoke: "confirmStopAgent", params: [] });
+    expect(resolveFixtureVoice(said, "agent", true).outcome).toMatchObject({ kind: "dispatch", action: rustPhrases("TYPING_STOP_PHRASES").includes(said) ? "interrupt_agent" : "dictate_to_agent" });
+    expect(resolveFixtureVoice(`${said} after the tests`, "agent", false).outcome).not.toMatchObject({ action: "stop_agent" });
   });
 
   /** Scenario: on the dashboard a prompt command is refused with the row's own hint, as commands.toml words it. */
