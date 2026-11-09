@@ -1384,7 +1384,7 @@ mod tests {
                 // The dialog's Discard (#1247): the one close that keeps no draft.
                 ("discard_new_agent", "discardNewAgent", vec!["overview"]),
                 // PRD #802 D5's set: each only opens a confirmation.
-                ("stop_agent", "confirmStopAgent", vec!["overview"]),
+                ("stop_agent", "confirmStopAgent", vec!["overview", "agent"]),
                 (
                     "close_orchestration",
                     "confirmCloseOrchestration",
@@ -2330,7 +2330,9 @@ mod tests {
                 "reading_off",
                 "hush_reading",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
-                "open_pr"
+                "open_pr",
+                // Issue #1402: close the open agent, behind its own confirmation.
+                "stop_agent"
             ]
         );
         // PRD #1401 — over the pull request browser: the rows callable
@@ -2785,7 +2787,12 @@ mod tests {
                 "{id}'s description must say it only asks: {}",
                 row.description
             );
-            assert_eq!(row.screens, vec![Screen::Overview], "{id}");
+            let expected = if *id == "stop_agent" {
+                vec![Screen::Overview, Screen::Agent]
+            } else {
+                vec![Screen::Overview]
+            };
+            assert_eq!(row.screens, expected, "{id}");
         }
         let stop = table.row("stop_agent").expect("present");
         assert_eq!(stop.params[0].kind, ParamKind::AgentRef);

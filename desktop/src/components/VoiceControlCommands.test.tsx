@@ -1431,7 +1431,7 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    fireEvent.click(screen.getAllByTestId("overview-stop-agent").find((button) => button.getAttribute("aria-label") === "Close coder agent")!);
     expect(screen.getByRole("alertdialog")).toBeVisible();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1459,7 +1459,7 @@ describe("typing into the open agent", () => {
     await completeUtterance();
     expect(resolveVoice).toHaveBeenCalledWith(said);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    fireEvent.click(screen.getAllByTestId("overview-stop-agent").find((button) => button.getAttribute("aria-label") === "Close coder agent")!);
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => { settle(dictated(said, "type")); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -1489,7 +1489,7 @@ describe("typing into the open agent", () => {
       [{ deckId: snapshot.connection.deckId, agentId: coder.id }, "run the login tests "],
     ]);
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    fireEvent.click(screen.getAllByTestId("overview-stop-agent").find((button) => button.getAttribute("aria-label") === "Close coder agent")!);
     expect(screen.getByRole("alertdialog")).toBeVisible();
     await act(async () => { settleTyped(); await Promise.resolve(); });
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_DICTATION_SEND_MS * 2); });
@@ -2809,7 +2809,7 @@ describe("sticky dictation in the open agent pane", () => {
     await completeUtterance();
     expect(screen.getByRole("button", { name: /stop typing/i })).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: /close coder agent/i, hidden: true }));
+    fireEvent.click(screen.getAllByTestId("overview-stop-agent").find((button) => button.getAttribute("aria-label") === "Close coder agent")!);
     expect(screen.getByRole("alertdialog")).toBeVisible();
     expect(screen.queryByRole("button", { name: /stop typing/i })).toBeNull();
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
@@ -4431,6 +4431,42 @@ describe("PRD #802 D5 — a spoken stop opens a confirmation; a spoken start sta
     await flush();
     expect(runAction).toHaveBeenCalledTimes(1);
     expect(runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: snapshot.connection.deckId, agentId: target.id });
+  });
+
+  /**
+   * Scenario: with typing mode off on either origin's agent screen, a bare
+   * "stop" resolves to a paramless stop_agent for the open pane. The reachable
+   * confirmation is the same Close agent dialog as the new stop-icon control,
+   * it names only that orchestration role and says the other roles keep
+   * running, and no deck action runs until the user confirms by hand.
+   */
+  it.each(["overview", "deck"] as const)("opens the open agent's stop confirmation by voice from the %s pane", async (from) => {
+    const voice = microphone([]);
+    const { deck, runAction, snapshot } = d5Deck(voice);
+    const target = snapshot.agents[0];
+    const answer = dispatch("stop_agent", "confirmStopAgent", "Confirm stopping the open agent — nothing has been stopped yet.", "stop", []);
+    const resolveVoice: ResolveVoice = vi.fn(async () => answer);
+    render(<DeckShell runtime={{ ...deck, resolveVoice }} initialView={{ kind: "agent", deckId: target.daemonId, agentId: target.id, from }} />);
+    await turnVoiceOn();
+
+    voice.deliver("stop");
+    await completeUtterance();
+    await flush();
+
+    const dialog = confirmation();
+    expect(dialog).not.toBeNull();
+    expect(dialog).toHaveTextContent("Close lead?");
+    expect(dialog).toHaveTextContent("This closes only lead; the other roles of its orchestration keep running without it.");
+    expect(dialog!.closest("[inert]")).toBeNull();
+    expect(runAction).not.toHaveBeenCalled();
+
+    await act(async () => {
+      fireEvent.click(within(dialog!).getByRole("button", { name: "Close agent" }));
+      await Promise.resolve();
+    });
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({
+      type: "stop_agent", deckId: target.daemonId, agentId: target.id, incarnation: target.incarnation,
+    });
   });
 
   /** Scenario: a direct spoken stop is still resolving when its named agent is

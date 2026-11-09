@@ -122,6 +122,9 @@ const VOICE_OFF_ROW: &str = "voice_off";
 /// typing mode, so they are a list of their own).
 const INTERRUPT_LIST: &str = "INTERRUPT_PHRASES";
 const TYPING_STOP_LIST: &str = "TYPING_STOP_PHRASES";
+/// Issue #1402 — the explicit close-agent phrases answered outside typing mode.
+const AGENT_CLOSE_LIST: &str = "AGENT_CLOSE_PHRASES";
+const STOP_AGENT_ROW: &str = "stop_agent";
 const CLEAR_PROMPT_LIST: &str = "CLEAR_PROMPT_PHRASES";
 const SCRATCH_LIST: &str = "SCRATCH_PHRASES";
 const INTERRUPT_ROW: &str = "interrupt_agent";
@@ -365,6 +368,7 @@ fn phrase_lists(sources: &Sources, rows: &[Row], findings: &mut Vec<String>) {
         (VOICE_OFF_LIST, VOICE_OFF_ROW),
         (INTERRUPT_LIST, INTERRUPT_ROW),
         (TYPING_STOP_LIST, INTERRUPT_ROW),
+        (AGENT_CLOSE_LIST, STOP_AGENT_ROW),
         (CLEAR_PROMPT_LIST, CLEAR_PROMPT_ROW),
         (SCRATCH_LIST, SCRATCH_ROW),
         (READING_ON_LIST, READING_ON_ROW),
@@ -1577,6 +1581,7 @@ mod tests {
             "VOICE_OFF_PHRASES",
             "INTERRUPT_PHRASES",
             "TYPING_STOP_PHRASES",
+            "AGENT_CLOSE_PHRASES",
             "CLEAR_PROMPT_PHRASES",
             "SCRATCH_PHRASES",
             "READING_ON_PHRASES",

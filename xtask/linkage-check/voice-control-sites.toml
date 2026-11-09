@@ -381,6 +381,12 @@ reason = "The tile's expand button: forwards `onOpen`, which DeckSurface wires t
 [[site]]
 file = "desktop/src/components/AgentTile.tsx"
 handler = "onClick"
+code = "onStop"
+reason = "The open pane's stop-icon Close agent: forwards `onStop`, whose host opens the same closeAgentConfirmation as `stop_agent` opens through VOICE_ACTIONS.confirmStopAgent."
+
+[[site]]
+file = "desktop/src/components/AgentTile.tsx"
+handler = "onClick"
 code = "onClose"
 reason = "The open pane's close X: forwards `onClose`, which DeckSurface wires to VOICE_ACTIONS.closeAgentView (`close`)."
 

@@ -32,6 +32,7 @@ import { sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
 import { deckAttentionText } from "../lib/inboxWords";
 import { DeckAttention } from "./DeckAttention";
+import { closeAgentConfirmation, stopTargetName, unnamedAgentLabel } from "../lib/stopAgent";
 
 /**
  * The honest subset of `AgentSession`: every field a daemon genuinely reports
@@ -810,12 +811,6 @@ export const CONFIRMATION_ALREADY_OPEN = "A confirmation is already open — ans
 /** The New agent dialog is modal, so a stop's confirmation could not be reached behind it. */
 export const STOP_BEHIND_NEW_AGENT = "The New agent dialog is open — close it first. Nothing was stopped.";
 
-/** What a stop or close confirmation calls one agent — the sanitised identity its row shows, or, in an orchestration, its role. */
-export function stopTargetName(agent: OverviewAgent): string {
-  const raw = agent.tab.kind === "orchestration" && agent.tab.roleName ? agent.tab.roleName : agent.displayName;
-  return displayIdentity(raw, DISPLAY_LIMITS.name, unnamedAgentLabel(agent));
-}
-
 /**
  * The fleet at a glance: every agent the desktop can see, grouped the way the
  * daemon groups them, described only by things that are actually true — and
@@ -1406,14 +1401,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       stopAgent: (agent) => {
         const deck = deckOf(agent.daemonId);
         if (!deck) return;
-        const name = stopTargetName(agent);
-        setConfirm({
-          title: `Close ${name}?`,
-          body: `This sends a stop request to ${name} on ${deckName(deck.connection)}. Unsaved terminal work may be interrupted.`,
-          label: "Close agent",
-          busyLabel: "Stopping…",
-          action: () => run({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation }),
-        });
+        setConfirm(closeAgentConfirmation(agent, deck, run));
       },
       closeOrchestration: (group) => {
         const deckId = group.agents[0]?.daemonId;
@@ -2511,21 +2499,6 @@ function OverviewGroupCard({ group, now, columns }: { group: OverviewGroup; now:
       </table>
     </article>
   );
-}
-
-/**
- * What an identity cell says when the daemon's own value renders as nothing.
- *
- * Honest — it does not invent a name — and identifying, which is the property
- * that matters: two agents whose names are both invisible still read as two
- * different rows, because the daemon's agent id distinguishes them and is what
- * every other surface (the TUI, the deck, the CLI) calls them by. The voice
- * matches the screen's other absences: "no active tool", "socket path not
- * reported".
- */
-function unnamedAgentLabel(agent: OverviewAgent): string {
-  const id = displayText(agent.id, DISPLAY_LIMITS.toolName);
-  return rendersBlank(id) ? "unnamed agent" : `unnamed agent ${id}`;
 }
 
 /** The same, for a group whose title renders as nothing. */

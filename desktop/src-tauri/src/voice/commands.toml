@@ -2037,10 +2037,12 @@ meaning     = "whole"
 # is #802's feature-wide mechanism to build, and when it lands these two rows
 # are the first to carry it.
 #
-# **Their words are the destructive reading, and only that** (PRD #1223, D1):
-# "close" is a VIEW word (`close`) — `stop_agent`'s description disclaims it,
-# and `close_orchestration` refuses any sentence that does not name the
-# orchestration or the run (`must_name`), whatever the meaning check says.
+# **Their model-path words are the destructive reading, and only that** (PRD
+# #1223, D1): "close" is a VIEW word (`close`) except for issue #1402's fixed
+# whole-utterance close-agent phrases on an agent screen, which the local path
+# sends to this same confirmation. `close_orchestration` refuses any sentence
+# that does not name the orchestration or the run (`must_name`), whatever the
+# meaning check says.
 #
 # **`stop_agent` is the one control whose label is not its voice phrase.**
 # Issue #1045 renamed the dashboard row's button to "Close <name> agent",
@@ -2094,21 +2096,24 @@ meaning     = "whole"
 # its `unavailable_redirects` presses Start instead.
 [[commands]]
 id          = "stop_agent"
-description = """Stop one running agent on the agent dashboard — the voice form of its row's close
-button, whose accessible name is "Close <name> agent". Use for stop tester agent, stop the tester,
-stop the agent, kill the reviewer, kill it, shut down the coder,
-shut it down, end that agent, terminate the one that is stuck. Set `agent` the way `open_agent`
-does. It never stops anything by itself: the app shows the same confirmation the row's button shows
-and the user confirms by hand, so pick it whenever the user asks to stop an agent, however
-urgently. It needs a word that can only mean stopping: "close" is NOT one — "close the agent" and
-"close the tester" close the VIEW (`close`) and stop nothing, on every screen and even with nothing
-open to close, although this row's button is labelled Close — and a start is its opposite: never this one, it is `open_new_agent`. Ending a whole orchestration is
+description = """Stop one running agent on the agent dashboard, or the agent open on its own screen —
+the voice form of the row's or pane's close button, whose accessible name is "Close <name> agent".
+Use for stop tester agent, stop the tester, stop the agent, kill the reviewer, kill it, shut down the coder,
+shut it down, end that agent, terminate the one that is stuck. On an agent screen with typing mode off,
+the whole utterances "stop", "stop it", "stop that", "stop the agent", "stop this agent", "close agent",
+"close the agent" and "close this agent" mean the open agent and are answered locally with no name.
+Elsewhere set `agent` the way `open_agent` does. It never stops anything by itself: the app shows the
+same confirmation the row's or pane's button shows and the user confirms by hand, so pick it whenever
+the user asks to stop an agent, however urgently. Away from those explicit agent-screen phrases it needs
+a word that can only mean stopping: "close" is NOT one — "close the agent" and "close the tester" close
+the VIEW (`close`) and stop nothing, on the dashboard and even with nothing open to close, although this
+row's button is labelled Close — and a start is its opposite: never this one, it is `open_new_agent`. Ending a whole orchestration is
 `close_orchestration`. Never for isolating or hiding — "get rid of everything except the tester"
 means SHOW the tester (`open_agent`) and stops nothing."""
 invoke      = "confirmStopAgent"
-screens     = ["overview"]
+screens     = ["overview", "agent"]
 requires    = ["new_agent_dialog_closed"]
-unavailable_hint = "stopping an agent works from the agent dashboard, with the New agent dialog closed"
+unavailable_hint = "stopping an agent works from the agent dashboard or an open agent's screen, with the New agent dialog closed"
 report      = "Confirm stopping {agent} — nothing has been stopped yet."
 asks_to     = "stop an agent"
 try_saying  = "stop {agent}"

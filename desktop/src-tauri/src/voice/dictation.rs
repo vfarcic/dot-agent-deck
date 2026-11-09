@@ -308,12 +308,24 @@ pub const INTERRUPT_PHRASES: [&str; 3] = ["interrupt", "interrupt it", "interrup
 /// dictation mode is on** (PRD #1541 M1 decision 4).
 ///
 /// A list of their own rather than part of [`INTERRUPT_PHRASES`], because the
-/// two halves differ outside the mode: there a bare *"stop"* is NOT answered
-/// locally at all — it keeps today's model answer (`stop_agent`, which is not
-/// callable on the agent screen) and issue #1402 owns what it should become —
-/// while *"interrupt"* is answered with "say typing on first". *"stop typing"*
+/// two halves differ outside the mode: there a bare *"stop"* opens the open
+/// agent's close confirmation (issue #1402), while *"interrupt"* is answered
+/// with "say typing on first". *"stop typing"*
 /// and *"stop listening"* are different whole phrases and keep their meanings.
 pub const TYPING_STOP_PHRASES: [&str; 3] = ["stop", "stop it", "stop that"];
+
+/// What closes the open agent while typing mode is OFF (issue #1402). Together
+/// with [`TYPING_STOP_PHRASES`], these are answered by `stop_agent`'s existing
+/// confirmation, never by interrupting a turn and never by closing only the
+/// view. Whole-utterance equality keeps a sentence that merely mentions stop
+/// or close out of the destructive flow.
+pub const AGENT_CLOSE_PHRASES: [&str; 5] = [
+    "stop the agent",
+    "stop this agent",
+    "close agent",
+    "close the agent",
+    "close this agent",
+];
 
 /// What starts reading mode for the open agent (PRD #1497), said as the whole
 /// utterance.
@@ -712,12 +724,22 @@ mod tests {
     /// one of the words, or opens with a dictation opener, is not a match.
     #[test]
     fn voice_dictation_prompt_control_phrases_match_only_whole_utterances() {
-        let lists: [(&[&str], &[&str]); 4] = [
+        let lists: [(&[&str], &[&str]); 5] = [
             (
                 &INTERRUPT_PHRASES,
                 &["interrupt", "interrupt it", "interrupt that"],
             ),
             (&TYPING_STOP_PHRASES, &["stop", "stop it", "stop that"]),
+            (
+                &AGENT_CLOSE_PHRASES,
+                &[
+                    "stop the agent",
+                    "stop this agent",
+                    "close agent",
+                    "close the agent",
+                    "close this agent",
+                ],
+            ),
             (
                 &CLEAR_PROMPT_PHRASES,
                 &[
@@ -766,6 +788,10 @@ mod tests {
             ("scratch that idea and start over", &SCRATCH_PHRASES[..]),
             ("stop the build when tests fail", &TYPING_STOP_PHRASES[..]),
             (
+                "close this agent when the tests pass",
+                &AGENT_CLOSE_PHRASES[..],
+            ),
+            (
                 "interrupt the build if a test fails",
                 &INTERRUPT_PHRASES[..],
             ),
@@ -782,13 +808,14 @@ mod tests {
     /// A newly shared phrase would make classification order determine an action.
     #[test]
     fn voice_dictation_reserved_phrase_lists_are_pairwise_disjoint() {
-        let lists: [(&str, &[&str]); 12] = [
+        let lists: [(&str, &[&str]); 13] = [
             ("dictation on", &DICTATION_ON_PHRASES),
             ("dictation off", &DICTATION_OFF_PHRASES),
             ("submit", &SUBMIT_PHRASES),
             ("voice off", &VOICE_OFF_PHRASES),
             ("interrupt", &INTERRUPT_PHRASES),
             ("typing stop", &TYPING_STOP_PHRASES),
+            ("agent close", &AGENT_CLOSE_PHRASES),
             ("clear prompt", &CLEAR_PROMPT_PHRASES),
             ("scratch", &SCRATCH_PHRASES),
             ("opener", &DICTATION_OPENERS),

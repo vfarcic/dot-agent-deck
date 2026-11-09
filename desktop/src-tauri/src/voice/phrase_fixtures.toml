@@ -1607,34 +1607,30 @@ screen = "agent"
 action = "scratch_that"
 outcome = "unavailable"
 
-# **A bare "stop" outside typing mode is NOT intercepted** and keeps today's
-# answer: the model's `stop_agent`, which is not callable on the agent screen
-# (issue #1402 owns what it should become). NOT measured when added — no
-# `OPENAI_API_KEY` on the box that wrote them — and pinned on `stop_agent`'s
-# own `heard_as` "stop" and the `stop-the-agent` precedent; a run that finds
-# the model answering otherwise should re-pin them, as long as the answer is
-# not `interrupt_agent`.
+# **A bare "stop" outside typing mode closes the open agent behind its
+# confirmation** (issue #1402). It is answered locally, like the explicit close
+# phrases below, so these fixtures must never be answered `interrupt_agent`.
 
 [[fixtures]]
 name = "idle-bare-stop"
 utterance = "stop"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "idle-bare-stop-it"
 utterance = "stop it"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "idle-bare-stop-that"
 utterance = "stop that"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
 
 # On another screen the prompt commands are the model's to answer, and the row
 # is not callable there. Model-facing, like the dictation `unavailable` pair.
@@ -2138,16 +2134,25 @@ resolved_orchestration = "build"
 # PRD #1223 — the user's own phrasings after using the shipped flow, the
 # fixtures that matter most here.
 #
-# D1: an utterance with a destructive and a non-destructive reading resolves to
-# the non-destructive one. "Close the agent" was taken as stopping it; it closes
-# the VIEW, and the agent keeps running. On the overview there may be no pane to
-# close, and `close` then says so — which is still not a stop.
+# D1 on the dashboard: an utterance with a destructive and a non-destructive
+# reading resolves to the non-destructive one. On the agent screen issue #1402
+# makes the explicit whole utterance "close this agent" (and its close-agent
+# forms) a request to end the OPEN agent behind confirmation; naming the agent
+# SCREEN still dismisses only the view. On the overview "close the agent" keeps
+# its non-destructive reading, even when there is no pane to close.
 
 [[fixtures]]
 name = "close-the-agent"
 utterance = "Close the agent"
 screen = "agent"
-action = "close"
+action = "stop_agent"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-this-agent"
+utterance = "close this agent"
+screen = "agent"
+action = "stop_agent"
 outcome = "dispatch"
 
 [[fixtures]]
@@ -2164,15 +2169,14 @@ screen = "agent"
 action = "close"
 outcome = "dispatch"
 
-# Stopping needs wording that can only mean stopping. On the agent screen the
-# row is not callable (its confirmation lives on the overview's row), so the
-# fixture pins that the request is READ as a stop, and refused as "not here".
+# Stopping on the agent screen targets the agent whose pane is open and opens
+# the same confirmation as its Close agent control (issue #1402).
 [[fixtures]]
 name = "stop-the-agent"
 utterance = "stop the agent"
 screen = "agent"
 action = "stop_agent"
-outcome = "unavailable"
+outcome = "dispatch"
 
 [[fixtures]]
 name = "stop-the-tester-agent"

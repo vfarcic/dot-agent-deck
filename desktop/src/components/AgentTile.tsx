@@ -7,6 +7,7 @@ import {
   Check,
   CheckCircle2,
   CircleDot,
+  CircleStop,
   FileCode2,
   GitCompareArrows,
   Handshake,
@@ -268,6 +269,12 @@ export interface AgentTileProps {
    */
   onClose?: () => void;
   /**
+   * Issue #1402 — close the agent itself, after the same confirmation the
+   * overview row opens. Supplied only at overlay presentation; `onClose` still
+   * dismisses only the view and leaves the agent running.
+   */
+  onStop?: () => void;
+  /**
    * PRD #1666 §6.4 — Retry or Cancel one deck message the tile lists, at the
    * revision it shows. Supplied only where a daemon can answer: without it the
    * rows show no buttons, as a control that does nothing must not exist.
@@ -350,6 +357,7 @@ export function AgentTile({
   onOpen,
   panePresent,
   onClose,
+  onStop,
   onInboxAction,
 }: AgentTileProps) {
   /* PRD #1401 — the badge opens the in-app browser where the shell offers one. */
@@ -614,6 +622,16 @@ export function AgentTile({
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
+          )}
+          {onStop && (
+            <button
+              className="agent-pane-control agent-stop-control"
+              data-testid="agent-pane-stop"
+              aria-label={`Close ${agent.displayName} agent`}
+              title={`Close ${agent.displayName}`}
+              onMouseDown={(event) => event.stopPropagation()}
+              onClick={onStop}
+            ><CircleStop size={14} /><span>Close agent</span></button>
           )}
           {onClose && (
             <button

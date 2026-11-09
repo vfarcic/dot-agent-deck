@@ -139,6 +139,44 @@ describe("agent pane overlay", () => {
   });
 
   /**
+   * Scenario: open Planner's agent screen from the dashboard and choose its
+   * stop-icon Close agent control, distinct from Back to dashboard. The shared
+   * confirmation opens and Cancel sends nothing; confirming sends one
+   * stop_agent for the agent on its own deck. Once the daemon stops listing
+   * Planner, the agent screen closes back to the dashboard rather than staying
+   * open with no subject.
+   */
+  it("confirms closing the open agent and returns to the dashboard when the daemon drops it", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const deck = runtime({ runAction });
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" as const };
+    const { rerender } = render(<DeckShell runtime={deck} initialView={view} />);
+
+    const close = within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close Plan / architecture agent" });
+    expect(close).toHaveTextContent("Close agent");
+    expect(close.querySelector("svg.lucide-circle-stop")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Back to dashboard" })).toBeInTheDocument();
+    fireEvent.click(close);
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Close Plan / architecture?");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(runAction).not.toHaveBeenCalled();
+
+    fireEvent.click(close);
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Close agent" }));
+      await Promise.resolve();
+    });
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({
+      type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: undefined,
+    });
+
+    const snapshot = { ...deck.snapshot, agents: deck.snapshot.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<DeckShell runtime={{ ...deck, snapshot, fleet: [snapshot] }} initialView={view} />);
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.getByTestId("overview-open-deck")).toBeInTheDocument();
+  });
+
+  /**
    * Scenario: open Planner's pane from the deck and close it again. Planner's
    * terminal is built once for the whole round trip and is never disposed, and
    * the element on screen is the same DOM node throughout.
