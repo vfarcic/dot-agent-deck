@@ -1867,6 +1867,18 @@ mod tests {
             orch: Option<(&str, &str, bool)>,
             cwd: &std::path::Path,
         ) -> String {
+            self.try_start_in(pane, command, orch, cwd)
+                .await
+                .expect("start an agent through the attach socket")
+        }
+
+        async fn try_start_in(
+            &self,
+            pane: &str,
+            command: &str,
+            orch: Option<(&str, &str, bool)>,
+            cwd: &std::path::Path,
+        ) -> Result<String, crate::daemon_client::ClientError> {
             let cwd = cwd.to_string_lossy().into_owned();
             let tab_membership = orch.map(|(id, role, start)| TabMembership::Orchestration {
                 name: "team".to_string(),
@@ -1886,7 +1898,6 @@ mod tests {
                     ..StartAgentOptions::default()
                 })
                 .await
-                .expect("start an agent through the attach socket")
         }
 
         fn claim(&self, pane: &str, agent: &str) -> CallerClaim {
@@ -2500,6 +2511,171 @@ mod tests {
         assert_eq!(report.targets[0].outcome, CloseOutcome::Closed);
         assert!(!deck.live(&worker));
         deck.shutdown().await;
+    }
+
+    /// Issue #1677: one member whose exit can never be confirmed makes the close
+    /// partial rather than closed, releases the instance and pane holds, and
+    /// leaves no late teardown behind to remove a successor.
+    #[test]
+    fn an_unreaped_member_is_a_survivor_and_cannot_tear_down_its_successor() {
+        use crate::platform::proc::test_child::{
+            WEDGE_TEST_BUDGET, WedgeGate, WedgedChild, holds_within,
+        };
+
+        const PANE: &str = "o-coder";
+        const INSTANCE: &str = "orch-reap-timeout";
+        let gate = std::sync::Arc::new(WedgeGate::default());
+        let worker_gate = gate.clone();
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = finished.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let close_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("close test runtime");
+            let result = runtime.block_on(async move {
+                let deck = Deck::new().await;
+                let healthy_gate = std::sync::Arc::new(WedgeGate::default());
+                healthy_gate.release();
+                let orch = deck.registry.insert_test_member_for_test(
+                    Box::new(WedgedChild::new(None, healthy_gate)),
+                    "o-orch",
+                    INSTANCE,
+                    true,
+                );
+                let _worker = deck.registry.insert_test_member_for_test(
+                    Box::new(WedgedChild::new(None, worker_gate.clone())),
+                    PANE,
+                    INSTANCE,
+                    false,
+                );
+                deck.orch_unit(
+                    "team-reap-timeout",
+                    ("disp", "nobody"),
+                    INSTANCE,
+                    "o-orch",
+                    &orch,
+                );
+                deck.report_done("o-orch", &orch);
+                let mut events = deck.event_tx.subscribe();
+                let report = deck
+                    .close(by_name("team-reap-timeout"), None, false, false)
+                    .await;
+                let holds_released = !deck.registry.is_instance_closing(INSTANCE)
+                    && !deck.registry.pane_close_in_flight("o-orch")
+                    && !deck.registry.pane_close_in_flight(PANE);
+                let successor = deck
+                    .try_start_in(
+                        PANE,
+                        "sleep 30",
+                        Some((INSTANCE, "coder", false)),
+                        deck.dir.path(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string());
+
+                // A JoinHandle-timeout-only implementation is still blocked in
+                // the old child here. Releasing it now exposes any late pane or
+                // unit cleanup after the successor has been admitted.
+                worker_gate.release();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let successor_live = successor
+                    .as_ref()
+                    .ok()
+                    .is_some_and(|id| deck.registry.agent_is_live(id));
+                let successor_owns_pane = successor.as_ref().ok().is_some_and(|id| {
+                    deck.registry.pane_current_agent_id(PANE).as_deref() == Some(id.as_str())
+                });
+                let successor_state_survives = {
+                    let state = deck.state.read().await;
+                    state.managed_pane_ids.contains(PANE)
+                        && state.pane_role_map.get(PANE).map(String::as_str) == Some("coder")
+                };
+                let mut late_pane_close = false;
+                while let Ok(message) = events.try_recv() {
+                    if let BroadcastMsg::Event(event) = message
+                        && event.is_daemon_pane_closed()
+                        && event.pane_id.as_deref() == Some(PANE)
+                    {
+                        late_pane_close = true;
+                    }
+                }
+                deck.shutdown().await;
+                (
+                    report,
+                    holds_released,
+                    successor,
+                    successor_live,
+                    successor_owns_pane,
+                    successor_state_survives,
+                    late_pane_close,
+                )
+            });
+            let _ = result_tx.send(result);
+            done.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        let returned = holds_within(
+            crate::agent_pty::AGENT_TERMINATE_GRACE
+                + crate::agent_pty::FORCE_REAP_DEADLINE
+                + WEDGE_TEST_BUDGET,
+            || finished.load(std::sync::atomic::Ordering::SeqCst),
+        );
+        if !returned {
+            gate.release();
+        }
+        let result = result_rx
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the close answers once the fixture is released");
+        close_thread
+            .join()
+            .expect("the close thread must not panic");
+        assert!(
+            returned,
+            "CloseAgents never returned — one member's blocking reap held the whole close"
+        );
+        let (
+            report,
+            holds_released,
+            successor,
+            successor_live,
+            successor_owns_pane,
+            successor_state_survives,
+            late_pane_close,
+        ) = result;
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::PartiallyClosed, "{target:?}");
+        assert_eq!(target.survivors, vec![PANE.to_string()]);
+        assert!(
+            target
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id.as_deref() == Some(PANE) && pane.stopped == Some(false)),
+            "the unconfirmed member must be reported per pane: {target:?}"
+        );
+        assert!(
+            target
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("could not confirm")),
+            "the report must carry the truthful termination failure: {target:?}"
+        );
+        assert!(
+            holds_released,
+            "a failed close releases its admission holds"
+        );
+        let successor = successor.expect("a successor is admitted after the failed close");
+        assert!(successor_live, "the successor {successor} remains live");
+        assert!(successor_owns_pane, "the successor keeps its pane");
+        assert!(
+            successor_state_survives,
+            "late predecessor cleanup must not unregister the successor"
+        );
+        assert!(
+            !late_pane_close,
+            "late predecessor cleanup must not announce the successor's pane closed"
+        );
     }
 
     /// Scenario: while one instance is closing, a spawn into it is refused;

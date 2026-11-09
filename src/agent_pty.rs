@@ -850,6 +850,12 @@ pub enum AgentPtyError {
     Resize(String),
     #[error("Agent {0} not found")]
     NotFound(String),
+    /// The registry generation was retired and its force-kill was issued, but
+    /// the OS had not reported the child's exit when the bounded reap expired.
+    #[error(
+        "could not confirm that agent {id} exited within the reap deadline; it may still be running (force-kill reported no error: {kill_reported_ok})"
+    )]
+    TerminationUnconfirmed { id: String, kill_reported_ok: bool },
     /// Caller-supplied spawn metadata failed validation. Surfaced to the
     /// attach client via `AttachResponse::err` so a malformed spawn fails
     /// loudly instead of silently dropping the bad field (PRD #76 M2.12
@@ -12402,8 +12408,8 @@ impl AgentPtyRegistry {
     /// against anything armed in the window) and then clears the closing mark.
     ///
     /// `closed` distinguishes the outcomes but the rollback is deliberately
-    /// asymmetric: on a FAILED close the pane is un-marked so the still-live
-    /// agent can be delegated to again, but the records swept at `begin` are
+    /// asymmetric: on a FAILED close the pane is un-marked so a live agent can
+    /// be delegated to again, but the records swept at `begin` are
     /// **not** restored. Losing a watch fails safe (no idle prompt for a worker
     /// whose pane we just tried to kill); resurrecting one could nag about a
     /// delegation whose pane the user explicitly asked to close.
@@ -15343,17 +15349,16 @@ impl AgentPtyRegistry {
             })
     }
 
-    /// Stop an agent: SIGKILL the child, reap it, drop its handles. Any
-    /// streaming subscribers will observe their broadcast receiver close
-    /// shortly after (once the reader thread sees EOF and drops its bus
-    /// reference).
+    /// Stop an agent and drop its handles. Any streaming subscribers will
+    /// observe their broadcast receiver close shortly after (once the reader
+    /// thread sees EOF and drops its bus reference).
     ///
-    /// PRD #92 F8: the kill path now uses
-    /// [`terminate_child_with_grace_and_wait`] — SIGTERM with a
-    /// 3-second grace before SIGKILL — so a well-behaved agent can
-    /// trap SIGTERM and clean up its own descendants (e.g. the
-    /// `setsid`'d sub-shells Claude Code creates internally).
-    /// Misbehaving agents are still reaped after the grace window.
+    /// PRD #92 F8: the kill path uses [`terminate_child_with_grace_and_wait`] —
+    /// SIGTERM with a 3-second grace before SIGKILL — so a well-behaved agent
+    /// can trap SIGTERM and clean up its own descendants. Issue #1677 bounds the
+    /// final nonblocking reap too: when the OS still reports no exit, the
+    /// generation stays retired and the caller gets `TerminationUnconfirmed`
+    /// rather than waiting forever or reporting a successful stop.
     ///
     /// PRD #92 F9 followup-3: this path used to prune the
     /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
@@ -15438,10 +15443,11 @@ impl AgentPtyRegistry {
                 let _ = release.recv();
             }
         }
-        crate::platform::proc::terminate_child_with_grace_and_wait(
+        let termination = crate::platform::proc::terminate_child_with_grace_and_wait(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
             &agent.process_group,
+            FORCE_REAP_DEADLINE,
         );
         agent.removal.record_reaped(&mut agent.child);
         // Notify the idle monitor so it observes the registry shrink
@@ -15450,7 +15456,24 @@ impl AgentPtyRegistry {
         // explicit-close path edge-trigger the monitor without depending
         // on the kernel's PTY drain timing.
         self.change_notify.notify_one();
-        Ok(())
+        match termination {
+            crate::platform::proc::ChildTermination::Reaped => Ok(()),
+            crate::platform::proc::ChildTermination::Unreaped { kill_reported_ok } => {
+                tracing::warn!(
+                    agent_id = %id,
+                    pane_id = ?agent.pane_id_env,
+                    pid = ?agent.child.process_id(),
+                    kill_reported_ok,
+                    deadline_ms = FORCE_REAP_DEADLINE.as_millis() as u64,
+                    "single-agent reap gave up: the child never reported an exit within the \
+                     deadline; its generation is retired, but it may still be running"
+                );
+                Err(AgentPtyError::TerminationUnconfirmed {
+                    id: id.to_string(),
+                    kill_reported_ok,
+                })
+            }
+        }
     }
 
     /// Respawn the agent attached to a given `pane_id_env`: gracefully
@@ -15928,30 +15951,46 @@ impl AgentPtyRegistry {
         // teardown's force phase reaps the descendant tree through (PRD #163 M3),
         // and it is dropped there once the old child is gone.
         let join = tokio::task::spawn_blocking(move || {
-            crate::platform::proc::terminate_child_with_grace_and_wait(
+            let termination = crate::platform::proc::terminate_child_with_grace_and_wait(
                 &mut child,
                 AGENT_TERMINATE_GRACE,
                 &process_group,
+                FORCE_REAP_DEADLINE,
             );
             removal.record_reaped(&mut child);
+            termination
         })
         .await;
-        if let Err(join_err) = join {
-            // The spawn_blocking task ran the SIGTERM → poll → SIGKILL
-            // sequence in `terminate_child_with_grace_and_wait`. A
-            // `JoinError` here means the closure panicked or was
-            // cancelled before returning; the SIGKILL backstop inside
-            // the helper only fires if the closure reached that line.
-            // The helper is panic-free in practice (no panic-prone
-            // calls in its body), so this branch is a defensive log —
-            // the child may or may not have been reaped depending on
-            // where the panic landed.
-            tracing::warn!(
-                pane_id = %pane_id_env,
-                error = %join_err,
-                "respawn: spawn_blocking for terminate panicked or was cancelled; \
-                 proceeding with fresh spawn anyway"
-            );
+        match join {
+            Ok(crate::platform::proc::ChildTermination::Reaped) => {}
+            Ok(crate::platform::proc::ChildTermination::Unreaped { kill_reported_ok }) => {
+                // The old generation is already removed and its blocking task
+                // ends here, before the successor is spawned. Nothing remains
+                // to run late pane cleanup against that successor.
+                tracing::warn!(
+                    pane_id = %pane_id_env,
+                    kill_reported_ok,
+                    "respawn: previous child did not report an exit before the reap deadline; \
+                     proceeding with fresh spawn anyway"
+                );
+            }
+            Err(join_err) => {
+                // The spawn_blocking task ran the SIGTERM → poll → SIGKILL
+                // sequence in `terminate_child_with_grace_and_wait`. A
+                // `JoinError` here means the closure panicked or was
+                // cancelled before returning; the SIGKILL backstop inside
+                // the helper only fires if the closure reached that line.
+                // The helper is panic-free in practice (no panic-prone
+                // calls in its body), so this branch is a defensive log —
+                // the child may or may not have been reaped depending on
+                // where the panic landed.
+                tracing::warn!(
+                    pane_id = %pane_id_env,
+                    error = %join_err,
+                    "respawn: spawn_blocking for terminate panicked or was cancelled; \
+                     proceeding with fresh spawn anyway"
+                );
+            }
         }
 
         // Step 3: spawn a fresh agent with the captured identity.
@@ -18566,11 +18605,20 @@ impl AgentPtyRegistry {
         instance: &str,
         is_start_role: bool,
     ) -> String {
-        let id = self.insert_test_agent_with_master(
-            Box::new(IdleTestChild),
-            Some(pane_id),
-            Box::new(IdleTestMaster),
-        );
+        self.insert_test_member_for_test(Box::new(IdleTestChild), pane_id, instance, is_start_role)
+    }
+
+    /// [`Self::insert_idle_member_for_test`] with a caller-supplied child, for
+    /// close tests that need an inert orchestration member whose reap wedges.
+    #[cfg(test)]
+    pub(crate) fn insert_test_member_for_test(
+        &self,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        pane_id: &str,
+        instance: &str,
+        is_start_role: bool,
+    ) -> String {
+        let id = self.insert_test_agent_with_master(child, Some(pane_id), Box::new(IdleTestMaster));
         if let Some(agent) = self.inner.lock().agents.get_mut(&id) {
             agent.tab_membership = Some(TabMembership::Orchestration {
                 name: "team".to_string(),
@@ -21273,6 +21321,9 @@ mod tests {
 mod spawn_tests {
     use super::*;
     use crate::event::OrchestrationSurfaceRole;
+    use crate::platform::proc::test_child::{
+        PHASE_ONE_FALLBACK_KILLS, WEDGE_TEST_BUDGET, WedgeGate, WedgedChild, holds_within,
+    };
     use spec::spec;
     use std::time::Duration;
 
@@ -33495,148 +33546,6 @@ mod spawn_tests {
     // their phase-3 SIGKILL.
     // ---------------------------------------------------------------------
 
-    /// A latch the test flips to let a deliberately-wedged reap finally
-    /// complete, so the shutdown thread can always be joined.
-    #[derive(Debug, Default)]
-    struct WedgeGate {
-        released: Mutex<bool>,
-        wake: std::sync::Condvar,
-    }
-
-    impl WedgeGate {
-        fn is_released(&self) -> bool {
-            *self.released.lock().unwrap()
-        }
-
-        fn block_until_released(&self) {
-            let mut released = self.released.lock().unwrap();
-            while !*released {
-                released = self.wake.wait(released).unwrap();
-            }
-        }
-
-        fn release(&self) {
-            *self.released.lock().unwrap() = true;
-            self.wake.notify_all();
-        }
-    }
-
-    /// A [`portable_pty::Child`] whose *reap* is under the test's control while
-    /// its *kill* is real.
-    ///
-    /// No real process can be coaxed into the shape issue #581 is about — a
-    /// child wedged in uninterruptible kernel I/O, which SIGKILL cannot
-    /// dislodge until the I/O completes — because a real child always returns
-    /// from `wait` once SIGKILL lands. So the wedge is modelled here and only
-    /// here: everything the teardown path *does* (the signal it sends, the pid
-    /// it sends it to) stays production code running against a real process
-    /// group in the Unix test below.
-    #[derive(Debug)]
-    struct WedgedChild {
-        /// Reported to the teardown path as this child's pid. `Some` makes the
-        /// production `killpg(SIGKILL)` land on a real process group; `None`
-        /// drives the documented pid-unavailable fallback, which is
-        /// `Child::kill` on both backends and therefore observable on Windows
-        /// too.
-        pid: Option<u32>,
-        /// How many times the teardown path issued a kill through that
-        /// fallback. A count, not a flag: phase 1's SIGTERM ask reaches the
-        /// same fallback, so only a kill *beyond* [`PHASE_ONE_FALLBACK_KILLS`]
-        /// is phase 3's. (The first draft asserted a flag and passed on the
-        /// unfixed code — phase 1 had already set it for every agent.)
-        kills: Arc<std::sync::atomic::AtomicUsize>,
-        /// Set when the child was actually reaped (by either `wait` or a
-        /// `try_wait` that reported an exit). The fix must not buy signal
-        /// independence by dropping the reap.
-        reaped: Arc<AtomicBool>,
-        /// Until released, `wait` blocks forever and `try_wait` keeps saying
-        /// "still running".
-        gate: Arc<WedgeGate>,
-        /// When set, the blocking `wait` never returns *at all*, however the
-        /// gate stands — the unbounded-`wait` half of the same wedge, which
-        /// only a `try_wait`-based reap can get past.
-        wait_never_returns: bool,
-    }
-
-    impl WedgedChild {
-        fn new(pid: Option<u32>, gate: Arc<WedgeGate>) -> Self {
-            Self {
-                pid,
-                kills: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-                reaped: Arc::new(AtomicBool::new(false)),
-                gate,
-                wait_never_returns: false,
-            }
-        }
-    }
-
-    impl portable_pty::ChildKiller for WedgedChild {
-        fn kill(&mut self) -> std::io::Result<()> {
-            self.kills.fetch_add(1, Ordering::SeqCst);
-            Ok(())
-        }
-
-        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
-            unreachable!("no teardown path clones a killer")
-        }
-    }
-
-    impl portable_pty::Child for WedgedChild {
-        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
-            if !self.gate.is_released() {
-                return Ok(None);
-            }
-            self.reaped.store(true, Ordering::SeqCst);
-            Ok(Some(portable_pty::ExitStatus::with_exit_code(0)))
-        }
-
-        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
-            if self.wait_never_returns {
-                // `park` may wake spuriously, so loop: this call must never
-                // return, which is the whole point of the flag.
-                loop {
-                    std::thread::park();
-                }
-            }
-            self.gate.block_until_released();
-            self.reaped.store(true, Ordering::SeqCst);
-            Ok(portable_pty::ExitStatus::with_exit_code(0))
-        }
-
-        fn process_id(&self) -> Option<u32> {
-            self.pid
-        }
-
-        #[cfg(windows)]
-        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
-            None
-        }
-    }
-
-    /// Poll `done` until it holds or `budget` elapses. Returns what it last saw.
-    fn holds_within(budget: Duration, mut done: impl FnMut() -> bool) -> bool {
-        let deadline = Instant::now() + budget;
-        while Instant::now() < deadline {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        done()
-    }
-
-    /// How long a phase-3 kill is given to reach every agent before the test
-    /// calls it starved. Generous — it is only ever paid on failure.
-    const WEDGE_TEST_BUDGET: Duration = Duration::from_secs(10);
-
-    /// Kills that phase 1's SIGTERM *ask* contributes per agent for a pid-less
-    /// child, before phase 3 is reached at all: on Unix `killpg` needs a pid and
-    /// so takes the `Child::kill` fallback, while on Windows
-    /// `GenerateConsoleCtrlEvent` skips a pid-less child outright. Phase 3's
-    /// force-kill is the one *on top of* this baseline, so it is the only thing
-    /// a strictly-greater count can be.
-    const PHASE_ONE_FALLBACK_KILLS: usize = if cfg!(unix) { 1 } else { 0 };
-
     /// Issue #581 (regression): phase 3 must force-kill *every* surviving
     /// agent, even when the first one it touches never finishes being reaped.
     ///
@@ -34491,6 +34400,147 @@ mod spawn_tests {
             reaped.iter().all(|r| r.load(Ordering::SeqCst)),
             "every agent must still be reaped, not merely signalled"
         );
+    }
+
+    /// Issue #1677: a single-agent close must not park forever in `Child::wait`
+    /// after the force-kill. The gate keeps `try_wait` at `None` until the test
+    /// releases it, while `wait` blocks on the same gate. On the unfixed path the
+    /// watchdog releases the gate so the thread can be joined, then fails the
+    /// bounded-return assertion; on the fixed path the close has already returned
+    /// a truthful error before the gate opens.
+    #[test]
+    fn close_agent_gives_up_on_a_child_that_never_reports_an_exit() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let gate = Arc::new(WedgeGate::default());
+        let child = WedgedChild::new(None, gate.clone());
+        let kills = child.kills.clone();
+        let reaped = child.reaped.clone();
+        let id = registry.insert_test_agent_for_pane(Box::new(child), Some("close-wedge"));
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let closing = registry.clone();
+        let close_id = id.clone();
+        let close_thread = std::thread::spawn(move || {
+            let result = closing.close_agent(&close_id).map_err(|e| e.to_string());
+            let _ = result_tx.send(result);
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let returned = holds_within(
+            AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET,
+            || finished.load(Ordering::SeqCst),
+        );
+        let reaped_before_release = reaped.load(Ordering::SeqCst);
+        gate.release();
+        let result = result_rx
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the close answers once the fixture is released");
+        close_thread
+            .join()
+            .expect("the close thread must not panic");
+
+        assert!(
+            returned,
+            "the close never returned — it is parked in the unbounded post-kill `Child::wait`"
+        );
+        let error = result.expect_err("an unconfirmed exit is not a successful close");
+        assert!(
+            error.contains("could not confirm") && error.contains("may still be running"),
+            "the error must say what is unknown without claiming the child is dead: {error}"
+        );
+        assert!(
+            kills.load(Ordering::SeqCst) > PHASE_ONE_FALLBACK_KILLS,
+            "bounding the reap must not skip the force-kill"
+        );
+        assert!(
+            !reaped_before_release,
+            "the fixture must still be unreaped when the bounded close gives up"
+        );
+    }
+
+    /// Issue #1677: the shared `StopAgent` sequence returns its per-agent error,
+    /// drops the caller's cleanup hold, and has no blocking work left that can
+    /// clean up a successor admitted afterwards.
+    #[test]
+    fn stop_agent_reap_timeout_releases_cleanup_and_leaves_a_successor_alone() {
+        const PANE: &str = "stop-wedge-pane";
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _event_rx) = broadcast::channel(16);
+        let gate = Arc::new(WedgeGate::default());
+        let id = registry
+            .insert_test_agent_for_pane(Box::new(WedgedChild::new(None, gate.clone())), Some(PANE));
+        let record = registry.agent_record_any(&id).expect("the wedged record");
+        let cleanup = registry
+            .hold_pane_for_cleanup(PANE, &id)
+            .expect("the stopping generation owns its pane");
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let done = finished.clone();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let stopping = registry.clone();
+        let stopping_state = state.clone();
+        let stopping_id = id.clone();
+        let stop_thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stop test runtime");
+            let result = runtime.block_on(crate::daemon_protocol::stop_agent_steps(
+                &stopping_id,
+                Some(&record),
+                Some(PANE),
+                &stopping,
+                &stopping_state,
+                &event_tx,
+                crate::dispatched_units::EndReason::Stopped,
+            ));
+            drop(cleanup);
+            let _ = result_tx.send(result);
+            done.store(true, Ordering::SeqCst);
+        });
+
+        let returned = holds_within(
+            AGENT_TERMINATE_GRACE + FORCE_REAP_DEADLINE + WEDGE_TEST_BUDGET,
+            || finished.load(Ordering::SeqCst),
+        );
+        if !returned {
+            // Unblock the unfixed implementation so this regression fails rather
+            // than leaving a thread and its runtime parked forever.
+            gate.release();
+        }
+        let result = result_rx
+            .recv_timeout(WEDGE_TEST_BUDGET)
+            .expect("the stop answers once the fixture is released");
+        stop_thread.join().expect("the stop thread must not panic");
+        assert!(
+            returned,
+            "StopAgent's shared steps never returned — the blocking reap outlived the request"
+        );
+        let error = result.expect_err("an unconfirmed exit must reach the stop caller");
+        assert!(error.contains("could not confirm"), "{error}");
+        assert!(!registry.pane_close_in_flight(PANE));
+        assert!(!registry.is_pane_closing(PANE));
+
+        let successor_gate = Arc::new(WedgeGate::default());
+        successor_gate.release();
+        let successor = registry.insert_test_agent_for_pane(
+            Box::new(WedgedChild::new(None, successor_gate)),
+            Some(PANE),
+        );
+        gate.release();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(registry.agent_is_live(&successor));
+        assert_eq!(
+            registry.pane_current_agent_id(PANE).as_deref(),
+            Some(successor.as_str())
+        );
+        registry
+            .close_agent(&successor)
+            .expect("the healthy successor closes promptly");
     }
 
     // ---------------------------------------------------------------------
