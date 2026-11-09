@@ -8,7 +8,7 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
+import { appFirst, LocalUpgradeFlow, type LocalUpgradeRequest, upgradeCopies } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
@@ -1257,6 +1257,18 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [localUpgrade, setLocalUpgrade] = useState<LocalUpgradeRequest>();
   /* The CLI's plan while it is behind and this app can upgrade it. */
   const cliPlan = selfUpgrade?.api ? cliBehind(selfUpgrade.check) : undefined;
+  /*
+    Issue #1962 — the Local daemon section's Upgrade runs the copies' flow
+    whenever the app itself can be upgraded from here, or was upgraded and
+    waits for a relaunch (`appFirst`), not only while the CLI is behind.
+    With the CLI current and the daemon older than the app, opening the
+    daemon's dialog alone would restart the daemon onto this app's build
+    while the app stays the oldest of the three (#1959's drift), so the app
+    is offered first and the relaunched app restarts the daemon. An app
+    this app cannot upgrade is left to the app's own notice, whose dialog
+    says what to do instead.
+  */
+  const localCopies = selfUpgrade?.check && selfUpgrade.api && (cliPlan || appFirst(selfUpgrade.check)) ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
    * order they render, as one sequence. Declared whenever they are on screen
@@ -1305,9 +1317,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const confirmationOpen = confirm !== undefined || upgrade !== undefined || localUpgrade !== undefined;
   /**
    * What a deck's Upgrade does, and what its button says. A remote deck's
-   * covers its daemon, which runs that host's CLI. The local deck's covers the
-   * CLI on this machine and the local daemon, either of which can be behind
-   * (issue #1753), so its label and tooltip name what is.
+   * covers its daemon, which runs that host's CLI. The local deck's covers
+   * this machine's copies of Agent Deck — the app while it can be upgraded
+   * from here or waits for a relaunch (issue #1962), the CLI while it is
+   * behind (issue #1753) — and the local daemon, so its label and tooltip
+   * name what is.
    */
   const deckUpgrade = (connection: ConnectionView): { onUpgrade?: () => void; upgradeLabel?: string; upgradeTitle?: string } => {
     const daemon: UpgradeTarget | undefined = runtime.upgradeDaemon && upgradeOffered(connection) && connection.deckId !== undefined
@@ -1315,12 +1329,22 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       : undefined;
     const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
     if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
-    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
-    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    if (!localCopies) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    /*
+      What this press covers, in the order the flow offers it: the app while
+      it leads (issue #1959), the CLI (issue #1753), the daemon. The button
+      names all of them (issue #1962).
+    */
+    const covered = upgradeCopies(localCopies.check, "local");
+    const names = [...(covered.includes("app") ? ["Agent Deck"] : []), ...(covered.includes("cli") ? ["the CLI"] : []), ...(daemon ? ["the daemon"] : [])];
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
-      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
-      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies: localCopies }),
+      upgradeLabel: `Upgrade ${names.length > 1 ? `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}` : names[0]} on this machine`,
+      upgradeTitle: [
+        ...(covered.includes("app") && selfUpgrade?.check?.notice ? [displayText(selfUpgrade.check.notice, DISPLAY_LIMITS.message)] : []),
+        ...(covered.includes("cli") ? [displayText(cliPlan!.headline, DISPLAY_LIMITS.message)] : []),
+        ...(daemon ? [daemonTitle] : []),
+      ].filter(Boolean).join(" "),
     };
   };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
@@ -1652,7 +1676,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                 crate says its daemon runs an older release than the app — on
                 the local deck too since issue #1636, as a restart onto this
                 app's build — and, on the local deck since issue #1753, when
-                this machine's CLI is behind, whatever the daemon runs.
+                this machine's CLI is behind, whatever the daemon runs, and
+                since issue #1962 when the app itself can be upgraded from
+                here or waits for a relaunch.
               */
               {...deckUpgrade(deck.snapshot.connection)}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}

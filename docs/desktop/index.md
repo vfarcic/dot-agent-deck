@@ -32,7 +32,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
 | Upgrade a remote daemon that runs an older release than the app | **Upgrade** on its section of the Dashboard | [Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon) |
 | Upgrade the app to a newer release, and the `dot-agent-deck` CLI on this machine with it when that is behind too | The upgrade button at the bottom of the rail, or **Upgrade…** on the Dashboard's banner | [Upgrade the app](#upgrade-the-app) |
-| Upgrade the `dot-agent-deck` CLI and the daemon on this machine while the app is current | **Upgrade** on the **Local daemon** section of the Dashboard | [Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine) |
+| Upgrade the Agent Deck app, the `dot-agent-deck` CLI and the daemon on this machine | **Upgrade** on the **Local daemon** section of the Dashboard | [Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine) |
 | Change the appearance or the zoom level | **Settings → Appearance**, **Settings → Zoom** | [Settings](settings.md) |
 | Sign out of GitHub in the app's pull request page | **Settings → GitHub** | [Settings → GitHub](settings.md#github) |
 | Drive the app by voice | **Voice** button, **Settings → Voice** | [Voice Control](voice.md) |
@@ -57,7 +57,7 @@ The app checks for a newer release when it starts and every 6 hours while it run
 
 Once the app has upgraded itself, it still runs the old version until it restarts, so it does not offer that upgrade again. Instead, the banner and the rail button say `Agent Deck v<new> is installed. Relaunch to run it.`, the banner's button reads **Relaunch…**, and the dialog they open shows the upgrade's result with a **Relaunch** button.
 
-Nothing appears while the app is current, or while the app cannot reach GitHub. When the app is current but the `dot-agent-deck` CLI on this machine is behind, which is the copy the TUI, your terminal commands and your agents' hooks run, the **Local daemon** section of the Dashboard offers **Upgrade** instead ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)).
+Nothing appears while the app is current, or while the app cannot reach GitHub. When the app is current but the `dot-agent-deck` CLI on this machine is behind, which is the copy the TUI, your terminal commands and your agents' hooks run, the **Local daemon** section of the Dashboard offers **Upgrade** instead ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)). When the app is behind, that section offers **Upgrade** as well, leading with the app.
 
 The TUI checks on the same schedule and shows a notice at the right end of its footer, such as `dot-agent-deck CLI: update available: v0.47.0 (current: v0.46.0)`, for the CLI it runs or for this app; pressing `u` there opens its own upgrade dialog, which covers both, with the same plans and the same one-copy-at-a-time questions ([Installation → Upgrade from the TUI](../installation.md#upgrade-from-the-tui)). `dot-agent-deck upgrade` in a terminal shows the same plans too.
 
