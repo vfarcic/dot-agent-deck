@@ -33,6 +33,21 @@ At `98683b4b` on 2026-09-10 that read **79 files: 53 lane 1 + 26 lane 2**, the c
 
 Lane 1 is not a required status check. The required set is still `build`, `build-macos`, `build-windows` and `security`; CLAUDE.md rule 8 records why it is deliberately advisory.
 
+## What a lane-1 shard runs
+
+CI builds lane 1 once, as `cargo nextest archive --workspace --features e2e` (`e2e-build` in `ci.yml`, the task of the same name in `.rwx/ci.yml`), and five shards run that archive. The archive holds every test binary in the workspace, because that is what `--workspace` builds, so it also holds the library's tests, the non-e2e integration tests, the xtask crates' and the desktop crate's. Those already run in the fast tier (`cargo test-fast`, the `test` job or task, against the build without the `e2e` feature), and until issue #2091 every shard ran them a second time: 37% of the shards' summed test time in the window [#2091](https://github.com/vfarcic/dot-agent-deck/issues/2091) measured.
+
+So [`scripts/e2e-shard.sh`](../../scripts/e2e-shard.sh), which both backends call, selects two things:
+
+- every test in a `tests/e2e_*.rs` binary, by binary name (`binary(/^e2e_/)`);
+- every test elsewhere in the root package whose path has a module named `e2e_only…` (`package(dot-agent-deck) & test(/(^|::)e2e_only[a-z0-9_]*::/)`). These are the tests that exist only in the `e2e` build, a `#[test]` under `#[cfg(feature = "e2e")]` in `src/` being the usual shape. The fast tier never compiles them, so this is the one place they run.
+
+**A test that exists only in the `e2e` build goes in an `e2e_only` module.** `mod e2e_only { use super::*; … }` under the `cfg`, or a module whose name starts with `e2e_only` (`doorbell_screen::e2e_only_standin_tests`). linkage-check rule 19 (`xtask/linkage-check/src/e2e_shard_selection.rs`) fails the build when such a test sits anywhere else, since the shard filter would select it nowhere and it would run in no CI job with every check green; it also fails when the script stops naming either selector. It decides "only in the `e2e` build" from the `cfg` predicates above the test (one that cannot hold with the feature off), so a test that exists in both builds but whose code under test has `e2e` arms is not one: it runs once, in the fast tier, against the plain build.
+
+`lifecycle/version/001` runs alone in the `version` shard, and the other four split the rest with `--partition count:N/4`. The four partitions are disjoint and together cover the filtered set, so each selected test runs in one shard.
+
+**Two load-sensitive library flakes surfaced only in the shards** before this change, because the shards ran the fast tier a second time beside the PTY tests: `daemon_protocol::tests::a_respawn_mid_window_is_named_by_the_restart_or_it_asks_again` and `hooks_manage::tests::the_version_probe_is_bounded_when_a_descendant_holds_stdout_open` ([#1980's tests comment](https://github.com/vfarcic/dot-agent-deck/issues/1980#issuecomment-6594911814)). The shards no longer run either, so that signal is gone from CI on purpose, and neither was left to disappear with it: the first was fixed in the daemon by #1992 ([#1950](https://github.com/vfarcic/dot-agent-deck/issues/1950)), and the second, which did not reproduce under a 60-run stress at load average 73 on macOS, is tracked in [#2212](https://github.com/vfarcic/dot-agent-deck/issues/2212) for a Linux reproduction. A library test that only fails under the shards' load is still a defect in the test or the code; find it by loading the fast tier yourself (CLAUDE.md rule 6), not by putting the fast tier back in the shards.
+
 ## Why lane 2 is not in CI
 
 **No e2e test reaches a real agent in CI, and no test credential is registered on this repository.** That is a decision with two reasons, and both have to be re-argued before anyone puts a key back.

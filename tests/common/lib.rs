@@ -945,6 +945,12 @@ pub fn fixture_git(dir: &Path, sandbox_root: &Path) -> std::process::Command {
 /// `e2e_dispatch_return.rs` had learned this; `e2e_dispatcher_mode.rs`'s
 /// `dispatch_close_002` / `_003` then went red on it in a lane-2 pass on the
 /// #1339 branch with 22 `claude` and 6 `codex` processes on the box.
+///
+/// The per-test `state/` (`DOT_AGENT_DECK_STATE_DIR`) is ignored for the same
+/// reason: the deck's daemon is already running and writes there, and a report
+/// store's `.pending-*.json` that is renamed away between `git add -A`'s scan
+/// and its stat fails the commit ("unable to stat"). `dispatch_return_008` went
+/// red on it twice in a row on `main`'s run for 982e120b.
 pub fn commit_fixture_repo(dir: &Path) {
     let run = |args: &[&str]| {
         let out = fixture_git(dir, dir)
@@ -963,8 +969,8 @@ pub fn commit_fixture_repo(dir: &Path) {
     std::fs::create_dir_all(exclude.parent().expect("info/exclude has a parent"))
         .expect("create the fixture's info dir");
     let mut ignored = std::fs::read_to_string(&exclude).unwrap_or_default();
-    ignored.push_str("\n/home/\n");
-    std::fs::write(&exclude, ignored).expect("ignore the per-test HOME");
+    ignored.push_str("\n/home/\n/state/\n");
+    std::fs::write(&exclude, ignored).expect("ignore the per-test HOME and state");
     run(&["add", "-A"]);
     run(&["commit", "-qm", "fixture baseline"]);
 }

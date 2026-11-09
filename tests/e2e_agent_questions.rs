@@ -174,9 +174,8 @@ fn question_live_003_claude_keyboard_deny_refuses_late_answer() {
     visible(&deck, "Interrupted");
 }
 
-/// Scenario: Codex on a cheap model asks to run a command outside its read-only sandbox;
-/// approve through the client and observe the sentinel. Switch to Plan mode,
-/// answer a two-question form through keys, and see both answers reported.
+/// Scenario: Codex on a cheap model asks to run a command outside its read-only sandbox, then a two-question Plan form.
+/// On a verified version the client answers; on a newer minor it is refused and the keyboard completes both prompts, creating the sentinel and reporting the choices.
 #[spec("question/live/004")]
 #[test]
 fn question_live_004_codex_permission_and_whole_form_by_keys() {
@@ -191,6 +190,17 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         )
     });
     skip_unless!(common::check_codex_available());
+    let version_output = std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .unwrap();
+    let version_line = String::from_utf8(version_output.stdout).unwrap();
+    let version = semver::Version::parse(version_line.split_whitespace().last().unwrap()).unwrap();
+    let covered = dot_agent_deck::agent_registry::CODEX_QUESTIONS.covers(Some((
+        version.major,
+        version.minor,
+        version.patch,
+    )));
     let target = common::harness_tempdir().unwrap();
     let sentinel = target.path().join("question_codex_93de612b.txt");
     let command = format!(
@@ -218,7 +228,14 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         "Ask Codex to do anything",
     );
     let q = pending(&deck, &id, QuestionKind::Permission);
-    assert_eq!(q.channel, AnswerChannel::Keys);
+    assert_eq!(
+        q.channel,
+        if covered {
+            AnswerChannel::Keys
+        } else {
+            AnswerChannel::Unsupported
+        }
+    );
     assert_eq!(
         q.questions[0]
             .options
@@ -236,8 +253,16 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
     assert!(!sentinel.exists());
     assert_eq!(
         answer(&deck, &id, &q, vec![selection(0, &[1])]),
-        AnswerReport::Answered
+        if covered {
+            AnswerReport::Answered
+        } else {
+            AnswerReport::Refused(AnswerRefusal::KeyboardOnly)
+        }
     );
+    if !covered {
+        assert!(!sentinel.exists(), "refused voice answer ran the command");
+        deck.send_keys(b"1");
+    }
     assert!(
         common::wait_until(TURN, || sentinel.is_file()),
         "Codex command did not run:\n{}",
@@ -275,13 +300,29 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         "Ask Codex to do anything",
     );
     let q = pending(&deck, &id, QuestionKind::Choice);
-    assert_eq!(q.channel, AnswerChannel::Keys);
+    assert_eq!(
+        q.channel,
+        if covered {
+            AnswerChannel::Keys
+        } else {
+            AnswerChannel::Unsupported
+        }
+    );
     assert_form(&q, false, "None of the above");
     visible(&deck, "None of the above");
     assert_eq!(
         answer(&deck, &id, &q, vec![selection(0, &[2]), selection(1, &[3])]),
-        AnswerReport::Answered
+        if covered {
+            AnswerReport::Answered
+        } else {
+            AnswerReport::Refused(AnswerRefusal::Unsupported)
+        }
     );
+    if !covered {
+        deck.send_keys(b"2");
+        visible(&deck, "Large");
+        deck.send_keys(b"3");
+    }
     finished(&deck, &id);
     visible(&deck, "Green|Large");
 }
@@ -342,7 +383,32 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
         ),
         "Ask anything",
     );
-    let q = pending(&deck, &id, QuestionKind::Permission);
+    let mut q = pending(&deck, &id, QuestionKind::Permission);
+    // OpenCode 1.19.0 asks for the sentinel's directory before the command,
+    // even inside the deck's working folder [observed 2026-11-09 with
+    // `openai/gpt-5.6-luna`]: allow that one through the client too, and go
+    // on with the command's own prompt.
+    if q.tool
+        .as_ref()
+        .is_some_and(|t| t.name == "external_directory")
+    {
+        assert_eq!(q.channel, AnswerChannel::Held);
+        assert_eq!(
+            answer(&deck, &id, &q, vec![selection(0, &[1])]),
+            AnswerReport::Answered
+        );
+        let directory = q.id.clone();
+        assert!(
+            common::wait_until(TURN, || snapshot(&deck, &id)
+                .and_then(|s| s.pending_question)
+                .is_some_and(|p| p.id != directory && p.kind == QuestionKind::Permission)),
+            "no command permission after the directory one:\n{}",
+            deck.snapshot_grid()
+        );
+        q = snapshot(&deck, &id)
+            .and_then(|s| s.pending_question)
+            .expect("the command's permission");
+    }
     assert_eq!(q.channel, AnswerChannel::Held);
     assert_eq!(
         q.questions[0]
@@ -395,4 +461,84 @@ fn question_live_005_opencode_permission_and_multiselect_reply() {
     );
     finished(&deck, &id);
     visible(&deck, "Green|Small|Large");
+}
+
+/// Scenario: Ask interactive Haiku to touch a uniquely named file, with the
+/// question notification set to one minute, and leave its permission prompt
+/// unanswered. The hook the deck installed holds it with the longest timeout
+/// Claude Code keeps; the card shows `QUESTION` and the prompt's age; after a
+/// minute the TUI sends exactly one terminal notification for it; and the
+/// prompt, still held, is allowed through the client, so the file appears
+/// (issue #2075).
+#[spec("question/live/008")]
+#[test]
+fn question_live_008_claude_unanswered_permission_shows_its_age_notifies_once_and_is_answered() {
+    skip_unless!(common::check_claude_available());
+    let target = common::harness_tempdir().unwrap();
+    let sentinel = target.path().join("question_wait_5d0e7a31.txt");
+    let config = target.path().join("config.toml");
+    std::fs::write(&config, "[notifications]\nquestion_after_minutes = 1\n").unwrap();
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env("PATH", path())
+        .with_env(
+            "DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS",
+            QUESTION_DAEMON_MAX_LIFETIME_SECS,
+        )
+        .with_env("DOT_AGENT_DECK_CONFIG", config.to_string_lossy())
+        .with_imported_claude_credentials()
+        .with_claude_trust_workdir()
+        .with_continue_session("question-haiku", "claude --model claude-haiku-4-5-20251001 --permission-mode default --tools Bash,AskUserQuestion")
+        .launch_with_fixture("minimal");
+    let settings: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(deck.home_dir().join(".claude/settings.json"))
+            .expect("the deck installed Claude Code's hooks"),
+    )
+    .unwrap();
+    assert_eq!(
+        settings["hooks"]["PermissionRequest"][0]["hooks"][0]["timeout"],
+        dot_agent_deck::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS,
+        "{settings}"
+    );
+    let id = agent_id(&deck);
+    let prompt = format!(
+        "Use Bash to run exactly touch {}. This is the question_wait_5d0e7a31 check. Do not use another tool or alter the command. After it succeeds, say done and stop.",
+        quote(sentinel.to_str().unwrap())
+    );
+    submit_claude(&deck, &id, &prompt, "question_wait_5d0e7a31");
+    let q = pending(&deck, &id, QuestionKind::Permission);
+    assert_claude_permission(&deck, &q);
+    deck.send_keys(b"\x04");
+    visible(&deck, "QUESTION ");
+    assert!(
+        deck.wait_for_stream_string_within(
+            "\x1b]9;Question waiting 1m",
+            std::time::Duration::from_secs(90)
+        ),
+        "no notification after a minute unanswered:\n{}",
+        deck.snapshot_grid()
+    );
+    // Still exactly one five seconds on: the TUI checks every frame, so a
+    // second notification would land well inside the hold.
+    deck.wait_until_grid_then_hold(
+        "the prompt has notified exactly once",
+        std::time::Duration::from_secs(5),
+        |_| deck.stream_text().matches("\x1b]9;").count() == 1,
+    );
+    assert_eq!(
+        deck.stream_text().matches("\x1b]9;").count(),
+        1,
+        "the prompt notified more than once"
+    );
+    assert!(!sentinel.exists(), "command ran before approval");
+    assert_eq!(
+        answer(&deck, &id, &q, vec![selection(0, &[1])]),
+        AnswerReport::Answered
+    );
+    assert!(
+        common::wait_until(TURN, || sentinel.is_file()),
+        "approved command never created sentinel after the wait:\n{}",
+        deck.snapshot_grid()
+    );
+    finished(&deck, &id);
 }

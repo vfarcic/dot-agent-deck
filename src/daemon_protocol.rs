@@ -124,6 +124,12 @@ pub use crate::hook_binary::{
     REMEDY_UPGRADE_OR_REINSTALL,
 };
 
+// Issue #1674: the kept-worktree report `AttachResponse::kept_worktree` and
+// `BroadcastMsg::WorktreeKept` carry, re-exported as a wire type so a client
+// names it through the protocol module rather than `issue_dispatch_run`, which
+// also holds the daemon's dispatch and worktree logic.
+pub use crate::issue_dispatch_run::KeptWorktree;
+
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};

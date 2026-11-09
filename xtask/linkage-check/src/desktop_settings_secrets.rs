@@ -134,7 +134,7 @@ const DESKTOP_SRC: &str = "desktop/src";
 /// layer. That is why `Option<String>` and `Vec<String>` still have no way in —
 /// they resolve to `String`, which is absent — and why there is no row for each
 /// container shape.
-const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 31] = [
+const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 32] = [
     (
         "u32",
         FieldKind::Scalar,
@@ -280,6 +280,12 @@ const ALLOWED_FIELD_TYPES: [(&str, FieldKind, &str); 31] = [
     ),
     (
         "ZoomSettings",
+        FieldKind::Section,
+        "a section struct, whose own fields this check walks",
+    ),
+    // Issue #2075: the `[questions]` section, one `u32` of minutes.
+    (
+        "QuestionSettings",
         FieldKind::Section,
         "a section struct, whose own fields this check walks",
     ),
@@ -555,7 +561,7 @@ const KEYLESS_MEMBERS: [&str; 3] = ["clear", "key", "length"];
 /// name scan on this side would repeat the mistake #827 is about: `endpoint:
 /// string` passes any name check and is a free-text field. A diff here is the
 /// review prompt.
-const PINNED_TS_FIELDS: [(&str, &str, &str); 31] = [
+const PINNED_TS_FIELDS: [(&str, &str, &str); 33] = [
     ("DesktopSettingsDto", "version", "number"),
     (
         "DesktopSettingsDto",
@@ -574,6 +580,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 31] = [
     // the merge then writes over the user's choices.
     ("DesktopSettingsDto", "voice?", "VoiceSettingsDto"),
     ("DesktopSettingsDto", "zoom", "{ level: number }"),
+    ("DesktopSettingsDto", "questions?", "QuestionSettingsDto"),
     // The two nested interfaces are scanned as well, and that is the point of
     // adding them rather than letting `EndpointSettingsDto` be an opaque name:
     // a credential riding into the document through a nested shape would
@@ -624,6 +631,7 @@ const PINNED_TS_FIELDS: [(&str, &str, &str); 31] = [
     // PRD #1497, decision 5 of 2026-10-09: a closed token
     // (`VOICE_READING_NOTICE`) — whether the notice was shown, never its text.
     ("VoiceSettingsDto", "reading_notice", "string"),
+    ("QuestionSettingsDto", "notify", "number"),
     // PRD #802's provider work. One interface for both stages, because both
     // hold the same three values and a second copy would be a second place to
     // forget a field. Every one is a REFERENCE — which backend, where it is,
@@ -1538,6 +1546,7 @@ pub struct VoiceSettings {
             "EndpointSettingsDto",
             "RemoteEndpointDto",
             "VoiceSettingsDto",
+            "QuestionSettingsDto",
             "VoiceStageDto",
             "VoiceIntentStageDto",
             "VoiceTranscriptionStageDto",
@@ -1628,7 +1637,14 @@ pub struct VoiceSettings {
         keys.sort();
         assert_eq!(
             keys,
-            ["appearance", "endpoints", "version", "voice", "zoom"],
+            [
+                "appearance",
+                "endpoints",
+                "questions",
+                "version",
+                "voice",
+                "zoom"
+            ],
             "unexpected normaliser result shape:\n{returned}"
         );
     }

@@ -134,6 +134,11 @@ mod devbox_gtk_origin;
 /// repository files, which no compile step reads.
 #[cfg(test)]
 mod dispatch_base;
+/// Issues #2091 / #2108: a test that exists only in the `e2e` build, outside a
+/// `tests/e2e_*.rs` binary, sits in an `e2e_only…` module, which is what the
+/// lane-1 shard filter (`scripts/e2e-shard.sh`) selects it by. A live rule —
+/// rule 19 in [`RULES`] — with its own planted-bad-input tests.
+mod e2e_shard_selection;
 /// Issue #1850: the OpenTelemetry spans `affected-checks --run` sends, off
 /// unless the standard `OTEL_*` variables turn them on.
 mod gate_telemetry;
@@ -1083,6 +1088,17 @@ const RULES: &[Rule] = &[
                   `set*` identifiers; see `voice_capability_state`.",
         check: rule_voice_capability_state,
     },
+    Rule {
+        number: 19,
+        name: "e2e-only-tests-are-selected",
+        summary: "A test that exists only in the `e2e` build (a `cfg` that cannot hold with \
+                  `feature = \"e2e\"` off) outside a `tests/e2e_*.rs` binary sits in a module \
+                  whose name starts with `e2e_only`, and `scripts/e2e-shard.sh` still selects \
+                  both that module name and the `e2e_` binaries. The fast tier never compiles \
+                  such a test and the lane-1 shards select only those two, so without this it \
+                  would run in no CI job (issues #2091, #2108). See `e2e_shard_selection`.",
+        check: rule_e2e_only_tests_are_selected,
+    },
 ];
 
 /// Everything the rules read, resolved once before any of them runs.
@@ -1345,6 +1361,13 @@ fn rule_site_image_refs(inputs: &Inputs) -> Vec<String> {
 /// rather than quietly emptying the rule.
 fn rule_unit_test_emitter_pins_endpoints(inputs: &Inputs) -> Vec<String> {
     unit_test_endpoint_pin::run(&inputs.root)
+}
+
+/// Rule 19 (issues #2091, #2108). Its own walk of the root package's module
+/// trees, because whether a test exists only in the `e2e` build depends on the
+/// `cfg` of every module above it, across files.
+fn rule_e2e_only_tests_are_selected(inputs: &Inputs) -> Vec<String> {
+    e2e_shard_selection::run(&inputs.root)
 }
 
 /// Run every registered rule, tagging each finding with its rule's number.
