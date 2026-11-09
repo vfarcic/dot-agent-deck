@@ -8,7 +8,7 @@ import { VOICE_ACTIONS, type DashboardScroll, type NewAgentVoice, type NewAgentV
 import { DECK_STATE_FALLBACK, deckUnavailableReason, isNewAgentShortcut } from "../lib/newAgent";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./UpgradeDialog";
-import { LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
+import { appFirst, LocalUpgradeFlow, type LocalUpgradeRequest } from "./LocalUpgradeFlow";
 import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
@@ -875,7 +875,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   notice?: ReactNode;
   /**
    * Issue #1753 — the app's newer-release check and the calls that upgrade
-   * this machine's CLI, for the Local daemon section's Upgrade. `onClosed`
+   * this machine's app and CLI, for the Local daemon section's Upgrade. `onClosed`
    * runs when that flow ends, so the app checks again.
    */
   selfUpgrade?: { check?: SelfUpgradeCheck; api?: SelfUpgradeApi; onClosed?: () => void };
@@ -1253,9 +1253,9 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [confirm, setConfirm] = useState<ConfirmState>();
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
-  /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */
+  /** Upgrade on the Local daemon section: the app, the CLI and the daemon. */
   const [localUpgrade, setLocalUpgrade] = useState<LocalUpgradeRequest>();
-  /* The CLI's plan while it is behind and this app can upgrade it. */
+  /* The CLI's plan while it is behind, including plans that say what to do by hand. */
   const cliPlan = selfUpgrade?.api ? cliBehind(selfUpgrade.check) : undefined;
   /**
    * PR #1451 round 3, change 3 — the rows, numbered: every deck's, in the
@@ -1306,8 +1306,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   /**
    * What a deck's Upgrade does, and what its button says. A remote deck's
    * covers its daemon, which runs that host's CLI. The local deck's covers the
-   * CLI on this machine and the local daemon, either of which can be behind
-   * (issue #1753), so its label and tooltip name what is.
+   * app, CLI and daemon on this machine, so its label and tooltip name what
+   * the flow covers (issues #1753, #1962).
    */
   const deckUpgrade = (connection: ConnectionView): { onUpgrade?: () => void; upgradeLabel?: string; upgradeTitle?: string } => {
     const daemon: UpgradeTarget | undefined = runtime.upgradeDaemon && upgradeOffered(connection) && connection.deckId !== undefined
@@ -1315,12 +1315,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       : undefined;
     const daemonTitle = connection.upgradeOffer?.kind === "offered" ? `Its daemon runs ${connection.upgradeOffer.from}; this app is ${connection.upgradeOffer.to}.` : undefined;
     if (connection.deckKind === "remote") return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
-    const cli = cliPlan && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
-    if (!cli) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const app = selfUpgrade?.check && selfUpgrade.api && appFirst(selfUpgrade.check) ? selfUpgrade.check : undefined;
+    const copies = (app || cliPlan) && selfUpgrade?.check && selfUpgrade.api ? { check: selfUpgrade.check, api: selfUpgrade.api } : undefined;
+    if (!copies) return daemon ? { onUpgrade: () => setUpgrade(daemon), upgradeTitle: daemonTitle } : {};
+    const names = [app ? "the app" : undefined, cliPlan ? "the CLI" : undefined, daemon ? "the daemon" : undefined].filter(Boolean);
+    const label = names.length === 1 ? names[0] : `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
     return {
-      onUpgrade: () => setLocalUpgrade({ daemon, copies: cli }),
-      upgradeLabel: daemon ? "Upgrade the CLI and the daemon on this machine" : "Upgrade the CLI on this machine",
-      upgradeTitle: [displayText(cliPlan!.headline, DISPLAY_LIMITS.message), daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
+      onUpgrade: () => setLocalUpgrade({ daemon, copies }),
+      upgradeLabel: `Upgrade ${label} on this machine`,
+      upgradeTitle: [app ? displayText(app.notice ?? app.app.headline, DISPLAY_LIMITS.message) : undefined, cliPlan ? displayText(cliPlan.headline, DISPLAY_LIMITS.message) : undefined, daemon ? daemonTitle : undefined].filter(Boolean).join(" "),
     };
   };
   /* Issue #1492 — the scroll keys, while the rows are on screen and focus is
