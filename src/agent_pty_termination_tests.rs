@@ -623,6 +623,10 @@ fn ended_by_itself(
     let deadline = std::time::Instant::now() + Duration::from_secs(20);
     while registry.exit_status_after_eof(&agent, &removal).is_none() {
         assert!(
+            registry.is_agent_still_registered(&agent),
+            "test prerequisite: nothing removed the generation"
+        );
+        assert!(
             std::time::Instant::now() < deadline,
             "test prerequisite: the child exited"
         );
