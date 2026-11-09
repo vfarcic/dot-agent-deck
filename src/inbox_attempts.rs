@@ -3,11 +3,9 @@
 //! transition rows, receiver slots and incarnations, possession, the attempt
 //! and evidence budgets, and task-bound work-done.
 //!
-//! The hub's receipt engine ([`crate::inbox_engine`]) drives the OpenCode
-//! receivers from this model; the other receivers keep the hub's ack-wait path
-//! until their own §13 slice moves them onto it. Time is passed in as an
-//! `Instant` on every operation, so every deadline is exercised without a
-//! sleep.
+//! The hub's receipt engine ([`crate::inbox_engine`]) drives receiver delivery
+//! from this model. Time is passed in as an `Instant` on every operation, so
+//! every deadline is exercised without a sleep.
 //!
 //! # The nine rows
 //!

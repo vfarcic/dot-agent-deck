@@ -8,17 +8,18 @@
 //! so the semantics are deterministic under test.
 //!
 //! The semantics are JetStream-shaped (decision 1 of the PRD): globally unique
-//! ids that double as dedup keys, explicit acknowledgement, redelivery after an
-//! ack-wait, a `max_deliver` bound, and offers that go to one taker at a time
+//! ids that double as dedup keys, explicit acknowledgement, receipt-driven
+//! redelivery, a `max_deliver` bound, and offers that go to one taker at a time
 //! under a time-limited claim.
 //!
 //! **States.** A message is `queued` until a consumer takes it (`fetched`), and
-//! `acknowledged` once an ack arrives. A fetch that is not acknowledged within
-//! the ack-wait returns it to `queued`; after `max_deliver` hand-overs it becomes
-//! `undeliverable`, as it does when its bound agent exits. An offer's ack is a
-//! claim (`claimed`), which ends in `acknowledged` on completion or returns the
-//! offer to its pool, excluding everyone who held it before. A message in
-//! `fetched` or `claimed` is never handed to a second consumer.
+//! `acknowledged` once an ack arrives. A fetch positively not handed returns it
+//! to `queued`; otherwise its attempt model decides whether to repeat it or make
+//! it uncertain. The `max_deliver` bound and a bound agent's exit can make it
+//! `undeliverable`. An offer's ack is a claim (`claimed`), which ends in
+//! `acknowledged` on completion or returns the offer to its pool, excluding
+//! everyone who held it before. A message in `fetched` or `claimed` is never
+//! handed to a second consumer.
 //!
 //! **Bounds.** Every limit in [`InboxLimits`] refuses explicitly ([`PostError`]):
 //! nothing is ever dropped to make room.
@@ -37,10 +38,10 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::deck_identity::{DeckId, is_valid_deck_id};
 
-/// Ack-wait: how long a fetched message waits for its ack before it is
-/// redelivered.
+/// Default ack-wait passed to the receipt attempt model. The store puts no ack
+/// deadline on a fetched message.
 pub const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(60);
-/// Hand-overs after which an unacknowledged message is undeliverable.
+/// Default hand-over bound shared by the store and receipt attempt model.
 pub const DEFAULT_MAX_DELIVER: u32 = 5;
 /// Queued plus fetched messages one recipient pane may hold.
 pub const DEFAULT_MAX_PER_RECIPIENT: usize = 256;
@@ -708,7 +709,10 @@ pub enum ReturnCause {
 /// overrides tests use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxLimits {
+    /// Passed to the receipt attempt model; a fetched message has no
+    /// store-level ack deadline.
     pub ack_wait: Duration,
+    /// Hand-over bound shared by the store and receipt attempt model.
     pub max_deliver: u32,
     pub max_per_recipient: usize,
     pub max_messages: usize,
