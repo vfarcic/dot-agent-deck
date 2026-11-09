@@ -166,6 +166,18 @@ ahead aaaaaaa1 ddddddd4 behind
 run green ddddddd4
 expect_actions ""
 
+reset "green closes an issue whose author is spelled the REST way, github-actions[bot]"
+issue 7 "$(red_marker aaaaaaa1)" OPEN "github-actions[bot]"
+ahead aaaaaaa1 ddddddd4
+run green ddddddd4
+expect_actions "close 7;"
+
+reset "an override spelled github-actions[bot] matches the GraphQL login"
+issue 7 "$(red_marker aaaaaaa1)"
+ahead aaaaaaa1 ddddddd4
+MAIN_RED_BOT='github-actions[bot]' run green ddddddd4
+expect_actions "close 7;"
+
 reset "a marker in the commit subject cannot reset the reds"
 COMMIT_SUBJECT_OVERRIDE="x $(green_marker 0000000b) y"
 issue 7 "$(red_marker aaaaaaa1)"

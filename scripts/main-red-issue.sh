@@ -60,7 +60,8 @@
 #         REOPEN_WINDOW_HOURS default 24
 #         MAIN_RED_LABEL      default main-red
 #         MAIN_RED_BOT        the login whose markers count (default
-#                             github-actions, the GITHUB_TOKEN's identity)
+#                             github-actions, the GITHUB_TOKEN's identity;
+#                             `github-actions[bot]` means the same)
 
 set -uo pipefail   # deliberately NOT -e: this script must never fail a workflow
 
@@ -68,7 +69,14 @@ STATE="${1:-}"
 LABEL="${MAIN_RED_LABEL:-main-red}"
 # Only this author's markers count: anyone who can comment on a public issue
 # could otherwise post a green marker and erase the reds a close is judged on.
+#
+# The same account has two spellings: GraphQL, which `gh issue view --json`
+# reads, returns `github-actions`, and REST returns `github-actions[bot]`
+# (both read back from issue #2193 on 2026-11-09). Both sides of the
+# comparison drop a trailing `[bot]`, so either API and either spelling of
+# the override match.
 BOT="${MAIN_RED_BOT:-github-actions}"
+BOT="${BOT%\[bot\]}"
 BOT="${BOT//[^A-Za-z0-9_-]/}"
 WINDOW_HOURS="${REOPEN_WINDOW_HOURS:-24}"
 ATTEMPT="${RUN_ATTEMPT:-1}"
@@ -117,7 +125,7 @@ open_issue() {
 markers() {
   gh issue view "$1" --json author,body,comments \
     -q "[{a: .author.login, b: .body}] + [.comments[] | {a: .author.login, b: .body}]
-        | .[] | select(.a == \"$BOT\") | .b" 2>/dev/null \
+        | .[] | select((.a // \"\") | sub(\"\\\\[bot\\\\]$\"; \"\") == \"$BOT\") | .b" 2>/dev/null \
   | grep -oE '<!-- main-(red|green)-sha: [0-9a-f]{7,40} -->' \
   | sed -E 's/<!-- main-(red|green)-sha: ([0-9a-f]+) -->/\1 \2/'
 }
