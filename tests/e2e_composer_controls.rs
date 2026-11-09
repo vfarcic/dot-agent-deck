@@ -5,7 +5,11 @@
 //! refuse what they must. A smoke test of the controls themselves; the rows
 //! that use them are S-20b's and S-20c's.
 
-dot_agent_deck_test_harness::link!();
+// The fixture child is selected by its private environment before libtest
+// parses an agent's injected arguments, and before the harness's own pre-main
+// set-up scrubs the deck variables it was spawned with. The normal test
+// process returns from it.
+dot_agent_deck_test_harness::link!(before = live::native_entry);
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]
@@ -13,15 +17,6 @@ mod live;
 
 use live::{Fixture, WAIT};
 use spec::spec;
-
-ctor::declarative::ctor! {
-    // The fixture child is selected by its private environment before libtest
-    // parses Codex's injected arguments. The normal test process returns.
-    #[ctor(unsafe)]
-    fn native_fixture_entry() {
-        live::native_entry();
-    }
-}
 
 fn writer(f: &Fixture) -> serde_json::Value {
     f.control("writer-status")["composer_writer"].clone()

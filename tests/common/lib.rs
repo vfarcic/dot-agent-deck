@@ -9533,6 +9533,18 @@ pub mod child_lifetime_bound;
 /// dot_agent_deck_test_harness::link!();
 /// ```
 ///
+/// A test binary that also runs as a fixture child (a copy of itself
+/// standing in for an agent, chosen by an environment variable before
+/// libtest starts) names that entry point, so it runs first, before the
+/// harness scrubs the deck variables the child was spawned with:
+///
+/// ```ignore
+/// dot_agent_deck_test_harness::link!(before = live::native_entry);
+/// ```
+///
+/// A separate constructor would not do: the order two constructors run in is
+/// not something either can rely on.
+///
 /// It does three things. It names this crate `common` at the test crate's
 /// root, so `common::…` and `crate::common::…` paths read as they did when the
 /// harness was a module. It imports [`skip_unless!`] there, where test bodies
@@ -9556,6 +9568,9 @@ pub mod child_lifetime_bound;
 #[macro_export]
 macro_rules! link {
     () => {
+        $crate::link!(before = $crate::__no_fixture_entry);
+    };
+    (before = $entry:path) => {
         #[allow(unused_imports)]
         use $crate as common;
         #[allow(unused_imports)]
@@ -9566,6 +9581,10 @@ macro_rules! link {
             /// #2083): see `dot_agent_deck_test_harness::link!`.
             #[ctor(unsafe)]
             fn __dot_agent_deck_test_harness_before_main() {
+                // A binary that also runs as a fixture child picks that role
+                // here, before the harness touches the environment the child
+                // was handed; the normal test process returns from it.
+                $entry();
                 // SAFETY: this is a pre-main constructor, so no other thread
                 // exists yet — the condition both functions document.
                 unsafe {
@@ -9580,6 +9599,10 @@ macro_rules! link {
         }
     };
 }
+
+/// [`link!`]'s default fixture entry: this binary is never a fixture child.
+#[doc(hidden)]
+pub fn __no_fixture_entry() {}
 
 // The harness's own unit-test binary is this crate, so it cannot invoke
 // `link!` on itself; it gets the same constructor directly, which is always

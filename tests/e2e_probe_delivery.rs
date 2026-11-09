@@ -4,7 +4,11 @@
 //! Uses S-20's read-only observations and ordinary scheduling requests. No
 //! test operation supplies an empty observation, opens a gate or forces a ring.
 
-dot_agent_deck_test_harness::link!();
+// The fixture child is selected by its private environment before libtest
+// parses an agent's injected arguments, and before the harness's own pre-main
+// set-up scrubs the deck variables it was spawned with. The normal test
+// process returns from it.
+dot_agent_deck_test_harness::link!(before = live::native_entry);
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]
@@ -16,13 +20,6 @@ use serde_json::{Value, json};
 use spec::spec;
 use std::fs;
 use std::time::Duration;
-
-ctor::declarative::ctor! {
-    #[ctor(unsafe)]
-    fn native_fixture_entry() {
-        live::native_entry();
-    }
-}
 
 const ENV: &[(&str, &str)] = &[
     ("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000"),
