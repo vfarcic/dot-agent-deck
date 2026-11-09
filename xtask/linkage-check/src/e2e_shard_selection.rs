@@ -49,6 +49,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// The module-name prefix the shard filter selects on. `scripts/e2e-shard.sh`
 /// holds the matching filter; [`run`] fails when the script stops naming it
@@ -153,7 +154,9 @@ struct Ctx {
 /// One crate's walk.
 struct Walk<'a> {
     root: &'a Path,
-    parsed: &'a BTreeMap<PathBuf, syn::File>,
+    /// Every parsed file, keyed by canonical path. A `mod` target that is not
+    /// in it yet (a `#[path]` outside `src/` and `tests/`) is parsed on demand.
+    parsed: &'a mut BTreeMap<PathBuf, Rc<syn::File>>,
     visited: BTreeSet<PathBuf>,
     findings: BTreeSet<String>,
     tests_seen: usize,
@@ -161,25 +164,44 @@ struct Walk<'a> {
 
 impl Walk<'_> {
     fn file(&mut self, file: &Path, dir: &Path, ctx: Ctx) {
-        let Some(ast) = self.parsed.get(file) else {
-            return;
-        };
+        // Keys are canonical, so `tests/../src/x.rs` and `src/x.rs` are one file.
+        let file = canonical(file);
         // A file reached twice in one crate would be a compile error; across
         // crates (`tests/common` from many roots) it is reached once per root,
         // and the findings set dedups.
-        if !self.visited.insert(file.to_path_buf()) {
+        if !self.visited.insert(file.clone()) {
             return;
         }
+        let display = file
+            .strip_prefix(self.root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let ast = match self.parsed.get(&file) {
+            Some(ast) => Rc::clone(ast),
+            None => match std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|text| syn::parse_file(&text).ok())
+            {
+                Some(ast) => {
+                    let ast = Rc::new(ast);
+                    self.parsed.insert(file.clone(), Rc::clone(&ast));
+                    ast
+                }
+                None => {
+                    self.findings.insert(format!(
+                        "{display}: a `mod` declaration loads it and it cannot be read or parsed \
+                         — its tests were not checked, which is a failure, never a skip"
+                    ));
+                    return;
+                }
+            },
+        };
         let ctx = Ctx {
             e2e: ctx.e2e || requires_e2e(&ast.attrs),
             ..ctx
         };
-        let display = file
-            .strip_prefix(self.root)
-            .unwrap_or(file)
-            .to_string_lossy()
-            .replace('\\', "/");
-        self.items(&ast.items, file, &display, dir, false, ctx);
+        self.items(&ast.items, &file, &display, dir, false, ctx);
     }
 
     fn items(
@@ -262,7 +284,15 @@ fn resolve(m: &syn::ItemMod, file: &Path, dir: &Path, inline: bool) -> Option<Pa
             ]
         }
     };
-    candidates.into_iter().find(|c| c.is_file())
+    candidates
+        .into_iter()
+        .find(|c| c.is_file())
+        .map(|c| canonical(&c))
+}
+
+/// `path` with `..`, `.` and symlinks resolved, or as given when it cannot be.
+fn canonical(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
 /// The directory a file's `mod x;` declarations resolve against.
@@ -327,22 +357,45 @@ fn crate_roots(root: &Path) -> Vec<PathBuf> {
 /// The two selectors the shard script must hold. A rename on one side alone
 /// would let this rule pass tests the filter no longer selects, or select
 /// nothing it should.
+///
+/// Read off the `lane1=` assignment and the line that passes it to nextest,
+/// never off comments: a selector left only in a comment selects nothing.
 fn shard_filter_findings(script: &str) -> Vec<String> {
+    let code: Vec<&str> = script
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#'))
+        .collect();
+    let Some(lane1) = code.iter().find(|l| l.starts_with("lane1=")) else {
+        return vec![format!(
+            "{SHARD_SCRIPT}: assigns no `lane1=` filter — this rule cannot tell what the \
+             shards select"
+        )];
+    };
     let mut out = Vec::new();
     let module = format!("(package(dot-agent-deck) & test(/(^|::){MODULE_PREFIX}[a-z0-9_]*::/))");
     for needle in [module.as_str(), "binary(/^e2e_/)"] {
-        if !script.contains(needle) {
+        if !lane1.contains(needle) {
             out.push(format!(
-                "{SHARD_SCRIPT}: no longer holds `{needle}` — the shards would stop running \
-                 tests this rule counts as selected"
+                "{SHARD_SCRIPT}: its `lane1=` filter no longer holds `{needle}` — the shards \
+                 would stop running tests this rule counts as selected"
             ));
         }
+    }
+    if !code.iter().any(|l| l.contains("-E \"($lane1)")) {
+        out.push(format!(
+            "{SHARD_SCRIPT}: no line passes `-E \"($lane1)…\"` to nextest — the `lane1=` \
+             filter this rule reads is not what the shards run"
+        ));
     }
     out
 }
 
 /// Run the check against `root` (the repository root).
 pub fn run(root: &Path) -> Vec<String> {
+    // Canonical, so every path below — collected, resolved through `#[path]`
+    // or a crate root — is keyed the same way.
+    let root = &canonical(root);
     let mut out = match std::fs::read_to_string(root.join(SHARD_SCRIPT)) {
         Ok(text) => shard_filter_findings(&text),
         Err(e) => vec![format!(
@@ -375,7 +428,7 @@ pub fn run(root: &Path) -> Vec<String> {
         };
         match syn::parse_file(&text) {
             Ok(ast) => {
-                parsed.insert(file, ast);
+                parsed.insert(canonical(&file), Rc::new(ast));
             }
             Err(e) => out.push(format!(
                 "{shown}: does not parse ({e}) — a file this rule cannot read is a failure, \
@@ -393,7 +446,7 @@ pub fn run(root: &Path) -> Vec<String> {
     for crate_root in roots {
         let mut walk = Walk {
             root,
-            parsed: &parsed,
+            parsed: &mut parsed,
             visited: BTreeSet::new(),
             findings: BTreeSet::new(),
             tests_seen: 0,
@@ -439,8 +492,8 @@ mod tests {
         dir
     }
 
-    const SCRIPT: &str =
-        "-E 'binary(/^e2e_/) | (package(dot-agent-deck) & test(/(^|::)e2e_only[a-z0-9_]*::/))'\n";
+    const SCRIPT: &str = "lane1='binary(/^e2e_/) | (package(dot-agent-deck) & test(/(^|::)e2e_only[a-z0-9_]*::/))'\n\
+        exec \"$@\" -E \"($lane1) & not $version\"\n";
 
     fn findings(files: &[(&str, &str)]) -> Vec<String> {
         let mut all = files.to_vec();
@@ -547,9 +600,52 @@ mod tests {
     #[test]
     fn a_shard_script_that_drops_either_selector_is_reported() {
         assert!(shard_filter_findings(SCRIPT).is_empty());
-        let found = shard_filter_findings("-E 'binary(/^e2e_/)'");
+        let found = shard_filter_findings(
+            "lane1='binary(/^e2e_/)'\nexec \"$@\" -E \"($lane1) & not $version\"\n",
+        );
         assert_eq!(found.len(), 1, "{found:?}");
         assert!(found[0].contains("e2e_only"), "{found:?}");
-        assert_eq!(shard_filter_findings("").len(), 2);
+        let none = shard_filter_findings("");
+        assert_eq!(none.len(), 1, "{none:?}");
+        assert!(none[0].contains("no `lane1=`"), "{none:?}");
+    }
+
+    #[test]
+    fn a_parent_relative_path_module_is_checked() {
+        let found = findings(&[
+            ("src/lib.rs", PLAIN),
+            (
+                "src/shared.rs",
+                "#[cfg(feature = \"e2e\")] #[test] fn shared() {}\n",
+            ),
+            (
+                "tests/other.rs",
+                "#[path = \"../src/shared.rs\"]\nmod shared;\n#[test] fn t() {}\n",
+            ),
+        ]);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(
+            found[0].starts_with("src/shared.rs:1: `shared`"),
+            "{found:?}"
+        );
+    }
+
+    #[test]
+    fn a_selector_left_only_in_a_comment_is_reported() {
+        let script = "# binary(/^e2e_/) used to be here\n\
+            lane1='(package(dot-agent-deck) & test(/(^|::)e2e_only[a-z0-9_]*::/))'\n\
+            exec \"$@\" -E \"($lane1)\"\n";
+        let found = shard_filter_findings(script);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("binary(/^e2e_/)"), "{found:?}");
+    }
+
+    #[test]
+    fn a_lane1_filter_nextest_is_not_given_is_reported() {
+        let script = "lane1='binary(/^e2e_/) | (package(dot-agent-deck) & test(/(^|::)e2e_only[a-z0-9_]*::/))'\n\
+            exec \"$@\" -E 'all()'\n";
+        let found = shard_filter_findings(script);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].contains("no line passes"), "{found:?}");
     }
 }
