@@ -152,7 +152,7 @@ A unit closed with `close` disappears from both clients, and a unit closed in a 
 
 ## When something goes wrong
 
-Stopping an agent has a time limit. If its process does not confirm that it exited, the deck reports that the stop could not be confirmed instead of waiting indefinitely; the process may still be running. In the TUI and desktop app, the close error leaves the card available to inspect. With `close`, every pane whose stop is unconfirmed is listed as a survivor, the command exits `1`, and the deck does not report the unit closed or remove its worktree. Check the process and the daemon log, and retry the close if the agent is still listed.
+Stopping an agent has a time limit. If its process does not confirm that it exited, the deck reports that the stop could not be confirmed instead of waiting indefinitely; the process may still be running. In the TUI and desktop app, the close error leaves the card available to inspect. With `close`, every pane whose stop is unconfirmed is listed as a survivor, the command exits `1`, and the deck does not report the unit closed or remove its worktree. Check the process and the daemon log, then retry the same close: the deck keeps the unconfirmed agent's cleanup record so the retry can finish the stop and its cleanup.
 
 | Message | Cause | What to do |
 |---|---|---|

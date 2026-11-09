@@ -3595,7 +3595,7 @@ fn hydration_diagnostics_enabled(value: Option<&std::ffi::OsStr>) -> bool {
 
 fn hydration_registry_snapshot(registry: &AgentPtyRegistry) -> String {
     format!(
-        "registry (record, observed_exited)={:?}",
+        "registry (record, observed_exited, termination_unconfirmed)={:?}",
         registry.agent_records_including_exited()
     )
 }
@@ -3632,7 +3632,7 @@ fn live_017_diagnostic_registry_labels_live_and_retained_exited_records() {
     for (id, observed_exited) in [(&live, false), (&exited, true)] {
         let record = records
             .iter()
-            .find(|(record, _)| &record.id == id)
+            .find(|(record, _, _)| &record.id == id)
             .expect("both diagnostic control records remain registered");
         assert_eq!(record.1, observed_exited, "control exit flag for {id}");
     }
@@ -3640,13 +3640,16 @@ fn live_017_diagnostic_registry_labels_live_and_retained_exited_records() {
     // Stop the children owned by this registry before checking the printed snapshot.
     registry.shutdown_all();
     assert!(
-        snapshot.starts_with("registry (record, observed_exited)="),
+        snapshot.starts_with("registry (record, observed_exited, termination_unconfirmed)="),
         "diagnostic must label the stored exit flag accurately: {snapshot}"
     );
     for (id, observed_exited) in [(&live, false), (&exited, true)] {
-        let (record, _) = records.iter().find(|(record, _)| &record.id == id).unwrap();
+        let (record, _, _) = records
+            .iter()
+            .find(|(record, _, _)| &record.id == id)
+            .unwrap();
         assert!(
-            snapshot.contains(&format!("({record:?}, {observed_exited})")),
+            snapshot.contains(&format!("({record:?}, {observed_exited}, false)")),
             "diagnostic must print id={id} with observed_exited={observed_exited}: {snapshot}"
         );
     }

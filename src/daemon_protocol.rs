@@ -7343,7 +7343,7 @@ async fn handle_connection(
                         let event_tx = event_tx.clone();
                         tokio::spawn(async move {
                             if !crate::issue_dispatch_run::worktree_still_in_use(
-                                &registry.agent_records(),
+                                &registry.agent_records_for_worktree_cleanup(),
                                 &worktree,
                             ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
                                 &worktree_registry,
