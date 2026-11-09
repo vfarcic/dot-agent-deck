@@ -30,6 +30,10 @@ pub const CONFIG_KEYS: &[(&str, &str)] = &[
     ),
     ("bell.on_error", "Bell on agent error (default: true)"),
     (
+        "notifications.question_after_minutes",
+        "Notify once when an agent's question has waited this many minutes; 0 turns it off (default: 10)",
+    ),
+    (
         "doorbell.claude",
         "Type the doorbell into Claude Code and check its input box (default: true)",
     ),
@@ -140,6 +144,36 @@ impl BellConfig {
     }
 }
 
+/// Issue #2075: the `[notifications]` table. `question_after_minutes`: once an
+/// agent's question has waited this long unanswered, the TUI sends one
+/// terminal notification for it; `0` turns that off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    pub question_after_minutes: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            question_after_minutes: 10,
+        }
+    }
+}
+
+impl NotificationsConfig {
+    fn is_default(&self) -> bool {
+        *self == Self::default()
+    }
+
+    /// How long a question waits before its notification, or `None` when
+    /// notifications are off.
+    pub fn question_after(&self) -> Option<chrono::Duration> {
+        let minutes = i64::try_from(self.question_after_minutes).ok()?;
+        (minutes > 0).then(|| chrono::Duration::minutes(minutes))
+    }
+}
+
 /// PRD #1666 part 3: the `[doorbell]` table, one switch per agent the deck
 /// types its doorbell line into. `false` turns the doorbell off for that
 /// agent: the deck types nothing into it and installs no input-box check, and
@@ -198,6 +232,10 @@ pub struct DashboardConfig {
     /// writes no `[doorbell]` table.
     #[serde(skip_serializing_if = "DoorbellConfig::is_default")]
     pub doorbell: DoorbellConfig,
+    /// Issue #2075 ([`NotificationsConfig`]). Not serialised at its default, so
+    /// a `config set` of another key writes no `[notifications]` table.
+    #[serde(skip_serializing_if = "NotificationsConfig::is_default")]
+    pub notifications: NotificationsConfig,
     pub auto_config_prompt: bool,
     /// PRD #1258: the `[host_metrics]` table — the thresholds this deck's
     /// daemon judges its host's disk, memory and load by
@@ -273,6 +311,7 @@ impl Default for DashboardConfig {
             default_dir: String::new(),
             bell: BellConfig::default(),
             doorbell: DoorbellConfig::default(),
+            notifications: NotificationsConfig::default(),
             auto_config_prompt: true,
             host_metrics: toml::Table::new(),
         }
@@ -434,6 +473,9 @@ impl DashboardConfig {
             "bell.on_error" => Ok(self.bell.on_error.to_string()),
             "doorbell.claude" => Ok(self.doorbell.claude.to_string()),
             "doorbell.codex" => Ok(self.doorbell.codex.to_string()),
+            "notifications.question_after_minutes" => {
+                Ok(self.notifications.question_after_minutes.to_string())
+            }
             "auto_config_prompt" => Ok(self.auto_config_prompt.to_string()),
             _ => match host_metrics_key(key) {
                 // The value in effect, so a reader sees the default for an
@@ -493,6 +535,12 @@ impl DashboardConfig {
             }
             "doorbell.codex" => {
                 self.doorbell.codex = parse_bool(value)?;
+                Ok(())
+            }
+            "notifications.question_after_minutes" => {
+                self.notifications.question_after_minutes = value.trim().parse().map_err(|_| {
+                    format!("Invalid {key}: {value:?} (a whole number of minutes; 0 turns it off)")
+                })?;
                 Ok(())
             }
             "auto_config_prompt" => {
@@ -3695,6 +3743,44 @@ timeout_secs = 600
         let parsed: DashboardConfig = toml::from_str("default_dir = \"/srv/x\"").unwrap();
         assert_eq!(parsed.default_dir, "/srv/x");
         assert!(CONFIG_KEYS.iter().any(|(key, _)| *key == "default_dir"));
+    }
+
+    /// Issue #2075: `notifications.question_after_minutes` defaults to 10, takes
+    /// a whole number of minutes, turns the notification off at 0, and is not
+    /// written while it is at its default.
+    #[test]
+    fn question_notification_delay_is_settable_and_zero_turns_it_off() {
+        let mut dc = DashboardConfig::default();
+        let key = "notifications.question_after_minutes";
+        assert_eq!(dc.get_field(key).unwrap(), "10");
+        assert_eq!(
+            dc.notifications.question_after(),
+            Some(chrono::Duration::minutes(10))
+        );
+        assert!(
+            !toml::to_string_pretty(&dc)
+                .unwrap()
+                .contains("notifications")
+        );
+        dc.set_field(key, "25").unwrap();
+        assert_eq!(dc.get_field(key).unwrap(), "25");
+        assert!(
+            toml::to_string_pretty(&dc)
+                .unwrap()
+                .contains("question_after_minutes = 25")
+        );
+        assert!(dc.set_field(key, "ten").is_err());
+        assert!(dc.set_field(key, "-1").is_err());
+        assert_eq!(dc.notifications.question_after_minutes, 25);
+        dc.set_field(key, "0").unwrap();
+        assert_eq!(dc.notifications.question_after(), None);
+        let parsed: DashboardConfig =
+            toml::from_str("[notifications]\nquestion_after_minutes = 3").unwrap();
+        assert_eq!(
+            parsed.notifications.question_after(),
+            Some(chrono::Duration::minutes(3))
+        );
+        assert!(CONFIG_KEYS.iter().any(|(k, _)| *k == key));
     }
 
     /// PRD #1258: the `[host_metrics]` thresholds are kept as written, so a

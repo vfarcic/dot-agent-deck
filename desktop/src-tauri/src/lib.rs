@@ -6665,6 +6665,9 @@ pub fn run() {
         // Issue #1403: the terminal copy chord's clipboard write. The page may
         // only write through it (`capabilities/default.json`).
         .plugin(tauri_plugin_clipboard_manager::init())
+        // Issue #2075: the one notification for a question left unanswered.
+        // The page may only post through it (`capabilities/default.json`).
+        .plugin(tauri_plugin_notification::init())
         // PRD #744: apply the stored zoom before the webview has run any of our
         // JavaScript, so a user at 150% does not watch the app paint at 100%
         // and then jump. That is the whole reason this leg exists Rust-side;

@@ -68,7 +68,7 @@ The desktop app shows five statuses. Each covers one or more of the words the TU
 | Desktop | TUI | Meaning |
 | --- | --- | --- |
 | **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
-| **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane. |
+| **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane, or from the app or by voice when the deck knows the question; its row then shows `QUESTION` and how long it has waited, and the app sends one notification once it has waited 10 minutes ([When a question waits](../session-management.md#when-a-question-waits)). |
 | **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands or subagents it left running keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
 | **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
 | **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |

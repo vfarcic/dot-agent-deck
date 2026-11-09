@@ -228,7 +228,8 @@ pub fn handle_hook(agent: &str) -> ExitCode {
     if !matches!(agent, "opencode" | "codex" | "devin")
         && let Some(held) = claude_held_question(&event, &input)
     {
-        let reply = hold_question(&event, CLAUDE_HOLD_DEADLINE);
+        exit_when_orphaned();
+        let reply = hold_question(&event, Some(CLAUDE_HOLD_DEADLINE));
         if let Some(decision) = reply.as_ref().and_then(|reply| {
             crate::question::claude_decision(
                 &held.question,
@@ -785,20 +786,47 @@ fn send_question_unheld_at(
     UnheldSend::Plain
 }
 
-/// PRD #1631: how long a held Claude Code `PermissionRequest` hook waits for
-/// the daemon — 3570 s, ending 30 s BEFORE the 3600 s `timeout` the deck
-/// installs the hook with
-/// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`]), so the hook
-/// exits on its own before Claude Code cancels it. Either way Claude Code then
-/// behaves as if there were no hook, and its dialog, on screen all along, is
-/// still answerable by keyboard [observed on 2.1.289].
-pub const CLAUDE_HOLD_DEADLINE: std::time::Duration =
-    std::time::Duration::from_secs(crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS - 30);
+/// PRD #1631, issue #2075: how long a held Claude Code `PermissionRequest`
+/// hook waits for the daemon. It ends [`CLAUDE_HOLD_MARGIN`] before the
+/// `timeout` the deck installs the hook with
+/// ([`crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS`], about 24.8
+/// days, the longest Claude Code keeps a hook), so the hook exits on its own
+/// before Claude Code cancels it. Either way Claude Code then behaves as if
+/// there were no hook, and its dialog, on screen all along, is still
+/// answerable by keyboard [observed on 2.1.289].
+pub const CLAUDE_HOLD_DEADLINE: std::time::Duration = std::time::Duration::from_secs(
+    crate::hooks_manage::PERMISSION_REQUEST_HOOK_TIMEOUT_SECS - CLAUDE_HOLD_MARGIN.as_secs(),
+);
 
-/// How long an `await-answer` child waits. The plugin and the extension stop it
-/// as soon as the agent reports the question answered another way, so this is
-/// only a backstop.
-pub const AWAIT_ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Issue #2075: how long before Claude Code's `timeout` the held hook stops
+/// waiting. Thirty seconds was not enough on a loaded Linux host, where every
+/// unanswered hook in 60 days was cancelled at the `timeout` instead; ten
+/// minutes is nothing against a hold of weeks.
+pub const CLAUDE_HOLD_MARGIN: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// Issue #2075: how often a holding producer checks that the agent that started
+/// it is still its parent. A hold no longer expires, so a producer whose agent
+/// died would otherwise keep its hold, and one of the daemon's
+/// `MAX_HELD_QUESTIONS`, for as long as the hold lasts.
+pub const ORPHAN_POLL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Issue #2075: end this process once the process that started it is gone, so
+/// a producer holding a question for an agent that died lets go of it. Unix
+/// only: elsewhere the hold ends when the daemon clears the agent's question.
+fn exit_when_orphaned() {
+    #[cfg(unix)]
+    {
+        let parent = std::os::unix::process::parent_id();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(ORPHAN_POLL);
+                if std::os::unix::process::parent_id() != parent {
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+}
 
 /// What a held Claude Code hook needs to turn the daemon's answer into its
 /// decision: the question, and the payload fields the decision echoes back.
@@ -828,7 +856,8 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
 }
 
 /// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
-/// and wait up to `deadline` for the daemon's reply, falling back to a plain
+/// and wait up to `deadline` for the daemon's reply — with no deadline, until
+/// the daemon replies or the connection closes — falling back to a plain
 /// event when the hold never starts ([`settle_hold`]). `None` when no
 /// [`crate::question::QuestionReply`] came back. That is a missing line — no
 /// daemon, a closed connection, the deadline — or a line that arrived but does
@@ -841,7 +870,7 @@ fn claude_held_question(event: &AgentEvent, raw: &str) -> Option<HeldClaudeQuest
 /// naming another question.
 fn hold_question(
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
 ) -> Option<crate::question::QuestionReply> {
     hold_question_at(&client_socket_path(), event, deadline)
 }
@@ -914,7 +943,7 @@ fn send_plain_at(path: &std::path::Path, event: &AgentEvent) {
 fn hold_question_at(
     path: &std::path::Path,
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
 ) -> Option<crate::question::QuestionReply> {
     hold_question_within_at(path, event, deadline, HOLD_START_WAIT)
 }
@@ -924,7 +953,7 @@ fn hold_question_at(
 fn hold_question_within_at(
     path: &std::path::Path,
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
     start_wait: std::time::Duration,
 ) -> Option<crate::question::QuestionReply> {
     let (end, _) = start_hold_at(path, event, deadline, start_wait, false);
@@ -934,13 +963,14 @@ fn hold_question_within_at(
 /// PRD #1631: send `event` as a held [`crate::event::DaemonMessage::Question`]
 /// that asks the daemon to confirm the hold, and wait for how it ends: up to
 /// `start_wait` for the daemon's first line, then, once it says `held`, up to
-/// `deadline` (counted from the start) for the reply. The connection comes
+/// `deadline` (counted from the start) for the reply, or with no `deadline`
+/// until the reply or the connection's end (issue #2075). The connection comes
 /// back with a reply, so a producer that acknowledges (`ack`) can write its
 /// acknowledgement on it.
 fn start_hold_at(
     path: &std::path::Path,
     event: &AgentEvent,
-    deadline: std::time::Duration,
+    deadline: Option<std::time::Duration>,
     start_wait: std::time::Duration,
     ack: bool,
 ) -> (HoldEnd, Option<crate::platform::ipc::IpcClient>) {
@@ -960,18 +990,19 @@ fn start_hold_at(
         return (HoldEnd::Unstarted, None);
     };
     let started = std::time::Instant::now();
-    let until = started + deadline;
-    let start_by = until.min(started + start_wait);
-    let Ok(mut stream) =
-        crate::platform::ipc::IpcClient::connect_timeout(path, start_wait.min(deadline))
-    else {
+    let until = deadline.map(|deadline| started + deadline);
+    let start_by = until.map_or(started + start_wait, |until| {
+        until.min(started + start_wait)
+    });
+    let first_wait = deadline.map_or(start_wait, |deadline| start_wait.min(deadline));
+    let Ok(mut stream) = crate::platform::ipc::IpcClient::connect_timeout(path, first_wait) else {
         return (HoldEnd::Unstarted, None);
     };
     // No half-close after the write: the daemon reads a held connection for
     // EOF to learn that the producer stopped waiting (Claude Code kills the
     // hook when the keyboard answers No [observed]), so a half-close would
     // read as exactly that the moment the request landed.
-    if stream.set_timeouts(deadline).is_err()
+    if stream.set_timeouts(deadline.unwrap_or(start_wait)).is_err()
         || !matches!(
             write_request_line(&mut stream, format!("{json}\n").as_bytes()),
             RequestWrite::Written
@@ -981,14 +1012,19 @@ fn start_hold_at(
     }
     let mut carry = Vec::new();
     let mut next_reply = |stream: &mut crate::platform::ipc::IpcClient, by| {
-        read_reply_line_carrying(stream, Some(by), &mut carry)
+        read_reply_line_carrying(stream, by, &mut carry)
             .ok()
             .and_then(|line| serde_json::from_str::<QuestionReply>(&line).ok())
     };
-    match next_reply(&mut stream, start_by) {
+    match next_reply(&mut stream, Some(start_by)) {
         Some(reply) if reply.outcome == ReplyOutcome::Held => {}
         Some(reply) => return (HoldEnd::Reply(reply), Some(stream)),
         None => return (HoldEnd::Unstarted, None),
+    }
+    // With no deadline the wait is unbounded, so the per-read timeout the
+    // hold-start read armed must go, or it would end the hold seconds in.
+    if until.is_none() && stream.clear_read_timeout().is_err() {
+        return (HoldEnd::Ended, None);
     }
     match next_reply(&mut stream, until) {
         Some(reply) => (HoldEnd::Reply(reply), Some(stream)),
@@ -1008,6 +1044,9 @@ fn start_hold_at(
 /// With `ack` (the OpenCode plugin) the question is the FIRST line of stdin,
 /// and the answer is acknowledged: see [`opencode_await_answer_acked_at`].
 pub fn handle_await_answer(agent: &str, question_arg: Option<&str>, ack: bool) -> ExitCode {
+    // Issue #2075: the child waits for as long as the question does, so it
+    // must not outlive the plugin or extension that started it.
+    exit_when_orphaned();
     if ack && agent == "opencode" && question_arg.is_none() {
         let mut first = String::new();
         if std::io::stdin().read_line(&mut first).is_ok() && !first.trim().is_empty() {
@@ -1063,7 +1102,7 @@ fn opencode_question_event(
 
 fn opencode_await_answer(raw: &str) -> Option<Value> {
     let (event, question, properties) = opencode_question_event(raw)?;
-    let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
+    let reply = hold_question(&event, None);
     crate::question::opencode_reply(&question, &properties, &reply?)
 }
 
@@ -1120,7 +1159,7 @@ fn opencode_hold_acked_at(
     out: &mut dyn std::io::Write,
     ack_line: impl FnOnce() -> Option<String>,
 ) {
-    let (end, stream) = start_hold_at(path, &event, AWAIT_ANSWER_DEADLINE, HOLD_START_WAIT, true);
+    let (end, stream) = start_hold_at(path, &event, None, HOLD_START_WAIT, true);
     let (Some(reply), Some(mut stream)) = (settle_hold(path, &event, end), stream) else {
         return;
     };
@@ -1169,7 +1208,7 @@ fn pi_await_answer(raw: &str) -> Option<Value> {
         None,
     );
     event.set_question(&question);
-    let reply = hold_question(&event, AWAIT_ANSWER_DEADLINE);
+    let reply = hold_question(&event, None);
     crate::question::pi_value(&dialog, &question, &reply?)
 }
 
@@ -6891,7 +6930,7 @@ mod question_tests {
         let decision = |answers: &[(u32, &[u32], Option<&str>)]| {
             let reply = QuestionReply::answered(&q.id, resolved(&q, answers));
             let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&reply).unwrap()));
-            let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10));
+            let got = hold_question_at(&path, &event, Some(std::time::Duration::from_secs(10)));
             let sent: Value = serde_json::from_str(&server.join().unwrap()).unwrap();
             assert_eq!(sent["message_type"], "question");
             assert_eq!(sent["hold"], true);
@@ -6924,7 +6963,8 @@ mod question_tests {
         let reply =
             QuestionReply::answered(&q.id, resolved(&q, &[(0, &[2], None), (1, &[1, 3], None)]));
         let (_dir, path, server) = stub_daemon(Some(serde_json::to_string(&reply).unwrap()));
-        let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10)).unwrap();
+        let got =
+            hold_question_at(&path, &event, Some(std::time::Duration::from_secs(10))).unwrap();
         server.join().unwrap();
         let decision =
             crate::question::claude_decision(&q, form.get("tool_input"), None, &got).unwrap();
@@ -6962,7 +7002,7 @@ mod question_tests {
         let (event, q) = held_event(&payload);
         let decide = |reply: Option<String>| {
             let (_dir, path, server) = stub_daemon(reply);
-            let got = hold_question_at(&path, &event, std::time::Duration::from_secs(10));
+            let got = hold_question_at(&path, &event, Some(std::time::Duration::from_secs(10)));
             server.join().unwrap();
             got.and_then(|reply| {
                 crate::question::claude_decision(&q, payload.get("tool_input"), None, &reply)
@@ -6983,7 +7023,7 @@ mod question_tests {
             hold_question_at(
                 &missing.path().join("absent.sock"),
                 &event,
-                std::time::Duration::from_secs(2)
+                Some(std::time::Duration::from_secs(2))
             )
             .is_none()
         );
@@ -7055,7 +7095,7 @@ mod question_tests {
                 (serde_json::from_str::<Value>(&sent).unwrap(), plain)
             });
             let started = Instant::now();
-            let got = hold_question_within_at(&path, &event, DEADLINE, START_WAIT);
+            let got = hold_question_within_at(&path, &event, Some(DEADLINE), START_WAIT);
             let took = started.elapsed();
             returned.send(()).unwrap();
             let (sent, plain) = server.join().unwrap();
@@ -7095,6 +7135,98 @@ mod question_tests {
             plain.is_none(),
             "a question the daemon held is already on the card: {plain:?}"
         );
+    }
+
+    /// Scenario: A held Claude Code `AskUserQuestion` hook meets a daemon that
+    /// says it holds the question and then says nothing more, as the daemon
+    /// does while nobody answers. With a deadline, as Claude Code's hook has,
+    /// the hook stops waiting at it and closes the connection, so it exits
+    /// before Claude Code's hook `timeout` cancels it; that deadline, weeks
+    /// long, is one the socket accepts. With no deadline, as an `await-answer`
+    /// child has, the hook is still waiting long after the hold-start read's
+    /// timeout, and the answer the daemon sends then is the one it acts on
+    /// (issue #2075).
+    #[cfg(unix)]
+    #[spec("question/hold/025")]
+    #[test]
+    fn question_hold_025_an_unanswered_hold_waits_until_its_deadline_or_its_answer() {
+        use std::io::{BufRead as _, Read as _};
+        use std::time::{Duration, Instant};
+        const START_WAIT: Duration = Duration::from_millis(500);
+        const DEADLINE: Duration = Duration::from_secs(2);
+        let payload = fixture("claude-ask-user-question-form.json");
+        let (event, q) = held_event(&payload);
+        let held = serde_json::to_string(&QuestionReply::held(&q.id)).unwrap();
+        // `answer_after`: write the reply that long after `held`, or never.
+        let run = |deadline: Option<Duration>, answer_after: Option<Duration>| {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("hook.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+            let held = held.clone();
+            let released = serde_json::to_string(&QuestionReply::released(
+                &q.id,
+                ReleaseReason::AnsweredElsewhere,
+            ))
+            .unwrap();
+            let server = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                let mut reader = std::io::BufReader::new(stream);
+                let mut sent = String::new();
+                reader.read_line(&mut sent).unwrap();
+                writeln!(reader.get_mut(), "{held}").unwrap();
+                if let Some(after) = answer_after {
+                    std::thread::sleep(after);
+                    writeln!(reader.get_mut(), "{released}").unwrap();
+                }
+                // The hook ending its wait is an EOF.
+                let mut rest = Vec::new();
+                let _ = reader.read_to_end(&mut rest);
+                let eof_at = Instant::now();
+                listener.set_nonblocking(true).unwrap();
+                (eof_at, listener.accept().is_ok())
+            });
+            let started = Instant::now();
+            let got = hold_question_within_at(&path, &event, deadline, START_WAIT);
+            let took = started.elapsed();
+            let (eof_at, plain_sent) = server.join().unwrap();
+            assert!(
+                !plain_sent,
+                "a question the daemon held is already on the card"
+            );
+            (got, took, eof_at.duration_since(started))
+        };
+
+        let (got, took, eof) = run(Some(DEADLINE), None);
+        assert_eq!(got, None, "no decision for an unanswered question");
+        assert!(
+            took >= DEADLINE && took < DEADLINE + Duration::from_secs(1),
+            "the hook stopped waiting after {took:?}, not at its {DEADLINE:?} deadline"
+        );
+        assert!(
+            eof < DEADLINE + Duration::from_secs(1),
+            "the daemon saw the held connection close only after {eof:?}"
+        );
+
+        // No deadline: still waiting four hold-start bounds after `held`, so
+        // the reply sent then is received rather than the hold ending early.
+        let late = START_WAIT * 4;
+        let (got, took, _) = run(None, Some(late));
+        assert_eq!(
+            got.map(|reply| reply.outcome),
+            Some(crate::question::ReplyOutcome::Released),
+            "a hold with no deadline ended before the daemon's reply {late:?} in"
+        );
+        assert!(took >= late, "the reply came back after only {took:?}");
+
+        // Claude Code's real deadline is one the socket takes as a timeout:
+        // a refusal there would turn every held question into a plain one.
+        let (client, _server) = std::os::unix::net::UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(CLAUDE_HOLD_DEADLINE))
+            .expect("the socket takes Claude Code's hold deadline as a read timeout");
+        client
+            .set_write_timeout(Some(CLAUDE_HOLD_DEADLINE))
+            .expect("the socket takes Claude Code's hold deadline as a write timeout");
     }
 
     /// Scenario: Claude Code's captured Bash `PermissionRequest` names no call,

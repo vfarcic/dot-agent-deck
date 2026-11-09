@@ -98,8 +98,8 @@ describe("SettingsSheet section column", () => {
     // is pinned so adding a section is a deliberate edit here rather than a
     // silent one. PRD #802 M4's Voice row took it to four, and this line is
     // that deliberate edit. PRD #1401's GitHub row (Sign out of GitHub) took
-    // it to five.
-    expect(SETTINGS_SECTIONS).toHaveLength(5);
+    // it to five, and issue #2075's Notifications row to six.
+    expect(SETTINGS_SECTIONS).toHaveLength(6);
     renderSheet();
     expect(screen.getByTestId("settings-layout")).not.toHaveClass("is-single");
     expect(screen.getByRole("navigation", { name: "Settings sections" })).toBeVisible();

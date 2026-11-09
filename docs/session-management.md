@@ -49,6 +49,28 @@ The first five statuses come from each agent's hooks, plugin or extension, and h
 - OpenCode reaching Anthropic through an Anthropic "credit balance is too low" error does not turn the card Blocked; that error carries no marker the deck can read.
 - Where a subagent is told apart: when a subagent's permission prompt is settled — it is allowed and the call it asked about finishes, the subagent stops or fails without it being answered, or, for OpenCode, it is answered either way — the card goes back to Idle if the main agent's turn had ended, or to Thinking if it is still running. An OpenCode subagent's question is told apart the same way, and is settled when it is answered or dismissed, or when the subagent stops. While the main agent's own prompt or another subagent's is also waiting, the card stays on **Needs Input**, and another subagent finishing a tool call does not answer it.
 
+### When a question waits
+
+When an agent asks a question the deck knows about (a permission prompt, a menu or a form; see the table above), you can answer it from the deck for as long as it waits, whether that is a minute or the next morning: in the agent's pane, from the desktop app, or [by voice](desktop/voice.md#answering-an-agents-question).
+
+While it waits, both clients show it and remind you once:
+
+- The TUI card ends its title with `QUESTION` and how long the question has waited, for example `QUESTION 12m`. A card too narrow for it shows the badge on a row of its own. The desktop app's tile shows the same badge.
+- Once a question has waited 10 minutes, the deck sends one notification for it, titled `Question waiting 10m`, naming the agent and its question. It does not repeat for that question, and a question answered sooner sends none.
+
+To change the wait, or turn the notification off:
+
+- **TUI:** `dot-agent-deck config set notifications.question_after_minutes 30`; `0` turns it off. The TUI sends the notification to your terminal as an OSC 9 notification, which terminals such as iTerm2, WezTerm and Ghostty show as a system notification. A terminal that doesn't support it, or tmux unless it passes the sequence through, shows nothing, and the card's badge is then what tells you.
+- **Desktop app:** **Settings → Notifications**, under "Notify when a question waits": 5, 10, 15, 30 or 60 minutes, or **Off**. It is stored in `desktop.toml` as `notify` under `[questions]`, in minutes, with `0` for off.
+
+Each client has its own setting and sends its own notification, so with both open you get one from each. Restarting the TUI or the desktop app can send a still-waiting question's notification once more.
+
+Limits:
+
+- **Claude Code:** the deck can answer a question for about 24 days of waiting, the longest Claude Code keeps the deck's hook running; after that, answer it in Claude Code's pane. After upgrading the deck, restart the daemon or run `dot-agent-deck hooks install` so Claude Code's hook gets the longer wait.
+- **Codex, OpenCode and Pi:** the deck sets no limit; it answers the question whenever you do.
+- **More than 64 questions waiting at once:** a question past that number still shows **Needs Input**, without the badge or the notification, and is answered in the agent's pane.
+
 ### Work left running after a turn
 
 An agent can end its turn and leave something running: a command it started in the background (a dev server, a long build, a `sleep`), or a subagent that keeps working after the main agent has answered. The card then reads **Idle**, because the agent is waiting for its next prompt, and a line under it says what is still running and for how long:
@@ -103,7 +125,7 @@ When the deck cannot tell whether a Claude Code, OpenCode or Pi agent got a mess
 
 *This section is about the TUI. The desktop app's rows and columns are described on [Desktop app → Dashboard](desktop/dashboard.md#rows-and-columns).*
 
-- **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), and on the right an animated dot and the status. The inbox line (`✉2 queued`, `✉ delivered`) follows the status while the whole title still fits beside it; see [Message delivery](#message-delivery) for where it goes otherwise.
+- **Title row**: the card number, the agent type, the pane's display name (or the session id if it has none), `QUESTION` and its age while the agent waits on a question ([When a question waits](#when-a-question-waits)), and on the right an animated dot and the status. The inbox line (`✉2 queued`, `✉ delivered`) follows the status while the whole title still fits beside it; see [Message delivery](#message-delivery) for where it goes otherwise.
 - **`Dir:`**: the basename of the working directory, shortened with `…` when it does not fit, including to leave room for the inbox line at the right end of the row when that line has moved here.
 - **`Background:`**: commands and subagents the agent left running after its turn ended, and for how long; see [Work left running after a turn](#work-left-running-after-a-turn).
 - **`Prmt:`**: the most recent prompt or prompts.

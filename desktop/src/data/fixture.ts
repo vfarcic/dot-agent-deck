@@ -859,6 +859,9 @@ export const DOCS_PENDING_QUESTION: PendingQuestionDto = {
   }],
   tool: { name: "Bash", detail: DOCS_QUESTION_COMMAND },
   answerable: true,
+  // Issue #2075: asked twelve minutes before the page loads, so the tile's
+  // badge reads `QUESTION 12m`.
+  raisedAtMs: Date.now() - 12 * 60 * 1000,
 };
 const docsQuestionAgents: AgentSession[] = docsAgents.map((agent) =>
   agent.id === "2"

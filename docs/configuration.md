@@ -100,6 +100,7 @@ A change applies to agents started after it, in the TUI and the desktop app alik
 | `bell.on_waiting_for_input` | boolean | `true` | Bell on waiting for input |
 | `bell.on_idle` | boolean | `false` | Bell on idle |
 | `bell.on_error` | boolean | `true` | Bell on error or blocked |
+| `notifications.question_after_minutes` | integer | `10` | Minutes an agent's question waits before the TUI's one [notification](session-management.md#when-a-question-waits) for it; `0` turns it off |
 | `doorbell.claude` | boolean | `true` | [Doorbell and input-box check](#turn-the-doorbell-off-for-claude-code-or-codex) for Claude Code |
 | `doorbell.codex` | boolean | `true` | [Doorbell](#turn-the-doorbell-off-for-claude-code-or-codex) for Codex |
 
@@ -119,6 +120,9 @@ on_error = true
 [doorbell]
 claude = true
 codex = true
+
+[notifications]
+question_after_minutes = 10
 ```
 
 `config set` rewrites the whole file from the keys above, so comments and any other keys are removed. If the file does not parse, the TUI and `config` print `Invalid config at <path>: <error>` and use the defaults, and a `config set` then replaces the unparseable file with the defaults plus the key you set. Fix a parse error by hand before running `config set`. While the file can't be used, the daemon also holds the doorbell off for both Claude Code and Codex for the agents it starts, rather than turning it on by default ([`turned_off`](troubleshooting.md#a-card-says-waiting-for-the-agent-to-fetch-it-send-it-a-prompt)). That includes a `config.toml` that is a link to a file that is no longer there, for example one that was moved or is on a drive that isn't mounted. For such a link, `config get` prints the default value, and `config set` keeps the link and writes a new file at its target with the defaults plus the key you set, or fails if the target's folder is gone too. Put the file back, or point the link at it, before running `config set`.

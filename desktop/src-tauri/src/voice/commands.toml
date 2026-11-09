@@ -562,8 +562,9 @@ whole_while = "new_agent_dialog"
 [[commands]]
 id          = "open_settings"
 description = """Open the app's Settings sheet: appearance, the daemons this app connects to, voice,
-and zoom. Use when the user asks for settings, preferences, options, configuration, or asks where
-to change how the app looks, where to add or edit a daemon (or deck), or where to put an API key. This only
+zoom, and notifications. Use when the user asks for settings, preferences, options, configuration, or asks where
+to change how the app looks, where to add or edit a daemon (or deck), where to put an API key, or when
+the app notifies them about a question an agent is waiting on. This only
 opens the sheet — it changes no setting by itself."""
 invoke      = "openSettings"
 screens     = ["deck", "overview"]
