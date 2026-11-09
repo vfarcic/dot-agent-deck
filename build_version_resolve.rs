@@ -255,8 +255,8 @@ pub fn build_needs_git(version_source: VersionSource, injected_build_id: Option<
 /// `rerun-if-changed` path as changed on *every* build, so a clone without
 /// `packed-refs` (the RWX sandbox's) rebuilt the root crate on every command.
 /// A missing branch ref file is the one exception: `build.rs` watches the
-/// directory it will appear in, so its creation by a commit or a reset is
-/// caught even without a reflog.
+/// nearest existing directory of [`ref_ancestor_dirs`], so its creation by a
+/// commit or a reset is caught even without a reflog.
 pub fn git_watch_names(head_ref: Option<&str>) -> Vec<String> {
     let mut names: Vec<String> = ["HEAD", "logs/HEAD", "index", "packed-refs"]
         .into_iter()
@@ -264,4 +264,17 @@ pub fn git_watch_names(head_ref: Option<&str>) -> Vec<String> {
         .collect();
     names.extend(head_ref.map(String::from));
     names
+}
+
+/// The directories a missing loose ref file `ref_path` (`refs/heads/a/b`)
+/// would be created in, nearest first, down to and including its namespace
+/// (`refs/heads`), never above it: `build.rs` watches the first that exists
+/// (issue #2072), and a directory above the namespace would be `refs/` or the
+/// git dir itself, whose scan reaches every ref or every object.
+pub fn ref_ancestor_dirs(ref_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = ref_path.split('/').filter(|p| !p.is_empty()).collect();
+    (2..parts.len())
+        .rev()
+        .map(|n| parts[..n].join("/"))
+        .collect()
 }

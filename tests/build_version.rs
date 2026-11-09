@@ -15,8 +15,8 @@ mod build_version_resolve;
 
 use build_version_resolve::{
     VersionSource, build_needs_git, escape_for_cargo_warning, git_watch_names,
-    is_single_line_directive_value, normalize_build_id, normalize_version, resolve_build_id,
-    resolve_version,
+    is_single_line_directive_value, normalize_build_id, normalize_version, ref_ancestor_dirs,
+    resolve_build_id, resolve_version,
 };
 
 /// The `Cargo.toml` placeholder, i.e. what a source build wrongly reported
@@ -340,4 +340,19 @@ fn git_watch_names_cover_head_reflog_index_packed_refs_and_the_branch_ref() {
         git_watch_names(None),
         ["HEAD", "logs/HEAD", "index", "packed-refs"]
     );
+}
+
+/// Issue #2072 (PR #2177 review): a nested branch whose loose ref file and its
+/// own directory are both missing still gets a watch, on the nearest existing
+/// ancestor. The candidates run nearest first and stop at the ref namespace,
+/// never `refs/` or the git dir.
+#[test]
+fn ref_ancestor_dirs_run_nearest_first_and_stop_at_the_namespace() {
+    assert_eq!(
+        ref_ancestor_dirs("refs/heads/agent/team/x"),
+        ["refs/heads/agent/team", "refs/heads/agent", "refs/heads"]
+    );
+    assert_eq!(ref_ancestor_dirs("refs/heads/main"), ["refs/heads"]);
+    assert!(ref_ancestor_dirs("refs/heads").is_empty());
+    assert!(ref_ancestor_dirs("HEAD").is_empty());
 }
