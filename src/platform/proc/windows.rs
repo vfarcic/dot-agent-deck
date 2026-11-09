@@ -15,7 +15,7 @@
 //! reaps the whole tree atomically. That is the unconditional backstop —
 //! the `killpg(SIGKILL)` equivalent — and it is what makes
 //! [`force_kill_child_and_wait`] and the last phase of
-//! [`terminate_child_with_grace_and_wait`] leak-free.
+//! [`terminate_child_with_grace_and_reap`] tear down the job's descendants too.
 //!
 //! Two consequences of "job membership is inherited forward only" are load-bearing
 //! and easy to get wrong, so both are pinned by tests and spelled out where they
@@ -29,7 +29,7 @@
 //!   reap. A ConPTY child that exits while its own descendants keep running is
 //!   ordinary (a shell wrapper whose tool process outlives it), so a teardown that
 //!   short-circuits on "the direct child is gone" leaks exactly the tree the job
-//!   exists to reap — see phase 3 of [`terminate_child_with_grace_and_wait`].
+//!   exists to reap — see phase 3 of [`terminate_child_with_grace_and_reap`].
 //!
 //! ## The graceful window is explicitly best-effort (v1 documented difference)
 //!
@@ -53,7 +53,7 @@
 //!    and does *not* pass `CREATE_NEW_PROCESS_GROUP`, so the agent's pid is not a
 //!    process-group id and the call is rejected as such.
 //!
-//! So the grace window in [`terminate_child_with_grace_and_wait`] is honest about
+//! So the grace window in [`terminate_child_with_grace_and_reap`] is honest about
 //! what it is: we *ask* (cheap, occasionally effective — e.g. a console-hosted
 //! registry whose child did get its own group), then we poll `try_wait` for the
 //! same grace budget the Unix path uses so a self-exiting agent is never
@@ -410,7 +410,8 @@ pub fn force_kill_child_group(
 
 /// Best-effort-graceful-then-force teardown used by the single-pane Ctrl+W path:
 /// ask with `CTRL_BREAK_EVENT`, poll `try_wait` until the child exits or `grace`
-/// elapses, then `TerminateJobObject` as the unconditional backstop and reap.
+/// elapses, then `TerminateJobObject` as the unconditional backstop and poll
+/// for at most `reap_budget` more. An unconfirmed exit is an error.
 ///
 /// Structurally identical to the Unix `SIGTERM` → poll → `SIGKILL` sequence
 /// (same 50 ms poll cadence, same "an early exiter is not penalised by the
@@ -427,28 +428,17 @@ pub fn force_kill_child_group(
 /// that spawns a tool process and exits (a shell wrapper, a launcher, `cmd /c`)
 /// leaves that tool process running *inside the job*, and nothing else will ever
 /// reap it. So an exited child still gets a `TerminateJobObject`.
-pub fn terminate_child_with_grace_and_wait(
+pub fn terminate_child_with_grace_and_reap(
     child: &mut Box<dyn portable_pty::Child + Send + Sync>,
     grace: Duration,
+    reap_budget: Duration,
     group: &AgentProcessGroup,
-) {
+) -> std::io::Result<()> {
     // Phase 1: ask the agent's process group to stop.
     best_effort_ctrl_break(child.process_id(), "graceful-close-ctrl-break");
 
     // Phase 2: poll `try_wait` until the child exits or the grace elapses.
-    let deadline = std::time::Instant::now() + grace;
-    let mut child_exited = false;
-    while std::time::Instant::now() < deadline {
-        match child.try_wait() {
-            Ok(Some(_)) => {
-                child_exited = true;
-                break;
-            }
-            Ok(None) => {}
-            Err(_) => break,
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let child_exited = matches!(super::poll_child_exit(child, grace), Ok(true));
 
     // Phase 3: guaranteed backstop — reaches survivors *and* descendants
     // regardless of whether anything honoured the CTRL_BREAK.
@@ -459,10 +449,10 @@ pub fn terminate_child_with_grace_and_wait(
         // terminated. `terminate_tree` is a no-op-safe call on a job whose
         // processes have all exited.
         group.terminate_tree("graceful-close-terminate-job-after-child-exit");
-        return;
+        return Ok(());
     }
-    reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
-    let _ = child.wait();
+    let kill_reported_ok = reap_tree_or_fallback(child, group, "graceful-close-terminate-job");
+    super::reap_after_force_kill(child, reap_budget, kill_reported_ok)
 }
 
 /// The daemon-wide `shutdown_all_graceful` "SIGTERM phase" for one agent: ask
@@ -1040,7 +1030,13 @@ mod tests {
 
         let mut child: Box<dyn portable_pty::Child + Send + Sync> =
             Box::new(crate::platform::proc::test_child::StdChild(doomed));
-        terminate_child_with_grace_and_wait(&mut child, Duration::from_secs(3), &group);
+        terminate_child_with_grace_and_reap(
+            &mut child,
+            Duration::from_secs(3),
+            Duration::from_secs(1),
+            &group,
+        )
+        .unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         let mut reaped = false;

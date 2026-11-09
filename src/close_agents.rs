@@ -2465,6 +2465,206 @@ mod tests {
         deck.shutdown().await;
     }
 
+    /// A child modelling an exit stuck in kernel I/O. Releasing the guard also
+    /// unblocks a regressed blocking wait, including when an assertion unwinds.
+    #[derive(Debug, Clone, Default)]
+    struct UnreapableChild(Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>);
+
+    impl portable_pty::ChildKiller for UnreapableChild {
+        fn kill(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(self.clone())
+        }
+    }
+
+    impl portable_pty::Child for UnreapableChild {
+        fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+            Ok((*self.0.0.lock().unwrap()).then(|| portable_pty::ExitStatus::with_exit_code(0)))
+        }
+
+        fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+            let mut released = self.0.0.lock().unwrap();
+            while !*released {
+                released = self.0.1.wait(released).unwrap();
+            }
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
+
+    struct ReleaseChild(UnreapableChild);
+
+    impl Drop for ReleaseChild {
+        fn drop(&mut self) {
+            *self.0.0.0.lock().unwrap() = true;
+            self.0.0.1.notify_all();
+        }
+    }
+
+    async fn unreapable_member_finishes(scope: &str) {
+        let deck = Deck::new().await;
+        let child = UnreapableChild::default();
+        let release = ReleaseChild(child.clone());
+        let pane = "stuck-pane";
+        let instance = "stuck-instance";
+        let agent =
+            deck.registry
+                .insert_member_child_for_test(pane, instance, false, Box::new(child));
+        let exited = deck.registry.subscribe(&agent).unwrap().exited;
+        let unit = if scope == "instance" {
+            // The reapable sibling is the control: it closes, and the failed
+            // member must remain listed rather than making the unit look gone.
+            let sibling = deck
+                .registry
+                .insert_idle_member_for_test("prompt-pane", instance, true);
+            deck.orch_unit(
+                "stuck-unit",
+                ("disp", "nobody"),
+                instance,
+                "prompt-pane",
+                &sibling,
+            )
+        } else {
+            deck.single_unit("stuck-unit", ("disp", "nobody"), pane, &agent)
+        };
+        let started = std::time::Instant::now();
+        let reply = tokio::time::timeout(Duration::from_secs(7), async {
+            if scope == "stop" {
+                let error = deck
+                    .client
+                    .stop_agent(&agent)
+                    .await
+                    .expect_err("unconfirmed exit is not success");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("termination could not be confirmed"),
+                    "{error}"
+                );
+            } else {
+                let report = deck.close(by_name("stuck-unit"), None, true, false).await;
+                let target = &report.targets[0];
+                assert_eq!(
+                    target.outcome,
+                    if scope == "instance" {
+                        CloseOutcome::PartiallyClosed
+                    } else {
+                        CloseOutcome::Failed
+                    },
+                    "{target:?}"
+                );
+                assert_eq!(target.survivors, [pane]);
+                assert!(
+                    target
+                        .error
+                        .as_deref()
+                        .unwrap()
+                        .contains("termination could not be confirmed"),
+                    "{target:?}"
+                );
+                assert_eq!(
+                    target
+                        .panes
+                        .iter()
+                        .find(|p| p.agent_id == agent)
+                        .unwrap()
+                        .stopped,
+                    Some(false)
+                );
+            }
+        })
+        .await;
+        assert!(
+            reply.is_ok(),
+            "{scope} waited indefinitely for an unreapable child"
+        );
+        assert!(
+            started.elapsed()
+                >= crate::agent_pty::AGENT_TERMINATE_GRACE + crate::agent_pty::FORCE_REAP_DEADLINE,
+            "give a slow exit its full grace and force-reap windows"
+        );
+        assert!(
+            deck.registry.agent_record_any(&agent).is_some(),
+            "retain the survivor for retry"
+        );
+        assert!(
+            deck.registry.dispatched_units().get(&unit).is_some(),
+            "the survivor's unit is still open"
+        );
+        assert_ne!(
+            deck.registry.dispatched_units().get(&unit).unwrap().state,
+            crate::dispatched_units::UnitState::Closing,
+            "a failed close must be retryable"
+        );
+        assert!(!deck.registry.is_instance_closing(instance));
+        assert!(!deck.registry.is_pane_closing(pane));
+        assert!(!deck.registry.pane_close_in_flight(pane));
+        let generation = deck
+            .registry
+            .begin_generation_close(&agent)
+            .expect("generation admission released");
+        drop(generation);
+
+        // Simulate reader EOF while the child is still unreapable, then admit
+        // a real successor before releasing that child. The late retry names
+        // the old generation and must leave the successor's role and PTY alive.
+        exited.store(true, std::sync::atomic::Ordering::SeqCst);
+        let successor = deck
+            .start(pane, "cat", Some((instance, "successor", true)))
+            .await;
+        drop(release);
+        deck.client
+            .stop_agent(&agent)
+            .await
+            .expect("reapable retry");
+        assert_eq!(
+            deck.registry.pane_current_agent_id(pane).as_deref(),
+            Some(successor.as_str())
+        );
+        assert!(deck.live(&successor));
+        assert!(
+            deck.state.read().await.pane_role_map.contains_key(pane),
+            "late cleanup must not unregister the successor"
+        );
+        deck.client
+            .stop_agent(&successor)
+            .await
+            .expect("ordinary stop control");
+        deck.shutdown().await;
+    }
+
+    /// Scenario: a StopAgent whose child cannot be reaped returns a failure,
+    /// releases its pane hold, and a late reap leaves a successor intact.
+    #[tokio::test]
+    async fn stop_agent_finishes_with_an_unreapable_child() {
+        unreapable_member_finishes("stop").await;
+    }
+
+    /// Scenario: a single-unit close reports its unreapable child as a survivor
+    /// and releases the generation admission gate for a later close.
+    #[tokio::test]
+    async fn single_close_finishes_with_an_unreapable_child() {
+        unreapable_member_finishes("single").await;
+    }
+
+    /// Scenario: a whole-instance close stops a reapable sibling, reports the
+    /// stuck child as a survivor, and allows a successor into the instance.
+    #[tokio::test]
+    async fn instance_close_finishes_with_an_unreapable_child() {
+        unreapable_member_finishes("instance").await;
+    }
+
     /// Scenario: closing an orchestration whose second role's stop fails. The
     /// report says partially-closed and names the survivor; it is never
     /// reported closed, and the unit stays recorded with its survivor.

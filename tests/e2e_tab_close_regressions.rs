@@ -294,7 +294,9 @@ async fn handle_connection(
                 StopScript::FailOnce { agent_id } if agent_id == &id
             ) && fail_pending.swap(false, Ordering::SeqCst);
             let response = if fail_this_attempt {
-                AttachResponse::err(format!("permission denied while stopping {id}"))
+                AttachResponse::err(format!(
+                    "Agent {id}: termination could not be confirmed: timed out waiting for the child to exit"
+                ))
             } else if matches!(
                 stop_script,
                 StopScript::AlreadyGone | StopScript::DoneUnverified
@@ -438,7 +440,7 @@ fn handshake_012_hydration_refuses_panes_after_the_startup_check() {
     );
 }
 
-/// Scenario: Hydrate a two-role orchestration whose worker refuses its first stop, then confirm its close. The tab and failed role must remain with a retry status while the successful role disappears; a second close removes the retained tab.
+/// Scenario: Hydrate a two-role orchestration whose worker's first stop reports that termination could not be confirmed, then confirm its close. The tab and failed role must remain with a retry status while the successful role disappears; a second close removes the retained tab.
 #[spec("lifecycle/stop/017")]
 #[test]
 fn stop_017_partial_tab_close_is_retained_and_retryable() {

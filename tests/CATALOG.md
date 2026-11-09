@@ -331,7 +331,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### dashboard/pane/002 — Closing a pane via `Ctrl+w` removes its card from the dashboard.
 - **Layer:** L2.
 - **Agent:** none.
-- **Asserts:** Ctrl+W opens the close confirmation; navigating from default Cancel to Close and confirming removes the card, and the focused card index stays within bounds.
+- **Asserts:** Ctrl+W opens the close confirmation; navigating from default Cancel to Close and confirming removes the card, and the focused card index stays within bounds. The real-binary close covers both a cooperative child and a child ignoring SIGTERM that needs the force-kill backstop.
 - **Does not assert:** which card receives focus next (`dashboard/selection/*` covers selection-after-close).
 - **Platform coverage:** mac+linux.
 
@@ -3307,9 +3307,10 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 ##### lifecycle/stop/017 — A partially failed tab close stays visible and succeeds on retry.
 - **Layer:** L2 (real-binary PTY against a protocol-faithful scripted daemon).
-- **Agent:** none (a hydrated two-role orchestration; the worker's first StopAgent is denied and its retry succeeds).
+- **Agent:** none (a hydrated two-role orchestration; the worker's first StopAgent reports unconfirmed termination and its retry succeeds).
 - **Asserts:** the first confirmed whole-tab close removes the successful pane, retains the failed pane and its tab/`×`, and renders that the tab was kept; after switching into the retained tab, a second confirmed close removes the failed pane, daemon record, and tab.
 - **Does not assert:** an exact count of `close_pane` calls; the observable retry outcome is the contract.
+- **Daemon coverage:** `src/close_agents.rs`'s `*_finishes_with_an_unreapable_child` tests drive StopAgent, single-unit close and whole-instance close over the attach socket with a releasable child whose nonblocking wait stays pending and whose blocking wait blocks. They require a bounded failure or partial result, a retained survivor, released admission and cleanup holds, and a later reap that leaves a real successor's role and agent intact. They model stuck I/O rather than inducing an OS process in that state.
 - **Platform coverage:** mac+linux.
 
 ##### lifecycle/stop/018 — Already-gone and unverified-success panes do not block whole-tab removal.

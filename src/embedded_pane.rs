@@ -2948,18 +2948,17 @@ const CREATE_PANE_ATTACH_TIMEOUT: Duration = Duration::from_secs(3);
 /// that errored).
 const CREATE_PANE_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// PRD #92 F8 — bounded wait for the Ctrl+W `stop-agent` RPC. The
-/// daemon's `close_agent` path now does a SIGTERM-with-grace before
-/// SIGKILL (`AGENT_TERMINATE_GRACE = 3 s` in `src/agent_pty.rs`), so
-/// the RPC can take up to ~3 s in the worst case (uncooperative agent
-/// that ignores SIGTERM). Pre-F8 the Ctrl+W path reused
-/// `CREATE_PANE_STOP_TIMEOUT` (2 s); that's now too tight — a SIGTERM-
-/// ignoring agent would trip the controller timeout before the
-/// daemon-side SIGKILL fallback fired. 5 s = 3 s F8 grace + 2 s
-/// buffer for SIGKILL delivery, child reap, and RPC round-trip on a
-/// loaded system. Anything longer is a real daemon hang and the user
-/// gets the "stop-agent timed out" error message with a retry hint.
+/// Bounded wait for the Ctrl+W `stop-agent` RPC. Leave room for the daemon's
+/// termination grace, its force-reap deadline and the reply. A stop that takes
+/// longer (including scheduling or transport delays) gets a retryable timeout.
 const CTRL_W_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+const _: () = assert!(
+    crate::agent_pty::AGENT_TERMINATE_GRACE.as_millis()
+        + crate::agent_pty::FORCE_REAP_DEADLINE.as_millis()
+        < CTRL_W_STOP_TIMEOUT.as_millis(),
+    "the stop RPC must allow the daemon to report an unconfirmed termination"
+);
 
 /// PRD #241 M2: is this `stop-agent` failure the daemon telling us that
 /// **this exact agent id** is already gone?

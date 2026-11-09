@@ -50,6 +50,68 @@ pub use scan::{
     fill_command_lines, qualifying_command_sessions, shell_tool_candidates,
 };
 
+/// Poll a child's exit without entering `Child::wait`, which can remain blocked
+/// after a force-kill when the kernel has not finished the child's I/O.
+fn poll_child_exit(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    budget: std::time::Duration,
+) -> std::io::Result<bool> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(remaining.min(std::time::Duration::from_millis(50)));
+    }
+}
+
+/// A force-kill is not an exit receipt. Keep the signal outcome in a failed
+/// reap's reason so callers can distinguish a stuck exit from a failed signal.
+fn reap_after_force_kill(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    budget: std::time::Duration,
+    kill_reported_ok: bool,
+) -> std::io::Result<()> {
+    let error = match poll_child_exit(child, budget) {
+        Ok(true) => return Ok(()),
+        Ok(false) => std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "timed out waiting for the child to exit",
+        ),
+        Err(error) => error,
+    };
+    Err(std::io::Error::new(
+        error.kind(),
+        format!(
+            "{error}; force-kill {}",
+            if kill_reported_ok {
+                "reported no failure"
+            } else {
+                "reported a failure"
+            }
+        ),
+    ))
+}
+
+/// Legacy respawn teardown. The respawn path relinquishes its old record and
+/// PTY before calling this, so it cannot retain an unconfirmed child for retry.
+/// Keep its wait here; stop requests use [`terminate_child_with_grace_and_reap`]
+/// and retain their generation on failure instead.
+pub fn terminate_child_with_grace_and_wait(
+    child: &mut Box<dyn portable_pty::Child + Send + Sync>,
+    grace: std::time::Duration,
+    group: &AgentProcessGroup,
+) {
+    if terminate_child_with_grace_and_reap(child, grace, std::time::Duration::ZERO, group).is_err()
+    {
+        let _ = child.wait();
+    }
+}
+
 /// Result of delivering the daemon-stop graceful signal to a PID via
 /// [`terminate_pid`].
 ///
@@ -154,14 +216,14 @@ pub use unix::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
     force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
     process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    terminate_child_with_grace_and_reap, terminate_pid,
 };
 #[cfg(windows)]
 pub use windows::{
     AgentProcessGroup, PinnedProcess, current_ppid, executable_of, force_kill_child_and_wait,
     force_kill_child_group, force_kill_pid, foreground_pgid, parent_pid_of, pin_process,
     process_start_of, process_table, process_table_async, send_sigterm_to_child_group,
-    terminate_child_with_grace_and_wait, terminate_pid,
+    terminate_child_with_grace_and_reap, terminate_pid,
 };
 
 /// PRD #1666 part 3, round 5-wake (plan §1.3): the session process `pid`
@@ -325,6 +387,62 @@ pub(crate) mod test_child {
 mod tests {
     use super::*;
 
+    /// A failed nonblocking wait must remain an unconfirmed stop, even after
+    /// the force-kill was attempted; it is not evidence that the child exited.
+    #[test]
+    fn a_child_wait_error_is_not_reported_as_a_successful_termination() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        #[derive(Debug, Clone)]
+        struct FailedWait(Arc<AtomicUsize>);
+        impl portable_pty::ChildKiller for FailedWait {
+            fn kill(&mut self) -> std::io::Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+            fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+                Box::new(self.clone())
+            }
+        }
+        impl portable_pty::Child for FailedWait {
+            fn try_wait(&mut self) -> std::io::Result<Option<portable_pty::ExitStatus>> {
+                Err(std::io::Error::other("could not read child status"))
+            }
+            fn wait(&mut self) -> std::io::Result<portable_pty::ExitStatus> {
+                panic!("a failed nonblocking wait must not fall back to a blocking wait")
+            }
+            fn process_id(&self) -> Option<u32> {
+                None
+            }
+            #[cfg(windows)]
+            fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+                None
+            }
+        }
+        let kills = Arc::new(AtomicUsize::new(0));
+        let mut child: Box<dyn portable_pty::Child + Send + Sync> =
+            Box::new(FailedWait(kills.clone()));
+        let result = terminate_child_with_grace_and_reap(
+            &mut child,
+            std::time::Duration::ZERO,
+            std::time::Duration::ZERO,
+            &AgentProcessGroup::adopt(None),
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("could not read child status")
+        );
+        assert!(
+            kills.load(Ordering::SeqCst) > 0,
+            "a wait error must still get the force-kill backstop"
+        );
+    }
+
     /// R2-fix4 (U2): a walk that runs out of steps is told apart from one
     /// that ends outside the root's tree, and from one that cannot read a
     /// parent; [`descends_from_with`] still answers it `Some(false)`.
@@ -417,7 +535,7 @@ mod tests {
 
         let grace = std::time::Duration::from_secs(3);
         let started = std::time::Instant::now();
-        terminate_child_with_grace_and_wait(&mut child, grace, &group);
+        terminate_child_with_grace_and_reap(&mut child, grace, grace, &group).unwrap();
         assert!(
             started.elapsed() < grace,
             "an already-exited child must not cost the full grace window (took {:?})",

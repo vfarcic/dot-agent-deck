@@ -9,41 +9,57 @@ use std::time::Duration;
 use common::{TuiDeck, write_hook_line};
 use spec::spec;
 
-/// Scenario: Launch a dashboard with one live card, return from PaneInput to command mode, press Ctrl+W, then move from default Cancel to Close and confirm. The modal must appear before teardown, and the card plus daemon agent record must disappear only after confirmation.
+/// Scenario: Launch a dashboard with one live card, return from PaneInput to command mode, press Ctrl+W, then move from default Cancel to Close and confirm. For both a cooperative child and one ignoring SIGTERM, the modal must appear before teardown, and the card plus daemon agent record must disappear only after confirmation.
 #[spec("dashboard/pane/002")]
 #[test]
 fn pane_002_confirmed_ctrl_w_removes_card() {
-    let deck = TuiDeck::builder()
-        .with_continue_session("close-card", "cat")
-        .launch_with_fixture("minimal");
-    deck.wait_for_string("[Command Mode Ctrl+D]");
-    deck.send_keys(b"\x04");
-    deck.wait_for_string("close-card");
-
-    deck.send_keys(b"\x17");
-    deck.wait_for_string("Close selected agent?");
-    assert!(
-        common::wait_for_agent_display_name(
-            deck.attach_socket_path(),
-            "close-card",
+    for (command, needs_backstop) in [
+        ("exec sh -c 'printf READY-TO-CLOSE; exec cat'", false),
+        (
+            "exec sh -c 'trap \"\" TERM HUP; printf READY-TO-CLOSE; exec sleep 300'",
             true,
-            Duration::from_secs(1),
         ),
-        "opening confirmation must not close the selected card"
-    );
+    ] {
+        let deck = TuiDeck::builder()
+            .with_continue_session("close-card", command)
+            .launch_with_fixture("minimal");
+        deck.wait_for_string("[Command Mode Ctrl+D]");
+        deck.wait_for_string("READY-TO-CLOSE");
+        deck.send_keys(b"\x04");
+        deck.wait_for_string("close-card");
 
-    deck.send_keys(b"\x1b[B");
-    deck.send_keys(b"\r");
-    deck.wait_for_string("No active agents");
-    assert!(
-        common::wait_for_agent_display_name(
-            deck.attach_socket_path(),
-            "close-card",
-            false,
-            Duration::from_secs(5),
-        ),
-        "confirming Close must remove the daemon agent record"
-    );
+        deck.send_keys(b"\x17");
+        deck.wait_for_string("Close selected agent?");
+        assert!(
+            common::wait_for_agent_display_name(
+                deck.attach_socket_path(),
+                "close-card",
+                true,
+                Duration::from_secs(1),
+            ),
+            "opening confirmation must not close the selected card"
+        );
+
+        deck.send_keys(b"\x1b[B");
+        let closing = std::time::Instant::now();
+        deck.send_keys(b"\r");
+        deck.wait_for_string("No active agents");
+        if needs_backstop {
+            assert!(
+                closing.elapsed() >= dot_agent_deck::agent_pty::AGENT_TERMINATE_GRACE,
+                "the child must survive the SIGTERM grace to exercise the force-reap path"
+            );
+        }
+        assert!(
+            common::wait_for_agent_display_name(
+                deck.attach_socket_path(),
+                "close-card",
+                false,
+                Duration::from_secs(5),
+            ),
+            "confirming Close must remove the daemon agent record"
+        );
+    }
 }
 
 /// Scenario: Launch an empty dashboard with no selected card and press Ctrl+W, then open Help as a processed-input sentinel. No close confirmation may appear and the lone Dashboard must remain rendered and usable.

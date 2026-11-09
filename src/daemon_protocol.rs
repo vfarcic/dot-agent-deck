@@ -5964,16 +5964,17 @@ pub(crate) async fn stop_agent_steps(
     }
     // PRD #92 F8 followup (auditor #1): `close_agent` runs the
     // synchronous SIGTERM-with-grace loop in
-    // `terminate_child_with_grace_and_wait`, which calls
-    // `std::thread::sleep` for up to 3 s while polling the
-    // child's `try_wait`. Calling that from inside the async
+    // `terminate_child_with_grace_and_reap`, which calls
+    // `std::thread::sleep` through the grace and bounded force-reap
+    // windows while polling the child's `try_wait`. Calling that inside the async
     // attach-connection task would block a Tokio worker thread
     // for the duration of the grace window — under load this
     // can starve other connections. Mirror the
     // `KIND_SHUTDOWN` handler's pattern: hop the blocking work
     // onto a `spawn_blocking` pool task, await the
     // `JoinHandle`, and surface a join error as a failed
-    // close.
+    // close. Await the work itself, not a timeout on its JoinHandle: the pane
+    // hold must outlive the work that can mutate its generation.
     let registry_for_close = registry.clone();
     let id_for_close = id.to_string();
     let close_result =
@@ -6031,7 +6032,7 @@ pub(crate) async fn stop_agent_steps(
             Ok(())
         }
         Err(msg) => {
-            // PRD #126: the close failed, so the agent is still live. Roll the
+            // PRD #126: the close failed, so termination is unconfirmed. Roll the
             // transition back by clearing the closing mark — future delegates
             // to this pane can arm again. The records swept at `begin` are
             // deliberately NOT restored: losing a watch fails safe,
@@ -7360,7 +7361,7 @@ async fn handle_connection(
                     write_resp(&mut stream, &AttachResponse::ok()).await?
                 }
                 Err(msg) => {
-                    // PRD #126: the close failed, so the agent is still live;
+                    // PRD #126: the close failed, so termination is unconfirmed;
                     // `stop_agent_steps` has already rolled the closing mark back.
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }

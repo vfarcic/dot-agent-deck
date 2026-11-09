@@ -850,6 +850,8 @@ pub enum AgentPtyError {
     Resize(String),
     #[error("Agent {0} not found")]
     NotFound(String),
+    #[error("Agent {id}: termination could not be confirmed: {reason}")]
+    TerminationUnconfirmed { id: String, reason: String },
     /// Caller-supplied spawn metadata failed validation. Surfaced to the
     /// attach client via `AttachResponse::err` so a malformed spawn fails
     /// loudly instead of silently dropping the bad field (PRD #76 M2.12
@@ -1025,7 +1027,7 @@ pub struct AgentPty {
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
 /// fallback used by the single-pane Ctrl+W path
-/// ([`crate::platform::proc::terminate_child_with_grace_and_wait`]) and as the
+/// ([`crate::platform::proc::terminate_child_with_grace_and_reap`]) and as the
 /// poll budget in the daemon-wide [`AgentPtyRegistry::shutdown_all_graceful`].
 /// 3 s matches the F1 graceful-shutdown grace, which is the natural
 /// sibling. Hardcoded as a constant for now (one symbol to find) rather
@@ -1112,8 +1114,9 @@ pub(crate) const DAEMON_STOP_POLL_BUDGET: Duration = {
 /// gets a fraction of the remainder rather than all of it.
 const FORCE_REAP_DEADLINE_DIVISOR: u64 = 2;
 
-/// How long [`AgentPtyRegistry::force_kill_and_reap_all`]'s reap pass polls a
-/// SIGKILLed child before giving up on it (issue #1118). Twenty ticks of
+/// How long [`AgentPtyRegistry::force_kill_and_reap_all`] and
+/// [`AgentPtyRegistry::close_agent`] poll a SIGKILLed child before giving up on
+/// its reap (issues #1118 and #1677). Twenty ticks of
 /// [`FORCE_REAP_POLL_INTERVAL`] as the three inputs stand today.
 ///
 /// **Derived from the budget the daemon's stop clients allow it, not picked
@@ -15349,11 +15352,13 @@ impl AgentPtyRegistry {
     /// reference).
     ///
     /// PRD #92 F8: the kill path now uses
-    /// [`terminate_child_with_grace_and_wait`] — SIGTERM with a
+    /// [`crate::platform::proc::terminate_child_with_grace_and_reap`] — SIGTERM with a
     /// 3-second grace before SIGKILL — so a well-behaved agent can
     /// trap SIGTERM and clean up its own descendants (e.g. the
     /// `setsid`'d sub-shells Claude Code creates internally).
-    /// Misbehaving agents are still reaped after the grace window.
+    /// After the grace, reap polling is bounded by [`FORCE_REAP_DEADLINE`].
+    /// An unconfirmed child is retained for another stop attempt and reported
+    /// as a failure, with its input retired rather than accepting more work.
     ///
     /// PRD #92 F9 followup-3: this path used to prune the
     /// `dispatch_mutexes` entry for `agent.pane_id_env`. Pruning was
@@ -15438,11 +15443,33 @@ impl AgentPtyRegistry {
                 let _ = release.recv();
             }
         }
-        crate::platform::proc::terminate_child_with_grace_and_wait(
+        let termination = crate::platform::proc::terminate_child_with_grace_and_reap(
             &mut agent.child,
             AGENT_TERMINATE_GRACE,
+            FORCE_REAP_DEADLINE,
             &agent.process_group,
         );
+        if let Err(error) = termination {
+            tracing::warn!(
+                agent_id = %id,
+                pid = ?agent.child.process_id(),
+                error = %error,
+                "close: termination could not be confirmed; retaining the child for retry"
+            );
+            // Keep the generation's child and identity for a later stop. This
+            // task has finished polling before its caller releases the cleanup
+            // hold: there is no detached wait that could later clean a new pane.
+            let mut inner = self.inner.lock();
+            if let Some(pane) = agent.pane_id_env.as_deref() {
+                agent.pane_handed_over |= Self::pane_claimed_by_other(&inner, pane, id);
+            }
+            inner.agents.insert(id.to_string(), agent);
+            self.change_notify.notify_one();
+            return Err(AgentPtyError::TerminationUnconfirmed {
+                id: id.to_string(),
+                reason: error.to_string(),
+            });
+        }
         agent.removal.record_reaped(&mut agent.child);
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
@@ -18566,11 +18593,19 @@ impl AgentPtyRegistry {
         instance: &str,
         is_start_role: bool,
     ) -> String {
-        let id = self.insert_test_agent_with_master(
-            Box::new(IdleTestChild),
-            Some(pane_id),
-            Box::new(IdleTestMaster),
-        );
+        self.insert_member_child_for_test(pane_id, instance, is_start_role, Box::new(IdleTestChild))
+    }
+
+    /// An inert orchestration member with a caller-controlled termination.
+    #[cfg(test)]
+    pub(crate) fn insert_member_child_for_test(
+        &self,
+        pane_id: &str,
+        instance: &str,
+        is_start_role: bool,
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+    ) -> String {
+        let id = self.insert_test_agent_with_master(child, Some(pane_id), Box::new(IdleTestMaster));
         if let Some(agent) = self.inner.lock().agents.get_mut(&id) {
             agent.tab_membership = Some(TabMembership::Orchestration {
                 name: "team".to_string(),
