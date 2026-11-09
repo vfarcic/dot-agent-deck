@@ -1112,6 +1112,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
 .confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
+.confirm-dialog.has-worktree-preview { display: flex; flex-direction: column; max-height: 100%; overflow-y: auto; }
+.confirm-dialog.has-worktree-preview > * { flex-shrink: 0; }
+.confirm-dialog .worktree-close-preview { min-height: 0; flex-shrink: 1; overflow-y: auto; }
 /* PRD #1487 M5 — the Upgrade / Replace daemon dialog: the confirm card, plus its stages and stop lists. */
 .upgrade-dialog { width: min(440px, 100%); }
 .upgrade-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--green); background: var(--green-soft); }

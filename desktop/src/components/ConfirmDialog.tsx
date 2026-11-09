@@ -31,6 +31,7 @@ export interface ConfirmState {
 export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
   const [busy, setBusy] = useState(false);
   const [preview, setPreview] = useState<{ state: ConfirmState; kept: KeptWorktree | null }>();
+  const kept = preview?.state === state ? preview.kept : null;
   const checking = Boolean(state.worktreePreview && preview?.state !== state);
   useEffect(() => {
     if (!state.worktreePreview) return;
@@ -65,5 +66,5 @@ export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose
     const asked = state;
     void asked.action().finally(() => { if (shown.current === asked) onClose(); });
   };
-  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{preview?.state === state && preview.kept && <p><KeptWorktreeText kept={preview.kept} /></p>}<div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy || checking} onClick={confirm}>{busy ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button></div></section></div>;
+  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}<div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy || checking} onClick={confirm}>{busy ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button></div></section></div>;
 }
