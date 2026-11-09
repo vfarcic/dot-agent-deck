@@ -201,8 +201,17 @@ impl Installed {
             .map(|(_, v)| v)
     }
 
+    /// Off Linux the deck installs no pane, so [`checkable`] skips before
+    /// this is reached; reaching it is a failure, not a pass.
+    #[cfg(not(target_os = "linux"))]
+    pub fn assert_installed(&self) {
+        panic!("the deck installs no pane off Linux; {}", self.evidence());
+    }
+
     /// The pane was installed: Claude Code's `VISUAL` and `EDITOR` name the
     /// deck's helper, and it has a generation and a tool environment file.
+    /// The helper's name exists only on Linux (`composer_probe::instance`).
+    #[cfg(target_os = "linux")]
     pub fn assert_installed(&self) {
         let helper = dot_agent_deck::composer_probe::instance::HELPER_NAME;
         for name in ["VISUAL", "EDITOR"] {

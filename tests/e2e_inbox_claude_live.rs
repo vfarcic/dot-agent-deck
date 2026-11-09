@@ -26,6 +26,8 @@ struct Claude {
 /// The Claude Code command every test here runs.
 const CLAUDE: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write";
 
+// Most of these serve the Linux-only installed-pane tests below.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Claude {
     fn new() -> Self {
         Self::launch(&common::capability_export_command(&format!(
