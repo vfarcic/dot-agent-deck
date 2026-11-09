@@ -69,6 +69,23 @@ describe("one notification per waiting question (issue #2075)", () => {
     expect(new Set(due.map((n) => n.key)).size).toBe(3);
   });
 
+  /**
+   * Scenario (question/desktop/036, PR #2208 review): one question has been
+   * notified and is still waiting while the window notifies more than the
+   * ledger keeps about other questions that are then answered; the old,
+   * still-waiting question is not notified a second time.
+   */
+  it("question/desktop/036: a question still waiting keeps its record when the ledger is full", () => {
+    const ledger: QuestionNotifyLedger = new Set();
+    const old = waiting({ questionId: "q-old" });
+    expect(dueQuestionNotifications([old], RAISED + 10 * MINUTE, 10, ledger)).toHaveLength(1);
+    for (let i = 0; i < 1_050; i++) {
+      const other = waiting({ questionId: `q-${i}` });
+      expect(dueQuestionNotifications([old, other], RAISED + 10 * MINUTE, 10, ledger)).toHaveLength(1);
+    }
+    expect(dueQuestionNotifications([old], RAISED + 11 * MINUTE, 10, ledger)).toEqual([]);
+  });
+
   it("question/desktop/036: the body is cut to its limit with an ellipsis", () => {
     const [due] = dueQuestionNotifications([waiting({ prompt: "x".repeat(300) })], RAISED + 10 * MINUTE, 10, new Set());
     expect(Array.from(due.body)).toHaveLength(QUESTION_NOTIFY_BODY_LIMIT);
@@ -102,7 +119,7 @@ describe("the notifier hook (issue #2075)", () => {
     let now = RAISED;
     const post = vi.fn();
     const settings: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS };
-    renderHook(() => useQuestionNotifications(fleetWith({ id: "q-1", raisedAtMs: RAISED }), settings, post, () => now));
+    renderHook(() => useQuestionNotifications(fleetWith({ id: "q-1", raisedAtMs: RAISED }), settings, true, post, () => now));
     expect(post).not.toHaveBeenCalled();
     now = RAISED + 10 * MINUTE;
     vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS);
@@ -116,10 +133,33 @@ describe("the notifier hook (issue #2075)", () => {
     renderHook(() => useQuestionNotifications(
       fleetWith({ id: "q-9", raisedAtMs: RAISED }),
       { ...DEFAULT_DESKTOP_SETTINGS, questions: { notify: 0 } },
+      true,
       off,
       () => RAISED + 600 * MINUTE,
     ));
     vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS * 4);
     expect(off).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario (question/desktop/036, PR #2208 review): the fleet, with a
+   * question long overdue, arrives before the saved settings, which say Off;
+   * nothing is posted while the settings are being read, and nothing once they
+   * say Off.
+   */
+  it("question/desktop/036: nothing is decided before the saved settings are read", () => {
+    const post = vi.fn();
+    const fleet = fleetWith({ id: "q-1", raisedAtMs: RAISED });
+    const clock = () => RAISED + 600 * MINUTE;
+    const { rerender } = renderHook(
+      ({ settings, ready }: { settings: DesktopSettingsDto; ready: boolean }) =>
+        useQuestionNotifications(fleet, settings, ready, post, clock),
+      { initialProps: { settings: DEFAULT_DESKTOP_SETTINGS, ready: false } },
+    );
+    vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS * 4);
+    expect(post).not.toHaveBeenCalled();
+    rerender({ settings: { ...DEFAULT_DESKTOP_SETTINGS, questions: { notify: 0 } }, ready: true });
+    vi.advanceTimersByTime(QUESTION_NOTIFY_TICK_MS * 4);
+    expect(post).not.toHaveBeenCalled();
   });
 });

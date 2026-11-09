@@ -39,9 +39,15 @@ export function waitingQuestionsOf(fleet: DeckFleet): WaitingQuestion[] {
   );
 }
 
+/**
+ * `ready` is whether the saved settings have been read: until then `settings`
+ * holds the defaults, so a check would decide on a delay the user may have
+ * changed or turned off (PR #2208 review). Nothing is checked before it.
+ */
 export function useQuestionNotifications(
   fleet: DeckFleet,
   settings: DesktopSettingsDto,
+  ready: boolean,
   post: (title: string, body: string) => void | Promise<void> = postOsNotification,
   now: () => number = Date.now,
 ): void {
@@ -50,6 +56,7 @@ export function useQuestionNotifications(
   latest.current = { fleet, settings, post, now };
 
   useEffect(() => {
+    if (!ready) return;
     const check = () => {
       const { fleet: currentFleet, settings: currentSettings, post: currentPost, now: clock } = latest.current;
       const due = dueQuestionNotifications(
@@ -63,5 +70,5 @@ export function useQuestionNotifications(
     check();
     const timer = window.setInterval(check, QUESTION_NOTIFY_TICK_MS);
     return () => window.clearInterval(timer);
-  }, [fleet, settings]);
+  }, [fleet, settings, ready]);
 }

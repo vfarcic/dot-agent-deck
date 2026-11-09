@@ -84,10 +84,15 @@ export function dueQuestionNotifications(
       body: truncate(`${question.agentName}: ${question.prompt}`, QUESTION_NOTIFY_BODY_LIMIT),
     });
   }
-  while (ledger.size > QUESTION_NOTIFY_LEDGER_LIMIT) {
-    const oldest = ledger.values().next().value;
-    if (oldest === undefined) break;
-    ledger.delete(oldest);
+  // Past the limit, forget the oldest keys of questions no longer waiting. A
+  // key whose question still waits is kept whatever its age, or that question
+  // would notify again on the next check (PR #2208 review).
+  if (ledger.size > QUESTION_NOTIFY_LEDGER_LIMIT) {
+    const stillWaiting = new Set(waiting.map(questionNotifyKey));
+    for (const key of [...ledger]) {
+      if (ledger.size <= QUESTION_NOTIFY_LEDGER_LIMIT) break;
+      if (!stillWaiting.has(key)) ledger.delete(key);
+    }
   }
   return due;
 }

@@ -314,7 +314,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   /* Issue #2075 — one OS notification per question left unanswered for the
      `[questions] notify` minutes, for every deck in the fleet, on every
      screen: which is why it is mounted here beside the settings it reads. */
-  useQuestionNotifications(runtime.fleet, settings.settings);
+  useQuestionNotifications(runtime.fleet, settings.settings, settings.loaded);
   /* PRD #1401 reads the level: a zoom change moves the pull request browser's
      frame, which it then reports again. */
   const zoom = useZoom(runtime, settings);
