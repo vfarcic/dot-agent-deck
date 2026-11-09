@@ -7,26 +7,36 @@
 # already there before changing anything.
 #
 #   bash bootstrap.sh                        # the box itself
-#   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>) and devbox install it
-#   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml
-#   bash bootstrap.sh --relay                # also export OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318 (the local relay)
+#   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>), devbox install it and install its orphan-reaper timer
+#   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml, and install google-cloud-cli
+#   bash bootstrap.sh --relay                # also run the local telemetry relay and the per-run resource collector, and point the environment at the relay
+#   bash bootstrap.sh --desktop              # also install what the desktop app's browser and driver test tiers need to run (with --repo, Playwright's browsers too)
 #
 # Layers, each assuming the one before:
-#   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents)
+#   1. apt: docker (Docker's repo), auditd, build-essential, nodejs/npm (runtime for npm-distributed agents);
+#      with --use-vals google-cloud-cli (Google's repo), with --desktop xvfb and the driver tier's runtime packages
 #   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
 #   3. nix + devbox, then `devbox global` from devbox-global.json
 #   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT)
 #      for non-interactive shells and systemd --user,
 #      so the deck daemon finds every agent and every agent inherits the same environment
-#   5. agents (claude, opencode 2.x, codex, pi, devin; a pinned opencode 1.x off PATH for tests), sem, dot-agent-deck, `hooks install`
-#   6. the optional repo
-#   7. which agents still need logging in
+#   5. agents (claude, opencode 2.x, codex, pi, devin; a pinned opencode 1.x off PATH for tests), sem, the rwx CLI,
+#      dot-agent-deck, `hooks install`
+#   6. with --relay: the relay container and the dot-agent-deck-collector user service
+#   7. the optional repo (with --desktop, Playwright's browsers for it)
+#   8. which agents and tools still need logging in
 #
-# Nothing secret is installed. Logging the agents in is left to the operator.
+# No key is kept in this directory, and the script prints none. Logging the agents,
+# gh, rwx and gcloud in is left to the operator, and so is everything that needs
+# the operator's own accounts: how the box is reached (tailscale, if you use it,
+# with your tailnet), the relay's keys (below), and the repositories you work in
+# beyond the one --repo clones.
 #
 # --use-vals is for a box whose operator can read the secrets .env.vals.yaml
 # points at: it makes every devbox shell, and every agent the deck starts, run
-# that file through `vals`, which fails without access. It sticks: a re-run
+# that file through `vals`, which fails without access. It installs
+# google-cloud-cli, which `vals` needs a login from for GCP Secret Manager
+# (`gcloud auth application-default login`). It sticks: a re-run
 # without the flag keeps it while the marked block it wrote is in ~/.bashrc. To
 # turn it off, delete that block and re-run. Either way a deck daemon that is
 # already running keeps the environment it started with, and so does the
@@ -34,20 +44,42 @@
 # is stopped and a new one is started from a fresh login (`dot-agent-deck
 # connect` from your machine does that), not from a shell opened before the run.
 #
-# --relay is for a box whose operator runs a local OpenTelemetry relay: a
-# collector listening on 127.0.0.1:4318 that forwards to Honeycomb with its own
-# key. It makes the relay the endpoint that every shell reading ~/.bashrc, and
+# --relay runs the box's local OpenTelemetry relay: the Docker container
+# otelcol-hostmetrics (relay/config.yaml beside this script, installed as
+# ~/.config/otelcol/config.yaml), an OpenTelemetry Collector that receives OTLP
+# on 127.0.0.1:4318, drops the agents' high-volume internal spans, adds the
+# box's host metrics and forwards everything to Honeycomb and, when its keys are
+# there, Dash0. Its keys live in env files only the operator can read, which
+# the run checks for before it changes anything:
+#   ~/.config/otelcol/honeycomb.env  HONEYCOMB_API_KEY=...                       (required)
+#   ~/.config/otelcol/dash0.env      DASH0_ENDPOINT=...  DASH0_AUTH_TOKEN=...    (optional)
+# one NAME=value per line, unquoted (Docker's --env-file format). A missing file
+# is written (mode 600) from the same variables in the environment this script
+# runs with (HONEYCOMB_INGEST_KEY, .env.vals.yaml's name, works for the first),
+# so running it from a vals shell fills both; an existing file is never
+# rewritten. Without dash0.env the relay runs without its Dash0 exporter, except
+# that a box whose installed config still has it stops with an error rather
+# than dropping Dash0 silently. The container is recreated only when its image,
+# config, parameters or key files change. It also installs
+# dot-agent-deck-collector, the per-run resource collector, as the systemd user
+# service dot-agent-deck-collector (user/ beside this script), sending to the
+# relay through ~/.config/dot-agent-deck/collector.env.
+# And it makes the relay the endpoint that every shell reading ~/.bashrc, and
 # every agent the deck starts, inherits by default; devbox.json's init_hook
 # keeps an endpoint the shell already has, so a vals shell inherits the relay
 # instead of the endpoint .env.vals.yaml names. A later setting still wins: an
 # OTEL_EXPORTER_OTLP_ENDPOINT in the repository's .env (the init_hook sources it
-# last) or an export further down ~/.bashrc. It neither installs nor checks the
-# relay; that is the box's own setup. It works with or without --use-vals, and
-# it sticks and reaches a running daemon exactly as --use-vals does, through its
-# own marked block. Turning it off (delete the block and re-run) drops the
-# endpoint from ~/.bashrc and environment.d, and unsets it in the running
-# systemd --user manager only while its value there is still the relay address
-# above; an endpoint with any other value is left alone.
+# last) or an export further down ~/.bashrc. It works with or without
+# --use-vals, and it sticks and reaches a running daemon exactly as --use-vals
+# does, through its own marked block. Turning it off (delete the block and
+# re-run) drops the endpoint from ~/.bashrc and environment.d, and unsets it in
+# the running systemd --user manager only while its value there is still the
+# relay address above; an endpoint with any other value is left alone. It does
+# not stop the relay or the collector: `docker rm -f otelcol-hostmetrics` and
+# `systemctl --user disable --now dot-agent-deck-collector` do.
+#
+# --desktop does not stick: give it on every run that should check those
+# packages.
 
 set -euo pipefail
 
@@ -56,7 +88,16 @@ REPO_URL=""
 REPO_DIR=""
 USE_VALS_FLAG=0
 RELAY_FLAG=0
+DESKTOP_FLAG=0
 RELAY_ENDPOINT=http://127.0.0.1:4318
+# The relay (layer 6). The name, image, mounts and network are the ones the
+# relay on the first box ran with before this script installed it (issue #2180).
+RELAY_CONTAINER=otelcol-hostmetrics
+RELAY_IMAGE=otel/opentelemetry-collector-contrib:0.120.0
+RELAY_DIR="$HOME/.config/otelcol"
+RELAY_CONFIG="$RELAY_DIR/config.yaml"
+HONEYCOMB_ENV="$RELAY_DIR/honeycomb.env"
+DASH0_ENV="$RELAY_DIR/dash0.env"
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -64,6 +105,7 @@ while [ $# -gt 0 ]; do
     --dir)  REPO_DIR="${2:?}"; shift 2 ;;
     --use-vals) USE_VALS_FLAG=1; shift ;;
     --relay)    RELAY_FLAG=1; shift ;;
+    --desktop)  DESKTOP_FLAG=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap.sh: unknown argument: $1" >&2; exit 2 ;;
   esac
@@ -75,6 +117,56 @@ have() { command -v "$1" >/dev/null 2>&1; }
 sudo -n true 2>/dev/null || { echo "bootstrap.sh: needs passwordless sudo" >&2; exit 1; }
 export DEBIAN_FRONTEND=noninteractive
 ME="$(id -un)"
+case "$(uname -m)" in x86_64) BIN_ARCH=amd64 ;; aarch64) BIN_ARCH=arm64 ;; *) BIN_ARCH="" ;; esac
+
+# The ~/.bashrc blocks of layer 4. Every block is found by these exact lines and nothing else.
+PATH_OPEN='# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>'
+PATH_CLOSE='# <<< dad-box PATH <<<'
+VALS_OPEN='# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>'
+VALS_CLOSE='# <<< dad-box USE_VALS <<<'
+RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
+RELAY_CLOSE='# <<< dad-box RELAY <<<'
+# --use-vals and --relay stick while their block is there, so the layers
+# before 4 already act on them (layer 4 checks the markers before it writes).
+if [ -f "$HOME/.bashrc" ]; then
+  grep -qxF "$VALS_OPEN" "$HOME/.bashrc" && USE_VALS_FLAG=1
+  grep -qxF "$RELAY_OPEN" "$HOME/.bashrc" && RELAY_FLAG=1
+fi
+
+# Has env file $1 a non-empty value for every name after it? Reads names only.
+env_file_sets() {
+  local file="$1" name; shift
+  for name in "$@"; do grep -qE "^${name}=." "$file" || return 1; done
+}
+
+# --relay: refuse before anything changes when the relay could not start.
+if [ "$RELAY_FLAG" = 1 ]; then
+  relay_fail() {
+    echo "bootstrap.sh: --relay: $*" >&2
+    echo "bootstrap.sh: changed nothing; see --relay in \`bash $0 --help\`" >&2
+    exit 1
+  }
+  if [ -f "$HONEYCOMB_ENV" ]; then
+    env_file_sets "$HONEYCOMB_ENV" HONEYCOMB_API_KEY || relay_fail "$HONEYCOMB_ENV does not set HONEYCOMB_API_KEY"
+  elif [ -z "${HONEYCOMB_API_KEY:-}${HONEYCOMB_INGEST_KEY:-}" ]; then
+    relay_fail "no Honeycomb key: create $HONEYCOMB_ENV (HONEYCOMB_API_KEY=..., mode 600), or run with HONEYCOMB_API_KEY or HONEYCOMB_INGEST_KEY set (a vals shell sets the second)"
+  fi
+  if [ -f "$DASH0_ENV" ]; then
+    env_file_sets "$DASH0_ENV" DASH0_ENDPOINT DASH0_AUTH_TOKEN || relay_fail "$DASH0_ENV must set both DASH0_ENDPOINT and DASH0_AUTH_TOKEN"
+  elif [ -n "${DASH0_ENDPOINT:-}" ] && [ -n "${DASH0_AUTH_TOKEN:-}" ]; then
+    :
+  elif [ -n "${DASH0_ENDPOINT:-}${DASH0_AUTH_TOKEN:-}" ]; then
+    relay_fail "only one of DASH0_ENDPOINT and DASH0_AUTH_TOKEN is set; set both, or neither to run the relay without Dash0"
+  elif [ -f "$RELAY_CONFIG" ] && grep -qF 'otlphttp/dash0' "$RELAY_CONFIG"; then
+    relay_fail "$RELAY_CONFIG sends to Dash0 but there is no $DASH0_ENV; create it (DASH0_ENDPOINT=... and DASH0_AUTH_TOKEN=..., mode 600) to keep Dash0, or delete $RELAY_CONFIG to drop it"
+  fi
+  # host networking: another listener on the relay's port would leave the
+  # container failing to bind.
+  if ! { have docker && sudo docker container inspect "$RELAY_CONTAINER" >/dev/null 2>&1; } \
+     && [ -n "$(ss -Hltn 'sport = :4318' 2>/dev/null)" ]; then
+    relay_fail "something other than the $RELAY_CONTAINER container already listens on port 4318 (\`sudo ss -ltnp 'sport = :4318'\` names it); stop it first"
+  fi
+fi
 
 # Write $2 to root-owned file $1 only when the content differs; succeed with
 # status 0 when it changed and 1 when it did not, so callers can react.
@@ -97,6 +189,38 @@ put_root_file /etc/apt/sources.list.d/docker.list \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" || true
 APT_PACKAGES=(build-essential auditd nodejs npm xz-utils ca-certificates curl git
               docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+# --use-vals: `vals` reads .env.vals.yaml's secrets from GCP Secret Manager with
+# the credentials `gcloud auth application-default login` writes. Google's repo
+# is added only while the package is missing, so a box that already has it from
+# a source list of its own (another file name or keyring) is not given a second
+# one, which apt refuses as a conflicting Signed-By.
+if [ "$USE_VALS_FLAG" = 1 ] && ! dpkg -s google-cloud-cli >/dev/null 2>&1; then
+  if [ ! -s /etc/apt/keyrings/cloud.google.asc ]; then
+    sudo curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg -o /etc/apt/keyrings/cloud.google.asc
+    sudo chmod a+r /etc/apt/keyrings/cloud.google.asc
+  fi
+  put_root_file /etc/apt/sources.list.d/google-cloud-sdk.list \
+    "deb [signed-by=/etc/apt/keyrings/cloud.google.asc] https://packages.cloud.google.com/apt cloud-sdk main" || true
+  APT_PACKAGES+=(google-cloud-cli)
+fi
+# --desktop: what the desktop app's driver tier needs at run time besides the
+# WebKitGTK build set devbox provides (docs/develop/desktop-gui.md): the set
+# ci.yml's desktop-driver job installs, less the -dev packages. The
+# WebKitWebDriver package is webkitgtk-webdriver from Ubuntu 26.04 and
+# webkit2gtk-driver before it. The browser tier's runtime libraries and fonts
+# come from Playwright itself, in layer 7.
+if [ "$DESKTOP_FLAG" = 1 ]; then
+  if dpkg -s webkitgtk-webdriver >/dev/null 2>&1; then webdriver_pkg=webkitgtk-webdriver
+  elif dpkg -s webkit2gtk-driver >/dev/null 2>&1; then webdriver_pkg=webkit2gtk-driver
+  else
+    sudo apt-get update -q   # a candidate is only known from current lists
+    webdriver_pkg=webkitgtk-webdriver
+    case "$(apt-cache policy "$webdriver_pkg" 2>/dev/null | sed -n 's/^ *Candidate: //p')" in
+      ""|"(none)") webdriver_pkg=webkit2gtk-driver ;;
+    esac
+  fi
+  APT_PACKAGES+=("$webdriver_pkg" xvfb xclip xdotool openssh-server libnss-wrapper)
+fi
 missing=()
 for p in "${APT_PACKAGES[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || missing+=("$p"); done
 if [ ${#missing[@]} -gt 0 ]; then
@@ -160,13 +284,6 @@ step "PATH for interactive, non-interactive and systemd --user processes"
 # The deck daemon is started over a non-interactive ssh session and every agent
 # inherits its PATH. Ubuntu's .bashrc returns early for non-interactive shells,
 # so this block goes at the TOP of it, before that guard.
-# Every block is found by these exact lines and nothing else.
-PATH_OPEN='# >>> dad-box PATH (scripts/box/bootstrap.sh) >>>'
-PATH_CLOSE='# <<< dad-box PATH <<<'
-VALS_OPEN='# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>'
-VALS_CLOSE='# <<< dad-box USE_VALS <<<'
-RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
-RELAY_CLOSE='# <<< dad-box RELAY <<<'
 PATH_BLOCK="$PATH_OPEN
 $(cat <<'EOF'
 for d in /nix/var/nix/profiles/default/bin "$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin" "$HOME/.opencode/bin" "$HOME/.local/bin"; do
@@ -399,14 +516,28 @@ if ! have devin; then
   bash -c "$(curl -fsSL https://cli.devin.ai/install.sh)" </dev/null || [ -x "$HOME/.local/bin/devin" ]
 fi
 have sem   || curl -fsSL https://storage.googleapis.com/sem-cli-releases/get.sh | bash
+# The rwx CLI, for this repo's RWX CI backend and remote sandbox
+# (docs/develop/rwx.md). Its release publishes no checksums; logging in
+# (`rwx login`) is the operator's step.
+if ! have rwx; then
+  case "$(uname -m)" in
+    x86_64|aarch64)
+      mkdir -p "$HOME/.local/bin"
+      curl -fsSL -o "$HOME/.local/bin/.rwx.part" \
+        "https://github.com/rwx-cloud/cli/releases/latest/download/rwx-linux-$(uname -m)"
+      chmod +x "$HOME/.local/bin/.rwx.part"
+      mv "$HOME/.local/bin/.rwx.part" "$HOME/.local/bin/rwx" ;;
+    *) echo "  warning: no rwx CLI release for $(uname -m); skipped" ;;
+  esac
+fi
 hash -r
 
 step "dot-agent-deck"
 if [ ! -x "$HOME/.local/bin/dot-agent-deck" ]; then
-  case "$(uname -m)" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) echo "unsupported arch $(uname -m)" >&2; exit 1 ;; esac
+  [ -n "$BIN_ARCH" ] || { echo "unsupported arch $(uname -m)" >&2; exit 1; }
   mkdir -p "$HOME/.local/bin"
   curl -fsSL -o "$HOME/.local/bin/.dot-agent-deck.part" \
-    "https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-linux-$arch"
+    "https://github.com/vfarcic/dot-agent-deck/releases/latest/download/dot-agent-deck-linux-$BIN_ARCH"
   chmod +x "$HOME/.local/bin/.dot-agent-deck.part"
   mv "$HOME/.local/bin/.dot-agent-deck.part" "$HOME/.local/bin/dot-agent-deck"
 fi
@@ -417,7 +548,137 @@ for agent in claude-code opencode codex devin; do
   "$HOME/.local/bin/dot-agent-deck" hooks install --agent "$agent" | sed "s/^/  [$agent] /"
 done
 
-# -------- 6. the repo ---------------------------------------------------------
+# -------- 6. the relay and the resource collector (--relay) ------------------
+
+if [ "$RELAY_FLAG" = 1 ]; then
+  step "telemetry relay (container $RELAY_CONTAINER, listening on $RELAY_ENDPOINT)"
+  [ -d "$RELAY_DIR" ] || install -d -m 0700 "$RELAY_DIR"
+  # A key file the preflight found missing is written from the environment,
+  # through a private temporary file; nothing here echoes a value.
+  if [ ! -f "$HONEYCOMB_ENV" ]; then
+    ( umask 077; printf 'HONEYCOMB_API_KEY=%s\n' "${HONEYCOMB_API_KEY:-${HONEYCOMB_INGEST_KEY:-}}" > "$HONEYCOMB_ENV.dad-box" )
+    mv "$HONEYCOMB_ENV.dad-box" "$HONEYCOMB_ENV"
+    echo "  wrote $HONEYCOMB_ENV from the environment"
+  fi
+  if [ ! -f "$DASH0_ENV" ] && [ -n "${DASH0_ENDPOINT:-}" ] && [ -n "${DASH0_AUTH_TOKEN:-}" ]; then
+    ( umask 077; printf 'DASH0_ENDPOINT=%s\nDASH0_AUTH_TOKEN=%s\n' "$DASH0_ENDPOINT" "$DASH0_AUTH_TOKEN" > "$DASH0_ENV.dad-box" )
+    mv "$DASH0_ENV.dad-box" "$DASH0_ENV"
+    echo "  wrote $DASH0_ENV from the environment"
+  fi
+  RELAY_ENV_ARGS=(--env-file "$HONEYCOMB_ENV")
+  if [ -f "$DASH0_ENV" ]; then
+    RELAY_ENV_ARGS+=(--env-file "$DASH0_ENV")
+    cp "$HERE/relay/config.yaml" "$RELAY_CONFIG.dad-box"
+  else
+    # No Dash0 keys: the same config without its Dash0 exporter, the comment
+    # above it and its place in each pipeline. The Collector refuses to start
+    # with an unset ${env:DASH0_ENDPOINT}, so the exporter cannot stay.
+    awk '
+      /^  #/ { held = held $0 "\n"; next }
+      /^  otlphttp\/dash0:$/ { held = ""; dropping = 1; next }
+      dropping && /^    / { next }
+      { dropping = 0; printf "%s", held; held = ""; gsub(/, otlphttp\/dash0\]/, "]"); print }
+      END { printf "%s", held }
+    ' "$HERE/relay/config.yaml" > "$RELAY_CONFIG.dad-box"
+    if grep -qi dash0 "$RELAY_CONFIG.dad-box"; then
+      rm -f "$RELAY_CONFIG.dad-box"
+      echo "bootstrap.sh: could not take Dash0 out of $HERE/relay/config.yaml; the relay is left as it was" >&2
+      exit 1
+    fi
+    echo "  no $DASH0_ENV: running without the Dash0 exporter"
+  fi
+  chmod 0644 "$RELAY_CONFIG.dad-box"   # read by the Collector's non-root user, whatever the umask
+  RELAY_RUN_ARGS=(--name "$RELAY_CONTAINER" --restart unless-stopped --network host
+                  -v "/:/hostfs:ro,rslave" -v "$RELAY_CONFIG:/etc/otelcol-contrib/config.yaml:ro")
+  # The Collector checks the new config, with the keys it will run with, before
+  # it replaces the one the running relay uses.
+  if ! sudo docker run --rm "${RELAY_ENV_ARGS[@]}" \
+      -v "$RELAY_CONFIG.dad-box:/etc/otelcol-contrib/config.yaml:ro" \
+      "$RELAY_IMAGE" validate --config /etc/otelcol-contrib/config.yaml; then
+    rm -f "$RELAY_CONFIG.dad-box"
+    echo "bootstrap.sh: the Collector rejected the relay config (above); the relay is left as it was" >&2
+    exit 1
+  fi
+  if cmp -s "$RELAY_CONFIG.dad-box" "$RELAY_CONFIG"; then
+    rm -f "$RELAY_CONFIG.dad-box"
+  else
+    mv "$RELAY_CONFIG.dad-box" "$RELAY_CONFIG"
+  fi
+  # The container carries a fingerprint of what it was started from: image,
+  # parameters, config, and each key file's size and modification time (not
+  # its contents). A different one, or none, means recreate it.
+  relay_fp="$(
+    {
+      printf '%s\n' "$RELAY_IMAGE" "${RELAY_RUN_ARGS[@]}" "${RELAY_ENV_ARGS[@]}"
+      cat "$RELAY_CONFIG"
+      for f in "$HONEYCOMB_ENV" "$DASH0_ENV"; do
+        if [ -f "$f" ]; then stat -c '%n %s %Y' "$f"; fi
+      done
+    } | sha256sum | cut -c1-16
+  )"
+  relay_now="$(sudo docker container inspect -f '{{index .Config.Labels "dad-box.relay"}} {{.State.Running}}' "$RELAY_CONTAINER" 2>/dev/null || true)"
+  if [ "$relay_now" = "$relay_fp true" ]; then
+    echo "  running, up to date"
+  elif [ "$relay_now" = "$relay_fp false" ]; then
+    sudo docker start "$RELAY_CONTAINER" >/dev/null
+    echo "  started"
+  else
+    if [ -n "$relay_now" ]; then sudo docker rm -f "$RELAY_CONTAINER" >/dev/null; fi
+    sudo docker run -d "${RELAY_RUN_ARGS[@]}" "${RELAY_ENV_ARGS[@]}" --label "dad-box.relay=$relay_fp" \
+      "$RELAY_IMAGE" --config /etc/otelcol-contrib/config.yaml >/dev/null
+    echo "  (re)created"
+  fi
+  sleep 5
+  if [ "$(sudo docker container inspect -f '{{.State.Running}}' "$RELAY_CONTAINER" 2>/dev/null)" != true ]; then
+    sudo docker logs --tail 20 "$RELAY_CONTAINER" >&2 || true
+    echo "bootstrap.sh: the relay container is not running (its log is above)" >&2
+    exit 1
+  fi
+
+  step "per-run resource collector (dot-agent-deck-collector user service)"
+  COLLECTOR_BIN="$HOME/.local/bin/dot-agent-deck-collector"
+  COLLECTOR_ENV="$HOME/.config/dot-agent-deck/collector.env"
+  COLLECTOR_UNIT="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/dot-agent-deck-collector.service"
+  collector_changed=0
+  # Like the deck above: installed when missing, not upgraded. The release's
+  # checksums.txt must vouch for the download.
+  if [ ! -x "$COLLECTOR_BIN" ]; then
+    [ -n "$BIN_ARCH" ] || { echo "unsupported arch $(uname -m)" >&2; exit 1; }
+    asset="dot-agent-deck-collector-linux-$BIN_ARCH"
+    base=https://github.com/vfarcic/dot-agent-deck/releases/latest/download
+    mkdir -p "$HOME/.local/bin"
+    curl -fsSL -o "$COLLECTOR_BIN.part" "$base/$asset"
+    want="$(curl -fsSL "$base/checksums.txt" | awk -v a="$asset" '{ n = $2; sub(/^\*/, "", n) } n == a { print $1 }')"
+    if [ -z "$want" ] || [ "$want" != "$(sha256sum "$COLLECTOR_BIN.part" | cut -d' ' -f1)" ]; then
+      rm -f "$COLLECTOR_BIN.part"
+      echo "bootstrap.sh: $asset does not match the release's checksums.txt; not installed" >&2
+      exit 1
+    fi
+    chmod +x "$COLLECTOR_BIN.part"
+    mv "$COLLECTOR_BIN.part" "$COLLECTOR_BIN"
+    collector_changed=1
+  fi
+  mkdir -p "$(dirname "$COLLECTOR_ENV")" "$(dirname "$COLLECTOR_UNIT")"
+  if [ ! -f "$COLLECTOR_ENV" ]; then
+    ( umask 077; printf 'OTEL_EXPORTER_OTLP_ENDPOINT=%s\n' "$RELAY_ENDPOINT" > "$COLLECTOR_ENV" )
+    collector_changed=1
+  elif ! grep -qxF "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" "$COLLECTOR_ENV"; then
+    echo "  warning: $COLLECTOR_ENV does not set OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT; left as it is"
+  fi
+  if ! cmp -s "$HERE/user/dot-agent-deck-collector.service" "$COLLECTOR_UNIT"; then
+    install -m 0644 "$HERE/user/dot-agent-deck-collector.service" "$COLLECTOR_UNIT"
+    systemctl --user daemon-reload || true
+    collector_changed=1
+  fi
+  if systemctl --user enable --now dot-agent-deck-collector.service >/dev/null 2>&1; then
+    [ "$collector_changed" -eq 0 ] || systemctl --user restart dot-agent-deck-collector.service
+    echo "  $(systemctl --user is-active dot-agent-deck-collector.service 2>/dev/null || true)"
+  else
+    echo "  warning: could not start it in the systemd --user manager; run: systemctl --user enable --now dot-agent-deck-collector"
+  fi
+fi
+
+# -------- 7. the repo ---------------------------------------------------------
 
 if [ -n "$REPO_URL" ]; then
   step "repo $REPO_URL"
@@ -426,12 +687,21 @@ if [ -n "$REPO_URL" ]; then
   (cd "$REPO_DIR" && devbox install)
   # This repo's own orphan reaper (CLAUDE.md rule 14's neighbour, docs/develop/orphan-reaper.md).
   [ -x "$REPO_DIR/scripts/install-reaper-timer.sh" ] && "$REPO_DIR/scripts/install-reaper-timer.sh"
+  # --desktop: the desktop app's browser tier runs in Playwright's Chromium and
+  # WebKit; `--with-deps` installs their runtime libraries and fonts with apt
+  # (docs/develop/desktop-gui.md, "The browser tier").
+  if [ "$DESKTOP_FLAG" = 1 ] && [ -f "$REPO_DIR/desktop/package.json" ]; then
+    step "Playwright browsers for $REPO_DIR/desktop"
+    (cd "$REPO_DIR" && devbox run -- bash -c 'cd desktop && pnpm install --frozen-lockfile && pnpm exec playwright install --with-deps chromium webkit')
+  fi
+elif [ "$DESKTOP_FLAG" = 1 ]; then
+  echo; echo "Note: --desktop without --repo installs no Playwright browsers; run \`pnpm exec playwright install --with-deps chromium webkit\` in the repo's desktop/ directory."
 fi
 
-# -------- 7. what is left for the operator -----------------------------------
+# -------- 8. what is left for the operator -----------------------------------
 
 step "versions"
-for c in dot-agent-deck claude opencode codex pi devin sem docker node devbox git gh; do
+for c in dot-agent-deck claude opencode codex pi devin sem rwx docker node devbox git gh; do
   v=MISSING
   if have "$c"; then
     case "$c" in sem|devbox) v="$("$c" version 2>/dev/null | head -n1)" ;; *) v="$("$c" --version 2>/dev/null | head -n1)" ;; esac
@@ -449,12 +719,19 @@ check opencode '[ -s ~/.local/share/opencode/auth.json ]'     'opencode auth log
 check pi       '[ -s ~/.pi/agent/auth.json ]'                 'pi   (then /login)'
 check devin    '[ -s ~/.local/share/devin/credentials.toml ]' 'devin   (follow its login prompt)'
 check gh       'gh auth status'                               'gh auth login && gh auth setup-git'
+have rwx && check rwx 'rwx whoami'                            'rwx login'
+if [ "$USE_VALS_FLAG" = 1 ]; then
+  check gcloud '[ -s ~/.config/gcloud/application_default_credentials.json ]' 'gcloud auth login && gcloud auth application-default login'
+fi
 [ "$todo" -eq 0 ] && echo "  nothing — every agent is logged in"
 if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
   echo; echo "Note: a deck daemon is already running; its agents get USE_VALS only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
 fi
 if [ "$RELAY_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
   echo; echo "Note: a deck daemon is already running; its agents send through the relay only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if [ "$RELAY_FLAG" = 1 ] && [ -f "$HOME/.config/dot-agent-deck/otel.env" ]; then
+  echo; echo "Note: nothing this script sets up reads ~/.config/dot-agent-deck/otel.env; the RELAY block in ~/.bashrc is the route to the relay now. Remove that file and whatever sources it."
 fi
 if ! id -nG | tr ' ' '\n' | grep -qx docker; then
   echo; echo "Note: log out and back in (or reconnect) for the docker group to apply."
