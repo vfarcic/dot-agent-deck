@@ -8,17 +8,20 @@
 //! so the semantics are deterministic under test.
 //!
 //! The semantics are JetStream-shaped (decision 1 of the PRD): globally unique
-//! ids that double as dedup keys, explicit acknowledgement, redelivery after an
-//! ack-wait, a `max_deliver` bound, and offers that go to one taker at a time
-//! under a time-limited claim.
+//! ids that double as dedup keys, explicit acknowledgement, bounded retries,
+//! and offers that go to one taker at a time under a time-limited claim. The
+//! receipt-attempt model ([`crate::inbox_attempts`]) decides delivery retries;
+//! this store has no fetched-message ack-wait.
 //!
 //! **States.** A message is `queued` until a consumer takes it (`fetched`), and
-//! `acknowledged` once an ack arrives. A fetch that is not acknowledged within
-//! the ack-wait returns it to `queued`; after `max_deliver` hand-overs it becomes
-//! `undeliverable`, as it does when its bound agent exits. An offer's ack is a
-//! claim (`claimed`), which ends in `acknowledged` on completion or returns the
-//! offer to its pool, excluding everyone who held it before. A message in
-//! `fetched` or `claimed` is never handed to a second consumer.
+//! `acknowledged` once an ack arrives. A fetched message has no store deadline:
+//! the hub mirrors its attempt model's decisions through
+//! [`Inbox::requeue_receipt`], [`Inbox::ack`] and [`Inbox::retire`]. A bound
+//! direct message becomes `undeliverable` when its agent exits. An offer's ack
+//! is a claim (`claimed`), which ends in `acknowledged` on completion or returns
+//! the offer to its pool, excluding everyone who held it before. Receipt
+//! repeats can hand out a fetched message again under the attempt model's
+//! budgets; a claimed offer waits for completion, release, expiry or exit.
 //!
 //! **Bounds.** Every limit in [`InboxLimits`] refuses explicitly ([`PostError`]):
 //! nothing is ever dropped to make room.
@@ -37,10 +40,10 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::deck_identity::{DeckId, is_valid_deck_id};
 
-/// Ack-wait: how long a fetched message waits for its ack before it is
-/// redelivered.
+/// Default receipt-attempt timing window; see [`InboxLimits::ack_wait`].
 pub const DEFAULT_ACK_WAIT: Duration = Duration::from_secs(60);
-/// Hand-overs after which an unacknowledged message is undeliverable.
+/// Default not-handed retry-round and offer-assignment bound;
+/// see [`InboxLimits::max_deliver`].
 pub const DEFAULT_MAX_DELIVER: u32 = 5;
 /// Queued plus fetched messages one recipient pane may hold.
 pub const DEFAULT_MAX_PER_RECIPIENT: usize = 256;
@@ -689,7 +692,9 @@ pub struct OfferReturn {
 pub enum ReturnCause {
     /// The holder never fetched it within [`InboxLimits::offer_assign_wait`].
     NotFetched,
-    /// The holder fetched it and did not claim it within the ack wait.
+    /// The receipt model returned a fetched offer after its attempts were
+    /// positively not handed. The name predates withdrawal of the store's
+    /// ack-wait; this cause does not imply a store deadline expired.
     AckWaitExpired,
     /// The claim lasted longer than its TTL without a completion.
     ClaimExpired,
@@ -703,12 +708,19 @@ pub enum ReturnCause {
 // Limits
 // ---------------------------------------------------------------------------
 
-/// Every bound and timing the inbox applies. [`Default`] is the production
-/// value; [`InboxLimits::from_env`] applies the `DOT_AGENT_DECK_INBOX_*`
-/// overrides tests use.
+/// Bounds and timings for the inbox store and receipt-attempt model.
+/// [`Default`] is the production value; [`InboxLimits::from_env`] applies the
+/// `DOT_AGENT_DECK_INBOX_*` overrides tests use.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboxLimits {
+    /// Passed by [`crate::inbox_hub::InboxHub::new`] to the receipt-attempt
+    /// model for resume answers, once-waiter idle grace, hook holds, one-shot
+    /// grants, caps-file staging and revoke resends. The store gives a fetched
+    /// message no deadline of its own.
     pub ack_wait: Duration,
+    /// Passed to the receipt-attempt model to bound not-handed retry rounds;
+    /// automatic marked repeats and total attempts have separate budgets.
+    /// Also bounds offer assignments in the store's `return_offer`.
     pub max_deliver: u32,
     pub max_per_recipient: usize,
     pub max_messages: usize,
@@ -1434,7 +1446,8 @@ impl Inbox {
     /// PRD #1666 §2 rule 3: a fetched message every attempt of which was
     /// positively not handed is queued again for its recipient, or for an
     /// offer returned to its pool, excluding this holder. The attempt model
-    /// counts and bounds these requeues, so `max_deliver` is not applied here.
+    /// counts and bounds direct-message requeues; an offer's return also
+    /// checks the store's `max_deliver` assignment bound.
     /// Returns whether it was fetched.
     pub fn requeue_receipt(&mut self, now: Instant, id: &str, pane_id: &str) -> bool {
         let Some(index) = self.messages.iter().position(|m| {

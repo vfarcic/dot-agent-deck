@@ -3,11 +3,11 @@
 //! transition rows, receiver slots and incarnations, possession, the attempt
 //! and evidence budgets, and task-bound work-done.
 //!
-//! The hub's receipt engine ([`crate::inbox_engine`]) drives the OpenCode
-//! receivers from this model; the other receivers keep the hub's ack-wait path
-//! until their own §13 slice moves them onto it. Time is passed in as an
-//! `Instant` on every operation, so every deadline is exercised without a
-//! sleep.
+//! The hub's receipt engine ([`crate::inbox_engine`]) drives stream and
+//! one-shot receivers from this model. Its ack-wait windows remain in use
+//! after withdrawal of the inbox store's fetched-message timeout. Time is
+//! passed in as an `Instant` on every operation, so every deadline is exercised
+//! without a sleep.
 //!
 //! # The nine rows
 //!
@@ -66,11 +66,14 @@ pub const MAX_LIVE_HOOKS: usize = 8;
 pub struct Limits {
     pub max_attempts: u32,
     pub max_auto_repeats: u32,
+    /// Retry rounds whose current-assignment attempts were all positively
+    /// not handed, counted by [`AttemptModel::finalize`].
     pub max_deliver: u32,
     pub evidence_limit: usize,
     /// No snapshot for this long lapses a stream incarnation's attempts.
     pub possess_ttl: Duration,
-    /// A resume answer's window, and a once-waiter's idle grace.
+    /// Window for resume answers, once-waiter idle grace, hook holds, one-shot
+    /// grants and caps-file staging; also the revoke-resend interval.
     pub ack_wait: Duration,
     pub held_long_after: Duration,
     /// PRD #1666 G3: [`NOT_STARTED_AFTER`], or its override.
