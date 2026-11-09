@@ -44,6 +44,7 @@ const ACTING_OPS: &[&str] = &[
     "inbox-cancel",
     "answer-question",
     "stop-agent",
+    "dispatch-worktree-close-preview",
     "set-agent-label",
     "subscribe-turn-replies",
     "prepare-orchestration",
@@ -153,6 +154,14 @@ fn serve(op: &str) -> AttachResponse {
         "list-agents" => AttachResponse::agent_records(vec![listed(REUSED_ID)]),
         "start-agent" | "start-prepared-agent" => AttachResponse::with_id("started".into()),
         "post-message" => AttachResponse::with_id("m-posted".into()),
+        "dispatch-worktree-close-preview" => {
+            let mut reply = AttachResponse::ok();
+            reply.kept_worktree = Some(dot_agent_deck::daemon_protocol::KeptWorktree {
+                path: "/remote/project-dispatch".into(),
+                confirmed_dirty: true,
+            });
+            reply
+        }
         "prepare-orchestration" => AttachResponse::prepared(
             dot_agent_deck::event::PreparedOrchestration {
                 path: "/project".into(),
@@ -355,6 +364,39 @@ fn role_options() -> StartAgentOptions {
             crate::dto::mint_desktop_pane_id(),
         )],
         ..Default::default()
+    }
+}
+
+/// Scenario: a close preview is asked after the app classified a daemon, but
+/// the socket now serves another build. A refused build receives no preview;
+/// the compatible control returns the kept directory through the desktop bridge.
+#[tokio::test]
+async fn worktree_close_preview_is_admitted_and_returns_the_daemons_report() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let _guard = AllowanceGuard::acquire();
+    for (name, replacement, served) in replacements() {
+        let deck = ReplacedDeck::start("close-preview", SwapAt::FirstConnection, replacement);
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&deck.socket);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        let state = crate::terminal::DesktopState::default();
+        let wire = crate::dto::deck_wire_id(&deck.endpoint());
+        let kept =
+            crate::worktree_close_preview_on(&state, &wire, vec![PANE.into()], listed_process())
+                .await;
+        if served {
+            let report = kept.as_ref().expect("compatible daemon returns its report");
+            assert_eq!(report.path, "/remote/project-dispatch");
+            assert!(report.confirmed_dirty);
+        }
+        let outcome = deck.finish();
+        assert_admitted(
+            name,
+            "close preview",
+            &outcome,
+            served,
+            kept.is_some(),
+            &["dispatch-worktree-close-preview"],
+        );
     }
 }
 

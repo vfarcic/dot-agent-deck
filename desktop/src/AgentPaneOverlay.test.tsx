@@ -324,13 +324,14 @@ describe("agent pane overlay", () => {
     expect(setShownTerminals).toHaveBeenLastCalledWith([]);
   });
 
-  /** Scenario: close the viewed agent from either screen origin, cancelling once first. The daemon receives the captured target only after confirmation; its refreshed listing removes the pane and returns to the dashboard, not an empty agent screen. */
+  /** Scenario: close the viewed agent from either screen origin, reading the kept-worktree warning and cancelling once first. The daemon receives the captured target only after confirmation; its refreshed listing removes the pane and returns to the dashboard, not an empty agent screen. */
   it.each(["overview", "deck"] as const)("confirms closing the viewed agent from %s and returns to the dashboard", async (from) => {
     const initial = runtime();
-    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a" })) };
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
     let settle!: (result: DeckActionResult) => void;
     const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
-    const rt = { ...initial, snapshot, fleet: [snapshot], runAction };
+    const previewWorktreeClose = vi.fn(async () => ({ path: "/remote/kept-dispatch", confirmed_dirty: true }));
+    const rt = { ...initial, snapshot, fleet: [snapshot], runAction, previewWorktreeClose };
     const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from };
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
     const pane = () => screen.getByTestId("agent-pane-overlay");
@@ -339,6 +340,9 @@ describe("agent pane overlay", () => {
     expect(within(pane()).getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     fireEvent.click(close());
     let dialog = screen.getByRole("alertdialog");
+    await act(async () => {});
+    expect(dialog).toHaveTextContent("/remote/kept-dispatch");
+    expect(previewWorktreeClose).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, ["pane-planner"], "process-a");
     expect(dialog).toHaveTextContent("Close Plan / architecture?");
     expect(dialog.closest("[inert]")).toBeNull();
     expect(pane().closest("[inert]")).not.toBeNull();
@@ -348,6 +352,7 @@ describe("agent pane overlay", () => {
 
     fireEvent.click(close());
     dialog = screen.getByRole("alertdialog");
+    await act(async () => {});
     fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" }));
     expect(within(dialog).getByRole("button", { name: "Stopping…" })).toBeDisabled();
     expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a" });
