@@ -1,14 +1,52 @@
 # Running the full CI matrix on demand, instead of on this box
 
-Issue #896. `.github/workflows/ci.yml` carries a bare `workflow_dispatch:` trigger, so any pushed branch can have the full matrix run on GitHub's runners with no local CPU at all. Nothing said so anywhere an agent would read it. The trigger itself is no secret — `release.yml`, `tag-release.yml` and `docs-publish.yml` are each described as `workflow_dispatch`-able in [`governance.md`](governance.md) and in their own skills — but `ci.yml`'s was written about nowhere, so every dispatched unit compiled everything locally, on a box already running the other units. This page is the mechanism, the commands, and the harder half: when to reach for it, and when reaching for it makes things worse.
+Issue #896. `.github/workflows/ci.yml` carries a `workflow_dispatch:` trigger, so any pushed branch can have the full matrix run on GitHub's runners with no local CPU at all. Nothing said so anywhere an agent would read it. The trigger itself is no secret — `release.yml`, `tag-release.yml` and `docs-publish.yml` are each described as `workflow_dispatch`-able in [`governance.md`](governance.md) and in their own skills — but `ci.yml`'s was written about nowhere, so every dispatched unit compiled everything locally, on a box already running the other units. This page is the mechanism, the commands, and the harder half: when to reach for it, and when reaching for it makes things worse.
 
 **It adds coverage; it does not subtract work.** Nothing here removes a local gate — the section below says why it cannot — and what it moves onto a runner is the optional sweeps, not the mandatory ones. [`build-gate.md`](build-gate.md) bounds how much of what stays here runs at once, and issue [#864](https://github.com/vfarcic/dot-agent-deck/issues/864) — `sccache`, a shared `CARGO_TARGET_DIR`, and the untouched `[profile.dev] debug` setting — is the change that attacks the cost itself. Reach for this when the box is the constraint today; reach for #864 when the question is how many agents this box can hold.
+
+## Which sweep to run (issue #2090)
+
+**A pre-PR sweep on GitHub's runners is the expensive way to get an answer the pull request will get anyway.** In the window issue #2090 measured (2026-10-30 21:15 → 2026-11-03 03:10 UTC), 63 dispatches of `ci.yml` from agent branches used 8,195 GitHub job-minutes, 1,336 of them macOS, which was 65 % of `ci.yml`'s GitHub job time: about 130 job-minutes and a p50 of 21.7 minutes of wall per sweep, and `build-macos` finished last in 51 of the 63. While `.github/ci-backend` says `rwx`, opening the pull request runs the same Linux jobs on RWX as `RWX: linux`, and a dispatch re-ran all of them on GitHub on top of that, because the backend switch applies to pull requests only.
+
+So pick the sweep by what you are missing, not by habit:
+
+| your situation | the sweep | GitHub job-minutes |
+| --- | --- | --- |
+| `rwx` is installed and `rwx whoami` succeeds | `rwx run .rwx/ci.yml` for the Linux half (below) | none |
+| and the change needs macOS, which your gates did not run on | also `gh workflow run ci.yml --ref <branch> -f linux_jobs=false` | `build-macos` and `changes` only |
+| no `rwx` CLI, your gates ran on macOS (a Mac, with `DAD_REMOTE_EXEC` unset) | `gh workflow run ci.yml --ref <branch> -f build_macos=false` | the Linux jobs |
+| no `rwx` CLI, your gates did not run on macOS | `gh workflow run ci.yml --ref <branch>`, the whole matrix | everything, as before #2090 |
+
+**When your gates did not run on macOS** means a Linux host, or `DAD_REMOTE_EXEC=rwx` sending `cargo xtask affected-checks --run`'s cargo commands to the Linux sandbox (unless the helper printed its note that it fell back to running them locally). A pull request does not run `build-macos`, so on such a machine a sweep is how that job runs before the merge, and dropping it moves a macOS-only defect's discovery to `main`'s push run (rule 8's post-merge watch). On a Mac running its gates locally, `cargo test-fast` has already run on macOS the `cargo nextest run --workspace` tier that `build-macos` runs. What the job still adds there is its bare `cargo clippy -- -D warnings`, which lints the `not(feature = "e2e")` arms in `src/` that the gate's clippy does not (CLAUDE.md rule 2): keep `build_macos` on for a change inside one of those arms. How much the job adds beyond that is not measured, which is #2090's open caveat.
+
+**Not sweeping at all is an option too.** The sweep buys the answer earlier than opening the pull request; it adds no check the pull request would not run, apart from `build-macos`.
+
+### The RWX sweep: `rwx run .rwx/ci.yml`
+
+`.rwx/ci.yml` has a `cli` trigger besides its `pull_request` one. On it, the `backend` task sets the run active whatever `.github/ci-backend` says and classifies with no file list, which `scripts/ci-changes.sh` answers with everything, so the run is the full DAG `RWX: linux` runs on a pull request: `fmt`, `clippy`, `build-release`, `linkage-check`, `test`, `e2e-build` and the `e2e` tier, the three desktop jobs, `windows-cross-check`, `security` (and its vendored-upstream audit), the vendored crossterm test, `nix`, `devbox` and the aarch64 cross-build. Its header says a run started this way tests local uncommitted changes on top of the pushed `HEAD`; push first anyway, so the run and the pull request see the same commit.
+
+```bash
+rwx whoami                         # fails without a login: use the GitHub rows of the table instead
+git push -u origin <branch>
+rwx run .rwx/ci.yml                # prints the run's URL; its last segment is the run id
+rwx results <run-id>               # the outcome, per task
+rwx logs <task-attempt-id>         # one task's log, for a red
+```
+
+What it does not run: `cross-version` (RWX cannot, see [rwx.md](rwx.md); the pull request runs it on GitHub), `build-macos` (RWX has no macOS runners), and the advisory `release-lib`, which is its own run definition (`rwx run .rwx/release-lib.yml`). It spends RWX credits instead of GitHub minutes. The flags of `rwx run` (whether it can wait for the run, for one) are not written down here because this change was made on a machine without the CLI: read `rwx run --help`.
+
+### The GitHub sweep's two inputs
+
+`ci.yml`'s `workflow_dispatch` takes two boolean inputs, both defaulting to `true`, so a dispatch with no `-f` runs what it ran before #2090:
+
+- `build_macos=false` skips `build-macos`, the only macOS job.
+- `linux_jobs=false` skips every Linux job but `changes`, `cross-version` included, by setting the `changes` job's `linux_backend` output to `rwx`, the value under which those jobs already skip for an RWX-owned pull request. What runs is `changes` and, unless you also pass `build_macos=false`, `build-macos`.
 
 ## The commands
 
 ```bash
 git push -u origin <branch>
-gh workflow run ci.yml --ref <branch>                 # prints the new run's URL
+gh workflow run ci.yml --ref <branch> [-f build_macos=false | -f linux_jobs=false]   # prints the new run's URL
 gh run watch <run-id>                                 # follow it
 gh run view <run-id> --log-failed                     # read only what broke
 ```
@@ -26,7 +64,7 @@ That block is not a sketch: it was run end to end against this repository on 202
 
 ## What a dispatch actually runs
 
-Every job in `ci.yml` but one: `changes`, `desktop-web`, `desktop-browser`, `desktop-driver`, `fmt`, `clippy`, `build-release`, `test`, `release-lib`, `build`, `e2e-build`, the five `e2e` shards, `e2e-deterministic`, `cross-version`, `windows-cross-check`, `build-windows` (which reports `skipped`: it is `if: false` until Windows ships), `build-macos`, `security`, `nix` and `devbox`. The exception, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
+With both inputs at their defaults, every job in `ci.yml` but one: `changes`, `desktop-web`, `desktop-browser`, `desktop-driver`, `fmt`, `clippy`, `build-release`, `test`, `release-lib`, `build`, `e2e-build`, the five `e2e` shards, `e2e-deterministic`, `cross-version`, `windows-cross-check`, `build-windows` (which reports `skipped`: it is `if: false` until Windows ships), `build-macos`, `security`, `nix` and `devbox`. The exception, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
 
 That list is read off a real dispatch rather than off the file: run [`35025264144`](https://github.com/vfarcic/dot-agent-deck/actions/runs/35025264144), a `workflow_dispatch` on this repository on 2026-09-15, ran exactly the eleven that existed then and reported `notify-main-red` as `skipped`, finishing green in 8.8 minutes; issue #953 added `desktop-driver`, and run [`36231844544`](https://github.com/vfarcic/dot-agent-deck/actions/runs/36231844544), a dispatch of that issue's branch on 2026-09-26, ran the twelve that existed then and skipped `notify-main-red`, green in 14.1 minutes; issue #1507 added `cross-version`, and run [`37141989587`](https://github.com/vfarcic/dot-agent-deck/actions/runs/37141989587), a dispatch of that issue's branch on 2026-10-03, listed the thirteen that existed then while `notify-main-red` was still unresolved. The split of `build` into `fmt`, `clippy`, `build-release` and `test`, and of `e2e-deterministic` into `e2e-build` and five `e2e` shards, both kept as aggregators under their old names, came after that and has not been read off a dispatch here. Note the shape of that last part before reading a job list yourself — a completed run reports **fourteen** jobs, the fourteenth `skipped`, while a run still in progress lists only the thirteen, because a skipped job appears only once its condition has resolved. So filter rather than counting:
 
@@ -96,4 +134,4 @@ The p90-to-max spread is worth reading before planning around the median: a queu
 
 ## Where an agent is told this
 
-CLAUDE.md rule 5 carries the short version, next to the three tiers, because that is where a reader asks what they owe and on which machine. The three dispatch skills — [`issue-queue`](../../.claude/skills/issue-queue/SKILL.md), [`prd-queue`](../../.claude/skills/prd-queue/SKILL.md) and [`pr-review-queue`](../../.claude/skills/pr-review-queue/SKILL.md) — put a line in the task text they compose, so a dispatched unit learns it the same way it learns the gates. What those four carry is the relieves-nothing framing, the *when*, and the one or two numbers that make the case; the mechanism, the samples behind the numbers and the narrowings live here, and that is the split to preserve when any of them is edited.
+CLAUDE.md rule 5 carries the short version, next to the three tiers, because that is where a reader asks what they owe and on which machine. Since issue #2090 that version leads with [which sweep to run](#which-sweep-to-run-issue-2090) rather than with the bare dispatch. The three dispatch skills — [`issue-queue`](../../.claude/skills/issue-queue/SKILL.md), [`prd-queue`](../../.claude/skills/prd-queue/SKILL.md) and [`pr-review-queue`](../../.claude/skills/pr-review-queue/SKILL.md) — put a line in the task text they compose, so a dispatched unit learns it the same way it learns the gates. What those four carry is the relieves-nothing framing, the *when*, and the one or two numbers that make the case; the mechanism, the samples behind the numbers and the narrowings live here, and that is the split to preserve when any of them is edited.

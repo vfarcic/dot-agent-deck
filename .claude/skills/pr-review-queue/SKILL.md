@@ -419,10 +419,14 @@ EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
   <if authored by the runner:>
     On YOUR branch you may start runs. `gh run rerun --failed <run-id>`
     re-runs only what broke, with no commit. And the full matrix can run on
-    GitHub's runners instead of this box: ci.yml carries a bare
+    GitHub's runners instead of this box: ci.yml carries a
     `workflow_dispatch:`, so `gh workflow run ci.yml --ref <headRefName>`
     dispatches it — take the run id from the URL it prints, because a listing
-    on a branch with an open PR returns the PR's run, not yours. Reach for it
+    on a branch with an open PR returns the PR's run, not yours. Sweep only
+    the half you are missing: with a working `rwx` login,
+    `rwx run .rwx/ci.yml` runs the Linux half on RWX and
+    `-f linux_jobs=false` dispatches build-macos alone; without one,
+    `-f build_macos=false` when your gates ran on macOS. Reach for it
     when the box is loaded, when a change needs build-macos (build-windows is
     `if: false` until Windows ships, so a dispatch does not run it),
     or as a sweep after your fixes. It relieves no gate: the gates
