@@ -309,7 +309,11 @@ describe("useDeckRuntime", () => {
    * each kept a dispatched worktree. The runtime holds one notice per
    * broadcast, from any deck, and dismissing one leaves the other on screen;
    * the close-confirmation preview passes the deck and its panes through to
-   * the bridge untouched.
+   * the bridge untouched. A broadcast stamped with a deck the fleet knows
+   * resolves to that deck's LABEL once, when it arrives (review on PR #2222) —
+   * the notice outlives navigation and the same checkout path can exist on
+   * more than one machine — and a stamp naming no deck the fleet knows leaves
+   * the notice naming the path alone.
    */
   it("holds one kept-worktree notice per broadcast and passes the preview through", async () => {
     let onWorktreeKept: ((kept: { path: string; confirmedDirty: boolean; deck?: string }) => void) | undefined;
@@ -322,11 +326,11 @@ describe("useDeckRuntime", () => {
     await waitFor(() => expect(result.current.snapshot.connection.status).toBe("connected"));
     await waitFor(() => expect(onWorktreeKept).toBeDefined());
 
-    act(() => onWorktreeKept!({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true, deck: FIXTURE_REMOTE_DAEMON_ID }));
-    act(() => onWorktreeKept!({ path: "/home/dev/code/deck-dispatch-another", confirmedDirty: false }));
-    expect(result.current.keptWorktrees?.map(({ path, confirmedDirty }) => ({ path, confirmedDirty }))).toEqual([
-      { path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true },
-      { path: "/home/dev/code/deck-dispatch-another", confirmedDirty: false },
+    act(() => onWorktreeKept!({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true, deck: FIXTURE_DAEMON_ID }));
+    act(() => onWorktreeKept!({ path: "/home/dev/code/deck-dispatch-another", confirmedDirty: false, deck: FIXTURE_REMOTE_DAEMON_ID }));
+    expect(result.current.keptWorktrees?.map(({ path, confirmedDirty, deck }) => ({ path, confirmedDirty, deck }))).toEqual([
+      { path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true, deck: "Local daemon" },
+      { path: "/home/dev/code/deck-dispatch-another", confirmedDirty: false, deck: undefined },
     ]);
 
     // Dismissing one notice leaves the other; each is its own dismissal.

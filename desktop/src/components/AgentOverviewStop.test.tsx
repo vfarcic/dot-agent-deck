@@ -217,6 +217,32 @@ describe("the close confirmation warns about a kept worktree (issue #1674)", () 
     expect(dialog).toHaveTextContent("Close planner?");
     expect(dialog).not.toHaveTextContent("KEPT");
   });
+
+  /**
+   * Scenario (review on PR #2222): Close is pressed on the planner role's row
+   * and then on the orchestration's card while both previews are pending. The
+   * presses resolve out of order — the orchestration's reply first, the
+   * planner's late. The late reply must not replace the newer question with
+   * the older one, because the user would then confirm a close for an agent
+   * they were no longer reading about.
+   */
+  it("keeps the newer close's question when two previews resolve out of order", async () => {
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    const pending = new Map<string, (kept: { path: string; confirmedDirty: boolean } | null) => void>();
+    const worktreeClosePreview = vi.fn((_deckId: string, paneIds: string[]) => new Promise<{ path: string; confirmedDirty: boolean } | null>((resolve) => { pending.set(paneIds.join(","), resolve); }));
+    render(<AgentOverview runtime={runtime(runAction, fleetWithOrchestration(), worktreeClosePreview)} onNavigate={vi.fn()} />);
+
+    await act(async () => fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")));
+    const remoteGroup = screen.getAllByTestId("daemon-group").find((group) => group.getAttribute("data-daemon-id") === FIXTURE_REMOTE_DAEMON_ID)!;
+    await act(async () => fireEvent.click(within(remoteGroup).getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" })));
+
+    await act(async () => pending.get("pane-41,pane-42")!({ path: "/home/build/code/orchestration", confirmedDirty: true }));
+    expect(confirmation()).toHaveTextContent("Close demo-project-orchestrator-1?");
+
+    await act(async () => pending.get("pane-41")!({ path: "/home/build/code/planner", confirmedDirty: true }));
+    expect(confirmation()).toHaveTextContent("Close demo-project-orchestrator-1?");
+    expect(confirmation()).not.toHaveTextContent("Close planner?");
+  });
 });
 
 describe("a spoken stop holds to the daemon process it named (PRD #1666 part 2, G-fix7)", () => {

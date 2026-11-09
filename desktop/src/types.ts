@@ -1602,6 +1602,15 @@ export interface KeptWorktreeView {
  */
 export interface KeptWorktreeEntry extends KeptWorktreeView {
   id: number;
+  /**
+   * The deck whose close kept the worktree, as a display label (`deckName`),
+   * resolved when the broadcast arrived — `CleanupWarningEntry.deck`'s
+   * precedent (issue #1234): these notices collect reports from every
+   * observed deck and outlive navigation, and the same checkout path can exist
+   * on more than one of them, so a path alone cannot say which machine kept
+   * the work. Absent when the broadcast named no deck the fleet knows.
+   */
+  deck?: string;
 }
 
 export interface DeckRuntimeState {

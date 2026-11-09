@@ -375,6 +375,32 @@ describe("agent pane overlay", () => {
     expect(rt.runAction).not.toHaveBeenCalled();
   });
 
+  /**
+   * Scenario (review on PR #2222): the pane's Close is pressed and its
+   * kept-worktree preview is still pending when the user leaves the pane for
+   * the dashboard. The late reply must open no dialog over the screen that
+   * replaced the pane — the question it was arming for is gone, and a stale
+   * one would still submit the captured stop when confirmed.
+   */
+  it("opens nothing when its preview resolves after the pane was left", async () => {
+    let settle!: (kept: { path: string; confirmedDirty: boolean } | null) => void;
+    const worktreeClosePreview = vi.fn(() => new Promise<{ path: string; confirmedDirty: boolean } | null>((resolve) => { settle = resolve; }));
+    const stamped = createFixtureSnapshot("connected");
+    const agents = stamped.agents.map((agent) => agent.id === "planner" ? { ...agent, paneId: "pane-planner" } : agent);
+    const withPane = { ...stamped, agents };
+    const rt = runtime({ snapshot: withPane, fleet: [withPane], worktreeClosePreview });
+    render(<DeckShell runtime={rt} initialView={{ kind: "agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", from: "overview" }} />);
+
+    await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" })));
+    expect(worktreeClosePreview).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, ["pane-planner"]);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+
+    await act(async () => fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Back to dashboard" })));
+    await act(async () => settle({ path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    expect(rt.runAction).not.toHaveBeenCalled();
+  });
+
   /** Scenario: cancel a pending close, then ask to close the same pane again or a different agent's pane. Success of the first request dismisses the second dialog only when its owning pane closes. */
   it.each([false, true])("scopes a late successful stop to its owning pane (different pane: %s)", async (differentPane) => {
     let settle!: (result: DeckActionResult) => void;

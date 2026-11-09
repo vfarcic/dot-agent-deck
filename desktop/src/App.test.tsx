@@ -1597,6 +1597,37 @@ describe("ControlDeck", () => {
     expect(screen.getByText("Local daemon stopped.")).toBeVisible();
   });
 
+  /**
+   * Scenario (issue #1674, review on PR #2222): Close is pressed on the deck
+   * screen for one agent and, while its kept-worktree preview is still
+   * pending, another agent is focused and Close pressed for it too. The two
+   * previews resolve out of order. The newer close's question is the one on
+   * screen, and the older preview's late reply cannot replace it — the user
+   * would otherwise confirm a close for an agent they were no longer reading
+   * about.
+   */
+  it("keeps the newer close's question on the deck screen when two previews resolve out of order", async () => {
+    const stamped = createFixtureSnapshot("connected");
+    const agents = stamped.agents.map((agent) => agent.id === "planner" ? { ...agent, paneId: "pane-planner" } : agent.id === "builder" ? { ...agent, paneId: "pane-builder" } : agent);
+    const withPane = { ...stamped, agents };
+    const pending = new Map<string, (kept: { path: string; confirmedDirty: boolean } | null) => void>();
+    const worktreeClosePreview = vi.fn((_deckId: string, paneIds: string[]) => new Promise<{ path: string; confirmedDirty: boolean } | null>((resolve) => { pending.set(paneIds.join(","), resolve); }));
+    const live = runtime({ mode: "live", snapshot: withPane, fleet: [withPane], worktreeClosePreview });
+    render(<ControlDeck runtime={live} />);
+
+    fireEvent.mouseDown(screen.getByTestId("agent-tile-planner"));
+    await act(async () => fireEvent.click(screen.getByTestId("stop-run")));
+    fireEvent.mouseDown(screen.getByTestId("agent-tile-builder"));
+    await act(async () => fireEvent.click(screen.getByTestId("stop-run")));
+
+    await act(async () => pending.get("pane-builder")!({ path: "/home/dev/code/deck-dispatch-builder", confirmedDirty: true }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Close Builder?");
+
+    await act(async () => pending.get("pane-planner")!({ path: "/home/dev/code/deck-dispatch-planner", confirmedDirty: true }));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Close Builder?");
+    expect(screen.getByRole("alertdialog")).not.toHaveTextContent("Close Planner?");
+  });
+
   /** Scenario: Replaces an incompatible zero-agent daemon through an explicit confirmation, on the shared upgrade path. */
   it("replaces an incompatible zero-agent daemon through an explicit confirmation", async () => {
     const incompatible = createFixtureSnapshot("error");

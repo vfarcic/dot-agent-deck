@@ -70,6 +70,20 @@ describe("the kept-worktree toast (issue #1674)", () => {
     expect(screen.getByTestId("worktree-kept-toast")).toHaveTextContent("deck-dispatch-another");
   });
 
+  /**
+   * Scenario (review on PR #2222): a kept-worktree notice whose broadcast was
+   * stamped with a deck the fleet knows names that deck beside the path — the
+   * same checkout path can exist on more than one machine, and the notice
+   * outlives whichever deck is selected when it is read.
+   */
+  it("names the deck that kept the worktree beside the path", () => {
+    const kept: KeptWorktreeEntry[] = [
+      { id: 1, path: "/home/dev/code/deck-dispatch-issue-1674", confirmedDirty: true, deck: "dev@build-box" },
+    ];
+    render(<DeckShell runtime={runtimeOf(createFixtureSnapshot("connected"), kept, vi.fn())} initialView={{ kind: "overview" }} />);
+    expect(screen.getByTestId("worktree-kept-toast")).toHaveTextContent("Uncommitted work here is KEPT, not deleted: /home/dev/code/deck-dispatch-issue-1674 on dev@build-box.");
+  });
+
   /** Scenario: with nothing kept, no notice renders — the toast stack shows nothing for this feature. */
   it("renders nothing when no worktree was kept", () => {
     render(<DeckShell runtime={runtimeOf(createFixtureSnapshot("connected"), [], vi.fn())} initialView={{ kind: "overview" }} />);

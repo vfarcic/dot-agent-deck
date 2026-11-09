@@ -368,7 +368,28 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const newAgentVoice = useRef<NewAgentVoice | undefined>(undefined);
   const agentView = view.kind === "agent" ? view : undefined;
   const [agentStopConfirm, setAgentStopConfirm] = useState<ConfirmState & { ownerView: NonNullable<typeof agentView> }>(); // voice-registry-exempt: the confirmation confirmStopAgent opens, not an independently opened capability
+  /**
+   * Issue #1674, review on PR #2222 — the pane's close confirmation arms
+   * through a preview the daemon answers asynchronously, and this shell keeps
+   * the slot it installs into across navigation, so the reply needs two
+   * guards beyond the overview's request number. Each request mints the next
+   * number, and the effect below bumps it whenever the view moves off a pane:
+   * a reply that lands after its pane was left or retired opens nothing,
+   * rather than a stale question over whatever screen replaced it. The
+   * functional `setAgentStopConfirm` in the reply is the second guard: a
+   * dialog that opened meanwhile is never replaced.
+   */
+  const paneCloseRequests = useRef(0);
+  /*
+   * And the reply's second sight: whether ANY confirmation is open by the
+   * time it lands, not only this slot's own — the Upgrade dialog the deck
+   * screen can open during the preview's window included. Held as a ref so
+   * the continuation reads it as of the last render, which is the last thing
+   * the user saw; assigned where `confirmationOpen` is computed, below.
+   */
+  const confirmationOpenRef = useRef(false);
   useEffect(() => {
+    paneCloseRequests.current += 1;
     setAgentStopConfirm((current) => current?.ownerView === agentView ? current : undefined);
   }, [agentView]);
   // A stopped agent can disappear from the listing before its action replies.
@@ -918,6 +939,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    */
   const localUpgrade = useLocalUpgradeAtStart(runtime);
   const confirmationOpen = screenConfirmationOpen || localUpgrade.target !== undefined || agentStopConfirm !== undefined;
+  confirmationOpenRef.current = confirmationOpen;
   const confirmPaneStop = useCallback((target: VoiceDispatchTarget): string | undefined => {
     if (confirmationOpen) return CONFIRMATION_ALREADY_OPEN;
     if (overlayAbove(document.querySelector(".agent-pane-overlay"))) return "Close what is open over the agent first. Nothing was closed.";
@@ -929,11 +951,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
      * Issue #1674: the preview is asked before the question opens, as every
      * other close confirmation now does, so the kept-worktree warning is in
      * the body the user reads. The answer to the utterance is unchanged —
-     * `undefined` says the question is opening, which it is.
+     * `undefined` says the question is opening, which it is. The request's
+     * number and the functional install are the review's guards (PR #2222):
+     * a reply that lands after this pane was left, retired, or closed again
+     * opens nothing and replaces no dialog that is already open.
      */
+    const request = ++paneCloseRequests.current;
     void keptWorktreeForClose(runtime.worktreeClosePreview, paneAgent.daemonId, paneAgent.paneId ? [paneAgent.paneId] : []).then((kept) => {
+      if (paneCloseRequests.current !== request || confirmationOpenRef.current) return;
       const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, kept);
-      setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
+      setAgentStopConfirm((current) => current ?? { ...question, ownerView: agentView, action: async () => {
         const attempt = { view: agentView };
         stoppingAttempt.current = attempt;
         try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
@@ -1817,6 +1844,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const notice = noticeState?.message;
   const setNotice = (message: string | undefined, detail?: string) => setNoticeState(message === undefined ? undefined : { message, ...(detail === undefined ? {} : { detail }) });
   const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
+  /**
+   * Issue #1674, review on PR #2222 — the deck screen's Close arms through a
+   * preview the daemon answers asynchronously, so the selection can move to
+   * another agent while one is pending. Each request mints the next number,
+   * and a reply installs its question only while its number is still current:
+   * the close the user asked for LAST is the question that opens, and a reply
+   * never replaces a dialog that is already open.
+   */
+  const closePreviewRequests = useRef(0);
   const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
      or closes, exactly as the overview reports its own: the voice panel's gate
@@ -2252,10 +2288,15 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
      * dispatched worktree BEFORE the question opens — the overview's and the
      * TUI's arm the same way — so the warning is in the body the user reads.
      * Best-effort: a preview that fails or cannot be asked opens the question
-     * exactly as it read before this existed.
+     * exactly as it read before this existed. The request's number and the
+     * functional install are the review's guards (PR #2222): a reply from a
+     * close whose selection has since moved opens nothing, and no reply
+     * replaces a dialog that is already open.
      */
+    const request = ++closePreviewRequests.current;
     void keptWorktreeForClose(runtime.worktreeClosePreview, snapshot.connection.deckId, selectedAgent.paneId ? [selectedAgent.paneId] : []).then((kept) => {
-      setConfirm({
+      if (closePreviewRequests.current !== request) return;
+      setConfirm((current) => current ?? {
         title: `Close ${selectedAgent.role}?`,
         body: `This sends a stop request to ${selectedAgent.displayName}. Unsaved terminal work may be interrupted.${kept ? ` ${keptWorktreeSentence(kept)}` : ""}`,
         label: "Close agent",

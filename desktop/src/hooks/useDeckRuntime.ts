@@ -442,7 +442,15 @@ export function useDeckRuntime(): DeckRuntimeState {
     void bridge.onWorktreeKept((kept) => {
       if (!active) return;
       nextKeptWorktreeId.current += 1;
-      const entry: KeptWorktreeEntry = { id: nextKeptWorktreeId.current, path: kept.path, confirmedDirty: kept.confirmedDirty };
+      /*
+       * The broadcast's deck stamp resolves to a LABEL here, once, as the
+       * cleanup warnings do (issue #1234): the notice outlives navigation and
+       * selection, so the fleet as it is when the notice is READ cannot say
+       * which machine kept the work — and the same checkout path can exist on
+       * more than one of them.
+       */
+      const deck = kept.deck === undefined ? undefined : fleetRef.current.find((entry) => entry.connection.deckId === kept.deck);
+      const entry: KeptWorktreeEntry = { id: nextKeptWorktreeId.current, path: kept.path, confirmedDirty: kept.confirmedDirty, ...(deck ? { deck: deckName(deck.connection) } : {}) };
       setKeptWorktrees((current) => [...current, entry]);
     }).then((stop) => {
       if (active) unsubscribe = stop;

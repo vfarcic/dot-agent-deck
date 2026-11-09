@@ -3636,6 +3636,12 @@ impl DaemonClient {
     /// would keep nothing, so `Ok(None)` needs no error arm: it is the
     /// ordinary answer, not a malformed one.
     ///
+    /// On a gated handle the request goes only to a daemon admitted on its
+    /// own connection (PRD #1666 part 2), for [`Self::stop_agent`]'s reason:
+    /// pane ids belong to one daemon process, so a replacement the client
+    /// would refuse may resolve the same pane id to an unrelated worktree,
+    /// and must not be asked.
+    ///
     /// Best-effort by contract, and the caller holds the deadline: the TUI
     /// bounds its own ask at 500 ms and renders no warning on any failure,
     /// and the desktop does the same, so a caller that cannot afford to wait
@@ -3645,7 +3651,7 @@ impl DaemonClient {
         &self,
         pane_ids: &[String],
     ) -> Result<Option<crate::issue_dispatch_run::KeptWorktree>, ClientError> {
-        let (mut rd, mut wr) = self.connect().await?;
+        let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -9050,22 +9056,27 @@ pub(crate) mod gate_fixture {
 /// issue #717, through [`DaemonClient::dispatch_worktree_close_preview`]. The
 /// daemon handler and the worktree policy it reads are driven end to end by
 /// `dispatch/close/002` through the TUI; what nothing else exercised is the
-/// CLIENT's wire behaviour, which is what this pins: the pane ids the request
-/// carries, and the reply field's readings.
+/// CLIENT's wire behaviour, which is what this pins: the gate's `Hello` the
+/// request rides behind (review on PR #2222: the preview goes through
+/// `admitted_connect`, as every desktop request does), the pane ids the
+/// request carries, and the reply field's readings.
 #[cfg(all(test, unix))]
 mod close_preview_tests {
     use super::*;
     use crate::daemon_protocol::{
-        AttachRequest, AttachResponse, KIND_REQ, bind_attach_listener, read_frame, write_resp,
+        AttachRequest, AttachResponse, KIND_REQ, PROTOCOL_VERSION, bind_attach_listener,
+        read_frame, write_resp,
     };
     use crate::issue_dispatch_run::KeptWorktree;
     use spec::spec;
     use std::sync::{Arc, Mutex};
 
     /// One scripted reply for every connection, and a log of the requests it
-    /// answered. A trimmed copy on the `gate_fixture` model rather than a lift
-    /// into it: that fixture answers `Hello` and serves follow-ons, none of
-    /// which a bare `connect()` — the preview's only path — ever sends.
+    /// answered — the gate's `Hello` included, so a request that arrived on an
+    /// unopened connection leaves a log the assertions can refuse. A trimmed
+    /// copy on the `gate_fixture` model rather than a lift into it: that
+    /// fixture answers `Hello` and serves follow-ons for requests with
+    /// scripted replies of their own, which this peer's three readings are not.
     struct PreviewPeer {
         _dir: tempfile::TempDir,
         path: std::path::PathBuf,
@@ -9087,14 +9098,42 @@ mod close_preview_tests {
             let log = Arc::clone(&requests);
             tokio::spawn(async move {
                 while let Ok(mut stream) = listener.accept().await {
-                    let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
-                        continue;
-                    };
-                    let Ok(request) = serde_json::from_slice(&payload) else {
-                        continue;
-                    };
-                    log.lock().unwrap().push(request);
-                    let _ = write_resp(&mut stream, &reply).await;
+                    let log = Arc::clone(&log);
+                    let reply = reply.clone();
+                    tokio::spawn(async move {
+                        // The gate opens with `Hello { follow_on: true }`
+                        // (PRD #1666 part 2); answer it as a daemon that can
+                        // serve a request on the same connection. A first
+                        // frame that is not that Hello gets no answer at all,
+                        // so a client that sends its preview unchecked fails
+                        // rather than passing.
+                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                            return;
+                        };
+                        let Ok(request) = serde_json::from_slice::<AttachRequest>(&payload) else {
+                            return;
+                        };
+                        let AttachRequest::Hello {
+                            follow_on: true, ..
+                        } = &request
+                        else {
+                            return;
+                        };
+                        log.lock().unwrap().push(request);
+                        let _ = write_resp(
+                            &mut stream,
+                            &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
+                        )
+                        .await;
+                        let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await else {
+                            return;
+                        };
+                        let Ok(request) = serde_json::from_slice(&payload) else {
+                            return;
+                        };
+                        log.lock().unwrap().push(request);
+                        let _ = write_resp(&mut stream, &reply).await;
+                    });
                 }
             });
             Self {
@@ -9107,16 +9146,24 @@ mod close_preview_tests {
         fn requests(&self) -> Vec<AttachRequest> {
             self.requests.lock().unwrap().clone()
         }
+
+        /// The preview client the desktop holds: gated, so every request goes
+        /// on a connection whose own `Hello` this build's protocol check
+        /// passed — the shape [`PreviewPeer`]'s handshake answers.
+        fn client(&self) -> DaemonClient {
+            DaemonClient::new(self.path.clone()).with_protocol_gate()
+        }
     }
 
-    /// Scenario: the close-confirmation preview asks the daemon whether closing panes would keep a dispatched worktree. The request carries the pane ids the caller named verbatim; a reply that kept nothing reads `Ok(None)`; one that kept a tree reads `Ok(Some)` with the path and the confirmed-dirty flag; a refused request surfaces the daemon's error rather than reading as "nothing kept", because a dialog that mistook a failure for an answer would warn about nothing while a directory stayed on disk.
+    /// Scenario: the close-confirmation preview asks the daemon whether closing panes would keep a dispatched worktree. The ask rides behind the gate's Hello on the same connection, as every desktop request does; the request carries the pane ids the caller named verbatim; a reply that kept nothing reads `Ok(None)`; one that kept a tree reads `Ok(Some)` with the path and the confirmed-dirty flag; a refused request surfaces the daemon's error rather than reading as "nothing kept", because a dialog that mistook a failure for an answer would warn about nothing while a directory stayed on disk.
     #[spec("protocol/close-preview/001")]
     #[tokio::test]
     async fn close_preview_001_the_client_sends_the_panes_and_reads_the_kept_worktree() {
         let pane_ids = vec!["pane-41".to_string(), "pane-42".to_string()];
 
         let nothing_kept = PreviewPeer::spawn(AttachResponse::ok());
-        let answer = DaemonClient::new(nothing_kept.path.clone())
+        let answer = nothing_kept
+            .client()
             .dispatch_worktree_close_preview(&pane_ids)
             .await
             .expect("a clean preview reply");
@@ -9127,9 +9174,9 @@ mod close_preview_tests {
         assert!(
             matches!(
                 nothing_kept.requests().as_slice(),
-                [AttachRequest::DispatchWorktreeClosePreview { pane_ids: sent }] if sent.as_slice() == pane_ids.as_slice()
+                [AttachRequest::Hello { follow_on: true, .. }, AttachRequest::DispatchWorktreeClosePreview { pane_ids: sent }] if sent.as_slice() == pane_ids.as_slice()
             ),
-            "the request carries the panes the caller named, verbatim: {:?}",
+            "the ask opens with the gate's Hello and then carries the panes the caller named, verbatim: {:?}",
             nothing_kept.requests()
         );
 
@@ -9139,7 +9186,8 @@ mod close_preview_tests {
             confirmed_dirty: true,
         });
         let kept = PreviewPeer::spawn(kept_reply);
-        let answer = DaemonClient::new(kept.path.clone())
+        let answer = kept
+            .client()
             .dispatch_worktree_close_preview(&pane_ids)
             .await
             .expect("a preview reply naming a kept worktree");
@@ -9153,7 +9201,8 @@ mod close_preview_tests {
         );
 
         let refused = PreviewPeer::spawn(AttachResponse::err("worktree registry unavailable"));
-        let error = DaemonClient::new(refused.path.clone())
+        let error = refused
+            .client()
             .dispatch_worktree_close_preview(&pane_ids)
             .await
             .expect_err("a refused preview is an error, not a silent nothing");

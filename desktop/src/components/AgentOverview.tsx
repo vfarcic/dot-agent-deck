@@ -824,11 +824,17 @@ export function stopTargetName(agent: OverviewAgent): string {
  * says about a dispatched worktree that is kept. The TUI's sentences, so the
  * two clients say the same words for the same fact (CLAUDE.md rule 22), with
  * the path spelled out because going to it is the whole point of the report.
+ * A post-close notice that knows which deck kept the work names it beside the
+ * path (review on PR #2222): these notices collect reports from every
+ * observed deck, and the same checkout path can exist on more than one of
+ * them. The close confirmation passes the preview's answer, which names no
+ * deck — its body already does.
  */
-export function keptWorktreeSentence(kept: KeptWorktreeView): string {
+export function keptWorktreeSentence(kept: KeptWorktreeView & { deck?: string }): string {
+  const where = kept.deck === undefined ? "" : ` on ${kept.deck}`;
   return kept.confirmedDirty
-    ? `Uncommitted work here is KEPT, not deleted: ${kept.path}.`
-    : `Uncommitted work here, if any, is KEPT: ${kept.path}.`;
+    ? `Uncommitted work here is KEPT, not deleted: ${kept.path}${where}.`
+    : `Uncommitted work here, if any, is KEPT: ${kept.path}${where}.`;
 }
 
 /**
@@ -1308,6 +1314,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
+  /**
+   * Issue #1674, review on PR #2222 — the close confirmations on this screen
+   * arm through a preview the daemon answers asynchronously, so two of them
+   * can be pending at once. Each request mints the next number here, and a
+   * reply installs its question only while its number is still current: a
+   * newer close supersedes an older pending preview (the last thing the user
+   * clicked is the question they are about to answer), and a reply never
+   * replaces a dialog that is already open.
+   */
+  const closePreviewRequests = useRef(0);
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
   /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */
@@ -1477,10 +1493,15 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          * the TUI's dialog arms (issue #717), so the warning is in the body
          * the user reads rather than a late amendment to it. Best-effort: a
          * preview that fails or cannot be asked opens the question exactly as
-         * it read before this existed.
+         * it read before this existed. The request's number guards the reply
+         * (see `closePreviewRequests`): a close clicked after this one
+         * supersedes it, so its late answer cannot replace the newer
+         * question.
          */
+        const request = ++closePreviewRequests.current;
         void keptWorktreeForClose(runtime.worktreeClosePreview, agent.daemonId, agent.paneId ? [agent.paneId] : []).then((kept) => {
-          setConfirm(stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, kept));
+          if (closePreviewRequests.current !== request) return;
+          setConfirm((current) => current ?? stopAgentConfirmation(agent, deck.connection, runtime.runAction, undefined, kept));
         });
       },
       closeOrchestration: (group) => {
@@ -1494,11 +1515,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
          * Issue #1674: the preview is asked before the question opens, as the
          * single close above does — and EVERY role's pane is sent, because a
          * multi-role orchestration shares ONE worktree and any of its panes
-         * resolves it.
+         * resolves it. Guarded by the request's number like the single close,
+         * so the two flows cannot replace each other's question either.
          */
         const paneIds = group.agents.flatMap((agent) => (agent.paneId ? [agent.paneId] : []));
+        const request = ++closePreviewRequests.current;
         void keptWorktreeForClose(runtime.worktreeClosePreview, deckId, paneIds).then((kept) => {
-          setConfirm({
+          if (closePreviewRequests.current !== request) return;
+          setConfirm((current) => current ?? {
             title: `Close ${title}?`,
             body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.${kept ? ` ${keptWorktreeSentence(kept)}` : ""}`,
             label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,

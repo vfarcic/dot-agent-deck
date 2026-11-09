@@ -1759,8 +1759,8 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### protocol/close-preview/001 — The client sends the close-preview's pane ids verbatim and reads the reply's three answers (issue #1674).
 - **Layer:** unit (client library against a synthetic socket peer, `src/daemon_client.rs`).
 - **Agent:** none.
-- **Asserts:** `DaemonClient::dispatch_worktree_close_preview` puts the caller's pane ids on the wire unchanged; an `ok` reply with no `kept_worktree` reads `Ok(None)`; one naming a kept worktree arrives whole with its path and `confirmed_dirty`; a refused request surfaces as `ClientError::Server` rather than reading as "nothing kept".
-- **Why it exists:** the desktop's close confirmation asks this question through this method (issue #1674), and nothing else exercises the client half — the TUI sends the raw request itself, and the daemon handler is driven end to end by `dispatch/close/002`.
+- **Asserts:** `DaemonClient::dispatch_worktree_close_preview` opens with the gate's `Hello { follow_on: true }` and carries the request on that same connection, as every desktop request does (PR #2222 review); the caller's pane ids go on the wire unchanged; an `ok` reply with no `kept_worktree` reads `Ok(None)`; one naming a kept worktree arrives whole with its path and `confirmed_dirty`; a refused request surfaces as `ClientError::Server` rather than reading as "nothing kept".
+- **Why it exists:** the desktop's close confirmation asks this question through this method (issue #1674), and nothing else exercises the client half — the TUI sends the raw request itself, and the daemon handler is driven end to end by `dispatch/close/002`. The gate assertion exists because pane ids belong to one daemon process, so a replacement daemon must not answer them unchecked.
 - **Does not assert:** the daemon's preview answer or the worktree policy behind it (covered by `dispatch/close/002` and the `issue_dispatch_run` unit tests); the desktop's rendering of the answer (the vitest tier).
 - **Platform coverage:** mac+linux (Unix socket harness).
 

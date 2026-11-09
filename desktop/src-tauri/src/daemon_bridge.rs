@@ -5145,6 +5145,59 @@ mod tests {
         );
     }
 
+    /// **Issue #1674, review on PR #2222.** Scenario: the deck a close
+    /// preview asks about accepts the establishment handshake and never
+    /// answers it. The preview's two-second deadline must bound the WHOLE ask
+    /// — the link acquisition included, not only the request that follows it —
+    /// so a confirmation dialog is not held closed by a stalled handshake
+    /// whose own reply limit is fifteen seconds.
+    ///
+    /// Paused at a POINT, for the silent-deck test above's reason: the clock
+    /// stops only after the deck has taken the connection and read the
+    /// request, so the runtime advances to the NEAREST deadline with exactly
+    /// one thing outstanding. Before the fix that nearest deadline was the
+    /// handshake's fifteen seconds — the error an establishment failure
+    /// reports — and with the deadline around the whole ask it is the
+    /// preview's own two, which is what the assertion reads.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_close_preview_deadline_bounds_the_link_not_only_the_request() {
+        use dot_agent_deck::daemon_client::LocalEndpoint;
+
+        let (dir, socket) = scratch_socket("1674-preview-stall");
+        let listener = bind_trusted(&socket);
+        let (accepted, accepted_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let silent = tokio::spawn(unresponsive_daemon(listener, accepted, release_rx));
+
+        let state = crate::terminal::DesktopState::default();
+        let endpoint = Endpoint::Local(LocalEndpoint::at(&socket));
+        let asking = tokio::spawn(async move {
+            crate::worktree_close_preview_endpoint(&state, &endpoint, vec!["pane-41".to_string()])
+                .await
+        });
+        accepted_rx
+            .await
+            .expect("the deck must have taken the connection and read the request");
+        tokio::time::pause();
+        let answer = tokio::time::timeout(Duration::from_secs(600), asking)
+            .await
+            .expect("the preview must bound its own wait rather than await a link that never comes")
+            .expect("the preview task must not panic");
+
+        let _ = release.send(());
+        let _ = silent.await;
+        let _ = std::fs::remove_dir_all(dir);
+
+        let error =
+            answer.expect_err("a stalled link must read as a preview that could not be asked");
+        assert!(
+            error.contains("within 2s"),
+            "the deadline that fired must be the preview's own two seconds, not the \
+             handshake's fifteen: {error}"
+        );
+    }
+
     /// **Test-plan item 10, and the risk this PRD is most likely to fail on.**
     /// Scenario: one observed deck accepts a handshake and never answers it,
     /// while a second, healthy deck is asked for its own. The healthy deck's

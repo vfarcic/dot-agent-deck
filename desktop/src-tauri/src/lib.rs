@@ -593,10 +593,12 @@ const ORCHESTRATION_ROLE_STOP_TIMEOUT: Duration = crate::daemon_bridge::DECK_REP
 /// and the dialog that click asked for. This bound is wider because the
 /// desktop's ask runs off the render loop — an invoke, not a blocked frame —
 /// and because a remote deck reaches its daemon over an ssh tunnel the TUI's
-/// local-socket deadline does not model. Like the TUI's, a blown deadline is
-/// not an error the user sees: the webview renders the dialog exactly as it
-/// did before this existed, which is also how both clients treat a daemon
-/// that cannot answer at all.
+/// local-socket deadline does not model. It covers the whole ask, link
+/// acquisition included, so a stalled handshake is bounded by it too (review
+/// on PR #2222). Like the TUI's, a blown deadline is not an error the user
+/// sees: the webview renders the dialog exactly as it did before this
+/// existed, which is also how both clients treat a daemon that cannot answer
+/// at all.
 const WORKTREE_CLOSE_PREVIEW_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// A role a launch started (or found started by reconciliation), which a
@@ -1941,15 +1943,35 @@ async fn worktree_close_preview_on(
     pane_ids: Vec<String>,
 ) -> Result<Option<DesktopKeptWorktree>, String> {
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
-    let daemon = state.daemon.trusted(scope.endpoint()).await?;
-    daemon.require_compatible()?;
-    let kept = match tokio::time::timeout(
-        WORKTREE_CLOSE_PREVIEW_TIMEOUT,
-        daemon.client.dispatch_worktree_close_preview(&pane_ids),
-    )
+    worktree_close_preview_endpoint(state, scope.endpoint(), pane_ids).await
+}
+
+/// [`worktree_close_preview_on`] against a resolved endpoint, so a test can
+/// drive the deadline without the applied-selection machinery a deck id
+/// needs. The deadline covers the WHOLE ask — the link acquisition included,
+/// not only the request (review on PR #2222): `trusted` can wait on this
+/// deck's establishment gate while a fresh handshake runs, and that handshake
+/// has a reply limit of its own (`DECK_REPLY_TIMEOUT`, 15 s) that a remote
+/// deck reaches through an ssh tunnel. A deadline that started after it would
+/// let a stalled link hold the dialog closed for far longer than two seconds,
+/// which is the one thing this bound exists to prevent.
+async fn worktree_close_preview_endpoint(
+    state: &DesktopState,
+    endpoint: &Endpoint,
+    pane_ids: Vec<String>,
+) -> Result<Option<DesktopKeptWorktree>, String> {
+    let kept = match tokio::time::timeout(WORKTREE_CLOSE_PREVIEW_TIMEOUT, async {
+        let daemon = state.daemon.trusted(endpoint).await?;
+        daemon.require_compatible()?;
+        daemon
+            .client
+            .dispatch_worktree_close_preview(&pane_ids)
+            .await
+            .map_err(|error| safe_message(error.to_string()))
+    })
     .await
     {
-        Ok(kept) => kept.map_err(|error| safe_message(error.to_string()))?,
+        Ok(kept) => kept?,
         Err(_) => {
             return Err(format!(
                 "the daemon did not answer the worktree close preview within {}s",
