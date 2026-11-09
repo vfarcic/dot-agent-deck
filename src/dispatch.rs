@@ -1221,9 +1221,9 @@ pub async fn handle_dispatch(
                     branch_cleanup_failed: true,
                 } => " (cleanup failed: branch may still exist — name may be wedged)".to_string(),
                 RollbackOutcome::Retained { live } => format!(
-                    " (the worktree {wt} was LEFT IN PLACE: {live} agent(s) are still running \
-                     in it, and removing it would delete their working directory underneath \
-                     them. Close them to release it. Branch {branch} is retained too, so this \
+                    " (the worktree {wt} was LEFT IN PLACE: {live} agent(s) still need a \
+                     confirmed stop. Close them to release it. \
+                     Branch {branch} is retained too, so this \
                      dispatch name stays wedged until then.)",
                     wt = paths.worktree_dir.display(),
                     branch = paths.branch,
@@ -1247,27 +1247,17 @@ enum RollbackOutcome {
     /// and the dispatch name is free again. `branch_cleanup_failed` is the
     /// pre-existing "the dir went but `git branch -D` did not" case.
     Reclaimed { branch_cleanup_failed: bool },
-    /// `live` agents are still rooted in the tree, so it was left in place along
-    /// with its branch and its worktree-registry entry.
+    /// `live` counts registered agents rooted in the tree, including exited
+    /// readers retained after a failed stop. Keep its branch and cleanup entry.
     Retained { live: usize },
 }
 
 /// Undo a dispatch whose spawn failed — but never at the cost of deleting a
 /// directory that live agents are working in.
 ///
-/// **Issue #575.** This used to be an unconditional
-/// `remove_worktree(.., RemovalPolicy::Force)` justified by the claim that "the
-/// agent never started, so there is no user work to protect". That claim is true
-/// for a single-agent dispatch and FALSE for a multi-role orchestration: `spawn`
-/// launches roles in a loop, so a failure at role 2 leaves roles 0 and 1 as live
-/// PTY children whose cwd is exactly this tree, and the force removal deleted it
-/// out from under them. Issue #600's teardown in
-/// [`crate::spawn`] now makes that the unreachable case rather than the ordinary
-/// one — `spawn` returns `Err` only after tearing its partial roles down — but the
-/// guard stays, because the invariant this function needs ("nothing is rooted
-/// here") is cheap to verify and catastrophic to assume. A role whose child
-/// somehow outlived its teardown must cost a retained directory, not a deleted
-/// working directory.
+/// A partial spawn's rollback can retain a child whose termination could not be
+/// confirmed. Include exited-reader records: PTY EOF is not proof of reaping.
+/// The hydration-oriented `agent_records()` would hide those survivors here.
 ///
 /// The guard is
 /// [`agents_rooted_in_worktree`](crate::issue_dispatch_run::agents_rooted_in_worktree),
@@ -1295,7 +1285,11 @@ async fn rollback_dispatched_worktree(
     branch: &str,
 ) -> RollbackOutcome {
     let live = crate::issue_dispatch_run::agents_rooted_in_worktree(
-        &registry.agent_records(),
+        &registry
+            .agent_records_including_exited()
+            .into_iter()
+            .map(|(record, _)| record)
+            .collect::<Vec<_>>(),
         worktree_dir,
     );
     if live > 0 {
@@ -3093,9 +3087,8 @@ mod tests {
     /// Issue #575 proper: the rollback guard, exercised with a LIVE agent actually
     /// rooted in the tree.
     ///
-    /// Issue #600's teardown makes that state unreachable through `handle_dispatch`
-    /// (the test above proves the partial spawn now tears itself down), so this
-    /// pins the guard at its own seam — a survivor must cost a retained directory,
+    /// A failed teardown can leave this state behind, so this pins the guard
+    /// at its own seam — a survivor must cost a retained directory,
     /// never a deleted working directory. `cat` stands in for an agent: it holds
     /// the cwd open on stdin and costs no LLM tokens.
     // `cat` as the stand-in role, and POSIX spawn/termination semantics: the
@@ -3125,7 +3118,7 @@ mod tests {
 
         // A live PTY child whose cwd IS the dispatched worktree — the role that
         // spawned before a later one failed.
-        registry
+        let agent = registry
             .spawn_agent(crate::agent_pty::SpawnOptions {
                 command: Some("cat"),
                 cwd: Some(&worktree_dir.to_string_lossy()),
@@ -3169,6 +3162,34 @@ mod tests {
             worktrees.lock().unwrap().contains_key(&worktree_dir),
             "the worktree registry entry must survive so tab-close cleanup can still reclaim it"
         );
+
+        // Model PTY EOF while the child remains owned and its stop fails. EOF
+        // removes it from hydration, but is not proof that its cwd can go.
+        registry
+            .subscribe(&agent)
+            .unwrap()
+            .exited
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        registry.fail_next_close_for_test(&agent);
+        assert!(registry.close_agent(&agent).is_err());
+        assert!(registry.agent_records().is_empty());
+        assert!(registry.agent_record_any(&agent).is_some());
+        let outcome = rollback_dispatched_worktree(
+            &registry,
+            &worktrees,
+            &worktree_dir,
+            &repo,
+            "agent/dispatch-survivor",
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            RollbackOutcome::Retained { live: 1 },
+            "EOF is not a confirmed reap"
+        );
+        assert!(worktree_dir.exists());
+        assert!(branch_exists(tmp.path(), &repo, "agent/dispatch-survivor"));
+        assert!(worktrees.lock().unwrap().contains_key(&worktree_dir));
 
         // Control: once that agent is gone, the very same call reclaims the tree.
         registry.shutdown_all();

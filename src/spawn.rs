@@ -155,6 +155,31 @@ pub enum SpawnError {
     /// work to the next fire of the successor daemon if it goes ahead.
     #[error("failed to spawn agent: {}", crate::agent_pty::ADMISSION_FROZEN_REASON)]
     DaemonRestarting,
+    /// A failed start whose rollback could not confirm these agents stopped.
+    /// Keep the original error typed so restart-aware callers can still defer it.
+    #[error("{error}. {}", rollback_summary(.survivors))]
+    Rollback {
+        #[source]
+        error: Box<SpawnError>,
+        survivors: Vec<String>,
+    },
+}
+
+impl SpawnError {
+    pub fn is_daemon_restarting(&self) -> bool {
+        match self {
+            Self::DaemonRestarting => true,
+            Self::Rollback { error, .. } => error.is_daemon_restarting(),
+            _ => false,
+        }
+    }
+
+    pub fn rollback_survivors(&self) -> &[String] {
+        match self {
+            Self::Rollback { survivors, .. } => survivors,
+            _ => &[],
+        }
+    }
 }
 
 /// What [`spawn`] opened. `SingleAgent` = one card; `Orchestration` = a tab of
@@ -864,10 +889,9 @@ async fn spawn_with_unit(
                     role_name: None,
                 }];
                 let survivors = close_started_agents(registry, state, event_tx, &started).await;
-                return Err(seed_refused(
-                    notifier,
-                    &req.task_name,
-                    &format!("{error}. {}", rollback_summary(&survivors)),
+                return Err(rollback_error(
+                    seed_refused(notifier, &req.task_name, &error),
+                    &survivors,
                 ));
             }
             Ok(SpawnHandle {
@@ -1345,10 +1369,9 @@ async fn spawn_with_unit(
                         .await
                         .release_orchestration_title_claim(&identity);
                 }
-                return Err(seed_refused(
-                    notifier,
-                    &req.task_name,
-                    &format!("{error}. {}", rollback_summary(&survivors)),
+                return Err(rollback_error(
+                    seed_refused(notifier, &req.task_name, &error),
+                    &survivors,
                 ));
             }
             Ok(SpawnHandle {
@@ -1449,11 +1472,10 @@ fn rollback_error(error: SpawnError, survivors: &[String]) -> SpawnError {
     if survivors.is_empty() {
         return error;
     }
-    let message = match error {
-        SpawnError::Agent(message) => message,
-        other => other.to_string(),
-    };
-    SpawnError::Agent(format!("{message}. {}", rollback_summary(survivors)))
+    SpawnError::Rollback {
+        error: Box::new(error),
+        survivors: survivors.to_vec(),
+    }
 }
 
 /// The teardown [`roll_back_partial_orchestration`] runs, for any agents a
@@ -3280,9 +3302,10 @@ mod tests {
                 .await
                 .expect("the spawn answers")
                 .expect("the spawn task");
-            let Err(SpawnError::Agent(message)) = outcome else {
+            let Err(error) = outcome else {
                 panic!("a spawn that lost its seed fails: {outcome:?}");
             };
+            let message = error.to_string();
             assert!(message.contains("first prompt"), "{message}");
 
             let mut surfaced = None;
@@ -3679,6 +3702,53 @@ mod tests {
                 .unwrap(),
             "an accepted restart leaves the fire to the successor"
         );
+    }
+
+    /// Scenario: an orchestration's first role starts, then admission freezes
+    /// before its second role and the first role's stop fails. The spawn must
+    /// retain the restart classification and report the survivor for a retry.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_later_role_restart_refusal_keeps_its_classification_with_survivors() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let (reached, release) = registry.pause_at_for_test("dispatch-role:orchestrator");
+        let req = closable_orchestration_request(dir.path(), "restart-survivor");
+        let task = {
+            let registry = registry.clone();
+            tokio::spawn(async move {
+                spawn(
+                    req,
+                    &registry,
+                    &RecordingNotifier::default(),
+                    None,
+                    true,
+                    None,
+                )
+                .await
+            })
+        };
+        reached.await.unwrap();
+        let agent = registry.agent_records().into_iter().next().unwrap();
+        registry.fail_next_close_for_test(&agent.id);
+        let freeze = registry.freeze_admission().await.unwrap();
+        release.send(()).unwrap();
+        let error = task
+            .await
+            .unwrap()
+            .err()
+            .expect("the later role is refused");
+        registry.shutdown_all();
+        drop(freeze);
+        assert!(
+            error.is_daemon_restarting(),
+            "restart must remain retryable: {error:?}"
+        );
+        assert!(
+            error.to_string().contains(&agent.id),
+            "the error must name the survivor: {error}"
+        );
+        assert_eq!(error.rollback_survivors(), std::slice::from_ref(&agent.id));
     }
 
     /// Issue #1065: an orchestration whose coordinator context cannot be

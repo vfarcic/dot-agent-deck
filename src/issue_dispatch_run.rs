@@ -658,18 +658,28 @@ pub async fn run_issue_dispatch(
 /// reclaiming it under the lock — so this removal can never overlap another
 /// dispatch's worktree operation.
 ///
-/// Any other failure: no agent will ever close to trigger cleanup, so the
-/// registry entry is dropped here. The worktree dir itself is left on disk —
-/// the next fire's worktree-exists idempotency signal reclaims the issue.
+/// A rollback survivor keeps the worktree and its cleanup entry. Otherwise an
+/// ordinary spawn failure drops the entry and leaves the directory on disk;
+/// the next fire's worktree-exists signal treats the issue as already claimed.
 async fn settle_failed_issue_spawn(
     e: crate::spawn::SpawnError,
     worktrees: &WorktreeRegistry,
     worktree_dir: &Path,
     creator: Creator,
 ) -> Result<IssueOutcome, String> {
-    if !matches!(e, crate::spawn::SpawnError::DaemonRestarting) {
-        take_worktree(worktrees, worktree_dir);
+    if !e.is_daemon_restarting() {
+        if e.rollback_survivors().is_empty() {
+            take_worktree(worktrees, worktree_dir);
+        }
         return Err(e.to_string());
+    }
+    if !e.rollback_survivors().is_empty() {
+        tracing::warn!(
+            error = %e,
+            worktree = %worktree_dir.display(),
+            "issue spawn deferred for restart; keeping the survivors' worktree and cleanup record"
+        );
+        return Ok(IssueOutcome::DeferredForRestart);
     }
     // Only a worktree this attempt recorded is ours to remove.
     let Some(entry) = take_worktree(worktrees, worktree_dir) else {
@@ -4177,6 +4187,33 @@ mod tests {
         .await;
         assert!(failed.is_err(), "a real failure is still reported");
         assert!(wt2.exists(), "and leaves its tree as before");
+
+        // A rollback survivor keeps its worktree and cleanup record for both
+        // error classes; enriching a restart still defers, rather than fails.
+        for restarting in [false, true] {
+            record_worktree(&reg, &wt2, &repo, RemovalPolicy::Force);
+            let error = crate::spawn::SpawnError::Rollback {
+                error: Box::new(if restarting {
+                    crate::spawn::SpawnError::DaemonRestarting
+                } else {
+                    crate::spawn::SpawnError::Agent("later role failed".into())
+                }),
+                survivors: vec!["unreaped-worker".into()],
+            };
+            let outcome =
+                settle_failed_issue_spawn(error, &reg, &wt2, Creator::issue_dispatch("nightly", 8))
+                    .await;
+            if restarting {
+                assert_eq!(outcome, Ok(IssueOutcome::DeferredForRestart));
+            } else {
+                assert!(outcome.unwrap_err().contains("unreaped-worker"));
+            }
+            assert!(wt2.exists(), "an unconfirmed stop cannot authorize removal");
+            assert!(
+                reg.lock().unwrap().contains_key(&wt2),
+                "the survivor still needs its cleanup record"
+            );
+        }
     }
 
     /// Scenario: a restart refuses the issue's spawn, and the repository's

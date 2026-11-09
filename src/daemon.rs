@@ -1464,9 +1464,10 @@ fn make_schedule_callback(
                     // it is not reported as one: retried if the restart is called
                     // off, and left to the successor daemon's next fire if it
                     // goes ahead.
-                    Err(crate::spawn::SpawnError::DaemonRestarting) => {
+                    Err(e) if e.is_daemon_restarting() => {
                         info!(
                             task = %req.task_name,
+                            error = %e,
                             "scheduled fire deferred: the daemon is restarting"
                         );
                         if !registry.wait_for_admission().await {
