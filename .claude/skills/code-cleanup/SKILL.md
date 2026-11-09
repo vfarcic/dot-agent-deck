@@ -192,7 +192,8 @@ named owner, an expiry issue, and `#[ignore = "quarantined: <owner>, #<issue>"]`
 say in your report which you did for each one — rerunning it until green and mentioning it in the
 report is neither. Before fixing a red your change did not cause, check whether an open PR already
 fixes it (`gh pr list --search '<test name>'`); if one does, name that PR in your report and leave
-the red to it.
+the red to it. If this task names an open `main-red` issue, a red that issue tracks belongs to the
+owner it names: name the issue in your report and leave the fix to that owner.
 If the only fix or quarantine for such a red lies in a file your mode does not own (a red test
 under tests/ met in code mode, say), do not make it in this PR, and do not merge this PR while that
 red stands: report the red, your diagnosis and the file the remedy needs, so the dispatcher can

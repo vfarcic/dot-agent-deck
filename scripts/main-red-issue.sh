@@ -32,10 +32,18 @@
 # one issue; the next red within the window reopens that same issue instead of
 # opening a second.
 #
+# A red and a green run can race on the same issue. Each side checks after its
+# write: a red whose comment landed on an issue that is now closed reopens it
+# and records the red again, and a green that finds, after closing, a red it
+# did not judge and does not cover reopens it with that red recorded again.
+#
 # The commits each issue records live in HTML-comment markers in its body and
 # comments (`<!-- main-red-sha: <sha> -->`, `<!-- main-green-sha: <sha> -->`),
-# which is what the green check reads back. Ancestry comes from GitHub's compare
-# API, so the job needs no git history.
+# which is what the green check reads back. Only markers written by MAIN_RED_BOT
+# (the workflow's own identity) count, and angle brackets are dropped from the
+# commit subject and job names it writes, so a comment or a commit subject
+# cannot forge one. Ancestry comes from GitHub's compare API, so the job needs
+# no git history.
 #
 # NEVER FAILS THE BUILD: like `scripts/notify.sh`, it always exits 0. It now
 # runs on green runs too, and an error here must not turn a green `main` red.
@@ -51,11 +59,17 @@
 #         DRY_RUN=1           read for real, print every write instead of doing it
 #         REOPEN_WINDOW_HOURS default 24
 #         MAIN_RED_LABEL      default main-red
+#         MAIN_RED_BOT        the login whose markers count (default
+#                             github-actions, the GITHUB_TOKEN's identity)
 
 set -uo pipefail   # deliberately NOT -e: this script must never fail a workflow
 
 STATE="${1:-}"
 LABEL="${MAIN_RED_LABEL:-main-red}"
+# Only this author's markers count: anyone who can comment on a public issue
+# could otherwise post a green marker and erase the reds a close is judged on.
+BOT="${MAIN_RED_BOT:-github-actions}"
+BOT="${BOT//[^A-Za-z0-9_-]/}"
 WINDOW_HOURS="${REOPEN_WINDOW_HOURS:-24}"
 ATTEMPT="${RUN_ATTEMPT:-1}"
 SHA="${COMMIT_SHA:-}"
@@ -98,20 +112,42 @@ open_issue() {
     -q 'map(.number) | sort | .[0] // empty' 2>/dev/null || true
 }
 
-# Red commits recorded since the issue last opened: walk the body and every
-# comment in order, append on a red marker, reset on a green one.
-recorded_reds() {
-  local n="$1"
-  gh issue view "$n" --json body,comments \
-    -q '[.body] + [.comments[].body] | .[]' 2>/dev/null \
+# Every marker the issue carries, in order, from $BOT's body and comments
+# only: one `red <sha>` or `green <sha>` per line.
+markers() {
+  gh issue view "$1" --json author,body,comments \
+    -q "[{a: .author.login, b: .body}] + [.comments[] | {a: .author.login, b: .body}]
+        | .[] | select(.a == \"$BOT\") | .b" 2>/dev/null \
   | grep -oE '<!-- main-(red|green)-sha: [0-9a-f]{7,40} -->' \
-  | awk '/main-green-sha/ { n = 0; next } { split($0, a, " "); reds[++n] = a[3] } END { for (i = 1; i <= n; i++) print reds[i] }'
+  | sed -E 's/<!-- main-(red|green)-sha: ([0-9a-f]+) -->/\1 \2/'
 }
+
+# Red commits recorded since the last green marker: what a close is judged on.
+recorded_reds() {
+  markers "$1" | awk '$1 == "green" { n = 0; next } { reds[++n] = $2 } END { for (i = 1; i <= n; i++) print reds[i] }'
+}
+
+# The reds that stood just before the LAST green marker: what was on the
+# issue when the most recent close was written.
+reds_before_last_green() {
+  markers "$1" | awk '$1 == "green" { n_prev = n; for (i = 1; i <= n; i++) prev[i] = reds[i]; n = 0; next }
+                      { reds[++n] = $2 }
+                      END { for (i = 1; i <= n_prev; i++) print prev[i] }'
+}
+
+issue_state() {
+  gh issue view "$1" --json state -q .state 2>/dev/null || true
+}
+
+# The subject and job names are text from a commit and from the workflow;
+# angle brackets are dropped so neither can carry a marker of its own.
+SAFE_SUBJECT="${COMMIT_SUBJECT:-subject unavailable}"; SAFE_SUBJECT="${SAFE_SUBJECT//[<>]/}"
+SAFE_FAILED="${FAILED_JOBS:-unknown}"; SAFE_FAILED="${SAFE_FAILED//[<>]/}"
 
 red_text() {
   printf '`main` is red at %s (%s), run attempt %s.\n\nFailed: %s\n\nRun: %s\n\n<!-- main-red-sha: %s -->\n' \
-    "$SHORT" "${COMMIT_SUBJECT:-subject unavailable}" "$ATTEMPT" \
-    "${FAILED_JOBS:-unknown}" "$RUN_URL" "$SHA"
+    "$SHORT" "$SAFE_SUBJECT" "$ATTEMPT" \
+    "$SAFE_FAILED" "$RUN_URL" "$SHA"
 }
 
 if [ "$STATE" = "red" ]; then
@@ -128,6 +164,14 @@ if [ "$STATE" = "red" ]; then
   n="$(open_issue)"
   if [ -n "$n" ]; then
     write gh issue comment "$n" --body "$body" >/dev/null && log "recorded red at $SHORT on open issue #$n"
+    # A concurrent green run may have closed it between our read and our
+    # comment, judging on reds that did not include this one. Reopen, and
+    # record the red again so it sits after that run's green marker.
+    if [ "${DRY_RUN:-}" != "1" ] && [ "$(issue_state "$n")" = "CLOSED" ]; then
+      gh issue reopen "$n" >/dev/null || true
+      gh issue comment "$n" --body "Reopened: a concurrent run closed this while this red was being recorded. $body" >/dev/null || true
+      log "#$n was closed under this red; reopened it"
+    fi
     exit 0
   fi
 
@@ -186,4 +230,23 @@ done <<<"$reds"
 
 write gh issue close "$n" --reason completed --comment "$(printf '`main` is green again at %s, run attempt %s: %s\n\n<!-- main-green-sha: %s -->\n' \
   "$SHORT" "$ATTEMPT" "$RUN_URL" "$SHA")" >/dev/null && log "closed #$n: green at $SHORT"
+[ "${DRY_RUN:-}" = "1" ] && exit 0
+
+# A concurrent red run may have recorded a red between our read and our
+# close. Read back the reds that stood when the close landed; any we did not
+# judge, and that this green does not cover, reopens the issue with those
+# reds recorded again after the green marker.
+missed=""
+while IFS= read -r red; do
+  [ -z "$red" ] && continue
+  grep -qx "$red" <<<"$reds" && continue
+  case "$(compare "$red" "$SHA")" in ahead|identical) ;; *) missed="$missed $red" ;; esac
+done <<<"$(reds_before_last_green "$n")"
+if [ -n "$missed" ]; then
+  again=""
+  for red in $missed; do again="$again<!-- main-red-sha: $red -->"$'\n'; done
+  gh issue reopen "$n" >/dev/null || true
+  gh issue comment "$n" --body "$(printf 'Reopened: a red was recorded while this issue was being closed, and the green at %s does not cover it.\n\n%s' "$SHORT" "$again")" >/dev/null || true
+  log "reopened #$n: a red landed during the close"
+fi
 exit 0

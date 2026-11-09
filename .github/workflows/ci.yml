@@ -2154,7 +2154,10 @@ jobs:
   # separate question from whether main builds. That list is enumerated by hand
   # and nothing enforces it, so ADD A NEW JOB HERE WHEN YOU ADD ONE ABOVE — a job
   # missing from `needs` is a job whose failure notifies nobody, which is the
-  # defect this whole job exists to fix, reintroduced one job at a time.
+  # defect this whole job exists to fix, reintroduced one job at a time. Since
+  # issue #2073 it is also a job whose failure a green verdict can CLOSE the
+  # issue over, which is why `desktop-driver` and `cross-version`, missing
+  # until then, were added with it.
   #
   # NEVER FAILS THE BUILD, and that matters more now that it runs on green
   # runs: `scripts/notify.sh` and `scripts/main-red-issue.sh` both always exit 0
@@ -2181,6 +2184,7 @@ jobs:
       - changes
       - desktop-web
       - desktop-browser
+      - desktop-driver
       - fmt
       - clippy
       - build-release
@@ -2190,6 +2194,7 @@ jobs:
       - e2e-build
       - e2e
       - e2e-deterministic
+      - cross-version
       - windows-cross-check
       - build-windows
       - build-macos
