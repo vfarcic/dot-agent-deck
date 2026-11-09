@@ -3,7 +3,7 @@
 //! Fast subprocess coverage for Codex's Claude-compatible native hook payloads.
 
 // Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
-// crate-internal resolver is `#[path]`-included instead, at two extra test
+// crate-internal resolver is `#[path]`-included instead, at three extra test
 // executions rather than the harness's ~530. Every scratch dir here binds a
 // `hook.sock`, which is exactly the shape that kept `tests/daemon_protocol.rs`
 // out of the OS temp dir. See `docs/develop/e2e-temp-dirs.md`.
@@ -16,9 +16,31 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use dot_agent_deck::event::{AgentEvent, AgentType, EventType};
+use dot_agent_deck::question::AnswerChannel;
+use spec::spec;
 
 fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
+    invoke_codex_hook_version(payload, "0.160.0")
+}
+
+fn invoke_codex_hook_version(payload: &serde_json::Value, version: &str) -> AgentEvent {
     let temp = test_temp::tempdir().expect("create Codex hook socket directory");
+    let codex = temp.path().join("codex");
+    std::fs::write(
+        &codex,
+        format!("#!/bin/sh\nprintf 'codex-cli {version}\\n'\n"),
+    )
+    .expect("write the Codex version stand-in");
+    let mut permissions = std::fs::metadata(&codex)
+        .expect("read the Codex version stand-in's permissions")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    std::fs::set_permissions(&codex, permissions)
+        .expect("make the Codex version stand-in executable");
+    let path = std::env::join_paths(std::iter::once(temp.path().to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("put the Codex version stand-in first on PATH");
     let socket = temp.path().join("hook.sock");
     let listener = UnixListener::bind(&socket).expect("bind Codex hook socket");
     listener
@@ -30,6 +52,7 @@ fn invoke_codex_hook(payload: &serde_json::Value) -> AgentEvent {
         .env("DOT_AGENT_DECK_SOCKET", &socket)
         .env("DOT_AGENT_DECK_PANE_ID", "codex-hook-pane")
         .env("DOT_AGENT_DECK_AGENT_ID", "codex-hook-agent")
+        .env("PATH", path)
         // A developer running this from a deck pane inherits that pane's
         // capability token; with one, the hook's inbox calls (PRD #1666 S7)
         // would reach this socket ahead of the event it reads.
@@ -242,5 +265,30 @@ fn codex_hooks_002_failed_tool_emits_error_before_session_exit() {
         event.event_type,
         EventType::Error,
         "a failed Codex PostToolUse must surface Error before process exit; event={event:?} payload={payload}"
+    );
+}
+
+/// Scenario: Run a Codex permission hook whose CLI reports 0.161.0, past the 0.160.x key table's verified minor. The emitted question must remain visible, but its channel and every table option must be keyboard-only rather than letting voice type keys verified only on 0.160.
+#[spec("question/detect/021")]
+#[test]
+fn question_detect_021_codex_past_the_verified_minor_is_keyboard_only() {
+    let event = invoke_codex_hook_version(
+        &serde_json::json!({
+            "session_id": "codex-hooks-session",
+            "hook_event_name": "PermissionRequest",
+            "cwd": "/tmp/codex-hooks",
+            "tool_name": "Bash",
+            "tool_input": {"command": "touch codex_newer.txt"}
+        }),
+        "0.161.0",
+    );
+    let question = event.question().expect("the permission question is shown");
+    assert_eq!(question.channel, AnswerChannel::Unsupported);
+    assert!(
+        question.questions[0]
+            .options
+            .iter()
+            .all(|option| option.keyboard_only),
+        "every answer from the unverified table is keyboard-only: {question:?}"
     );
 }

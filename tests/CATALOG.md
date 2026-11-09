@@ -12598,8 +12598,8 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/001 — A Claude Code permission request for a Bash command becomes a held Permission question.
 - **Layer:** L1/fast unit (`src/hook.rs`, the hook CLI's event builder on a captured Claude Code 2.1.289 payload, `tests/fixtures/agent-questions/claude-permission-bash.json`).
 - **Agent:** none (captured payload).
-- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id.
-- **Does not assert:** that Claude Code draws exactly these labels — they come from the option table and are pinned by `question/live/*`.
+- **Asserts:** the event is a `PermissionRequest` carrying a deck-minted question: options Yes (allow once), "Yes, and always allow access to /work/proj from this project" (always, its scope naming the directory and the session destination from the first `permission_suggestions` entry) and No (deny); channel held; the tool and its detail; and nothing held without a pane id. At Claude Code 2.2.0, past the table's verified 2.1 minor, the permission channel and its hook-answered options remain answerable.
+- **Does not assert:** that Claude Code draws exactly these labels — they come from the option table and are pinned by `question/live/*`; the version probe reaching this builder (`question/detect/021` covers the Codex half of that probe).
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/002 — A Claude Code permission request suggesting accept-edits names that option.
@@ -12619,8 +12619,8 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/004 — Claude Code's plan approval is answered by keys and not held.
 - **Layer:** L1/fast unit (`src/hook.rs`, captured `ExitPlanMode` payload).
 - **Agent:** none.
-- **Asserts:** a Plan question on the keys channel, its third option keyboard-only, the hook not holding it (a hook decision does not dismiss the plan dialog), and "manually approve" answered by the key `2`.
-- **Does not assert:** the key `1`, which is inferred.
+- **Asserts:** a Plan question on the keys channel, its third option keyboard-only, the hook not holding it (a hook decision does not dismiss the plan dialog), and "manually approve" answered by the key `2`. At Claude Code 2.2.0, past the table's verified 2.1 minor, the channel is Unsupported and every plan option is keyboard-only.
+- **Does not assert:** the key `1`, which is inferred; the version probe reaching this builder (`question/detect/021` covers the Codex half of that probe).
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/005 — Codex's `request_user_input` form rides its `ToolStart` and is answered by keys.
@@ -12633,8 +12633,8 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 ##### question/detect/006 — A Codex approval is answered by `1`, `p` and `3`, and Codex's `Interrupt` reads as Idle.
 - **Layer:** L1/fast unit (`src/hook.rs`, reconstructed Codex `PermissionRequest`).
 - **Agent:** none.
-- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle.
-- **Does not assert:** that Codex accepts those keys (`question/live/*`).
+- **Asserts:** a Permission question on the keys channel whose options map to the keys `1`, `p` and `3`, the always option's scope naming the command; `Interrupt` maps to Idle. Codex 0.160.999 remains covered, while 0.159.0 and 0.161.0 make the channel Unsupported and every table option keyboard-only.
+- **Does not assert:** that Codex accepts those keys (`question/live/*`), or the production version probe (`question/detect/021`).
 - **Platform coverage:** mac+linux.
 
 ##### question/detect/007 — The OpenCode plugin holds a question through `await-answer` and replies through OpenCode.
@@ -12734,6 +12734,13 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Agent:** none.
 - **Asserts:** Claude Code's `PermissionRequest` names no call and fingerprints its input like the call's `PreToolUse`, and unlike another command's; applied to state, the question ties to that call, survives the other call's `PostToolUse` on Needs Input, and clears on its own. OpenCode's `permission.asked` puts `tool.callID` in `tool.use_id`, a `tool.execute.after` carries its `call_id` as `tool_use_id`, and only the matching call's end clears it.
 - **Does not assert:** live agents running parallel calls; Codex's `PreToolUse` and `PermissionRequest` inputs agreeing.
+- **Platform coverage:** mac+linux.
+
+##### question/detect/021 — Codex past the verified minor keeps its permission answers keyboard-only.
+- **Layer:** L1/fast subprocess (`tests/codex_hook_ingestion.rs`), the real hook CLI with a Codex version stand-in first on its PATH.
+- **Agent:** none (a shell stand-in reports `codex-cli 0.161.0`; no real Codex runs).
+- **Asserts:** the hook's version probe reaches the question builder; past the 0.160.x table's verified minor, the permission question is still emitted with every table option keyboard-only and an Unsupported channel.
+- **Does not assert:** the same-minor and held-hook boundaries (`question/detect/001`, `/004` and `/006`), or a real newer Codex's menu.
 - **Platform coverage:** mac+linux.
 #### question/state
 
@@ -13210,11 +13217,11 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** a keyboard allow or another client's simultaneous answer.
 - **Platform coverage:** mac+linux.
 
-##### question/live/004 — Codex approval and two-question Plan form accept the daemon's keys.
+##### question/live/004 — Codex question answers respect the verified key-table minor.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Codex, cheap `common::codex_test_model()` (default gpt-5.1-codex-mini), read-only sandbox and on-request approvals.
-- **Asserts:** permission table labels and visible allow/deny choices; approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; client answers both questions and Codex reports Green/Large.
-- **Does not assert:** always-allow persistence or free-text notes.
+- **Asserts:** permission table labels and visible allow/deny choices on every run. On 0.160.x, approval creates a unique sentinel; Plan mode exposes a whole two-question form with appended `None of the above`; client answers both questions and Codex reports Green/Large. Past that minor, the permission channel is Unsupported, every option is keyboard-only, an allow-once answer is refused and the sentinel stays absent.
+- **Does not assert:** always-allow persistence or free-text notes; the older table's key behavior when the installed Codex is already past 0.160.x.
 - **Platform coverage:** mac+linux.
 
 ##### question/live/005 — OpenCode replies through its plugin for permissions and whole forms.

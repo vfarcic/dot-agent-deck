@@ -379,11 +379,11 @@ pub type StrandedLineRecogniser =
 pub struct QuestionTables {
     /// The oldest version these tables are known to describe. A version below
     /// it lists the table's options keyboard-only and refuses the keys channel.
-    /// An unknown version (no producer reports one today) is treated as covered:
-    /// the lane-2 tests are the guard.
+    /// An unknown version is treated as covered: the lane-2 tests are the guard.
     pub verified_from: (u64, u64, u64),
-    /// The newest version the tables were verified on, for the docs and for
-    /// whoever next measures them.
+    /// The newest version the tables were verified on. Later patch releases of
+    /// the same minor stay covered; past that minor, answers the deck would
+    /// type from this table become keyboard-only until it is re-verified.
     pub verified_on: (u64, u64, u64),
     pub menus: &'static [MenuTable],
 }
@@ -398,10 +398,13 @@ impl QuestionTables {
             .unwrap_or(&[])
     }
 
-    /// Whether `version` is one these tables describe; `None` (not reported)
-    /// is.
+    /// Whether `version` is one these tables' key mappings describe; `None`
+    /// (not reported) is. Patch releases after [`Self::verified_on`] are
+    /// covered while they remain on its major.minor.
     pub fn covers(&self, version: Option<(u64, u64, u64)>) -> bool {
-        version.is_none_or(|v| v >= self.verified_from)
+        version.is_none_or(|v| {
+            v >= self.verified_from && (v.0, v.1) <= (self.verified_on.0, self.verified_on.1)
+        })
     }
 }
 

@@ -156,7 +156,12 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
         // `extract_tool_detail` arms (`shell`, `apply_patch`) sharpen the detail.
         "codex" => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::Codex)
+            let version = question_agent_version(
+                &AgentType::Codex,
+                &hook_input.hook_event_name,
+                hook_input.tool_name.as_deref(),
+            );
+            build_event_typed_with_version(hook_input, AgentType::Codex, version)
         }
         // Devin CLI ships a Claude-Code-compatible hooks engine too, so its
         // command hooks POST the SAME stdin JSON shape ([`ClaudeCodeHookInput`])
@@ -169,9 +174,61 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
         }
         _ => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
-            build_event_typed(hook_input, AgentType::ClaudeCode)
+            let version = question_agent_version(
+                &AgentType::ClaudeCode,
+                &hook_input.hook_event_name,
+                hook_input.tool_name.as_deref(),
+            );
+            build_event_typed_with_version(hook_input, AgentType::ClaudeCode, version)
         }
     }
+}
+
+/// The version whose question table a Claude-compatible hook should use.
+/// Only an event that can raise such a question pays for the bounded CLI
+/// probe; every other hook, and an agent with no version parser here, answers
+/// `None`, which leaves its table covered.
+fn question_agent_version(
+    agent_type: &AgentType,
+    hook_event_name: &str,
+    tool_name: Option<&str>,
+) -> Option<(u64, u64, u64)> {
+    let needed = match agent_type {
+        AgentType::ClaudeCode => hook_event_name == "PermissionRequest",
+        AgentType::Codex => {
+            hook_event_name == "PermissionRequest"
+                || (hook_event_name == "PreToolUse" && tool_name == Some("request_user_input"))
+        }
+        _ => false,
+    };
+    if !needed {
+        return None;
+    }
+    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+    let program = match agent_type {
+        AgentType::ClaudeCode => "claude",
+        AgentType::Codex => "codex",
+        _ => return None,
+    };
+    let output = crate::hooks_manage::probe_agent_version(std::ffi::OsStr::new(program), TIMEOUT);
+    match agent_type {
+        AgentType::ClaudeCode => output
+            .as_deref()
+            .and_then(crate::hooks_manage::parse_claude_version),
+        AgentType::Codex => output.as_deref().and_then(parse_codex_version),
+        _ => None,
+    }
+}
+
+/// Codex prints `codex-cli MAJOR.MINOR.PATCH`; accept exactly that bare
+/// release as its last word, not a pre-release or build-tagged version.
+fn parse_codex_version(output: &str) -> Option<(u64, u64, u64)> {
+    let version = semver::Version::parse(output.split_whitespace().last()?).ok()?;
+    (version.pre.is_empty() && version.build.is_empty()).then_some((
+        version.major,
+        version.minor,
+        version.patch,
+    ))
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
@@ -1458,6 +1515,16 @@ fn build_event(input: ClaudeCodeHookInput) -> Option<AgentEvent> {
 /// builder, differing only in the stamped identity and the Codex-aware
 /// `extract_tool_detail` arms.
 fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Option<AgentEvent> {
+    build_event_typed_with_version(input, agent_type, None)
+}
+
+/// [`build_event_typed`] with the agent version its question tables should
+/// use. Tests that do not exercise version coverage use the wrapper above.
+fn build_event_typed_with_version(
+    input: ClaudeCodeHookInput,
+    agent_type: AgentType,
+    question_version: Option<(u64, u64, u64)>,
+) -> Option<AgentEvent> {
     let ClaudeCodeHookInput {
         session_id,
         hook_event_name,
@@ -1711,6 +1778,7 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
         metadata.get("tool_use_id").map(String::as_str),
         extra.get("permission_suggestions"),
         extra.get("permission_mode").and_then(Value::as_str),
+        question_version,
     );
 
     let mut event = AgentEvent {
@@ -1746,8 +1814,8 @@ fn build_event_typed(input: ClaudeCodeHookInput, agent_type: AgentType) -> Optio
 ///   [`crate::question::codex_request_user_input`].
 /// - Devin `PermissionRequest` → [`crate::question::devin_permission_request`].
 ///
-/// The agent's version is not in any of these payloads, so the tables are used
-/// as verified (`None`).
+/// The agent's version is not in these payloads. `version` is what the bounded
+/// CLI probe found, or `None` when it is unknown, which leaves a table covered.
 #[allow(clippy::too_many_arguments)]
 fn hook_question(
     agent_type: &AgentType,
@@ -1758,6 +1826,7 @@ fn hook_question(
     tool_use_id: Option<&str>,
     permission_suggestions: Option<&Value>,
     permission_mode: Option<&str>,
+    version: Option<(u64, u64, u64)>,
 ) -> Option<crate::question::PendingQuestion> {
     let now = Utc::now().timestamp_millis();
     let id = crate::question::mint_question_id;
@@ -1771,7 +1840,7 @@ fn hook_question(
                 permission_suggestions,
                 permission_mode,
                 now,
-                None,
+                version,
             )
             .question,
         ),
@@ -1787,18 +1856,18 @@ fn hook_question(
                 tool_detail,
                 command.as_deref(),
                 now,
-                None,
+                version,
             ))
         }
         (AgentType::Codex, "PreToolUse") if tool_name == Some("request_user_input") => {
-            crate::question::codex_request_user_input(tool_use_id, tool_input, now, None)
+            crate::question::codex_request_user_input(tool_use_id, tool_input, now, version)
         }
         (AgentType::Devin, "PermissionRequest") => Some(crate::question::devin_permission_request(
             id(),
             tool_name?,
             tool_detail,
             now,
-            None,
+            version,
         )),
         _ => None,
     }
@@ -6033,6 +6102,43 @@ mod question_tests {
                 .is_none(),
             "no pane id in a unit test, so nothing to hold for"
         );
+
+        // A later minor makes only the answers the deck would TYPE
+        // unverified. Permission answers still go through Claude's held hook.
+        let payload = fixture("claude-permission-bash.json");
+        let newer = crate::question::claude_permission_request(
+            "q-newer".into(),
+            "Bash",
+            payload.get("tool_input"),
+            Some("touch created_m1.txt".into()),
+            payload.get("permission_suggestions"),
+            payload.get("permission_mode").and_then(Value::as_str),
+            1,
+            Some((2, 2, 0)),
+        )
+        .question;
+        assert_eq!(newer.channel, AnswerChannel::Held);
+        for option in &newer.questions[0].options {
+            assert_eq!(
+                option.answerable(),
+                option.label != "Yes, and switch to auto mode",
+                "{} must keep its own answerability",
+                option.label
+            );
+        }
+        assert!(
+            newer
+                .validate(
+                    &[crate::question::QuestionAnswer {
+                        question_index: 0,
+                        option_indices: vec![1],
+                        text: None,
+                    }],
+                    false,
+                )
+                .is_ok(),
+            "Claude 2.2's allow-once answer still goes through the held hook"
+        );
     }
 
     /// Scenario: Claude Code 2.1.296 asks to run a Bash command in the default
@@ -6237,6 +6343,30 @@ mod question_tests {
         )
         .unwrap();
         assert_eq!(keys, vec!["2"]);
+
+        let newer = crate::question::claude_permission_request(
+            "q-newer-plan".into(),
+            "ExitPlanMode",
+            payload.get("tool_input"),
+            None,
+            None,
+            None,
+            1,
+            Some((2, 2, 0)),
+        )
+        .question;
+        assert_eq!(
+            newer.channel,
+            AnswerChannel::Unsupported,
+            "past 2.1, the deck has no verified plan-approval keys to type"
+        );
+        assert!(
+            newer.questions[0]
+                .options
+                .iter()
+                .all(|option| option.keyboard_only),
+            "every plan answer stays visible but keyboard-only"
+        );
     }
 
     /// Scenario: Codex 0.160.0's captured `PreToolUse` for a two-question
@@ -6303,6 +6433,37 @@ mod question_tests {
                 .is_some_and(|s| s.contains("touch codex_b.txt"))
         );
         assert_eq!(map_event_type("Interrupt"), Some(EventType::Idle));
+
+        let build = |version| {
+            crate::question::codex_permission_request(
+                "q-version".into(),
+                "Bash",
+                Some("touch codex_b.txt".into()),
+                Some("touch codex_b.txt"),
+                1,
+                version,
+            )
+        };
+        assert_eq!(
+            build(Some((0, 160, 999))).channel,
+            AnswerChannel::Keys,
+            "a later patch of the verified minor is still covered"
+        );
+        for version in [Some((0, 159, 0)), Some((0, 161, 0))] {
+            let question = build(version);
+            assert_eq!(
+                question.channel,
+                AnswerChannel::Unsupported,
+                "{version:?} is outside the verified key table"
+            );
+            assert!(
+                question.questions[0]
+                    .options
+                    .iter()
+                    .all(|option| option.keyboard_only),
+                "{version:?}: every table answer is keyboard-only"
+            );
+        }
     }
 
     /// Scenario: A Devin `PermissionRequest` becomes a Permission question

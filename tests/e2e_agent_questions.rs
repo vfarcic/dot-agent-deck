@@ -174,9 +174,11 @@ fn question_live_003_claude_keyboard_deny_refuses_late_answer() {
     visible(&deck, "Interrupted");
 }
 
-/// Scenario: Codex on a cheap model asks to run a command outside its read-only sandbox;
-/// approve through the client and observe the sentinel. Switch to Plan mode,
-/// answer a two-question form through keys, and see both answers reported.
+/// Scenario: Codex on a cheap model asks to run a command outside its read-only sandbox.
+/// On the verified 0.160.x table, approve through the client, then answer a
+/// two-question Plan-mode form and see both answers reported. On a later
+/// minor, the same visible prompt must instead refuse voice keys and leave
+/// every option keyboard-only, with the sentinel uncreated.
 #[spec("question/live/004")]
 #[test]
 fn question_live_004_codex_permission_and_whole_form_by_keys() {
@@ -191,6 +193,19 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         )
     });
     skip_unless!(common::check_codex_available());
+    let version_output = std::process::Command::new("codex")
+        .arg("--version")
+        .output()
+        .expect("read Codex's version after its preflight passed");
+    let version_output = String::from_utf8_lossy(&version_output.stdout);
+    let version = semver::Version::parse(
+        version_output
+            .split_whitespace()
+            .last()
+            .expect("Codex's version output names a release"),
+    )
+    .expect("parse Codex's release");
+    let version = (version.major, version.minor, version.patch);
     let target = common::harness_tempdir().unwrap();
     let sentinel = target.path().join("question_codex_93de612b.txt");
     let command = format!(
@@ -218,6 +233,27 @@ fn question_live_004_codex_permission_and_whole_form_by_keys() {
         "Ask Codex to do anything",
     );
     let q = pending(&deck, &id, QuestionKind::Permission);
+    if !dot_agent_deck::agent_registry::CODEX_QUESTIONS.covers(Some(version)) {
+        assert_eq!(q.channel, AnswerChannel::Unsupported);
+        assert!(
+            q.questions[0]
+                .options
+                .iter()
+                .all(|option| option.keyboard_only),
+            "Codex {version:?} must not receive keys from the 0.160.x table: {q:?}"
+        );
+        assert_eq!(
+            answer(&deck, &id, &q, vec![selection(0, &[1])]),
+            AnswerReport::Refused(AnswerRefusal::KeyboardOnly)
+        );
+        assert!(
+            !sentinel.exists(),
+            "an unverified voice answer ran the command"
+        );
+        visible(&deck, "Yes, proceed");
+        visible(&deck, "No, and tell Codex what to do differently");
+        return;
+    }
     assert_eq!(q.channel, AnswerChannel::Keys);
     assert_eq!(
         q.questions[0]

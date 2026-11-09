@@ -268,6 +268,16 @@ pub fn installed_claude_accepts_stop_failure() -> (bool, Option<String>) {
     probe_claude_version(std::ffi::OsStr::new("claude"), CLAUDE_VERSION_PROBE_TIMEOUT)
 }
 
+/// The first line an agent prints for `--version`, using the same bounded,
+/// tree-cleaning probe as Claude Code's hook-install gates. `None` when the
+/// command cannot be started, does not finish in time, or prints no line.
+pub(crate) fn probe_agent_version(
+    program: &std::ffi::OsStr,
+    timeout: std::time::Duration,
+) -> Option<String> {
+    probe_claude_version(program, timeout).1
+}
+
 /// [`installed_claude_accepts_stop_failure`] with the program and the bound
 /// injected.
 ///

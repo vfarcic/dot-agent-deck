@@ -787,9 +787,10 @@ impl PendingQuestion {
 // ---------------------------------------------------------------------------
 
 /// The table options for `menu` that apply under `when`, as question options
-/// numbered from `first_index`. A table that does not cover `version` lists its
-/// options keyboard-only: the labels are still the best the deck knows, but
-/// it does not send keys or decisions it has not verified.
+/// numbered from `first_index`. Below `verified_from`, every table option is
+/// keyboard-only. Past `verified_on`'s minor, only an option the deck would
+/// type is: an answer delivered through a held hook or a plugin stays
+/// answerable. The labels remain the best the deck knows in every case.
 fn table_options(
     tables: Option<&QuestionTables>,
     menu: MenuKind,
@@ -801,20 +802,30 @@ fn table_options(
     let Some(tables) = tables else {
         return Vec::new();
     };
-    let covered = tables.covers(version);
+    let keys_covered = tables.covers(version);
+    let below_verified = version.is_some_and(|version| version < tables.verified_from);
     tables
         .menu(menu)
         .iter()
         .filter(|option| when(option.when))
         .enumerate()
-        .map(|(i, option)| table_option(option, first_index + i as u32, covered, fill))
+        .map(|(i, option)| {
+            table_option(
+                option,
+                first_index + i as u32,
+                below_verified,
+                keys_covered,
+                fill,
+            )
+        })
         .collect()
 }
 
 fn table_option(
     option: &TableOption,
     index: u32,
-    covered: bool,
+    below_verified: bool,
+    keys_covered: bool,
     fill: &dyn Fn(&str) -> String,
 ) -> QuestionOption {
     QuestionOption {
@@ -822,7 +833,9 @@ fn table_option(
         label: fill(option.label),
         description: None,
         role: option.role,
-        keyboard_only: option.keyboard_only || !covered,
+        keyboard_only: option.keyboard_only
+            || below_verified
+            || (option.keys.is_some() && !keys_covered),
         scope: option.scope.map(fill),
         maybe_hidden: option.maybe_hidden,
     }
@@ -1135,8 +1148,8 @@ fn claude_offers_auto_mode(tool_name: &str, permission_mode: Option<&str>) -> bo
 ///   `permission_mode`, Claude's keyboard-only "Yes, and switch to auto mode",
 ///   and No; held.
 ///
-/// `version` is the Claude Code version when known; the hook does not know it,
-/// and passes `None`.
+/// `version` is the Claude Code version when the hook's bounded CLI probe
+/// knows it; an unknown version leaves the table covered.
 #[allow(clippy::too_many_arguments)]
 pub fn claude_permission_request(
     id: String,
