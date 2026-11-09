@@ -863,8 +863,12 @@ async fn spawn_with_unit(
                     pane_id: pane_id.clone(),
                     role_name: None,
                 }];
-                close_started_agents(registry, state, event_tx, &started).await;
-                return Err(seed_refused(notifier, &req.task_name, &error));
+                let survivors = close_started_agents(registry, state, event_tx, &started).await;
+                return Err(seed_refused(
+                    notifier,
+                    &req.task_name,
+                    &format!("{error}. {}", rollback_summary(&survivors)),
+                ));
             }
             Ok(SpawnHandle {
                 task_name: req.task_name,
@@ -1075,25 +1079,13 @@ async fn spawn_with_unit(
                     unit_origin,
                     notifier,
                 );
-                // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
-                // to be a bare `?`, which returned the error while every role
-                // already launched stayed live in the registry — with no
-                // `SpawnHandle` returned, the caller had nothing to close them
-                // with and no tab was ever surfaced, so those children were
-                // unreachable by any close path the user has. Tear them down here
-                // instead, so `Err` from this function means "nothing is running".
-                //
-                // Chosen over returning a PARTIAL handle because a half-spawned
-                // orchestration is not a usable product: the orchestrator has been
-                // handed a context file naming roles that do not exist, its
-                // delegations to them cannot route, and the caller
-                // (`handle_dispatch`, `issue_dispatch_run`) has no way to surface
-                // a tab for it — the `OrchestrationSurface` broadcast below is
-                // never reached. See the issue and the PR for the full argument.
+                // Roll back roles started before this failure. A role whose
+                // termination cannot be confirmed keeps its routing and is named
+                // in the error so the user can retry its stop.
                 let id = match id {
                     Ok(id) => id,
                     Err(e) => {
-                        roll_back_partial_orchestration(
+                        let survivors = roll_back_partial_orchestration(
                             registry,
                             state,
                             event_tx,
@@ -1102,15 +1094,15 @@ async fn spawn_with_unit(
                             &role.role_name,
                         )
                         .await;
-                        // Issue #1339: nothing is left running, so nothing
-                        // holds the title this spawn was admitted under.
+                        // Registered survivors keep their title; release the
+                        // construction's provisional claim.
                         if let Some(state) = state {
                             state
                                 .write()
                                 .await
                                 .release_orchestration_title_claim(&identity);
                         }
-                        return Err(e);
+                        return Err(rollback_error(e, &survivors));
                     }
                 };
                 // Tell the DAEMON's AppState who this pane is, so the
@@ -1137,14 +1129,8 @@ async fn spawn_with_unit(
                 // per role keeps state consistent with whatever subset actually
                 // started.
                 //
-                // (Issue #600 has since decided the other half: the loop no
-                // longer just `?`s out — it rolls the already-spawned roles back,
-                // so `Err` from this function means nothing is left running. This
-                // registration is what the rollback UNDOES, and it still has to
-                // happen here rather than after the loop: the rollback tears down
-                // a role only after that role's `close_agent` has removed its
-                // child, so between the two a live child must never be missing its
-                // routing entry.)
+                // Rollback removes this registration after a confirmed stop and
+                // keeps it for an unconfirmed survivor.
                 //
                 // Issue #454 review, item 5: gated on the SAME validation the
                 // `AttachRequest::StartAgent` seam applies. There it is implicit
@@ -1352,14 +1338,18 @@ async fn spawn_with_unit(
                 &reason,
                 &prompt,
             ) {
-                close_started_agents(registry, state, event_tx, &agents).await;
+                let survivors = close_started_agents(registry, state, event_tx, &agents).await;
                 if let Some(state) = state {
                     state
                         .write()
                         .await
                         .release_orchestration_title_claim(&identity);
                 }
-                return Err(seed_refused(notifier, &req.task_name, &error));
+                return Err(seed_refused(
+                    notifier,
+                    &req.task_name,
+                    &format!("{error}. {}", rollback_summary(&survivors)),
+                ));
             }
             Ok(SpawnHandle {
                 task_name: req.task_name,
@@ -1399,46 +1389,31 @@ async fn abort_closed_orchestration(
         "spawn: a role of this orchestration was closed while it was starting; publishing \
          nothing for it"
     );
-    if !registry.is_instance_closing(&identity.id) {
+    let survivors = if !registry.is_instance_closing(&identity.id) {
         let still: Vec<SpawnedAgent> = started
             .iter()
             .filter(|agent| registry.generation_registered(&agent.id))
             .cloned()
             .collect();
         roll_back_partial_orchestration(registry, state, event_tx, &still, &identity.name, "-")
-            .await;
-    }
+            .await
+    } else {
+        Vec::new()
+    };
     if let Some(state) = state {
         state
             .write()
             .await
             .release_orchestration_title_claim(identity);
     }
-    SpawnError::Agent(CLOSED_WHILE_STARTING.to_string())
+    rollback_error(
+        SpawnError::Agent(CLOSED_WHILE_STARTING.to_string()),
+        &survivors,
+    )
 }
 
-/// Issue #600: tear down the roles an orchestration spawn had already started
-/// when a LATER role failed, so [`spawn`]'s `Err` means "nothing is running".
-///
-/// Before this, the role loop `?`d straight out: roles `0..N` stayed live in
-/// `AgentPtyRegistry` as PTY children, no `SpawnHandle` came back so the caller
-/// had nothing to close them with, and the `OrchestrationSurface` broadcast that
-/// would have given the user a tab is never reached on the failure path — so the
-/// children were unreachable by every close path that exists. It also left
-/// `handle_dispatch`'s rollback force-removing the worktree those children were
-/// rooted in (issue #575); with the teardown in place that rollback runs against
-/// a tree nothing occupies, which is the state its comment always claimed.
-///
-/// Best-effort by construction, and it never reports failure upwards: the caller
-/// is already returning the ORIGINAL spawn error, which is what the user needs to
-/// see. A role that somehow survives is caught downstream instead — the dispatch
-/// rollback re-asks `worktree_still_in_use` before it removes anything.
-///
-/// Uses the same close protocol as the `AttachRequest::StopAgent` handler
-/// (`begin_pane_close` → `close_agent` → `unregister_pane` → `finish_pane_close`)
-/// rather than a bare `close_agent`, because the roles that DID start are already
-/// registered in `pane_role_map` and a fast orchestrator could in principle have
-/// armed a delegation against one of them before the failing role was reached.
+/// Tear down roles started before a later role failed. Return the agent IDs
+/// whose termination was not confirmed, for inclusion beside the spawn error.
 async fn roll_back_partial_orchestration(
     registry: &Arc<AgentPtyRegistry>,
     state: Option<&crate::state::SharedState>,
@@ -1446,9 +1421,9 @@ async fn roll_back_partial_orchestration(
     started: &[SpawnedAgent],
     orchestration: &str,
     failed_role: &str,
-) {
+) -> Vec<String> {
     if started.is_empty() {
-        return;
+        return Vec::new();
     }
     tracing::warn!(
         orchestration = %orchestration,
@@ -1456,28 +1431,50 @@ async fn roll_back_partial_orchestration(
         rolling_back = started.len(),
         "spawn: a later orchestration role failed; tearing down the roles that already started"
     );
-    close_started_agents(registry, state, event_tx, started).await;
+    close_started_agents(registry, state, event_tx, started).await
+}
+
+pub(crate) fn rollback_summary(survivors: &[String]) -> String {
+    if survivors.is_empty() {
+        "The started agents were closed.".to_string()
+    } else {
+        format!(
+            "Termination could not be confirmed for agents: {}. Retry stopping them.",
+            survivors.join(", ")
+        )
+    }
+}
+
+fn rollback_error(error: SpawnError, survivors: &[String]) -> SpawnError {
+    if survivors.is_empty() {
+        return error;
+    }
+    let message = match error {
+        SpawnError::Agent(message) => message,
+        other => other.to_string(),
+    };
+    SpawnError::Agent(format!("{message}. {}", rollback_summary(survivors)))
 }
 
 /// The teardown [`roll_back_partial_orchestration`] runs, for any agents a
 /// spawn started and must not leave running: the `StopAgent` close protocol
-/// for each of `started`. Best-effort, as that function describes.
+/// for each of `started`, returning unconfirmed survivors' agent IDs.
 ///
 /// PR #1735 third review: an agent this rolls back may already have been seen
 /// — the spawn surfaced its card, or the agent's own `SessionStart` hook did —
 /// so, as `StopAgent` does, each pane is closed under a cleanup hold
 /// ([`AgentPtyRegistry::hold_pane_for_cleanup`]): its pane-scoped cleanup runs
 /// only while no other generation claims the pane, and then the pane's
-/// sessions go and its closure is announced to every attached client
-/// (`event_tx`). The unit the agent belonged to ends as a stop ends it.
+/// sessions go and its closure is announced to attached clients (`event_tx`)
+/// after a confirmed stop. A failed close keeps the pane and unit retryable.
 pub(crate) async fn close_started_agents(
     registry: &Arc<AgentPtyRegistry>,
     state: Option<&crate::state::SharedState>,
     event_tx: Option<&broadcast::Sender<BroadcastMsg>>,
     started: &[SpawnedAgent],
-) {
+) -> Vec<String> {
     if started.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let records: Vec<Option<crate::agent_pty::AgentRecord>> = started
@@ -1502,8 +1499,8 @@ pub(crate) async fn close_started_agents(
     }
 
     // `close_agent` runs the synchronous SIGTERM-with-grace loop
-    // (`terminate_child_with_grace_and_wait`, up to `AGENT_TERMINATE_GRACE` per
-    // child), so it must not run on a Tokio worker thread — same reasoning as the
+    // (grace plus bounded reap polling per child), so it must not run on a
+    // Tokio worker thread — same reasoning as the
     // `StopAgent` handler's `spawn_blocking` hop.
     let registry_for_close = registry.clone();
     let ids: Vec<String> = started.iter().map(|a| a.id.clone()).collect();
@@ -1516,12 +1513,13 @@ pub(crate) async fn close_started_agents(
             .collect::<Vec<_>>()
     })
     .await;
+    let mut stopped = std::collections::HashSet::new();
     match closed {
         Ok(outcomes) => {
             for (id, outcome) in outcomes {
-                if let Err(e) = outcome {
-                    // `NotFound` is ordinary here — the child may have exited on
-                    // its own between spawning and the failure of a later role.
+                if outcome.is_ok() {
+                    stopped.insert(id);
+                } else if let Err(e) = outcome {
                     tracing::warn!(
                         agent_id = %id,
                         error = %e,
@@ -1539,23 +1537,29 @@ pub(crate) async fn close_started_agents(
         }
     }
 
-    // Drop the routing identity these panes were given as each spawn landed
-    // (`register_orchestration_role`, above), and any session the agents' hooks
-    // created on them. Done AFTER the children are gone so a live child is never
-    // missing its `pane_role_map` entry — the inverse ordering is exactly the
-    // inconsistency issue #454 closed.
+    // Remove routing and sessions only for confirmed stops, while their holds
+    // still prevent a successor from claiming the pane.
     if let Some(state) = state {
         let mut guard = state.write().await;
-        for pane in &held_panes {
-            guard.unregister_pane(pane);
-            guard.remove_sessions_for_pane(pane);
+        for (agent, hold) in started.iter().zip(&holds) {
+            if stopped.contains(&agent.id)
+                && let Some(hold) = hold
+            {
+                guard.unregister_pane(hold.pane_id());
+                guard.remove_sessions_for_pane(hold.pane_id());
+            }
         }
     }
-    for pane in &held_panes {
-        registry.finish_pane_close(pane, true);
+    for (agent, hold) in started.iter().zip(&holds) {
+        if let Some(hold) = hold {
+            registry.finish_pane_close(hold.pane_id(), stopped.contains(&agent.id));
+        }
     }
     for (record, hold) in records.iter().zip(&holds) {
         let Some(record) = record else { continue };
+        if !stopped.contains(&record.id) {
+            continue;
+        }
         if let (Some(tx), Some(hold)) = (event_tx, hold) {
             surface_attach_stopped_agent(tx, record, hold.pane_id());
         }
@@ -1568,6 +1572,11 @@ pub(crate) async fn close_started_agents(
         .await;
     }
     drop(holds);
+    started
+        .iter()
+        .filter(|agent| !stopped.contains(&agent.id))
+        .map(|agent| agent.id.clone())
+        .collect()
 }
 
 /// Spawn one pane via the existing registry path, tagging it with `pane_id` (so
@@ -3179,117 +3188,147 @@ mod tests {
     /// after the spawn surfaced its card. The deck fills while the spawn is
     /// paused just before publishing, so the card goes out and then the seed
     /// post is refused. The rollback must take the card back off every attached
-    /// client — one pane-closed announcement for that pane and agent, after the
-    /// card — end the unit it recorded, and leave nothing running.
+    /// client after a confirmed stop. If that stop fails, keep the card and unit
+    /// and name the surviving agent in the returned error.
     #[tokio::test]
     async fn a_dispatched_agent_whose_seed_is_refused_after_its_card_is_announced_closed() {
-        struct SilentNotifier;
-        impl Notifier for SilentNotifier {
-            fn notify(&self, _event: NotifyEvent) {}
-        }
-        let dir = tempfile::tempdir().expect("tempdir for the agent cwd");
-        let registry = Arc::new(AgentPtyRegistry::new());
-        let state: crate::state::SharedState =
-            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
-        let (event_tx, _keep) = broadcast::channel(4096);
-        let mut events = event_tx.subscribe();
-        let (reached, release) = registry.pause_at_for_test("dispatch-publication");
-        let spawned = {
-            let registry = registry.clone();
-            let state = state.clone();
-            let event_tx = event_tx.clone();
-            let req = SpawnRequest {
-                task_name: "seed-refused".to_string(),
-                working_dir: dir.path().to_string_lossy().into_owned(),
-                command: Some("sleep 30".to_string()),
-                prompt: "the task this agent was dispatched for".to_string(),
-                resolved_target: Some(SpawnTarget::SingleAgent {
+        for fail_stop in [false, true] {
+            struct SilentNotifier;
+            impl Notifier for SilentNotifier {
+                fn notify(&self, _event: NotifyEvent) {}
+            }
+            let dir = tempfile::tempdir().expect("tempdir for the agent cwd");
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let state: crate::state::SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            let (event_tx, _keep) = broadcast::channel(4096);
+            let mut events = event_tx.subscribe();
+            let (reached, release) = registry.pause_at_for_test("dispatch-publication");
+            let spawned = {
+                let registry = registry.clone();
+                let state = state.clone();
+                let event_tx = event_tx.clone();
+                let req = SpawnRequest {
+                    task_name: "seed-refused".to_string(),
+                    working_dir: dir.path().to_string_lossy().into_owned(),
                     command: Some("sleep 30".to_string()),
-                    inherited: None,
-                }),
-                compose_orchestrator_context: None,
-                seed_reason: None,
-            };
-            let origin = crate::dispatched_units::UnitOrigin {
-                name: "seed-refused".to_string(),
-                worktree: dir.path().to_path_buf(),
-                branch: "agent/seed-refused".to_string(),
-                clone_dir: dir.path().to_path_buf(),
-                dispatcher: crate::dispatched_units::Dispatcher {
+                    prompt: "the task this agent was dispatched for".to_string(),
+                    resolved_target: Some(SpawnTarget::SingleAgent {
+                        command: Some("sleep 30".to_string()),
+                        inherited: None,
+                    }),
+                    compose_orchestrator_context: None,
+                    seed_reason: None,
+                };
+                let origin = crate::dispatched_units::UnitOrigin {
+                    name: "seed-refused".to_string(),
+                    worktree: dir.path().to_path_buf(),
+                    branch: "agent/seed-refused".to_string(),
+                    clone_dir: dir.path().to_path_buf(),
+                    dispatcher: crate::dispatched_units::Dispatcher {
+                        pane_id: "disp".to_string(),
+                        agent_id: "nobody".to_string(),
+                    },
+                };
+                let caller = crate::dispatch_return::DispatchCaller {
                     pane_id: "disp".to_string(),
                     agent_id: "nobody".to_string(),
-                },
-            };
-            let caller = crate::dispatch_return::DispatchCaller {
-                pane_id: "disp".to_string(),
-                agent_id: "nobody".to_string(),
-                unit_name: "seed-refused".to_string(),
-            };
-            tokio::spawn(async move {
-                spawn_dispatched_unit(
-                    req,
-                    &registry,
-                    &SilentNotifier,
-                    Some(&event_tx),
-                    true,
-                    Some(&state),
-                    origin,
-                    caller,
-                )
-                .await
-                .map(|handle| handle.unit_id)
-            })
-        };
-        reached.await.expect("the dispatch reaches the pause");
-        let limits = registry.inbox().limits();
-        'fill: for pane in 0.. {
-            let to = crate::inbox::Recipient::bound(format!("filler-{pane}"), "filler");
-            for n in 0..limits.max_per_recipient {
-                if registry
-                    .inbox()
-                    .post_direct(
-                        to.clone(),
-                        crate::inbox::Content::from_deck("test", format!("filler {n}"), "x"),
+                    unit_name: "seed-refused".to_string(),
+                };
+                tokio::spawn(async move {
+                    spawn_dispatched_unit(
+                        req,
+                        &registry,
+                        &SilentNotifier,
+                        Some(&event_tx),
+                        true,
+                        Some(&state),
+                        origin,
+                        caller,
                     )
-                    .is_err()
-                {
-                    break 'fill;
+                    .await
+                    .map(|handle| handle.unit_id)
+                })
+            };
+            reached.await.expect("the dispatch reaches the pause");
+            let agent = registry
+                .agent_records()
+                .into_iter()
+                .next()
+                .expect("the started agent");
+            if fail_stop {
+                registry.fail_next_close_for_test(&agent.id);
+            }
+            let limits = registry.inbox().limits();
+            'fill: for pane in 0.. {
+                let to = crate::inbox::Recipient::bound(format!("filler-{pane}"), "filler");
+                for n in 0..limits.max_per_recipient {
+                    if registry
+                        .inbox()
+                        .post_direct(
+                            to.clone(),
+                            crate::inbox::Content::from_deck("test", format!("filler {n}"), "x"),
+                        )
+                        .is_err()
+                    {
+                        break 'fill;
+                    }
                 }
             }
-        }
-        let _ = release.send(());
-        let outcome = tokio::time::timeout(Duration::from_secs(15), spawned)
-            .await
-            .expect("the spawn answers")
-            .expect("the spawn task");
-        let Err(SpawnError::Agent(message)) = outcome else {
-            panic!("a spawn that lost its seed fails: {outcome:?}");
-        };
-        assert!(message.contains("first prompt"), "{message}");
+            let _ = release.send(());
+            let outcome = tokio::time::timeout(Duration::from_secs(15), spawned)
+                .await
+                .expect("the spawn answers")
+                .expect("the spawn task");
+            let Err(SpawnError::Agent(message)) = outcome else {
+                panic!("a spawn that lost its seed fails: {outcome:?}");
+            };
+            assert!(message.contains("first prompt"), "{message}");
 
-        let mut surfaced = None;
-        let mut closed = Vec::new();
-        while let Ok(msg) = events.try_recv() {
-            if let BroadcastMsg::Event(event) = msg {
-                if event.is_daemon_pane_closed() {
-                    closed.push(event);
-                } else if event.event_type == EventType::SessionStart && surfaced.is_none() {
-                    surfaced = Some(event);
+            let mut surfaced = None;
+            let mut closed = Vec::new();
+            while let Ok(msg) = events.try_recv() {
+                if let BroadcastMsg::Event(event) = msg {
+                    if event.is_daemon_pane_closed() {
+                        closed.push(event);
+                    } else if event.event_type == EventType::SessionStart && surfaced.is_none() {
+                        surfaced = Some(event);
+                    }
                 }
             }
+            let surfaced = surfaced.expect("the spawn surfaced the agent's card");
+            if fail_stop {
+                assert!(
+                    message.contains(&agent.id) && message.contains("Retry stopping"),
+                    "{message}"
+                );
+                assert!(
+                    closed.is_empty(),
+                    "a failed stop must not announce the card closed"
+                );
+                assert_eq!(registry.live_count(), 1);
+                assert_eq!(
+                    registry.dispatched_units().live().count(),
+                    1,
+                    "the survivor's unit stays open"
+                );
+                assert!(!registry.is_pane_closing(agent.pane_id_env.as_deref().unwrap()));
+                assert!(!registry.pane_close_in_flight(agent.pane_id_env.as_deref().unwrap()));
+                registry.shutdown_all();
+                continue;
+            }
+            let [closure] = closed.as_slice() else {
+                panic!("expected exactly one pane-closed announcement, got {closed:#?}");
+            };
+            assert_eq!(closure.pane_id, surfaced.pane_id);
+            assert!(closure.agent_id.is_some(), "the closure names the agent");
+            assert_eq!(registry.live_count(), 0, "nothing is left running");
+            assert_eq!(
+                registry.dispatched_units().live().count(),
+                0,
+                "the unit the spawn recorded has ended"
+            );
         }
-        let surfaced = surfaced.expect("the spawn surfaced the agent's card");
-        let [closure] = closed.as_slice() else {
-            panic!("expected exactly one pane-closed announcement, got {closed:#?}");
-        };
-        assert_eq!(closure.pane_id, surfaced.pane_id);
-        assert!(closure.agent_id.is_some(), "the closure names the agent");
-        assert_eq!(registry.live_count(), 0, "nothing is left running");
-        assert_eq!(
-            registry.dispatched_units().live().count(),
-            0,
-            "the unit the spawn recorded has ended"
-        );
     }
 
     /// Start [`closable_orchestration_request`] as a dispatched unit, pause it

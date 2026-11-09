@@ -6979,7 +6979,7 @@ async fn handle_connection(
                         // card, before the seed is refused. So the rollback
                         // closes it as `StopAgent` would, generation-safely,
                         // taking its sessions and announcing the pane closed.
-                        crate::spawn::close_started_agents(
+                        let survivors = crate::spawn::close_started_agents(
                             &registry,
                             Some(&state),
                             Some(&event_tx),
@@ -7000,7 +7000,8 @@ async fn handle_connection(
                             &mut stream,
                             &AttachResponse::err(format!(
                                 "start-agent: the agent's inbox refused its first prompt: \
-                                 {error}. The agent was closed."
+                                 {error}. {}",
+                                crate::spawn::rollback_summary(&survivors)
                             )),
                         )
                         .await?;

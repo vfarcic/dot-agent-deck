@@ -686,39 +686,6 @@ async fn assert_queued_dispatch_with_an_unresolved_worker_releases_its_commissio
     assert!(!harness.summary_path().exists());
 }
 
-/// A raw, no-echo `cat` successor for the orchestrator pane, carrying the same
-/// registry `TabMembership` a legitimate in-place restart of that role would
-/// carry — so the only thing separating it from its predecessor is the registry
-/// agent id, which is exactly the input under test.
-fn spawn_orchestrator_successor(
-    registry: &std::sync::Arc<AgentPtyRegistry>,
-    cwd: &str,
-    marker: &str,
-) -> String {
-    let command =
-        format!("stty -echo -icanon -icrnl -opost min 1 time 0 && printf {marker} && exec cat -u");
-    registry
-        .spawn_agent(SpawnOptions {
-            command: Some(&command),
-            cwd: Some(cwd),
-            env: vec![
-                (DOT_AGENT_DECK_PANE_ID.to_string(), ORCH_PANE.to_string()),
-                ("SHELL".to_string(), "/bin/sh".to_string()),
-            ],
-            tab_membership: Some(TabMembership::Orchestration {
-                name: ORCHESTRATION.to_string(),
-                role_index: 0,
-                role_name: ORCH_ROLE.to_string(),
-                is_start_role: true,
-                orchestration_cwd: Some(cwd.to_string()),
-                display_title: None,
-                orchestration_id: Some(ORCHESTRATION_INSTANCE.to_string()),
-            }),
-            ..SpawnOptions::default()
-        })
-        .expect("spawn the orchestrator successor stub")
-}
-
 /// The successor's readiness marker, and the barrier written into it after the
 /// refusal. Distinct strings so neither can be mistaken for the other, and
 /// neither is a substring of the feedback the test is proving absent.
@@ -763,17 +730,17 @@ fn work_done_006_feedback_is_refused_when_the_orchestrator_pane_changed_hands() 
         // owns the pane, so the feedback is bound to that agent...
         harness.delegate().await;
 
-        // ...and then the orchestrator is restarted in place. `close_agent`
-        // removes the record before the child dies, so the EOF sweep does not
-        // run and the outstanding delegation survives the restart — which is
-        // what leaves the identity gate as the only thing standing between the
-        // completion and the new occupant.
-        let cwd = harness.cwd.path().to_string_lossy().into_owned();
-        harness
+        // Restart in place through the real respawn path, keeping the pane's
+        // identity and history. A full close would discard terminal history
+        // after reaping, so close + spawn is not the restart this test describes.
+        let command = format!(
+            "stty -echo -icanon -icrnl -opost min 1 time 0 && printf {SUCCESSOR_READY} && exec cat -u"
+        );
+        let successor = harness
             .registry
-            .close_agent(&harness.orchestrator_agent_id)
-            .expect("close the commissioning orchestrator");
-        let successor = spawn_orchestrator_successor(&harness.registry, &cwd, SUCCESSOR_READY);
+            .respawn_agent_for_pane(ORCH_PANE, &command)
+            .await
+            .expect("restart the commissioning orchestrator in place");
         assert_ne!(
             successor, harness.orchestrator_agent_id,
             "the restart must produce a NEW registry agent id"

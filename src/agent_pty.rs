@@ -15430,11 +15430,6 @@ impl AgentPtyRegistry {
             }
             agent
         };
-        // PRD #1666 hardening M3: a closed pane's inbox history goes with it.
-        // Outside the registry lock: the hub takes its own.
-        if let Some(pane) = closed_pane {
-            self.inbox().forget_pane_history(&pane);
-        }
         #[cfg(test)]
         {
             let hold = self.close_reap_holds.lock().unwrap().remove(id);
@@ -15471,6 +15466,22 @@ impl AgentPtyRegistry {
             });
         }
         agent.removal.record_reaped(&mut agent.child);
+        // A failed stop retains the pane, including its inbox history. Recheck
+        // after the reap: a successor may have claimed it during termination.
+        // The hub takes its lock before the registry, in the reader lock order.
+        if let Some(pane) = closed_pane {
+            self.inbox().forget_pane_history_if(&pane, || {
+                let inner = self.inner.lock();
+                !inner
+                    .agents
+                    .values()
+                    .any(|a| a.pane_id_env.as_deref() == Some(&pane))
+                    && !inner
+                        .pending_spawns
+                        .values()
+                        .any(|p| p.as_deref() == Some(&pane))
+            });
+        }
         // Notify the idle monitor so it observes the registry shrink
         // immediately. The pump_reader thread will *also* signal once it
         // sees EOF from the kill, but doing it here makes the
@@ -15625,17 +15636,35 @@ impl AgentPtyRegistry {
         // a pane that keeps changing hands is reported as `NotFound`, which
         // `respawn_or_recreate_agent_for_pane` answers by retrying the respawn.
         const OCCUPANT_CHECKS: usize = 3;
+        // A failed stop already retired this generation's input, but retained
+        // its child for another stop. Do not feed it to the legacy respawn
+        // teardown, whose blocking wait cannot report an unconfirmed exit.
+        fn occupant<'a>(
+            inner: &'a RegistryInner,
+            pane: &str,
+        ) -> Result<(&'a String, &'a RunningAgent), AgentPtyError> {
+            let (id, agent) = inner
+                .agents
+                .iter()
+                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane) && !a.pane_handed_over)
+                .ok_or_else(|| AgentPtyError::NotFound(pane.to_string()))?;
+            if agent.pane_retired.load(Ordering::SeqCst) {
+                return Err(AgentPtyError::TerminationUnconfirmed {
+                    id: id.clone(),
+                    reason: "a previous stop could not reap this child; retry stopping it before restarting the pane".into(),
+                });
+            }
+            Ok((id, agent))
+        }
         let mut checks = 0;
         #[allow(unused_variables)]
         let (removed, verified_dir, agent_id) = loop {
             checks += 1;
-            let checked = self
-                .inner
-                .lock()
-                .agents
-                .iter()
-                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
-                .map(|(id, a)| (id.clone(), a.cwd.clone()));
+            let checked = {
+                let inner = self.inner.lock();
+                let (id, agent) = occupant(&inner, pane_id_env)?;
+                Some((id.clone(), agent.cwd.clone()))
+            };
             #[cfg(unix)]
             let verified_dir = match checked.as_ref() {
                 Some((_, cwd)) => self.reverify_prepared_pane(pane_id_env, cwd.as_deref())?,
@@ -15705,12 +15734,7 @@ impl AgentPtyRegistry {
             if self.admission_frozen.load(Ordering::SeqCst) {
                 return Err(AgentPtyError::Spawn(ADMISSION_FROZEN_REASON.into()));
             }
-            let agent_id = inner
-                .agents
-                .iter()
-                .find(|(_, a)| a.pane_id_env.as_deref() == Some(pane_id_env))
-                .map(|(id, _)| id.clone())
-                .ok_or_else(|| AgentPtyError::NotFound(pane_id_env.to_string()))?;
+            let agent_id = occupant(&inner, pane_id_env)?.0.clone();
             if checked.as_ref().map(|(id, _)| id) != Some(&agent_id) {
                 if checks < OCCUPANT_CHECKS {
                     continue;

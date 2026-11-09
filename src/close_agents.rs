@@ -2522,6 +2522,63 @@ mod tests {
             deck.registry
                 .insert_member_child_for_test(pane, instance, false, Box::new(child));
         let exited = deck.registry.subscribe(&agent).unwrap().exited;
+        let history = if scope == "history" {
+            let message = deck
+                .registry
+                .inbox()
+                .post_direct(
+                    crate::inbox::Recipient::bound(pane, &agent),
+                    crate::inbox::Content::from_deck(
+                        "test",
+                        "kept history",
+                        "acknowledged before stop",
+                    ),
+                )
+                .unwrap();
+            deck.registry.inbox().test_take_acked(pane, &agent);
+            let undeliverable = deck
+                .registry
+                .inbox()
+                .post_direct(
+                    crate::inbox::Recipient::bound(pane, "departed-generation"),
+                    crate::inbox::Content::from_deck(
+                        "test",
+                        "undeliverable history",
+                        "kept after exit",
+                    ),
+                )
+                .unwrap();
+            deck.registry
+                .inbox()
+                .agent_exited(pane, "departed-generation");
+            Some([message, undeliverable])
+        } else {
+            None
+        };
+        let mut events = deck.event_tx.subscribe();
+        let rollback_sibling = if scope == "rollback" {
+            deck.state.write().await.register_orchestration_role(
+                pane,
+                "worker",
+                false,
+                crate::state::OrchestrationIdentity {
+                    name: "team".into(),
+                    id: instance.into(),
+                },
+                None,
+            );
+            deck.thinking(pane, &agent).await;
+            Some(
+                deck.start(
+                    "rollback-control",
+                    "cat",
+                    Some((instance, "orchestrator", true)),
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         let unit = if scope == "instance" {
             // The reapable sibling is the control: it closes, and the failed
             // member must remain listed rather than making the unit look gone.
@@ -2540,7 +2597,55 @@ mod tests {
         };
         let started = std::time::Instant::now();
         let reply = tokio::time::timeout(Duration::from_secs(7), async {
-            if scope == "stop" {
+            if scope == "rollback" {
+                let survivors = crate::spawn::close_started_agents(
+                    &deck.registry,
+                    Some(&deck.state),
+                    Some(&deck.event_tx),
+                    &[
+                        crate::spawn::SpawnedAgent {
+                            id: rollback_sibling.clone().unwrap(),
+                            pane_id: "rollback-control".into(),
+                            role_name: None,
+                        },
+                        crate::spawn::SpawnedAgent {
+                            id: agent.clone(),
+                            pane_id: pane.into(),
+                            role_name: None,
+                        },
+                    ],
+                )
+                .await;
+                assert_eq!(
+                    survivors,
+                    std::slice::from_ref(&agent),
+                    "rollback reports the surviving agent ID"
+                );
+                assert!(crate::spawn::rollback_summary(&survivors).contains(&agent));
+                let state = deck.state.read().await;
+                assert!(
+                    state.pane_role_map.contains_key(pane),
+                    "rollback must retain the survivor's role"
+                );
+                assert!(
+                    state.pane_status_of(pane).is_some(),
+                    "rollback must retain the survivor's card"
+                );
+                assert!(!state.pane_role_map.contains_key("rollback-control"));
+                let mut closed = Vec::new();
+                while let Ok(message) = events.try_recv() {
+                    if let BroadcastMsg::Event(event) = message
+                        && event.is_daemon_pane_closed()
+                    {
+                        closed.push(event.pane_id);
+                    }
+                }
+                assert_eq!(
+                    closed,
+                    [Some("rollback-control".into())],
+                    "announce only the confirmed stop"
+                );
+            } else if matches!(scope, "stop" | "history" | "respawn") {
                 let error = deck
                     .client
                     .stop_agent(&agent)
@@ -2598,6 +2703,41 @@ mod tests {
             deck.registry.agent_record_any(&agent).is_some(),
             "retain the survivor for retry"
         );
+        if let Some(messages) = &history {
+            assert!(
+                messages.iter().all(|id| deck
+                    .registry
+                    .inbox()
+                    .list(pane)
+                    .iter()
+                    .any(|m| &m.id == id)),
+                "failed stop must retain acknowledged and undeliverable inbox history"
+            );
+        }
+        if scope == "respawn" {
+            let result = tokio::time::timeout(
+                Duration::from_secs(7),
+                deck.registry.respawn_agent_for_pane(pane, "cat"),
+            )
+            .await;
+            assert!(
+                result.is_ok(),
+                "restart after a failed stop must not enter a blocking wait"
+            );
+            let error = result
+                .unwrap()
+                .expect_err("the unreaped generation cannot be replaced");
+            assert!(
+                error
+                    .to_string()
+                    .contains("termination could not be confirmed"),
+                "{error}"
+            );
+            assert!(
+                deck.registry.agent_record_any(&agent).is_some(),
+                "restart must preserve the survivor"
+            );
+        }
         assert!(
             deck.registry.dispatched_units().get(&unit).is_some(),
             "the survivor's unit is still open"
@@ -2620,9 +2760,22 @@ mod tests {
         // a real successor before releasing that child. The late retry names
         // the old generation and must leave the successor's role and PTY alive.
         exited.store(true, std::sync::atomic::Ordering::SeqCst);
-        let successor = deck
+        let mut successor = deck
             .start(pane, "cat", Some((instance, "successor", true)))
             .await;
+        if scope == "respawn" {
+            successor = tokio::time::timeout(
+                Duration::from_secs(7),
+                deck.registry.respawn_agent_for_pane(pane, "cat"),
+            )
+            .await
+            .expect("a handed-over survivor cannot block its successor's restart")
+            .expect("restart the current occupant");
+            assert!(
+                deck.registry.agent_record_any(&agent).is_some(),
+                "restart must not select the handed-over survivor"
+            );
+        }
         drop(release);
         deck.client
             .stop_agent(&agent)
@@ -2633,6 +2786,17 @@ mod tests {
             Some(successor.as_str())
         );
         assert!(deck.live(&successor));
+        if let Some(messages) = &history {
+            assert!(
+                messages.iter().all(|id| deck
+                    .registry
+                    .inbox()
+                    .list(pane)
+                    .iter()
+                    .any(|m| &m.id == id)),
+                "a late reap must preserve the successor's pane history"
+            );
+        }
         assert!(
             deck.state.read().await.pane_role_map.contains_key(pane),
             "late cleanup must not unregister the successor"
@@ -2641,6 +2805,12 @@ mod tests {
             .stop_agent(&successor)
             .await
             .expect("ordinary stop control");
+        if history.is_some() {
+            assert!(
+                deck.registry.inbox().list(pane).is_empty(),
+                "confirmed final close drops history"
+            );
+        }
         deck.shutdown().await;
     }
 
@@ -2649,6 +2819,27 @@ mod tests {
     #[tokio::test]
     async fn stop_agent_finishes_with_an_unreapable_child() {
         unreapable_member_finishes("stop").await;
+    }
+
+    /// Scenario: rollback closes a normal sibling but keeps an unreapable role's card,
+    /// routing and unit available for another stop, without broadcasting that pane closed.
+    #[tokio::test]
+    async fn rollback_finishes_with_an_unreapable_child() {
+        unreapable_member_finishes("rollback").await;
+    }
+
+    /// Scenario: a failed stop keeps the pane's acknowledged and undeliverable inbox history; a confirmed
+    /// final close removes it, after a late reap has left the successor alone.
+    #[tokio::test]
+    async fn history_survives_an_unreapable_child() {
+        unreapable_member_finishes("history").await;
+    }
+
+    /// Scenario: restarting a pane after its stop failed returns a retryable failure
+    /// within a bound and keeps the old generation available for another stop.
+    #[tokio::test]
+    async fn respawn_refuses_an_unreapable_child() {
+        unreapable_member_finishes("respawn").await;
     }
 
     /// Scenario: a single-unit close reports its unreapable child as a survivor

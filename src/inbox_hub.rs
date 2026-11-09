@@ -1967,6 +1967,16 @@ impl InboxHub {
         self.lock().inbox.forget_pane_history(pane_id);
     }
 
+    /// Forget a reaped pane's history if no successor claims it. The predicate
+    /// may take the registry lock (hub → registry), but must not call this hub.
+    /// Holding the hub lock keeps a successor's inbox operations after this check.
+    pub fn forget_pane_history_if(&self, pane_id: &str, unclaimed: impl FnOnce() -> bool) {
+        let mut st = self.lock();
+        if unclaimed() {
+            st.inbox.forget_pane_history(pane_id);
+        }
+    }
+
     /// Live waiters armed for `agent_id` in `pane_id`.
     pub fn armed(&self, pane_id: &str, agent_id: &str) -> usize {
         self.lock()
