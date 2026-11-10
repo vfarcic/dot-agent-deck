@@ -1515,6 +1515,9 @@ struct Writer {
     file: File,
     /// The current segment's number.
     segment: u64,
+    /// The number the next rotation tries first. It only grows: a taken
+    /// name moves it past for good.
+    next_segment: u64,
     /// Shared with the handle, for compaction: segments below it are sealed.
     current: Arc<AtomicU64>,
     segment_max: u64,
@@ -1529,11 +1532,15 @@ struct Writer {
     rotate_backoff: u64,
     /// Rotations failed in a row.
     rotate_failures: u64,
+    /// Taken segment names skipped over the run's lifetime.
+    rotate_skipped: u64,
     broken: bool,
     #[cfg(test)]
     gate: Option<Arc<WriterGate>>,
     #[cfg(test)]
     rotate_sync_fault: Option<Arc<AtomicU64>>,
+    #[cfg(test)]
+    rotate_remove_fault: Option<Arc<AtomicU64>>,
     /// Released when the writer ends, after everything is written.
     _lock: File,
     /// Dropped last, so the handle's last drop can wait for the lock's release.
@@ -1627,21 +1634,20 @@ impl Writer {
         }
     }
 
-    /// Seal the current segment and start the next. On failure the current
-    /// one keeps taking lines: that includes a failed directory sync after
-    /// the new segment was created, since lines synced into a file whose
-    /// directory entry is not durable can vanish with it in a crash. The new,
-    /// empty file is removed then, so it does not read as the run's highest
-    /// segment. A failed rotation is not tried again on the next line, but
-    /// once the segment has grown by [`Self::rotate_backoff`] more, so a
-    /// lasting fault costs one attempt (and one warning) per stretch of
-    /// lines, not one per line.
+    /// Seal the current segment and start the next, keeping one rule: the
+    /// run's highest-numbered segment on disk is always the one being
+    /// written, since every reader and every compaction (this run's or
+    /// another's) treats the segments below it as sealed.
     ///
-    /// Only this writer creates this run's segments (it holds the run lock),
-    /// so a name that already exists is an empty segment an earlier failed
-    /// rotation could not remove. It is skipped for the next free number:
-    /// once a later segment exists it is sealed, and compaction folds it
-    /// away.
+    /// When the new segment's directory sync fails, lines synced into it
+    /// could vanish with its directory entry in a crash, so it is removed
+    /// and the current segment keeps taking lines; the rotation is tried
+    /// again once the segment has grown by [`Self::rotate_backoff`] more, so
+    /// a lasting fault costs one attempt (and one warning) per stretch of
+    /// lines, not one per line. When that removal fails too, the new file is
+    /// already the run's highest segment to everyone else, so the writer
+    /// switches to it anyway rather than leave a higher file it does not
+    /// write.
     fn rotate(&mut self) {
         match self.start_next_segment() {
             Ok(next) => {
@@ -1673,44 +1679,58 @@ impl Writer {
         }
     }
 
-    /// Create, sync and switch to the next segment; its number.
+    /// Create the next segment and switch to it; its number.
+    ///
+    /// The number comes from [`Self::next_segment`], which only grows. Only
+    /// this writer creates this run's segments, so a name already taken is a
+    /// file put there from outside it; it moves the number on for good, so
+    /// each taken name costs one skip in the run's lifetime and taken names
+    /// can never stall rotation.
     fn start_next_segment(&mut self) -> io::Result<u64> {
-        let mut next = self.segment + 1;
-        let mut skipped = 0;
-        let file = loop {
-            let name = segment_name_n(&self.run, next);
-            match self.dir.create_new_owner_only(&name) {
-                Ok(file) => break file,
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && skipped < ROTATE_SKIP_MAX => {
-                    skipped += 1;
-                    next += 1;
+        let (next, file) = loop {
+            let n = self.next_segment;
+            match self
+                .dir
+                .create_new_owner_only(&segment_name_n(&self.run, n))
+            {
+                Ok(file) => break (n, file),
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                    self.next_segment = n.saturating_add(1);
+                    self.rotate_skipped += 1;
+                    // Rate-limited: the 1st, 2nd, 4th, 8th... skip.
+                    if self.rotate_skipped.is_power_of_two() {
+                        warn!(
+                            segment = n,
+                            skipped = self.rotate_skipped,
+                            "work journal: a segment name is already taken; skipping to the next number"
+                        );
+                    }
                 }
                 Err(e) => return Err(e),
             }
         };
-        let name = segment_name_n(&self.run, next);
         if let Err(error) = self.sync_for_rotation() {
-            drop(file);
-            if let Err(remove) = self.dir.remove_file(&name) {
-                warn!(
+            let name = segment_name_n(&self.run, next);
+            match self.remove_for_rotation(&name) {
+                // Gone: the current segment is still the run's highest, and
+                // the number is free for the next try.
+                Ok(()) => return Err(error),
+                Err(remove) => warn!(
                     segment = %name,
-                    error = %remove,
-                    "work journal: the unsynced new segment could not be removed; the next rotation skips its name"
-                );
+                    %error,
+                    %remove,
+                    "work journal: the new segment's directory sync failed and it could not be removed; writing to it, since it is the run's highest segment"
+                ),
             }
-            return Err(error);
         }
         self.file = file;
         self.segment = next;
+        self.next_segment = next.saturating_add(1);
         self.len = 0;
         self.current.store(next, Ordering::Release);
         Ok(next)
     }
 }
-
-/// How many leftover segment names (empty files failed rotations could not
-/// remove) one rotation skips before it gives up.
-const ROTATE_SKIP_MAX: u32 = 64;
 
 impl Writer {
     /// The directory sync that makes a new segment's entry durable.
@@ -1724,6 +1744,19 @@ impl Writer {
             return Err(io::Error::other("injected rotation sync failure"));
         }
         self.dir.sync()
+    }
+
+    /// Removes a new segment whose directory sync failed.
+    fn remove_for_rotation(&self, name: &str) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(faults) = &self.rotate_remove_fault
+            && faults
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(io::Error::other("injected segment removal failure"));
+        }
+        self.dir.remove_file(name)
     }
 }
 
@@ -1776,6 +1809,9 @@ pub(crate) struct TestHooks {
     /// While above zero, each rotation's directory sync fails and takes one
     /// off.
     pub(crate) rotate_sync_fault: Option<Arc<AtomicU64>>,
+    /// While above zero, each removal of a new segment whose directory sync
+    /// failed fails too and takes one off.
+    pub(crate) rotate_remove_fault: Option<Arc<AtomicU64>>,
     /// Holds each recovery attempt, with the lock not yet taken, until it is
     /// opened.
     pub(crate) recovery_gate: Option<Arc<WriterGate>>,
@@ -1794,6 +1830,7 @@ impl std::fmt::Debug for TestHooks {
             .field("fail_recovery", &self.fail_recovery)
             .field("chunk_probe_fault", &self.chunk_probe_fault)
             .field("rotate_sync_fault", &self.rotate_sync_fault)
+            .field("rotate_remove_fault", &self.rotate_remove_fault)
             .field("recovery_gate", &self.recovery_gate.is_some())
             .field("skipped_pending", &self.skipped_pending)
             .finish()
@@ -2020,6 +2057,7 @@ impl WorkJournal {
             homes: homes.clone(),
             file,
             segment: 0,
+            next_segment: 1,
             current: Arc::clone(&current),
             segment_max: options.segment_max_bytes.max(1),
             next_seq: 1,
@@ -2027,11 +2065,14 @@ impl WorkJournal {
             rotate_at: 0,
             rotate_backoff: 0,
             rotate_failures: 0,
+            rotate_skipped: 0,
             broken: false,
             #[cfg(test)]
             gate: options.hooks.gate.clone(),
             #[cfg(test)]
             rotate_sync_fault: options.hooks.rotate_sync_fault.clone(),
+            #[cfg(test)]
+            rotate_remove_fault: options.hooks.rotate_remove_fault.clone(),
             _lock: lock,
             _done: done,
         };

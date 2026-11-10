@@ -2113,9 +2113,9 @@ fn a_rotation_whose_directory_sync_fails_keeps_writing_the_current_segment() {
 
 /// Qodo finding 10 (second round) on PR #2248: a rotation that keeps
 /// failing is not tried again on every line, but once the segment has grown
-/// further, with the stretch doubling per failure. And an empty segment a
-/// failed rotation could not remove does not wedge every later rotation:
-/// once the fault clears, the writer skips that name for the next free one.
+/// further, with the stretch doubling per failure. And a file already at
+/// the next segment's name does not wedge rotation: once the fault clears,
+/// the writer skips that name for the next free one.
 #[test]
 fn a_failing_rotation_backs_off_and_a_leftover_segment_does_not_wedge_it() {
     let state = state();
@@ -2158,8 +2158,7 @@ fn a_failing_rotation_backs_off_and_a_leftover_segment_does_not_wedge_it() {
     // The unsynced segment was removed each time.
     assert!(!dir.join("run-me.1.jsonl").exists());
 
-    // An earlier failed rotation could not remove its file: it is left at
-    // the next segment's name.
+    // A file put at the next segment's name from outside the writer.
     plant(state.path(), "run-me.1.jsonl", &[], "");
     faults.store(0, Ordering::SeqCst);
     let before = written;
@@ -2172,6 +2171,125 @@ fn a_failing_rotation_backs_off_and_a_leftover_segment_does_not_wedge_it() {
     written += 1;
     journal.flush();
     assert!(fs::metadata(dir.join("run-me.2.jsonl")).unwrap().len() > 0);
+    let read: HashSet<WorkId> = read_journal(state.path())
+        .unwrap()
+        .lines
+        .iter()
+        .map(|l| l.event.work().clone())
+        .collect();
+    assert_eq!(read, (0..written).map(work).collect::<HashSet<_>>());
+}
+
+/// Qodo finding (third round) on PR #2248: when a new segment's directory
+/// sync fails and removing it fails too, the writer switches to it, so the
+/// run's highest segment on disk is the one being written. A compaction by
+/// another run, which treats every segment of a live run below its highest
+/// as sealed, folds the old segment and never the one being written: every
+/// line, before and after, reads back.
+#[test]
+fn a_rotation_whose_sync_and_removal_fail_writes_the_new_segment() {
+    let state = state();
+    let sync_faults = Arc::new(AtomicU64::new(1));
+    let remove_faults = Arc::new(AtomicU64::new(1));
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "me",
+        &deck(),
+        options_with(|o| {
+            o.segment_max_bytes = 2048;
+            o.hooks.rotate_sync_fault = Some(Arc::clone(&sync_faults));
+            o.hooks.rotate_remove_fault = Some(Arc::clone(&remove_faults));
+        }),
+    )
+    .unwrap();
+    let dir = journal_dir(state.path());
+    let linked = |n: u64| Event::Linked {
+        work: work(n),
+        refs: Box::new(Refs::default()),
+    };
+    let len = |name: &str| fs::metadata(dir.join(name)).unwrap().len();
+    let mut written = 0;
+    while !dir.join("run-me.1.jsonl").exists() {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < 100, "rotation was never tried");
+    }
+    assert_eq!(
+        sync_faults.load(Ordering::SeqCst),
+        0,
+        "the sync never failed"
+    );
+    assert_eq!(
+        remove_faults.load(Ordering::SeqCst),
+        0,
+        "the removal never failed"
+    );
+    // The writer is on the new segment: the old one stops growing.
+    let sealed = len("run-me.jsonl");
+    assert!(len("run-me.1.jsonl") > 0);
+    for _ in 0..3 {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+    }
+    assert_eq!(len("run-me.jsonl"), sealed);
+    let writing = len("run-me.1.jsonl");
+
+    // Another live run compacts: it folds the sealed segment only.
+    let other = open(state.path(), "other");
+    let report = other.compact_with(now_ms(), Retention::default()).unwrap();
+    assert_eq!(report.consumed_files, 1, "{report:?}");
+    assert!(!dir.join("run-me.jsonl").exists());
+    assert_eq!(len("run-me.1.jsonl"), writing);
+    journal.try_record(linked(written)).unwrap();
+    written += 1;
+    assert!(len("run-me.1.jsonl") > writing);
+    assert!(!dir.join("run-me.2.jsonl").exists());
+    let read: HashSet<WorkId> = read_journal(state.path())
+        .unwrap()
+        .lines
+        .iter()
+        .map(|l| l.event.work().clone())
+        .collect();
+    assert_eq!(read, (0..written).map(work).collect::<HashSet<_>>());
+}
+
+/// Qodo finding (third round) on PR #2248: taken segment names never stall
+/// rotation, however many there are. The writer remembers the next number
+/// across rotations, so it goes past 70 taken names in one rotation, and the
+/// rotation after that continues from there rather than from the bottom,
+/// even when a lower name has been freed in between.
+#[test]
+fn many_taken_segment_names_do_not_stall_rotation_or_restart_its_numbering() {
+    let state = state();
+    for n in 1..=70 {
+        plant(state.path(), &format!("run-me.{n}.jsonl"), &[], "");
+    }
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "me",
+        &deck(),
+        options_with(|o| o.segment_max_bytes = 512),
+    )
+    .unwrap();
+    let dir = journal_dir(state.path());
+    let linked = |n: u64| Event::Linked {
+        work: work(n),
+        refs: Box::new(Refs::default()),
+    };
+    let mut written = 0;
+    while !dir.join("run-me.71.jsonl").exists() {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < 100, "rotation stalled on the taken names");
+    }
+    // A lower name is free again; the next rotation still moves up.
+    fs::remove_file(dir.join("run-me.5.jsonl")).unwrap();
+    while !dir.join("run-me.72.jsonl").exists() {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < 200, "the second rotation never happened");
+    }
+    assert!(!dir.join("run-me.5.jsonl").exists(), "numbering restarted");
     let read: HashSet<WorkId> = read_journal(state.path())
         .unwrap()
         .lines
