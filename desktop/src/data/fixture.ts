@@ -230,7 +230,7 @@ export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatu
   const agentType = (cli && FIXTURE_AGENT_TYPES[cli]) || "none";
   const promptKeys = FIXTURE_PROMPT_KEYS[agentType];
   // What `agentTurn` makes of the daemon status each fixture status stands for.
-  const turn = status === "running" ? "working" : status === "needs_input" || status === "idle" ? "idle" : undefined;
+  const turn = status === "running" ? "working" : status === "needs_input" || status === "waiting" || status === "idle" ? "idle" : undefined;
   return {
     agentType,
     ...(turn ? { turn } : {}),
