@@ -1101,7 +1101,7 @@ async fn dispatch_one_issue(
     // started was already written.
     if let Some(work) = &issue_work {
         match &spawned {
-            Ok(_) => registry.work().issue_launched(work),
+            Ok(_) => registry.work().launched_without_unit(work),
             Err(_) => registry.work().launch_failed(work, None),
         }
     }

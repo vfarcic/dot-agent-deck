@@ -1346,7 +1346,7 @@ fn a_scheduled_issue_dispatch_closes_with_what_it_started_or_leaves_nothing() {
     assert_eq!(served, single);
     tracker.attempt_started(&single, "1", Some("i-1"), None);
     tracker.flush_open(&single);
-    tracker.issue_launched(&single);
+    tracker.launched_without_unit(&single);
     assert_eq!(
         kinds_of(&lines(&tracker, state.path()), &single),
         ["opened", "attempt_started"],
@@ -1378,7 +1378,7 @@ fn a_scheduled_issue_dispatch_closes_with_what_it_started_or_leaves_nothing() {
         .unwrap();
     tracker.attempt_started(&orch, "2", Some("io-1"), Some("orchestrator"));
     tracker.flush_open(&team);
-    tracker.issue_launched(&team);
+    tracker.launched_without_unit(&team);
     assert_eq!(kinds_of(&lines(&tracker, state.path()), &team), ["opened"]);
     tracker.attempt_ended("2", worker_end());
     tracker.orchestration_ended("orch-issue");
@@ -1410,4 +1410,85 @@ fn a_scheduled_issue_dispatch_closes_with_what_it_started_or_leaves_nothing() {
     let read = lines(&tracker, state.path());
     assert_eq!(kinds_of(&read, &broken), ["opened", "closed"]);
     assert_eq!(tracker.book_sizes().launches, 0);
+}
+
+/// Qodo finding 1 (second round) on PR #2248: a `dispatch` with no caller
+/// spawns without registering a unit, so no unit's end can close its work.
+/// It closes with what it spawned instead: a single agent's pane, or the
+/// orchestration it started, and at once when that is already gone.
+#[test]
+fn a_dispatch_with_no_caller_closes_with_what_it_spawned() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+
+    // A single agent: closes `pane_closed` when its pane closes.
+    let single = tracker
+        .dispatch_minted(None, "agent/dispatch-solo", Path::new("/tmp/solo"))
+        .unwrap();
+    tracker.attempt_started(&single, "1", Some("d-1"), None);
+    tracker.launched_without_unit(&single);
+    assert_eq!(
+        kinds_of(&lines(&tracker, state.path()), &single),
+        ["attempt_started", "opened"],
+        "open while its pane is"
+    );
+    tracker.attempt_ended("1", worker_end());
+    tracker.pane_closed("d-1");
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        kinds_of(&read, &single),
+        ["attempt_started", "opened", "attempt_ended", "closed"]
+    );
+    assert!(read.iter().any(|l| matches!(
+        &l.event,
+        Event::Closed { work, how: CloseHow::PaneClosed } if work == &single
+    )));
+
+    // An orchestration: closes `orchestration_ended` when it ends.
+    let team = tracker
+        .dispatch_minted(None, "agent/dispatch-team", Path::new("/tmp/team"))
+        .unwrap();
+    let orch = tracker
+        .resolve_spawn(
+            Some(&team),
+            Some("do-1"),
+            Some(&orchestration("orch-nocaller", "orchestrator")),
+            None,
+        )
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&orch, "2", Some("do-1"), Some("orchestrator"));
+    tracker.launched_without_unit(&team);
+    assert_eq!(kinds_of(&lines(&tracker, state.path()), &team), ["opened"]);
+    tracker.attempt_ended("2", worker_end());
+    tracker.orchestration_ended("orch-nocaller");
+    let read = lines(&tracker, state.path());
+    assert_eq!(kinds_of(&read, &team), ["opened", "closed"]);
+    assert!(read.iter().any(|l| matches!(
+        &l.event,
+        Event::Closed { work, how: CloseHow::OrchestrationEnded } if work == &team
+    )));
+
+    // Its pane already closed by the time the spawn returned: closes at once.
+    let gone = tracker
+        .dispatch_minted(None, "agent/dispatch-gone", Path::new("/tmp/gone"))
+        .unwrap();
+    tracker.attempt_started(&gone, "3", Some("d-3"), None);
+    tracker.attempt_ended("3", worker_end());
+    tracker.pane_closed("d-3");
+    tracker.launched_without_unit(&gone);
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        kinds_of(&read, &gone),
+        ["attempt_started", "attempt_ended", "opened", "closed"]
+    );
+    assert!(read.iter().any(|l| matches!(
+        &l.event,
+        Event::Closed { work, how: CloseHow::PaneClosed } if work == &gone
+    )));
+    let sizes = tracker.book_sizes();
+    assert_eq!(
+        (sizes.launches, sizes.close_with_child, sizes.pending_units),
+        (0, 0, 0)
+    );
 }

@@ -2082,8 +2082,8 @@ fn a_rotation_whose_directory_sync_fails_keeps_writing_the_current_segment() {
         work: work(n),
         refs: Box::new(Refs::default()),
     };
-    // Past the segment size: each line that would rotate meets a failing
-    // sync, while three failures last.
+    // Past the segment size: each rotation tried meets a failing sync, while
+    // three failures last.
     let mut written = 0;
     while faults.load(Ordering::SeqCst) > 0 {
         journal.try_record(linked(written)).unwrap();
@@ -2092,13 +2092,86 @@ fn a_rotation_whose_directory_sync_fails_keeps_writing_the_current_segment() {
     }
     assert_eq!(segments(), vec!["run-me.jsonl".to_string()]);
     assert!(fs::metadata(dir.join("run-me.jsonl")).unwrap().len() > 512);
-    // The sync works again: the next line rotates.
-    journal.try_record(linked(written)).unwrap();
-    written += 1;
+    // The sync works again: the next rotation tried goes ahead.
+    while segments().len() == 1 {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < 200, "rotation never resumed");
+    }
     assert_eq!(
         segments(),
         vec!["run-me.1.jsonl".to_string(), "run-me.jsonl".to_string()]
     );
+    let read: HashSet<WorkId> = read_journal(state.path())
+        .unwrap()
+        .lines
+        .iter()
+        .map(|l| l.event.work().clone())
+        .collect();
+    assert_eq!(read, (0..written).map(work).collect::<HashSet<_>>());
+}
+
+/// Qodo finding 10 (second round) on PR #2248: a rotation that keeps
+/// failing is not tried again on every line, but once the segment has grown
+/// further, with the stretch doubling per failure. And an empty segment a
+/// failed rotation could not remove does not wedge every later rotation:
+/// once the fault clears, the writer skips that name for the next free one.
+#[test]
+fn a_failing_rotation_backs_off_and_a_leftover_segment_does_not_wedge_it() {
+    let state = state();
+    let faults = Arc::new(AtomicU64::new(u64::MAX));
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "me",
+        &deck(),
+        options_with(|o| {
+            o.segment_max_bytes = 4096;
+            o.hooks.rotate_sync_fault = Some(Arc::clone(&faults));
+        }),
+    )
+    .unwrap();
+    let dir = journal_dir(state.path());
+    let linked = |n: u64| Event::Linked {
+        work: work(n),
+        refs: Box::new(Refs::default()),
+    };
+    let current_len = || fs::metadata(dir.join("run-me.jsonl")).unwrap().len();
+    // To four times the segment size, with every directory sync failing.
+    let mut written = 0;
+    let mut over = 0;
+    while current_len() < 4096 * 4 {
+        if current_len() >= 4096 {
+            over += 1;
+        }
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < 2000, "the segment never grew");
+    }
+    let attempts = u64::MAX - faults.load(Ordering::SeqCst);
+    assert!(attempts >= 1, "rotation was never tried");
+    // Retried after a sixteenth of the size more, doubling up to the size:
+    // seven attempts over three segments' worth of lines, not one per line.
+    assert!(
+        attempts <= 8 && attempts * 2 < over,
+        "{attempts} rotation attempts over {over} lines past the segment size"
+    );
+    // The unsynced segment was removed each time.
+    assert!(!dir.join("run-me.1.jsonl").exists());
+
+    // An earlier failed rotation could not remove its file: it is left at
+    // the next segment's name.
+    plant(state.path(), "run-me.1.jsonl", &[], "");
+    faults.store(0, Ordering::SeqCst);
+    let before = written;
+    while !dir.join("run-me.2.jsonl").exists() {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < before + 1000, "rotation stayed wedged");
+    }
+    journal.try_record(linked(written)).unwrap();
+    written += 1;
+    journal.flush();
+    assert!(fs::metadata(dir.join("run-me.2.jsonl")).unwrap().len() > 0);
     let read: HashSet<WorkId> = read_journal(state.path())
         .unwrap()
         .lines
@@ -2221,4 +2294,49 @@ fn startup_recovery_in_the_background_never_holds_up_its_caller() {
     );
     let report = journal.compact_with(NOW_MS, Retention::default()).unwrap();
     assert!(!report.skipped_recovery_pending, "{report:?}");
+}
+
+/// Qodo finding 2 (second round) on PR #2248: the daemon's compaction loop
+/// starts while startup recovery's first attempt is still running on its
+/// thread, so its immediate round is skipped. That round is not lost to the
+/// next hourly tick: it runs as soon as the first attempt has.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compaction_round_held_back_by_startup_recovery_runs_once_it_has() {
+    let state = state();
+    let dead = plant(
+        state.path(),
+        "run-dead.jsonl",
+        &[encoded(&line("dead", 1, 1, started(work(1), "dead", 1)))],
+        "",
+    );
+    let gate = WriterGate::closed();
+    let skipped = Arc::new(AtomicU64::new(0));
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "new",
+        &deck(),
+        options_with(|o| {
+            o.hooks.recovery_gate = Some(Arc::clone(&gate));
+            o.hooks.skipped_pending = Some(Arc::clone(&skipped));
+        }),
+    )
+    .unwrap();
+    journal.start_recovery_in_background();
+    let compaction = crate::work_tracking::spawn_compaction(journal.clone());
+    // Gate held: the immediate round ran and was skipped, and nothing folded.
+    until("the immediate round is skipped as recovery pending", || {
+        skipped.load(Ordering::SeqCst) > 0
+    });
+    until("the background attempt reaches its gate", || {
+        gate.reached.load(Ordering::SeqCst) > 0
+    });
+    assert!(dead.exists());
+    // Gate released: a round runs and folds the dead run's segment, long
+    // before the next hourly tick.
+    gate.open();
+    assert!(journal.wait_recovered(Duration::from_secs(60)));
+    until("a compaction round folds the dead run's segment", || {
+        !dead.exists()
+    });
+    compaction.abort();
 }

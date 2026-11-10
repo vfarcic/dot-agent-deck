@@ -1520,6 +1520,15 @@ struct Writer {
     segment_max: u64,
     next_seq: u64,
     len: u64,
+    /// After a failed rotation, the current segment's length at which the
+    /// next one is tried (zero: at once, when the segment is full).
+    rotate_at: u64,
+    /// How much further the segment grows before the next try after another
+    /// failure: doubles per failure from a sixteenth of `segment_max` up to
+    /// `segment_max`; zero while rotation has not failed.
+    rotate_backoff: u64,
+    /// Rotations failed in a row.
+    rotate_failures: u64,
     broken: bool,
     #[cfg(test)]
     gate: Option<Arc<WriterGate>>,
@@ -1583,7 +1592,10 @@ impl Writer {
         };
         let mut bytes = encode_line_for(&line, &self.homes).map_err(RecordError::Refused)?;
         bytes.push(b'\n');
-        if self.len > 0 && self.len.saturating_add(bytes.len() as u64) > self.segment_max {
+        if self.len > 0
+            && self.len.saturating_add(bytes.len() as u64) > self.segment_max
+            && self.len >= self.rotate_at
+        {
             self.rotate();
         }
         let written = self
@@ -1619,43 +1631,86 @@ impl Writer {
     /// one keeps taking lines: that includes a failed directory sync after
     /// the new segment was created, since lines synced into a file whose
     /// directory entry is not durable can vanish with it in a crash. The new,
-    /// empty file is removed then, so it neither blocks the next attempt nor
-    /// reads as the run's highest segment.
+    /// empty file is removed then, so it does not read as the run's highest
+    /// segment. A failed rotation is not tried again on the next line, but
+    /// once the segment has grown by [`Self::rotate_backoff`] more, so a
+    /// lasting fault costs one attempt (and one warning) per stretch of
+    /// lines, not one per line.
+    ///
+    /// Only this writer creates this run's segments (it holds the run lock),
+    /// so a name that already exists is an empty segment an earlier failed
+    /// rotation could not remove. It is skipped for the next free number:
+    /// once a later segment exists it is sealed, and compaction folds it
+    /// away.
     fn rotate(&mut self) {
-        let next = self.segment + 1;
-        let name = segment_name_n(&self.run, next);
-        match self.dir.create_new_owner_only(&name) {
-            Ok(file) => {
-                if let Err(error) = self.sync_for_rotation() {
-                    warn!(
-                        segment = %name,
-                        %error,
-                        "work journal: the directory sync after a rotation failed; the current segment keeps growing"
+        match self.start_next_segment() {
+            Ok(next) => {
+                if self.rotate_failures > 0 {
+                    info!(
+                        failures = self.rotate_failures,
+                        "work journal: rotation works again"
                     );
-                    drop(file);
-                    if let Err(error) = self.dir.remove_file(&name) {
-                        warn!(
-                            segment = %name,
-                            %error,
-                            "work journal: the unsynced new segment could not be removed"
-                        );
-                    }
-                    return;
                 }
-                self.file = file;
-                self.segment = next;
-                self.len = 0;
-                self.current.store(next, Ordering::Release);
-                debug!(segment = %name, "work journal: started a new segment");
+                self.rotate_at = 0;
+                self.rotate_backoff = 0;
+                self.rotate_failures = 0;
+                debug!(segment = next, "work journal: started a new segment");
             }
-            Err(error) => warn!(
-                segment = %name,
-                %error,
-                "work journal: could not start a new segment; the current one keeps growing"
-            ),
+            Err(error) => {
+                self.rotate_failures += 1;
+                self.rotate_backoff = self
+                    .rotate_backoff
+                    .saturating_mul(2)
+                    .clamp((self.segment_max / 16).max(1), self.segment_max);
+                self.rotate_at = self.len.saturating_add(self.rotate_backoff);
+                warn!(
+                    %error,
+                    failures = self.rotate_failures,
+                    retry_after_bytes = self.rotate_backoff,
+                    "work journal: could not start a new segment; the current one keeps growing"
+                );
+            }
         }
     }
+
+    /// Create, sync and switch to the next segment; its number.
+    fn start_next_segment(&mut self) -> io::Result<u64> {
+        let mut next = self.segment + 1;
+        let mut skipped = 0;
+        let file = loop {
+            let name = segment_name_n(&self.run, next);
+            match self.dir.create_new_owner_only(&name) {
+                Ok(file) => break file,
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists && skipped < ROTATE_SKIP_MAX => {
+                    skipped += 1;
+                    next += 1;
+                }
+                Err(e) => return Err(e),
+            }
+        };
+        let name = segment_name_n(&self.run, next);
+        if let Err(error) = self.sync_for_rotation() {
+            drop(file);
+            if let Err(remove) = self.dir.remove_file(&name) {
+                warn!(
+                    segment = %name,
+                    error = %remove,
+                    "work journal: the unsynced new segment could not be removed; the next rotation skips its name"
+                );
+            }
+            return Err(error);
+        }
+        self.file = file;
+        self.segment = next;
+        self.len = 0;
+        self.current.store(next, Ordering::Release);
+        Ok(next)
+    }
 }
+
+/// How many leftover segment names (empty files failed rotations could not
+/// remove) one rotation skips before it gives up.
+const ROTATE_SKIP_MAX: u32 = 64;
 
 impl Writer {
     /// The directory sync that makes a new segment's entry durable.
@@ -1724,6 +1779,9 @@ pub(crate) struct TestHooks {
     /// Holds each recovery attempt, with the lock not yet taken, until it is
     /// opened.
     pub(crate) recovery_gate: Option<Arc<WriterGate>>,
+    /// Counts the compaction rounds skipped because startup recovery had not
+    /// had its first attempt yet.
+    pub(crate) skipped_pending: Option<Arc<AtomicU64>>,
 }
 
 #[cfg(test)]
@@ -1737,6 +1795,7 @@ impl std::fmt::Debug for TestHooks {
             .field("chunk_probe_fault", &self.chunk_probe_fault)
             .field("rotate_sync_fault", &self.rotate_sync_fault)
             .field("recovery_gate", &self.recovery_gate.is_some())
+            .field("skipped_pending", &self.skipped_pending)
             .finish()
     }
 }
@@ -1965,6 +2024,9 @@ impl WorkJournal {
             segment_max: options.segment_max_bytes.max(1),
             next_seq: 1,
             len: 0,
+            rotate_at: 0,
+            rotate_backoff: 0,
+            rotate_failures: 0,
             broken: false,
             #[cfg(test)]
             gate: options.hooks.gate.clone(),
@@ -2289,6 +2351,32 @@ impl WorkJournal {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         while matches!(*phase, RecoveryPhase::Pending | RecoveryPhase::Retry) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            phase = self
+                .shared
+                .phase_changed
+                .wait_timeout(phase, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        true
+    }
+
+    /// Wait at most `bound` for startup recovery's first attempt (or, while
+    /// another daemon holds the maintenance lock, the attempt that finds it
+    /// free); `true` once compaction no longer waits for it, which is the
+    /// case as soon as the phase leaves pending (done, or retrying).
+    pub fn wait_recovery_attempted(&self, bound: Duration) -> bool {
+        let deadline = Instant::now() + bound;
+        let mut phase = self
+            .shared
+            .phase
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        while *phase == RecoveryPhase::Pending {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return false;
@@ -2642,6 +2730,10 @@ impl WorkJournal {
         let mut report = CompactReport::default();
         if self.phase() == RecoveryPhase::Pending {
             report.skipped_recovery_pending = true;
+            #[cfg(test)]
+            if let Some(skipped) = &self.shared.hooks.skipped_pending {
+                skipped.fetch_add(1, Ordering::SeqCst);
+            }
             return Ok(report);
         }
         let Some(maintenance) = maintenance_exclusive(dir)? else {

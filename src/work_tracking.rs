@@ -1016,7 +1016,7 @@ impl WorkTracker {
     /// until the spawn settles: written by the spawn once something of it is
     /// published (or by [`Self::unit_registered`] and [`Self::flush_open`]
     /// once a dispatch's unit id is known), by [`Self::launch_succeeded`] or
-    /// [`Self::issue_launched`] when the spawn returns, and forgotten by
+    /// [`Self::launched_without_unit`] when the spawn returns, and forgotten by
     /// [`Self::launch_failed`] when nothing of it was written.
     pub fn hold_launch(
         &self,
@@ -1050,8 +1050,9 @@ impl WorkTracker {
         Some(work)
     }
 
-    /// Launch `work`'s spawn succeeded: its `opened` is written if it is
-    /// still held. Its end is its own (a dispatched unit's end).
+    /// Launch `work`'s spawn succeeded and registered a unit: its `opened` is
+    /// written if it is still held. It closes when that unit ends
+    /// ([`Self::unit_ended`]).
     pub fn launch_succeeded(&self, work: &WorkId) {
         let Some(journal) = self.journal() else {
             return;
@@ -1061,12 +1062,13 @@ impl WorkTracker {
         book.launches.remove(work);
     }
 
-    /// Scheduled issue dispatch `work`'s spawn succeeded: its `opened` is
-    /// written if it is still held, and it closes with what it started — a
-    /// single agent's pane (`pane_closed`, when that pane closes) or its
-    /// orchestration (`orchestration_ended`, when that orchestration ends);
-    /// when neither is still running, it closes now.
-    pub fn issue_launched(&self, work: &WorkId) {
+    /// Launch `work`'s spawn succeeded and registered no unit whose end
+    /// closes it — a scheduled issue dispatch, or a `dispatch` with no caller:
+    /// its `opened` is written if it is still held, and it closes with what
+    /// it started — a single agent's pane (`pane_closed`, when that pane
+    /// closes) or its orchestration (`orchestration_ended`, when that
+    /// orchestration ends); when neither is still running, it closes now.
+    pub fn launched_without_unit(&self, work: &WorkId) {
         let Some(journal) = self.journal() else {
             return;
         };
@@ -1160,18 +1162,42 @@ impl WorkTracker {
 /// How often compaction runs after the one at startup.
 pub const COMPACTION_EVERY: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
+/// The longest a compaction round that startup recovery held back waits for
+/// it in one go, on the blocking pool, before it looks again. Short, so a
+/// runtime shutting down is not kept waiting on it.
+const RECOVERY_WAIT_SLICE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Compact `journal` now, off the caller's path, and then every
 /// [`COMPACTION_EVERY`]. Compaction blocks, so it runs on the blocking pool.
+///
+/// Compaction waits for startup recovery's first attempt, which runs on its
+/// own thread. A round that finds it still pending is not lost to the next
+/// hourly tick: it waits for that attempt (in short slices, off the async
+/// path) and runs as soon as it has.
 pub fn spawn_compaction(journal: WorkJournal) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut every = tokio::time::interval(COMPACTION_EVERY);
+        every.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
             every.tick().await;
-            let journal = journal.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                journal.compact();
-            })
-            .await;
+            loop {
+                let round = journal.clone();
+                let Ok(report) = tokio::task::spawn_blocking(move || round.compact()).await else {
+                    break;
+                };
+                if !report.skipped_recovery_pending {
+                    break;
+                }
+                let waiting = journal.clone();
+                if tokio::task::spawn_blocking(move || {
+                    waiting.wait_recovery_attempted(RECOVERY_WAIT_SLICE)
+                })
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
         }
     })
 }

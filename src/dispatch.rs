@@ -1162,13 +1162,20 @@ pub async fn handle_dispatch(
             .await
         }
     };
-    // PRD #1889: a dispatch that registered no unit writes its work as it is;
-    // a failed one leaves no work behind when it started nothing, and keeps
-    // and closes it when something it started was already written (a role
-    // of its orchestration that came up before a later one failed).
+    // PRD #1889: a dispatch with a caller registered a unit, whose end closes
+    // its work. One with no caller registered none, so its work closes with
+    // what it spawned: its pane (single agent) or its orchestration, at once
+    // when that is already gone. A failed one leaves no work behind when it
+    // started nothing, and keeps and closes it when something it started was
+    // already written (a role of its orchestration that came up before a
+    // later one failed).
     if let Some(work) = &work_id {
         if spawned.is_ok() {
-            ctx.registry.work().launch_succeeded(work);
+            if ctx.caller.is_some() {
+                ctx.registry.work().launch_succeeded(work);
+            } else {
+                ctx.registry.work().launched_without_unit(work);
+            }
         } else {
             ctx.registry
                 .work()
