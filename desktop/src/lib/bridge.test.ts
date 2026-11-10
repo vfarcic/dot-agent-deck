@@ -70,6 +70,34 @@ describe("TauriDeckBridge", () => {
 
   afterEach(() => vi.restoreAllMocks());
 
+  /** Scenario: preview a close on a remote deck, then receive its cleanup report after its card has gone. The notification reaches the fleet-wide listener even while the local deck is selected; unrelated broadcasts produce no notice. */
+  it("previews worktrees on the named deck and forwards kept reports from unselected decks", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    const kept = vi.fn();
+    const unsubscribe = await bridge.subscribe(vi.fn(), vi.fn(), kept);
+    await bridge.connect();
+    const report = { path: "/remote/project-dispatch", confirmed_dirty: true };
+    invoke.mockResolvedValueOnce(report);
+    expect(await bridge.previewWorktreeClose("remote", ["pane-41", "pane-42"], "process-a")).toEqual(report);
+    expect(invoke).toHaveBeenLastCalledWith("desktop_worktree_close_preview", { deckId: "remote", paneIds: ["pane-41", "pane-42"], incarnation: "process-a" });
+    expect(kept).not.toHaveBeenCalled();
+    const emit = (payload: unknown) => listeners.get("desktop://daemon-event")?.({ payload });
+    emit({ kind: "unrecognised", deck: "remote", ...report });
+    emit({ kind: "worktree_kept", deck: "remote", path: 42, confirmed_dirty: true });
+    expect(kept).not.toHaveBeenCalled();
+    emit({ kind: "worktree_kept", deck: "remote", ...report });
+    emit({ kind: "worktree_kept", deck: snapshot.connection.deckId, path: "/local/kept", confirmed_dirty: false });
+    expect(kept.mock.calls).toEqual([
+      [{ deckId: "remote", ...report }],
+      [{ deckId: snapshot.connection.deckId, path: "/local/kept", confirmed_dirty: false }],
+    ]);
+    unsubscribe();
+    emit({ kind: "worktree_kept", deck: "remote", ...report });
+    expect(kept).toHaveBeenCalledTimes(2);
+    await bridge.dispose();
+  });
+
   /** Scenario: Open a card listed before a same-build restart. A backend that checks the card incarnation refuses it with the gone sentence; keyboard input rejects as not attached and no PTY bytes move. */
   it("opening a stale card preserves its incarnation and transfers no PTY bytes", async () => {
     const { TauriDeckBridge } = await import("./bridge");
@@ -3700,6 +3728,8 @@ describe("desktop settings hold no credential (issue 827)", () => {
       { voice: { intent: { backend: "remote", key: SENTINEL, token: SENTINEL } } },
       { voice: { transcription: SENTINEL, intent: SENTINEL } },
       { zoom: { level: 1.25, token: SENTINEL } },
+      // Issue #2075: the `[questions]` section is rebuilt field by field too.
+      { questions: { notify: 7, token: SENTINEL } },
       { version: SENTINEL },
       { appearance: { mode: SENTINEL } },
       [SENTINEL],
@@ -3718,7 +3748,7 @@ describe("desktop settings hold no credential (issue 827)", () => {
       // `Option<EndpointSettings>` reads as `None`, because `JSON.stringify`
       // drops an `undefined` value on the way to the bridge. The assertion
       // below pins that it carries no *value*.
-      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "version", "voice", "zoom"]);
+      expect(Object.keys(normalized).sort()).toEqual(["appearance", "endpoints", "questions", "version", "voice", "zoom"]);
       expect(normalized.endpoints).toBeUndefined();
       expect(JSON.parse(JSON.stringify(normalized))).not.toHaveProperty("endpoints");
       // PRD #802 M4's `voice` takes the same shape for the same reason, and the

@@ -1626,6 +1626,10 @@ export interface DeckRuntimeState {
    */
   clearError: () => void;
   runAction: (action: DeckAction) => Promise<DeckActionResult>;
+  /** Best-effort close hint; render-only runtimes may omit it. */
+  previewWorktreeClose?: import("./lib/worktreeClose").WorktreeClosePreview;
+  worktreeKept?: readonly import("./lib/worktreeClose").WorktreeKeptEntry[];
+  dismissWorktreeKept?: (id: number) => void;
   /**
    * PRD #1487 M5 — upgrade the daemon of the deck `deckId` names: **Upgrade**
    * on a remote deck, **Replace daemon** on the local one. `onEvent` hears the

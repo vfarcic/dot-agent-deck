@@ -222,6 +222,19 @@ getrandom = "0.4"
 # version actually built, and Renovate moves it within that range once a
 # release has cleared the four days `renovate.json` holds a Tauri crate.
 tauri-plugin-clipboard-manager = "2.3.3"
+# Issue #2075: ONE operating-system notification per question an agent has
+# left unanswered for the `[questions] notify` minutes. A webview cannot post
+# one itself on every platform — WKWebView has no Notification API — so it
+# goes through this plugin's `notify` command, invoked by name from
+# `src/lib/osNotification.ts` through `@tauri-apps/api/core`'s `invoke`,
+# exactly as the clipboard plugin above is, and for the same reason: no npm
+# half for Renovate's two lanes to move out of step with this crate.
+# `capabilities/default.json` grants `allow-notify` and nothing else. The
+# desktop backends are `notify-rust` (D-Bus through `zbus`, pure Rust, so no
+# system package on Linux) and `mac-notification-sys` on macOS. The
+# requirement is the latest 2.x when this was added; `Cargo.lock` decides the
+# version built.
+tauri-plugin-notification = "2.8.0"
 # Issue #1450: whether a finished voice segment holds a human voice at all,
 # asked before any Speech backend is called (`voice/human_voice.rs`). A
 # breath, a cough, a knock or a beep clears the level-and-density audio gate,
