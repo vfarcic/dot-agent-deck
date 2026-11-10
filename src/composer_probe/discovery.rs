@@ -10,8 +10,9 @@
 //! would find it on that `PATH`, passing over the deck's own telemetry shims
 //! (`crate::telemetry::shim::is_shim_file`), which `exec` the real program,
 //! and symlinks are followed to a kernel identity `(dev, ino)`, read from the
-//! file the pin opened (`fstat`), as its shebang is. Nothing later looks a
-//! name up again. A native candidate is checked by its `/proc/<pid>/exe`
+//! file the pin opened (`fstat`), as its shebang is. Nothing later looks the
+//! agent's name up again; the one later lookup is an `env NAME` shebang's
+//! interpreter, below. A native candidate is checked by its `/proc/<pid>/exe`
 //! against the pinned pair, so a pane started before an agent update keeps
 //! its old inode, a wrapper that `exec`s a different inode after the pin is
 //! refused, and a pane spawned after the update pins the new one. A name
@@ -29,6 +30,19 @@
 //! is what attests it. Another script under the same interpreter, or the
 //! script under another interpreter, isn't an entrypoint, and a native below
 //! it is refused as an executable mismatch.
+//!
+//! **An `env NAME` shebang's interpreter** (issue #2258) is whatever `env`
+//! finds as `NAME` on the `PATH` of the process it runs in, and a launcher
+//! sets that `PATH` after the spawn: `devbox run`, `nix develop`, `mise` and
+//! `nvm` put their own `node` first, so the spawn's resolution names another
+//! inode than the entrypoint runs. Such an entrypoint is also attested when
+//! its executable is what `NAME` resolves to, the same way, on its own
+//! `PATH` as its environment began (`/proc/<pid>/environ`), read when the
+//! entrypoint is checked. An interpreter the entrypoint runs from anywhere
+//! else (another inode on no directory of that `PATH`, or one behind an
+//! earlier `NAME` there) is still refused. This widens nothing the windows
+//! below leave open: a process that can set the entrypoint's `PATH` controls
+//! its environment, and so its `NODE_OPTIONS`, which nothing compares.
 //!
 //! **What holds for the hosted route, and what doesn't.** The entrypoint's
 //! executable is the interpreter's, so it says nothing about which script
@@ -115,6 +129,21 @@ pub struct Hosted {
     /// The argv in front of the script path: `env`'s program word, or the
     /// shebang's interpreter path and its one argument.
     pub prefix: Vec<OsString>,
+}
+
+impl Hosted {
+    /// The `NAME` of an `env NAME` shebang, which `env` looks up on the
+    /// `PATH` of the process it runs in; `None` for a shebang that names
+    /// its interpreter by path. [`hosted_by`] gives an `env` shebang its
+    /// name alone as the prefix, and any other its interpreter's absolute
+    /// path first.
+    fn env_name(&self) -> Option<&OsStr> {
+        use std::os::unix::ffi::OsStrExt;
+        match self.prefix.as_slice() {
+            [name] if !name.as_bytes().contains(&b'/') => Some(name),
+            _ => None,
+        }
+    }
 }
 
 /// The pins a generation's spawn took: one per agent its class may run.
@@ -438,6 +467,36 @@ pub trait Procs {
     fn file(&mut self, path: &Path) -> Option<FileId> {
         executable_id(path)
     }
+    /// `pid`'s `PATH` as its environment began: what `env` searched for the
+    /// interpreter it ran. `None` when it can't be read or has none.
+    fn env_path(&mut self, _pid: u32) -> Option<OsString> {
+        None
+    }
+}
+
+/// Whether `proc`, process `pid`, runs the interpreter `hosted` names: the
+/// one pinned at spawn, or, for an `env NAME` shebang, the `NAME` its own
+/// `PATH` resolves as `env` would (the module doc's issue #2258 paragraph).
+fn runs_interpreter(procs: &mut impl Procs, pid: u32, proc: &Proc, hosted: &Hosted) -> bool {
+    let Some(exe) = proc.exe else {
+        return false;
+    };
+    if exe == hosted.interpreter {
+        return true;
+    }
+    let (Some(name), Some(path)) = (hosted.env_name(), procs.env_path(pid)) else {
+        return false;
+    };
+    // As `locate` searches: in order, absolute directories only.
+    for dir in std::env::split_paths(&path) {
+        if !dir.is_absolute() {
+            return false;
+        }
+        if let Some(found) = procs.file(&dir.join(name)) {
+            return found == exe;
+        }
+    }
+    false
 }
 
 /// A process the walk found named as an agent, with what it was found
@@ -498,17 +557,23 @@ fn wrapped(proc: &Proc, own_exe: Option<FileId>) -> Option<&[OsString]> {
 /// the deck wrapper's agent child, the wrapped command's arguments at its
 /// end (the deck's own spawn: the telemetry shim may add arguments in front
 /// of them).
-fn attested_entry(proc: &Proc, pin: &Pin, below_wrapper: Option<&[OsString]>) -> bool {
+fn attested_entry(
+    procs: &mut impl Procs,
+    pid: u32,
+    proc: &Proc,
+    pin: &Pin,
+    below_wrapper: Option<&[OsString]>,
+) -> bool {
     let Some(hosted) = &pin.hosted else {
         return false;
     };
     let p = hosted.prefix.len();
-    if proc.exe != Some(hosted.interpreter)
-        || proc.argv.len() <= p
+    if proc.argv.len() <= p
         || proc.argv[..p] != hosted.prefix[..]
         || !Path::new(&proc.argv[p])
             .components()
             .eq(pin.path.components())
+        || !runs_interpreter(procs, pid, proc, hosted)
     {
         return false;
     }
@@ -578,8 +643,14 @@ pub fn find(
         if node.chain.len() >= WALK_DEPTH {
             continue;
         }
-        let entry = attested_entry(&proc, walk.pin, node.below_wrapper.as_deref())
-            .then(|| (node.pid, proc.start, proc.argv.clone()));
+        let entry = attested_entry(
+            procs,
+            node.pid,
+            &proc,
+            walk.pin,
+            node.below_wrapper.as_deref(),
+        )
+        .then(|| (node.pid, proc.start, proc.argv.clone()));
         let below_wrapper = wrapped(&proc, walk.own_exe).map(<[OsString]>::to_vec);
         let mut chain = node.chain;
         chain.push((node.pid, proc.start));
@@ -664,7 +735,7 @@ pub fn validate(
         && let Some(entry) = procs.read(*pid)
         && entry.start == *start
         && !entry.gone()
-        && entry.exe == Some(hosted.interpreter)
+        && runs_interpreter(procs, *pid, &entry, hosted)
         && entry.argv == *argv
         && entry.uid == Some(uid)
         && proc.ppid == *pid
@@ -812,7 +883,27 @@ impl Procs for LinuxProcs {
         found.dedup();
         found
     }
+
+    fn env_path(&mut self, pid: u32) -> Option<OsString> {
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        let mut environ = Vec::new();
+        std::fs::File::open(format!("/proc/{pid}/environ"))
+            .ok()?
+            .take(ENVIRON_BYTES)
+            .read_to_end(&mut environ)
+            .ok()?;
+        environ
+            .split(|b| *b == 0)
+            .find_map(|var| var.strip_prefix(b"PATH="))
+            .map(|path| OsStr::from_bytes(path).to_os_string())
+    }
 }
+
+/// The most bytes of a process's environment [`LinuxProcs::env_path`] reads:
+/// a `PATH` past it isn't found, and the interpreter isn't attested by it.
+#[cfg(target_os = "linux")]
+const ENVIRON_BYTES: u64 = 1 << 20;
 
 #[cfg(test)]
 mod tests {
@@ -837,6 +928,8 @@ mod tests {
         reads: HashMap<u32, usize>,
         /// What a path holds; a path not listed is read from the disk.
         files: HashMap<PathBuf, FileId>,
+        /// Each process's `PATH`, as its environment began.
+        paths: HashMap<u32, OsString>,
     }
 
     impl Table {
@@ -892,6 +985,9 @@ mod tests {
                 .get(path)
                 .copied()
                 .or_else(|| executable_id(path))
+        }
+        fn env_path(&mut self, pid: u32) -> Option<OsString> {
+            self.paths.get(&pid).cloned()
         }
     }
 
@@ -1094,6 +1190,66 @@ mod tests {
         .add(11, 10, interp, "node", &["node", script])
         .add(12, 11, NATIVE, "codex", &["/n/codex"]);
         t
+    }
+
+    /// Scenario: An npm-shaped Codex (`#!/usr/bin/env node`) is pinned at spawn from a PATH whose `node` is one inode, and a launcher such as `devbox run` puts a directory with another `node` first on the entrypoint's own PATH, so its entrypoint runs that other `node` (issue #2258). The native below it binds. The same entrypoint is refused when its own PATH is unknown, names the spawn's `node` first, finds a third `node` before the one it runs, or puts a relative directory first: the interpreter must be what `env` would find on that PATH.
+    #[spec("inbox/probe/035")]
+    #[test]
+    fn probe_035_an_env_interpreter_is_found_on_the_entrypoints_own_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let (spawn, launcher, third) = (
+            dir.path().join("spawn"),
+            dir.path().join("launcher"),
+            dir.path().join("third"),
+        );
+        for at in [&spawn, &launcher, &third] {
+            std::fs::create_dir(at).unwrap();
+            std::fs::copy("/bin/sh", at.join("node")).unwrap();
+        }
+        let script = spawn.join("codex");
+        write_executable(&script, b"#!/usr/bin/env node\n// codex.js\n");
+        let pin = pin_program(OsStr::new("codex"), Some(spawn.as_os_str())).expect("pinned");
+        let launchers = executable_id(&launcher.join("node")).unwrap();
+        assert_ne!(
+            Some(launchers),
+            pin.hosted.as_ref().map(|h| h.interpreter),
+            "the launcher's node is another inode than the spawn's"
+        );
+        let at = script.to_str().unwrap();
+        let joined = |dirs: &[&Path]| std::env::join_paths(dirs).unwrap();
+        let attempt = |path: Option<OsString>| {
+            let mut t = hosted_table(launchers, at);
+            if let Some(path) = path {
+                t.paths.insert(11, path);
+            }
+            find(&mut t, 10, 100, &walk(&pin))
+                .ok_or(Refusal::Differs(ProbeAgent::Codex))
+                .and_then(|c| validate(&mut t, &c, ProbeAgent::Codex, &pin, UID, false))
+                .map(|accepted| accepted.how)
+        };
+        assert_eq!(
+            attempt(Some(joined(&[&launcher, &spawn]))),
+            Ok(Attested::BelowEntry),
+            "the launcher's node, first on the entrypoint's own PATH"
+        );
+        for (path, why) in [
+            (None, "no PATH read"),
+            (Some(joined(&[&spawn, &launcher])), "the spawn's node first"),
+            (
+                Some(joined(&[&third, &launcher])),
+                "another node before the one it runs",
+            ),
+            (
+                Some(OsString::from(format!("relative:{}", launcher.display()))),
+                "a relative directory first",
+            ),
+        ] {
+            assert_eq!(
+                attempt(path),
+                Err(Refusal::Differs(ProbeAgent::Codex)),
+                "{why}"
+            );
+        }
     }
 
     /// Scenario: An npm-shaped Codex (a `#!/usr/bin/env node` script on the PATH, its interpreter beside it) is pinned at spawn, and its entrypoint and the native it spawns bind. Then npm replaces the script at the same path with a new file (a new inode) before validation: the same entrypoint and native are refused as an executable mismatch, as the native route refuses a wrapper that execs a replaced binary.
