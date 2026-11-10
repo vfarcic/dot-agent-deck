@@ -381,6 +381,10 @@ pub enum UiMode {
     /// names, opened by the `restart_notice` key (default `a`) or the footer's
     /// `[Agents]` button. Its state lives in `UiState::restart_notice`.
     RestartNotice,
+    /// PRD #385 M5: keyboard copy mode on the focused pane, opened by the
+    /// `copy_mode` key (default `v`) in command mode. Its state lives in
+    /// `UiState::copy_mode`; its keys are [`handle_copy_mode_key`]'s.
+    CopyMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2008,6 +2012,12 @@ struct UiState {
     session_snapshot_write_failed: bool,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
+    /// PRD #385 M5: text a key handler copied, waiting for the run loop to
+    /// deliver it ([`deliver_copy`]), which owns the clipboard. Key handlers
+    /// have no clipboard of their own.
+    pending_copy: Option<String>,
+    /// PRD #385 M5: the open copy mode, while `mode` is [`UiMode::CopyMode`].
+    copy_mode: Option<crate::copy_mode::CopyMode>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
     focused_pane_rect: Option<Rect>,
     /// PRD #385 M2: every pane the last frame drew, with its outer rect, so a
@@ -2513,6 +2523,8 @@ impl UiState {
             legacy_modes_warned_dirs: HashSet::new(),
             session_snapshot_write_failed: false,
             selection: None,
+            pending_copy: None,
+            copy_mode: None,
             focused_pane_rect: None,
             drawn_pane_rects: Vec::new(),
             last_click: None,
@@ -5499,6 +5511,9 @@ pub enum Action {
     /// daemon for its host sample. Reached from the dashboard `host_metrics`
     /// binding (default `m`).
     OpenHostMetrics,
+    /// PRD #385 M5: open copy mode on the focused pane (command-mode
+    /// `copy_mode` key, default `v`).
+    EnterCopyMode,
     /// PRD #1258 M3: close the host overlay — its Escape key and its `[Close]`
     /// button share this arm.
     CloseHostMetrics,
@@ -6236,6 +6251,108 @@ fn clear_selection_on_pane_input(ui: &mut UiState, pane_id: &str, bytes: &[u8]) 
 fn clear_selection_on_tab_switch(ui: &mut UiState, deck: Option<DeckKey>) {
     if ui.selection.as_ref().is_some_and(|sel| sel.deck != deck) {
         ui.selection = None;
+    }
+}
+
+/// PRD #385 M5: open copy mode on the focused pane, from what its screen
+/// shows now ([`crate::copy_mode`]). With no focused pane, nothing happens. A
+/// mouse selection is dropped, so only copy mode's highlight is on screen.
+fn enter_copy_mode(ui: &mut UiState, pane: &dyn PaneController) {
+    let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() else {
+        return;
+    };
+    let Some(pane_id) = embedded.focused_pane_id() else {
+        return;
+    };
+    let Some(screen) = embedded.get_screen(&pane_id) else {
+        return;
+    };
+    let Ok(parser) = screen.lock() else {
+        return;
+    };
+    let copy = crate::copy_mode::CopyMode::open(pane_id, parser.screen());
+    drop(parser);
+    ui.selection = None;
+    ui.copy_mode = Some(copy);
+    ui.mode = UiMode::CopyMode;
+}
+
+/// PRD #385 M5: close copy mode and return to command mode. The pane was
+/// never scrolled by copy mode, so it is where it was.
+fn leave_copy_mode(ui: &mut UiState) {
+    ui.copy_mode = None;
+    if ui.mode == UiMode::CopyMode {
+        ui.mode = UiMode::Normal;
+    }
+}
+
+/// PRD #385 M5 (decision 7): copy mode's keys, select-and-yank only. Arrows
+/// or `h`/`j`/`k`/`l` move, `PageUp`/`PageDown` page through the history,
+/// `g`/`G` go to its top and bottom, `v` or `Space` starts the selection (or
+/// drops it), `y` or `Enter` copies it and leaves (with nothing selected they
+/// do nothing), `Esc` or `q` leave without copying. The copy is left in
+/// [`UiState::pending_copy`] for the run loop to deliver.
+fn handle_copy_mode_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    use crate::copy_mode::Move;
+    let Some(copy) = ui.copy_mode.as_mut() else {
+        leave_copy_mode(ui);
+        return Action::Continue;
+    };
+    // A Ctrl or Alt chord is not one of copy mode's keys.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Action::Continue;
+    }
+    let movement = match key.code {
+        KeyCode::Left | KeyCode::Char('h') => Some(Move::Left),
+        KeyCode::Right | KeyCode::Char('l') => Some(Move::Right),
+        KeyCode::Up | KeyCode::Char('k') => Some(Move::Up),
+        KeyCode::Down | KeyCode::Char('j') => Some(Move::Down),
+        KeyCode::PageUp => Some(Move::PageUp),
+        KeyCode::PageDown => Some(Move::PageDown),
+        KeyCode::Char('g') => Some(Move::Top),
+        KeyCode::Char('G') => Some(Move::Bottom),
+        _ => None,
+    };
+    if let Some(movement) = movement {
+        copy.apply(movement);
+        return Action::Continue;
+    }
+    match key.code {
+        KeyCode::Char('v' | ' ') => copy.toggle_anchor(),
+        KeyCode::Char('y') | KeyCode::Enter => {
+            if let Some(text) = copy.yank() {
+                ui.pending_copy = Some(text);
+                leave_copy_mode(ui);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => leave_copy_mode(ui),
+        _ => {}
+    }
+    Action::Continue
+}
+
+/// PRD #385: put `text` on the clipboard by both routes and set the status
+/// line from what went out ([`crate::clipboard::status_message`]). The one
+/// path a copy takes, from a mouse release or from copy mode's yank.
+fn deliver_copy(
+    ui: &mut UiState,
+    clipboard: &mut dyn crate::clipboard::ClipboardBackend,
+    text: &str,
+) {
+    let outcome = crate::clipboard::deliver(clipboard, text);
+    if let Some(message) = crate::clipboard::status_message(outcome) {
+        ui.status_message = Some((message.to_string(), std::time::Instant::now()));
+    }
+}
+
+/// PRD #385 M5: deliver the copy a key handler left in
+/// [`UiState::pending_copy`], if any. The run loop calls it after every key.
+fn deliver_pending_copy(ui: &mut UiState, clipboard: &mut dyn crate::clipboard::ClipboardBackend) {
+    if let Some(text) = ui.pending_copy.take() {
+        deliver_copy(ui, clipboard, &text);
     }
 }
 
@@ -8634,6 +8751,11 @@ fn handle_normal_key(
     if pressed(KbAction::OpenUpgrade) {
         return Action::OpenUpgrade;
     }
+    // PRD #385 M5: copy mode on the focused pane (default `v`). The
+    // dispatcher resolves the pane and does nothing when none is focused.
+    if kb.matches(KbAction::CopyMode, &key) {
+        return Action::EnterCopyMode;
+    }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
             ui.filter_text.clear();
@@ -10299,7 +10421,11 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
-        | UiMode::RestartNotice => true,
+        | UiMode::RestartNotice
+        // PRD #385 M5: copy mode's pane shows a frozen screen, so the wheel
+        // must not scroll the live one behind it (the run loop ignores the
+        // mouse in copy mode altogether).
+        | UiMode::CopyMode => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -11943,6 +12069,7 @@ fn dispatch_action(
         // the view starts at "Reading…" and the request goes out off the TUI
         // thread; `poll_host_metrics` puts the answer on screen when it lands.
         // Without one (the render seams) the overlay shows what it was given.
+        Action::EnterCopyMode => enter_copy_mode(ui, pane),
         Action::OpenHostMetrics => {
             ui.mode = UiMode::HostMetrics;
             if let Some(reader) = ui.host_metrics_reader.clone() {
@@ -12789,6 +12916,20 @@ fn handle_key_event(
     let kb = ui.keybindings.clone();
     let is_ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
 
+    // PRD #385 M5: copy mode takes every key while it is open, ahead of the
+    // global shortcuts, except `Ctrl+C`, which leaves it for the quit dialog
+    // as every other modal's handler does.
+    if ui.mode == UiMode::CopyMode {
+        action = Some(if is_ctrl_c {
+            leave_copy_mode(ui);
+            ui.quit_confirm_selected = 0;
+            ui.mode = UiMode::QuitConfirm;
+            Action::Continue
+        } else {
+            handle_copy_mode_key(key, ui)
+        });
+    }
+
     // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
     // resolves the digits from config so they can be remapped.
     if !is_ctrl_c && ui.mode == UiMode::Normal {
@@ -13019,6 +13160,8 @@ fn handle_key_event(
                 Action::Continue
             }
             UiMode::Upgrade => handle_upgrade_key(key, ui),
+            // Resolved before the shortcuts above, so never reached here.
+            UiMode::CopyMode => Action::Continue,
         });
     }
 
@@ -14887,6 +15030,17 @@ pub fn run_tui(
                 break;
             }
 
+            // PRD #385 M5: copy mode is keyboard-only. Its pane shows a frozen
+            // screen, so a mouse selection or a wheel scroll there would act on
+            // text other than what is shown; the mouse is ignored until it
+            // closes.
+            if matches!(ev, Event::Mouse(_)) && ui.mode == UiMode::CopyMode {
+                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    break;
+                }
+                continue;
+            }
+
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
                 // PRD #385 M3: a press clears a kept selection before anything
@@ -15411,11 +15565,7 @@ pub fn run_tui(
                     if let Some(text) = outcome.copy {
                         // PRD #385: native clipboard and OSC 52, and a status
                         // line that says which of them went out.
-                        let outcome = crate::clipboard::deliver(&mut clipboard, &text);
-                        if let Some(message) = crate::clipboard::status_message(outcome) {
-                            ui.status_message =
-                                Some((message.to_string(), std::time::Instant::now()));
-                        }
+                        deliver_copy(&mut ui, &mut clipboard, &text);
                     }
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -15489,6 +15639,9 @@ pub fn run_tui(
                 &filtered,
                 frame_area,
             );
+            // PRD #385 M5: a yank in copy mode leaves its text for this loop,
+            // which owns the clipboard.
+            deliver_pending_copy(&mut ui, &mut clipboard);
             if flow == Flow::Break {
                 break 'outer;
             }
@@ -17336,6 +17489,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &pane_status,
                 &ui.selection,
+                copy_mode_shown(ui),
                 None,
                 ui.mode,
                 banner_visibility,
@@ -17402,6 +17556,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &pane_status,
                 &ui.selection,
+                copy_mode_shown(ui),
                 None,
                 ui.mode,
                 banner_visibility,
@@ -17445,6 +17600,7 @@ fn render_frame(
             &ui.pane_display_names,
             &pane_status,
             &ui.selection,
+            copy_mode_shown(ui),
             None,
             ui.mode,
             banner_visibility,
@@ -18250,6 +18406,9 @@ struct DrawnPanes {
     /// PRD #385: the selection can no longer be shown as it was copied (its
     /// pane closed, moved, or its text changed), so it is to be cleared.
     selection_stale: bool,
+    /// PRD #385 M5: the pane copy mode is open on was not drawn (it closed,
+    /// or is no longer on screen), so copy mode is to be closed.
+    copy_mode_gone: bool,
 }
 
 /// Keep what a frame drew on [`UiState`]: the rects the mouse is hit-tested
@@ -18259,6 +18418,14 @@ fn record_drawn_panes(ui: &mut UiState, drawn: DrawnPanes) {
     ui.drawn_pane_rects = drawn.panes;
     if drawn.selection_stale {
         ui.selection = None;
+    }
+    // PRD #385 M5: copy mode ends with its pane, and its frozen screen is let
+    // go once the UI has left copy mode by any path.
+    if drawn.copy_mode_gone {
+        leave_copy_mode(ui);
+    }
+    if ui.mode != UiMode::CopyMode {
+        ui.copy_mode = None;
     }
 }
 
@@ -18278,6 +18445,10 @@ fn render_terminal_panes(
     // keeps the legacy focus-only border (the `TerminalWidget::new` default).
     pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
+    // PRD #385 M5: the open copy mode, when there is one ([`copy_mode_shown`]).
+    // Its pane is drawn from copy mode's frozen screen, with its cursor and
+    // selection on top.
+    copy_mode: Option<&crate::copy_mode::CopyMode>,
     visual_focus_id: Option<&str>,
     // Issue #88 follow-up / PRD #341 M1+M3: the live `UiState::mode`. Two
     // different questions are asked of it here, and they are NOT complements:
@@ -18329,6 +18500,8 @@ fn render_terminal_panes(
         drawn.selection_stale = true;
     }
     if pane_ids.is_empty() {
+        // PRD #385 M5: no pane is drawn, so neither is copy mode's.
+        drawn.copy_mode_gone = copy_mode.is_some();
         return drawn;
     }
     let input_active = mode == UiMode::PaneInput;
@@ -18420,10 +18593,14 @@ fn render_terminal_panes(
                     let title = pane_name(pane_id);
                     // PRD #84 M5: this pane was sized to `chunks[i]` by
                     // `resize_panes_to_layout` this frame, so attest the contract.
-                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
-                        .contract_guaranteed(true)
-                        .with_input_active(input_active)
-                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
+                    let mut widget = TerminalWidget::new(
+                        pane_screen_to_draw(copy_mode, pane_id, &screen),
+                        title,
+                        focused,
+                    )
+                    .contract_guaranteed(true)
+                    .with_input_active(input_active)
+                    .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): supply the pane's status so a non-focused
                     // pane renders its status-colored border via the palette (the
                     // focus override stays inside TerminalWidget). Panes without a
@@ -18456,10 +18633,14 @@ fn render_terminal_panes(
                     let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
                     // PRD #84 M5: the expanded pane was sized to `chunks[i]`
                     // by `resize_panes_to_layout` this frame — attest it.
-                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                        .contract_guaranteed(true)
-                        .with_input_active(input_active)
-                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
+                    let mut widget = TerminalWidget::new(
+                        pane_screen_to_draw(copy_mode, pane_id, &screen),
+                        title,
+                        is_focused,
+                    )
+                    .contract_guaranteed(true)
+                    .with_input_active(input_active)
+                    .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): same status threading as the Tiled arm.
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
@@ -18591,20 +18772,86 @@ fn render_terminal_panes(
                 let x = inner_x + col;
                 let y = inner_y + row;
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    // Invert colors for selection highlight.
-                    cell.set_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::LightCyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    cell.set_style(selection_highlight_style());
                 }
             }
         }
     }
 
+    // PRD #385 M5: copy mode's selection and cursor, over the frozen screen
+    // its pane was drawn from above, so the highlight shows exactly what a
+    // yank copies. A copy mode whose pane this frame did not draw (it closed,
+    // or another pane took the stacked layout's one slot) has nothing left to
+    // show, so it is reported for the caller to close.
+    if let Some(copy) = copy_mode {
+        match drawn.panes.iter().find(|(id, _)| id == copy.pane_id()) {
+            Some((_, rect)) => render_copy_mode_marks(frame.buffer_mut(), copy, *rect),
+            None => drawn.copy_mode_gone = true,
+        }
+    }
+
     drawn.focused = focused_pane_rect;
     drawn
+}
+
+/// PRD #385 M5: the screen a pane is drawn from — copy mode's frozen copy for
+/// the pane copy mode is open on, the live screen otherwise.
+fn pane_screen_to_draw(
+    copy_mode: Option<&crate::copy_mode::CopyMode>,
+    pane_id: &str,
+    live: &Arc<std::sync::Mutex<vt100::Parser>>,
+) -> Arc<std::sync::Mutex<vt100::Parser>> {
+    match copy_mode {
+        Some(copy) if copy.pane_id() == pane_id => copy.frozen(),
+        _ => Arc::clone(live),
+    }
+}
+
+/// PRD #385 M5: the copy mode to draw this frame: the open one, while the UI
+/// is in copy mode.
+fn copy_mode_shown(ui: &UiState) -> Option<&crate::copy_mode::CopyMode> {
+    ui.copy_mode
+        .as_ref()
+        .filter(|_| ui.mode == UiMode::CopyMode)
+}
+
+/// The style of a selected cell, shared by a mouse selection and copy mode.
+fn selection_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The style of copy mode's cursor cell.
+fn copy_mode_cursor_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// PRD #385 M5: draw copy mode's selection, then its cursor, over the pane
+/// drawn at `rect`.
+fn render_copy_mode_marks(buf: &mut Buffer, copy: &crate::copy_mode::CopyMode, rect: Rect) {
+    let inner = pane_inner_rect(rect);
+    for row in 0..inner.height {
+        let marks = copy.row_marks(row);
+        let y = inner.y + row;
+        if let Some((first, last)) = marks.selected {
+            for col in first..=last.min(inner.width.saturating_sub(1)) {
+                if let Some(cell) = buf.cell_mut((inner.x + col, y)) {
+                    cell.set_style(selection_highlight_style());
+                }
+            }
+        }
+        if let Some(col) = marks.cursor
+            && col < inner.width
+            && let Some(cell) = buf.cell_mut((inner.x + col, y))
+        {
+            cell.set_style(copy_mode_cursor_style());
+        }
+    }
 }
 
 fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
@@ -19015,6 +19262,7 @@ fn render_button_bar(
 fn mode_chip_label(mode: UiMode) -> Option<&'static str> {
     match mode {
         UiMode::PaneInput => Some(CHIP_TYPING),
+        UiMode::CopyMode => Some(CHIP_COPY),
         UiMode::Filter | UiMode::Rename => None,
         _ => Some(CHIP_COMMAND),
     }
@@ -19024,6 +19272,13 @@ fn mode_chip_label(mode: UiMode) -> Option<&'static str> {
 const CHIP_COMMAND: &str = " COMMAND ";
 /// The chip for `UiMode::PaneInput`.
 const CHIP_TYPING: &str = " TYPING ";
+/// The chip for `UiMode::CopyMode` (PRD #385 M5).
+const CHIP_COPY: &str = " COPY ";
+
+/// PRD #385 M5: what copy mode's bottom bar shows beside its chip while no
+/// status message is up — its keys.
+const COPY_MODE_HINTS: &str =
+    "move h/j/k/l · page PgUp/PgDn · top/bottom g/G · select v · copy y · exit Esc/q";
 
 /// The one space between the chip and the bar content, part of the band
 /// [`mode_chip_bar_split`] reserves.
@@ -19038,7 +19293,7 @@ const GAP_AFTER_CHIP: u16 = 1;
 /// finding 2's defect in miniature. Above this width every mode gets its own
 /// (differently sized) chip; below it, all of them lose it together.
 fn mode_chip_min_width() -> u16 {
-    [CHIP_COMMAND, CHIP_TYPING]
+    [CHIP_COMMAND, CHIP_TYPING, CHIP_COPY]
         .into_iter()
         .map(|label| label.chars().count() as u16)
         .max()
@@ -19138,7 +19393,7 @@ fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
 /// is a usability bug).
 fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
     let rows = match ui.mode {
-        UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
+        UiMode::Filter | UiMode::Rename | UiMode::PaneInput | UiMode::CopyMode => 1,
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
@@ -19291,6 +19546,18 @@ fn render_bottom_bar_below_notice(
                 true,
             )];
             ui.button_rects = render_right_aligned_buttons(frame, &buttons, area);
+        }
+        // PRD #385 M5: copy mode's keys beside its chip, or a status message
+        // while one is up. No buttons: copy mode is keyboard-only.
+        UiMode::CopyMode => {
+            let line = match ui.status_message {
+                Some((ref msg, _)) => {
+                    Line::styled(msg.as_str(), Style::default().fg(Color::Yellow))
+                }
+                None => Line::styled(COPY_MODE_HINTS, text_primary()),
+            };
+            frame.render_widget(Paragraph::new(line), area);
+            ui.button_rects.clear();
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
@@ -25117,6 +25384,7 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 Some(PANE_ID),
                 // The one input the seam varies: exactly what `render_frame`
                 // passes (`ui.mode`).
@@ -25203,6 +25471,7 @@ pub fn render_command_banner_pane_to_buffer(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 Some(if focused { PANE_ID } else { NO_PANE }),
                 mode,
                 visibility,
@@ -25305,6 +25574,7 @@ impl PaneSelectionSeam {
                     &HashMap::new(),
                     &HashMap::new(),
                     &self.ui.selection,
+                    copy_mode_shown(&self.ui),
                     None,
                     self.ui.mode,
                     CommandBannerVisibility::Hidden,
@@ -25387,6 +25657,172 @@ impl PaneSelectionSeam {
     /// Every copy a release delivered, oldest first.
     pub fn copies(&self) -> &[String] {
         &self.copies
+    }
+}
+
+/// A clipboard for the L1 seams: no native clipboard, and OSC 52 "sent" to a
+/// list, so no test reaches a real clipboard or terminal.
+#[derive(Default)]
+struct SeamClipboard {
+    copies: Vec<String>,
+}
+
+impl crate::clipboard::ClipboardBackend for SeamClipboard {
+    fn write_native(&mut self, _text: &str) -> crate::clipboard::NativeWrite {
+        crate::clipboard::NativeWrite::Unavailable
+    }
+
+    fn send_osc52(&mut self, text: &str) -> bool {
+        self.copies.push(text.to_owned());
+        true
+    }
+}
+
+/// PRD #385 M5 L1 seam: one pane over a `TestBackend` frame with the bottom bar
+/// on its last row, in command mode, driven key by key through
+/// [`handle_key_event`] and drawn through [`render_terminal_panes`] and
+/// [`render_bottom_bar`], as the live loop does. A copy goes through
+/// [`deliver_pending_copy`] into a recording clipboard, as the live loop's goes
+/// into the deck's.
+#[doc(hidden)]
+pub struct CopyModeSeam {
+    ui: UiState,
+    ctrl: Arc<EmbeddedPaneController>,
+    _input: crate::embedded_pane::SeamChildInput,
+    tab_manager: TabManager,
+    state: SharedState,
+    width: u16,
+    height: u16,
+    clipboard: SeamClipboard,
+}
+
+#[doc(hidden)]
+impl CopyModeSeam {
+    /// The seam's one pane id.
+    pub const PANE_ID: &'static str = "copy-pane";
+
+    /// A `width` x `height` frame: the pane over every row but the last, which
+    /// is the bottom bar, with `bytes` already on the pane's screen.
+    pub fn new(width: u16, height: u16, bytes: &[u8]) -> Self {
+        let pane = Self::pane_rect_for(width, height);
+        let inner = pane_inner_rect(pane);
+        let (ctrl, input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+            Self::PANE_ID,
+            inner.height.max(1),
+            inner.width.max(1),
+            bytes,
+            false,
+        );
+        let ctrl = Arc::new(ctrl);
+        let tab_manager = TabManager::new(Arc::clone(&ctrl) as Arc<dyn PaneController>);
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.mode = UiMode::Normal;
+        Self {
+            ui,
+            ctrl,
+            _input: input,
+            tab_manager,
+            state: Arc::new(tokio::sync::RwLock::new(AppState::default())),
+            width,
+            height,
+            clipboard: SeamClipboard::default(),
+        }
+    }
+
+    fn pane_rect_for(width: u16, height: u16) -> Rect {
+        Rect::new(0, 0, width, height.saturating_sub(1))
+    }
+
+    /// The outer rect the pane is drawn in.
+    pub fn pane_rect(&self) -> Rect {
+        Self::pane_rect_for(self.width, self.height)
+    }
+
+    /// One key, as the live loop handles it: resolved and dispatched, then any
+    /// copy it made delivered.
+    pub fn key(&mut self, key: KeyEvent) {
+        let snapshot = AppState::default();
+        let filtered: Vec<(&String, &SessionState)> = Vec::new();
+        let _ = handle_key_event(
+            key,
+            &mut self.ui,
+            &*self.ctrl,
+            &self.state,
+            &mut self.tab_manager,
+            &snapshot,
+            &filtered,
+            Rect::new(0, 0, self.width, self.height),
+        );
+        deliver_pending_copy(&mut self.ui, &mut self.clipboard);
+    }
+
+    /// Draw a frame: the pane, then the bottom bar.
+    pub fn render(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let pane = self.pane_rect();
+        let bar = Rect::new(0, self.height.saturating_sub(1), self.width, 1);
+        let ids = [Self::PANE_ID.to_string()];
+        let mut terminal = Terminal::new(TestBackend::new(self.width, self.height))
+            .expect("TestBackend should construct");
+        let mut drawn = DrawnPanes::default();
+        terminal
+            .draw(|frame| {
+                drawn = render_terminal_panes(
+                    frame,
+                    Some(&*self.ctrl),
+                    pane,
+                    &ids,
+                    PaneLayout::Tiled,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &self.ui.selection,
+                    copy_mode_shown(&self.ui),
+                    None,
+                    self.ui.mode,
+                    CommandBannerVisibility::Hidden,
+                    None,
+                    std::time::Instant::now(),
+                    false,
+                );
+                render_bottom_bar(frame, &mut self.ui, bar, true, &[]);
+            })
+            .expect("TestBackend draw should succeed");
+        record_drawn_panes(&mut self.ui, drawn);
+        terminal.backend().buffer().clone()
+    }
+
+    /// New output from the pane's program.
+    pub fn feed(&self, bytes: &[u8]) {
+        let screen = self
+            .ctrl
+            .get_screen(Self::PANE_ID)
+            .expect("the pane exists");
+        screen.lock().unwrap().process(bytes);
+    }
+
+    /// The pane goes away, as it does when it is closed.
+    pub fn close_pane(&self) {
+        self.ctrl.forget_pane(Self::PANE_ID);
+    }
+
+    /// The pane's own scrollback offset (0 = following live output).
+    pub fn scrollback(&self) -> usize {
+        let screen = self
+            .ctrl
+            .get_screen(Self::PANE_ID)
+            .expect("the pane exists");
+        screen.lock().unwrap().screen().scrollback()
+    }
+
+    /// Every copy delivered, oldest first.
+    pub fn copies(&self) -> &[String] {
+        &self.clipboard.copies
+    }
+
+    /// The status line's message, if one is set.
+    pub fn status(&self) -> Option<&str> {
+        self.ui.status_message.as_ref().map(|(m, _)| m.as_str())
     }
 }
 
@@ -25629,6 +26065,7 @@ fn render_sized_scroll_seam_pane_to_buffer(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 Some(SCROLL_SEAM_PANE_ID),
                 mode,
                 banner,
@@ -26187,6 +26624,7 @@ fn observe_scroll_notice_pane_affinity(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 None,
                 UiMode::PaneInput,
                 CommandBannerVisibility::Hidden,
@@ -42096,7 +42534,8 @@ mod tests {
             | UiMode::HostMetrics
             | UiMode::Upgrade
             | UiMode::InboxAttention
-            | UiMode::RestartNotice => mode,
+            | UiMode::RestartNotice
+            | UiMode::CopyMode => mode,
         }
     }
 
@@ -42121,6 +42560,7 @@ mod tests {
             UiMode::Upgrade,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
+            UiMode::CopyMode,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)

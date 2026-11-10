@@ -7760,6 +7760,40 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** a panic on a thread arboard starts for itself; the `panic = "abort"` build, where nothing is contained and the hook tears down.
 - **Platform coverage:** mac+linux+windows.
 
+#### copymode/keys
+
+##### copymode/keys/001 — `v` in command mode opens copy mode, which pages back to a line in the pane's history, selects it and yanks it (PRD #385 M5).
+- **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel, then 120 lines).
+- **Asserts:** with the sentinel scrolled out of view, `v` in command mode shows the ` COPY ` mode chip and a copy-mode cursor; `PageUp` pages back until the sentinel is on screen; moving the cursor onto it, `v`, moving across it and `y` writes exactly one OSC 52 sequence, whose payload is exactly the sentinel; the status line then reports the OSC 52-only send and the chip reads ` COMMAND ` again.
+- **Does not assert:** the native clipboard (the harness turns it off); the keys' L1 edge cases (`copymode/keys/002`); a real agent, so it carries no ` [reel]` marker (`copymode/live/001` does).
+- **Platform coverage:** mac+linux.
+
+##### copymode/keys/002 — Leaving copy mode without a yank copies nothing and leaves the pane where it was; live output does not move copy mode's view; an empty pane and the alternate screen behave (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`: one inert pane and the bottom bar over a `TestBackend` frame, keys through the live loop's `handle_key_event`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** after paging and setting a selection, `Esc`, and `q` after the pane was first scrolled back in command mode, return to command mode with no copy and no status message, the pane at the scroll offset it had before and showing what it showed before; forty lines of output while copy mode is open leave its view unchanged, its bottom shows no new line and a yank copies none, and after leaving the pane shows the new output; on an empty pane copy mode opens with the cursor at the first cell, `PageUp` and `g` leave it there (no history) and `G` moves it to the last row, `y` with no selection keeps copy mode open, and an empty selection leaves it without a copy or a status; on a full-screen program's alternate screen copy mode has no history to page into and copies that screen's text; and copy mode closes, copying nothing, once the pane it is open on closes.
+- **Does not assert:** the real binary (`copymode/keys/001`); a pane that stays open but leaves the screen (the stacked layout giving its slot to another pane), which closes copy mode through the same not-drawn check.
+- **Platform coverage:** mac+linux+windows.
+
+#### copymode/render
+
+##### copymode/render/001 — Copy mode shows its mode chip, its cursor and its selection on the focused pane (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`, `insta` snapshot of the frame with the cursor and selected cells marked, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** `v` in command mode turns the bottom bar's chip from ` COMMAND ` to ` COPY ` and draws the cursor where the pane's own cursor is; after moving and selecting, exactly `line-28` is marked, with one cursor cell at its end; `y` copies `line-28`, sets the OSC 52 status message and removes the cursor and highlight.
+- **Does not assert:** exact colours beyond the cursor's yellow and the selection's light-cyan backgrounds; the stacked layout or an orchestration tab, which draw the focused pane through the same function.
+- **Platform coverage:** mac+linux+windows.
+
+#### copymode/live
+
+##### copymode/live/001 — Copy mode yanks what a live Claude Code agent printed (PRD #385 M5). [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_copy_mode_live.rs`, `#![cfg(all(unix, feature = "e2e", feature = "e2e-live"))]`), attached PTY. Imported isolated credentials and pre-seeded project trust, as `scheduler/dispatch/013`; `--allowedTools Bash Read`.
+- **Agent:** interactive Claude Code on Haiku, started through the attach socket in a fixture directory whose one file is the sentinel.
+- **Asserts:** after the agent lists the directory and the sentinel file name is on screen, `Ctrl+D`, `v`, moving the copy-mode cursor onto the name, `v`, moving across it and `y` write an OSC 52 sequence carrying exactly the name; the status line reports the OSC 52-only send and the chip reads ` COMMAND `.
+- **Does not assert:** the native clipboard (the harness turns it off); paging, which `copymode/keys/001` covers.
+- **Platform coverage:** mac+linux.
+
 
 ### Theme contrast
 

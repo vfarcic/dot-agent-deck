@@ -25,6 +25,14 @@ The native clipboard is opened lazily on a dedicated `native-clipboard` thread a
 
 A failed open (no display, a headless session) is settled for the rest of the deck's life: later copies go out as OSC 52 only without trying to open the clipboard again.
 
+## Keyboard copy mode
+
+`v` in command mode (the `copy_mode` action in `src/keybindings.rs`, remappable) opens copy mode on the focused pane: `UiMode::CopyMode`, with its state in `UiState::copy_mode` (`src/copy_mode.rs`). Its own keys are fixed, like a dialog's, and limited to select-and-yank (PRD #385 decision 7): `h`/`j`/`k`/`l` or the arrows, `PageUp`/`PageDown`, `g`/`G`, `v` or `Space` to start or drop the selection, `y` or `Enter` to copy and leave, `Esc` or `q` to leave. Selection is a stream from the anchor to the cursor, like a drag. It is keyboard-only: the run loop ignores the mouse while it is open, and `overlay_blocks_mouse` lists the mode.
+
+**The view is frozen by copying the screen.** Opening copy mode clones the pane's `vt100::Screen` (it is `Clone`) into a parser of its own, and the pane is drawn from that copy until copy mode closes, with the cursor and selection drawn over it (`render_copy_mode_marks`). Output that arrives meanwhile goes to the live screen only, so nothing moves under the cursor and the highlight is exactly what a yank copies (decision 6). Paging changes the copy's scrollback offset and never the live pane's, so closing copy mode leaves the pane where it was: at the live output, or, if it was scrolled back, still on the same text, because vt100 raises a non-zero offset as new lines push rows into history. vt100's own anchoring alone would not have been enough to freeze the view, since it does not apply at offset 0, where a pane usually is.
+
+A yank leaves its text in `UiState::pending_copy`; the run loop delivers it after the key through `deliver_copy`, the same path a mouse release takes, so the status line wording is the same. Copy mode closes, copying nothing, when its pane is not drawn in a frame (closed, or no longer on screen). The alternate screen keeps no history in vt100, so on a full-screen program copy mode sees only what is on screen.
+
 ## The test knob: `DOT_AGENT_DECK_NATIVE_CLIPBOARD`
 
 Setting `DOT_AGENT_DECK_NATIVE_CLIPBOARD` to `0`, `false`, `off` or `no` turns the native write off, so copies go out as OSC 52 only. It is read once, when the TUI starts.
