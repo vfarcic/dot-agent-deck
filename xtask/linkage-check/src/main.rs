@@ -68,6 +68,10 @@
 //!   behind by SIGKILLed test processes. Decides by whether the owning PID
 //!   in the `dad-tests-<pid>-*` name is still alive rather than by age
 //!   (issue #461). Dry-run unless `--apply`.
+//! - `clean-targets` — issue #2107: deletes the cargo `target/` of every
+//!   worktree of this repository that nothing is using and that has not been
+//!   written within `--min-idle`. Dry-run unless `--apply`. See
+//!   [`clean_targets`].
 //! - `affected-checks` — issue #1575: prints the checks a change needs,
 //!   from the merge-base with `origin/main` to the working tree (or the paths
 //!   given): CLAUDE.md rule 2's and rule 5's full gates for code or a build
@@ -92,6 +96,9 @@
 mod affected_checks;
 #[cfg(all(test, unix))]
 mod build_gate;
+/// Issue #2107: `cargo xtask clean-targets`, which reclaims idle worktrees'
+/// cargo `target/` trees.
+mod clean_targets;
 mod clean_tmp;
 /// PRD #1666: `/code-cleanup`'s instructions mode owns the `dot-ai-*` skills,
 /// which became project-owned when syncing from `dot-ai` stopped. Issue #1819:
@@ -1628,6 +1635,9 @@ fn main() -> ExitCode {
     }
     if matches!(args.first().map(String::as_str), Some("clean-e2e-tmp")) {
         return clean_tmp::run(&args[1..]);
+    }
+    if matches!(args.first().map(String::as_str), Some("clean-targets")) {
+        return clean_targets::run(&repo_root(), &args[1..]);
     }
     if matches!(args.first().map(String::as_str), Some("site")) {
         return xtask_site::run(&repo_root(), &args[1..]);

@@ -1870,6 +1870,24 @@ impl RunTracker {
         }
     }
 
+    /// Issue #2099: the deck told the orchestrator that the worker owing each
+    /// of `tasks` stopped, as `stopped` says: their hand-offs end with it,
+    /// applied like an inbox change, so one whose post has not been placed
+    /// yet is ended when it is.
+    pub fn observe_worker_stopped(
+        &mut self,
+        tasks: &[String],
+        stopped: super::handoff::Stopped,
+        now: u64,
+    ) {
+        for task in tasks {
+            let change = Change::Stopped(task.clone(), stopped);
+            if !self.hold_notice(&change, now) {
+                self.apply_change(change, now);
+            }
+        }
+    }
+
     /// Issue #1981 M7 review: hold `change`, seen at `now`, in the prepared
     /// run holding the post it concerns, after the events held so far, for
     /// [`Self::commit_run`] to apply in that place: applied before the run
