@@ -33,7 +33,7 @@
 //! BEHAVIOR, so a configured `issue_dispatch` task fires regardless of the flag
 //! and this deck env carries no `DOT_AGENT_DECK_EXPERIMENTAL`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

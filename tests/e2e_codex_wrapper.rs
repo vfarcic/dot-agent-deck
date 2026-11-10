@@ -4,7 +4,7 @@
 //! deterministic plumbing; the real case runs a cheap Codex model against a
 //! uniquely named fixture sentinel. Both assert the user-visible dashboard.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

@@ -27,7 +27,7 @@ use dot_agent_deck::state::{AppState, OrchestrationIdentity};
 
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::synthetic_agent::SyntheticAgent;
 

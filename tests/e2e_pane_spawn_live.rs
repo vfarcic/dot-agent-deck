@@ -38,7 +38,7 @@
 //! snapshot writer read a grown tab's role list live, or from a copy frozen
 //! at tab-open time?
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

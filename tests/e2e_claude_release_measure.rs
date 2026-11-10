@@ -7,7 +7,7 @@
 //! 2.1.317 and 2.1.318 stay committed under `tests/fixtures/claude-inbox/`
 //! and replayed in the fast tier (`tests/doorbell_screen_profiles.rs`), with
 //! what holds only for those releases (executable hashes, exact palettes).
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/installed_agent.rs"]
 mod installed;
 

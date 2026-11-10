@@ -12,7 +12,7 @@
 //! no TUI has touched, after the plugin was left pointing at a copy of the deck
 //! that no longer exists.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;

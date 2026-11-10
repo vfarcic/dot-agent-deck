@@ -6,7 +6,7 @@
 //! PTY stays open, keeps running, and keeps reporting status regardless of
 //! whether its pane is currently drawn.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

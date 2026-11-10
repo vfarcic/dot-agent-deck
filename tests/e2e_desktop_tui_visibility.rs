@@ -6,7 +6,7 @@
 //! exact attach requests its actions issue and then observe the real TUI in a
 //! PTY. Each starts with the equivalent TUI-native launch as a control.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::{self, Read, Write};
 use std::net::Shutdown;

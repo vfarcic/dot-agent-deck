@@ -11,7 +11,7 @@
 //! `.dot-agent-deck/recordings/` are keyed by the `#[spec]` id, never by the
 //! file it lives in.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

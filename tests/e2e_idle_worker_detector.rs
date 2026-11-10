@@ -5,7 +5,7 @@
 //! orchestrators act on undelivered and waiting-for-input notices without a
 //! human keystroke.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_view.rs"]

@@ -39,7 +39,7 @@
 //! Lane 1 (`cargo test-e2e`): both roles are stand-ins, no agent and no
 //! credential, so CI runs it on every PR.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

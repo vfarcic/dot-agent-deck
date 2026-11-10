@@ -18,7 +18,7 @@
 //!
 //! It is lane 2 because it runs a real agent binary; it spends no credential.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use spec::spec;
 use std::path::{Path, PathBuf};

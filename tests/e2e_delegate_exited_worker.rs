@@ -15,7 +15,7 @@
 //! Lane 1 (`cargo test-e2e`): every role is a stand-in (`cat`, or the
 //! fixture's `worker.py`), no agent and no credential.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;

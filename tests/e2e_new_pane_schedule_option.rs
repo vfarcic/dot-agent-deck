@@ -20,7 +20,7 @@
 //! `↳ authoring session — writes a schedule, then done`, whose tail overflows
 //! the modal's inner width and is clipped at the right border.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

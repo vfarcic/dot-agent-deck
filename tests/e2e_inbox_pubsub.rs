@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", unix))]
 //! S11 contract exercised only through the real binary's public JSON and CLI.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]

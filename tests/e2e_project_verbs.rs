@@ -34,7 +34,7 @@
 //! `tests/e2e_tab_close_regressions.rs`. All polling lives in `common` helpers
 //! so these bodies carry no raw sleep (linkage-check Decision 21).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

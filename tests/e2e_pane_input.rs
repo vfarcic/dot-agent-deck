@@ -10,7 +10,7 @@
 //! (issue #502); the two shared no helpers and no constants, so splitting them
 //! duplicated nothing.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

@@ -64,7 +64,7 @@ pub const DAEMON_START_POLL_TIMEOUT: Duration =
 
 /// e2e seam (PRD #1258): the variable an `e2e` build reads to widen
 /// [`DAEMON_START_POLL_TIMEOUT`] for [`ensure_external_daemon_or_die`], in
-/// milliseconds. The TUI harness (`tests/common/mod.rs`) sets it to the default
+/// milliseconds. The TUI harness (`tests/common/lib.rs`) sets it to the default
 /// load-scaled, because on a starved box (io stalled ~70% of the window, load
 /// 17 on 16 cores) a debug daemon measurably bound after the fixed 15 s and the
 /// deck gave up while its daemon was still healthy.

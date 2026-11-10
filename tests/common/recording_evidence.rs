@@ -240,15 +240,21 @@ pub(crate) fn claude_session_provenance(home: &Path) -> Vec<Value> {
     files.truncate(256);
     let mut budget = 16 * 1024 * 1024;
     let mut results = Vec::new();
-    for mut transcript in files {
+    for transcript in files {
         if budget == 0 {
             collection_truncated = true;
             break;
         }
+        // Reopen through the same pinned, no-follow walk, one file at a time,
+        // and read it only if it is still the file enumeration chose.
+        let Ok(mut file) = reopen_transcript(&root, &transcript) else {
+            collection_truncated = true;
+            continue;
+        };
         let limit = transcript.length.min(1024 * 1024).min(budget);
         budget -= limit;
         let mut result = empty_session(&transcript.path);
-        collect_session_tail(&mut transcript.file, transcript.length, limit, &mut result);
+        collect_session_tail(&mut file, transcript.length, limit, &mut result);
         results.push(result);
     }
     for result in &mut results {
@@ -381,11 +387,44 @@ fn push_distinct(values: &mut Value, value: &str) {
     }
 }
 
+/// A transcript chosen during enumeration. It holds the file's identity, not
+/// an open descriptor: holding one per candidate needed up to 257 descriptors
+/// at once, past macOS's default soft limit of 256 for a terminal shell, and
+/// the opens that failed there dropped transcripts without marking the
+/// collection truncated.
 struct Transcript {
     path: PathBuf,
-    file: File,
+    relative: PathBuf,
+    identity: FileIdentity,
     length: u64,
     modified: std::time::SystemTime,
+}
+
+#[cfg(unix)]
+type FileIdentity = (u64, u64);
+#[cfg(not(unix))]
+type FileIdentity = ();
+
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> FileIdentity {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.dev(), metadata.ino())
+}
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> FileIdentity {}
+
+fn reopen_transcript(root: &File, transcript: &Transcript) -> io::Result<File> {
+    let names: Vec<_> = transcript.relative.iter().collect();
+    let mut parent: Option<File> = None;
+    for (i, name) in names.iter().enumerate() {
+        let dir = parent.as_ref().unwrap_or(root);
+        parent = Some(open_child(dir, Path::new(name), i + 1 < names.len())?);
+    }
+    let file = parent.ok_or_else(|| io::Error::other("empty transcript path"))?;
+    if file_identity(&file.metadata()?) != transcript.identity {
+        return Err(io::Error::other("transcript replaced after enumeration"));
+    }
+    Ok(file)
 }
 
 fn session_files(
@@ -419,16 +458,23 @@ fn session_files(
             && let Ok(file) = open_child(dir, relative, false)
             && let Ok(metadata) = file.metadata()
         {
+            drop(file);
+            let path = path.join(&name);
+            let relative = path
+                .strip_prefix(".claude/projects")
+                .unwrap_or(&path)
+                .to_path_buf();
             files.push(Transcript {
-                path: path.join(name),
-                file,
+                path,
+                relative,
+                identity: file_identity(&metadata),
                 length: metadata.len(),
                 modified: metadata.modified().unwrap_or(std::time::UNIX_EPOCH),
             });
             if files.len() > 256 {
                 *truncated = true;
-                // Keep descriptors for the newest candidates, bounding open
-                // files as well as the eventual output and parse budget.
+                // Keep the newest candidates, bounding the eventual output
+                // and parse budget.
                 files.sort_by(|a, b| {
                     b.modified
                         .cmp(&a.modified)

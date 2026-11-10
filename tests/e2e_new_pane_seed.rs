@@ -34,7 +34,7 @@
 //!   finding 8's click-only chip until PRD #1223 removed that chip from both
 //!   clients; it now pins the absence in the real binary.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

@@ -52,7 +52,7 @@ use dot_agent_deck::state::{
 };
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 const ORCH_PANE: &str = "idle-orchestrator-pane";
 const ORCH_ROLE: &str = "orchestrator";
 const ORCHESTRATION: &str = "idle-test-orchestration";
