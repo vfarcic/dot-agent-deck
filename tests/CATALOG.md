@@ -7689,6 +7689,24 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
 
+#### mouse/capture
+
+##### mouse/capture/001 — The deck does not ask its terminal for any-motion mouse tracking (PRD #385 M4).
+- **Layer:** L1 (pure byte output of the terminal-mode guard, `ui::tests`).
+- **Agent:** none.
+- **Asserts:** turning the deck's terminal modes on writes `?1000h`, `?1002h` and `?1006h` and nothing containing `1003`; turning them off writes `?1000l`, `?1002l`, `?1003l` and `?1006l`.
+- **Does not assert:** what a real terminal reports in each mode; the Windows console path, which sets mouse input through the console API rather than these sequences.
+- **Platform coverage:** mac+linux.
+
+#### clipboard/deliver
+
+##### clipboard/deliver/001 — A copied selection goes to the native clipboard and as OSC 52, and the status line says only what happened (PRD #385 M1).
+- **Layer:** L1 pure data (`clipboard::tests`), against a fake `ClipboardBackend` and a fake `NativeSink`; no test writes a real clipboard.
+- **Agent:** none.
+- **Asserts:** a copy attempts the native write and always sends OSC 52; the status line reads "Copied to clipboard" only for a confirmed native write, the OSC 52 wording (pointing at Troubleshooting, never "Copied") when the native write was unavailable, failed or unconfirmed, a not-copied line when neither went out, and nothing for an empty selection; the native clipboard is opened lazily and once, a failed open is not retried, a refused write reports failed, a blocked write returns unconfirmed after the bounded wait without holding the caller and later writes land once it unblocks; `DOT_AGENT_DECK_NATIVE_CLIPBOARD` set to `0`/`false`/`off`/`no` turns the native write off.
+- **Does not assert:** that `arboard` reaches a real X11, Wayland or macOS clipboard; the mouse gesture that triggers a copy (that is the pane selection's own tests); an agent's own OSC 52 copy, which is `embed/clipboard/001`.
+- **Platform coverage:** mac+linux+windows.
+
 
 ### Theme contrast
 

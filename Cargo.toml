@@ -142,6 +142,20 @@ bytes = "1"
 # whose `openpty` returns `anyhow::Result`. Already in the graph through
 # `portable-pty` itself, so this adds no crate to the build.
 anyhow = "1"
+# PRD #385: copying a pane selection writes the native system clipboard
+# (`src/clipboard.rs`) as well as sending OSC 52, which several common
+# terminals ignore. Already in this workspace's lockfile through the desktop
+# crate's `tauri-plugin-clipboard-manager`, at the version that builds there.
+# `default-features = false` drops `image-data` (the `image` crate and its
+# decoders): the deck copies text only. `wayland-data-control` adds
+# `wl-clipboard-rs`, pure Rust like arboard's X11 backend (`x11rb`); its
+# `wayland-sys` comes in with no features, which links nothing (its build
+# script probes pkg-config only for `client`/`server`/`cursor`/`egl`), so no
+# system library or C build step is added. Without it, a Wayland session
+# would reach the clipboard only through XWayland.
+arboard = { version = "3.7", default-features = false, features = [
+  "wayland-data-control",
+] }
 
 # Issue #250: `build.rs` validates an injected `DAD_VERSION` with the EXACT
 # parser `src/version.rs` uses (`semver::Version::parse`), so the set of

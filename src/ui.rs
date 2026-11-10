@@ -6008,7 +6008,11 @@ fn osc52_clipboard_sequence(text: &str) -> String {
 /// Copy text to the system clipboard using the OSC 52 escape sequence.
 /// Writes directly to the controlling terminal to bypass ratatui's buffered
 /// terminal output.
-fn copy_to_clipboard_osc52(text: &str) {
+///
+/// Returns whether the sequence was written to the terminal — that it was
+/// sent, not that the terminal honoured it (PRD #385: the status line reports
+/// what [`crate::clipboard::deliver`] saw, and this is its OSC 52 half).
+fn copy_to_clipboard_osc52(text: &str) -> bool {
     use std::io::Write;
     let seq = osc52_clipboard_sequence(text);
     // Write to the controlling terminal directly so the escape sequence reaches
@@ -6021,9 +6025,12 @@ fn copy_to_clipboard_osc52(text: &str) {
     let terminal = std::fs::OpenOptions::new().write(true).open("/dev/tty");
     #[cfg(windows)]
     let terminal = open_console_output();
-    if let Ok(mut tty) = terminal {
-        let _ = tty.write_all(seq.as_bytes());
-        let _ = tty.flush();
+    match terminal {
+        Ok(mut tty) => tty
+            .write_all(seq.as_bytes())
+            .and_then(|()| tty.flush())
+            .is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -12297,6 +12304,44 @@ struct TerminalModes {
     restore: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// The mouse reporting the deck asks its terminal for: presses, releases,
+/// motion **while a button is held** (drags) and the wheel, in SGR encoding
+/// (`?1000h ?1002h ?1015h ?1006h`).
+///
+/// PRD #385 M4: this is crossterm's [`crossterm::event::EnableMouseCapture`]
+/// without its `?1003h` (any-event tracking), which made the terminal report
+/// every pointer movement over the window, button or not. The deck has no use
+/// for those reports: the pane mouse arm ignores bare motion, the focus claim
+/// excludes it (`focus_report::focus_signal`), and a child pane is forwarded
+/// the wheel only (`EmbeddedPaneController::forward_mouse_scroll`), never
+/// motion. The disable side keeps crossterm's
+/// [`crossterm::event::DisableMouseCapture`], whose `?1003l` is harmless and
+/// turns off a stale any-event mode another program may have left on.
+///
+/// On a Windows console without ANSI support it falls back to crossterm's
+/// console-mode call, which has no per-mode switch to drop.
+#[derive(Debug, Clone, Copy)]
+struct EnableButtonMouseCapture;
+
+/// The bytes [`EnableButtonMouseCapture`] writes, in crossterm's order.
+const BUTTON_MOUSE_CAPTURE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
+
+impl crossterm::Command for EnableButtonMouseCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(BUTTON_MOUSE_CAPTURE_ON)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::Command::execute_winapi(&crossterm::event::EnableMouseCapture)
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
 impl Default for TerminalModes {
     fn default() -> Self {
         Self {
@@ -12322,7 +12367,7 @@ impl TerminalModes {
         // On an error the `?` drops `guard`, which writes the disables.
         crossterm::execute!(
             guard.out,
-            crossterm::event::EnableMouseCapture,
+            EnableButtonMouseCapture,
             crossterm::event::EnableBracketedPaste,
             crossterm::event::EnableFocusChange,
         )?;
@@ -12862,6 +12907,10 @@ pub fn run_tui(
 
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    // PRD #385: where a pane selection is copied to. Created here so the
+    // native clipboard, once opened at the first copy, lives as long as the
+    // deck does (X11/Wayland serve a copy from the process that made it).
+    let mut clipboard = crate::clipboard::SystemClipboard::new(copy_to_clipboard_osc52);
     let startup_hook_status = surface_startup_hook_note(&mut ui, startup_hooks);
     // PRD #196: restore the persisted global last-command so the new-pane form
     // can seed from it from the very first spawn of the session. Loaded
@@ -14375,8 +14424,12 @@ pub fn run_tui(
             // the user's own terminal — write-only, validated by
             // `osc52::osc52_copy_text`, and only the newest when several
             // arrived in one frame, since each would replace the last.
+            //
+            // PRD #385 left this OSC 52-only on purpose: giving an agent's
+            // escape sequence write access to the native clipboard is a
+            // separate decision, so it does not go through `clipboard`.
             if let Some(text) = embedded.take_clipboard_copy() {
-                copy_to_clipboard_osc52(&text);
+                let _ = copy_to_clipboard_osc52(&text);
             }
             let rejections = embedded.take_stream_rejections();
             if !rejections.is_empty() {
@@ -15171,12 +15224,16 @@ pub fn run_tui(
                             {
                                 let offset = screen_row_offset(parser.screen(), sel.pane_rect);
                                 let text = extract_selection_text(parser.screen(), sel, offset);
-                                if !text.is_empty() {
-                                    copy_to_clipboard_osc52(&text);
-                                    ui.status_message = Some((
-                                        "Copied to clipboard".to_string(),
-                                        std::time::Instant::now(),
-                                    ));
+                                // The native write can wait (bounded); do not
+                                // hold the pane's parser, which its reader
+                                // thread feeds, while it does.
+                                drop(parser);
+                                // PRD #385: native clipboard and OSC 52, and a
+                                // status line that says which of them went out.
+                                let outcome = crate::clipboard::deliver(&mut clipboard, &text);
+                                if let Some(message) = crate::clipboard::status_message(outcome) {
+                                    ui.status_message =
+                                        Some((message.to_string(), std::time::Instant::now()));
                                 }
                             }
                             // Keep selection visible after multi-click; clear on single-click.
@@ -37291,7 +37348,7 @@ mod tests {
     }
 
     fn terminal_modes_on() -> String {
-        ansi(crossterm::event::EnableMouseCapture)
+        ansi(EnableButtonMouseCapture)
             + &ansi(crossterm::event::EnableBracketedPaste)
             + &ansi(crossterm::event::EnableFocusChange)
     }
@@ -37339,6 +37396,35 @@ mod tests {
         event_loop_step()?;
         guard.disable();
         Ok(())
+    }
+
+    /// Scenario: The deck turns its terminal modes on and then off. Turning them on asks for presses, releases, drags and the wheel in SGR encoding but not any-motion tracking (`?1003h`), and turning them off still sends `?1003l` along with every other mouse disable.
+    #[cfg(unix)]
+    #[spec("mouse/capture/001")]
+    #[test]
+    fn capture_001_the_deck_does_not_ask_for_any_motion_tracking() {
+        let (modes, _restores) = counting_modes();
+        let out = SharedTerminalOutput::default();
+        let mut guard = modes.enable(out.clone()).expect("enable writes to memory");
+        let on = out.text();
+        for mode in ["?1000h", "?1002h", "?1006h"] {
+            assert!(
+                on.contains(&format!("\x1b[{mode}")),
+                "{mode} missing: {on:?}"
+            );
+        }
+        assert!(
+            !on.contains("1003"),
+            "the deck must not request any-motion tracking: {on:?}"
+        );
+        guard.disable();
+        let off = out.text()[on.len()..].to_string();
+        for mode in ["?1000l", "?1002l", "?1003l", "?1006l"] {
+            assert!(
+                off.contains(&format!("\x1b[{mode}")),
+                "{mode} missing: {off:?}"
+            );
+        }
     }
 
     /// PRD #1105 M11 audit — the terminal I/O error returns `run_tui`'s event

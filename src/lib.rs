@@ -24,6 +24,8 @@ pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
+// PRD #385: a pane selection copied to the native clipboard and OSC 52.
+pub mod clipboard;
 // PRD #1589: the daemon side of `close` — resolve, authorize, refuse or close.
 pub mod close_agents;
 // PRD #1589: the `close` command's request building and report rendering.

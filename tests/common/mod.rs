@@ -1318,6 +1318,7 @@ impl TuiDeck {
             // Disable the idle-shutdown so the daemon does not race the
             // test by exiting after a brief detach.
             ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0"),
+            ("DOT_AGENT_DECK_NATIVE_CLIPBOARD", "0"), // PRD #385: not the real clipboard
             // Leaked-daemon safety net: the deck lazy-spawns its daemon
             // DETACHED (its own session → parent is PID 1 from birth), so the
             // orphan watchdog can't be enabled here (it would fire instantly).
