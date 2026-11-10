@@ -1988,7 +1988,7 @@ describe("ControlDeck", () => {
     const snapshot = createFixtureSnapshot("connected");
     snapshot.agents[0].paneId = "pane-toolbar";
     snapshot.agents[0].incarnation = "process-toolbar";
-    const previewWorktreeClose = vi.fn(async () => ({ path: "/remote/dispatch-toolbar", confirmed_dirty: true }));
+    const previewWorktreeClose = vi.fn(async () => ({ kept: { path: "/remote/dispatch-toolbar", confirmed_dirty: true }, keepWorktree: null }));
     const rt = runtime({ snapshot, previewWorktreeClose });
     render(<ControlDeck runtime={rt} />);
     fireEvent.click(screen.getByRole("button", { name: "Close Planner" }));
@@ -1998,6 +1998,21 @@ describe("ControlDeck", () => {
     await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Close agent" })));
     expect(rt.runAction).toHaveBeenCalledWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-toolbar" });
     expect(screen.queryByTestId("worktree-kept-toast")).toBeNull();
+  });
+
+  /** Scenario (issue #1958): close the selected dispatched agent from the deck toolbar with "Close agent, keep worktree"; the stop carries the keep. */
+  it("closes from the toolbar keeping the worktree", async () => {
+    const snapshot = createFixtureSnapshot("connected");
+    snapshot.agents[0].paneId = "pane-toolbar";
+    snapshot.agents[0].incarnation = "process-toolbar";
+    const previewWorktreeClose = vi.fn(async () => ({ kept: null, keepWorktree: "/remote/dispatch-toolbar" }));
+    const rt = runtime({ snapshot, previewWorktreeClose });
+    render(<ControlDeck runtime={rt} />);
+    fireEvent.click(screen.getByRole("button", { name: "Close Planner" }));
+    const dialog = screen.getByRole("alertdialog");
+    const keep = await within(dialog).findByRole("button", { name: "Close agent, keep worktree" });
+    await act(async () => fireEvent.click(keep));
+    expect(rt.runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-toolbar", keepWorktree: true });
   });
 
   /** Scenario: The narrow layout keeps its agent summary visible, then opens the Events drawer on demand. */

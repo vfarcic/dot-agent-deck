@@ -2,7 +2,7 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
-import { worktreeKeptNotice, type KeptWorktree } from "./worktreeClose";
+import { NO_WORKTREE_CLOSE_REPORT, worktreeKeptNotice, type WorktreeCloseReport } from "./worktreeClose";
 import { agentKey, boundAgentKey } from "./agentKey";
 import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
@@ -1831,8 +1831,8 @@ export type DesktopRunActionDto =
   | { type: "bootstrap"; startIfMissing?: boolean }
   | { type: "start_agent"; deckId: string; command?: string; cwd?: string; displayName?: string; rows?: number; cols?: number; authoringKind?: "schedule" | "schedule-issues" | "dispatcher" }
   | { type: "start_orchestration"; deckId: string; path: string; orchestration: string; displayTitle?: string; configRevision?: string; rows?: number; cols?: number }
-  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
-  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string; keepWorktree?: boolean }
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[]; keepWorktree?: boolean }
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
@@ -3876,8 +3876,8 @@ class FixtureDeckBridge implements DeckBridge {
     return fixtureDesktopFeatures();
   }
 
-  async previewWorktreeClose(): Promise<KeptWorktree | null> {
-    return null;
+  async previewWorktreeClose(): Promise<WorktreeCloseReport> {
+    return NO_WORKTREE_CLOSE_REPORT;
   }
 
   /** PRD #1223 M4 — the named fixture deck's options, or `unsupported` for one this preview plays as older. */
@@ -5759,9 +5759,9 @@ export class TauriDeckBridge implements DeckBridge {
     return invoke<NewAgentOptions>("desktop_new_agent_options", { deckId });
   }
 
-  async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | null> {
+  async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<WorktreeCloseReport> {
     const invoke = await this.getInvoke();
-    return invoke<KeptWorktree | null>("desktop_worktree_close_preview", { deckId, paneIds, incarnation });
+    return invoke<WorktreeCloseReport>("desktop_worktree_close_preview", { deckId, paneIds, incarnation });
   }
 
   /** PRD #1223 M6. The deck and the path go through untouched, as for {@link listDirectories}. */

@@ -1406,6 +1406,13 @@ pub enum DesktopAction {
         /// [`DesktopAgent::incarnation`], which the stop is bound to.
         #[serde(default)]
         incarnation: Incarnation,
+        /// Issue #1958: close and KEEP the agent's dispatched worktree, whatever
+        /// its state — the close dialog's "Close agent, keep worktree". Sent
+        /// through `DaemonClient::stop_agent_keeping_worktree`, which refuses
+        /// with nothing stopped when the deck cannot keep. Absent means false:
+        /// an ordinary stop.
+        #[serde(default)]
+        keep_worktree: bool,
     },
     /// PRD #1223 U4 — close a whole orchestration: stop every role the
     /// webview's fleet entry lists for it, on the deck `deck_id` names,
@@ -1415,6 +1422,12 @@ pub enum DesktopAction {
     StopOrchestration {
         deck_id: String,
         roles: Vec<StopOrchestrationRole>,
+        /// Issue #1958: keep the orchestration's dispatched worktree — "Close
+        /// all N roles, keep worktree". Applied to EVERY role's stop, because
+        /// the deck cleans the worktree up on whichever stop ends up last.
+        /// Absent means false.
+        #[serde(default)]
+        keep_worktree: bool,
     },
     StopDaemon {
         #[serde(default)]
@@ -1472,6 +1485,22 @@ pub struct StopOrchestrationRole {
     /// which this role's stop is bound to.
     #[serde(default)]
     pub incarnation: Incarnation,
+}
+
+/// What the close dialog learns before it asks (issue #717 / #1958): the
+/// dispatched worktree a close would leave holding uncommitted work, and
+/// whether to offer "keep worktree".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCloseReport {
+    /// The worktree an ordinary close would KEEP because it holds (or may
+    /// hold) uncommitted work. `null` when it would keep none.
+    pub kept: Option<dot_agent_deck::daemon_protocol::KeptWorktree>,
+    /// Issue #1958: the dispatched worktree to offer "…, keep worktree" for —
+    /// set only when the deck advertises the keep AND the closed panes own a
+    /// recorded worktree, whatever its state. `null` means offer no such
+    /// choice, which is what an older deck always gets.
+    pub keep_worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

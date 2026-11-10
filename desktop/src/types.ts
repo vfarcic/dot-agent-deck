@@ -1370,7 +1370,7 @@ export type DeckAction =
    * resolves as it resolves a start's: never from the selection, so an agent on
    * another deck can be stopped from the overview under All Decks.
    */
-  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string; keepWorktree?: boolean }
   /**
    * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
    * deck `deckId` names, concurrently. There is no orchestration-wide daemon
@@ -1379,7 +1379,7 @@ export type DeckAction =
    * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
    * named as.
    */
-  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[]; keepWorktree?: boolean }
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string };
 
 /**
