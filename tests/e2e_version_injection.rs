@@ -36,7 +36,7 @@
 //!
 //! The single largest factor is **how busy the machine is** — by more than the
 //! whole rest of this section put together. Measured on one 16-core dev box,
-//! `--jobs` capped to 8 as `capped_jobs` caps it, the three nested builds back
+//! `--jobs` capped to 8 as `nested_build_jobs` caps it by default, the three nested builds back
 //! to back:
 //!
 //! | machine | cold | warm | scratch dir |
@@ -54,64 +54,51 @@
 //! read one slow run as a regression, and do not tune this test against a
 //! single measurement.
 //!
-//! ## Issue #928's cache premise was wrong, which is why nothing changed here
+//! ## What CI actually pays (issue #2109)
 //!
-//! #928 read the scratch `CARGO_TARGET_DIR` as defeating CI's cache — "cold on
-//! every run, forever". It does not. `Swatinem/rust-cache` caches the whole
-//! `target/` tree, and its pre-save cleanup *recurses* into a nested target
-//! dir: `cleanTargetDir` calls a directory a profile only if that directory
-//! holds `build`, `.fingerprint` or `deps`, and `target/version-injection-e2e`
-//! holds none of the three at its root, so it is walked rather than pruned.
-//! `rmExcept` then keeps every entry belonging to a dependency and drops only
-//! this workspace's own. Transcribed from the action at the SHA `ci.yml` pins
-//! and run against a real populated scratch dir: **995 entries kept, 24
-//! removed** — the 24 being this package's own artifacts and fingerprints plus
-//! `incremental/`, `examples/` and the two cargo lock files.
-//!
-//! So a cache-hit run starts build 1 with the dependency graph already
-//! compiled, and what it pays — three times, every run — is a recompile of
-//! **this** package (140k lines under `src/`) plus a link. That is the floor
-//! for the shape this test has, and two ways under it were considered and
-//! rejected: collapsing the builds would stop pinning either
+//! Issue #928 argued about whether CI's `Swatinem/rust-cache` covered the
+//! scratch dir (it did: its cleanup recurses into a nested target dir and
+//! keeps the dependencies). That stopped mattering when the e2e tier moved to a
+//! nextest archive run in shards: this test runs alone in the `version` shard
+//! (`scripts/e2e-shard.sh`), and neither backend's shard restores a cache
+//! holding this scratch dir, so **every CI run is the cold case** — the whole dependency graph, then this
+//! package (140k lines under `src/`) three times. Two ways under that were
+//! considered and rejected: collapsing the builds would stop pinning either
 //! `rerun-if-env-changed` directive individually (changing both variables at
-//! once proves neither, since either one alone re-runs the whole script), and
-//! seeding the scratch dir from the main `target/debug` would mean reaching
-//! into cargo's artifact layout so that a test whose job is to prove a BUILD
-//! behaves correctly starts from another build's output. A shared compilation
-//! cache (`sccache`) would genuinely reach it and is out of this issue's scope,
-//! since it would touch every build in the repository rather than this one.
+//! once proves neither), and seeding the scratch dir from the main
+//! `target/debug` would mean a test whose job is to prove a BUILD behaves
+//! correctly starts from another build's output.
 //!
-//! ## The `debug = 0` profile that is deliberately NOT here
+//! ## What the nested build pins (issue #2109)
 //!
-//! Dropping debug info from these builds looks obviously right: the produced
-//! binary is executed twice per build, for `--version` and `daemon hello`, and
-//! neither reads a debugger or a symbolised backtrace. Measured on the quiet
-//! box, a `dev`-inheriting profile with `debug = 0` against plain `dev`:
+//! Three settings make the build cheaper without touching what it proves —
+//! none of them changes what `build.rs` reads, which directive fires, or which
+//! `env!()` sites the binary carries:
 //!
-//! | | cold | warm | scratch dir |
-//! | --- | --- | --- | --- |
-//! | `dev` | 65.0s | 24.0s | 1.8 GB |
-//! | `debug = 0` | 55.5s | 19.5s / 22.3s | 1.1 GB |
-//! | `dev`, `CARGO_INCREMENTAL=0` | 98.5s | — | 1.3 GB |
-//! | `debug = 0`, `CARGO_INCREMENTAL=0` | 101.4s | — | 650 MB |
+//! - **`CARGO_INCREMENTAL=1`.** GitHub's shard exports `CARGO_INCREMENTAL=0`
+//!   (`dtolnay/rust-toolchain` sets it), which also drops this
+//!   package from 256 codegen units to 16 — and this package's compile, three
+//!   times over, is most of the work. Dependencies are never built
+//!   incrementally, so it costs them nothing. It is the quiet-box table's
+//!   65.0s against 98.5s above.
+//! - **`CARGO_PROFILE_DEV_DEBUG=0`.** The produced binary is run for
+//!   `--version` and `daemon hello`, neither of which reads debug info. Set in
+//!   the environment rather than declared as a profile in `Cargo.toml`: no CI
+//!   cache holds this dir any more, so there is no cache key it would have to
+//!   rotate. A local scratch dir built before this rebuilds once.
+//! - **`DAD_E2E_NESTED_BUILD_JOBS`** overrides the `--jobs` cap below. The
+//!   `version` shard sets it to `all` (every CPU the runner's quota allows), since the cap exists to protect
+//!   tests running beside this one and in that shard there are none; on a
+//!   4-vCPU runner the cap halved the cold build's parallelism.
 //!
-//! The time saving is 10-15% where it appears at all and slightly **negative**
-//! in the configuration CI actually uses — inside this box's noise either way,
-//! which is the point of the 6x table above. (On the busy box it looked like a
-//! halving. It was load, not debug info.) The disk saving is real and about
-//! half.
+//! Measured on a 14-core macOS dev box (2026-11-09), `CARGO_INCREMENTAL=0`
+//! exported as CI has it, scratch dir deleted before each run, the whole test:
 //!
-//! It is not here because of the cache. To take effect in CI the profile has to
-//! be declared in `Cargo.toml`: rust-cache keys on that manifest and does not
-//! re-save on an exact key match, so setting `CARGO_PROFILE_DEV_DEBUG=0` in
-//! this file rotates no key, leaves the cache serving `debug` artifacts the
-//! build can no longer use, and makes every run pay a cold build with nothing
-//! written back. Declaring it rotates the key once — but the first cache
-//! written after that carries the old `debug` artifacts forward for good, since
-//! cargo never garbage collects a target dir and rust-cache re-saves whatever
-//! it restored. CI would store *more*, not less, for a time saving inside the
-//! noise. Halving what a worktree keeps on disk is still worth having; it
-//! belongs with issue #927, which owns per-worktree build cost.
+//! | | busy (load 11-35) | quiet (load 3-5), via `e2e-shard.sh version` |
+//! | --- | --- | --- |
+//! | before (7 jobs, outer env's incremental and debug) | 189s, 189s | 109.3s |
+//! | the two pinned settings, cap kept (7 jobs) | 132s | — |
+//! | the two pinned settings, uncapped (14 jobs) | 102s | 58.7s |
 //!
 //! Three containment choices worth keeping:
 //!
@@ -124,7 +111,8 @@
 //!   (`--jobs`), because it runs while nextest is executing the rest of the e2e
 //!   suite and a full-parallel nested compile can starve the timed tests around
 //!   it into flaking. That premise used to be mostly false and is now true: see
-//!   the next point.
+//!   the next point. `DAD_E2E_NESTED_BUILD_JOBS` lifts it where the test runs
+//!   alone (above).
 //! - nextest schedules this test near the **front** of its queue, behind only
 //!   the exclusive reservations (`priority` in `.config/nextest.toml`), instead
 //!   of at its natural binary-name position about 70% of the way down. It was the last of ~2,680 tests to finish in 13
@@ -195,12 +183,37 @@ fn host_target() -> String {
         .to_string()
 }
 
-/// Half the machine's cores, at least one — see the cost note at the top of the
-/// file for why the nested build is capped.
-fn capped_jobs() -> usize {
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(1))
-        .unwrap_or(1)
+/// The variable that lifts the `--jobs` cap when this test is known to run
+/// alone. `scripts/e2e-shard.sh` sets it for CI's `version` shard, whose only
+/// test this is, so the cap would protect nothing there (issue #2109).
+const NESTED_BUILD_JOBS_ENV: &str = "DAD_E2E_NESTED_BUILD_JOBS";
+
+/// The nested build's `--jobs`. `DAD_E2E_NESTED_BUILD_JOBS=all` uses every CPU
+/// this process may use, a positive number uses that many, and anything else
+/// (unset included) caps it at half, at least one — see the cost note at the
+/// top of the file for why the nested build is capped by default.
+///
+/// `all` rather than a count from the shell: `std::thread::available_parallelism`
+/// honours a cgroup CPU quota, which `getconf _NPROCESSORS_ONLN` / `nproc` on a
+/// quota-limited runner may not, so a count computed in the script could
+/// oversubscribe the very shard it is meant to speed up.
+fn nested_build_jobs() -> usize {
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    match std::env::var(NESTED_BUILD_JOBS_ENV)
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("all") => available,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or((available / 2).max(1)),
+        None => (available / 2).max(1),
+    }
 }
 
 /// Build `dot-agent-deck` with `version` / `build_id` pre-set in the build
@@ -210,7 +223,7 @@ fn build_with_injected(version: &str, build_id: &str) -> PathBuf {
     let scratch = scratch_target_dir();
     let target = host_target();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let jobs = capped_jobs().to_string();
+    let jobs = nested_build_jobs().to_string();
 
     let out = Command::new(&cargo)
         .args([
@@ -226,6 +239,13 @@ fn build_with_injected(version: &str, build_id: &str) -> PathBuf {
         .env("CARGO_TARGET_DIR", &scratch)
         .env("DAD_VERSION", version)
         .env("DAD_BUILD_ID", build_id)
+        // Issue #2109: the two settings that make this build cheaper without
+        // touching what it proves. Neither changes what `build.rs` sees or
+        // which `rerun-if-env-changed` directive fires; both are pinned here so
+        // the outer environment (CI exports `CARGO_INCREMENTAL=0`) cannot
+        // choose them. See "What the nested build pins" at the top of the file.
+        .env("CARGO_INCREMENTAL", "1")
+        .env("CARGO_PROFILE_DEV_DEBUG", "0")
         // Cargo passes its jobserver to child processes through this variable;
         // handing it to a nested cargo makes it warn about an unusable
         // jobserver fd. Dropping it just costs the child its own job slots —

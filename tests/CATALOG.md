@@ -75,9 +75,9 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/otlp/002 — Configured export describes the run and its status intervals.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** synthetic shell and cat with synthesized status hooks.
-- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver.
-- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry.
+- **Agent:** synthetic shell and cat with synthesized status hooks; and a clear=true orchestration worker that is a Pi stand-in shell reporting through the real in-pane `agent-event` CLI, as the bundled extension does (issue #2078).
+- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver. In the Pi case a delegate respawns the worker, so its replacement's run sees no `SessionStart` at all (Pi sends none, and a respawn surfaces no placeholder); that run must still export thinking, working and idle `agent.status` spans beside its one bash `agent.operation` (the control).
+- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry; the real `pi` runtime (`telemetry/otlp/019`).
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/003 — The spawned agent and exported run share the same run id.
@@ -195,7 +195,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### telemetry/otlp/019 — Real interactive Pi Haiku exports metadata with the deck identity. [reel]
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
 - **Agent:** real Pi on Anthropic claude-haiku-4-5, using the automatically bundled extension.
-- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run and prompt/file/output sentinels are absent from every captured body.
+- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run, the deck exports a busy and an idle `agent.status` span for the Pi run (issue #2078) and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** provider fallback or exact token/cost values.
 - **Platform coverage:** mac+linux with Anthropic credentials.
 
@@ -8607,6 +8607,13 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** Granting worker permission or completing its blocked task.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/032 — A real worker whose turn fails on a provider error wakes its orchestrator through an acknowledged inbox notice (issue #2099).
+- **Layer:** L2 PTY-attached, lane 2, tests/e2e_idle_worker_detector.rs; shares `real_worker_stop_is_reported` with `scheduler/idle-worker/022`.
+- **Agent:** a real interactive Claude Haiku orchestrator and a real interactive Claude worker on a retired model the provider rejects (the model `status/blocked/022` uses), in an isolated HOME.
+- **Asserts:** the orchestrator delegates; the worker takes the task and its first turn ends on the provider's error (`StopFailure` → Error); the `delegated worker stopped on an error` notice carrying the untrusted role label is acknowledged once and prompts a visible orchestrator action plus one append to an absolute sentinel path without human input.
+- **Does not assert:** a real 429 rate limit (not reproducible on demand); the hand-off span's outcome (`telemetry/otlp/047`); Codex or OpenCode workers, whose failed turns reach the same ingestion path (`status/blocked/023`, `/026`); the orchestrator re-delegating.
+- **Platform coverage:** mac+linux.
+
 ##### scheduler/idle-worker/023 — A replaced agent's late hook report, which the daemon rejects, can neither overwrite nor cancel its successor's waiting-for-input episode, so the successor's wait is still reported once (issue #447).
 - **Layer:** fast integration (the daemon's real hook-ingestion step `daemon::ingest_event` with the registry installed as ownership oracle, as `run_daemon_with` installs it, plus real `handle_delegate` and `respawn_agent_for_pane` against daemon-owned PTYs; the debounce shortened through `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS`).
 - **Agent:** none (`cat` stand-ins; the orchestrator is a raw/no-echo `cat` so one submission appears once).
@@ -14770,6 +14777,14 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Agent:** two Python PTY stand-ins with no commissioned task.
 - **Asserts:** a real note reaches the orchestrator, its completed agent.run has deck.handoffs.uncorrelated.count=1, no agent.handoff or agent.handoff.read is invented, and the private report sentinel is absent from captured raw JSON bodies.
 - **Does not assert:** report retry deduplication, several uncorrelated notes, or a report sent while a commissioned task is outstanding.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/047 — A worker whose turn ends on an error is reported to its orchestrator, and its handoff ends then (issue #2099).
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate, fetch and ack CLI calls, the daemon's own hook ingestion and a local OTLP/JSON receiver; the waiting-notice debounce shortened to 300 ms and the worker-response timeout set to an hour, on but never due (the blocked-worker notice is owed only while that timeout is on).
+- **Agent:** two Python PTY stand-ins; the worker's failure is a tagged Claude Code `error` hook event, as `StopFailure` sends after a rate-limit burst.
+- **Asserts:** after the worker acknowledges its task and reports the error, one `A delegated worker stopped on an error` daemon notice reaches the orchestrator's inbox and the task's agent.handoff exports with outcome `worker_failed`, role `coder` and no reported event, while neither agent's run has ended. Then the orchestrator re-delegates with `--supersede`, the worker acknowledges the new task and reports a provider usage limit (`quota_blocked`): the existing blocked-worker notice arrives and that handoff exports `worker_blocked`. Each handoff is exported once, closing the runs adds none, and no private task text reaches the OTLP bodies. Before the fix the notice never arrived (the error case) and both handoffs stayed open.
+- **Does not assert:** a real agent's failed turn (the hook mapping is `status/blocked/011`, `/022`, `/023`, `/026`); the default 30-second debounce; a worker that starts working again inside the debounce (the episode's cancellation is the waiting notice's, `scheduler/idle-worker/021`); a report sent after the handoff ended.
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/041 — Periodic daemon health exports memory, open runs, hook latency summaries and span drops.
