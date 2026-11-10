@@ -15,7 +15,7 @@
 //! the daemon-side integration. They are RED today because
 //! `make_schedule_callback` is still a logging no-op (no agent is ever spawned).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]

@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 //! Native inbox delivery through the bundled extension in real interactive Pi.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/pi_inbox_live.rs"]

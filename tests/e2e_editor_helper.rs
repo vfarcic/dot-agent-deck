@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", target_os = "linux"))]
 
 //! Synthetic helper subprocesses only: no daemon, agent or user configuration.
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use dot_agent_deck::composer_probe::install::ProbeAgent;
 use dot_agent_deck::composer_probe::instance::{DaemonId, Instance};

@@ -4,7 +4,7 @@
 //! stand-in panes' mail from outside them; inbox/protocol/014 and /015 pin the
 //! binding itself.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]

@@ -27,7 +27,7 @@
 //! Unix only for the reason `tests/scratch_binary_hook_install.rs` records:
 //! `env_clear` plus `HOME` isolates the child here and not on Windows.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

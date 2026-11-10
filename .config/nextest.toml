@@ -42,7 +42,7 @@
 # with, so identifier reuse is not the mechanism. It could not have been: each
 # deck's hook socket is `<per-test tempdir>/hook.sock` and its daemon is
 # addressed only through that same 0700 tempdir (`TuiDeck`,
-# `tests/common/mod.rs`), so `pane 1` is scoped to one deck and an injection
+# `tests/common/lib.rs`), so `pane 1` is scoped to one deck and an injection
 # into it cannot reach another.
 #
 # The real cause was event ORDERING inside a single test, which is exactly why
@@ -740,7 +740,7 @@ slow-timeout = { period = "60s", terminate-after = 14 }
 
 # Decision 28 + M4.3: recording dumps land under
 # `<workspace>/.dot-agent-deck/recordings/<test-name>/` (see
-# `tests/common/mod.rs`). That tree is gitignored dev-time state, so
+# `tests/common/lib.rs`). That tree is gitignored dev-time state, so
 # no setup-script wipe is needed — a re-run simply replaces the prior
 # per-test artifacts. The per-run subdir from M2.1 is gone: concurrent
 # `cargo test-e2e` invocations on one checkout aren't a real-world

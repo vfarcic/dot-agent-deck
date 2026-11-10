@@ -8,7 +8,7 @@ use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{AgentType, DelegateSignal};
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCH_PANE: &str = "synthetic-orchestrator-pane";
 const WORKER_PANE: &str = "codex-worker-pane";

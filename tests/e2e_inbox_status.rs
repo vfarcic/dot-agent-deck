@@ -3,7 +3,7 @@
 //! Attached-client tests of live inbox summaries, state-change broadcasts
 //! and persisted deck identity. Synthetic panes spend no agent credential.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

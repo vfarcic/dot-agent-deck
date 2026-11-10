@@ -20,7 +20,7 @@
 //! `041` needs no model turn (nothing is submitted); `043` delivers tasks.
 #[path = "support/codex_installed.rs"]
 mod codex_installed;
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/helper_pause.rs"]
 mod helper_pause;
 #[path = "support/inbox_doorbell.rs"]

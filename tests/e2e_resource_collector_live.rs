@@ -2,7 +2,7 @@
 
 //! Real interactive work joins the collector's figures to the deck run trace.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[allow(dead_code)]
 mod resource_collector;
 

@@ -3,7 +3,7 @@
 //! Scheduled manually with --test-threads 1: never opt in on a shared box by accident.
 #[path = "support/codex_inbox_live.rs"]
 mod codex;
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "common/inbox_load.rs"]

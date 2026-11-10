@@ -25,7 +25,7 @@
 //! mid-session left no evidence of whether it was stopped, crashed, or was
 //! OOM-killed.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

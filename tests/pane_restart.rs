@@ -24,7 +24,7 @@ use dot_agent_deck::event::{
 use dot_agent_deck::state::OrchestrationIdentity;
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCH_PANE: &str = "restart-orchestrator";
 const WORKER_PANE: &str = "restart-coder";

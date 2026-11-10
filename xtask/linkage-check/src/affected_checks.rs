@@ -57,12 +57,15 @@ pub(crate) const FULL_GATES: &[&[&str]] = &[
     &["cargo", "test-fast"],
 ];
 
-/// Every xtask package's tests, and no root package or desktop crate.
+/// Every xtask package's tests, and no root package, desktop crate or test
+/// harness crate.
 ///
 /// `--workspace --exclude` rather than a `-p` list, so a new `xtask/*` member
 /// is included without anyone editing this line;
 /// `the_workspace_has_no_member_this_helper_does_not_account_for` fails if a
-/// member that is not an xtask appears.
+/// member that is not an xtask appears. The test harness crate
+/// (`tests/common`, issue #2083) is excluded because it depends on the root
+/// package, so running it would build the root package this plan avoids.
 pub(crate) const XTASK_TESTS: &[&str] = &[
     "cargo",
     "nextest",
@@ -72,6 +75,8 @@ pub(crate) const XTASK_TESTS: &[&str] = &[
     "dot-agent-deck",
     "--exclude",
     "dot-agent-deck-desktop",
+    "--exclude",
+    "dot-agent-deck-test-harness",
 ];
 
 /// The root package's name, as `-p` takes it.
@@ -1161,7 +1166,8 @@ mod tests {
         );
         assert_eq!(
             xtask(),
-            "cargo nextest run --workspace --exclude dot-agent-deck --exclude dot-agent-deck-desktop"
+            "cargo nextest run --workspace --exclude dot-agent-deck --exclude dot-agent-deck-desktop \
+             --exclude dot-agent-deck-test-harness"
         );
     }
 
@@ -1223,6 +1229,14 @@ mod tests {
         ("desktop/src-tauri", "dot-agent-deck-desktop"),
     ];
 
+    /// Workspace members a narrowed plan does not run whose sources the guard
+    /// already scans as part of the root package's `tests/` directory, as
+    /// (manifest dir, package name). The test harness crate (issue #2083)
+    /// sits there, and it resolves every checkout path from the checkout root
+    /// (`checkout_root()`), not from its own manifest dir, so its literals are
+    /// read against the root exactly as the root package's are.
+    const ROOT_SCANNED_CRATES: &[(&str, &str)] = &[("tests/common", "dot-agent-deck-test-harness")];
+
     /// A literal in a scanned crate that names a narrowed path but is not a
     /// read of THIS checkout, with the reason. Each entry must still match
     /// something, so a stale one fails rather than masking a future read.
@@ -1238,7 +1252,7 @@ mod tests {
             "a scratch root the test builds; the real CHANGELOG.md is never read",
         ),
         (
-            "tests/common/mod.rs",
+            "tests/common/lib.rs",
             ".claude",
             "the host's or a test HOME's ~/.claude, not the checkout's",
         ),
@@ -1306,6 +1320,10 @@ mod tests {
     fn reaches_the_checkout(source: &str) -> bool {
         [
             "CARGO_MANIFEST_DIR",
+            // Issue #2083: the test harness crate's manifest dir is
+            // `tests/common`, so its sources reach the checkout through this
+            // helper, which resolves the checkout root, instead.
+            "checkout_root(",
             "include_str!",
             "include_bytes!",
             "ls-files",
@@ -1501,6 +1519,12 @@ mod tests {
                 && sources.contains_key("tests/embedded_docs_boundary.rs"),
             "the scan found the root package's sources"
         );
+        for (dir, _) in ROOT_SCANNED_CRATES {
+            assert!(
+                sources.contains_key(&format!("{dir}/lib.rs")),
+                "the scan reaches {dir}, which ROOT_SCANNED_CRATES says it does"
+            );
+        }
         let (findings, stale) = uncovered_reads(&sources, NOT_CHECKOUT_READS);
         assert!(
             findings.is_empty(),
@@ -1666,7 +1690,8 @@ mod tests {
             let accounted = member.starts_with("xtask/")
                 || PARTLY_RUN_CRATES
                     .iter()
-                    .any(|(dir, _)| *member == if dir.is_empty() { "." } else { dir });
+                    .any(|(dir, _)| *member == if dir.is_empty() { "." } else { dir })
+                || ROOT_SCANNED_CRATES.iter().any(|(dir, _)| member == dir);
             assert!(
                 accounted,
                 "workspace member {member} is neither an xtask (run whole by XTASK_TESTS) \
@@ -1674,7 +1699,7 @@ mod tests {
                  from XTASK_TESTS"
             );
         }
-        for (_, package) in PARTLY_RUN_CRATES {
+        for (_, package) in PARTLY_RUN_CRATES.iter().chain(ROOT_SCANNED_CRATES) {
             assert!(
                 XTASK_TESTS
                     .windows(2)

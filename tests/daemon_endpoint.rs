@@ -29,7 +29,7 @@ use std::time::Duration;
 #[cfg(unix)]
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 /// What one real `dot-agent-deck daemon endpoint` subprocess produced.
 #[cfg(unix)]

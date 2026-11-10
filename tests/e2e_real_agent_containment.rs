@@ -13,7 +13,7 @@
 //! inherit; `/009` checks the two daemon fixtures. `tests/real_agent_containment.rs`
 //! holds the source guard (`/007`) and the link's own checks (`/008`).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 
