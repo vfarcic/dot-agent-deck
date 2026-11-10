@@ -1752,6 +1752,13 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the daemon storing the identity on the pane's agent and handing it to the scan (`run_monitor`, `shell_activity_candidates`), the watch's sampling, a live OpenCode (`status/waiting/009`).
 - **Platform coverage:** mac+linux+windows.
 
+##### status/waiting/018 — A client that replaces the one a direct OpenCode 2 spawn started does not inherit the spawn's version, so a tool's `serve --stdio` under it counts (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; two-or-three-look sequences of process rows, as the OpenCode watch samples them, for one watched agent whose direct spawn was probed as 2.2.5.
+- **Asserts:** after the spawn's own 2.x client and its private server are named, a replacement client — a new pid running a binary recorded as 1.19.5, a new pid running a binary with no recorded version, or the same pid now running the 1.x binary (an `exec`), with or without a look at a pane running no client in between — gets no private server named and nothing to publish, and fed into the scan the `serve --stdio` its tool started as its direct child, and that command's session, count; the spawn's own client, looked at again, keeps its server named.
+- **Does not assert:** the daemon clearing the registry copy after a failed look (the `agent_pty` unit test `publishing_opencode_private_servers_clears_every_unnamed_agent` pins the registry half; `run_monitor`'s wiring is untested), a replacement that runs before the watch's first look (it is taken for the spawn's client), a reused pid that is again the client's direct `serve --stdio` child, a live OpenCode.
+- **Platform coverage:** mac+linux+windows.
+
 ### Agent protocol
 
 #### agent/readiness

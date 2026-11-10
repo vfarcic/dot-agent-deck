@@ -232,13 +232,22 @@ pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHA
 /// - only for a client whose version is **known to be 2.x**: OpenCode 1.x has
 ///   no private server, and on 1.x the shell tool runs in the client, so a tool
 ///   that starts `opencode serve --stdio` makes exactly this shape. An unknown
-///   version (a wrapper the deck could not probe) identifies no server;
+///   version (a wrapper the deck could not probe, or a client that replaced
+///   the one a direct spawn was probed as) identifies no server;
+/// - the daemon keeps only the pair its watch's last successful look
+///   identified, and none after a look that failed;
 /// - the scan then re-checks the pair against its own sample
 ///   ([`is_identified_agent_server`]): that pid, still the client's child, a
 ///   session boundary below a client that is not itself detached, and a
 ///   sampled command line whose words are an OpenCode program followed by
-///   `serve --stdio` ([`is_opencode_private_server_command`]), so a pid reused
-///   since the watch looked is not exempted.
+///   `serve --stdio` ([`is_opencode_private_server_command`]). A pid reused
+///   since the watch looked by a process that fails any of those checks is
+///   not exempted. The pair is two numeric pids, not process identities: a
+///   process that reuses the server's pid as another `opencode serve --stdio`
+///   direct child of the same client, in a session of its own, before the
+///   watch's next look (every [`crate::opencode_mode::POLL_INTERVAL`]), is
+///   taken for the server, and so is the server after an `exec` that keeps
+///   that command line.
 ///
 /// On 2.x a tool's processes run under the private server (measured), so none
 /// of them is the client's child. Until the watch has looked at a new pane (it

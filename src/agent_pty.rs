@@ -3679,11 +3679,11 @@ pub struct RunningAgent {
     /// Issue #1757: this generation's OpenCode 2 client and its private server,
     /// as the daemon's OpenCode watch last identified them
     /// ([`crate::opencode_mode::Watch::private_server`], set through
-    /// [`AgentPtyRegistry::set_opencode_private_server`]). The shell-activity
+    /// [`AgentPtyRegistry::publish_opencode_private_servers`]). The shell-activity
     /// scan re-roots at that server instead of counting it as a background
     /// command ([`crate::platform::proc::AgentServer`]). `None` until the watch
-    /// has looked, and for every pane it identifies no server in.
-    /// Daemon-local, not on the wire.
+    /// has looked, for every pane it identifies no server in, and after a look
+    /// that failed. Daemon-local, not on the wire.
     pub opencode_private_server: Option<crate::platform::proc::AgentServer>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
@@ -18623,17 +18623,22 @@ impl AgentPtyRegistry {
         Some(Self::classify_shell_activity(&candidates, &table))
     }
 
-    /// Issue #1757: record `agent_id`'s OpenCode 2 client and private server as
-    /// the daemon's OpenCode watch identified them
-    /// ([`RunningAgent::opencode_private_server`]); `None` clears it. An agent
-    /// no longer in the registry is ignored.
-    pub fn set_opencode_private_server(
+    /// Issue #1757: record the OpenCode 2 clients and private servers the
+    /// daemon's OpenCode watch identified on its last look
+    /// ([`RunningAgent::opencode_private_server`]), by agent id, and clear
+    /// every other agent's, so an identity no look vouches for any more — the
+    /// watch failed, the client is gone or changed, the agent is no longer
+    /// watched — is not carried. An id no longer in the registry is ignored.
+    pub fn publish_opencode_private_servers(
         &self,
-        agent_id: &str,
-        server: Option<crate::platform::proc::AgentServer>,
+        servers: &[(String, crate::platform::proc::AgentServer)],
     ) {
-        if let Some(agent) = self.inner.lock().agents.get_mut(agent_id) {
-            agent.opencode_private_server = server;
+        let mut inner = self.inner.lock();
+        for (agent_id, agent) in inner.agents.iter_mut() {
+            agent.opencode_private_server = servers
+                .iter()
+                .find(|(id, _)| id == agent_id)
+                .map(|(_, server)| *server);
         }
     }
 
@@ -20944,6 +20949,44 @@ mod tests {
                 "idle member {id} holds a PTY master"
             );
         }
+    }
+
+    /// Issue #1757 (round-3 audit): each publish of the OpenCode watch's
+    /// identities replaces every agent's — an agent the look did not name, and
+    /// every agent after a failed look (an empty publish), keeps none, so a
+    /// stale client/server pair is never carried past a look that does not
+    /// vouch for it.
+    #[test]
+    fn publishing_opencode_private_servers_clears_every_unnamed_agent() {
+        use crate::platform::proc::AgentServer;
+        let registry = AgentPtyRegistry::new();
+        let a = registry.insert_idle_member_for_test("oc-a", "oc", true);
+        let b = registry.insert_idle_member_for_test("oc-b", "oc", false);
+        let server = |client_pid, server_pid| AgentServer {
+            client_pid,
+            server_pid,
+        };
+        let held = |id: &str| registry.inner.lock().agents[id].opencode_private_server;
+
+        registry.publish_opencode_private_servers(&[
+            (a.clone(), server(101, 102)),
+            (b.clone(), server(201, 202)),
+        ]);
+        assert_eq!(held(&a), Some(server(101, 102)));
+        assert_eq!(held(&b), Some(server(201, 202)));
+
+        // The next look names only `a`, with a new pair: `b`'s is cleared.
+        registry.publish_opencode_private_servers(&[
+            (a.clone(), server(103, 104)),
+            ("gone".to_string(), server(1, 2)),
+        ]);
+        assert_eq!(held(&a), Some(server(103, 104)));
+        assert_eq!(held(&b), None, "an agent the look did not name");
+
+        // A failed look publishes nothing: every identity is cleared.
+        registry.publish_opencode_private_servers(&[]);
+        assert_eq!(held(&a), None, "after a failed look");
+        assert_eq!(held(&b), None);
     }
 
     /// Issue #714 (review): a blocked-worker notice task is cancellable only

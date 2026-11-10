@@ -356,14 +356,22 @@ pub struct Watched {
 /// current client, so a notice that needs time waits for it, and a new client
 /// (OpenCode restarted inside the pane) starts the wait again; and which
 /// wrapper-started clients' generations it has already passed on to be
-/// remembered ([`Watch::take_confirmed`]).
+/// remembered ([`Watch::take_confirmed`]); and, per agent, the first client it
+/// identified (its pid and executable), the only client a direct spawn's
+/// version vouches for ([`evaluate`]).
 #[derive(Debug, Default)]
 pub struct Watch {
     first_seen: HashMap<String, (i32, std::time::Instant)>,
     confirmed_for: HashMap<String, (i32, Major)>,
     confirmed: Vec<Major>,
     servers: HashMap<String, crate::platform::proc::AgentServer>,
+    spawned_clients: HashMap<String, ClientGeneration>,
 }
+
+/// Issue #1757: a client as the watch identified it — its pid and the
+/// executable it ran then. A different pid, or the same pid running another
+/// executable (an `exec`), is another client.
+type ClientGeneration = (i32, Option<PathBuf>);
 
 impl Watch {
     /// How long `agent_id`'s client `client_pid` has been seen as of `now`,
@@ -390,9 +398,35 @@ impl Watch {
         self.confirmed_for
             .retain(|id, _| keep.contains(id.as_str()));
         self.servers.retain(|id, _| keep.contains(id.as_str()));
+        self.spawned_clients
+            .retain(|id, _| keep.contains(id.as_str()));
     }
 
-    /// Forget `agent_id`'s client (the pane runs none now).
+    /// Issue #1757: is `client` the first client the watch identified for
+    /// `agent_id`, the one its spawn started? The first client identified is
+    /// remembered as that one, for as long as the agent is watched: a pane
+    /// that runs no client for a while and then another one has not started
+    /// its spawn's client again ([`Self::forget`] keeps it).
+    fn is_spawned_client(&mut self, agent_id: &str, client: &Client) -> bool {
+        let generation = self
+            .spawned_clients
+            .entry(agent_id.to_string())
+            .or_insert_with(|| (client.pid, client.exe.clone()));
+        generation.0 == client.pid && generation.1 == client.exe
+    }
+
+    /// What a watch that starts over after a failed look keeps
+    /// ([`run_monitor`]): which client each agent's spawn started, so a client
+    /// that replaced it meanwhile is not taken for it.
+    fn starting_over(spawned_clients: HashMap<String, ClientGeneration>) -> Self {
+        Self {
+            spawned_clients,
+            ..Self::default()
+        }
+    }
+
+    /// Forget `agent_id`'s client (the pane runs none now). Which client its
+    /// spawn started is kept ([`Self::is_spawned_client`]).
     pub fn forget(&mut self, agent_id: &str) {
         self.first_seen.remove(agent_id);
         self.confirmed_for.remove(agent_id);
@@ -406,6 +440,20 @@ impl Watch {
     /// not know.
     pub fn private_server(&self, agent_id: &str) -> Option<crate::platform::proc::AgentServer> {
         self.servers.get(agent_id).copied()
+    }
+
+    /// Issue #1757: every private server identified on the last look
+    /// ([`Self::private_server`]), by agent: what the daemon hands the
+    /// shell-activity scan, clearing every other agent's
+    /// ([`crate::agent_pty::AgentPtyRegistry::publish_opencode_private_servers`]).
+    pub fn private_servers(&self) -> Vec<(String, crate::platform::proc::AgentServer)> {
+        let mut servers: Vec<_> = self
+            .servers
+            .iter()
+            .map(|(id, server)| (id.clone(), *server))
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+        servers
     }
 
     /// Note that `agent_id`'s wrapper-started client `client_pid` runs
@@ -436,11 +484,18 @@ pub const REPORT_SLACK: Duration = Duration::from_secs(10);
 /// One look at every watched agent: the notice each one's card should carry
 /// now, from the process sample `rows`.
 ///
-/// - The client's version is the agent's [`Watched::spawn_version`] when its
-///   command named the binary directly: that pane's client is what the deck
-///   started, even when the file it runs is another one (an npm launcher
-///   script that `exec`s the native binary, audit F3). Otherwise it is what
-///   `version_of` gives the client's binary. In production that is
+/// - The client's version is what `version_of` gives the client's binary.
+///   When that is unknown and the agent's command named the binary directly,
+///   it is the agent's [`Watched::spawn_version`], for the first client the
+///   watch identified in the pane (its pid and executable then) and no other:
+///   that client is what the deck started, even when the file it runs is
+///   another one (an npm launcher script that `exec`s the native binary,
+///   audit F3), but a client that replaced it — another pid, or the same pid
+///   running another executable — may be any version (issue #1757: a
+///   command such as `/opt/v2/opencode; /opt/v1/opencode` runs a 1.x client
+///   after the 2.x one it was probed as). The first client identified is
+///   taken to be the spawn's, so one that replaced it before the watch's
+///   first look still gets the spawn's version. In production `version_of` is
 ///   [`crate::opencode_version::recorded_version`], which only reads what a
 ///   spawn-time probe recorded (a direct command's binary, or the `opencode`
 ///   a wrapper's PATH resolves to) and runs nothing, so a client running a
@@ -473,10 +528,11 @@ pub fn evaluate(
                 }
                 Some(client) => {
                     let seen_for = watch.seen_for(&w.agent_id, client.pid, now);
+                    let spawned = watch.is_spawned_client(&w.agent_id, &client);
+                    let recorded = client.exe.as_deref().and_then(version_of);
                     let version = match w.spawn_version {
-                        Some(version) => Some(version),
+                        Some(version) => recorded.or(spawned.then_some(version)),
                         None => {
-                            let recorded = client.exe.as_deref().and_then(version_of);
                             if let Some(version) = recorded {
                                 watch.confirm(&w.agent_id, client.pid, Major::of(version));
                             }
@@ -487,6 +543,8 @@ pub fn evaluate(
                     // as part of the agent rather than as a command. Only on a
                     // known 2.x: on 1.x the shell tool runs in the client, so
                     // a tool starting `opencode serve --stdio` is this shape.
+                    // Recomputed on every look, so a client that changed (or
+                    // whose version is no longer known) loses it here.
                     match (version.map(Major::of), client.private_server) {
                         (Some(Major::V2), Some(server_pid)) => {
                             watch.servers.insert(
@@ -538,6 +596,8 @@ pub async fn run_monitor(
         let watched = registry.opencode_watch_list();
         if watched.is_empty() {
             watch.retain(&HashSet::new());
+            // Issue #1757: no agent is watched, so none keeps an identity.
+            registry.publish_opencode_private_servers(&[]);
             continue;
         }
         let mut last_report: HashMap<String, std::time::Instant> = watched
@@ -573,6 +633,7 @@ pub async fn run_monitor(
                 }
             }
         }
+        let spawned_clients = watch.spawned_clients.clone();
         let job = tokio::task::spawn_blocking(move || {
             let roots: Vec<i32> = watched.iter().map(|w| w.root_pid).collect();
             let rows = sample(&roots)?;
@@ -591,27 +652,31 @@ pub async fn run_monitor(
         });
         let Ok(outcome) = job.await else {
             // The blocking task panicked; start over with a fresh watch.
-            watch = Watch::default();
+            watch = Watch::starting_over(spawned_clients);
+            // Issue #1757: no look vouches for any identity now.
+            registry.publish_opencode_private_servers(&[]);
             continue;
         };
         match outcome {
             Some((kept, notices)) => {
                 watch = kept;
+                // Issue #1757: what the shell-activity scan may re-root at
+                // instead of counting it as a background command — this look's
+                // identities, and none for every other agent.
+                registry.publish_opencode_private_servers(&watch.private_servers());
                 for (w, notice) in notices {
-                    // Issue #1757: what the shell-activity scan may re-root
-                    // at instead of counting it as a background command.
-                    registry.set_opencode_private_server(
-                        &w.agent_id,
-                        watch.private_server(&w.agent_id),
-                    );
                     registry
                         .inbox()
                         .set_agent_notice(&w.pane_id, &w.agent_id, notice);
                 }
             }
-            // No process table on this platform, or `ps` failed: no opinion,
-            // so nothing is changed.
-            None => watch = Watch::default(),
+            // No process table on this platform, or `ps` failed: no opinion
+            // on the notices, so they are left as they are; but no look
+            // vouches for an identity either, so every one is cleared.
+            None => {
+                watch = Watch::starting_over(spawned_clients);
+                registry.publish_opencode_private_servers(&[]);
+            }
         }
     }
 }

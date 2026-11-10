@@ -1067,6 +1067,146 @@ fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
     );
 }
 
+/// Scenario: A pane started directly on OpenCode 2.x has its client and private server identified by the daemon's OpenCode watch; then, without a respawn, another client takes the pane — a new process running a 1.x binary, a new process whose version the deck never recorded, or the same process `exec`ing a 1.x binary — and that client starts a tool command `opencode serve --stdio` as its direct child in a session of its own. The spawn's 2.x version no longer vouches for the pane's client, so the watch names no private server and the shell-activity scan counts that tool command (and what runs in its session), while the original client, still the one the deck started, keeps its own server exempt.
+#[spec("status/waiting/018")]
+#[test]
+fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version() {
+    use dot_agent_deck::opencode_mode::{ProcRow, Watch, Watched, evaluate};
+    use dot_agent_deck::platform::proc::{AgentServer, qualifying_command_sessions_with_server};
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    const V2: &str = "/opt/v2/opencode";
+    const V1: &str = "/opt/old/opencode-1.19.5";
+    const UNPROBED: &str = "/opt/elsewhere/opencode";
+    let proc_row = |pid: i32, ppid: i32, exe: &str, argv: &[&str]| ProcRow {
+        pid,
+        ppid,
+        exe: Some(PathBuf::from(exe)),
+        argv: (!argv.is_empty()).then(|| argv.iter().map(|a| a.to_string()).collect()),
+    };
+    // The pane runs `/opt/v2/opencode --standalone; <another OpenCode>; :`,
+    // a direct command the spawn probed as 2.2.5.
+    let watched = [Watched {
+        pane_id: "p".to_string(),
+        agent_id: "agent-p".to_string(),
+        root_pid: 100,
+        spawn_version: Some((2, 2, 5)),
+    }];
+    // Only the 1.x binary has a recorded version of its own; the 2.x client's
+    // is known from the spawn, and `UNPROBED` from nothing.
+    let version_of = |exe: &Path| (exe == Path::new(V1)).then_some((1, 19, 5));
+    let first = vec![
+        proc_row(100, 1, "/usr/bin/bash", &[]),
+        proc_row(101, 100, V2, &["opencode", "--standalone"]),
+        proc_row(102, 101, V2, &[V2, "serve", "--stdio", "--port", "0"]),
+    ];
+    // A client (`client_pid`, running `exe`) whose tool started a
+    // `serve --stdio` (202) as the client's direct child.
+    let replaced = |client_pid: i32, exe: &str| {
+        vec![
+            proc_row(100, 1, "/usr/bin/bash", &[]),
+            proc_row(client_pid, 100, exe, &["opencode"]),
+            proc_row(
+                202,
+                client_pid,
+                V2,
+                &[V2, "serve", "--stdio", "--port", "0"],
+            ),
+        ]
+    };
+    let t0 = std::time::Instant::now();
+    let look = |watch: &mut Watch, rows: &[ProcRow], n: u32| {
+        evaluate(
+            &watched,
+            rows,
+            watch,
+            t0 + std::time::Duration::from_secs(5 * u64::from(n)),
+            &version_of,
+            &HashMap::new(),
+        );
+        watch.private_server("agent-p")
+    };
+
+    // The scan's view of a replacement tree: the client on the pane's
+    // session, the tool's server detached with a child of its own.
+    let info = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id: sid,
+        has_controlling_tty: sid == 100,
+        session_leader: pid == sid,
+        command_line: argv.map_or(CommandLine::NotSampled, |a| CommandLine::Read(a.into())),
+    };
+    let tool_server = format!("{V2} serve --stdio --port 0");
+    let scan_of = |client_pid: i32| {
+        vec![
+            info(100, 1, 100, None),
+            info(client_pid, 100, 100, None),
+            info(202, client_pid, 202, Some(&tool_server)),
+            info(203, 202, 202, None),
+        ]
+    };
+
+    for (name, client_pid, exe) in [
+        ("a new 1.x client", 201, V1),
+        ("a new client of unknown version", 201, UNPROBED),
+        ("the 2.x client exec'ing a 1.x binary", 101, V1),
+    ] {
+        let mut watch = Watch::default();
+        assert_eq!(
+            look(&mut watch, &first, 0),
+            Some(AgentServer {
+                client_pid: 101,
+                server_pid: 102,
+            }),
+            "{name}: premise, the spawn's own 2.x client and its server"
+        );
+        // The pane runs no OpenCode for a look, then the replacement: a gap
+        // does not make the replacement the spawn's client.
+        let shell_only: Vec<ProcRow> = first.iter().filter(|r| r.pid == 100).cloned().collect();
+        assert_eq!(look(&mut watch, &shell_only, 1), None, "{name}: no client");
+        let identity = look(&mut watch, &replaced(client_pid, exe), 2);
+        assert_eq!(identity, None, "{name}: no private server is named");
+        assert_eq!(
+            watch.private_servers(),
+            vec![],
+            "{name}: nothing to publish"
+        );
+        assert_eq!(
+            qualifying_command_sessions_with_server(&scan_of(client_pid), 100, &[], identity),
+            Some(HashSet::from([202])),
+            "{name}: the tool's `serve --stdio` and its session count"
+        );
+    }
+
+    // Without the gap, back to back, the same.
+    let mut watch = Watch::default();
+    assert!(look(&mut watch, &first, 0).is_some());
+    assert_eq!(look(&mut watch, &replaced(201, V1), 1), None);
+
+    // The spawn's own client, looked at again, keeps its server exempt.
+    let mut watch = Watch::default();
+    assert!(look(&mut watch, &first, 0).is_some());
+    assert_eq!(
+        look(&mut watch, &first, 1),
+        Some(AgentServer {
+            client_pid: 101,
+            server_pid: 102,
+        })
+    );
+    assert_eq!(
+        watch.private_servers(),
+        vec![(
+            "agent-p".to_string(),
+            AgentServer {
+                client_pid: 101,
+                server_pid: 102,
+            }
+        )]
+    );
+}
+
 /// Scenario: builds three pairs of fixture tables from the measured
 /// `getsid`/`ps` captures in `.dot-agent-deck/386-argv-notes.md` and the
 /// PRD — Table A (backbone plus the Bash-tool descendant), Table B (backbone
