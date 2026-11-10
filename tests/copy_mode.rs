@@ -338,3 +338,57 @@ fn copymode_keys_002_copy_mode_closes_with_its_pane() {
     assert!(bar(&buf).starts_with(" COMMAND"), "{}", bar(&buf));
     assert!(seam.copies().is_empty());
 }
+
+/// Thirty lines, each wider than the 28-column pane they are drawn in.
+fn wide_lines() -> Vec<u8> {
+    (0..30)
+        .map(|n| format!("r{n:02}-abcdefghijklmnopqrstuvwxyz0123456789"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// Scenario: The pane is drawn 28 columns by 9 rows while its terminal screen is 50 by 20, so it shows the screen's top-left corner and the screen's cursor is below the drawn rows. Copy mode opens with its cursor on a drawn cell, cannot move it past the pane's right edge, and a selection over two lines yanks exactly the text the highlight is drawn over.
+#[spec("copymode/keys/003")]
+#[test]
+fn copymode_keys_003_a_screen_larger_than_its_pane_selects_what_is_drawn() {
+    let mut seam = CopyModeSeam::with_screen(WIDTH, HEIGHT, &wide_lines(), 20, 50);
+    seam.render();
+    chars(&mut seam, "v");
+    let buf = seam.render();
+    let rect = seam.pane_rect();
+    let cursor = cells(&buf, is_cursor);
+    assert_eq!(
+        cursor.len(),
+        1,
+        "copy mode must open with its cursor on a drawn cell of the pane:\n{}",
+        pane_text(&buf, rect)
+    );
+
+    // Up one line, to column 4, start the selection, down one line and as
+    // far right as the cursor goes.
+    chars(&mut seam, "k");
+    press(&mut seam, KeyCode::Char('h'), 60);
+    press(&mut seam, KeyCode::Char('l'), 4);
+    chars(&mut seam, "vj");
+    press(&mut seam, KeyCode::Char('l'), 60);
+    let buf = seam.render();
+    let shown = marked_text(&buf);
+    let cursor = cells(&buf, is_cursor);
+    assert!(
+        cursor.iter().all(|&(x, y)| x > rect.x
+            && x < rect.x + rect.width - 1
+            && y < rect.y + rect.height - 1),
+        "the cursor must stay inside the pane, got {cursor:?}"
+    );
+    chars(&mut seam, "y");
+    assert_eq!(
+        seam.copies().last().map(String::as_str),
+        Some(shown.as_str()),
+        "the yank must copy exactly what the highlight shows"
+    );
+    assert_eq!(
+        shown, "abcdefghijklmnopqrstuvwx\nr18-abcdefghijklmnopqrstuvwx",
+        "the selection runs over the two drawn lines it was made on"
+    );
+}

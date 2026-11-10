@@ -142,3 +142,72 @@ fn select_001_a_drag_in_a_non_focused_pane_focuses_it_and_copies_its_text() {
         },
     );
 }
+
+/// The screen row of the first content row of the pane whose left border is
+/// in column `border_col`, found from the row `below` by walking up to the
+/// pane's top-left corner.
+fn first_content_row(screen: &vt100::Screen, border_col: u16, below: u16) -> Option<u16> {
+    (0..below).rev().find_map(|row| {
+        let cell = screen.cell(row, border_col)?;
+        matches!(cell.contents(), "┌" | "┏" | "╭" | "╔").then_some(row + 1)
+    })
+}
+
+/// Scenario: One shell pane has printed a sentinel on its bottom row and the deck is in command mode. A drag that starts on the sentinel and is released over the bottom bar's New Agent button copies exactly the sentinel and opens no directory picker; a second drag released over the pane's dashboard card copies the pane text between the card's row and the sentinel and leaves the deck in command mode.
+#[spec("mouse/select/005")]
+#[test]
+fn select_005_a_drag_released_over_chrome_still_copies_the_pane_text() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("selrelease", "bash --noprofile --norc")
+        .launch_with_fixture("form");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    // Blank the pane, then leave the sentinel on its bottom row with the
+    // shell held by `sleep`, so every row above the sentinel is empty.
+    let sentinel = "SELREL-42-overchrome";
+    deck.send_bytes(
+        b"clear; for i in $(seq 80); do echo; done; printf 'SELREL-%d-overchrome' $((6*7)); sleep 600\r",
+    );
+    deck.wait_for_string(sentinel);
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+
+    let (col, row) = deck.wait_for_in_grid(sentinel);
+    let last = col + sentinel.len() as u16 - 1;
+    let (button_col, button_row) = deck.wait_for_in_grid("[New Agent n/Ctrl+N]");
+    assert!(
+        button_col + 1 < col && button_row > row,
+        "the test needs the New Agent button below and left of the pane: button at ({button_col}, {button_row}), sentinel at ({col}, {row})"
+    );
+
+    // Released over the button: the drag's end clamps to the pane's bottom
+    // row and first column, so the selection is exactly the sentinel.
+    deck.drag((last, row), (button_col + 1, button_row));
+    deck.wait_for_stream_string(&osc52(sentinel));
+    deck.wait_for_string("Sent to terminal clipboard (OSC 52)");
+    assert!(
+        !deck.snapshot_grid().contains("Select Directory"),
+        "releasing a pane drag over the New Agent button must not open the directory picker"
+    );
+
+    // Released over the pane's dashboard card, above and left of the pane.
+    let (card_col, card_row) = deck.wait_for_in_grid("Launch an agent");
+    let inner_y = deck.capture_screen_when("the pane's top border", |screen| {
+        first_content_row(screen, col - 1, row)
+    });
+    assert!(
+        card_col + 1 < col && card_row < row,
+        "the test needs the card above and left of the pane: card at ({card_col}, {card_row}), sentinel at ({col}, {row})"
+    );
+    let blank_rows = row - card_row.max(inner_y);
+    let expected = format!("{}{sentinel}", "\n".repeat(usize::from(blank_rows)));
+    // A plain click on a blank pane cell first, so the next press is not
+    // counted as a second click on the cell the first drag pressed (which
+    // would select a word).
+    deck.click(col + 10, row - 5);
+    deck.drag((last, row), (card_col + 1, card_row));
+    deck.wait_for_stream_string(&osc52(&expected));
+    deck.wait_until_grid("the deck is still in command mode", |g| {
+        g.contains("[New Agent n/Ctrl+N]") && !g.contains("Select Directory")
+    });
+}

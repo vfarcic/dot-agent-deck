@@ -445,6 +445,10 @@ fn serve(shared: &Shared, opener: NativeOpener) {
                 NativeWrite::Failed
             }
         };
+        // Not busy any more BEFORE the reply goes out: a copy the UI makes as
+        // soon as this one is answered must find the worker idle and wait for
+        // its own answer, not be taken for a backlog and reported unconfirmed.
+        shared.lock().busy = false;
         // The UI side may have stopped waiting; a closed reply is fine.
         let _ = request.reply.try_send(result);
     }

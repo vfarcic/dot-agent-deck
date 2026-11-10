@@ -190,6 +190,17 @@ impl TerminalWidget {
     }
 }
 
+/// The `(rows, cols)` of `screen` a pane whose content area is `inner` draws:
+/// the screen 1:1 from its top-left cell, clipped to the area, so screen cell
+/// `(r, c)` is drawn at content cell `(r, c)` when it is inside this size.
+///
+/// PRD #385: the widget draws through this, and a mouse selection and copy
+/// mode map their cells through it, so what they select is what is drawn.
+pub(crate) fn drawn_screen_size(screen: &vt100::Screen, inner: Rect) -> (u16, u16) {
+    let (screen_rows, screen_cols) = crate::vt_grid::size(screen);
+    (inner.height.min(screen_rows), inner.width.min(screen_cols))
+}
+
 impl Widget for TerminalWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // PRD #13 + #155: terminal-relative styling, with an Option-A
@@ -261,8 +272,6 @@ impl Widget for TerminalWidget {
         // layout/PTY-size mismatch that `resize_panes_to_layout` (M4) now
         // prevents, and the row window was the direct cause of the "scramble /
         // stale content near the bottom rows" symptom.
-        let (screen_rows, screen_cols) = crate::vt_grid::size(screen);
-
         // PRD #882 — the invariant-3 equality guard is GONE, and its removal is
         // a design change rather than a relaxation.
         //
@@ -296,9 +305,10 @@ impl Widget for TerminalWidget {
         // client that is not the last-focused one.
 
         // `min(area, screen)` from the top-left, so an over- or under-sized
-        // screen never reads out of bounds.
-        let rows = (inner.height as usize).min(screen_rows as usize);
-        let cols = (inner.width as usize).min(screen_cols as usize);
+        // screen never reads out of bounds. PRD #385: the same function maps
+        // a mouse selection and copy mode onto these cells.
+        let (rows, cols) = drawn_screen_size(screen, inner);
+        let (rows, cols) = (usize::from(rows), usize::from(cols));
 
         for row_idx in 0..rows {
             let mut spans = Vec::new();

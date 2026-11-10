@@ -271,3 +271,189 @@ fn select_004_a_kept_highlight_never_shows_text_other_than_what_was_copied() {
         assert_shows_only_the_copy(&mut seam, what);
     }
 }
+
+/// Twenty lines, each wider than the 28-column panes these tests draw them
+/// in, the last with no newline after it so the cursor sits on the screen's
+/// bottom row.
+fn wide_lines(rows: usize) -> Vec<u8> {
+    (0..rows)
+        .map(|n| format!("r{n:02}-abcdefghijklmnopqrstuvwxyz0123456789"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// The drawn width of a pane in a 30-column frame.
+const SHOWN: usize = 28;
+
+/// The first `SHOWN` columns of line `n` of [`wide_lines`]: what a pane in a
+/// 30-column frame shows of it.
+fn shown_line(n: usize) -> String {
+    format!("r{n:02}-abcdefghijklmnopqrstuvwxyz0123456789")[..SHOWN].to_string()
+}
+
+/// The last copy, and the highlighted text, are both `expected`.
+fn assert_highlight_is_the_copy(seam: &mut PaneSelectionSeam, expected: &str, what: &str) {
+    assert_eq!(
+        seam.copies().last().map(String::as_str),
+        Some(expected),
+        "{what}: the copy is not what the pane shows there"
+    );
+    let buf = seam.render();
+    assert_eq!(
+        highlighted_text(&buf),
+        expected,
+        "{what}: the highlight does not show what was copied:\n{}",
+        frame_with_highlight(&buf)
+    );
+}
+
+fn double_click(seam: &mut PaneSelectionSeam, col: u16, row: u16) {
+    for _ in 0..2 {
+        press(seam, col, row);
+        release(seam, col, row);
+    }
+}
+
+fn triple_click(seam: &mut PaneSelectionSeam, col: u16, row: u16) {
+    for _ in 0..3 {
+        press(seam, col, row);
+        release(seam, col, row);
+    }
+}
+
+/// Scenario: One pane is drawn 28 columns by 6 rows while its terminal screen is larger, as it is while another attached client decides the size or a resize is in flight, so the pane shows the screen's top-left corner. A drag on the first drawn row, a drag across three drawn rows, a double-click on a word that runs past the pane's right edge and a triple-click on a paragraph each copy exactly the text the highlight is drawn over, and nothing the pane does not show.
+#[spec("mouse/select/007")]
+#[test]
+fn select_007_a_screen_larger_than_its_pane_copies_what_is_drawn() {
+    // Taller and wider: the cursor is on row 19, far below the drawn rows.
+    let tall = wide_lines(20);
+    let mut seam = PaneSelectionSeam::tiled_with_screen(30, 8, &[("a", &tall)], "a", 20, 50);
+    seam.render();
+    let (x, y) = first_cell(seam.pane_rect("a"));
+    press(&mut seam, x, y);
+    drag(&mut seam, x + 5, y);
+    release(&mut seam, x + 5, y);
+    assert_highlight_is_the_copy(&mut seam, "r00-ab", "a drag on the first drawn row");
+
+    press(&mut seam, x + 4, y);
+    drag(&mut seam, x + 3, y + 2);
+    release(&mut seam, x + 3, y + 2);
+    let expected = format!("{}\n{}\nr02-", &shown_line(0)[4..], shown_line(1));
+    assert_highlight_is_the_copy(&mut seam, &expected, "a drag across three drawn rows");
+
+    // As tall as the pane, only wider: the rows already line up, so this is
+    // the columns alone.
+    let six = wide_lines(6);
+    let mut seam = PaneSelectionSeam::tiled_with_screen(30, 8, &[("a", &six)], "a", 6, 50);
+    seam.render();
+    let (x, y) = first_cell(seam.pane_rect("a"));
+    press(&mut seam, x + 4, y);
+    drag(&mut seam, x + 3, y + 2);
+    release(&mut seam, x + 3, y + 2);
+    assert_highlight_is_the_copy(
+        &mut seam,
+        &expected,
+        "a drag across three rows of a screen wider than its pane",
+    );
+
+    double_click(&mut seam, x + 6, y + 1);
+    assert_highlight_is_the_copy(
+        &mut seam,
+        &shown_line(1),
+        "a double-click on a word running past the pane's edge",
+    );
+
+    triple_click(&mut seam, x + 6, y + 1);
+    let paragraph = (0..6).map(shown_line).collect::<Vec<_>>().join("\n");
+    assert_highlight_is_the_copy(
+        &mut seam,
+        &paragraph,
+        "a triple-click on a paragraph wider than the pane",
+    );
+
+    let mut seam = PaneSelectionSeam::tiled_with_screen(30, 8, &[("a", &tall)], "a", 20, 50);
+    seam.render();
+    triple_click(&mut seam, x + 6, y + 1);
+    assert_highlight_is_the_copy(
+        &mut seam,
+        &paragraph,
+        "a triple-click on a screen taller and wider than its pane",
+    );
+}
+
+/// Seven lines that fill a 42 x 7 pane's content area.
+fn seven_lines() -> Vec<String> {
+    (1..=7)
+        .map(|n| format!("line-{n} alpha bravo charlie delta echo"))
+        .collect()
+}
+
+/// Scenario: In command mode the COMMAND MODE banner is drawn over the focused pane, and a pane whose scroll was refused shows its cannot-scroll notice. A drag over the whole pane, through the banner or the notice, highlights the pane's own text, both while dragging and after the release, and the release copies exactly that text.
+#[spec("mouse/select/008")]
+#[test]
+fn select_008_a_selection_over_the_command_banner_or_a_notice_shows_the_pane_text() {
+    let lines = seven_lines();
+    let bytes = lines.join("\r\n").into_bytes();
+    let expected = lines.join("\n");
+
+    for overlay in ["the COMMAND MODE banner", "the cannot-scroll notice"] {
+        let mut seam = PaneSelectionSeam::tiled(44, 9, &[("a", &bytes)], "a");
+        if overlay == "the COMMAND MODE banner" {
+            seam.command_mode(true);
+        } else {
+            seam.arm_scroll_notice("a");
+        }
+        let before = seam.render();
+        let frame = frame_with_highlight(&before);
+        assert!(
+            lines.iter().any(|line| !frame.contains(line.as_str())),
+            "{overlay} must cover some of the pane's text before the drag:\n{frame}"
+        );
+
+        let rect = seam.pane_rect("a");
+        let (x, y) = first_cell(rect);
+        let (last_x, last_y) = (rect.x + rect.width - 2, rect.y + rect.height - 2);
+        press(&mut seam, x, y);
+        drag(&mut seam, last_x, last_y);
+        let buf = seam.render();
+        assert_eq!(
+            highlighted_text(&buf),
+            expected,
+            "while dragging through {overlay} the highlight must show the pane's text:\n{}",
+            frame_with_highlight(&buf)
+        );
+        release(&mut seam, last_x, last_y);
+        assert_highlight_is_the_copy(&mut seam, &expected, &format!("a drag through {overlay}"));
+    }
+}
+
+/// Scenario: In the stacked layout, the one drawn pane's screen is larger than the pane, and a drag on its first drawn row copies exactly the highlighted text. Separately, a frame resize after a copy (the pane's screen not resized yet) never leaves a highlight showing anything other than what was copied.
+#[spec("mouse/select/009")]
+#[test]
+fn select_009_stacked_and_resized_panes_copy_and_show_the_same_text() {
+    let tall = wide_lines(20);
+    let mut seam =
+        PaneSelectionSeam::tiled_with_screen(30, 12, &[("a", b"other"), ("b", &tall)], "b", 20, 50);
+    seam.stack();
+    seam.render();
+    let (x, y) = first_cell(seam.pane_rect("b"));
+    press(&mut seam, x, y);
+    drag(&mut seam, x + 5, y);
+    release(&mut seam, x + 5, y);
+    assert_highlight_is_the_copy(&mut seam, "r00-ab", "a drag in a stacked pane");
+
+    for (width, height) in [(50, 14), (30, 8), (40, 12)] {
+        let mut seam = two_panes("b");
+        select_bravo(&mut seam);
+        assert_eq!(highlighted_text(&seam.render()), "bravo");
+        seam.resize(width, height);
+        let buf = seam.render();
+        let shown = highlighted_text(&buf);
+        assert!(
+            shown.is_empty() || shown == "bravo",
+            "after a resize to {width}x{height} the highlight shows {shown:?}, but `bravo` is what was copied:\n{}",
+            frame_with_highlight(&buf)
+        );
+    }
+}

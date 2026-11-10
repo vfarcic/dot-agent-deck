@@ -17,6 +17,12 @@
 //!
 //! Selection is a stream, as a mouse drag is: from the anchor to the cursor,
 //! running to the end of each line in between.
+//!
+//! **Only drawn cells.** A pane draws its screen from the top-left cell,
+//! clipped to the pane (`terminal_widget::drawn_screen_size`), and the screen
+//! can be larger than the pane while another attached client decides its
+//! size. Copy mode keeps its view, cursor and selection inside the part that
+//! is drawn, so it never highlights, or yanks, a cell the user cannot see.
 
 use std::sync::{Arc, Mutex};
 
@@ -55,6 +61,10 @@ pub struct CopyMode {
     history: usize,
     rows: u16,
     cols: u16,
+    /// The rows and columns of the screen the pane draws, from its top-left
+    /// cell; at most `rows` x `cols`.
+    shown_rows: u16,
+    shown_cols: u16,
     /// Scrollback offset of the view (0 = the screen's own rows).
     view: usize,
     cursor: Pos,
@@ -71,25 +81,27 @@ pub struct RowMarks {
 }
 
 impl CopyMode {
-    /// Open copy mode on `pane_id`, whose live screen is `screen`. The view
-    /// starts where the pane is scrolled to, and the cursor at the pane's own
-    /// cursor when the pane shows its live screen, or on the view's last row
-    /// when it is scrolled back.
-    pub fn open(pane_id: impl Into<String>, screen: &vt100::Screen) -> Self {
+    /// Open copy mode on `pane_id`, whose live screen is `screen` and whose
+    /// pane draws `shown` (rows, cols) of it. The view starts where the pane is
+    /// scrolled to, and the cursor at the pane's own cursor when the pane shows
+    /// its live screen, or on the view's last row when it is scrolled back,
+    /// each kept to the drawn cells.
+    pub fn open(pane_id: impl Into<String>, screen: &vt100::Screen, shown: (u16, u16)) -> Self {
         let (rows, cols) = crate::vt_grid::size(screen);
         let mut parser = crate::vt_grid::parser(rows, cols, 0);
         *parser.screen_mut() = screen.clone();
         let history = screen.scrollback_len();
         let view = screen.scrollback().min(history);
+        let (shown_rows, shown_cols) = Self::clamp_shown(shown, rows, cols);
         let cursor = if view == 0 {
             let (row, col) = screen.cursor_position();
             Pos {
-                line: history + usize::from(row.min(rows - 1)),
-                col: col.min(cols - 1),
+                line: history + usize::from(row.min(shown_rows - 1)),
+                col: col.min(shown_cols - 1),
             }
         } else {
             Pos {
-                line: history - view + usize::from(rows - 1),
+                line: history - view + usize::from(shown_rows - 1),
                 col: 0,
             }
         };
@@ -99,10 +111,44 @@ impl CopyMode {
             history,
             rows,
             cols,
+            shown_rows,
+            shown_cols,
             view,
             cursor,
             anchor: None,
         }
+    }
+
+    /// `pos` with its line and column each at most `last`'s.
+    fn clamp_pos(pos: Pos, last: Pos) -> Pos {
+        Pos {
+            line: pos.line.min(last.line),
+            col: pos.col.min(last.col),
+        }
+    }
+
+    fn clamp_shown((rows, cols): (u16, u16), max_rows: u16, max_cols: u16) -> (u16, u16) {
+        (rows.min(max_rows).max(1), cols.min(max_cols).max(1))
+    }
+
+    /// The pane now draws `shown` (rows, cols) of the screen, as a resize can
+    /// change it: the cursor and the selection's anchor are brought onto drawn
+    /// cells, and the view onto the cursor.
+    pub fn set_shown(&mut self, shown: (u16, u16)) {
+        let (shown_rows, shown_cols) = Self::clamp_shown(shown, self.rows, self.cols);
+        if (shown_rows, shown_cols) == (self.shown_rows, self.shown_cols) {
+            return;
+        }
+        self.shown_rows = shown_rows;
+        self.shown_cols = shown_cols;
+        let last = Pos {
+            line: self.total_lines() - 1,
+            col: shown_cols - 1,
+        };
+        self.cursor = Self::clamp_pos(self.cursor, last);
+        self.anchor = self.anchor.map(|pos| Self::clamp_pos(pos, last));
+        self.keep_cursor_in_view();
+        self.scroll_frozen_to(self.view);
     }
 
     pub fn pane_id(&self) -> &str {
@@ -118,8 +164,10 @@ impl CopyMode {
         self.cursor
     }
 
+    /// The history, then the screen rows the pane draws: the rows below
+    /// those are never drawn, at any scroll offset.
     fn total_lines(&self) -> usize {
-        self.history + usize::from(self.rows)
+        self.history + usize::from(self.shown_rows)
     }
 
     /// The line shown on the view's first row.
@@ -128,12 +176,12 @@ impl CopyMode {
     }
 
     fn page(&self) -> usize {
-        usize::from(self.rows.saturating_sub(1).max(1))
+        usize::from(self.shown_rows.saturating_sub(1).max(1))
     }
 
     pub fn apply(&mut self, movement: Move) {
         let last_line = self.total_lines() - 1;
-        let last_col = self.cols - 1;
+        let last_col = self.shown_cols - 1;
         let page = self.page();
         match movement {
             Move::Left => self.cursor.col = self.cursor.col.saturating_sub(1),
@@ -166,7 +214,7 @@ impl CopyMode {
 
     /// Scroll the view just enough to show the cursor.
     fn keep_cursor_in_view(&mut self) {
-        let rows = usize::from(self.rows);
+        let rows = usize::from(self.shown_rows);
         let top = self.top();
         if self.cursor.line < top {
             self.view = self.history - self.cursor.line;
@@ -208,7 +256,7 @@ impl CopyMode {
                 let last = if line == end.line {
                     end.col
                 } else {
-                    self.cols - 1
+                    self.shown_cols - 1
                 };
                 (first, last)
             })
@@ -240,10 +288,10 @@ impl CopyMode {
             let last = if line == end.line {
                 end.col
             } else {
-                self.cols - 1
+                self.shown_cols - 1
             };
             let mut segment = String::new();
-            for col in first..=last.min(self.cols - 1) {
+            for col in first..=last.min(self.shown_cols - 1) {
                 match screen.cell(row, col) {
                     Some(cell) if cell.is_wide_continuation() => {}
                     Some(cell) if !cell.contents().is_empty() => segment.push_str(cell.contents()),
@@ -253,6 +301,8 @@ impl CopyMode {
             if line == end.line {
                 text.push_str(segment.trim_end());
             } else if screen.row_wrapped(row) && last == self.cols - 1 {
+                // Joined only when the whole row is drawn: a row clipped at
+                // the pane's edge ends where the highlight does.
                 text.push_str(&segment);
             } else {
                 text.push_str(segment.trim_end());
@@ -277,7 +327,7 @@ mod tests {
     #[test]
     fn a_stream_selection_runs_to_the_end_of_each_line_between() {
         let parser = screen(4, 10, b"alpha one\r\nbravo two\r\ncharlie\r\n");
-        let mut copy = CopyMode::open("p", parser.screen());
+        let mut copy = CopyMode::open("p", parser.screen(), crate::vt_grid::size(parser.screen()));
         copy.apply(Move::Top);
         copy.apply(Move::Right);
         copy.apply(Move::Right);
@@ -291,7 +341,7 @@ mod tests {
     #[test]
     fn a_wrapped_line_is_copied_without_a_newline() {
         let parser = screen(4, 5, b"abcdefgh");
-        let mut copy = CopyMode::open("p", parser.screen());
+        let mut copy = CopyMode::open("p", parser.screen(), crate::vt_grid::size(parser.screen()));
         copy.apply(Move::Top);
         copy.toggle_anchor();
         copy.apply(Move::Down);
@@ -304,7 +354,7 @@ mod tests {
     fn the_cursor_keeps_the_view_on_itself_through_the_history() {
         let lines: Vec<String> = (1..=20).map(|n| format!("l{n}")).collect();
         let parser = screen(4, 10, lines.join("\r\n").as_bytes());
-        let mut copy = CopyMode::open("p", parser.screen());
+        let mut copy = CopyMode::open("p", parser.screen(), crate::vt_grid::size(parser.screen()));
         assert_eq!(copy.cursor().line, 19);
         for _ in 0..19 {
             copy.apply(Move::Up);

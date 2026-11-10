@@ -7718,14 +7718,49 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L1 (`PaneSelectionSeam`).
 - **Agent:** none.
 - **Asserts:** after a drag over `bravo` is released, `bravo` is copied once and stays highlighted; the next press (in another pane) removes it, and the plain click that press makes leaves no highlight; a lone `Esc` typed into the pane leaves it, while a typed `x` removes it; switching tab and back leaves none; closing the pane that owns it leaves none on the pane that remains.
-- **Does not assert:** that the live loop calls the tab-switch check with the real active tab (the seam passes its own); paste, which goes through the same clearing function as typing; a press on a button, card or dialog (the seam draws none).
+- **Does not assert:** the tab switch through the real tab manager and key path (`mouse/select/006`; the seam switches its own deck); paste, which goes through the same clearing function as typing; a press on a button, card or dialog (the seam draws none).
 - **Platform coverage:** mac+linux+windows.
 
 ##### mouse/select/004 — A kept highlight never shows text other than what was copied (PRD #385 decision 6).
 - **Layer:** L1 (`PaneSelectionSeam`, output fed straight into the panes' vt100 parsers).
 - **Agent:** none.
 - **Asserts:** after `bravo` is copied from pane `b`, output in pane `a` and output on another line of `b` keep the `bravo` highlight; after output that scrolls `b`, overwrites the selected cells, or clears the screen, the highlighted cells show either nothing or exactly `bravo`.
-- **Does not assert:** that the selection follows its text as it scrolls (the deck clears it instead: vt100 keeps no position for a scrolled line); a resize, which clears it through the same pane-rect check.
+- **Does not assert:** that the selection follows its text as it scrolls (the deck clears it instead: vt100 keeps no position for a scrolled line); a resize (`mouse/select/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/005 — A drag that starts in a pane and is released over a button or a card still copies, and fires nothing (PRD #385 M3).
+- **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent; it blanks itself and leaves a shell-computed sentinel on its bottom row, held there by `sleep`).
+- **Asserts:** in command mode, a drag from the end of the sentinel released over the bottom bar's `[New Agent n/Ctrl+N]` button writes an OSC 52 sequence whose payload is exactly the sentinel (the drag's end clamps to the pane's bottom row and first column), shows the OSC 52-only status, and opens no directory picker; after a plain click on a blank pane cell (so the next press is not a double-click), a second drag from the sentinel released over the pane's dashboard card writes an OSC 52 sequence carrying the blank rows from the card's row (or the pane's top) down to the sentinel, then the sentinel, and the deck stays in command mode.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); a release over a tab header or a dialog (no dialog can open mid-drag without a key); a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/006 — A real tab switch clears the selection even when the user is back before the next frame (PRD #385 M3).
+- **Layer:** L1 (`ui::tests`: a real `TabManager` with a dashboard and an orchestration tab, keys through the live loop's `handle_key_event`).
+- **Agent:** none.
+- **Asserts:** with a copied selection kept on a dashboard pane in pane input, Ctrl+PageDown then Ctrl+PageUp, handled with no frame drawn between them, leave no selection; Ctrl+PageUp on the first tab, and selecting the tab already active, keep it.
+- **Does not assert:** the highlight's cells (`mouse/select/003`); tab moves that do not go through `switch_tab_with_focus` (opening or closing a tab), which the check made before every frame still covers.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/007 — A pane whose screen is larger than the pane copies exactly what the highlight is drawn over (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam::tiled_with_screen`: the pane's vt100 screen sized apart from its pane, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** with a 28 x 6 pane over a 20 x 50 screen (cursor on row 19), a drag on the first drawn row and a drag across three drawn rows copy the text the pane shows at the top-left of its screen, and the kept highlight shows that same text; with a 6 x 50 screen, the three-row drag, a double-click on a word that runs past the pane's right edge and a triple-click on the paragraph each copy only the drawn columns, matching the highlight; the triple-click on the 20 x 50 screen copies the drawn rows only.
+- **Does not assert:** a screen smaller than its pane (the cells past it are blank and trimmed from the copy); an orchestration tab, which draws panes through the same function.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/008 — A selection through the COMMAND MODE banner or a cannot-scroll notice shows the pane's text, not the overlay's (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, command mode with the banner expanded, or the pane's cannot-scroll notice armed).
+- **Agent:** none.
+- **Asserts:** the overlay covers some of the pane's text before the drag; while a drag across the whole pane is held, and after its release, the highlighted cells show the pane's seven lines, and the release copies exactly those lines.
+- **Does not assert:** that the banner comes back once the selection is cleared (it decays on its own timer); dialogs, which take every click while they are open.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/009 — The stacked layout copies what is drawn, and a resize never leaves a highlight over other text (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, stacked layout and frame resizes with the panes' screens left at their size).
+- **Agent:** none.
+- **Asserts:** in the stacked layout, a drag on the first drawn row of a pane whose screen is larger than the pane copies `r00-ab` and the highlight shows the same; after `bravo` is copied, resizing the frame to 50 x 14, 30 x 8 or its own 40 x 12 leaves either no highlight or one showing exactly `bravo`.
+- **Does not assert:** that a selection survives a resize (it is cleared when its pane moves); the zoomed layout, which draws through the stacked one.
 - **Platform coverage:** mac+linux+windows.
 
 #### clipboard/deliver
@@ -7774,6 +7809,13 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Agent:** none.
 - **Asserts:** after paging and setting a selection, `Esc`, and `q` after the pane was first scrolled back in command mode, return to command mode with no copy and no status message, the pane at the scroll offset it had before and showing what it showed before; forty lines of output while copy mode is open leave its view unchanged, its bottom shows no new line and a yank copies none, and after leaving the pane shows the new output; on an empty pane copy mode opens with the cursor at the first cell, `PageUp` and `g` leave it there (no history) and `G` moves it to the last row, `y` with no selection keeps copy mode open, and an empty selection leaves it without a copy or a status; on a full-screen program's alternate screen copy mode has no history to page into and copies that screen's text; and copy mode closes, copying nothing, once the pane it is open on closes.
 - **Does not assert:** the real binary (`copymode/keys/001`); a pane that stays open but leaves the screen (the stacked layout giving its slot to another pane), which closes copy mode through the same not-drawn check.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/003 — Copy mode on a pane whose screen is larger than the pane keeps its cursor on drawn cells and yanks what is highlighted (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam::with_screen`: the pane's vt100 screen sized apart from its pane, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with a 28 x 9 pane over a 20 x 50 screen whose cursor is on row 19, `v` opens copy mode with exactly one cursor cell drawn; after moving and selecting across two lines with the cursor pushed far right, the cursor is still inside the pane, and `y` copies exactly the highlighted text, `abcdefghijklmnopqrstuvwx` and the next line's first 28 columns.
+- **Does not assert:** a screen smaller than its pane; a resize while copy mode is open (it takes the new drawn size from the next frame).
 - **Platform coverage:** mac+linux+windows.
 
 #### copymode/render
