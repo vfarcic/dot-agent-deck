@@ -7834,8 +7834,15 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L1 (`clipboard::tests`), the deck's own `ui::tui_panic_hook` installed with a recording teardown, and fake openers/sinks that panic.
 - **Agent:** none.
 - **Asserts:** a panic while opening the clipboard and a panic while writing to it each settle the native clipboard as unavailable (that copy and the next report it so) and do not reach the hook's teardown; a control panic on an ordinary thread does reach it.
-- **Does not assert:** a panic on a thread arboard starts for itself; the `panic = "abort"` build, where nothing is contained and the hook tears down.
+- **Does not assert:** a panic on a thread arboard starts for itself; the `panic = "abort"` build, where nothing is contained and the hook tears down; the hooks `run_tui` installs around this one (`clipboard/native/004` covers the assembled stack).
 - **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/004 — A contained panic leaves the terminal set up under the deck's whole panic-hook stack, and any other panic hands it back (PRD #385).
+- **Layer:** L1 (`ui::panic_teardown_tests`, `src/ui_panic_teardown_tests.rs`): the test binary re-executed on a fresh pseudo-terminal in a session of its own, setting the terminal up with `ui::enter_tui_terminal`, the function `run_tui` calls (its panic hook, the terminal modes, then `wide_glyph_backend::init`); a fake clipboard opener that panics.
+- **Agent:** none.
+- **Asserts:** after a panic on the native clipboard's worker (opening the clipboard) and after a panic inside a guarded parser feed, the terminal is still in raw mode (no canonical input, no echo) and nothing written before the check left the alternate screen (`ESC [ ? 1049 l`); after a panic on an ordinary thread, the control, the alternate screen was left and raw mode is off.
+- **Does not assert:** the event loop or a real agent's output; the `panic = "abort"` build; a real clipboard (none is opened).
+- **Platform coverage:** mac+linux.
 
 #### copymode/keys
 

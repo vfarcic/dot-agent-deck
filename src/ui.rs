@@ -13435,13 +13435,22 @@ where
     }
 }
 
-pub fn run_tui(
-    state: SharedState,
-    pane: Arc<dyn PaneController>,
-    config: DashboardConfig,
-    keybindings: KeybindingConfig,
-    startup_hooks: Option<crate::hooks_refresh::StartupNote>,
-) -> std::io::Result<()> {
+/// Set the terminal up for the TUI, in the order its teardown relies on: the
+/// panic hook, then mouse capture, bracketed paste and focus reporting, then
+/// raw mode and the alternate screen ([`crate::wide_glyph_backend::init`]).
+///
+/// The hook installed here is the one that hands the terminal back on a
+/// panic, and it asks [`tui_panic_hook`]'s contained-panic policy first, so a
+/// panic the deck recovers from (a guarded parser feed, the native clipboard's
+/// worker) leaves raw mode and the alternate screen on for the TUI that keeps
+/// running. `wide_glyph_backend::init` installs no hook of its own for that
+/// reason: ratatui's `init` puts an unconditional restore in front of every
+/// hook installed before it (PRD #385). `clipboard/native/004` runs this
+/// function in a pseudo-terminal and checks both outcomes.
+fn enter_tui_terminal() -> std::io::Result<(
+    TerminalModesGuard<std::io::Stdout>,
+    crate::wide_glyph_backend::DeckTerminal,
+)> {
     let terminal_modes = TerminalModes::default();
     let hook_terminal_modes = terminal_modes.clone();
     let original_hook = std::panic::take_hook();
@@ -13467,14 +13476,26 @@ pub fn run_tui(
     // signal the focus claim in `crate::focus_report` is built on. Where the
     // terminal does not report focus, input stands in.
     //
-    // Held as an RAII guard, for the reason `_keyboard_enhancement` is below:
-    // the event loop returns early via `?` on any terminal I/O error, which
-    // would skip the explicit teardown and leave all three modes on in the
-    // user's shell. Declared before `_keyboard_enhancement`, so on those
-    // returns it drops after it — the same order as the explicit teardown.
-    let mut terminal_modes = terminal_modes.enable(std::io::stdout())?;
+    // Returned as an RAII guard, for the reason `run_tui` holds
+    // `_keyboard_enhancement` as one: the event loop returns early via `?` on
+    // any terminal I/O error, which would skip the explicit teardown and leave
+    // all three modes on in the user's shell. `run_tui` binds it before
+    // `_keyboard_enhancement`, so on those returns it drops after it — the
+    // same order as the explicit teardown.
+    let terminal_modes = terminal_modes.enable(std::io::stdout())?;
 
-    let mut terminal = crate::wide_glyph_backend::init();
+    let terminal = crate::wide_glyph_backend::init();
+    Ok((terminal_modes, terminal))
+}
+
+pub fn run_tui(
+    state: SharedState,
+    pane: Arc<dyn PaneController>,
+    config: DashboardConfig,
+    keybindings: KeybindingConfig,
+    startup_hooks: Option<crate::hooks_refresh::StartupNote>,
+) -> std::io::Result<()> {
+    let (mut terminal_modes, mut terminal) = enter_tui_terminal()?;
 
     // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
     // enhanced keyboard protocol now — before the event loop starts polling,
@@ -49257,6 +49278,12 @@ mod one_shot_protocol_gate_tests {
         assert_eq!(daemon.recorded(), vec!["0:list-agents".to_string()]);
     }
 }
+
+/// PRD #385: a contained panic leaves the terminal set up, under the whole
+/// panic-hook stack `run_tui` installs.
+#[cfg(all(test, unix))]
+#[path = "ui_panic_teardown_tests.rs"]
+mod panic_teardown_tests;
 
 /// Issue #1913: a deck restart that reuses an orchestration tab's pane ids.
 #[cfg(all(test, unix))]
