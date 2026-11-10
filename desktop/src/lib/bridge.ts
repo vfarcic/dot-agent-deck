@@ -19,6 +19,7 @@ import { speechAudioError } from "./speech";
 import { DEFAULT_SPEECH_LANGUAGE, SPEECH_LANGUAGE_TOKENS } from "./speechLanguages";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { pullRequestFromDto } from "./pullRequest";
+import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -2290,6 +2291,19 @@ export interface DeckBridge {
    */
   newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations>;
   /**
+   * PRD #1885 — whether `target`'s orchestration is approved on the deck its
+   * launch goes to (`target.deckId`, or the selected deck when absent), and
+   * the escaped text the review dialog shows when it is not; `unsupported`
+   * with the refusal to show for a deck older than the review.
+   */
+  projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust>;
+  /**
+   * PRD #1885 — approve `target`'s orchestration, carrying the `digest` of the
+   * text the dialog showed. Rejects with the deck's `trust-text-changed`
+   * refusal when the config changed since, and approves nothing then.
+   */
+  approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
+  /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
    * wrappers. The runtime asks ONCE at startup (`useDeckRuntime`), and the
@@ -3905,6 +3919,31 @@ class FixtureDeckBridge implements DeckBridge {
    * way — and `unsupported` for a deck this preview plays as older or as
    * non-Unix.
    */
+  /**
+   * PRD #1885 — the browser preview has no approval store: every fixture
+   * orchestration answers approved, with its roles as the review would show
+   * them, so a fixture launch starts as it always did. Approving answers the
+   * same.
+   */
+  async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    await Promise.resolve();
+    const home = FIXTURE_HOMES[target.deckId ?? ""] ?? "/home/dev";
+    const roles = fixtureProjectOrchestrations(home, target.path)?.find((candidate) => candidate.name === target.orchestration)?.roles ?? [];
+    return {
+      kind: "review",
+      project: target.path,
+      orchestration: target.orchestration,
+      state: "approved",
+      roles: roles.map((role) => ({ name: role.name, command: FIXTURE_ROLE_COMMANDS[role.name] ?? "" })),
+      removedRoles: [],
+      digest: "fixture-digest",
+    };
+  }
+
+  async approveProjectTrust(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    return this.projectTrustState(target);
+  }
+
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     await Promise.resolve();
     this.connectedDeck(deckId);
@@ -5768,6 +5807,17 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOrchestrations>("desktop_new_agent_orchestrations", { deckId, path });
+  }
+
+  /** PRD #1885. `deckId` is sent only when the target names one; without it the crate takes the selected deck, as the Runs launch does. */
+  async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    const invoke = await this.getInvoke();
+    return invoke<ProjectTrust>("desktop_project_trust_state", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration });
+  }
+
+  async approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust> {
+    const invoke = await this.getInvoke();
+    return invoke<ProjectTrust>("desktop_approve_project_trust", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration, digest });
   }
 
   async dispose(): Promise<void> {

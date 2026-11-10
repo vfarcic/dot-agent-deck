@@ -46,6 +46,7 @@ mod selection_saves;
 mod self_upgrade;
 mod settings;
 mod terminal;
+mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
 // crate's shared upgrade procedure.
 mod upgrade;
@@ -6833,6 +6834,8 @@ pub fn run() {
             desktop_list_projects,
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
+            trust_review::desktop_project_trust_state,
+            trust_review::desktop_approve_project_trust,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_new_agent_options,

@@ -853,6 +853,7 @@ mod tests {
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",
+                "approve_project_commands",
                 "stop_agent",
                 "close_orchestration",
                 "none"

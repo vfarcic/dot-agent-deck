@@ -1715,6 +1715,15 @@ export interface DeckRuntimeState {
    * runtime without it offers no orchestration chips.
    */
   newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
+  /**
+   * PRD #1885 — whether an orchestration's commands and prompts are approved
+   * on the deck its launch goes to, and the text the review dialog shows when
+   * they are not; and the user's approval of exactly that text. Optional for
+   * the reason the three above are, and a runtime without them starts no
+   * orchestration (`useProjectTrustReview` refuses).
+   */
+  projectTrustState?: (target: import("./lib/projectTrust").ProjectTrustTarget) => Promise<import("./lib/projectTrust").ProjectTrust>;
+  approveProjectTrust?: (target: import("./lib/projectTrust").ProjectTrustTarget, digest: string) => Promise<import("./lib/projectTrust").ProjectTrust>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /**

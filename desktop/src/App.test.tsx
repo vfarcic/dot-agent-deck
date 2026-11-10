@@ -1,6 +1,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useCallback, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { approvedProjectTrust } from "./test/projectTrust";
+import { APPROVE_AND_START, TRUST_TITLE, type ProjectTrust } from "./lib/projectTrust";
 import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
 import { WINDOWS_ORCHESTRATION_BLOCK_REASON } from "./lib/platform";
@@ -67,6 +69,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     snapshot: base,
     terminalData: {},
     clearError: vi.fn(),
+    ...approvedProjectTrust(),
     runAction: vi.fn(async () => ({ ok: true }) as import("./types").DeckActionResult),
     // PRD #1487 M5: Upgrade and Replace daemon. A daemon that restarts with
     // nothing running unless a test says otherwise.
@@ -807,6 +810,52 @@ describe("ControlDeck", () => {
       taskPrompt: "Wire the launch prompt into the orchestration.",
       roles: expect.arrayContaining([expect.objectContaining({ role: "orchestrator", start: true }), expect.objectContaining({ role: "coder", start: false })]),
     })));
+  });
+
+  /**
+   * PRD #1885. Scenario: on the Runs screen, activate an orchestration whose
+   * project commands nobody approved. After the activation confirmation the
+   * deck is asked first, and `Review project commands` shows its roles while
+   * nothing is activated; Approve and start sends the shown digest, and only
+   * then does the activation go out. Cancel on a second attempt activates
+   * nothing and approves nothing.
+   */
+  it("reviews an unapproved orchestration's commands before the Runs activation", async () => {
+    const review: ProjectTrust = {
+      kind: "review",
+      project: "/home/dev/code/deck",
+      orchestration: "dot-agent-deck",
+      state: "never_approved",
+      roles: [{ name: "orchestrator", command: "devbox run agent-orchestrator", prompt: ["Coordinate the team."] }],
+      removedRoles: [],
+      digest: "runs-digest",
+    };
+    const projectTrustState = vi.fn(async () => structuredClone(review));
+    const approveProjectTrust = vi.fn(async (): Promise<ProjectTrust> => ({ ...review, state: "approved" }));
+    const live = liveWithProject({ projectTrustState, approveProjectTrust });
+    render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+
+    const dialog = await screen.findByTestId("project-trust-dialog");
+    expect(projectTrustState).toHaveBeenCalledWith({ path: "/home/dev/code/deck", orchestration: "dot-agent-deck" });
+    expect(dialog).toHaveTextContent(TRUST_TITLE);
+    expect(dialog).toHaveTextContent("devbox run agent-orchestrator");
+    expect(live.runAction).not.toHaveBeenCalledWith(expect.objectContaining({ type: "activate_orchestration" }));
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByTestId("project-trust-dialog")).toBeNull());
+    expect(approveProjectTrust).not.toHaveBeenCalled();
+    expect(live.runAction).not.toHaveBeenCalledWith(expect.objectContaining({ type: "activate_orchestration" }));
+
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+    fireEvent.click(within(await screen.findByTestId("project-trust-dialog")).getByRole("button", { name: APPROVE_AND_START }));
+
+    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith(expect.objectContaining({ type: "activate_orchestration", name: "dot-agent-deck", cwd: "/home/dev/code/deck" })));
+    expect(approveProjectTrust).toHaveBeenCalledWith({ path: "/home/dev/code/deck", orchestration: "dot-agent-deck" }, "runs-digest");
   });
 
   /**

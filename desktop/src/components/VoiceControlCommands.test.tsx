@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { approvedProjectTrust } from "../test/projectTrust";
 import { Profiler } from "react";
 import { createFixtureFleet, createFixtureSnapshot, FIXTURE_DAEMON_ID, FIXTURE_REMOTE_DAEMON_ID, FIXTURE_UNREACHABLE_DAEMON_ID, resolveFixtureVoice } from "../data/fixture";
 import {
@@ -182,6 +183,7 @@ function runtime(resolveVoice: ResolveVoice, voice: VoiceControls, overrides: Pa
     fleet: [snapshot],
     terminalData: {},
     clearError: vi.fn(),
+    ...approvedProjectTrust(),
     runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),

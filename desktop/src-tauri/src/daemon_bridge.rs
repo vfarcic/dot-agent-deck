@@ -7556,10 +7556,136 @@ mod tests {
     #[cfg(unix)]
     fn approve_project(project: &std::path::Path) {
         use dot_agent_deck::project_trust::{TrustStore, approve_all};
+        use_test_trust_store();
+        approve_all(&TrustStore::default_location(), project).expect("approve the fixture config");
+    }
+
+    /// Point this test process's approval store at a private directory, once,
+    /// so no test reads or writes the user's own approvals.
+    #[cfg(unix)]
+    fn use_test_trust_store() {
+        use dot_agent_deck::project_trust::TrustStore;
         static STORE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
         let store = STORE.get_or_init(|| tempfile::tempdir().expect("mint the trust store dir"));
         let _ = TrustStore::use_state_dir_for_this_process(store.path().to_path_buf());
-        approve_all(&TrustStore::default_location(), project).expect("approve the fixture config");
+    }
+
+    /// Scenario (PRD #1885): a real deck and a project whose orchestration
+    /// `m6` nobody approved. The review query answers it `never_approved` with
+    /// every role's command and prompt (a control character in the prompt
+    /// shown escaped, line by line), and launching it is refused with
+    /// `not-approved` and starts nothing. An approval carrying a digest of
+    /// other text is refused with `trust-text-changed` and records nothing;
+    /// one carrying the shown digest records it, the query then answers
+    /// `approved`, and the same launch starts both roles.
+    ///
+    /// **What it fails against.** A bridge that approved without the digest,
+    /// or a daemon that started an unapproved orchestration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unapproved_orchestration_is_reviewed_approved_with_the_shown_digest_then_started() {
+        use crate::trust_review::{
+            DesktopProjectTrust, approve_project_trust_on, project_trust_state_on,
+        };
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        use_test_trust_store();
+        let local = RealDeck::start("trust-review");
+        let project = local.dir.join("trust-project");
+        std::fs::create_dir_all(&project).expect("create the project");
+        std::fs::write(
+            project.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"m6\"\n\n[[orchestrations.roles]]\nname = \"planner\"\ncommand = \"sh -c 'echo planner-configured >> configured.log; sleep 600'\"\nstart = true\nprompt_template = \"plan it\\u001b[2J\\nsecond line\"\n\n[[orchestrations.roles]]\nname = \"builder\"\ncommand = \"sh -c 'echo builder-configured >> configured.log; sleep 600'\"\ndescription = \"builds\"\n",
+        )
+        .expect("write the project config");
+        let project = std::fs::canonicalize(&project).expect("canonicalize the project");
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+        let (settings, _unused_remote) = all_decks_with_one_remote_row("trust-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let first = project_trust_state_on(&state, Some(&local_wire), &project_wire, "m6").await;
+        let Ok(DesktopProjectTrust::Review(shown)) = first else {
+            panic!("the deck answers a review: {first:?}");
+        };
+        assert_eq!(shown.state, "never_approved");
+        assert_eq!(shown.orchestration, "m6");
+        let names: Vec<_> = shown.roles.iter().map(|role| role.name.as_str()).collect();
+        assert_eq!(names, ["planner", "builder"]);
+        assert!(shown.roles[0].command.contains("planner-configured"));
+        assert_eq!(
+            shown.roles[0].prompt.as_deref(),
+            Some(&["plan it\\u{1b}[2J".to_string(), "second line".to_string()][..]),
+            "the prompt arrives escaped, one string per line"
+        );
+        assert_eq!(
+            shown.roles[1].description.as_deref(),
+            Some(&["builds".to_string()][..])
+        );
+
+        let refused = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            orchestration_start(&project_wire, Some("trust-review-1"), None),
+        )
+        .await;
+        let refusal = refused
+            .err()
+            .map(|error| format!("{error:?}"))
+            .unwrap_or_default();
+        assert!(
+            refusal.contains("not-approved"),
+            "an unapproved launch is refused: {refusal}"
+        );
+        assert!(
+            named_records(&local).is_empty(),
+            "nothing started while unapproved"
+        );
+
+        let stale = approve_project_trust_on(
+            &state,
+            Some(&local_wire),
+            &project_wire,
+            "m6",
+            &"0".repeat(64),
+        )
+        .await;
+        assert!(
+            stale
+                .as_ref()
+                .is_err_and(|error| error.contains("trust-text-changed")),
+            "a digest of other text approves nothing: {stale:?}"
+        );
+
+        let approved = approve_project_trust_on(
+            &state,
+            Some(&local_wire),
+            &project_wire,
+            "m6",
+            &shown.digest,
+        )
+        .await;
+        assert!(
+            matches!(&approved, Ok(DesktopProjectTrust::Review(view)) if view.state == "approved"),
+            "the shown digest approves it: {approved:?}"
+        );
+        let again = project_trust_state_on(&state, Some(&local_wire), &project_wire, "m6").await;
+        assert!(
+            matches!(&again, Ok(DesktopProjectTrust::Review(view)) if view.state == "approved"),
+            "{again:?}"
+        );
+
+        let started = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            orchestration_start(&project_wire, Some("trust-review-2"), None),
+        )
+        .await;
+        assert!(
+            started.is_ok(),
+            "the approved orchestration starts: {:?}",
+            started.err()
+        );
     }
 
     /// A project under `root` whose one orchestration, `m6`, has a Pi start
