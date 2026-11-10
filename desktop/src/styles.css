@@ -1568,6 +1568,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .count-running { color: var(--teal); }
 .count-needs-input { color: var(--amber); }
 .count-failed { color: var(--red); }
+/* Issue #1757: Waiting's mark is hollow teal; its count reads in the same teal. */
+.count-waiting { color: var(--teal); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }
 

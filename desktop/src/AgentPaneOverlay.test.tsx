@@ -728,6 +728,22 @@ describe("background work on the tile and the agent screen", () => {
     expect(within(tile).getByTestId("background-work-7")).toHaveTextContent("Background: 1 command · 5m");
   });
 
+  /**
+   * Scenario (issue #1757): open the agent dashboard on a daemon whose one
+   * agent is Waiting. The header's WAITING counter reads 1 and IDLE reads 0,
+   * as the TUI's stats bar reads `1 waiting` and no `idle` segment.
+   */
+  it("counts a Waiting agent under WAITING, not IDLE, in the dashboard header", () => {
+    const snapshot = backgroundSnapshot({ commands: 1, subagents: 0, sinceMs: Date.now() - 60_000 }, undefined, "waiting" as DesktopAgentDto["status"]);
+    render(<AppDeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} initialView={{ kind: "overview" }} />);
+    const waiting = screen.getByTestId("overview-count-waiting");
+    expect(waiting).toHaveTextContent("WAITING");
+    expect(waiting).toHaveTextContent("1");
+    expect(waiting.querySelector("strong")).toHaveClass("count-waiting");
+    expect(screen.getByTestId("overview-count-idle")).toHaveTextContent("0");
+    expect(screen.getByTestId("overview-count-running")).toHaveTextContent("0");
+  });
+
   /** Scenario: the same agent with nothing left running shows no background line at all. */
   it("shows nothing when the agent left nothing running", () => {
     render(<DeckShell runtime={liveRuntime(undefined)} />);

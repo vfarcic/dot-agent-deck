@@ -7,7 +7,7 @@ The **Agent dashboard** is the desktop app's main screen and the one it opens on
 ## Check what is running
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. Remote daemons are added in [Settings → Daemons](daemons.md).
-2. Read the counters at the top. **AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **IDLE** and **GROUPS** count the agents on the daemons that answered. **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When a shown daemon has not answered, **DAEMONS** turns red and the other counters describe only the daemons that did. When no daemon answered, the other counters read `—`.
+2. Read the counters at the top. **AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered. **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When a shown daemon has not answered, **DAEMONS** turns red and the other counters describe only the daemons that did. When no daemon answered, the other counters read `—`.
 3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
 
 ## One section per daemon
@@ -53,7 +53,7 @@ Dispatchers, schedule agents and schedule: issues agents are the agents started 
 
 An agent is shown when it matches everything you chose: the text, and one of the ticked entries in each list you ticked something in. For example, ticking **Working** and **Thinking** under Status and **Codex** under Agent type shows the Codex agents that are working or thinking.
 
-While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **IDLE**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
+While a filter is set, a line under the header says how much of the fleet you are looking at, for example `Showing 4 of 11 agents · Working · Dispatchers`. Each part of the filter has its own remove control on that line, and **Show all** clears the whole filter in one click. The counters in the header (**AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE**, **GROUPS** and **DAEMONS**) always count the whole fleet, not only the agents the filter shows.
 
 A daemon none of whose agents match shows one line in its place, for example `build-box: no matching agents`, and so does an orchestration or other group with no matching agents, so nothing disappears without a word.
 
