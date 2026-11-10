@@ -237,6 +237,13 @@ mod release_workflow_wiring;
 #[cfg(test)]
 mod renovate_lock_file_maintenance;
 mod repo_state;
+/// Issue #2081: which automated-review findings on a pull request nobody has
+/// answered, which `.claude/skills/pr-create/unanswered-findings.sh` decides
+/// from Qodo's and Greptile's comments and the PR's threads. Tests only, and
+/// Unix only: the script is driven under `bash` against an offline `gh`
+/// stand-in.
+#[cfg(all(test, unix))]
+mod review_findings;
 /// Issue #1256: when the automated review apps have finished, which
 /// `.claude/skills/pr-create/wait-reviews.sh` decides from `reviewers.json`
 /// for every skill that waits on a review. Tests only, and Unix only: the
