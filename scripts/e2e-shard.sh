@@ -23,7 +23,9 @@
 #
 # `lifecycle/version/001` runs a nested cold `cargo build` (72-370s in CI) and
 # set the floor of whichever partition drew it, so it runs alone in the
-# `version` shard and the other four split the rest with `count:N/4`. Every
+# `version` shard and the other four split the rest with `count:N/4`. Running
+# alone, it may use every core for that build (`DAD_E2E_NESTED_BUILD_JOBS`
+# below). Every
 # selected test runs in exactly one shard: the four `count` partitions are
 # disjoint and cover the filtered set, and the `version` shard takes the one
 # test the other four exclude.
@@ -41,6 +43,13 @@ lane1='binary(/^e2e_/) | (package(dot-agent-deck) & test(/(^|::)e2e_only[a-z0-9_
 
 case "$shard" in
   version)
+    # The test caps its nested build at half the cores so it cannot starve
+    # timed tests running beside it. In this shard it runs alone, so the cap
+    # protects nothing and only halves a cold build on a 4-vCPU runner
+    # (issue #2109). The variable reaches the test through nextest's
+    # environment; tests/e2e_version_injection.rs reads it.
+    DAD_E2E_NESTED_BUILD_JOBS=$(getconf _NPROCESSORS_ONLN)
+    export DAD_E2E_NESTED_BUILD_JOBS
     exec "$@" -E "$version"
     ;;
   1 | 2 | 3 | 4)
