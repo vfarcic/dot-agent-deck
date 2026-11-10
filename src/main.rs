@@ -3113,7 +3113,7 @@ async fn run_tui_session() -> ExitCode {
     // alternate screen, so any malformed-config / conflict / unknown-action
     // warnings land on stderr in the normal terminal (and, under a PTY, in
     // the byte stream that precedes the alt-screen switch) where they are
-    // actually visible. `run_tui` (via `ratatui::init`) is what flips into
+    // actually visible. `run_tui` (via `wide_glyph_backend::init`) is what flips into
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 

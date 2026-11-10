@@ -13474,7 +13474,7 @@ pub fn run_tui(
     // returns it drops after it — the same order as the explicit teardown.
     let mut terminal_modes = terminal_modes.enable(std::io::stdout())?;
 
-    let mut terminal = ratatui::init();
+    let mut terminal = crate::wide_glyph_backend::init();
 
     // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
     // enhanced keyboard protocol now — before the event loop starts polling,

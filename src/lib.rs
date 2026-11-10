@@ -241,6 +241,9 @@ pub mod version;
 pub mod vt_grid;
 pub mod vt_work;
 pub mod watch;
+// PRD #385: the deck's ratatui backend, drawing a two-column glyph so its
+// second column is right whichever width the host terminal gives it.
+pub mod wide_glyph_backend;
 pub mod worktree_owner;
 pub mod worktree_reclaim;
 pub mod wrap;

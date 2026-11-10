@@ -3896,11 +3896,18 @@ note).
 - **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag; colours.
 - **Platform coverage:** mac+linux+windows.
 
-##### render/widget/005 — A cell that changes width between two frames is redrawn where a fresh render draws it: a glyph turning wide (VS16) does not shift the rest of its row (PRD #385 decision 6).
-- **Layer:** L1 (in-process `TerminalWidget` → ratatui's `Buffer::diff` → `CrosstermBackend<Vec<u8>>` → a vt100 parser standing in for the host terminal, `tests/render_terminal_widget.rs`).
+##### render/widget/005 — A cell that changes width between two frames is redrawn where a fresh render draws it, whether the host terminal draws an emoji-presentation (VS16) symbol two columns wide or one: a glyph turning wide does not shift the rest of its row or leave its second column stale (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` → ratatui's `Buffer::diff` → the deck's backend, `WideGlyphBackend` over `CrosstermBackend<Vec<u8>>` → a vt100 parser standing in for the host terminal, `tests/render_terminal_widget.rs`).
 - **Agent:** none.
-- **Asserts:** after drawing `☀︎AB` and then `☀️AB`, the display shows `A` and `B` in the two columns right after the sun's two, cell for cell (contents, wide continuation, inverse, underline, colours) the same as a fresh render of the second frame; the same holds for CJK, zero-width-joiner and VS16 glyphs replaced by narrow text, styled wide glyphs replaced by narrow ones (the trailing column's colour is cleared), `ｶﾞ` and `⌚︎`/`🙂︎` (widths the screen and ratatui measure differently), the sun turning narrow again, and wide-to-wide replacements.
-- **Does not assert:** how a real host terminal or font draws these sequences (the display is vt100's model); transitions in rows other than the first; scrolled-back screens.
+- **Asserts:** on a host that draws `☀️` two columns wide (vt100) and on one that draws it one column wide (vt100 reading the output without its VS16 characters, as xterm.js's Unicode 6/11 width tables draw it): after drawing `☀︎AB` and then `☀️AB`, and after `xZAB` is rewritten as `☀️AB`, `❤️AB` or `1️⃣AB`, the display is cell for cell (contents, wide continuation, inverse, underline, colours) the same as a fresh render of the second frame, so `A` and `B` are not shifted and the symbol's second column keeps nothing of the first frame; the same holds for CJK, zero-width-joiner and VS16 glyphs replaced by narrow text, styled wide glyphs replaced by narrow ones (the trailing column's colour is cleared), `ｶﾞ` and `⌚︎`/`🙂︎` (widths the screen and ratatui measure differently), the sun turning narrow again, and wide-to-wide replacements.
+- **Does not assert:** how a real host terminal or font draws these sequences (both displays are models built on vt100); transitions in rows other than the first; scrolled-back screens.
+- **Platform coverage:** mac+linux+windows.
+
+##### render/widget/006 — A selection made after a row turned wide highlights exactly the text it copied, whether the host terminal draws an emoji-presentation (VS16) symbol two columns wide or one (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam` frames → ratatui's `Buffer::diff` → `WideGlyphBackend` over `CrosstermBackend<Vec<u8>>` → the two vt100-based host displays of `render/widget/005`, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** a pane shows `xZAB`, a drag over `xZ` copies `xZ`, the row is rewritten as `☀️AB`, a click on a blank row, then a drag over `A` and `B` copies `AB`; after every frame of that sequence is drawn incrementally, the cells drawn with the selection's background on each host show `AB`, and the display matches a fresh render of the last frame.
+- **Does not assert:** a real host terminal or font; keyboard copy mode; selections spanning the wide glyph itself.
 - **Platform coverage:** mac+linux+windows.
 
 #### render/layout

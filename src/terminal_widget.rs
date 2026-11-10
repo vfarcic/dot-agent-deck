@@ -380,6 +380,9 @@ impl Widget for TerminalWidget {
                 // every later cell on the row is drawn one column right
                 // (`render/widget/005`). A forced width makes the diff skip
                 // the second column, as it does for any other wide glyph.
+                // That second column is blanked by the deck's backend
+                // (`crate::wide_glyph_backend`), for a host terminal that
+                // draws the glyph one column wide.
                 if (width > 1 || symbol.cell_width() != width)
                     && let Some(forced) = NonZeroU16::new(width)
                 {
