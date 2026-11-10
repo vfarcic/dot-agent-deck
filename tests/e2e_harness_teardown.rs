@@ -13,7 +13,7 @@
 //! recording whose provenance is not `passed` — so the panic path no longer
 //! regenerates it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::PathBuf;
 

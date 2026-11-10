@@ -9,7 +9,7 @@
 //! for the gated surface live in `tests/experimental_flag.rs` and
 //! `tests/e2e_experimental_flag.rs` (tester-owned).
 
-// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
+// Issue #322. Fast-tier, does NOT link `tests/common/lib.rs`; the ~40-line
 // crate-internal resolver is `#[path]`-included instead, at two extra test
 // executions rather than the harness's ~530. The two scratch dirs here hold a
 // throwaway `.dot-agent-deck.toml`, so they are tiny — but a file with two

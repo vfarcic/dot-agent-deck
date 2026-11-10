@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
 //! A genuine interactive Claude turn with hooks behaving like an old binary.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/hook_stale.rs"]
 mod hook_stale;
 

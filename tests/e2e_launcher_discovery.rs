@@ -58,7 +58,10 @@
 //! No operation installs in production, sets permission, supplies an empty
 //! observation, publishes an arm, or resets the Schedule. No real agent runs.
 
-mod common;
+// The fixture child is selected by its private environment before libtest
+// parses an agent's injected arguments, once the harness's pre-main set-up has
+// run. The normal test process returns from it.
+dot_agent_deck_test_harness::link!(then = live::native_entry);
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]
@@ -73,13 +76,6 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
-
-ctor::declarative::ctor! {
-    #[ctor(unsafe)]
-    fn native_fixture_entry() {
-        live::native_entry();
-    }
-}
 
 #[derive(Clone, Copy)]
 enum Route {

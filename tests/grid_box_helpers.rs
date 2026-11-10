@@ -22,7 +22,7 @@
 //! Nothing in this file spawns a PTY, a binary or a daemon, so there is no
 //! reason for it to be gated at all (review of #465, S5).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 /// Every fixture below is a real rectangle: each row's right-hand glyph sits at
 /// the same column as the top row's. `label_in_box_top_border` reads only the

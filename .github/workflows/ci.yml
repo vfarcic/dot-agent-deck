@@ -58,7 +58,23 @@ on:
   # conservative direction and it is left alone.
   merge_group:
     types: [checks_requested]
+  # Issue #2090 — a manual run of the full matrix against a pushed branch
+  # (docs/develop/ci-on-demand.md). Both inputs default to today's behaviour,
+  # so `gh workflow run ci.yml --ref <branch>` with no `-f` still runs every
+  # job. They exist so an agent's pre-PR sweep can drop the halves it already
+  # has: `build_macos=false` when its gates ran on macOS, and
+  # `linux_jobs=false` when its Linux half ran on RWX (`rwx run .rwx/ci.yml`).
+  # The inputs are read only on this event; every other event ignores them.
   workflow_dispatch:
+    inputs:
+      build_macos:
+        description: Run build-macos (the only macOS job). false skips it.
+        type: boolean
+        default: true
+      linux_jobs:
+        description: Run the Linux jobs, cross-version included. false skips them, for a sweep whose Linux half ran with `rwx run .rwx/ci.yml`.
+        type: boolean
+        default: true
 
 # Issue #1088 — cancel a superseded run only where the superseded run is waste.
 #
@@ -201,6 +217,12 @@ jobs:
           # the head, skipped its own, and nothing would run.
           SHA: ${{ github.event.pull_request.head.sha || github.sha }}
           EVENT: ${{ github.event_name }}
+          # Issue #2090: on a manual run, `linux_jobs=false` means the Linux
+          # half ran on RWX already, which is what `rwx` means here, so every
+          # job that skips for an RWX-owned pull request skips for it too.
+          # Empty on every other event. (Not `event == ... && inputs.x || ''`:
+          # a boolean `false` is falsy there and would come out empty.)
+          LINUX_JOBS: ${{ inputs.linux_jobs }}
         run: |
           backend=gha
           if [ "$EVENT" = pull_request ]; then
@@ -208,6 +230,9 @@ jobs:
               "repos/$REPO/contents/.github/ci-backend?ref=$SHA" 2>/dev/null \
               | tr -d '[:space:]' || true)
             [ "$file" = rwx ] && backend=rwx
+          fi
+          if [ "$EVENT" = workflow_dispatch ] && [ "$LINUX_JOBS" = false ]; then
+            backend=rwx
           fi
           echo "linux_backend=$backend" | tee -a "$GITHUB_OUTPUT"
       # The path classification lives in scripts/ci-changes.sh, which
@@ -255,13 +280,16 @@ jobs:
       # would download. A failure fails this job, and with it the
       # run, rather than sending every build down the placeholder path. It
       # runs only when a job here will build (the same conditions those jobs
-      # carry; `linux_backend` reads `rwx` only on a pull request, where
-      # `build-macos` does not run), so an RWX-owned or lock-only PR cannot
-      # go red over a tag it would not use. `.rwx/ci.yml`'s `backend` task
-      # runs the same script for RWX, and `.rwx/sandbox.yml`'s `version` task
-      # for the sandbox (issue #2052).
+      # carry), so an RWX-owned or lock-only PR cannot go red over a tag it
+      # would not use. `linux_backend` reads `rwx` on a pull request, where
+      # `build-macos` does not run, and on a manual run with
+      # `linux_jobs=false` (issue #2090), where `build-macos` runs only when
+      # `build_macos` is on: so under `rwx` the lookup runs for that one case.
+      # `.rwx/ci.yml`'s `backend`
+      # task runs the same script for RWX, and `.rwx/sandbox.yml`'s `version`
+      # task for the sandbox (issue #2052).
       - id: version
-        if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && steps.backend.outputs.linux_backend != 'rwx'
+        if: steps.detect.outputs.devbox_only != 'true' && steps.detect.outputs.flake_only != 'true' && (steps.backend.outputs.linux_backend != 'rwx' || (github.event_name == 'workflow_dispatch' && inputs.build_macos))
         env:
           REPO: ${{ github.repository }}
         run: |
@@ -1215,7 +1243,9 @@ jobs:
   # checkout. One test, `lifecycle/version/001`, runs a nested cold
   # `cargo build` (72-370s in CI) and had set the floor of whichever partition
   # drew it, so it runs alone in its own shard and the other four split the
-  # rest with `--partition count:N/4`. Measured on 2026-10-18 against the
+  # rest with `--partition count:N/4`. The archive holds the fast tier too, and
+  # the shards skip it: they run the `tests/e2e_*.rs` binaries and the
+  # `e2e_only…` modules (`scripts/e2e-shard.sh`, issue #2091). Measured on 2026-10-18 against the
   # single-job layout on the same commits: ~12.6 minutes to a Linux verdict
   # instead of ~20.
   e2e-build:
@@ -1371,16 +1401,16 @@ jobs:
       #
       # The archive is extracted into the checkout, so `target/` lands where the
       # tests' compile-time paths (`env!("CARGO_BIN_EXE_dot-agent-deck")`) point.
+      #
+      # What each shard selects — the `tests/e2e_*.rs` binaries and the
+      # `e2e_only…` modules, not the fast tier again — is in
+      # `scripts/e2e-shard.sh`, which `.rwx/ci.yml` calls too (issue #2091).
       - env:
           SHARD: ${{ matrix.shard }}
         run: |
-          if [ "$SHARD" = version ]; then
-            set -- -E 'test(=version_001_injected_build_env_reaches_the_binary)'
-          else
-            set -- --partition "count:$SHARD/4" -E 'not test(=version_001_injected_build_env_reaches_the_binary)'
-          fi
-          cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
-            --extract-to . --extract-overwrite --retries 1 "$@"
+          scripts/e2e-shard.sh "$SHARD" \
+            cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
+            --extract-to . --extract-overwrite --retries 1
       # Issue #564: keep THIS attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
       # `build-macos`. It matters more here than anywhere else in this file:
@@ -1436,7 +1466,9 @@ jobs:
     # contains the builds in unprivileged bubblewrap namespaces, and inside an
     # RWX task bwrap cannot set up the network namespace (measured 2026-10-22:
     # `bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted`).
-    if: needs.changes.outputs.binary == 'true'
+    # A manual run with `linux_jobs=false` skips it with the other Linux jobs
+    # (issue #2090): RWX cannot run it, and the pull request runs it anyway.
+    if: needs.changes.outputs.binary == 'true' && (github.event_name != 'workflow_dispatch' || inputs.linux_jobs)
     runs-on: ubuntu-latest
     # A cold build of one binary plus both directions' scenarios, each bounded
     # by the harness's own `--run-timeout-secs` (1200 by default).
@@ -1789,7 +1821,9 @@ jobs:
     # macOS-only defect now surfaces on `main` instead: `notify-main-red` opens
     # an issue, the merging skill's post-merge watch (`merge-pr`) owns the fix,
     # and `tag-release.yml` refuses to release a `main` this job left red.
-    if: github.event_name != 'pull_request' && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true'
+    # A manual run can skip it with `build_macos=false` (issue #2090,
+    # docs/develop/ci-on-demand.md); the input defaults to true.
+    if: github.event_name != 'pull_request' && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && (github.event_name != 'workflow_dispatch' || inputs.build_macos)
     runs-on: macos-latest
     # Line tables keep file:line in panics and backtraces and drop the rest of
     # the debug info, which is most of a test build's link time — the same

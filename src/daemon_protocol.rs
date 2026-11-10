@@ -124,6 +124,12 @@ pub use crate::hook_binary::{
     REMEDY_UPGRADE_OR_REINSTALL,
 };
 
+// Issue #1674: the kept-worktree report `AttachResponse::kept_worktree` and
+// `BroadcastMsg::WorktreeKept` carry, re-exported as a wire type so a client
+// names it through the protocol module rather than `issue_dispatch_run`, which
+// also holds the daemon's dispatch and worktree logic.
+pub use crate::issue_dispatch_run::KeptWorktree;
+
 use crate::agent_pty::{AgentPtyRegistry, AgentRecord, SpawnOptions};
 use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, is_valid_pane_id_env};
 use crate::event::{AgentType, BroadcastMsg};
@@ -4764,7 +4770,9 @@ pub struct ComposerCapDrops {
 }
 
 /// How long `observer-hold` waits for a pass already running to finish
-/// before answering that it hasn't (Q105b.2). Linux only, as its one user is.
+/// before answering that it hasn't (Q105b.2). Linux only, as its one user
+/// `e2e_composer_observer_control` is: under `e2e` on macOS it was dead code
+/// and failed CLAUDE.md rule 2's clippy there.
 #[cfg(all(feature = "e2e", target_os = "linux"))]
 const OBSERVER_HOLD_BOUND: Duration = Duration::from_secs(30);
 

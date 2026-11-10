@@ -1113,7 +1113,7 @@ fn first_durable_path_match(
 
 /// `current_exe()`, or — only under the `e2e` feature, and only once
 /// [`set_test_current_exe_override`] has been called — the injected test
-/// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/mod.rs`)
+/// override. [`spawn_inprocess_daemon`]'s test harness (`tests/common/lib.rs`)
 /// calls the setter with the built deck binary — a link to
 /// `env!("CARGO_BIN_EXE_dot-agent-deck")` outside the checkout — before driving
 /// `handle_delegate`, because a `handle_delegate` run entirely in-process
@@ -2874,21 +2874,27 @@ mod tests {
         );
     }
 
-    /// Round two, item 2: the legacy root is a literal `/tmp` unless the
-    /// `e2e`-only override names another, and an empty override is no override.
+    // Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+    // build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
     #[cfg(all(unix, feature = "e2e"))]
-    #[test]
-    fn the_legacy_endpoint_root_is_overridable_only_under_the_e2e_feature() {
-        assert_eq!(legacy_endpoint_root_from(None), Path::new("/tmp"));
-        assert_eq!(
-            legacy_endpoint_root_from(Some(std::ffi::OsString::new())),
-            Path::new("/tmp"),
-            "an empty override is treated as unset, like every other override here"
-        );
-        assert_eq!(
-            legacy_endpoint_root_from(Some(std::ffi::OsString::from("/scratch/legacy"))),
-            Path::new("/scratch/legacy")
-        );
+    mod e2e_only {
+        use super::*;
+
+        /// Round two, item 2: the legacy root is a literal `/tmp` unless the
+        /// `e2e`-only override names another, and an empty override is no override.
+        #[test]
+        fn the_legacy_endpoint_root_is_overridable_only_under_the_e2e_feature() {
+            assert_eq!(legacy_endpoint_root_from(None), Path::new("/tmp"));
+            assert_eq!(
+                legacy_endpoint_root_from(Some(std::ffi::OsString::new())),
+                Path::new("/tmp"),
+                "an empty override is treated as unset, like every other override here"
+            );
+            assert_eq!(
+                legacy_endpoint_root_from(Some(std::ffi::OsString::from("/scratch/legacy"))),
+                Path::new("/scratch/legacy")
+            );
+        }
     }
 
     /// Round two, item 3: resolution carries the arm that produced it, and a

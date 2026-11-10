@@ -3,7 +3,7 @@
 //! Shared start functions against the real daemon, with SSH commands executed
 //! by /bin/sh in an owned HOME. No SSH server or agent credential is needed.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

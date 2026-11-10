@@ -4,7 +4,7 @@
 //! No agent is started; the warning comes from the real daemon and the logs
 //! through the real export path.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[allow(dead_code)] // This target reads the receiver's raw bodies.
 mod telemetry_operation_receiver;
 

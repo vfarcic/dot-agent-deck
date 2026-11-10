@@ -7,7 +7,7 @@
 //! RED mutant. The test process owns the instance and the hook socket, which
 //! `tests/support/editor_helper_faults.py` inherits as fd 3 and answers as
 //! the daemon. No daemon, agent or user configuration.
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use dot_agent_deck::composer_probe::install::ProbeAgent;
 use dot_agent_deck::composer_probe::instance::{DaemonId, Instance};

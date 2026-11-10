@@ -2,6 +2,7 @@ import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
+import { worktreeKeptNotice, type KeptWorktree } from "./worktreeClose";
 import { agentKey, boundAgentKey } from "./agentKey";
 import { AGENT_GONE_AFTER_RESTART, AGENT_IDENTITY_UNKNOWN } from "./agentIdentity";
 import { getTerminal } from "./terminalRegistry";
@@ -580,6 +581,28 @@ export interface DesktopSettingsDto {
    * and the platform call are all in one unit.
    */
   zoom: { level: number };
+  /**
+   * Issue #2075: the `[questions]` section — `notify` is how many minutes a
+   * question may wait unanswered before the app posts one notification for it,
+   * `0` for none. **Optional for `voice`'s reason**: `undefined` is
+   * "unspecified", and `normalizeQuestionSettings` keeps it so, so a save from
+   * this webview never writes a fabricated default over the user's file.
+   * Readers take `questionNotifyAfterMinutes(settings)`.
+   */
+  questions?: QuestionSettingsDto;
+}
+
+/** Issue #2075: the `[questions]` section (`QuestionSettings` in `src-tauri/src/settings.rs`). */
+export interface QuestionSettingsDto {
+  notify: number;
+}
+
+/** What an absent `[questions]` section means: `DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES` on the Rust side. */
+export const DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES = 10;
+
+/** The minutes a question waits before its one notification, `0` for never. */
+export function questionNotifyAfterMinutes(settings: DesktopSettingsDto): number {
+  return settings.questions?.notify ?? DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES;
 }
 
 /**
@@ -1466,7 +1489,21 @@ export function normalizeDesktopSettings(value: unknown): DesktopSettingsDto {
     endpoints: normalizeEndpointSettings(record.endpoints),
     voice: normalizeVoiceSettings(record.voice),
     zoom: { level: clampZoom(zoom.level) },
+    questions: normalizeQuestionSettings(record.questions),
   };
+}
+
+/**
+ * Coerce the `[questions]` section (issue #2075), **preserving absence** for
+ * `normalizeVoiceSettings`' reason. A present section is rebuilt field by
+ * field; a `notify` that is not a whole number of minutes from 0 to the `u32`
+ * ceiling reads as the default, as Rust's deserializer would refuse it.
+ */
+function normalizeQuestionSettings(value: unknown): QuestionSettingsDto | undefined {
+  if (typeof value !== "object" || value === null) return undefined;
+  const notify = (value as Record<string, unknown>).notify;
+  const valid = typeof notify === "number" && Number.isInteger(notify) && notify >= 0 && notify <= 0xffff_ffff;
+  return { notify: valid ? notify : DEFAULT_QUESTION_NOTIFY_AFTER_MINUTES };
 }
 
 /**
@@ -1815,6 +1852,7 @@ export type DesktopRunActionDto =
  * exactly where they were.
  */
 type FleetListener = (fleet: DeckFleet) => void;
+type WorktreeKeptListener = (notice: import("./worktreeClose").WorktreeKeptNotice) => void;
 type TerminalListener = (event: TerminalChunk) => void;
 
 /**
@@ -1866,7 +1904,8 @@ export interface DeckBridge {
    * and a settings save that touched `[endpoints]` (see `saveSettings`).
    */
   connect(): Promise<DeckFleet>;
-  subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe>;
+  subscribe(onFleet: FleetListener, onTerminal: TerminalListener, onWorktreeKept?: WorktreeKeptListener): Promise<Unsubscribe>;
+  previewWorktreeClose: import("./worktreeClose").WorktreeClosePreview;
   runAction(action: DeckAction): Promise<DeckActionResult>;
   /**
    * Type into one agent's terminal, named by the composite `(deckId, agentId)`.
@@ -3837,6 +3876,10 @@ class FixtureDeckBridge implements DeckBridge {
     return fixtureDesktopFeatures();
   }
 
+  async previewWorktreeClose(): Promise<KeptWorktree | null> {
+    return null;
+  }
+
   /** PRD #1223 M4 — the named fixture deck's options, or `unsupported` for one this preview plays as older. */
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     await Promise.resolve();
@@ -4954,7 +4997,7 @@ export class TauriDeckBridge implements DeckBridge {
     return this.fleetView();
   }
 
-  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener): Promise<Unsubscribe> {
+  async subscribe(onFleet: FleetListener, onTerminal: TerminalListener, onWorktreeKept?: WorktreeKeptListener): Promise<Unsubscribe> {
     const { listen } = await import("@tauri-apps/api/event");
     this.terminalListener = onTerminal;
     this.fleetListener = onFleet;
@@ -4982,6 +5025,8 @@ export class TauriDeckBridge implements DeckBridge {
     // event produces one within the coalescing window; republishing the last
     // mapped snapshot keeps the drawer current without waiting for the next.
     const stopDaemonEvent = await listen<unknown>("desktop://daemon-event", (event) => {
+      const kept = worktreeKeptNotice(event.payload);
+      if (kept) onWorktreeKept?.(kept);
       // PRD #742 M3 stamped every payload with the deck it came from, and this
       // is the reader that stamp was for: the evidence drawer and the handoff
       // rail are the DECK SCREEN's, which DECISION 1 keeps single-deck, so an
@@ -5712,6 +5757,11 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOptions(deckId: string): Promise<NewAgentOptions> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOptions>("desktop_new_agent_options", { deckId });
+  }
+
+  async previewWorktreeClose(deckId: string, paneIds: string[], incarnation?: string): Promise<KeptWorktree | null> {
+    const invoke = await this.getInvoke();
+    return invoke<KeptWorktree | null>("desktop_worktree_close_preview", { deckId, paneIds, incarnation });
   }
 
   /** PRD #1223 M6. The deck and the path go through untouched, as for {@link listDirectories}. */

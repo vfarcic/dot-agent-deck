@@ -12,7 +12,7 @@
 //! line contains a stable check identity and one verdict token. Tests normalize
 //! whitespace/case around check identities and do not pin complete sentences.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::ffi::OsString;
 use std::os::unix::fs::PermissionsExt;

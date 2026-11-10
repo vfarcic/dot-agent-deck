@@ -26,7 +26,7 @@ use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};
 use dot_agent_deck::state::{AppState, SharedState};
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 static HARNESS_BIND_LOCK: Mutex<()> = Mutex::new(());
 

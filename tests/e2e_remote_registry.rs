@@ -3,7 +3,7 @@
 //! L2 lane-1 coverage for the shared CLI and desktop remote registry format.
 //! Both commands run the real binary against a test-owned `remotes.toml`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::Path;
 use std::process::{Command, Output, Stdio};

@@ -64,7 +64,7 @@ pub const DAEMON_START_POLL_TIMEOUT: Duration =
 
 /// e2e seam (PRD #1258): the variable an `e2e` build reads to widen
 /// [`DAEMON_START_POLL_TIMEOUT`] for [`ensure_external_daemon_or_die`], in
-/// milliseconds. The TUI harness (`tests/common/mod.rs`) sets it to the default
+/// milliseconds. The TUI harness (`tests/common/lib.rs`) sets it to the default
 /// load-scaled, because on a starved box (io stalled ~70% of the window, load
 /// 17 on 16 cores) a debug daemon measurably bound after the fixed 15 s and the
 /// deck gave up while its daemon was still healthy.
@@ -505,39 +505,45 @@ mod tests {
         );
     }
 
-    /// PRD #1258: the e2e start-bound seam only ever widens the bound, and
-    /// within a ceiling. Unset, empty and junk fall back to the default; a value
-    /// below the daemon's pre-bind budget is raised to it rather than honoured,
-    /// because shortening it would reintroduce the healthy-but-slow failure
-    /// [`attach_poll_timeout_exceeds_daemon_pre_bind_budget`] guards.
+    // Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+    // build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
     #[cfg(feature = "e2e")]
-    #[test]
-    fn daemon_start_timeout_override_parses_and_clamps() {
-        let ms = |d: Duration| d.as_millis();
-        let default = ms(DAEMON_START_POLL_TIMEOUT);
-        let max = ms(DAEMON_START_POLL_TIMEOUT_MAX);
-        for (input, expected) in [
-            (None, default),
-            (Some(""), default),
-            (Some("   "), default),
-            (Some("soon"), default),
-            (Some("-5"), default),
-            (Some("12.5"), default),
-            (Some("99999999999999999999999"), default),
-            (Some("0"), default),
-            (Some("1000"), default),
-            (Some(" 40000 "), 40_000),
-            (Some("90000"), 90_000),
-            (Some("600000"), max),
-            (Some(&*u64::MAX.to_string()), max),
-        ] {
-            assert_eq!(
-                ms(parse_daemon_start_timeout(input)),
-                expected,
-                "input {input:?}"
-            );
+    mod e2e_only {
+        use super::*;
+
+        /// PRD #1258: the e2e start-bound seam only ever widens the bound, and
+        /// within a ceiling. Unset, empty and junk fall back to the default; a value
+        /// below the daemon's pre-bind budget is raised to it rather than honoured,
+        /// because shortening it would reintroduce the healthy-but-slow failure
+        /// [`attach_poll_timeout_exceeds_daemon_pre_bind_budget`] guards.
+        #[test]
+        fn daemon_start_timeout_override_parses_and_clamps() {
+            let ms = |d: Duration| d.as_millis();
+            let default = ms(DAEMON_START_POLL_TIMEOUT);
+            let max = ms(DAEMON_START_POLL_TIMEOUT_MAX);
+            for (input, expected) in [
+                (None, default),
+                (Some(""), default),
+                (Some("   "), default),
+                (Some("soon"), default),
+                (Some("-5"), default),
+                (Some("12.5"), default),
+                (Some("99999999999999999999999"), default),
+                (Some("0"), default),
+                (Some("1000"), default),
+                (Some(" 40000 "), 40_000),
+                (Some("90000"), 90_000),
+                (Some("600000"), max),
+                (Some(&*u64::MAX.to_string()), max),
+            ] {
+                assert_eq!(
+                    ms(parse_daemon_start_timeout(input)),
+                    expected,
+                    "input {input:?}"
+                );
+            }
+            assert!(DAEMON_START_POLL_TIMEOUT_MAX > DAEMON_START_POLL_TIMEOUT);
         }
-        assert!(DAEMON_START_POLL_TIMEOUT_MAX > DAEMON_START_POLL_TIMEOUT);
     }
 
     /// Issue #1121 round two, B6: a non-primary endpoint — the pre-#1121

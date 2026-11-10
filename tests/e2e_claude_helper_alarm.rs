@@ -23,7 +23,7 @@
 //!
 //! The capture root is printed and kept under `/var/tmp`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/installed_agent.rs"]
 mod installed;
 

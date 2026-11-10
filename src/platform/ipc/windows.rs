@@ -471,6 +471,14 @@ impl IpcClient {
         Ok(())
     }
 
+    /// Issue #2075: let reads block for as long as they take, for a hold that
+    /// has no deadline. A named pipe client keeps one deadline for reads and
+    /// writes alike, so this lifts both.
+    pub fn clear_read_timeout(&self) -> io::Result<()> {
+        self.timeout_ms.store(INFINITE, Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Half-close the write side (Unix `shutdown(Shutdown::Write)`). A named pipe
     /// has no half-close primitive, so this stays a no-op.
     ///

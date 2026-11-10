@@ -405,6 +405,37 @@ fn resolve(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 thread_local! {
     static FS_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// [`with_probe_answers`]'s answers, by canonical path.
+    static PROBE_ANSWERS: std::cell::RefCell<Option<HashMap<PathBuf, Result<String, String>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with [`probe_version`] answering `answers` on this thread for those
+/// paths, without running them; any other path is probed as usual.
+///
+/// For tests of what a caller DECIDES from a probe (issue #2183): a real probe
+/// is bounded by [`HOOK_BINARY_PROBE_TIMEOUT`], and on a loaded machine a stub
+/// script's shell can take longer than that to start, so the probe fails and
+/// the test reads a decision about an unprobeable pin. The probe itself is
+/// covered by the tests that run it.
+#[cfg(test)]
+pub(crate) fn with_probe_answers<R>(
+    answers: impl IntoIterator<Item = (PathBuf, Result<String, String>)>,
+    f: impl FnOnce() -> R,
+) -> R {
+    struct Restore(Option<HashMap<PathBuf, Result<String, String>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            PROBE_ANSWERS.with(|answers| *answers.borrow_mut() = previous);
+        }
+    }
+    let answers = answers
+        .into_iter()
+        .map(|(path, answer)| (std::fs::canonicalize(&path).unwrap_or(path), answer))
+        .collect();
+    let _restore = Restore(PROBE_ANSWERS.with(|a| a.borrow_mut().replace(answers)));
+    f()
 }
 
 /// The release `binary --version` reports, run once for the same file while
@@ -421,6 +452,15 @@ thread_local! {
 /// installers call this, never a hook line's ingest.
 pub fn probe_version(binary: &Path) -> Result<String, String> {
     let canonical = resolve(binary).unwrap_or_else(|| binary.to_path_buf());
+    #[cfg(test)]
+    if let Some(answer) = PROBE_ANSWERS.with(|answers| {
+        answers
+            .borrow()
+            .as_ref()
+            .and_then(|answers| answers.get(&canonical).cloned())
+    }) {
+        return answer;
+    }
     let identity = probe_identity(&canonical);
     let started = Instant::now();
     if let Some(hit) = probe_cache()

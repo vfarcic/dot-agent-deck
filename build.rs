@@ -21,8 +21,9 @@ mod build_version_resolve;
 mod published_docs;
 
 use build_version_resolve::{
-    VersionSource, escape_for_cargo_warning, is_single_line_directive_value, normalize_build_id,
-    normalize_version, resolve_build_id, resolve_version,
+    VersionSource, build_needs_git, escape_for_cargo_warning, git_watch_names,
+    is_single_line_directive_value, normalize_build_id, normalize_version, ref_ancestor_dirs,
+    resolve_build_id, resolve_version,
 };
 
 fn main() {
@@ -56,9 +57,20 @@ fn main() {
             escape_for_cargo_warning(raw)
         );
     }
+    // A valid injection wins over the tag, so ask git for one only when
+    // there is none (issue #2072: an injected build runs no git command).
+    let tag = if injected_version
+        .as_deref()
+        .and_then(normalize_version)
+        .is_some()
+    {
+        None
+    } else {
+        git_tag()
+    };
     let version = resolve_version(
         injected_version.as_deref(),
-        git_tag().as_deref(),
+        tag.as_deref(),
         env!("CARGO_PKG_VERSION"),
     );
     if version.source == VersionSource::Placeholder {
@@ -74,10 +86,14 @@ fn main() {
     }
     emit_rustc_env("DAD_VERSION", &version.value);
 
+    // Issue #2072: with both values injected, git cannot reach either one, so
+    // ask it nothing and watch none of its files (see `build_needs_git`).
+    let use_git = build_needs_git(version.source, injected_build_id.as_deref());
+
     // PRD #103 M1.0: emit a finer-grained build identifier alongside DAD_VERSION.
     // Shape: `<DAD_VERSION>-g<short-sha>[-dirty]`, falling back to
     // `<DAD_VERSION>-unknown` when git metadata is unavailable.
-    let short_sha = git_short_sha();
+    let short_sha = if use_git { git_short_sha() } else { None };
     // Only ask git whether the tree is dirty when there is a sha to qualify;
     // without one the answer cannot reach the composed id anyway.
     let dirty = short_sha.is_some() && git_is_dirty();
@@ -120,11 +136,27 @@ fn main() {
     // shared `commondir` for packed-refs). Fall back to the literal path
     // only if `git rev-parse` fails — matches the existing degrade-to-
     // unknown discipline elsewhere in this file.
-    emit_rerun_if_changed_git_path("HEAD");
-    emit_rerun_if_changed_git_path("index");
-    emit_rerun_if_changed_git_path("packed-refs");
-    if let Some(ref_path) = parse_head_ref_path() {
-        emit_rerun_if_changed_git_path(&ref_path);
+    //
+    // Issue #2072: `git_watch_names` documents which file catches what, and
+    // why a path that does not exist is not emitted.
+    if use_git {
+        let head_ref = parse_head_ref_path();
+        for name in git_watch_names(head_ref.as_deref()) {
+            let emitted = emit_rerun_if_changed_git_path(&name);
+            // A branch whose loose ref file does not exist yet (a packed
+            // branch, or one with no commit) gets that file on its next
+            // commit or reset, creating any missing directories on the way:
+            // watch the nearest of its directories that exists.
+            if !emitted && head_ref.as_deref() == Some(name.as_str()) {
+                let existing = ref_ancestor_dirs(&name)
+                    .iter()
+                    .filter_map(|dir| resolve_git_path(dir))
+                    .find(|dir| Path::new(dir).is_dir());
+                if let Some(dir) = existing {
+                    emit_rerun_if_changed_path(Path::new(&dir));
+                }
+            }
+        }
     }
 }
 
@@ -223,10 +255,26 @@ fn emit_rustc_env(name: &str, value: &str) {
 /// shared `commondir` for `packed-refs` and `refs/heads/<branch>`.
 ///
 /// Falls back to the literal `.git/<relative>` path if `git rev-parse`
-/// fails (no git, shallow tarball, ...). Cargo's `rerun-if-changed`
-/// silently tolerates non-existent paths, so the fallback is harmless
-/// outside a real repo.
-fn emit_rerun_if_changed_git_path(relative: &str) {
+/// fails (no git, shallow tarball, ...).
+///
+/// Emits nothing for a path that does not exist (issue #2072): cargo treats a
+/// missing `rerun-if-changed` path as changed on every build, so watching one
+/// re-ran this script, and rebuilt the root crate, on every `cargo` command.
+/// Returns whether it emitted the directive.
+fn emit_rerun_if_changed_git_path(relative: &str) -> bool {
+    match resolve_git_path(relative) {
+        Some(resolved) if Path::new(&resolved).exists() => {
+            println!("cargo:rerun-if-changed={resolved}");
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `relative` resolved through `git rev-parse --git-path`, or the literal
+/// `.git/<relative>` when that fails; `None` when the result is not a single
+/// safe directive line.
+fn resolve_git_path(relative: &str) -> Option<String> {
     let resolved = Command::new("git")
         .args(["rev-parse", "--git-path", relative])
         .output()
@@ -248,9 +296,9 @@ fn emit_rerun_if_changed_git_path(relative: &str) {
         // Only reachable if `relative` itself is unsafe, which
         // `parse_head_ref_path` already rules out. Watching nothing is a
         // stale-build-id risk; emitting it is a directive-injection one.
-        return;
+        return None;
     }
-    println!("cargo:rerun-if-changed={resolved}");
+    Some(resolved)
 }
 
 /// Read `name` from the build environment, treating unset, empty and
@@ -294,8 +342,15 @@ fn git_short_sha() -> Option<String> {
     if sha.is_empty() { None } else { Some(sha) }
 }
 
+/// Is the work tree dirty? `--no-optional-locks` (issue #2072): a plain
+/// `git status` refreshes the index's stat cache and writes the index back,
+/// and the index is one of the files this script watches, so every run made
+/// the next `cargo` command see a changed index and rebuild the root crate.
 fn git_is_dirty() -> bool {
-    let Ok(output) = Command::new("git").args(["status", "--porcelain"]).output() else {
+    let Ok(output) = Command::new("git")
+        .args(["--no-optional-locks", "status", "--porcelain"])
+        .output()
+    else {
         return false;
     };
     if !output.status.success() {

@@ -469,6 +469,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
 - When `DAD_REMOTE_EXEC=rwx` is set in your environment
   (docs/develop/rwx.md): the helper already runs its cargo commands in an RWX
   sandbox, and every OTHER cargo command that compiles (a build, a
+  `cargo check` or `cargo clippy` run outside the helper, a
   `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
   filtered to a single test, since a filter narrows what runs, not what compiles) goes
   through `rwx sandbox exec -- <command>`, `cargo mutants` included (do not
@@ -479,9 +480,14 @@ GATES — CLAUDE.md is the authority, this is the summary:
   report. Anything that reaches a real agent (`cargo test-e2e-live`, or any
   command with the `e2e-live` feature) stays local.
 - The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
-  above. ci.yml carries a bare `workflow_dispatch:`, so after a push
+  above. ci.yml carries a `workflow_dispatch:`, so after a push
   `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
-  the URL that prints, not from a listing). But the helper's gates run BEFORE
+  the URL that prints, not from a listing). Sweep only the half you are
+  missing: with a working `rwx` login, `rwx run .rwx/ci.yml` runs the Linux
+  half on RWX and `-f linux_jobs=false` dispatches build-macos alone (for
+  when your gates did not run on macOS); without one, pass
+  `-f build_macos=false` when your gates ran `cargo test-fast` on macOS and
+  the change leaves build-macos's own job alone. Both default to true. But the helper's gates run BEFORE
   a commit exists, so they have already passed by the time there is anything
   to dispatch, and the helper stays the per-task gate. What a dispatch
   buys is the part no local gate covers at all — build-macos,
@@ -557,37 +563,32 @@ with REVIEWS=complete or REVIEWS=incomplete. Run it again after your LAST
 push: Greptile reviews only when the PR opens (greptile.json sets
 triggerOnUpdates: false), but Qodo re-reviews EVERY push (.pr_agent.toml), so
 a fix push can raise new findings. The findings live ONLY at
-`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; a green check
-and the apps' summary comments carry none of them, except Qodo's
-informational tier, which stays in its "Code Review by Qodo" issue comment
-(inline_comments_severity_threshold = 2), so read both. Keep the
---paginate: replies count toward the page, so without it a busy PR silently
-truncates the findings you are about to answer. Reply on each thread — what
-you fixed, or why you did not — AND RESOLVE THE THREAD, BEFORE you notify and
-stop. Resolving is half the job: an unresolved thread blocks the merge button
+`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate` and in the
+apps' summary comments: Qodo's "Code Review by Qodo" issue comment lists its
+findings, and its informational tier lives only there
+(inline_comments_severity_threshold = 2); Greptile's summary lists its
+findings too. A green check carries none of them. Keep the --paginate:
+replies count toward the page, so without it a busy PR silently truncates the
+findings you are about to answer. Reply on each thread — what you fixed, or
+why you did not — AND RESOLVE THE THREAD; answer a summary item that has no
+thread in a PR comment quoting its title. After your last wait-reviews.sh,
+`.claude/skills/pr-create/unanswered-findings.sh <pr>` must print
+FINDINGS=answered, BEFORE you notify and stop; put its UNANSWERED_COUNT= in
+your report (issue #2081). Resolving is half the job: an unresolved thread blocks the merge button
 AND the approval the merge needs, so a PR with every finding fixed still sits
 (PR #1035 sat a day that way). REVIEWS=incomplete is a result, not a reason
 to keep waiting: an app that is out of quota produces nothing at all, so
 report which review was not obtained and go on. Do not defer it to the merge: this run stops
-before merge, and an armed auto-merge PR lands the moment the approval arrives,
-so a finding left for "before merging" is read by nobody. Measured on PR #869:
+before merge, so a finding left for "before merging" is read by nobody. Measured on PR #869:
 five findings, two P1, unanswered through 3h45m of further commits.
 
 STOP CONDITION: open the PR, request review from the other maintainer with
 `gh pr create --reviewer <OTHER>`, and STOP. Do not merge. Per CLAUDE.md rule 8
 nobody merges their own unapproved PR, and for an admin account that would
-succeed silently rather than fail. You may arm auto-merge; you may not press it.
-BUT --auto waits only for the REQUIRED checks and the review rule, so a
-non-required check that is still pending does NOT hold it. Armed here, before
-the approval, the PR reads BLOCKED and gh arms it normally (`autoMergeRequest`
-is set, so nothing looks wrong); GitHub then merges the moment the approval
-lands, whether or not that check has passed. PR #1208 landed a lockfile update
-inside Renovate's renovate/stability-days window by the same gap. So read
-`gh pr checks <n>` before arming, and if an unrequired check is pending and
-matters, leave the PR DISARMED rather than arming it. Auto-merge also runs no
-overlap check (.claude/skills/merge-pr/SKILL.md, "The overlap check before a
-merge") and no watch of main's CI run after the merge: it merges on whatever CI the PR has when the approval lands, even if
-`main` has changed the PR's files since.
+succeed silently rather than fail. Do not arm auto-merge either (CLAUDE.md
+rule 8): it would merge the moment the approval lands, with nobody present to
+run the overlap check (.claude/skills/merge-pr/SKILL.md) or to watch main's CI
+run for the merge.
 ```
 
 ### 8b — The `--orchestration` task
@@ -642,8 +643,11 @@ lifecycle, and it covers what /prd-full does not.
   optional. Send with `scripts/notify.sh "<message>"`; it enforces the explicit
   chat_id and has no inbound path, so those two rules hold by construction.
 - The full matrix can run on GitHub's runners, and it is yours to pass on.
-  ci.yml carries a bare `workflow_dispatch:`, so after a push
-  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there. It
+  ci.yml carries a `workflow_dispatch:`, so after a push
+  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there; sweep
+  only the half that is missing (`rwx run .rwx/ci.yml` for Linux,
+  `-f linux_jobs=false` or `-f build_macos=false` on the dispatch, per
+  docs/develop/ci-on-demand.md's table). It
   relieves NO gate a worker owes: `cargo xtask affected-checks --run` is the
   gate before a commit exists, so whatever it selected has already passed by
   the time there is anything to dispatch. What it buys is the part no local

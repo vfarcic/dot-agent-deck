@@ -8,7 +8,7 @@
 //! `devbox run agent`: a launcher whose name reveals no agent, which says what
 //! it runs only through its own hook.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::process::Output;

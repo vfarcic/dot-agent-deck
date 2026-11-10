@@ -787,13 +787,14 @@ impl PendingQuestion {
 // ---------------------------------------------------------------------------
 
 /// The table options for `menu` that apply under `when`, as question options
-/// numbered from `first_index`. A table that does not cover `version` lists its
-/// options keyboard-only: the labels are still the best the deck knows, but
-/// it does not send keys or decisions it has not verified.
+/// numbered from `first_index`. When answers are typed, a table that does not
+/// cover `version` lists its options keyboard-only. Held hook decisions and
+/// plugin replies keep their answerability independently of menu keystrokes.
 fn table_options(
     tables: Option<&QuestionTables>,
     menu: MenuKind,
     version: Option<(u64, u64, u64)>,
+    channel: AnswerChannel,
     first_index: u32,
     when: &dyn Fn(TableWhen) -> bool,
     fill: &dyn Fn(&str) -> String,
@@ -801,7 +802,8 @@ fn table_options(
     let Some(tables) = tables else {
         return Vec::new();
     };
-    let covered = tables.covers(version);
+    let covered = version.is_none_or(|v| v >= tables.verified_from)
+        && (channel != AnswerChannel::Keys || tables.covers(version));
     tables
         .menu(menu)
         .iter()
@@ -1135,8 +1137,7 @@ fn claude_offers_auto_mode(tool_name: &str, permission_mode: Option<&str>) -> bo
 ///   `permission_mode`, Claude's keyboard-only "Yes, and switch to auto mode",
 ///   and No; held.
 ///
-/// `version` is the Claude Code version when known; the hook does not know it,
-/// and passes `None`.
+/// `version` is the Claude Code version when known, probed by the hook.
 #[allow(clippy::too_many_arguments)]
 pub fn claude_permission_request(
     id: String,
@@ -1169,6 +1170,7 @@ pub fn claude_permission_request(
                                 tables,
                                 MenuKind::ChoiceAppended,
                                 version,
+                                AnswerChannel::Held,
                                 next,
                                 &|_| true,
                                 &no_fill,
@@ -1212,7 +1214,15 @@ pub fn claude_permission_request(
             }
         }
         "ExitPlanMode" => {
-            let options = table_options(tables, MenuKind::Plan, version, 1, &|_| true, &no_fill);
+            let options = table_options(
+                tables,
+                MenuKind::Plan,
+                version,
+                AnswerChannel::Keys,
+                1,
+                &|_| true,
+                &no_fill,
+            );
             BuiltQuestion {
                 question: PendingQuestion {
                     id,
@@ -1250,6 +1260,7 @@ pub fn claude_permission_request(
                 tables,
                 MenuKind::Permission,
                 version,
+                AnswerChannel::Held,
                 1,
                 &|when| {
                     when == TableWhen::Always
@@ -1402,6 +1413,7 @@ pub fn codex_permission_request(
         tables,
         MenuKind::Permission,
         version,
+        AnswerChannel::Keys,
         1,
         &|_| true,
         &|s: &str| s.to_string(),
@@ -1483,6 +1495,7 @@ pub fn codex_request_user_input(
                 tables,
                 MenuKind::ChoiceAppended,
                 version,
+                AnswerChannel::Keys,
                 next,
                 &|_| true,
                 &|s: &str| s.to_string(),
@@ -1540,6 +1553,7 @@ pub fn devin_permission_request(
         tables,
         MenuKind::Permission,
         version,
+        AnswerChannel::Keys,
         1,
         &|_| true,
         &|s: &str| s.to_string(),
@@ -1603,6 +1617,7 @@ pub fn opencode_permission_asked(props: &Value, raised_at_ms: i64) -> Option<Pen
         tables,
         MenuKind::Permission,
         None,
+        AnswerChannel::Held,
         1,
         &|_| true,
         &|s: &str| s.to_string(),
@@ -1684,6 +1699,7 @@ pub fn opencode_question_asked(props: &Value, raised_at_ms: i64) -> Option<Pendi
                     tables,
                     MenuKind::ChoiceAppended,
                     None,
+                    AnswerChannel::Held,
                     next,
                     &|_| true,
                     &|s: &str| s.to_string(),

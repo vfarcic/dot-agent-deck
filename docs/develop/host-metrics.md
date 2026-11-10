@@ -4,7 +4,7 @@ PRD #1258 (complete; the PRD is `prds/done/1258-resource-aware-decks.md`). The d
 
 ## The sampler
 
-`src/host_metrics.rs` owns it. It is also the only place in the tree that reads the load average: `machine_load_per_cpu` used to exist twice, in `src/test_budget.rs` and in `tests/common/mod.rs`, and issue #1245 had to teach each copy macOS separately. Both now call this module (M2). A new caller should import from here rather than reading `/proc/loadavg` itself.
+`src/host_metrics.rs` owns it. It is also the only place in the tree that reads the load average: `machine_load_per_cpu` used to exist twice, in `src/test_budget.rs` and in `tests/common/lib.rs`, and issue #1245 had to teach each copy macOS separately. Both now call this module (M2). A new caller should import from here rather than reading `/proc/loadavg` itself.
 
 The reply's wire shape (`HostMetrics`, `DiskUsage`, the three `ROLE_*` names) and the client's size bounds (`MAX_DISK_ROLES`, `MAX_ROLE_BYTES`, `HostMetrics::within_reply_bounds`) live in `src/daemon_protocol.rs`, not here. Linkage-check rule 12 (`xtask/linkage-check/src/desktop_project_boundary.rs`) allows the desktop crate to name `daemon_protocol` and `daemon_client` but not `host_metrics`, which reads `/proc` and calls `statvfs`; keeping the types with the protocol lets the desktop decode and bound the reply without the boundary being widened to the sampler.
 

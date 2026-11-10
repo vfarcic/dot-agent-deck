@@ -10,7 +10,7 @@
 //! Both tests are local-only, flaky-tolerant pre-PR e2es. They intentionally
 //! have no reel marker because PRD #249 is a bug fix rather than a showcase.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_view.rs"]

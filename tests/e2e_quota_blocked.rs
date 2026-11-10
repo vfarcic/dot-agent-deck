@@ -3,7 +3,7 @@
 //! Attached-TUI coverage for quota-blocked agent cards and delegation.
 //! These agent commands are local stand-ins; no provider credential is used.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod view;
 

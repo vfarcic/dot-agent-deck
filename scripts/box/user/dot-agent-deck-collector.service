@@ -1,0 +1,11 @@
+[Unit]
+Description=dot-agent-deck per-run resource collector
+
+[Service]
+ExecStart=%h/.local/bin/dot-agent-deck-collector
+EnvironmentFile=%h/.config/dot-agent-deck/collector.env
+Nice=10
+Restart=on-failure
+
+[Install]
+WantedBy=default.target

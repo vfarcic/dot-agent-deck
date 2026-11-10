@@ -20,7 +20,7 @@
 //! What it watches is filter-mode text, which only grows, so each key has a
 //! check of its own that no earlier key can satisfy.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

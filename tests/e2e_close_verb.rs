@@ -4,7 +4,7 @@
 //! and attached TUI. The pane probes record their own minted identities outside
 //! the checkout; tokens are never printed or included in assertion diagnostics.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
