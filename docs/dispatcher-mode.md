@@ -55,6 +55,8 @@ dot-agent-deck dispatch <name> --task-file <file> --command "devbox run oc-big" 
 
 The unit's pane then runs that command, in the unit's own copy of the repository, and its card shows that agent, in the TUI and in the desktop app alike: the choice is made in the dispatcher's conversation, which works the same in both. The task it gets is the same as without the flags. A choice of agent or command always starts one agent, so the dispatcher does not ask about the shape for that unit. The dispatcher uses these flags only when you ask for a particular agent or command; otherwise units run what the dispatcher runs.
 
+A single-agent unit that runs Claude Code starts with Claude Code's prompt suggestions off, since nobody types into its pane; the dispatcher keeps them. A unit started as an orchestration follows [the orchestration rule](orchestration.md#prompt-suggestions-are-off-in-workers): its workers have them off and its orchestrator keeps them.
+
 ### Write the request so the unit can act on it
 
 - **The task must stand on its own.** The unit is a fresh agent that cannot see the dispatcher's conversation. State the goal and the expected outcome.

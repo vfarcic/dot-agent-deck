@@ -14322,6 +14322,9 @@ impl AgentPtyRegistry {
             }),
             _ => None,
         };
+        // Issue #2094: a worker role or a dispatched single agent has nobody
+        // typing into it, so Claude Code's prompt suggestions are turned off.
+        crate::unattended_pane::apply(&mut opts.env, tab_membership.as_ref(), opts.origin);
         let (preallocated_id, reservation) = self.reserve_spawn(
             &pane_id_env,
             &hook_token_for_record,
@@ -25187,6 +25190,96 @@ mod spawn_tests {
             std::thread::sleep(Duration::from_millis(25));
         }
         panic!("child never reported its DOT_AGENT_DECK_SOCKET");
+    }
+
+    /// What a child spawned with `membership` and `origin` sees as
+    /// `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION`, `<unset>` when absent.
+    fn child_observed_prompt_suggestion(
+        registry: &Arc<AgentPtyRegistry>,
+        pane_id: &str,
+        membership: Option<TabMembership>,
+        origin: Option<crate::hook_provenance::InstanceOrigin>,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("suggestion.txt");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s\" \"${{{}:-<unset>}}\" > {}'",
+                    crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION,
+                    out.display()
+                )),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: membership,
+                origin,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its prompt-suggestion setting");
+    }
+
+    /// Scenario: issue #2094. An orchestration worker role and a dispatched
+    /// single-agent pane are spawned with Claude Code's prompt suggestions off;
+    /// the orchestrator seat and a plain pane get nothing from the deck, so they
+    /// see whatever the daemon itself inherited.
+    #[test]
+    fn spawn_agent_turns_prompt_suggestions_off_only_in_unattended_panes() {
+        use crate::hook_provenance::InstanceOrigin;
+        let role = |is_start_role: bool| TabMembership::Orchestration {
+            name: "team".to_string(),
+            role_index: if is_start_role { 0 } else { 1 },
+            role_name: if is_start_role {
+                "orchestrator"
+            } else {
+                "coder"
+            }
+            .to_string(),
+            is_start_role,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("o-2094".to_string()),
+        };
+        let inherited = std::env::var(crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION)
+            .unwrap_or_else(|_| "<unset>".to_string());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let worker = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-worker",
+            Some(role(false)),
+            Some(InstanceOrigin::Direct),
+        );
+        let dispatched = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-dispatched",
+            None,
+            Some(InstanceOrigin::Dispatched),
+        );
+        let orchestrator = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-orchestrator",
+            Some(role(true)),
+            Some(InstanceOrigin::Dispatched),
+        );
+        let plain = child_observed_prompt_suggestion(&registry, "pane-2094-plain", None, None);
+        registry.shutdown_all();
+        assert_eq!(worker, "false", "a worker role has nobody typing into it");
+        assert_eq!(
+            dispatched, "false",
+            "a dispatched unit has nobody typing into it"
+        );
+        assert_eq!(
+            orchestrator, inherited,
+            "the orchestrator seat is left alone"
+        );
+        assert_eq!(plain, inherited, "a plain pane is left alone");
     }
 
     #[test]

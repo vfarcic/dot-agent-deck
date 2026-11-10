@@ -3400,10 +3400,19 @@ mod tests {
             dir.path(),
             "hung",
             &format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                "#!/bin/sh\n[ \"$1\" = warm ] && exit 0\necho $$ > '{}'\nexec sleep 30\n",
                 pidfile.display()
             ),
         );
+        // Run the fresh stub once, untimed, so macOS's first-launch scan of a
+        // just-written executable (#2183) is over before the one-second probe:
+        // under load it outlasted the deadline and the stub was killed before
+        // it wrote its pid.
+        let warmed = std::process::Command::new(&stub)
+            .arg("warm")
+            .status()
+            .expect("run the stub once");
+        assert!(warmed.success(), "warming the stub failed: {warmed}");
         take_probe_events();
         FAIL_REAPER_SPAWN.with(|seam| seam.set(true));
         let result = run_probe(Path::new(&stub), Duration::from_secs(1));

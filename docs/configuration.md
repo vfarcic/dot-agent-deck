@@ -324,6 +324,8 @@ Agent messages use an inbox in both clients; no readiness delay or forced submis
 
 The deck puts these in each agent's environment; you do not set them. `DOT_AGENT_DECK_PANE_ID` names the pane and `DOT_AGENT_DECK_PANE_CAPABILITY` carries the token that lets that pane's `work-done`, `delegate`, `dispatch` and status updates be accepted. Running those commands in a shell the deck did not start (a plain terminal, or a tool that strips the environment) fails because these are missing; see [Orchestration](orchestration.md) and [Troubleshooting](troubleshooting.md).
 
+In a pane nobody types into (an orchestration worker, or a single-agent unit started by `dispatch`) the deck also sets `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, which turns off Claude Code's prompt suggestions there: each one costs a model request, and no one is reading that pane to accept it. The orchestrator, a dispatcher and the panes you open yourself keep Claude Code's own setting. Other agents read nothing under that name.
+
 ## `desktop.toml` reference
 
 The desktop app keeps its settings in `desktop.toml`, beside the TUI's files: `~/.config/dot-agent-deck/desktop.toml` on macOS and Linux, or the path in `DOT_AGENT_DECK_DESKTOP_CONFIG`. The app writes it as you change **Settings**, and you can also edit it by hand while the app is closed. The TUI's `config.toml` and `keybindings.toml` do not configure the app, except that the app gets `default_command` and `default_dir` from the daemon, which reads them from `config.toml` on its host. [Desktop app → Settings](desktop/settings.md) describes the screen.

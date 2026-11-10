@@ -12778,8 +12778,14 @@ const cleanup = await mod.setup(api);
 for (let n = 1; n <= 20; n++) {{
   handlers.get("form.created")?.({{ type: "form.created", data: {{ form: {{ id: "frm_" + n, sessionID: "s1", title: "Q" + n, fields: [{{ key: "ok", type: "boolean" }}] }} }} }});
 }}
-await sleep(1500);
 const count = () => execSync("ps -eo args").toString().split(String.fromCharCode(10)).filter((l) => l.includes("sleep 39")).length;
+// Poll rather than sleep a fixed span: on a loaded host the sixteen recorder
+// launches can take longer than any fixed wait. Then settle, so a cap that
+// let a seventeenth through would have time to show it.
+for (let waited = 0; waited < 20000 && count() < 16; waited += 100) {{
+  await sleep(100);
+}}
+await sleep(500);
 const held = count();
 cleanup?.();
 await sleep(500);

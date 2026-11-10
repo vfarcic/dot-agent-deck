@@ -229,6 +229,8 @@ mod test_paths;
 mod test_pty_wait;
 pub mod turn_reply;
 pub mod ui;
+// Issue #2094: what the deck sets for an agent in a pane nobody types into.
+pub mod unattended_pane;
 // Issue #670: the one implementation of the control-character / Unicode-bidi
 // filter applied to producer-supplied strings before they reach a terminal.
 pub mod untrusted_text;
