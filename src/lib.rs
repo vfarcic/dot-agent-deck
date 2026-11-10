@@ -163,6 +163,8 @@ pub mod project_config;
 // there is for files this process wrote, and this one is for a path a caller
 // selected over the attach socket.
 pub mod project_resolve;
+// PRD #1885: remembered approvals of a project's orchestration commands and prompts.
+pub mod project_trust;
 // Issue #1884: the bounded macOS retry of PTY allocation.
 pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
@@ -182,6 +184,8 @@ pub mod report_recovery;
 pub mod retained_store;
 pub mod roles_cli;
 pub mod schedule_cli;
+// PRD #1885: a schedule's last fire, when it was refused as not approved.
+pub mod schedule_outcome;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;
 pub mod self_upgrade;
@@ -227,6 +231,8 @@ mod test_paths;
 // deterministic were private to one of them.
 #[cfg(test)]
 mod test_pty_wait;
+// PRD #1885: `dot-agent-deck trust list | approve | revoke`.
+pub mod trust_cli;
 pub mod turn_reply;
 pub mod ui;
 // Issue #670: the one implementation of the control-character / Unicode-bidi

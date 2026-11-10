@@ -543,6 +543,25 @@ pub async fn run_issue_dispatch(
         return;
     }
 
+    // PRD #1885: an orchestration this clone's config would open runs only when
+    // its text is the approved text — checked HERE, before any issue's worktree
+    // is created and so before its devbox warm-up runs anything the default
+    // branch configured. The clone was just brought up to the default branch,
+    // which is what each issue's new branch is cut from. The spawn checks the
+    // worktree's own read again before starting anything.
+    {
+        let config = crate::spawn::load_config_for_dir(&clone_dir);
+        if let Some(chosen) = config
+            .as_ref()
+            .and_then(|c| crate::project_config::default_orchestration(c, &clone_dir))
+            && crate::spawn::refuse_unless_approved(&clone_dir, chosen.config, task_name, notifier)
+                .await
+                .is_err()
+        {
+            return;
+        }
+    }
+
     // Enumerate open issues. The `--limit` in the argv is advisory; cap in code.
     let issues = match list_open_issues(cfg).await {
         Ok(v) => v,

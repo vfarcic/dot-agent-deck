@@ -7549,6 +7549,19 @@ mod tests {
     // PRD #1223 M6 — orchestrations from the New agent dialog
     // -----------------------------------------------------------------------
 
+    /// PRD #1885: approve every orchestration of the config in `project`,
+    /// through the real store API, in a store private to this test process —
+    /// the daemon these tests run in-process prepares only an approved
+    /// orchestration, and they are about the launch, not the approval.
+    #[cfg(unix)]
+    fn approve_project(project: &std::path::Path) {
+        use dot_agent_deck::project_trust::{TrustStore, approve_all};
+        static STORE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let store = STORE.get_or_init(|| tempfile::tempdir().expect("mint the trust store dir"));
+        let _ = TrustStore::use_state_dir_for_this_process(store.path().to_path_buf());
+        approve_all(&TrustStore::default_location(), project).expect("approve the fixture config");
+    }
+
     /// A project under `root` whose one orchestration, `m6`, has a Pi start
     /// role and an OpenCode worker — both DECLARED on `sh` stand-ins, so the
     /// deck's use of the declaration is observable — and whose commands each
@@ -7577,7 +7590,9 @@ agent = "opencode"
 "#,
         )
         .expect("write the project config");
-        std::fs::canonicalize(&project).expect("canonicalize the project")
+        let project = std::fs::canonicalize(&project).expect("canonicalize the project");
+        approve_project(&project);
+        project
     }
 
     /// PRD #1223 audit V4: the same project with the orchestration name
@@ -7617,7 +7632,9 @@ start = true
 "#,
         )
         .expect("write the project config");
-        std::fs::canonicalize(&project).expect("canonicalize the project")
+        let project = std::fs::canonicalize(&project).expect("canonicalize the project");
+        approve_project(&project);
+        project
     }
 
     #[cfg(unix)]

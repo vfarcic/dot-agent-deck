@@ -925,6 +925,20 @@ pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 /// directory on every platform this builds for.
 pub const CAP_LAST_COMMAND: &str = "last-command";
 
+/// Capability string for PRD #1885's approval of a project's orchestration
+/// commands and prompts: [`AttachRequest::ProjectTrustState`] and
+/// [`AttachRequest::ApproveProjectTrust`] — one feature, so one string.
+///
+/// Both are new request variants that every sender withholds until the daemon
+/// names this (CLAUDE.md rule 18's second rung), so no `PROTOCOL_VERSION` bump:
+/// an older daemon has no such variants and would refuse them with the generic
+/// `malformed request: …`. Held by
+/// [`crate::daemon_client::DaemonClient::project_trust_state`] and
+/// [`crate::daemon_client::DaemonClient::approve_project_trust`], so no call
+/// site checks it itself. Advertised on every platform: neither dispatch arm is
+/// `#[cfg]`-gated.
+pub const CAP_PROJECT_TRUST: &str = "project-trust";
+
 /// Capability string for [`AttachRequest::PostMessage`] (PRD #1666): a client
 /// hands a deck-generated message — a seed, an orchestrator's role context, the
 /// configuration prompt — to the daemon's inbox instead of typing it into the
@@ -1343,6 +1357,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
     CAP_ADDRESSED_MESSAGE_AGENT,
+    CAP_PROJECT_TRUST,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1368,6 +1383,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
     CAP_ADDRESSED_MESSAGE_AGENT,
+    CAP_PROJECT_TRUST,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1834,6 +1850,25 @@ pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
 /// [`PROJECT_ERR_STALE_REVISION`], so a caller holding a stale revision is told
 /// to resolve again first.
 pub const PROJECT_ERR_AMBIGUOUS_ORCHESTRATION: &str = "ambiguous-orchestration";
+
+/// PRD #1885: the project resolved and defines the orchestration, but its
+/// commands and prompts are not approved — never, or not as they now read — so
+/// nothing was published and no token issued.
+///
+/// A client that advertises nothing new still shows the sentence after the
+/// code, which names the orchestration, the project and the
+/// `dot-agent-deck trust approve` command that approves it. A client that
+/// recognises the code asks the user instead, through
+/// [`AttachRequest::ProjectTrustState`] and [`AttachRequest::ApproveProjectTrust`]
+/// (withheld unless the daemon advertises [`CAP_PROJECT_TRUST`]), and prepares
+/// again once approved. Refused after [`PROJECT_ERR_STALE_REVISION`] and
+/// [`PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`], before anything is written.
+pub const PROJECT_ERR_NOT_APPROVED: &str = "not-approved";
+
+/// PRD #1885: an [`AttachRequest::ApproveProjectTrust`] carried the digest of
+/// text that is no longer what the config says, so nothing was approved. The
+/// remedy is to fetch the trust state again and show the user the new text.
+pub const PROJECT_ERR_TRUST_TEXT_CHANGED: &str = "trust-text-changed";
 
 /// Issue #1233 item 4: the daemon did not finish a
 /// [`AttachRequest::PrepareOrchestration`] within
@@ -3018,6 +3053,42 @@ pub enum AttachRequest {
     SeedLastCommand {
         command: String,
     },
+    /// PRD #1885: the trust state of orchestration `orchestration` of the
+    /// project config in `path` — whether its commands and prompts are the
+    /// approved text, the full text of every role (command, description,
+    /// prompt, and the other recorded fields), which roles changed, and a
+    /// SHA-256 digest of exactly that text. A client shows it to the user before
+    /// it starts the orchestration, and approves with
+    /// [`Self::ApproveProjectTrust`] carrying the digest.
+    ///
+    /// It hands back config CONTENT (the commands themselves), which
+    /// [`Self::ResolveProject`] deliberately withholds; showing that text is the
+    /// point of the prompt. Any peer that reaches this socket already runs as the
+    /// daemon's user (see [`Self::StartAgent`]'s trust-boundary note).
+    ///
+    /// The reply rides back on [`AttachResponse::project_trust`]. **Withheld
+    /// unless the daemon advertises [`CAP_PROJECT_TRUST`]**: an older daemon has
+    /// no such variant.
+    ProjectTrustState {
+        /// An absolute path to the directory holding `.dot-agent-deck.toml`.
+        path: String,
+        orchestration: String,
+    },
+    /// PRD #1885: approve orchestration `orchestration` of the project config in
+    /// `path`, but only if its text still hashes to `digest` — the digest of the
+    /// text [`Self::ProjectTrustState`] showed — so the daemon records exactly
+    /// what the user saw. A digest that no longer matches is refused with
+    /// [`PROJECT_ERR_TRUST_TEXT_CHANGED`] and records nothing. On success the
+    /// reply's [`AttachResponse::project_trust`] is the new state.
+    ///
+    /// The hook socket has no verb that approves: only a client, on a user's
+    /// answer, and the `dot-agent-deck trust approve` CLI do. **Withheld unless
+    /// the daemon advertises [`CAP_PROJECT_TRUST`]**.
+    ApproveProjectTrust {
+        path: String,
+        orchestration: String,
+        digest: String,
+    },
     /// PRD #1666: post a deck-generated message to `pane_id`'s inbox, bound to
     /// `expected_agent_id` (the pane's live agent when omitted). The reply
     /// carries the message id on [`AttachResponse::id`]; a refusal (no such
@@ -3824,6 +3895,11 @@ pub struct AttachResponse {
     /// basis as [`Self::projects`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<crate::event::ResolvedProject>,
+    /// PRD #1885: the answer to [`AttachRequest::ProjectTrustState`] and
+    /// [`AttachRequest::ApproveProjectTrust`]. `None` on every other response
+    /// and on a refusal. Additive + optional, like [`Self::project`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_trust: Option<crate::project_trust::ProjectTrustView>,
     /// PRD #819 M2 / issue #1045: the answer to
     /// [`AttachRequest::PrepareOrchestration`]. `None` on every other response,
     /// and on a preparation that failed — a failed preparation publishes
@@ -8124,6 +8200,85 @@ async fn handle_connection(
             };
             write_resp(&mut stream, &resp).await?
         }
+        // PRD #1885: what a client shows before it starts an orchestration, and
+        // the approval it records on the user's answer. Both read the config
+        // through the bounded project reader, on the bounded project pool.
+        AttachRequest::ProjectTrustState {
+            path,
+            orchestration,
+        } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => project_trust_reply(
+                    crate::project_resolve::run_bounded(move || {
+                        let dir = trust_config_dir(&path)?;
+                        let config = read_trust_config(&dir)?;
+                        let approvals = crate::project_trust::TrustStore::default_location()
+                            .load()
+                            .map_err(crate::project_trust::TrustError::Store)?;
+                        crate::project_trust::inspect_config(
+                            &approvals,
+                            &dir,
+                            &config,
+                            &orchestration,
+                        )
+                        .map(|check| check.view())
+                    })
+                    .await,
+                ),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::ApproveProjectTrust {
+            path,
+            orchestration,
+            digest,
+        } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => project_trust_reply(
+                    crate::project_resolve::run_bounded(move || {
+                        let dir = trust_config_dir(&path)?;
+                        let store = crate::project_trust::TrustStore::default_location();
+                        match crate::project_trust::approve_if_unchanged_with(
+                            &store,
+                            &dir,
+                            &orchestration,
+                            &digest,
+                            &read_trust_config,
+                        )? {
+                            crate::project_trust::ApproveOutcome::Approved => {
+                                tracing::info!(
+                                    project = %dir.display(),
+                                    orchestration = %orchestration,
+                                    "a client approved the orchestration's commands and prompts"
+                                );
+                                let approvals = store
+                                    .load()
+                                    .map_err(crate::project_trust::TrustError::Store)?;
+                                let config = read_trust_config(&dir)?;
+                                crate::project_trust::inspect_config(
+                                    &approvals,
+                                    &dir,
+                                    &config,
+                                    &orchestration,
+                                )
+                                .map(|check| check.view())
+                            }
+                            crate::project_trust::ApproveOutcome::Stale => {
+                                Err(crate::project_trust::TrustError::Config(format!(
+                                    "{PROJECT_ERR_TRUST_TEXT_CHANGED}: the orchestration's \
+                                     commands or prompts changed since they were shown, so \
+                                     nothing was approved; show the new text and ask again"
+                                )))
+                            }
+                        }
+                    })
+                    .await,
+                ),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
         // Issue #1540: set the deck's last command only if it has none. `ok`
         // whether or not it was taken — the caller has nothing to do either way.
         AttachRequest::SeedLastCommand { command } => {
@@ -8525,6 +8680,65 @@ fn sole_valid_pane_id_under(env: &[(String, String)], case_insensitive: bool) ->
         return None;
     }
     Some(value)
+}
+
+/// PRD #1885: the canonical directory a trust request names.
+fn trust_config_dir(path: &str) -> Result<std::path::PathBuf, crate::project_trust::TrustError> {
+    crate::project_resolve::canonicalize_project_dir(std::path::Path::new(path)).map_err(|_| {
+        crate::project_trust::TrustError::Config(format!(
+            "{PROJECT_ERR_UNRESOLVED}: that path is not a project directory"
+        ))
+    })
+}
+
+/// PRD #1885: read a trust request's config through the bounded project reader.
+/// Its errors are reduced to one sentence: the path is client-selected, and the
+/// parser's message quotes file content.
+fn read_trust_config(
+    dir: &std::path::Path,
+) -> Result<crate::project_config::ProjectConfig, crate::project_trust::TrustError> {
+    crate::project_resolve::read_project_config(dir).map_err(|e| {
+        warn!(project = %dir.display(), reason = %e, "project trust: the config did not read");
+        crate::project_trust::TrustError::Config(format!(
+            "{PROJECT_ERR_UNRESOLVED}: that project's config could not be read"
+        ))
+    })
+}
+
+/// PRD #1885: the reply to a trust request.
+fn project_trust_reply(
+    outcome: Result<
+        Result<crate::project_trust::ProjectTrustView, crate::project_trust::TrustError>,
+        crate::project_resolve::ProjectResolveError,
+    >,
+) -> AttachResponse {
+    match outcome {
+        Ok(Ok(view)) => {
+            let mut resp = AttachResponse::ok();
+            resp.project_trust = Some(view);
+            resp
+        }
+        Ok(Err(crate::project_trust::TrustError::Config(message))) => AttachResponse::err(message),
+        Ok(Err(crate::project_trust::TrustError::NoOrchestration { .. })) => {
+            AttachResponse::err(crate::project_resolve::no_such_orchestration_refusal())
+        }
+        Ok(Err(crate::project_trust::TrustError::NoConfig(_))) => AttachResponse::err(format!(
+            "{PROJECT_ERR_UNRESOLVED}: that directory holds no project config"
+        )),
+        Ok(Err(crate::project_trust::TrustError::Store(e))) => {
+            warn!(reason = %e, "project trust: the approval store could not be used");
+            AttachResponse::err(format!(
+                "{PROJECT_ERR_UNRESOLVED}: the approval store could not be read or written"
+            ))
+        }
+        Err(e) => {
+            warn!(reason = %e, "project trust could not complete");
+            AttachResponse::err(format!(
+                "{PROJECT_ERR_UNRESOLVED}: {}",
+                crate::project_resolve::ProjectResolveError::Internal.detail()
+            ))
+        }
+    }
 }
 
 fn validate_project_path(path: &str) -> Result<(), String> {

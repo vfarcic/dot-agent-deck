@@ -155,6 +155,11 @@ pub enum SpawnError {
     /// work to the next fire of the successor daemon if it goes ahead.
     #[error("failed to spawn agent: {}", crate::agent_pty::ADMISSION_FROZEN_REASON)]
     DaemonRestarting,
+    /// PRD #1885: the orchestration's commands and prompts are not approved as
+    /// they now read, so nothing was started. The text names the orchestration,
+    /// the project and the command that approves it.
+    #[error("{0}")]
+    NotApproved(String),
 }
 
 /// What [`spawn`] opened. `SingleAgent` = one card; `Orchestration` = a tab of
@@ -654,6 +659,56 @@ fn register_dispatched_unit(
     Some(id)
 }
 
+/// PRD #1885: refuse, through `notifier` and as [`SpawnError::NotApproved`], to
+/// start `orchestration` of the config in `config_dir` unless its text is the
+/// approved text. Reads the approval store again, off the runtime's threads.
+pub async fn refuse_unless_approved(
+    config_dir: &Path,
+    orchestration: &crate::project_config::OrchestrationConfig,
+    task_name: &str,
+    notifier: &dyn Notifier,
+) -> Result<(), SpawnError> {
+    let Some(refusal) = approval_refusal(config_dir, orchestration, task_name).await else {
+        return Ok(());
+    };
+    notifier.notify(NotifyEvent::NotApproved {
+        task: task_name.to_string(),
+        message: refusal.clone(),
+    });
+    Err(SpawnError::NotApproved(refusal))
+}
+
+/// PRD #1885: the refusal for starting `orchestration` of the config in
+/// `config_dir`, logged at warn under `path`, or `None` when its text is the
+/// approved text. Reads the approval store again, off the runtime's threads; a
+/// check that cannot finish refuses.
+pub async fn approval_refusal(
+    config_dir: &Path,
+    orchestration: &crate::project_config::OrchestrationConfig,
+    path: &str,
+) -> Option<String> {
+    let (dir, orch) = (config_dir.to_path_buf(), orchestration.clone());
+    let check = match tokio::task::spawn_blocking(move || {
+        crate::project_trust::check_blocking(
+            &crate::project_trust::TrustStore::default_location(),
+            &dir,
+            &orch,
+        )
+    })
+    .await
+    {
+        Ok(check) => check,
+        Err(e) => {
+            return Some(format!(
+                "orchestration '{}' was not started: its approval could not be checked ({e})",
+                orchestration.name
+            ));
+        }
+    };
+    crate::project_trust::log_refusal(path, &check);
+    check.refusal()
+}
+
 async fn spawn_with_unit(
     req: SpawnRequest,
     registry: &Arc<AgentPtyRegistry>,
@@ -718,7 +773,16 @@ async fn spawn_with_unit(
                     "{note}"
                 );
             }
-            decide_target(cfg.as_ref(), dir, req.command.as_deref())
+            let target = decide_target(cfg.as_ref(), dir, req.command.as_deref());
+            // PRD #1885: an orchestration this fire read from `dir` runs, unattended,
+            // only when its text is the approved text. Judged on the config just
+            // read, which is the text the roles below run. (A caller that resolved
+            // its target itself — `dispatch`, a schedule's `shape` — checked it
+            // where it read the config.)
+            if let SpawnTarget::Orchestration { config, .. } = &target {
+                refuse_unless_approved(dir, config, &req.task_name, notifier).await?;
+            }
+            target
         }
     };
 

@@ -696,9 +696,18 @@ fn build_dispatcher_seed(working_dir: &std::path::Path) -> String {
 /// Status of a schedule as shown in the manager dialog. "disabled" when
 /// `enabled = false`; "live" when the task currently has a live reused
 /// tab/agent; "idle" otherwise.
-fn schedule_status_label(enabled: bool, is_live: bool) -> &'static str {
+/// PRD #1885: the schedules whose last fire was refused as not approved.
+fn schedule_refusals() -> crate::schedule_outcome::Outcomes {
+    crate::schedule_outcome::OutcomeStore::default_location().load()
+}
+
+/// The manager's STATUS cell. PRD #1885: `refused` when the task's last fire
+/// was refused as not approved, so a schedule that stopped working says so.
+fn schedule_status_label_with(enabled: bool, is_live: bool, refused: bool) -> &'static str {
     if !enabled {
         "disabled"
+    } else if refused {
+        "refused"
     } else if is_live {
         "live"
     } else {
@@ -2180,6 +2189,10 @@ struct UiState {
     /// Schedule names with a live tab/agent, snapshotted when the dialog opens
     /// (drives the live/idle status indicator).
     scheduled_live_names: HashSet<String>,
+    /// PRD #1885: each schedule whose last fire was refused because its
+    /// orchestration is not approved, snapshotted with
+    /// [`Self::scheduled_live_names`].
+    scheduled_refusals: crate::schedule_outcome::Outcomes,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -2524,6 +2537,7 @@ impl UiState {
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
+            scheduled_refusals: Default::default(),
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
@@ -11784,6 +11798,7 @@ fn dispatch_action(
             ui.scheduled_selected = 0;
             ui.scheduled_delete_confirm = false;
             ui.scheduled_live_names = live_schedule_names();
+            ui.scheduled_refusals = schedule_refusals();
             ui.mode = UiMode::ScheduledTasks;
         }
         // PRD #127 finding #4: `[Add]` button parity for the `a` key. PRD #170
@@ -11845,6 +11860,7 @@ fn dispatch_action(
             // PRD #127 N2: dialog stays open after run-now; refresh live-status snapshot.
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_live_names = live_schedule_names();
+                ui.scheduled_refusals = schedule_refusals();
             }
         }
         Action::ScheduleDelete(name) => {
@@ -11877,6 +11893,7 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
+                ui.scheduled_refusals = schedule_refusals();
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
                 }
@@ -11923,6 +11940,7 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
+                ui.scheduled_refusals = schedule_refusals();
             }
         }
         Action::Continue => {}
@@ -21538,6 +21556,38 @@ fn render_scheduled_tasks(
     let status_col = 11usize; // widest status ("disabled") + padding
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
 
+    // PRD #1885: the selected task's last fire, when it was refused as not
+    // approved — the refusal names the command that approves it — wrapped to
+    // the list's width beneath the rows.
+    let refusal_lines: Vec<String> = if ui.scheduled_delete_confirm {
+        Vec::new()
+    } else {
+        ui.scheduled_tasks
+            .get(ui.scheduled_selected)
+            .and_then(|t| ui.scheduled_refusals.get(&t.name))
+            .map(|refusal| {
+                let width = (2 + name_col + status_col + next_col).max(56);
+                let mut lines = vec![format!(
+                    "  Last fire refused at {}:",
+                    crate::untrusted_text::strip_control_and_bidi(&refusal.at, false)
+                )];
+                let text = crate::untrusted_text::strip_control_and_bidi(&refusal.message, false);
+                let mut line = String::from("   ");
+                for word in text.split_whitespace() {
+                    if line.chars().count() + 1 + word.chars().count() > width && line.len() > 3 {
+                        lines.push(std::mem::replace(&mut line, String::from("   ")));
+                    }
+                    line.push(' ');
+                    line.push_str(word);
+                }
+                if line.len() > 3 {
+                    lines.push(line);
+                }
+                lines
+            })
+            .unwrap_or_default()
+    };
+
     // PRD #144: the delete confirmation renders on its natural lines (the name
     // on its own line, the fixed `… (y/n)` trailer on the next). The modal is
     // sized to contain them below, so the trailer is never pushed past the
@@ -21570,7 +21620,7 @@ fn render_scheduled_tasks(
     } else {
         2
     };
-    let chrome_lines = 3 + footer_lines;
+    let chrome_lines = 3 + footer_lines + refusal_lines.len();
 
     // Widest content line drives the modal width. The padded field rows fill to
     // the inner width, so they don't drive it — the list columns, the header,
@@ -21596,9 +21646,15 @@ fn render_scheduled_tasks(
     } else {
         0
     };
+    let refusal_w = refusal_lines
+        .iter()
+        .map(|l| count_chars(l))
+        .max()
+        .unwrap_or(0);
     let content_w = [
         list_w,
         header_w,
+        refusal_w,
         confirm_w,
         BUTTON_ROW_W,
         count_chars("  Esc close"),
@@ -21665,7 +21721,8 @@ fn render_scheduled_tasks(
             .take(win_end - win_start)
         {
             let is_live = ui.scheduled_live_names.contains(&task.name);
-            let status = schedule_status_label(task.enabled, is_live);
+            let refused = ui.scheduled_refusals.contains_key(&task.name);
+            let status = schedule_status_label_with(task.enabled, is_live, refused);
             let next = schedule_next_fire_display(task);
             let selected = i == ui.scheduled_selected;
             let marker = if selected { "\u{25b6} " } else { "  " };
@@ -21694,6 +21751,12 @@ fn render_scheduled_tasks(
                 },
             ));
             lines.push(Line::styled(row, style));
+        }
+        for line in &refusal_lines {
+            lines.push(Line::styled(
+                line.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
         }
     }
 
@@ -39194,12 +39257,87 @@ mod tests {
         }
     }
 
+    /// PRD #1885: a schedule whose last fire was refused as not approved reads
+    /// `refused`, and the selected one shows the refusal — with the command that
+    /// approves it — beneath the rows.
+    #[test]
+    fn schedule_manager_shows_a_refused_last_fire() {
+        let mut ui = default_ui();
+        ui.scheduled_tasks = vec![
+            make_scheduled_task("nightly", true),
+            make_scheduled_task("weekly", true),
+        ];
+        ui.scheduled_refusals.insert(
+            "nightly".to_string(),
+            crate::schedule_outcome::Refusal {
+                at: "2026-11-10T09:00:00Z".to_string(),
+                message: "orchestration 'team' of project /work/p was never approved, so \
+                          nothing from it was started. Review and approve it from a terminal \
+                          outside the deck with: dot-agent-deck trust approve /work/p \
+                          --orchestration team"
+                    .to_string(),
+            },
+        );
+        let render = |ui: &UiState| {
+            let buffer = draw_to_buffer(100, 30, |frame| {
+                let frame_area = frame.area();
+                render_scheduled_tasks(frame, frame_area, ui);
+            });
+            let area = buffer.area();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+        };
+        let lines = render(&ui);
+        let screen = lines.join("\n");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("nightly") && l.contains("refused")),
+            "{screen}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("weekly") && l.contains("idle")),
+            "{screen}"
+        );
+        let flat = screen
+            .split_whitespace()
+            .filter(|w| !w.chars().all(|c| "│─┌┐└┘".contains(c)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("Last fire refused at 2026-11-10T09:00:00Z"),
+            "{screen}"
+        );
+        assert!(flat.contains("never approved"), "{screen}");
+        assert!(
+            flat.contains("dot-agent-deck trust approve /work/p --orchestration team"),
+            "{screen}"
+        );
+
+        ui.scheduled_selected = 1;
+        let screen = render(&ui).join("\n");
+        assert!(
+            !screen.contains("Last fire refused"),
+            "only the selected task's refusal is shown:\n{screen}"
+        );
+    }
+
     #[test]
     fn manager_status_label_derivation() {
-        assert_eq!(schedule_status_label(false, false), "disabled");
-        assert_eq!(schedule_status_label(false, true), "disabled"); // disabled wins
-        assert_eq!(schedule_status_label(true, true), "live");
-        assert_eq!(schedule_status_label(true, false), "idle");
+        assert_eq!(schedule_status_label_with(false, false, false), "disabled");
+        assert_eq!(schedule_status_label_with(false, true, false), "disabled"); // disabled wins
+        assert_eq!(schedule_status_label_with(true, true, false), "live");
+        assert_eq!(schedule_status_label_with(true, false, false), "idle");
+        // PRD #1885: a refused last fire reads `refused`, under `disabled`.
+        assert_eq!(schedule_status_label_with(true, true, true), "refused");
+        assert_eq!(schedule_status_label_with(false, false, true), "disabled");
     }
 
     #[test]

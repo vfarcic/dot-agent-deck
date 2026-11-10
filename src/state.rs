@@ -5158,23 +5158,83 @@ pub(crate) struct ProjectConfigs {
     /// `None` for a directory with no config or one that does not parse — both
     /// resolve as "no role config", as they always have.
     by_dir: HashMap<String, Option<ProjectConfig>>,
+    /// PRD #1885: for each directory that holds a config, its project and the
+    /// approvals as they stood when the config was read — read in the same
+    /// blocking pass, so a trust check under a state guard reads no file and
+    /// judges exactly the text the spawn that follows will run.
+    trust: HashMap<String, DirTrust>,
+}
+
+/// PRD #1885: what [`ProjectConfigs::trust_check`] needs about one directory.
+#[derive(Debug, Clone)]
+struct DirTrust {
+    project: std::path::PathBuf,
+    approvals: Arc<crate::project_trust::ApprovalStore>,
 }
 
 impl ProjectConfigs {
     /// Read `dirs` on the calling thread. Only for a caller that is not on a
     /// request path: tests, and [`worker_response_timeout`].
     pub(crate) fn load_blocking<S: Into<String>>(dirs: impl IntoIterator<Item = S>) -> Self {
+        let mut approvals: Option<Arc<crate::project_trust::ApprovalStore>> = None;
+        let mut trust = HashMap::new();
         let by_dir = dirs
             .into_iter()
             .map(Into::into)
             .map(|dir| {
-                let config = load_project_config(std::path::Path::new(&dir))
-                    .ok()
-                    .flatten();
+                let path = std::path::Path::new(&dir);
+                let config = load_project_config(path).ok().flatten();
+                if config.is_some() {
+                    let approvals = approvals
+                        .get_or_insert_with(|| {
+                            Arc::new(crate::project_trust::load_or_empty(
+                                &crate::project_trust::TrustStore::default_location(),
+                            ))
+                        })
+                        .clone();
+                    let project = crate::project_trust::project_identity(path)
+                        .unwrap_or_else(|_| path.to_path_buf());
+                    trust.insert(dir.clone(), DirTrust { project, approvals });
+                }
                 (dir, config)
             })
             .collect();
-        Self { by_dir }
+        Self { by_dir, trust }
+    }
+
+    /// PRD #1885: the trust state of orchestration `name` in `dir`'s config as
+    /// this set read it, or `None` when the config has no such orchestration
+    /// (nothing from it can be spawned then either).
+    pub(crate) fn trust_check(
+        &self,
+        dir: &str,
+        name: &str,
+    ) -> Option<crate::project_trust::TrustCheck> {
+        let orchestration = self
+            .by_dir
+            .get(dir)?
+            .as_ref()?
+            .orchestrations
+            .iter()
+            .find(|o| o.name == name)?;
+        let (project, approvals) = match self.trust.get(dir) {
+            Some(t) => (t.project.clone(), t.approvals.clone()),
+            None => (std::path::PathBuf::from(dir), Arc::default()),
+        };
+        Some(crate::project_trust::TrustCheck::evaluate(
+            &approvals,
+            project,
+            std::path::Path::new(dir),
+            orchestration,
+        ))
+    }
+
+    /// PRD #1885: the refusal for spawning from orchestration `name` of `dir`'s
+    /// config, logged at warn under `path`, or `None` when it is approved.
+    pub(crate) fn trust_refusal(&self, path: &str, dir: &str, name: &str) -> Option<String> {
+        let check = self.trust_check(dir, name)?;
+        crate::project_trust::log_refusal(path, &check);
+        check.refusal()
     }
 
     /// Read `dirs` on the blocking pool. This frees the runtime thread, not a
@@ -5193,7 +5253,10 @@ impl ProjectConfigs {
             return;
         }
         match tokio::task::spawn_blocking(move || Self::load_blocking(unread)).await {
-            Ok(read) => self.by_dir.extend(read.by_dir),
+            Ok(read) => {
+                self.by_dir.extend(read.by_dir);
+                self.trust.extend(read.trust);
+            }
             Err(e) => warn!(
                 error = %e,
                 "reading the project config failed; the directories it named resolve as \
@@ -5772,10 +5835,19 @@ async fn dispatch_one_owned(
         id: message_id.to_string(),
     };
 
+    // PRD #1885: the refusal, when the text this dispatch read is not the
+    // approved text — checked again here, on the read the respawn below runs,
+    // because the file can change after `delegate` checked it.
+    let mut trust_refusal: Option<String> = None;
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
             let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
-            lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
+            let found =
+                lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role);
+            if found.as_ref().is_some_and(|(_, role)| role.clear) {
+                trust_refusal = configs.trust_refusal("delegate", c, identity.name());
+            }
+            found
         }
         _ => None,
     };
@@ -5876,6 +5948,26 @@ async fn dispatch_one_owned(
     // it was for: posts that arrive during the restart cannot take its room.
     // The room the worker's older tasks free counts as its own. A refusal
     // returns the room, and the saved file is removed unless the post goes in.
+    // PRD #1885: the file changed between `delegate`'s check and this read, to
+    // text nobody approved — nothing is restarted and the task is not
+    // delivered, and the orchestrator is told why and how to approve.
+    if let Some(refusal) = trust_refusal {
+        let why = "the orchestration is not approved as it now reads";
+        release_undelivered_commission(&registry, &pane_id, commission_arm_id, &target_role, why);
+        retire_undelivered_idle_worker_record(&registry, &pane_id, delegation_seq, why);
+        post_orchestrator_notice_in(
+            &registry,
+            None,
+            orchestrator,
+            "task refused",
+            format!(
+                "The task for the worker in role {} was NOT delivered and the role was not \
+                 restarted: {refusal}",
+                quote_untrusted_role(&target_role)
+            ),
+        );
+        return;
+    }
     let mut reservation = match registry.inbox().reserve_delegate(&pane_id, &content) {
         Ok(reservation) => reservation,
         Err(error) => {
@@ -11099,6 +11191,26 @@ impl AppState {
         // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
         let targets = self.delegate_targets(&signal.pane_id, &signal.to);
 
+        // PRD #1885: a delegate to a `clear = true` role starts that role's
+        // command again, unattended, so it runs only from an approved
+        // orchestration. Checked for every target before anything is armed or
+        // dispatched, so a refusal delivers nothing and the orchestrator's
+        // `delegate` fails with the reason and the command that approves it.
+        if let Some(identity) = orchestration.as_ref() {
+            for (target_role, pane_id) in &targets {
+                let cwd = self.pane_cwd_map.get(pane_id).map(String::as_str);
+                if delegate_respawns_worker(configs, cwd, Some(identity), target_role)
+                    && let Some(cwd) = cwd
+                    && let Some(refusal) = configs.trust_refusal("delegate", cwd, identity.name())
+                {
+                    return DelegateResponse {
+                        error: Some(refusal),
+                        ..Default::default()
+                    };
+                }
+            }
+        }
+
         // Which of the caller's `--to` roles actually resolved to a worker pane.
         // `delegate_targets` already logs a `warn!` per empty role and then
         // silently drops it, which is fine for the fan-out but is exactly the
@@ -11824,6 +11936,18 @@ pub async fn handle_restart_role_with_state(
             };
         };
 
+        // PRD #1885: a restart runs the role's command again, unattended, so
+        // only from an approved orchestration — judged on the same read whose
+        // command the restart would run.
+        if let (Some(c), Some(identity)) = (cwd.as_deref(), orchestration.as_ref())
+            && let Some(refusal) = configs.trust_refusal("pane restart", c, identity.name())
+        {
+            return RestartRoleResponse {
+                error: Some(refusal),
+                ..Default::default()
+            };
+        }
+
         ResolvedRestart {
             title: orchestration
                 .as_ref()
@@ -12089,6 +12213,17 @@ pub async fn handle_spawn_role_with_state(
                 ..Default::default()
             };
         };
+
+        // PRD #1885: spawning a role runs its command, unattended, so only from
+        // an approved orchestration — judged on the read the spawn would run.
+        if let Some(c) = cwd.as_deref()
+            && let Some(refusal) = configs.trust_refusal("pane spawn", c, identity.name())
+        {
+            return SpawnRoleResponse {
+                error: Some(refusal),
+                ..Default::default()
+            };
+        }
 
         // `delegate_targets` (below) deliberately EXCLUDES `orchestrator_pane_ids`,
         // so reusing it as the "already live" oracle answers empty for the
@@ -18483,6 +18618,9 @@ mod tests {
              [[orchestrations.roles]]\nname = \"fresh\"\ncommand = \"cat\"\nclear = true\n",
         )
         .expect("write project config");
+        // PRD #1885: a `clear = true` restart runs only from an approved
+        // orchestration; these tests are about the restart, not the gate.
+        crate::project_trust::approve_all_for_test(dir.path());
         dir
     }
 

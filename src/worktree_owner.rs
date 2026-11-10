@@ -309,6 +309,14 @@ pub fn main_worktree_if_linked(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The root of the worktree `dir` is in — the main checkout or a linked one,
+/// whichever `dir` belongs to — as `git rev-parse --show-toplevel` answers it.
+/// `None` outside a repository or in a bare one. PRD #1885 uses it to place a
+/// config directory inside its worktree before keying it on the main one.
+pub fn worktree_toplevel_of(dir: &Path) -> Option<PathBuf> {
+    rev_parse_path(dir, "--show-toplevel")
+}
+
 /// Where `dir` sits relative to the repository's main worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placement {

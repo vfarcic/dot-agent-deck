@@ -14200,3 +14200,23 @@ impl Drop for AttachInput {
         }
     }
 }
+
+/// PRD #1885: approve every orchestration of the config in `dir`, through the
+/// real store API, for an IN-PROCESS test whose subject is not the approval —
+/// the daemon's unattended paths (delegate to a `clear = true` role, `pane
+/// restart`, `pane spawn`, a dispatch, a prepared start) refuse an unapproved
+/// one. The store is pointed at a per-process directory under the harness root
+/// first, so a test never reads or writes the developer's own approvals. A
+/// subprocess deck has its own `DOT_AGENT_DECK_STATE_DIR`, and is approved
+/// through the CLI instead.
+#[allow(dead_code)]
+pub fn approve_project_fixture(dir: &Path) {
+    use dot_agent_deck::project_trust::{TrustStore, approve_all};
+    let state = harness_temp_root().join("trust-state");
+    std::fs::create_dir_all(&state).expect("create the per-process trust store dir");
+    harden_dir_0700(&state);
+    // The first call in this process wins; a later one keeps that directory.
+    let _ = TrustStore::use_state_dir_for_this_process(state);
+    approve_all(&TrustStore::default_location(), dir)
+        .unwrap_or_else(|e| panic!("fixture precondition: approve {}: {e}", dir.display()));
+}

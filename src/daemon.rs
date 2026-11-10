@@ -1321,6 +1321,9 @@ fn make_schedule_callback(
             let state = state.clone();
             Box::pin(async move {
                 let notifier = crate::scheduler::StderrNotifier;
+                // PRD #1885: the recorded outcome describes the LAST fire, so this
+                // one starts by forgetting the previous one's refusal.
+                clear_schedule_refusal(&task_name).await;
                 // PRD #120 (flag redesign 2026-06-24): a configured `issue_dispatch`
                 // task runs UNCONDITIONALLY — the `experimental` flag no longer gates
                 // the dispatch behavior, only the new-pane modal creation option
@@ -1385,6 +1388,8 @@ fn make_schedule_callback(
         let state = state.clone();
         Box::pin(async move {
             let notifier = crate::scheduler::StderrNotifier;
+            // PRD #1885: the recorded outcome describes the LAST fire.
+            clear_schedule_refusal(&req.task_name).await;
             // Issue #835: resolve the declared shape against the target dir's
             // config AS IT STANDS NOW.
             //
@@ -1428,7 +1433,24 @@ fn make_schedule_callback(
                     )
                 });
                 match resolved {
-                    Ok(target) => req.resolved_target = Some(target),
+                    Ok(target) => {
+                        // PRD #1885: this path read the config itself, so it
+                        // checks the orchestration it chose against the
+                        // approvals here, before anything is started.
+                        if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &target
+                            && crate::spawn::refuse_unless_approved(
+                                dir,
+                                config,
+                                &req.task_name,
+                                &notifier,
+                            )
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                        req.resolved_target = Some(target)
+                    }
                     Err(message) => {
                         let message = format!("shape {raw:?}: {message}");
                         warn!(
@@ -1487,6 +1509,16 @@ fn make_schedule_callback(
             }
         })
     })
+}
+
+/// PRD #1885: forget `task`'s recorded refusal as a new fire of it starts, off
+/// the runtime's threads.
+async fn clear_schedule_refusal(task: &str) {
+    let task = task.to_string();
+    let _ = tokio::task::spawn_blocking(move || {
+        crate::schedule_outcome::OutcomeStore::default_location().clear(&task)
+    })
+    .await;
 }
 
 /// PRD #93 M1.2 idle monitor — edge-triggered, generation-gated.
