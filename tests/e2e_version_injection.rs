@@ -87,7 +87,7 @@
 //!   cache holds this dir any more, so there is no cache key it would have to
 //!   rotate. A local scratch dir built before this rebuilds once.
 //! - **`DAD_E2E_NESTED_BUILD_JOBS`** overrides the `--jobs` cap below. The
-//!   `version` shard sets it to every core, since the cap exists to protect
+//!   `version` shard sets it to `all` (every CPU the runner's quota allows), since the cap exists to protect
 //!   tests running beside this one and in that shard there are none; on a
 //!   4-vCPU runner the cap halved the cold build's parallelism.
 //!
@@ -188,21 +188,32 @@ fn host_target() -> String {
 /// test this is, so the cap would protect nothing there (issue #2109).
 const NESTED_BUILD_JOBS_ENV: &str = "DAD_E2E_NESTED_BUILD_JOBS";
 
-/// The nested build's `--jobs`: `DAD_E2E_NESTED_BUILD_JOBS` when it holds a
-/// positive number, otherwise half the machine's cores, at least one — see the
-/// cost note at the top of the file for why the nested build is capped by
-/// default.
+/// The nested build's `--jobs`. `DAD_E2E_NESTED_BUILD_JOBS=all` uses every CPU
+/// this process may use, a positive number uses that many, and anything else
+/// (unset included) caps it at half, at least one — see the cost note at the
+/// top of the file for why the nested build is capped by default.
+///
+/// `all` rather than a count from the shell: `std::thread::available_parallelism`
+/// honours a cgroup CPU quota, which `getconf _NPROCESSORS_ONLN` / `nproc` on a
+/// quota-limited runner may not, so a count computed in the script could
+/// oversubscribe the very shard it is meant to speed up.
 fn nested_build_jobs() -> usize {
-    if let Some(jobs) = std::env::var(NESTED_BUILD_JOBS_ENV)
+    let available = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    match std::env::var(NESTED_BUILD_JOBS_ENV)
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|&n| n > 0)
+        .as_deref()
+        .map(str::trim)
     {
-        return jobs;
+        Some("all") => available,
+        Some(v) => v
+            .parse::<usize>()
+            .ok()
+            .filter(|&n| n > 0)
+            .unwrap_or((available / 2).max(1)),
+        None => (available / 2).max(1),
     }
-    std::thread::available_parallelism()
-        .map(|n| (n.get() / 2).max(1))
-        .unwrap_or(1)
 }
 
 /// Build `dot-agent-deck` with `version` / `build_id` pre-set in the build
