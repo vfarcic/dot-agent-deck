@@ -4628,6 +4628,32 @@ pub(crate) mod tests {
         assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(2054)));
     }
 
+    /// Issue #2096: `deck.pr.numbers` keeps the first
+    /// [`MAX_PR_NUMBERS_PER_RUN`] pull requests, while `deck.pr.number`
+    /// still follows the latest one past the cap.
+    #[test]
+    fn the_list_of_pull_requests_stops_at_its_cap() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        let count = MAX_PR_NUMBERS_PER_RUN as u64 + 1;
+        for n in 1..=count {
+            tracker.observe_event(&pr_report("p1", Some(n), Some(n)), 10 + n);
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let kept: Vec<u64> = (1..count).collect();
+        assert_eq!(
+            attr(run, AttrKey::PrNumbers),
+            Some(&AttrValue::Str(pr_numbers_value(&kept)))
+        );
+        assert_eq!(
+            attr(run, AttrKey::PrNumber),
+            Some(&AttrValue::Int(i64::try_from(count).unwrap()))
+        );
+    }
+
     fn agent_identity_of(attributes: &[Attribute]) -> Vec<Attribute> {
         attributes
             .iter()
