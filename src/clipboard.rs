@@ -20,7 +20,9 @@
 //! tests inject a fake so that none of them writes the clipboard of the
 //! machine running them.
 
-use std::sync::mpsc;
+use std::cell::Cell;
+use std::panic::AssertUnwindSafe;
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
 
 /// Environment knob that turns the native clipboard write off, leaving OSC 52
@@ -39,6 +41,16 @@ pub const NATIVE_CLIPBOARD_ENV: &str = "DOT_AGENT_DECK_NATIVE_CLIPBOARD";
 /// how long one copy can hold the UI thread, including the first copy, which
 /// also opens the clipboard.
 pub const NATIVE_WRITE_WAIT: Duration = Duration::from_millis(250);
+
+/// How long an ordinary exit waits for the native clipboard's worker to
+/// finish, so that dropping the clipboard (arboard's handoff to an X11
+/// clipboard manager) is not cut off by the process exiting, while an X server
+/// that stopped answering cannot hang the exit. See
+/// [`NativeClipboard::shutdown`].
+pub const NATIVE_SHUTDOWN_WAIT: Duration = Duration::from_millis(300);
+
+/// The native clipboard worker thread's name.
+pub const NATIVE_THREAD_NAME: &str = "native-clipboard";
 
 /// What the native clipboard write did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -137,30 +149,97 @@ fn open_system_clipboard() -> Option<Box<dyn NativeSink>> {
     }
 }
 
+/// One copy handed to the worker thread.
 struct Request {
+    /// The copy's place in the order copies were made; see [`Slot::latest`].
+    generation: u64,
     text: String,
     reply: mpsc::SyncSender<NativeWrite>,
+}
+
+/// What the UI thread and the worker thread share, under one lock.
+#[derive(Default)]
+struct Slot {
+    /// The newest copy the worker has not started yet. A newer copy replaces
+    /// it, so a copy superseded before it started is never written.
+    pending: Option<Request>,
+    /// The generation of the newest copy handed in. The worker writes a copy
+    /// only while it is still the newest, so a stale one is dropped rather
+    /// than written over a newer selection.
+    latest: u64,
+    /// The worker is opening the clipboard or inside a write.
+    busy: bool,
+    /// The deck is shutting the clipboard down.
+    closing: bool,
+    /// The worker has stopped: the clipboard failed to open, it panicked, or
+    /// it was shut down.
+    gone: bool,
+}
+
+struct Shared {
+    slot: Mutex<Slot>,
+    wake: Condvar,
+}
+
+impl Shared {
+    fn lock(&self) -> MutexGuard<'_, Slot> {
+        // Nothing panics while holding the lock, but a poisoned lock must not
+        // take the copy path down with it.
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
 }
 
 enum NativeState {
     /// Not opened yet; the opener runs on the first write.
     NotStarted(NativeOpener),
-    Running(mpsc::SyncSender<Request>),
+    Running {
+        shared: Arc<Shared>,
+        /// Disconnects when the worker thread has finished, after it has
+        /// dropped the clipboard (which is when arboard's X11 backend hands
+        /// its contents to a clipboard manager).
+        finished: mpsc::Receiver<()>,
+    },
     /// Turned off, failed to open, or the worker is gone. Settled for the
     /// rest of the deck's life, so a headless session does not try to open a
     /// clipboard again on every copy.
     Unavailable,
 }
 
+thread_local! {
+    /// Set for the whole life of the native clipboard's worker thread. The
+    /// `run_tui` panic hook reads it through [`in_clipboard_worker`], so a
+    /// panic on that thread, which the worker catches and settles as
+    /// [`NativeWrite::Unavailable`], does not tear down the terminal the TUI
+    /// is still drawing on.
+    static IN_CLIPBOARD_WORKER: Cell<bool> = const { Cell::new(false) };
+}
+
+/// True on the native clipboard's worker thread. See [`IN_CLIPBOARD_WORKER`].
+///
+/// The `run_tui` hook reads it only under `panic = "unwind"`, for the reason
+/// it reads `embedded_pane::in_guarded_parser_feed`; hence the conditional
+/// `dead_code` allowance.
+#[cfg_attr(panic = "abort", allow(dead_code))]
+pub(crate) fn in_clipboard_worker() -> bool {
+    IN_CLIPBOARD_WORKER.with(Cell::get)
+}
+
 /// The native half of a copy, kept off the UI thread.
 ///
 /// The clipboard is opened lazily, on a dedicated thread, at the first copy,
-/// and that thread keeps it for the deck's lifetime: on X11 and Wayland the
-/// copied text is served by the process that owns the selection, so a
+/// and that thread keeps it until the deck shuts it down: on X11 and Wayland
+/// the copied text is served by the process that owns the selection, so a
 /// clipboard object dropped right after the write would take the copy with
 /// it. Opening and writing can block (an X server that is slow or
 /// unreachable), so the UI thread waits at most [`NATIVE_WRITE_WAIT`] for an
-/// answer and never queues more than one write behind a stuck one.
+/// answer and does not wait at all while an earlier write is still running.
+///
+/// While a write is stuck, later copies do not queue up behind it: one slot
+/// holds the newest copy not yet started, and a newer copy replaces it, so
+/// when the clipboard answers again the newest selection is the one written
+/// and the superseded ones are dropped. A write already in progress cannot be
+/// stopped; it finishes when the backend returns, before the newest copy is
+/// written.
 pub struct NativeClipboard {
     state: NativeState,
     wait: Duration,
@@ -194,37 +273,74 @@ impl NativeClipboard {
         }
     }
 
-    pub fn write(&mut self, text: &str) -> NativeWrite {
-        if matches!(self.state, NativeState::NotStarted(_)) {
-            let NativeState::NotStarted(opener) =
-                std::mem::replace(&mut self.state, NativeState::Unavailable)
-            else {
-                unreachable!("checked just above");
-            };
-            // Capacity 1: one write may wait behind the one being served.
-            let (tx, rx) = mpsc::sync_channel::<Request>(1);
-            let spawned = std::thread::Builder::new()
-                .name("native-clipboard".into())
-                .spawn(move || serve(rx, opener));
-            if spawned.is_ok() {
-                self.state = NativeState::Running(tx);
-            }
+    fn start(&mut self) {
+        if !matches!(self.state, NativeState::NotStarted(_)) {
+            return;
         }
-        let NativeState::Running(tx) = &self.state else {
+        let NativeState::NotStarted(opener) =
+            std::mem::replace(&mut self.state, NativeState::Unavailable)
+        else {
+            unreachable!("checked just above");
+        };
+        let shared = Arc::new(Shared {
+            slot: Mutex::new(Slot::default()),
+            wake: Condvar::new(),
+        });
+        let (finished_tx, finished) = mpsc::channel::<()>();
+        let worker_shared = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name(NATIVE_THREAD_NAME.into())
+            .spawn(move || {
+                IN_CLIPBOARD_WORKER.with(|flag| flag.set(true));
+                let served =
+                    std::panic::catch_unwind(AssertUnwindSafe(|| serve(&worker_shared, opener)));
+                if served.is_err() {
+                    tracing::warn!(
+                        "the native clipboard thread panicked; copies go out as OSC 52 only"
+                    );
+                }
+                let mut slot = worker_shared.lock();
+                slot.gone = true;
+                // Its reply drops with it, which tells a waiting copy.
+                slot.pending = None;
+                drop(slot);
+                // The clipboard was dropped inside `serve` (or by the
+                // unwind), so this says the exit handoff is over.
+                drop(finished_tx);
+            });
+        if spawned.is_ok() {
+            self.state = NativeState::Running { shared, finished };
+        }
+    }
+
+    pub fn write(&mut self, text: &str) -> NativeWrite {
+        self.start();
+        let NativeState::Running { shared, .. } = &self.state else {
             return NativeWrite::Unavailable;
         };
         let (reply, answer) = mpsc::sync_channel(1);
-        let request = Request {
-            text: text.to_owned(),
-            reply,
-        };
-        match tx.try_send(request) {
-            Ok(()) => {}
-            Err(mpsc::TrySendError::Full(_)) => return NativeWrite::NotConfirmed,
-            Err(mpsc::TrySendError::Disconnected(_)) => {
+        let backlog = {
+            let mut slot = shared.lock();
+            if slot.gone {
+                drop(slot);
                 self.state = NativeState::Unavailable;
                 return NativeWrite::Unavailable;
             }
+            slot.latest += 1;
+            let backlog = slot.busy || slot.pending.is_some();
+            // Replaces (and so drops) any older copy that had not started.
+            slot.pending = Some(Request {
+                generation: slot.latest,
+                text: text.to_owned(),
+                reply,
+            });
+            backlog
+        };
+        shared.wake.notify_all();
+        if backlog {
+            // An earlier write is still running: this copy waits in the slot
+            // for it, and the UI does not.
+            return NativeWrite::NotConfirmed;
         }
         match answer.recv_timeout(self.wait) {
             Ok(NativeWrite::Unavailable) | Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -236,6 +352,40 @@ impl NativeClipboard {
             Err(mpsc::RecvTimeoutError::Timeout) => NativeWrite::NotConfirmed,
         }
     }
+
+    /// Stop the worker and wait up to `deadline` for it to finish, which
+    /// includes dropping the clipboard. On X11, arboard's drop is when a
+    /// clipboard manager is asked to take over what the deck copied, so a copy
+    /// can outlive the deck; waiting here keeps the process from exiting in
+    /// the middle of that. A copy not yet started is dropped, not written.
+    ///
+    /// Returns `true` when the worker finished (or never ran), `false` when
+    /// the deadline passed first, as with an X server that stopped answering:
+    /// the deck then exits without the handoff. Idempotent.
+    pub fn shutdown(&mut self, deadline: Duration) -> bool {
+        let state = std::mem::replace(&mut self.state, NativeState::Unavailable);
+        let NativeState::Running { shared, finished } = state else {
+            return true;
+        };
+        {
+            let mut slot = shared.lock();
+            slot.closing = true;
+            slot.pending = None;
+        }
+        shared.wake.notify_all();
+        !matches!(
+            finished.recv_timeout(deadline),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        )
+    }
+}
+
+impl Drop for NativeClipboard {
+    /// The backstop for a way out of the TUI that skips its explicit
+    /// shutdown; bounded like it.
+    fn drop(&mut self) {
+        self.shutdown(NATIVE_SHUTDOWN_WAIT);
+    }
 }
 
 /// Whether the value of [`NATIVE_CLIPBOARD_ENV`] leaves the native write on.
@@ -246,18 +396,48 @@ fn native_enabled(value: Option<&str>) -> bool {
     )
 }
 
-/// The worker thread: open the clipboard at the first request, then serve
-/// writes until the deck drops its [`NativeClipboard`]. On a failed open it
-/// answers that request `Unavailable` and exits, which the UI side records.
-fn serve(requests: mpsc::Receiver<Request>, opener: NativeOpener) {
-    let Ok(first) = requests.recv() else {
+/// Wait for the next copy to write, marking the worker busy; `None` once the
+/// deck shuts the clipboard down.
+fn next_request(shared: &Shared) -> Option<Request> {
+    let mut slot = shared.lock();
+    slot.busy = false;
+    loop {
+        if slot.closing {
+            return None;
+        }
+        if let Some(request) = slot.pending.take() {
+            slot.busy = true;
+            return Some(request);
+        }
+        slot = shared.wake.wait(slot).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
+/// Whether `request` is still the newest copy, checked just before it is
+/// written.
+fn still_newest(shared: &Shared, request: &Request) -> bool {
+    let slot = shared.lock();
+    !slot.closing && slot.latest == request.generation
+}
+
+/// The worker thread: open the clipboard at the first copy, then write copies
+/// until the deck shuts it down. On a failed open it answers that copy
+/// `Unavailable` and returns, which the UI side records.
+fn serve(shared: &Shared, opener: NativeOpener) {
+    let Some(first) = next_request(shared) else {
         return;
     };
     let Some(mut sink) = opener() else {
         let _ = first.reply.try_send(NativeWrite::Unavailable);
         return;
     };
-    for request in std::iter::once(first).chain(requests.iter()) {
+    let mut next = Some(first);
+    while let Some(request) = next.take().or_else(|| next_request(shared)) {
+        // Superseded while the clipboard was opening or the last write ran:
+        // dropping it closes its reply, and the newer copy is in the slot.
+        if !still_newest(shared, &request) {
+            continue;
+        }
         let result = match sink.write_text(&request.text) {
             Ok(()) => NativeWrite::Written,
             Err(error) => {
@@ -268,6 +448,8 @@ fn serve(requests: mpsc::Receiver<Request>, opener: NativeOpener) {
         // The UI side may have stopped waiting; a closed reply is fine.
         let _ = request.reply.try_send(result);
     }
+    // Dropping the clipboard here is arboard's exit handoff on X11.
+    drop(sink);
 }
 
 /// The deck's clipboard: [`NativeClipboard::system`] plus an OSC 52 sender.
@@ -284,6 +466,15 @@ impl SystemClipboard {
             native: NativeClipboard::system(),
             osc52,
         }
+    }
+}
+
+impl SystemClipboard {
+    /// Shut the native clipboard down on an ordinary exit, waiting at most
+    /// [`NATIVE_SHUTDOWN_WAIT`]; see [`NativeClipboard::shutdown`]. Keeping
+    /// the copy past the exit is best effort.
+    pub fn shutdown(&mut self) -> bool {
+        self.native.shutdown(NATIVE_SHUTDOWN_WAIT)
     }
 }
 
@@ -391,10 +582,15 @@ mod tests {
         written: Arc<Mutex<Vec<String>>>,
         gate: Option<mpsc::Receiver<()>>,
         fail: bool,
+        /// Told the text of each write as the write starts.
+        entered: Option<mpsc::Sender<String>>,
     }
 
     impl NativeSink for FakeSink {
         fn write_text(&mut self, text: &str) -> Result<(), String> {
+            if let Some(entered) = &self.entered {
+                let _ = entered.send(text.to_owned());
+            }
             if let Some(gate) = &self.gate {
                 let _ = gate.recv();
             }
@@ -426,6 +622,7 @@ mod tests {
             written: Arc::clone(&written),
             gate: None,
             fail: false,
+            entered: None,
         };
         let mut native = NativeClipboard::with_opener(counting_opener(&opens, Some(sink)), LONG);
         assert_eq!(opens.load(Ordering::SeqCst), 0, "opened lazily");
@@ -456,6 +653,7 @@ mod tests {
             written: Arc::new(Mutex::new(Vec::new())),
             gate: None,
             fail: true,
+            entered: None,
         };
         let mut native = NativeClipboard::with_opener(counting_opener(&opens, Some(sink)), LONG);
         assert_eq!(native.write("text"), NativeWrite::Failed);
@@ -472,6 +670,7 @@ mod tests {
             written: Arc::clone(&written),
             gate: Some(gate),
             fail: false,
+            entered: None,
         };
         let wait = Duration::from_millis(20);
         let mut native = NativeClipboard::with_opener(counting_opener(&opens, Some(sink)), wait);
@@ -515,5 +714,180 @@ mod tests {
         }
         let mut native = NativeClipboard::off();
         assert_eq!(native.write("text"), NativeWrite::Unavailable);
+    }
+
+    /// Scenario: The native write blocks on a first copy, A, and two more copies, B and then C, are made while it is stuck. Once the clipboard answers again, A finishes, B (superseded before it started) is never written, and C, the newest copy, is what the clipboard ends up holding.
+    #[spec("clipboard/native/001")]
+    #[test]
+    fn native_001_the_newest_copy_wins_after_a_stuck_write() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let (release, gate) = mpsc::channel();
+        let (entered_tx, entered) = mpsc::channel();
+        let sink = FakeSink {
+            written: Arc::clone(&written),
+            gate: Some(gate),
+            fail: false,
+            entered: Some(entered_tx),
+        };
+        let wait = Duration::from_millis(20);
+        let mut native = NativeClipboard::with_opener(counting_opener(&opens, Some(sink)), wait);
+        assert_eq!(native.write("A"), NativeWrite::NotConfirmed);
+        // A is in flight: the worker is inside the sink's write.
+        assert_eq!(entered.recv_timeout(LONG).as_deref(), Ok("A"));
+        assert_eq!(native.write("B"), NativeWrite::NotConfirmed);
+        assert_eq!(native.write("C"), NativeWrite::NotConfirmed);
+        // The clipboard recovers.
+        drop(release);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !written.lock().unwrap().iter().any(|t| t == "C")
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Let any stale write that was still going to happen happen.
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            *written.lock().unwrap(),
+            ["A", "C"],
+            "the in-flight write finishes, the superseded one is dropped, the newest lands last"
+        );
+    }
+
+    /// A sink whose `Drop` stands in for arboard's X11 clipboard-manager
+    /// handoff, which runs when the clipboard is dropped: it waits for
+    /// `gate` (or `delay`) and then records that it finished.
+    struct HandoffSink {
+        finished: Arc<std::sync::atomic::AtomicBool>,
+        delay: Duration,
+        gate: Option<mpsc::Receiver<()>>,
+    }
+
+    impl NativeSink for HandoffSink {
+        fn write_text(&mut self, _text: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    impl Drop for HandoffSink {
+        fn drop(&mut self) {
+            std::thread::sleep(self.delay);
+            if let Some(gate) = &self.gate {
+                let _ = gate.recv();
+            }
+            self.finished.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Scenario: The deck exits after a copy and the clipboard's exit handoff takes a moment to finish. Shutting the native clipboard down waits for that handoff, so it has completed by the time the shutdown returns.
+    #[spec("clipboard/native/002")]
+    #[test]
+    fn native_002_exit_waits_for_the_clipboard_handoff() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let sink = HandoffSink {
+            finished: Arc::clone(&finished),
+            delay: Duration::from_millis(50),
+            gate: None,
+        };
+        let mut native = NativeClipboard::with_opener(
+            Box::new(move || Some(Box::new(sink) as Box<dyn NativeSink>)),
+            LONG,
+        );
+        assert_eq!(native.write("text"), NativeWrite::Written);
+        assert!(
+            native.shutdown(Duration::from_secs(5)),
+            "the handoff completed"
+        );
+        assert!(finished.load(Ordering::SeqCst));
+        assert!(
+            NATIVE_SHUTDOWN_WAIT <= Duration::from_millis(300),
+            "exit waits at most a short, bounded time"
+        );
+    }
+
+    /// Scenario: The deck exits while the clipboard's exit handoff never completes, as with an X server that stopped answering. The shutdown gives up after its deadline and returns, so the exit does not hang.
+    #[spec("clipboard/native/002")]
+    #[test]
+    fn native_002_exit_does_not_hang_on_a_stuck_handoff() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (release, gate) = mpsc::channel::<()>();
+        let sink = HandoffSink {
+            finished: Arc::clone(&finished),
+            delay: Duration::ZERO,
+            gate: Some(gate),
+        };
+        let mut native = NativeClipboard::with_opener(
+            Box::new(move || Some(Box::new(sink) as Box<dyn NativeSink>)),
+            LONG,
+        );
+        assert_eq!(native.write("text"), NativeWrite::Written);
+        let started = std::time::Instant::now();
+        assert!(
+            !native.shutdown(Duration::from_millis(100)),
+            "a handoff that never finishes is reported as not finished"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded");
+        assert!(!finished.load(Ordering::SeqCst));
+        drop(release);
+    }
+
+    struct PanickingSink;
+
+    impl NativeSink for PanickingSink {
+        fn write_text(&mut self, _text: &str) -> Result<(), String> {
+            panic!("deliberate panic in a fake clipboard write");
+        }
+    }
+
+    /// Scenario: Opening the native clipboard panics on its worker thread, as arboard's X11 constructor can when it cannot start its own thread, and so does a write. The deck's panic hook leaves the terminal alone for those panics, and the copies report the native clipboard unavailable while a panic on any other thread still gets the teardown.
+    #[spec("clipboard/native/003")]
+    #[test]
+    fn native_003_a_clipboard_thread_panic_leaves_the_terminal_alone() {
+        let torn_down = Arc::new(Mutex::new(Vec::<String>::new()));
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(crate::ui::tui_panic_hook({
+            let torn_down = Arc::clone(&torn_down);
+            move |_info| {
+                let name = std::thread::current().name().unwrap_or_default().to_owned();
+                torn_down
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(name);
+            }
+        })));
+
+        // Control: a panic on an ordinary thread still reaches the teardown.
+        let control = std::thread::Builder::new()
+            .name("not-the-clipboard".into())
+            .spawn(|| panic!("deliberate control panic"))
+            .unwrap()
+            .join();
+        assert!(control.is_err());
+
+        let mut opener_panics = NativeClipboard::with_opener(
+            Box::new(|| panic!("deliberate panic in a fake clipboard open")),
+            LONG,
+        );
+        assert_eq!(opener_panics.write("text"), NativeWrite::Unavailable);
+        assert_eq!(opener_panics.write("again"), NativeWrite::Unavailable);
+
+        let mut write_panics = NativeClipboard::with_opener(
+            Box::new(|| Some(Box::new(PanickingSink) as Box<dyn NativeSink>)),
+            LONG,
+        );
+        assert_eq!(write_panics.write("text"), NativeWrite::Unavailable);
+        assert_eq!(write_panics.write("again"), NativeWrite::Unavailable);
+
+        std::panic::set_hook(previous);
+        let torn_down = torn_down.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            torn_down.iter().any(|n| n == "not-the-clipboard"),
+            "control: {torn_down:?}"
+        );
+        assert!(
+            !torn_down.iter().any(|n| n == NATIVE_THREAD_NAME),
+            "the clipboard thread's panics tore the terminal down: {torn_down:?}"
+        );
     }
 }

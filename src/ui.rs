@@ -13055,6 +13055,53 @@ fn handle_key_event(
     flow
 }
 
+/// The `run_tui` panic hook: `teardown` (restore the terminal, then report)
+/// runs for every panic except one the deck contains and recovers from.
+///
+/// A panic inside a guarded vt100 feed (see
+/// `embedded_pane::guarded_parser_feed`) is caught by the caller and must
+/// NOT tear down the live terminal — doing so would yank the alternate
+/// screen out from under the render loop and exit the TUI, exactly the
+/// crash this guard exists to prevent. Leave the terminal untouched and
+/// let `catch_unwind` swallow it (the caller logs and drops the chunk).
+///
+/// PRD #227 audit item C: gated on `panic = "unwind"`, which is every
+/// official build (`Cargo.toml` defines no `panic = "abort"` profile).
+/// The early return is only correct BECAUSE the panic is recoverable:
+/// under `panic = "abort"` nothing can catch it, `catch_unwind` never
+/// runs, `KeyboardEnhancementGuard::drop` never runs, and the process
+/// dies moments later — so returning here would leak the enhanced
+/// keyboard mode into the user's shell, the single failure mode this
+/// milestone exists to prevent. In an abort build the whole `if` is
+/// compiled out and the guarded case falls through to `teardown`, which is the right trade when the deck is dying anyway.
+///
+/// NOT solvable by simply moving the pop above this return: under unwind
+/// that would pop on every RECOVERED guarded-parser panic and silently
+/// disable Shift+Enter (and every other modifier-bearing key) for the
+/// rest of a session that keeps running perfectly well.
+///
+/// PRD #385: a panic on the native clipboard's worker thread is contained the
+/// same way. That thread runs under `catch_unwind` for its whole life
+/// (`clipboard::in_clipboard_worker`) and settles the native clipboard as
+/// unavailable, so copies go on as OSC 52 only; tearing the terminal down
+/// for it would leave a running TUI drawing on a restored shell. A panic on a
+/// thread arboard starts for itself is not on that thread and is not covered.
+pub(crate) fn tui_panic_hook<F>(
+    teardown: F,
+) -> impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static
+where
+    F: Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
+{
+    move |info| {
+        #[cfg(panic = "unwind")]
+        if crate::embedded_pane::in_guarded_parser_feed() || crate::clipboard::in_clipboard_worker()
+        {
+            return;
+        }
+        teardown(info);
+    }
+}
+
 pub fn run_tui(
     state: SharedState,
     pane: Arc<dyn PaneController>,
@@ -13065,33 +13112,7 @@ pub fn run_tui(
     let terminal_modes = TerminalModes::default();
     let hook_terminal_modes = terminal_modes.clone();
     let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // A panic inside a guarded vt100 feed (see
-        // `embedded_pane::guarded_parser_feed`) is caught by the caller and must
-        // NOT tear down the live terminal — doing so would yank the alternate
-        // screen out from under the render loop and exit the TUI, exactly the
-        // crash this guard exists to prevent. Leave the terminal untouched and
-        // let `catch_unwind` swallow it (the caller logs and drops the chunk).
-        //
-        // PRD #227 audit item C: gated on `panic = "unwind"`, which is every
-        // official build (`Cargo.toml` defines no `panic = "abort"` profile).
-        // The early return is only correct BECAUSE the panic is recoverable:
-        // under `panic = "abort"` nothing can catch it, `catch_unwind` never
-        // runs, `KeyboardEnhancementGuard::drop` never runs, and the process
-        // dies moments later — so returning here would leak the enhanced
-        // keyboard mode into the user's shell, the single failure mode this
-        // milestone exists to prevent. In an abort build the whole `if` is
-        // compiled out and the guarded case falls through to the full teardown
-        // below, which is the right trade when the deck is dying anyway.
-        //
-        // NOT solvable by simply moving the pop above this return: under unwind
-        // that would pop on every RECOVERED guarded-parser panic and silently
-        // disable Shift+Enter (and every other modifier-bearing key) for the
-        // rest of a session that keeps running perfectly well.
-        #[cfg(panic = "unwind")]
-        if crate::embedded_pane::in_guarded_parser_feed() {
-            return;
-        }
+    std::panic::set_hook(Box::new(tui_panic_hook(move |info| {
         // PRD #227 M2: pop the keyboard-enhancement flag on the crash path too.
         // Unlike mouse capture, a leaked push is not merely cosmetic — it
         // survives the process and corrupts key delivery in the shell the user
@@ -13104,7 +13125,7 @@ pub fn run_tui(
         // property the modes always had.
         hook_terminal_modes.disable(&mut std::io::stdout());
         original_hook(info);
-    }));
+    })));
 
     // Enable mouse capture and bracketed paste so events reach our event loop.
     //
@@ -15546,6 +15567,13 @@ pub fn run_tui(
     // Sanitised on the way out — see `flush_session_warnings` for why that
     // happens HERE and not at the fifteen `session_warnings.push` sites.
     flush_session_warnings(&ui.session_warnings, &mut std::io::stderr().lock());
+
+    // PRD #385: let the native clipboard hand what the deck copied to a
+    // clipboard manager (arboard does this on X11 when it is dropped) before
+    // the process exits, bounded so an X server that stopped answering cannot
+    // hold the exit. Best effort; the clipboard's `Drop` is the backstop on
+    // the other ways out of this function.
+    clipboard.shutdown();
 
     Ok(())
 }

@@ -7737,6 +7737,29 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** that `arboard` reaches a real X11, Wayland or macOS clipboard; the mouse gesture that triggers a copy (that is the pane selection's own tests); an agent's own OSC 52 copy, which is `embed/clipboard/001`.
 - **Platform coverage:** mac+linux+windows.
 
+#### clipboard/native
+
+##### clipboard/native/001 — Copies made while the native write is stuck do not land out of order: the newest one wins (PRD #385).
+- **Layer:** L1 pure data (`clipboard::tests`), a fake `NativeSink` whose write blocks until released.
+- **Agent:** none.
+- **Asserts:** with a write of `A` in progress and blocked, copies `B` and then `C` return unconfirmed without waiting; once the sink is released the clipboard receives `A` then `C`, and `B` is never written.
+- **Does not assert:** that the in-progress write can be stopped (it cannot); a real X11, Wayland or macOS clipboard.
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/002 — Exit waits a bounded time for the native clipboard's handoff (PRD #385).
+- **Layer:** L1 pure data (`clipboard::tests`), a fake `NativeSink` whose `Drop` stands in for arboard's X11 clipboard-manager handoff.
+- **Agent:** none.
+- **Asserts:** shutting the native clipboard down waits for a handoff that finishes, which has finished when the shutdown returns; a handoff that never finishes makes the shutdown return `false` after its deadline instead of hanging; the exit wait constant is at most 300 ms.
+- **Does not assert:** that a real clipboard manager takes the copy; that `run_tui` calls the shutdown (it does so at its ordinary exit; the clipboard's `Drop` is the backstop).
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/003 — A panic on the native clipboard thread does not tear the terminal down (PRD #385).
+- **Layer:** L1 (`clipboard::tests`), the deck's own `ui::tui_panic_hook` installed with a recording teardown, and fake openers/sinks that panic.
+- **Agent:** none.
+- **Asserts:** a panic while opening the clipboard and a panic while writing to it each settle the native clipboard as unavailable (that copy and the next report it so) and do not reach the hook's teardown; a control panic on an ordinary thread does reach it.
+- **Does not assert:** a panic on a thread arboard starts for itself; the `panic = "abort"` build, where nothing is contained and the hook tears down.
+- **Platform coverage:** mac+linux+windows.
+
 
 ### Theme contrast
 
