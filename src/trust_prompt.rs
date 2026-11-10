@@ -163,9 +163,9 @@ pub fn decide(
                 }
             }
         }
-        Err(e) => Gate::Refuse(format!(
+        Err(e) => Gate::Refuse(escape_control_and_bidi(&format!(
             "Orchestration not started: its approval could not be checked ({e})."
-        )),
+        ))),
     }
 }
 
@@ -204,6 +204,14 @@ fn rearm_lead(name: &str) -> String {
     format!("Orchestration '{name}': its instructions were not sent to its coordinator again")
 }
 
+/// A re-arm refusal, escaped for display like [`crate::project_trust::refusal_text`]:
+/// it names the config's orchestration and path and can quote the daemon's
+/// error, so a control or bidi character in any of them is shown, never
+/// obeyed.
+fn refuse_rearm(message: String) -> Rearm {
+    Rearm::Refuse(escape_control_and_bidi(&message))
+}
+
 /// Decide what a remit re-arm of `current` — the orchestration text a running
 /// tab holds, which a warm reattach read from the config without asking — may
 /// publish, from the daemon's `answer` to the trust-state request for it.
@@ -237,13 +245,13 @@ pub fn decide_rearm(
                     if same_roles {
                         Rearm::PublishApproved(fresh)
                     } else {
-                        Rearm::Refuse(format!(
+                        refuse_rearm(format!(
                             "{lead}: its roles changed since it was opened. Open it again to \
                              use the new roles."
                         ))
                     }
                 }
-                _ => Rearm::Refuse(format!(
+                _ => refuse_rearm(format!(
                     "{lead}: its config changed while it was being checked."
                 )),
             }
@@ -254,7 +262,7 @@ pub fn decide_rearm(
             } else {
                 "was never approved"
             };
-            Rearm::Refuse(format!(
+            refuse_rearm(format!(
                 "{lead}, because its config {state}. Review and approve it from a terminal \
                  outside the deck with: {}",
                 crate::project_trust::approve_command(
@@ -265,9 +273,9 @@ pub fn decide_rearm(
         }
         Ok(GatedQuery::Unsupported) => match local().refusal() {
             None => Rearm::Publish,
-            Some(refusal) => Rearm::Refuse(format!("{lead}. {OLDER_DAEMON_NOTE} {refusal}")),
+            Some(refusal) => refuse_rearm(format!("{lead}. {OLDER_DAEMON_NOTE} {refusal}")),
         },
-        Err(e) => Rearm::Refuse(format!("{lead}: its approval could not be checked ({e}).")),
+        Err(e) => refuse_rearm(format!("{lead}: its approval could not be checked ({e}).")),
     }
 }
 
@@ -792,6 +800,69 @@ mod tests {
             unused_check,
         );
         assert!(matches!(gate, Gate::Refuse(m) if m.contains("could not be checked")));
+    }
+
+    /// Text a terminal would obey: ESC, BEL and RIGHT-TO-LEFT OVERRIDE.
+    const HOSTILE: &str = "\u{1b}[2J\u{7}\u{202e}";
+
+    fn assert_shown_escaped(message: &str) {
+        assert!(
+            !message
+                .chars()
+                .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+            "a raw control or bidi character reached the refusal: {message:?}"
+        );
+        assert!(
+            message.contains("\\u{1b}") && message.contains("\\u{202e}"),
+            "the hostile text is shown escaped, not dropped: {message:?}"
+        );
+    }
+
+    /// PRD #1885 (Qodo #8 on PR #2256): a refusal built from a daemon error
+    /// or from the config's orchestration name shows control and bidi
+    /// characters escaped, wherever the caller puts it.
+    #[test]
+    fn refusals_show_hostile_names_and_errors_escaped() {
+        let chosen = orchestration("cat");
+        match decide(
+            Err(format!("boom {HOSTILE}")),
+            &chosen,
+            || None,
+            unused_check,
+        ) {
+            Gate::Refuse(message) => assert_shown_escaped(&message),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+
+        let mut held = orchestration("cat");
+        held.name = format!("team{HOSTILE}");
+        for state in ["never_approved", "changed"] {
+            match decide_rearm(
+                Ok(GatedQuery::Answered(view_of(&held, state))),
+                &held,
+                || None,
+                unused_check,
+            ) {
+                Rearm::Refuse(message) => assert_shown_escaped(&message),
+                other => panic!("{state}: expected a refusal, got {other:?}"),
+            }
+        }
+        match decide_rearm(
+            Ok(GatedQuery::Answered(view_of(
+                &orchestration("cut"),
+                "approved",
+            ))),
+            &held,
+            || None,
+            unused_check,
+        ) {
+            Rearm::Refuse(message) => assert_shown_escaped(&message),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+        match decide_rearm(Err(format!("boom {HOSTILE}")), &held, || None, unused_check) {
+            Rearm::Refuse(message) => assert_shown_escaped(&message),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 
     /// An older daemon: the TUI reads the store itself, opens an approved

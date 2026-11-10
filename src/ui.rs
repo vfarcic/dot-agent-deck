@@ -12079,20 +12079,25 @@ fn dispatch_action(
                     true
                 }
                 Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+                    // The command names the config's path and orchestration:
+                    // shown, never obeyed.
                     ui.status_message = Some((
-                        format!(
+                        crate::untrusted_text::escape_control_and_bidi(&format!(
                             "{} Not approved: run `{}` from a terminal outside the deck.",
                             crate::trust_prompt::OLDER_DAEMON_NOTE,
                             crate::project_trust::approve_command(
                                 std::path::Path::new(&view.config_dir),
                                 &view.orchestration
                             )
-                        ),
+                        )),
                         std::time::Instant::now(),
                     ));
                     false
                 }
                 Err(e) => {
+                    // The daemon's error can quote the config: shown, never
+                    // obeyed.
+                    let e = crate::untrusted_text::escape_control_and_bidi(&e);
                     ui.status_message = Some((
                         format!("Orchestration '{name}' not approved: {e}"),
                         std::time::Instant::now(),
@@ -42038,6 +42043,15 @@ mod tests {
         view: crate::project_trust::ProjectTrustView,
         approved: std::sync::Mutex<bool>,
         approvals: std::sync::Mutex<Vec<String>>,
+        /// When set, what the next approval answers instead of approving.
+        approve_answer: std::sync::Mutex<
+            Option<
+                Result<
+                    crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>,
+                    String,
+                >,
+            >,
+        >,
         inner: CapturingPaneController,
     }
 
@@ -42053,6 +42067,7 @@ mod tests {
                 view: check.view(),
                 approved: std::sync::Mutex::new(false),
                 approvals: std::sync::Mutex::new(Vec::new()),
+                approve_answer: std::sync::Mutex::new(None),
                 inner: CapturingPaneController::new(),
             }
         }
@@ -42119,6 +42134,9 @@ mod tests {
         ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
         {
             self.approvals.lock().unwrap().push(digest.to_string());
+            if let Some(answer) = self.approve_answer.lock().unwrap().take() {
+                return answer;
+            }
             if digest != self.view.digest {
                 return Err(format!(
                     "{}: changed",
@@ -42235,6 +42253,55 @@ mod tests {
             "approving opens every role"
         );
         assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: approve, with `a`, an orchestration whose config name
+    /// carries ESC, BEL and RIGHT-TO-LEFT OVERRIDE, against a daemon too old to
+    /// approve and against one whose refusal carries the same characters. The
+    /// status line shows every one of them escaped (Qodo #8 on PR #2256).
+    #[test]
+    fn prompt_007_an_approval_refusal_shows_hostile_text_escaped() {
+        const HOSTILE: &str = "\u{1b}[2J\u{7}\u{202e}";
+        let answers = [
+            Ok(crate::daemon_client::GatedQuery::Unsupported),
+            Err(format!("daemon returned error: boom {HOSTILE}")),
+        ];
+        for answer in answers {
+            let tmp = tempdir().expect("tempdir");
+            let config = make_orchestration(&format!("review{HOSTILE}"));
+            let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_against(
+                open_request(tmp.path(), &config),
+                &mut ui,
+                pc.as_ref(),
+                &mut tm,
+            );
+            assert_eq!(ui.mode, UiMode::TrustPrompt);
+            let label = format!("{answer:?}");
+            *pc.approve_answer.lock().unwrap() = Some(answer);
+            dispatch_against(Action::ApproveProjectTrust, &mut ui, pc.as_ref(), &mut tm);
+            assert!(
+                pc.inner.recorded_orchestration_names().is_empty(),
+                "{label}"
+            );
+            let status = ui
+                .status_message
+                .as_ref()
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default();
+            assert!(
+                !status
+                    .chars()
+                    .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+                "{label}: a raw control or bidi character reached the status line: {status:?}"
+            );
+            assert!(
+                status.contains("review\\u{1b}") && status.contains("\\u{202e}"),
+                "{label}: the hostile text is shown escaped, not dropped: {status:?}"
+            );
+        }
     }
 
     /// Scenario: three saved orchestrations are held back by the startup
