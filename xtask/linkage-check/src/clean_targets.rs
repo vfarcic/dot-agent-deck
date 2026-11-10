@@ -43,15 +43,20 @@
 //!
 //! # The delete is a rename first
 //!
-//! The process check is repeated immediately before each delete, and the tree
-//! is then **renamed** out of the worktree (to a hidden sibling of the
-//! worktree, `.dad-clean-targets-…`, on the same filesystem) before it is
-//! removed. A build that starts after the rename gets a fresh, empty `target/`
-//! instead of a half-deleted one. A sibling and not a name inside the worktree,
-//! because `.gitignore` ignores `/target` only, so a renamed tree inside the
-//! worktree would show up as untracked files to a `git add -A` while it is
-//! being removed. A parked tree left behind by an interrupted run is found and
-//! removed by the next run.
+//! Each tree is decided again in full (holders, marker, idle, size)
+//! immediately before it is deleted, because the plan can be minutes old by
+//! then. The tree is then **renamed** out of the worktree into
+//! `<git common dir>/dad-clean-targets/` and removed from there. A build that
+//! starts after the rename gets a fresh, empty `target/` instead of a
+//! half-deleted one. Not a name inside the worktree, because `.gitignore`
+//! ignores `/target` only, so a renamed tree there would be untracked files to
+//! a `git add -A` while it is being removed; and not a sibling of the
+//! worktree, because a parent directory shared with other repositories cannot
+//! tell this command's leftovers from theirs. Only this command writes the
+//! parking directory, so a tree left there by an interrupted run is found by
+//! its location, markers or not, and removed by the next run. A worktree on
+//! another filesystem than the common dir cannot be renamed there, and its
+//! tree is kept with the error reported.
 //!
 //! The window between the recheck and the rename is not closed: a build that
 //! starts inside it can lose its tree. It is the time two syscalls take, and
@@ -60,7 +65,6 @@
 //! Dry run by default; `--apply` deletes. Operational page:
 //! `docs/develop/target-cleanup.md`.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::{Duration, SystemTime};
@@ -68,8 +72,9 @@ use std::time::{Duration, SystemTime};
 /// cargo's `CACHEDIR.TAG` signature (<https://bford.info/cachedir/>).
 const CACHEDIR_SIGNATURE: &str = "Signature: 8a477f597d28d172789f06886806bc55";
 
-/// Prefix of a tree parked for removal, beside the worktree it came from.
-const PARK_PREFIX: &str = ".dad-clean-targets-";
+/// The directory, inside the git common dir, that trees are parked in for
+/// removal. See [`parking_dir`].
+const PARKING_DIR: &str = "dad-clean-targets";
 
 const DEFAULT_MIN_IDLE_MINUTES: u64 = 30;
 
@@ -354,37 +359,46 @@ pub(crate) fn assess(
     Some((target, verdict))
 }
 
-/// The parking path for `target` of `worktree`: a hidden sibling of the
-/// worktree, so it is on the same filesystem and outside the work tree.
-pub(crate) fn park_path(worktree: &Path, tag: &str) -> Option<PathBuf> {
-    let name = worktree.file_name()?.to_string_lossy().into_owned();
-    let mut file: OsString = PARK_PREFIX.into();
-    file.push(format!("{name}-{tag}"));
-    Some(worktree.parent()?.join(file))
+/// The directory this command parks trees in: `dad-clean-targets` inside the
+/// repository's git common dir. Only this command writes there, so everything
+/// in it is a tree it parked: ownership comes from the location, not from a
+/// marker inside the tree, which an interrupted removal may already have
+/// deleted. Being inside this repository's own `.git`, it can never hold
+/// another repository's files, and git ignores a directory it does not know.
+pub(crate) fn parking_dir(git_common_dir: &Path) -> PathBuf {
+    git_common_dir.join(PARKING_DIR)
 }
 
-/// Trees parked by an earlier run that did not finish removing them: hidden
-/// siblings of the worktrees that carry the prefix and cargo's tag.
-pub(crate) fn parked_leftovers(worktrees: &[PathBuf]) -> Vec<PathBuf> {
-    let mut parents: Vec<PathBuf> = worktrees
-        .iter()
-        .filter_map(|w| w.parent().map(Path::to_path_buf))
-        .collect();
-    parents.sort();
-    parents.dedup();
-    let mut out = Vec::new();
-    for p in parents {
-        let Ok(entries) = std::fs::read_dir(&p) else {
-            continue;
-        };
-        for e in entries.flatten() {
-            if e.file_name().to_string_lossy().starts_with(PARK_PREFIX)
-                && is_cargo_target(&e.path())
-            {
-                out.push(e.path());
-            }
-        }
+/// The parking path for `worktree`'s `target/`.
+pub(crate) fn park_path(parking: &Path, worktree: &Path, tag: &str) -> Option<PathBuf> {
+    let name = worktree.file_name()?.to_string_lossy().into_owned();
+    Some(parking.join(format!("{name}-{tag}")))
+}
+
+/// Create the parking directory if it is missing, and refuse it unless it is
+/// a real directory: a symlink there would turn the rename into a move to
+/// wherever it points.
+pub(crate) fn ensure_parking(parking: &Path) -> Result<(), String> {
+    match std::fs::create_dir(parking) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(format!("could not create {}: {e}", parking.display())),
     }
+    match std::fs::symlink_metadata(parking) {
+        Ok(m) if m.is_dir() => Ok(()),
+        _ => Err(format!("{} is not a real directory", parking.display())),
+    }
+}
+
+/// Trees parked by an earlier run that did not finish removing them: every
+/// entry of the parking directory, whatever is left inside it.
+pub(crate) fn parked_leftovers(parking: &Path) -> Vec<PathBuf> {
+    if !std::fs::symlink_metadata(parking).is_ok_and(|m| m.is_dir()) {
+        return Vec::new();
+    }
+    let mut out: Vec<PathBuf> = std::fs::read_dir(parking)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
     out.sort();
     out
 }
@@ -447,17 +461,20 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
             "--apply" => opts.apply = true,
             "--min-idle" => {
                 let v = it.next().ok_or("--min-idle needs a number of minutes")?;
-                let m: u64 = v
-                    .parse()
-                    .map_err(|_| format!("--min-idle: not a whole number of minutes: {v}"))?;
-                opts.min_idle = Duration::from_secs(m * 60);
+                let secs = v
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|m| m.checked_mul(60))
+                    .ok_or_else(|| format!("--min-idle: not a usable number of minutes: {v}"))?;
+                opts.min_idle = Duration::from_secs(secs);
             }
             "--min-size" => {
                 let v = it.next().ok_or("--min-size needs a number of GiB")?;
-                let g: u64 = v
-                    .parse()
-                    .map_err(|_| format!("--min-size: not a whole number of GiB: {v}"))?;
-                opts.min_size_bytes = g << 30;
+                opts.min_size_bytes = v
+                    .parse::<u64>()
+                    .ok()
+                    .and_then(|g| g.checked_mul(1 << 30))
+                    .ok_or_else(|| format!("--min-size: not a usable number of GiB: {v}"))?;
             }
             "-h" | "--help" => {
                 usage();
@@ -469,12 +486,12 @@ fn parse_args(args: &[String]) -> Result<Option<Opts>, String> {
     Ok(Some(opts))
 }
 
-/// `git worktree list --porcelain` for `root`, with the variables that would
-/// point git at another repository cleared (the hazard linkage-check rule 13
-/// guards in `src/`).
-fn list_worktrees(root: &Path) -> Result<Vec<PathBuf>, String> {
+/// Run `git <args>` in `root` with the variables that would point git at
+/// another repository cleared (the hazard linkage-check rule 13 guards in
+/// `src/`), returning its stdout.
+fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
-        .args(["worktree", "list", "--porcelain"])
+        .args(args)
         .current_dir(root)
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -485,13 +502,12 @@ fn list_worktrees(root: &Path) -> Result<Vec<PathBuf>, String> {
         .map_err(|e| format!("could not run git: {e}"))?;
     if !out.status.success() {
         return Err(format!(
-            "git worktree list failed: {}",
+            "git {} failed: {}",
+            args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(parse_worktree_porcelain(&String::from_utf8_lossy(
-        &out.stdout,
-    )))
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// One snapshot of every file this user's processes hold, or `None` when it
@@ -521,20 +537,30 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let worktrees = match list_worktrees(root) {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!("xtask clean-targets: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
+    let (worktrees, parking) =
+        match git(root, &["worktree", "list", "--porcelain"]).and_then(|list| {
+            let common = git(
+                root,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )?;
+            Ok((
+                parse_worktree_porcelain(&list),
+                parking_dir(Path::new(common.trim())),
+            ))
+        }) {
+            Ok(w) => w,
+            Err(e) => {
+                eprintln!("xtask clean-targets: {e}");
+                return ExitCode::FAILURE;
+            }
+        };
     let snapshot = holders_snapshot();
     if snapshot.is_none() {
         eprintln!("xtask clean-targets: could not list open files with `lsof`; every tree is kept");
     }
     let now = SystemTime::now();
 
-    let mut planned: Vec<(PathBuf, PathBuf, u64)> = Vec::new(); // worktree, target, bytes
+    let mut planned: Vec<(PathBuf, PathBuf, u64)> = Vec::new(); // worktree, target, bytes at plan time
     for wt in &worktrees {
         let Some((target, verdict)) = assess(wt, snapshot.as_deref(), now, &opts) else {
             continue;
@@ -553,7 +579,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
             Verdict::Skip(why) => println!("keep    {}: {why}", target.display()),
         }
     }
-    let leftovers = parked_leftovers(&worktrees);
+    let leftovers = parked_leftovers(&parking);
     for l in &leftovers {
         println!("remove  {} (left parked by an earlier run)", l.display());
     }
@@ -578,9 +604,17 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
             .unwrap_or_default()
             .as_nanos()
     );
-    for (wt, target, bytes) in planned {
-        // The snapshot above can be minutes old after the walks; take a new one
-        // for each delete, and keep the tree if it cannot be taken.
+    if !planned.is_empty()
+        && let Err(e) = ensure_parking(&parking)
+    {
+        eprintln!("xtask clean-targets: {e}; every tree is kept");
+        return ExitCode::FAILURE;
+    }
+    for (wt, target, _) in planned {
+        // The plan can be minutes old after the walks: a build may have
+        // started, or started and finished, since. So decide each tree again,
+        // in full — holders, marker, idle and size — immediately before it is
+        // parked, and keep it if the holders cannot be listed.
         let Some(fresh) = holders_snapshot() else {
             println!(
                 "kept    {}: open files could not be rechecked",
@@ -589,13 +623,17 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
             failed = true;
             continue;
         };
-        if let Some(why) = blocker(&wt, &target, &fresh) {
-            println!("kept    {}: {why}", target.display());
-            continue;
-        }
-        let Some(parked) = park_path(&wt, &tag) else {
+        let bytes = match assess(&wt, Some(&fresh), SystemTime::now(), &opts) {
+            Some((_, Verdict::Reclaim { bytes, .. })) => bytes,
+            Some((_, Verdict::Skip(why))) => {
+                println!("kept    {}: {why}", target.display());
+                continue;
+            }
+            None => continue, // gone since the plan
+        };
+        let Some(parked) = park_path(&parking, &wt, &tag) else {
             println!(
-                "kept    {}: no parent directory to park it in",
+                "kept    {}: the worktree path has no name",
                 target.display()
             );
             continue;
@@ -627,6 +665,7 @@ pub fn run(root: &Path, args: &[String]) -> ExitCode {
             }
             match std::fs::remove_dir_all(&l) {
                 Ok(()) => println!("deleted {}", l.display()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     eprintln!("failed  {}: {e}", l.display());
                     failed = true;
@@ -891,16 +930,27 @@ mod tests {
         ));
     }
 
+    /// A stand-in git common dir beside the worktrees, as the main
+    /// checkout's `.git` is.
+    fn common_dir(parent: &Path) -> PathBuf {
+        let c = parent.join("main/.git");
+        fs::create_dir_all(&c).unwrap();
+        c
+    }
+
     #[test]
     fn reclaim_removes_only_target_and_leaves_no_parked_tree() {
         let d = tempfile::tempdir().unwrap();
         let wt = worktree(d.path(), "repo-dispatch-1", ago(120));
-        let parked = park_path(&wt, "t1").unwrap();
-        assert_eq!(parked.parent(), wt.parent());
+        let parking = parking_dir(&common_dir(d.path()));
+        ensure_parking(&parking).unwrap();
+        let parked = park_path(&parking, &wt, "t1").unwrap();
+        assert_eq!(parked.parent(), Some(parking.as_path()));
         reclaim(&wt.join("target"), &parked).unwrap();
 
         assert!(!wt.join("target").exists());
         assert!(!parked.exists());
+        assert!(parked_leftovers(&parking).is_empty());
         assert_eq!(
             fs::read_to_string(wt.join("src/lib.rs")).unwrap(),
             "fn x() {}"
@@ -913,17 +963,40 @@ mod tests {
     }
 
     #[test]
-    fn a_parked_tree_left_by_an_interrupted_run_is_found_and_nothing_else_is() {
+    fn a_parked_tree_is_found_by_its_location_even_with_its_markers_gone() {
         let d = tempfile::tempdir().unwrap();
         let wt = worktree(d.path(), "repo-dispatch-1", ago(120));
-        let parked = park_path(&wt, "t2").unwrap();
+        let parking = parking_dir(&common_dir(d.path()));
+        ensure_parking(&parking).unwrap();
+        let parked = park_path(&parking, &wt, "t2").unwrap();
         fs::rename(wt.join("target"), &parked).unwrap();
-        // Same prefix, but no cargo tag: not ours.
-        fs::create_dir(d.path().join(format!("{PARK_PREFIX}other"))).unwrap();
-        // A sibling worktree's own target/ is not a leftover.
+        // An interrupted removal can take the markers first.
+        fs::remove_file(parked.join("CACHEDIR.TAG")).unwrap();
+        // Directories beside the worktrees are never leftovers, whatever their
+        // name or content: they may be another repository's.
+        let beside = d.path().join(".dad-clean-targets-other");
+        fs::create_dir(&beside).unwrap();
+        fs::write(beside.join("CACHEDIR.TAG"), CACHEDIR_SIGNATURE).unwrap();
         worktree(d.path(), "repo-dispatch-2", ago(120));
 
-        assert_eq!(parked_leftovers(std::slice::from_ref(&wt)), vec![parked]);
+        assert_eq!(parked_leftovers(&parking), vec![parked]);
+    }
+
+    #[test]
+    fn no_parking_directory_means_no_leftovers_and_a_symlinked_one_is_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let parking = parking_dir(&common_dir(d.path()));
+        assert!(parked_leftovers(&parking).is_empty());
+
+        #[cfg(unix)]
+        {
+            let elsewhere = d.path().join("elsewhere");
+            fs::create_dir(&elsewhere).unwrap();
+            fs::write(elsewhere.join("precious"), "x").unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &parking).unwrap();
+            assert!(ensure_parking(&parking).is_err());
+            assert!(parked_leftovers(&parking).is_empty());
+        }
     }
 
     #[test]
@@ -938,6 +1011,9 @@ mod tests {
         assert_eq!(o.min_idle, Duration::from_secs(3600));
         assert_eq!(o.min_size_bytes, 50 << 30);
         assert!(a(&["--min-idle", "x"]).is_err());
+        // Values that would overflow are refused, not wrapped to a small one.
+        assert!(a(&["--min-size", "17179869184"]).is_err());
+        assert!(a(&["--min-idle", &u64::MAX.to_string()]).is_err());
         assert!(a(&["--bogus"]).is_err());
     }
 }
