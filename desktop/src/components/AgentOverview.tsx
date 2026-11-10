@@ -1061,6 +1061,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
   /** Issue #1073 — what the last Stop daemon did, in the crate's own sentence, naming the daemon. */
   const [daemonNotice, setDaemonNotice] = useState<string>();
+  /** The stop whose result the notice may show: a stop that settles after a later one was confirmed writes nothing. */
+  const latestDaemonStop = useRef(0);
   /**
    * Issue #1247 — the form the dialog handed back when it was last closed,
    * replayed by the next open. Here rather than in the dialog because closing
@@ -1571,13 +1573,14 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       label: "Stop daemon",
       busyLabel: "Stopping…",
       action: async () => {
+        const stop = ++latestDaemonStop.current;
         setDaemonNotice(undefined);
         try {
           // The crate's own sentence: "stopped" only for a daemon it saw go,
           // and "still shutting down" for one that accepted and had not gone
           // when it stopped waiting, whose card may still read connected.
           const result = await runtime.runAction({ type: "stop_daemon", deckId });
-          setDaemonNotice(`${deckName(target)}: ${result.message ?? "Daemon stopped."}`);
+          if (stop === latestDaemonStop.current) setDaemonNotice(`${deckName(target)}: ${result.message ?? "Daemon stopped."}`);
         } catch {
           // The runtime files the refusal under its global error.
         }

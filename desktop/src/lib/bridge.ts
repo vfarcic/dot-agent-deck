@@ -1871,6 +1871,8 @@ interface PendingTerminalAttachment {
   lifecycle: number;
   /** The deck the attach is for, so a teardown of that deck alone can cancel it (issue #1073). */
   deckId: string;
+  /** Set when that teardown cancelled this attempt: its late failure is not the pane's error to show. */
+  cancelled?: boolean;
   channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>;
   output: Uint8Array[];
   stateEvents: DesktopTerminalStateDto[];
@@ -4610,13 +4612,18 @@ export class TauriDeckBridge implements DeckBridge {
           if (this.pendingAttachments.get(key) === attempt) this.pendingAttachments.delete(key);
           this.attached.delete(key);
           if (this.terminalChannels.get(key) === onOutput) this.terminalChannels.delete(key);
-          this.deliverTerminal(target, {
-            agentId: target.agentId,
-            data: new Uint8Array(),
-            stream: "error",
-            operation: "append",
-            message: terminalAttachFailure(cause),
-          });
+          // An attempt its deck's stop or replacement cancelled fails because
+          // that daemon is going away; the next declaration attaches afresh, so
+          // this failure is not the pane's to show (issue #1073).
+          if (!attempt.cancelled) {
+            this.deliverTerminal(target, {
+              agentId: target.agentId,
+              data: new Uint8Array(),
+              stream: "error",
+              operation: "append",
+              message: terminalAttachFailure(cause),
+            });
+          }
         }
         throw cause;
       } finally {
@@ -5746,6 +5753,7 @@ export class TauriDeckBridge implements DeckBridge {
   private forgetDeckSessions(deckId: string): void {
     for (const [key, pending] of Array.from(this.pendingAttachments.entries())) {
       if (pending.deckId !== deckId) continue;
+      pending.cancelled = true;
       this.pendingAttachments.delete(key);
       this.attached.delete(key);
       if (this.terminalChannels.get(key) === pending.channel) this.terminalChannels.delete(key);

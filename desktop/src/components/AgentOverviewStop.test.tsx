@@ -250,6 +250,26 @@ describe("stopping a whole daemon from its card (issue #1073)", () => {
     expect(screen.queryByTestId("overview-daemon-notice")).not.toBeInTheDocument();
   });
 
+  /** Scenario: Two stops are confirmed one after the other and the FIRST one settles last; the notice keeps the result of the stop pressed most recently. */
+  it("keeps the latest stop's result when an older stop settles later", async () => {
+    let settleFirst: ((result: DeckActionResult) => void) | undefined;
+    const runAction = vi.fn(async (action: { type: string; deckId?: string }) => action.deckId === FIXTURE_REMOTE_DAEMON_ID
+      ? new Promise<DeckActionResult>((resolve) => { settleFirst = resolve; })
+      : ({ ok: true, message: "Daemon stopped gracefully." }) as DeckActionResult);
+    render(<AgentOverview runtime={live(runAction as DeckRuntimeState["runAction"])} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(card(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-stop"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+    await waitFor(() => expect(settleFirst).toBeDefined());
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(within(card(FIXTURE_DAEMON_ID)).getByTestId("daemon-stop"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+    expect(await screen.findByTestId("overview-daemon-notice")).toHaveTextContent("Local daemon: Daemon stopped gracefully.");
+
+    await act(async () => { settleFirst?.({ ok: true, message: "The daemon accepted the stop and is still shutting down." }); });
+    expect(screen.getByTestId("overview-daemon-notice")).toHaveTextContent("Local daemon: Daemon stopped gracefully.");
+  });
+
   /** Scenario: The local daemon's card offers Stop daemon too, and it stops the local daemon by its own id. */
   it("stops the local daemon from its own card", async () => {
     const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
