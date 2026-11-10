@@ -25,11 +25,13 @@
 //!   test, and the environment of every OpenCode process a pane runs (read
 //!   from `/proc`) holds no variable named like a key, token, secret, password
 //!   or credential;
-//! - no route out: every proxy variable points at a listener in this test
-//!   that answers nothing and closes each connection, with only loopback
+//! - no proxy that answers: every proxy variable points at a listener in this
+//!   test that answers nothing and closes each connection, with only loopback
 //!   exempt. That listener must see at least one connection (OpenCode's
-//!   model-catalog fetch as it starts, measured on 1.19.5 and 2.2.5), which is
-//!   what shows OpenCode honours the variables at all.
+//!   model-catalog fetch as it starts, measured on 1.19.5 and 2.2.5), which
+//!   shows OpenCode reads the variables. It sees only what takes the proxy: a
+//!   connection opened without it would go unobserved, which is why the first
+//!   two checks, not this one, are what put a model out of reach.
 //!
 //! Nothing is typed into a pane. Where a session is needed, 1.x gets one from
 //! its own loopback server (`--port`, `POST /session`), and 2.x from a deck
@@ -405,8 +407,11 @@ impl NoModel {
         );
     }
 
-    /// At the end: OpenCode did try the network (so the proxy variables were
-    /// in force), and every attempt went to the proxy, which answered none.
+    /// At the end: OpenCode sent at least one request through the refusing
+    /// proxy, which shows it reads the proxy variables. This observes the
+    /// requests that took the proxy, not every connection a process opens;
+    /// what keeps a model out of reach is that none is configured ([`NoModel::home`],
+    /// [`NoModel::screen`]) and no credential exists ([`NoModel::env`]).
     fn proxy(real: &Real) {
         let seen = real.proxy.seen();
         assert!(
@@ -838,6 +843,11 @@ fn opencode_real_002_opencode_2_gets_standalone_and_its_plugin_runs_with_the_pan
             "2.x's private server, which hosts the server plugin, has the pane's {var}"
         );
     }
+    assert_eq!(
+        real.card_status(&pane),
+        None,
+        "before any session, the card has no status"
+    );
     let posted = inbox::attach(
         &real.deck,
         json!({"op":"post-message","pane_id":pane.id,"expected_agent_id":pane.agent,
@@ -845,11 +855,6 @@ fn opencode_real_002_opencode_2_gets_standalone_and_its_plugin_runs_with_the_pan
             "origin":"seed"}),
     );
     assert_eq!(posted["ok"], true, "post a deck message: {posted}");
-    assert_eq!(
-        real.card_status(&pane),
-        None,
-        "before any session, the card has no status"
-    );
     let start = real.session_start(&pane, |_| true);
     assert_eq!(start.pane_id.as_deref(), Some(pane.id.as_str()));
     real.events.wait_for(
@@ -912,10 +917,11 @@ fn opencode_real_003_opencode_2_reports_a_broken_plugin_beside_the_decks() {
 
 /// Scenario: With one OpenCode config root, start the pinned real OpenCode
 /// 2.x, stop it, start the pinned 1.x, stop it, and start 2.x again, each in
-/// its own deck pane with no model and its own data root. Each start must load the deck's plugin and report no
-/// failed plugin; whatever the first 2.x start copied into `cli.json`, the
-/// 1.x start's install leaves no deck entry there and the second 2.x start
-/// finds none, and the deck's server module is never rewritten.
+/// its own deck pane with no model and its own data root. Each start must
+/// load the deck's plugin and report no failed plugin; the first 2.x start
+/// copies the deck's 1.x TUI entry into a new `cli.json`, the 1.x start's
+/// install takes it out again and the second 2.x start finds none, and the
+/// deck's server module is never rewritten.
 #[spec("hooks/opencode-real/004")]
 #[test]
 fn opencode_real_004_switching_between_opencode_1_and_2_keeps_the_plugin_loading() {
@@ -946,7 +952,16 @@ fn opencode_real_004_switching_between_opencode_1_and_2_keeps_the_plugin_loading
     real.no_failed_plugin(&first);
     let installed = module();
     real.stop(&first);
-    eprintln!("cli.json after the first 2.x start: {}", cli_text());
+    // The thing to repair: 2.x copied the deck's 1.x TUI entry out of
+    // `tui.json` into the `cli.json` it created (measured on 2.2.5). If a
+    // newer 2.x stops doing that, the repair below has nothing to act on and
+    // this precondition, not a silent pass, says so.
+    assert!(
+        cli_text().contains("dot-agent-deck"),
+        "precondition: the first 2.x start leaves a deck entry in cli.json for the next \
+         install to remove; cli.json: {:?}",
+        cli_text()
+    );
 
     let second = real.start_with_data(&v1, "", "real-opencode-switch-b", 1, data("data-1"));
     real.plugin_loaded(&second);

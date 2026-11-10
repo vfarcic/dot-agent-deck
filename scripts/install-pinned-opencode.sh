@@ -20,7 +20,9 @@
 #
 # Neither is put on PATH. A prefix already holding the pinned version is left
 # alone, so a dev box that ran bootstrap.sh is not reinstalled. Each package's
-# postinstall puts its platform binary in place, as bootstrap.sh relies on too;
+# postinstall puts its platform binary in place, as bootstrap.sh relies on too
+# (npm's `ignore-scripts` is honoured: the install then stops and says how to
+# finish it);
 # the version check at the end fails the run if a binary is not the pinned one.
 #
 # Installing a binary starts nothing: no model, provider or credential is
@@ -53,11 +55,17 @@ install_pin() {
   mkdir -p "$prefix"
   cp "$pins/$pin/package.json" "$pins/$pin/package-lock.json" "$prefix/"
   npm ci --prefix "$prefix" --no-fund --no-audit
-  # An npm that holds install scripts back (`ignore-scripts`, or a newer npm's
-  # `allowScripts` policy, which only warns as of npm 11) leaves the package's
-  # placeholder in place of the binary. This package's postinstall is the one
-  # script the install needs, so it is run here by name, as bootstrap.sh does.
+  # An npm that holds install scripts back leaves the package's placeholder
+  # in place of the binary. `ignore-scripts` is the user's policy and is
+  # honoured: the install fails, naming the one command that finishes it, as
+  # bootstrap.sh reports it. Otherwise (a newer npm's `allowScripts` policy,
+  # which only warns as of npm 11) this package's postinstall, the one script
+  # the install needs, is run here by name, as bootstrap.sh does.
   if [ "$(reported_version "$bin")" != "$want" ]; then
+    if [ "$(npm config get ignore-scripts 2>/dev/null)" = true ]; then
+      echo "$0: npm's ignore-scripts is set, so $package's postinstall did not run; to finish the OpenCode $want install, run it yourself: (cd $prefix/node_modules/$package && node ./postinstall.mjs)" >&2
+      exit 1
+    fi
     (cd "$prefix/node_modules/$package" && node ./postinstall.mjs)
   fi
   local got
