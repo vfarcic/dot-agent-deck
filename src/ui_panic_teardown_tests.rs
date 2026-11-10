@@ -56,6 +56,23 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
         "open pseudo-terminal: {}",
         std::io::Error::last_os_error()
     );
+    // `openpty` opens both without close-on-exec, so a process another test
+    // thread spawns would inherit them, and an inherited slave keeps the
+    // master readable past the child's exit. Mark both close-on-exec at once;
+    // the child still gets the slave as its stdio, which `Command` installs
+    // with `dup2` (that clears the flag on the copy). A spawn in the few
+    // instructions between `openpty` and these calls can still inherit them,
+    // which is why `run_child` also bounds the drain by its deadline.
+    for fd in [master, slave] {
+        // SAFETY: `fd` was opened above and is still open.
+        let rc = unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        assert_ne!(
+            rc,
+            -1,
+            "set close-on-exec on the pseudo-terminal: {}",
+            std::io::Error::last_os_error()
+        );
+    }
     // SAFETY: both descriptors are freshly opened and owned by this test.
     unsafe {
         (
@@ -63,6 +80,18 @@ fn open_pty() -> (std::fs::File, std::fs::File) {
             std::fs::File::from_raw_fd(slave),
         )
     }
+}
+
+/// Run `read` on a thread of its own, and hand back a receiver for its result,
+/// so the caller can wait for it with a deadline rather than without one.
+fn read_on_thread<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> std::sync::mpsc::Receiver<T> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(read());
+    });
+    receiver
 }
 
 /// What a child run left behind.
@@ -119,13 +148,16 @@ fn run_child(case: &str) -> Run {
             Ok(())
         });
     }
+    // One deadline for the child, its terminal and its stderr together.
+    let deadline = Instant::now() + Duration::from_secs(60);
     let mut child = command.spawn().expect("start the child");
+    // The parent's copies of the slave: the command's two and this one.
     drop(command);
     drop(slave);
 
     // Read the terminal until the child's side closes, which on Linux reads
     // as an error once the buffered output is drained.
-    let reader = std::thread::spawn(move || {
+    let reader = read_on_thread(move || {
         let mut out = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -137,13 +169,12 @@ fn run_child(case: &str) -> Run {
         out
     });
     let mut stderr = child.stderr.take().expect("the child's stderr");
-    let stderr = std::thread::spawn(move || {
+    let stderr = read_on_thread(move || {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text);
         text
     });
 
-    let deadline = Instant::now() + Duration::from_secs(60);
     let status = loop {
         if let Some(status) = child.try_wait().expect("poll the child") {
             break status;
@@ -155,9 +186,18 @@ fn run_child(case: &str) -> Run {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
+    // Something other than the child can still hold its terminal or stderr
+    // open; past the deadline that fails the test instead of hanging it.
+    let left = || deadline.saturating_duration_since(Instant::now());
+    let terminal = reader.recv_timeout(left()).unwrap_or_else(|error| {
+        panic!("case {case}: the child's terminal was not drained within 60s: {error}")
+    });
+    let stderr = stderr.recv_timeout(left()).unwrap_or_else(|error| {
+        panic!("case {case}: the child's stderr was not drained within 60s: {error}")
+    });
     let run = Run {
-        terminal: String::from_utf8_lossy(&reader.join().expect("the reader")).into_owned(),
-        stderr: stderr.join().expect("the stderr reader"),
+        terminal: String::from_utf8_lossy(&terminal).into_owned(),
+        stderr,
     };
     assert!(
         status.success(),
