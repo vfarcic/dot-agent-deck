@@ -1839,6 +1839,9 @@ pub async fn cleanup_worktree(
             // A keep took it between the look above and the hold.
             return WorktreeVerdictKind::NotRecorded;
         };
+        // Issue #1958 round 4 test seam: this cleanup now owns the tree and
+        // has neither probed nor removed it yet.
+        registry.pause_point("close-worktree-cleanup-taken").await;
         let removal = crate::issue_dispatch_run::remove_worktree_outcome(
             &worktree,
             &entry.clone_dir,
