@@ -475,7 +475,7 @@ tasks:
       echo "$HOME/.nix-profile/bin" >> "$RWX_ENV/PATH"
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
-      NIX_VERSION: 2.35.4
+      NIX_VERSION: 2.35.6
 
   # `nix flake check` (`nix`).
   - key: nix
