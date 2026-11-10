@@ -17,7 +17,7 @@
 //! 'binary(e2e_pane_verbs_real_agent)'` so a preflight that cannot be satisfied
 //! fails instead of skipping.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

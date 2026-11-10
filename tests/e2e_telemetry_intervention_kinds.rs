@@ -3,7 +3,7 @@
 //! Synthetic input through an attached TUI, observed at an isolated OTLP receiver.
 //! The stand-in records raw input; it never calls a model or reads credentials.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::AgentRecord;

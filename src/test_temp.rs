@@ -8,7 +8,7 @@
 //! it mechanically (issue #474); the note above `mod tests` below has the
 //! measurement that makes the arrangement worth keeping.
 //!
-//! `tests/common/mod.rs` holds the real machinery: the candidate ladder,
+//! `tests/common/lib.rs` holds the real machinery: the candidate ladder,
 //! `DAD_E2E_TMPDIR`, the free-space pre-flight, the descriptor-relative
 //! validation walk, the per-process root and its `atexit` sweep. Two kinds of
 //! test process cannot reach any of it, because neither links that file — the
@@ -128,7 +128,7 @@ fn private_base() -> Option<PathBuf> {
 // `tests/rehydration.rs` and `tests/worktree_reclaim.rs`, ten of them as of
 // #474. That is the whole cost of sharing the module this way — two extra
 // fast-tier executions per crate, against the ~530 that pulling
-// `tests/common/mod.rs` in would have duplicated. Measured across the six added
+// `tests/common/lib.rs` in would have duplicated. Measured across the six added
 // at once: 2,315 → 2,327.
 // Keeping it self-contained is what makes that price available, so a `crate::`
 // reference added here would take it away — which is why `linkage-check` rule 9

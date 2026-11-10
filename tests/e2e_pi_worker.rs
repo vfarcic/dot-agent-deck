@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::DelegateSignal;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/pi_inbox_live.rs"]

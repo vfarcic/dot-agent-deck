@@ -114,7 +114,7 @@ It prints `DUE=<mode>` for each mode to dispatch, and `SKIP=<mode>`, the PR and 
 
 ## Step 2: disk and parallelism
 
-Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule applies unchanged: `df -h /` before each dispatch, and below ~100G free, reclaim finished units' worktrees with the runner's agreement or pause. Cleanup units count against the parallelism the runner set for the queue run. Run on its own, this skill asks the runner how many may run at once (recommend 2–3, as `/issue-queue` does) before dispatching more than one, and dispatches the rest as units finish.
+Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule applies unchanged: the `cargo xtask clean-targets` sweep and `df -h /` before each dispatch, and below ~100G free, `cargo xtask clean-targets --apply` first, then reclaim finished units' worktrees with the runner's agreement or pause. Cleanup units count against the parallelism the runner set for the queue run. Run on its own, this skill asks the runner how many may run at once (recommend 2–3, as `/issue-queue` does) before dispatching more than one, and dispatches the rest as units finish.
 
 ## Step 3: name each unit
 
@@ -205,8 +205,10 @@ and resolve every review thread: wait for the review apps with
 `.claude/skills/pr-create/wait-reviews.sh <n>`, again after your last push (Qodo re-reviews every
 push), then read `gh api repos/<owner>/<repo>/pulls/<n>/comments --paginate` and Qodo's "Code
 Review by Qodo" issue comment, which alone carries its informational findings. Reply on each
-thread and resolve it. The script bounds the wait; on REVIEWS=incomplete, report which review was
-not obtained and go on.
+thread and resolve it; answer a summary item with no thread in a PR comment quoting its title,
+until `.claude/skills/pr-create/unanswered-findings.sh <n>` prints FINDINGS=answered.
+wait-reviews.sh bounds the wait; on REVIEWS=incomplete, report which review was not obtained
+and go on.
 
 FINISH:
 - code: take the PR to merged by the procedure in .claude/skills/issue-queue/SKILL.md, subsection

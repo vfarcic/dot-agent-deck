@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", target_os = "linux"))]
 
 //! Real kernel trees and the installed helper; every agent is this test binary.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/editor_installation.rs"]

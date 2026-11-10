@@ -13,7 +13,7 @@
 //! Code's prompt-delivery path, and a task that arrives and is done is the proof
 //! that it did.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

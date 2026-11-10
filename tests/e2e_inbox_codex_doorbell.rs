@@ -15,7 +15,7 @@
 //! output (the untrusted-hooks path is not covered here). The daemon reads
 //! Codex's shipped facts, `head_echo` included, as production does: nothing
 //! assumes a measurement here.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

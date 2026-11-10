@@ -17,7 +17,7 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 // Issue #322. This crate is fast-tier and deliberately does NOT link
-// `tests/common/mod.rs` — doing so would pull the whole PTY harness into
+// `tests/common/lib.rs` — doing so would pull the whole PTY harness into
 // another binary and duplicate its ~530 fast-tier executions. But it is also
 // the one file in that group that binds Unix domain sockets, and
 // `cargo test-e2e` runs it, so its scratch dirs were being created in the OS

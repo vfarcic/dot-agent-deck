@@ -23,7 +23,7 @@
 //!
 //! Gated behind the `e2e` feature so `cargo test-fast` never compiles it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[cfg(all(feature = "e2e", unix))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
@@ -52,7 +52,7 @@ const DELIVERED_POINTER: &str = "Read .dot-agent-deck/orchestrator-context";
 /// PTYs, the fixture script's own `python3` readiness emit, the deck's
 /// readiness gate and the PTY write — rather than one round trip, which is
 /// why it sits well above the harness-wide 10s `WAIT_TIMEOUT`
-/// (`tests/common/mod.rs`) this call site used to merely restate. The 10s
+/// (`tests/common/lib.rs`) this call site used to merely restate. The 10s
 /// version timed out on `main` in CI on a runner executing 8107 tests in
 /// parallel (issue #832; `e2e-deterministic` run 33571127245,
 /// `orchestration_remit_007`) while the same wait needs ~2s on an idle
@@ -66,7 +66,7 @@ const SPAWN_DELIVERY_TIMEOUT: Duration = Duration::from_secs(30);
 ///
 /// Carried forward from issue #818's containment round, which raised every
 /// positive wait in this file from a bare 10s (a restatement of the
-/// harness-wide `WAIT_TIMEOUT`, `tests/common/mod.rs`) to 30s after
+/// harness-wide `WAIT_TIMEOUT`, `tests/common/lib.rs`) to 30s after
 /// `orchestration_remit_001` was observed on a runner failing at BOTH this
 /// bound and [`SPAWN_DELIVERY_TIMEOUT`] in different runs. That bound is kept
 /// rather than reverted: this measures a real PTY write plus the fixture's
@@ -278,7 +278,7 @@ impl ContextRewriteWatcher {
             // bounded poll — rather than from a sleep in this file. That is
             // Decision 21 (no sleeps in an e2e test body), and the cadence is
             // right on the measurement rather than by luck: `wait_until` polls
-            // every 50ms (`tests/common/mod.rs`) against a ~680ms gap between
+            // every 50ms (`tests/common/lib.rs`) against a ~680ms gap between
             // two genuine re-arms, so ~13x margin.
             let stopped_cleanly = common::wait_until(CONTEXT_WATCH_MAX, || {
                 let now = mtime(&path);
@@ -699,7 +699,7 @@ fn inject_clear_session_start(
     // Latching: `Idle` is TRANSIENT here. On a pane whose re-assertion this
     // event triggers, the delivery's own `thinking` confirmation overwrites
     // `Idle` within roughly one `wait_until` poll interval (50ms,
-    // `tests/common/mod.rs`), so a `status == Idle` wait can miss the window
+    // `tests/common/lib.rs`), so a `status == Idle` wait can miss the window
     // entirely and time out on a correct system — trading a predicate that
     // passes too easily for one that fails at random. `active_tool` stays
     // `None` once cleared, and the only events that clear it here are this

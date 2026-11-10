@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", target_os = "linux"))]
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/pty_frontier.rs"]
 mod fixture;
 

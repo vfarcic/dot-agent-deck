@@ -14,7 +14,7 @@
 //! card the way a `PostToolUse` does, without turning the card to Error. The
 //! exported-span half lives in `tests/e2e_telemetry_failed_operation.rs`.
 //!
-//! Deliberately not linking `tests/common/mod.rs`: the crate-internal
+//! Deliberately not linking `tests/common/lib.rs`: the crate-internal
 //! temp-dir resolver is `#[path]`-included, the same shape as
 //! `tests/subagent_tool_status.rs`.
 

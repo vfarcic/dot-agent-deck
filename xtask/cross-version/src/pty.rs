@@ -1,7 +1,7 @@
 //! A PTY-attached deck, driven by keystrokes and read back through a vt100
 //! terminal emulator.
 //!
-//! This is the same mechanism the L2 e2e harness uses (`tests/common/mod.rs`),
+//! This is the same mechanism the L2 e2e harness uses (`tests/common/lib.rs`),
 //! reimplemented here rather than reused for one reason: that harness launches
 //! `env!("CARGO_BIN_EXE_dot-agent-deck")`, the binary the *test build* produced,
 //! and links `dot_agent_deck` for its protocol types. A cross-version run needs
@@ -41,7 +41,7 @@ const LONGEST_QUERY_LEN: usize = 4;
 /// Answer the terminal-capability queries the deck writes to its tty, so its
 /// startup probe returns immediately instead of blocking for 2000 ms.
 ///
-/// Ported from `tests/common/mod.rs::answer_terminal_queries`, which carries the
+/// Ported from `tests/common/lib.rs::answer_terminal_queries`, which carries the
 /// full reasoning (PRD #227 M2). Without it every launch here would pay two
 /// seconds and come up with the enhanced keyboard protocol disabled, which is
 /// not the configuration a user's terminal presents.

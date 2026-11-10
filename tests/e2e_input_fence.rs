@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", target_os = "linux"))]
 
 //! S-15/S-16: real attach connections and a native raw-terminal recorder, no agent API.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/input_fence.rs"]
 mod fixture;
 #[path = "support/inbox_doorbell.rs"]

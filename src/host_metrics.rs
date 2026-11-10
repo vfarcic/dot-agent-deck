@@ -1,7 +1,7 @@
 //! Measurements of the machine this process runs on — PRD #1258.
 //!
 //! **The one load measurement in the tree.** `machine_load_per_cpu` used to
-//! exist twice, in `src/test_budget.rs` and in `tests/common/mod.rs`, and
+//! exist twice, in `src/test_budget.rs` and in `tests/common/lib.rs`, and
 //! issue #1245 had to teach each copy macOS separately. Both now call this
 //! module, so a fix to how the load is read lands once. Keep it that way: a
 //! third caller imports from here rather than reading `/proc/loadavg` itself.

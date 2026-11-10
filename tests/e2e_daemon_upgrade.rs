@@ -6,7 +6,7 @@
 //! The successor wrapper records its PID and executes a retained test build.
 //! These are process-handover tests, not two-release compatibility or UI tests.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;

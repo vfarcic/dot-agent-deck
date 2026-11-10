@@ -3,7 +3,7 @@
 //! Offline daemon PR resolution and dashboard interaction, using strict PATH
 //! stubs and genuine fixture git repositories. No GitHub or agent credentials.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;

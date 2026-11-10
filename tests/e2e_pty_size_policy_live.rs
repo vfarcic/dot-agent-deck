@@ -13,7 +13,7 @@
 //! like the corruption PRD #104 was opened about. A stand-in proves the
 //! plumbing; only a live agent proves the user-visible result.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

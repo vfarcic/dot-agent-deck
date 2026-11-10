@@ -5,7 +5,7 @@
 //! instructions give, the orchestrator's inbox carries that task id, and the
 //! worker is free for the next delegate.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

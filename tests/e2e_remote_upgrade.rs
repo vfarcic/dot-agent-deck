@@ -6,7 +6,7 @@
 //! debug build stamps. This proves policy and process replacement, not release
 //! compatibility, real SSH authentication, or real-agent work.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::fs;
 use std::io::{Read, Write};

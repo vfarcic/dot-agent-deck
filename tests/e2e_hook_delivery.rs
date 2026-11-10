@@ -8,7 +8,7 @@
 //! Decision 6: this file is gated behind the `e2e` feature so CI
 //! (which runs only `cargo test-fast`) never compiles it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{TuiDeck, write_hook_line};
 use spec::spec;

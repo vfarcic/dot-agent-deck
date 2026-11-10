@@ -3,7 +3,7 @@
 //! Attached-TUI draft regressions retargeted from typed task delivery to the
 //! inbox doorbell. Synthetic panes spend no real-agent credential.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

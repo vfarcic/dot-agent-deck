@@ -32,7 +32,7 @@ use dot_agent_deck::event::{SpawnRoleResponse, SpawnRoleSignal};
 use dot_agent_deck::state::{OrchestrationIdentity, handle_spawn_role_with_state};
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCH_PANE: &str = "spawn-orchestrator";
 const CODER_PANE: &str = "spawn-coder";

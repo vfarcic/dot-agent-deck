@@ -14,7 +14,7 @@
 //! via-PTY + real daemon + real CLI-subprocess technique for this same
 //! `pane <verb>` family), not another entry in `tests/pane_restart.rs`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 
