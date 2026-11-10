@@ -4756,40 +4756,6 @@ fn hook_line_for_log(line: &str) -> String {
         .into_owned()
 }
 
-/// The log line for a raw status event the provenance gate refused.
-///
-/// Issue #2104: nine in ten of these were a dying agent's own last report —
-/// Claude Code's `SessionEnd`, mostly — arriving a fraction of a second after a
-/// close or a respawn removed its generation's record and token. That refusal
-/// is correct and expected, so when the token is one this daemon retired
-/// (`retired_token`, from [`AgentPtyRegistry::hook_token_was_retired`]) it is
-/// logged at `debug`; every other refusal — an unknown token the daemon never
-/// minted, a token for another pane or agent, a missing or malformed one —
-/// stays a warning. The event is refused either way.
-fn log_raw_event_refusal(event: &crate::event::AgentEvent, reason: &str, retired_token: bool) {
-    let claimed_pane = escape_id_for_log(event.pane_id.as_deref().unwrap_or("<none>"));
-    if retired_token {
-        debug!(
-            verb = "agent_event",
-            event_type = ?event.event_type,
-            claimed_pane = %claimed_pane,
-            reason,
-            "hook socket: refused a status event from an agent this deck already \
-             closed or replaced (its token was retired at teardown); expected"
-        );
-    } else {
-        warn!(
-            verb = "agent_event",
-            event_type = ?event.event_type,
-            claimed_pane = %claimed_pane,
-            reason,
-            "hook socket: refused a status event whose hook \
-             capability token does not attest the pane it \
-             names; see docs/develop/hook-provenance.md"
-        );
-    }
-}
-
 /// Issue #318: `line` with the hook capability token taken out, for a log.
 ///
 /// A line that parses as JSON is walked whole (Greptile, PR #1559): every
@@ -7932,10 +7898,37 @@ async fn run_hook_loop_with_limits(
                                     // never the token. No reply line — a raw
                                     // event is fire-and-forget, and a hook's
                                     // output is what its agent reads.
-                                    log_raw_event_refusal(
-                                        &event,
-                                        refusal.code(),
-                                        retired_token,
+                                    //
+                                    // Issue #2104: a dying generation's own last
+                                    // report — its token retired at close or
+                                    // respawn — is expected, so it is logged at
+                                    // debug; every other refusal stays a warning.
+                                    // The `warn!` below is pinned verbatim by
+                                    // `xtask/cross-version`'s `KNOWN_EFFECTS`.
+                                    if retired_token {
+                                        debug!(
+                                            verb = "agent_event",
+                                            event_type = ?event.event_type,
+                                            claimed_pane = %escape_id_for_log(
+                                                event.pane_id.as_deref().unwrap_or("<none>")
+                                            ),
+                                            reason = refusal.code(),
+                                            "hook socket: refused a status event from an \
+                                             agent this deck already closed or replaced (its \
+                                             token was retired at teardown); expected"
+                                        );
+                                        continue;
+                                    }
+                                    warn!(
+                                        verb = "agent_event",
+                                        event_type = ?event.event_type,
+                                        claimed_pane = %escape_id_for_log(
+                                            event.pane_id.as_deref().unwrap_or("<none>")
+                                        ),
+                                        reason = refusal.code(),
+                                        "hook socket: refused a status event whose hook \
+                                         capability token does not attest the pane it \
+                                         names; see docs/develop/hook-provenance.md"
                                     );
                                     continue;
                                 }
