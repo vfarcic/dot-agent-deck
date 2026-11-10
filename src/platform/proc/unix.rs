@@ -612,25 +612,31 @@ pub fn parent_pid_of(pid: u32) -> Option<u32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// See the Linux variant.
+/// See the Linux variant. macOS asks for the short BSD info
+/// (`PROC_PIDT_SHORTBSDINFO`), not the full one (`PROC_PIDTBSDINFO`): the
+/// full one is refused with `EPERM` for a process another user owns, the
+/// short one is not (measured on macOS 26, as `ps` reads every process's
+/// parent), so a walk climbs past the root-owned `/usr/bin/login` a terminal
+/// starts its shell through, as it climbs past a root process on Linux
+/// (issue #2237). A process that has exited still answers `None` (`ESRCH`).
 #[cfg(target_os = "macos")]
 pub fn parent_pid_of(pid: u32) -> Option<u32> {
     let pid = libc::c_int::try_from(pid).ok()?;
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is a zeroed, stack-allocated `proc_bsdinfo` that outlives
-    // the call, and `size` is exactly its size, so the kernel writes at most
-    // that many bytes into it.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed, stack-allocated `proc_bsdshortinfo` that
+    // outlives the call, and `size` is exactly its size, so the kernel writes
+    // at most that many bytes into it.
     let written = unsafe {
         libc::proc_pidinfo(
             pid,
-            libc::PROC_PIDTBSDINFO,
+            libc::PROC_PIDT_SHORTBSDINFO,
             0,
             &mut info as *mut _ as *mut libc::c_void,
             size,
         )
     };
-    (written == size).then_some(info.pbi_ppid)
+    (written == size).then_some(info.pbsi_ppid)
 }
 
 /// See the Linux variant.
@@ -661,7 +667,7 @@ pub fn process_start_of(pid: u32) -> Option<u64> {
     let pid = libc::c_int::try_from(pid).ok()?;
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: as in `parent_pid_of`: a zeroed stack `proc_bsdinfo` of exactly
+    // SAFETY: a zeroed stack `proc_bsdinfo` of exactly
     // `size` bytes that outlives the call.
     let written = unsafe {
         libc::proc_pidinfo(
@@ -913,5 +919,21 @@ mod tests {
             "an empty list never reaches `ps` — the sampler returns early — but the \
              formatting must not invent a stray separator"
         );
+    }
+
+    /// Issue #2237: the parent walk reads a process another user owns. On
+    /// macOS a shell a terminal starts runs under the root-owned
+    /// `/usr/bin/login`, and a walk that stopped there could not place a
+    /// receiver relative to the agent, so the inbox refused it as
+    /// unidentified. `launchd`/`init` (pid 1) belongs to root, and its parent
+    /// is the kernel (0), on every terminal and in CI. Running as root reads
+    /// it either way, so this pins the property only for an ordinary user.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_pid_of_reads_a_process_another_user_owns() {
+        assert_eq!(parent_pid_of(1), Some(0));
+        // A pid no process holds still answers `None`: an exited process is
+        // not read as a parent.
+        assert_eq!(parent_pid_of(u32::MAX >> 1), None);
     }
 }
