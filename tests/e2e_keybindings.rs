@@ -22,7 +22,7 @@
 //! keys still fire their hardcoded defaults, and no fallback warning is
 //! emitted.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

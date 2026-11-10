@@ -1,22 +1,18 @@
 //! The harness's own unit tests — the pure-function half of
-//! `tests/common/mod.rs`: temp-root containment and name parsing, credential
+//! `tests/common/lib.rs`: temp-root containment and name parsing, credential
 //! collection and env-var trimming, the redaction range arithmetic and the
 //! wrapped-credential matcher.
 //!
-//! **Exactly one binary compiles this file** — `tests/harness_unit.rs`, the
-//! only place it is named. That is the point of it being a file rather than
-//! the `#[cfg(test)] mod harness_unit_tests` it used to be inside
-//! `tests/common/mod.rs`, and issue #806 is why. `cfg(test)` is true in
-//! **every** integration-test target, not only in the one being tested, so a
-//! `#[cfg(test)]` module inside the harness compiled into every binary that
-//! wrote `mod common;` — and nextest then ran all of it, once per binary.
-//! Measured on `45528bc`, the commit before the move: **108** distinct tests
-//! became **7020** executions under lane 1 (`cargo test-e2e`, 65 binaries) —
-//! 75.4% of everything that lane selects — 1836 in the fast tier (17
-//! binaries) and 9612 under `cargo test-e2e-live` (89 binaries). The cost was
-//! multiplicative, not additive: one test added here cost 65 executions in
-//! every lane-1 run, forever, which is the wrong incentive on a module this
-//! repo deliberately keeps well-tested.
+//! **They run in exactly one binary: the harness crate's own unit-test
+//! target** (issue #2083), declared as `#[cfg(test)] mod harness_unit_tests`
+//! in `lib.rs`. `cargo test-fast` reaches it through `--workspace`. Issue #806
+//! is why that matters: while the harness was a `mod common;` in every test
+//! binary, `cfg(test)` was true in all of them, so a `#[cfg(test)]` module in
+//! the harness compiled into every binary that wrote `mod common;` and nextest
+//! ran all of it once per binary. Measured on `45528bc`: **108** distinct
+//! tests became **7020** executions under lane 1 (65 binaries). #806 moved
+//! them into a single dedicated binary (`tests/harness_unit.rs`); since the
+//! harness became a crate, its own unit-test target is that single binary.
 //!
 //! Nothing here needs a binary of its own to run in. These are assertions
 //! about pure functions and about directories under a `tempfile` root, and
@@ -46,22 +42,17 @@
 //! here uses; under plain `cargo test`, sibling tests share the process and
 //! these writes race them (issue #245).
 //!
-//! **Why so much of `mod.rs` is `pub(crate)`.** This module is a *sibling* of
-//! `common`, not a child of it, so `use super::*` no longer reaches the
-//! harness's private helpers. The helpers these tests cover therefore carry
-//! `pub(crate)` — 66 declarations of 64 distinct items (two are declared
-//! twice, under `#[cfg]` pairs) plus four struct fields, widened for this
-//! file and for nothing else. Rust offers no narrower spelling: a private
-//! item cannot be re-exported (E0364/E0365), and no `#[cfg]` available here
-//! distinguishes one test binary from another — `cfg(test)` is true in all of
-//! them, and feature, `RUSTFLAGS` and `build.rs` cfgs are per-package rather
-//! than per-target. The module tree is the only thing that can single one
-//! out.
+//! **Why so much of `lib.rs` is `pub(crate)`.** Under #806 this module was a
+//! sibling of `common` in another binary, so the helpers these tests cover
+//! were widened to `pub(crate)` to be reachable. It is now a child of the
+//! crate root, which reaches the root's private items anyway; the widening is
+//! left in place because narrowing it again is churn with no effect outside
+//! this crate.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::common::*;
+use crate::*;
 
 /// Scenario: A failed run leaves a cast, grid, fixture, logs and provenance.
 /// Starting and completing a passing rerun clears the current files but keeps
@@ -2093,7 +2084,7 @@ fn the_harness_root_is_never_inside_the_repository() {
         eprintln!("skipping: {TEMP_BASE_ENV} is set, so placement is explicit");
         return;
     }
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = checkout_root();
     let root = harness_temp_root();
     assert!(
         !root.starts_with(repo),
@@ -3389,7 +3380,7 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
     // itself, which the global-store assertion above proves.
     let panic_text = format_redacted_panic(
         "deck",
-        "tests/common/mod.rs:1:1",
+        "tests/common/lib.rs:1:1",
         &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
     );
     for (what, value) in [
@@ -3909,7 +3900,7 @@ fn a_credential_wrapped_across_grid_rows_is_redacted_from_every_sink() {
     register_diagnostic_redactions(redactions.clone());
     let panic_text = format_redacted_panic(
         "deck",
-        "tests/common/mod.rs:1:1",
+        "tests/common/lib.rs:1:1",
         &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
     );
     assert_no_fragment_survives(&panic_text, key, "the panic seam");
@@ -4670,7 +4661,7 @@ fn a_panic_message_is_redacted_without_losing_its_diagnostic_shape() {
 
     let rendered = format_redacted_panic(
         "deck",
-        "tests/common/mod.rs:1:1",
+        "tests/common/lib.rs:1:1",
         &format!(
             "did not see \"ready\" within 30s.\nFinal grid:\n  \
              ANTHROPIC_API_KEY: sk-ant-...{suffix}\n  Do you want to use this API key?\n"
@@ -4681,7 +4672,7 @@ fn a_panic_message_is_redacted_without_losing_its_diagnostic_shape() {
         "a registered credential survived the panic seam: {rendered}"
     );
     assert!(rendered.contains("[REDACTED-CREDENTIAL]"), "{rendered}");
-    assert!(rendered.contains("thread 'deck' panicked at tests/common/mod.rs:1:1"));
+    assert!(rendered.contains("thread 'deck' panicked at tests/common/lib.rs:1:1"));
     assert!(rendered.contains("did not see \"ready\" within 30s."));
     assert!(rendered.contains("Do you want to use this API key?"));
 }
@@ -5023,7 +5014,7 @@ fn no_test_prints_terminal_content_outside_the_redacting_panic_seam() {
         &src[open..]
     }
 
-    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let tests_dir = checkout_root().join("tests");
     let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .expect("read tests/")
         .filter_map(|entry| {
@@ -5031,7 +5022,7 @@ fn no_test_prints_terminal_content_outside_the_redacting_panic_seam() {
             (path.extension()? == "rs").then_some(path)
         })
         .collect();
-    sources.push(tests_dir.join("common").join("mod.rs"));
+    sources.push(tests_dir.join("common").join("lib.rs"));
     sources.sort();
     assert!(
         sources.len() > 50,
@@ -5141,7 +5132,7 @@ fn no_test_installs_a_competing_panic_hook() {
         line.trim_start().starts_with("use ")
             && (line.contains(concat!("set_", "hook")) || line.contains(concat!("take_", "hook")))
     };
-    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let tests_dir = checkout_root().join("tests");
     let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .expect("read tests/")
         .filter_map(|entry| {
@@ -5149,7 +5140,7 @@ fn no_test_installs_a_competing_panic_hook() {
             (path.extension()? == "rs").then_some(path)
         })
         .collect();
-    sources.push(tests_dir.join("common").join("mod.rs"));
+    sources.push(tests_dir.join("common").join("lib.rs"));
     sources.sort();
     assert!(sources.len() > 50, "the scan is not reaching the suite");
 
@@ -5162,7 +5153,7 @@ fn no_test_installs_a_competing_panic_hook() {
                 continue;
             }
             // The seam's own installation is the one legitimate site.
-            if path.ends_with("common/mod.rs") && line.contains("Box::new(|info|") {
+            if path.ends_with("common/lib.rs") && line.contains("Box::new(|info|") {
                 seam_installations += 1;
                 continue;
             }
@@ -5780,7 +5771,7 @@ fn an_io_stall_widens_the_ceiling_the_load_average_left_alone() {
 mod load_context_tests {
     use std::time::Duration;
 
-    use crate::common::load_context::*;
+    use crate::load_context::*;
 
     const PSI_CPU: &str = "some avg10=7.21 avg60=19.87 avg300=16.87 total=31056709947\n\
                            full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
@@ -6048,7 +6039,7 @@ mod load_context_tests {
         if std::env::var_os(LOAD_CHILD_ENV).is_none() {
             return;
         }
-        let _dir = crate::common::harness_tempdir().expect("harness tempdir");
+        let _dir = crate::harness_tempdir().expect("harness tempdir");
         panic!("{LOAD_CHILD_MARKER}");
     }
 

@@ -9049,7 +9049,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 
 ##### newagent/authoring/001 — Every authoring kind posts the TUI's seed text once and is capability-advertised.
 - **Layer:** L2 lane 1 (one headless `daemon serve` driven over its attach and hook sockets; raw JSON pins `authoring_kind`'s desktop-facing wire independently of the typed client helper).
-- **Agent:** synthetic `claude` stand-ins that emit genuine `SessionStart` hooks and then hand their pane to the shared profiled agent (`tests/common/mod.rs`, `PROFILED_AGENT`, in raw mode under the e2e stand-in profile), which logs every line submitted after readiness; no credential.
+- **Agent:** synthetic `claude` stand-ins that emit genuine `SessionStart` hooks and then hand their pane to the shared profiled agent (`tests/common/lib.rs`, `PROFILED_AGENT`, in raw mode under the e2e stand-in profile), which logs every line submitted after readiness; no credential.
 - **Asserts:** `StartAgent` with each of `schedule`, `schedule-issues`, and `dispatcher` posts exactly one message to that pane's inbox whose text contains the seed byte-for-byte equal to `AuthoringKind::compose_seed` for the selected working directory (PRD #1666); nothing is written before the readiness announcement, and the only lines read after it are the token-led doorbell line naming that message, never the seed's content; no second message follows. `NewAgentOptions.authoring_kinds` lists all three values in order, and `Hello.capabilities` contains `authoring-kind`.
 - **Does not assert:** desktop chip rendering or experimental filtering; real-agent interpretation of the seed (`newagent/live/001` owns that later lane-2 surface).
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]` — the daemon, hook and PTY harness uses Unix-domain sockets and Unix PTYs).
@@ -14854,7 +14854,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 ##### telemetry/otlp/035 — Automatic inbox doorbells do not count as interventions.
 
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_telemetry_intervention_kinds.rs`, `telemetry_otlp_035_deck_doorbell_is_not_intervention`); real binary, attached TUI and isolated OTLP HTTP/JSON receiver.
-- **Agent:** the e2e stand-in profile's recorder (`PROFILED_AGENT` in `tests/common/mod.rs`), the screen the deck types the doorbell into since PRD #1666 part 3 rings only a measured one; no model or credential.
+- **Agent:** the e2e stand-in profile's recorder (`PROFILED_AGENT` in `tests/common/lib.rs`), the screen the deck types the doorbell into since PRD #1666 part 3 rings only a measured one; no model or credential.
 - **Asserts:** a posted inbox task produces a doorbell submitted to the stand-in, which runs `inbox fetch`, with zero exported intervention events and count 0; the task sentinel stays private.
 - **Does not assert:** real-agent prompt rendering, mouse input, unbracketed-paste detection, or burst separation after five seconds.
 - **Platform coverage:** mac+linux.

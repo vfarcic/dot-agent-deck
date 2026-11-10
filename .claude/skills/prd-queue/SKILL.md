@@ -469,6 +469,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
 - When `DAD_REMOTE_EXEC=rwx` is set in your environment
   (docs/develop/rwx.md): the helper already runs its cargo commands in an RWX
   sandbox, and every OTHER cargo command that compiles (a build, a
+  `cargo check` or `cargo clippy` run outside the helper, a
   `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
   filtered to a single test, since a filter narrows what runs, not what compiles) goes
   through `rwx sandbox exec -- <command>`, `cargo mutants` included (do not
@@ -558,14 +559,18 @@ with REVIEWS=complete or REVIEWS=incomplete. Run it again after your LAST
 push: Greptile reviews only when the PR opens (greptile.json sets
 triggerOnUpdates: false), but Qodo re-reviews EVERY push (.pr_agent.toml), so
 a fix push can raise new findings. The findings live ONLY at
-`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate`; a green check
-and the apps' summary comments carry none of them, except Qodo's
-informational tier, which stays in its "Code Review by Qodo" issue comment
-(inline_comments_severity_threshold = 2), so read both. Keep the
---paginate: replies count toward the page, so without it a busy PR silently
-truncates the findings you are about to answer. Reply on each thread — what
-you fixed, or why you did not — AND RESOLVE THE THREAD, BEFORE you notify and
-stop. Resolving is half the job: an unresolved thread blocks the merge button
+`gh api repos/<owner>/<repo>/pulls/<pr>/comments --paginate` and in the
+apps' summary comments: Qodo's "Code Review by Qodo" issue comment lists its
+findings, and its informational tier lives only there
+(inline_comments_severity_threshold = 2); Greptile's summary lists its
+findings too. A green check carries none of them. Keep the --paginate:
+replies count toward the page, so without it a busy PR silently truncates the
+findings you are about to answer. Reply on each thread — what you fixed, or
+why you did not — AND RESOLVE THE THREAD; answer a summary item that has no
+thread in a PR comment quoting its title. After your last wait-reviews.sh,
+`.claude/skills/pr-create/unanswered-findings.sh <pr>` must print
+FINDINGS=answered, BEFORE you notify and stop; put its UNANSWERED_COUNT= in
+your report (issue #2081). Resolving is half the job: an unresolved thread blocks the merge button
 AND the approval the merge needs, so a PR with every finding fixed still sits
 (PR #1035 sat a day that way). REVIEWS=incomplete is a result, not a reason
 to keep waiting: an app that is out of quota produces nothing at all, so

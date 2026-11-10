@@ -62,7 +62,7 @@
 //! `ls -a`, print the listing) — well under the <$0.05/run bound. Flaky-tolerant
 //! (real LLM) per CLAUDE.md rule 4: run once, not looped.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::Path;
 use std::time::Duration;

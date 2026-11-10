@@ -2,7 +2,7 @@
 
 //! Fast safety coverage for Codex hook installation and wrapper trust scoping.
 
-// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
+// Issue #322. Fast-tier, does NOT link `tests/common/lib.rs`; the ~40-line
 // crate-internal resolver is `#[path]`-included instead, at two extra test
 // executions rather than the harness's ~530. The 14 scratch dirs here are
 // pinned Codex homes and wrapper fixtures — small, but they were landing in the

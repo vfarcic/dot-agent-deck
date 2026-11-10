@@ -12,7 +12,7 @@
 //! doc — CI uploads no recordings, and `cargo xtask docs --tests` rebuilds it
 //! on demand — so the panic path no longer regenerates it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::PathBuf;
 

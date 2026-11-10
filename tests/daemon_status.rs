@@ -25,7 +25,7 @@ use dot_agent_deck::state::SessionStatus;
 #[cfg(unix)]
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 #[cfg(unix)]
 const DRIVEN_PANE: &str = "status-driven-pane-7f3a1c";

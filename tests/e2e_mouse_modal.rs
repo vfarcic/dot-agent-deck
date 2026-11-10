@@ -20,7 +20,7 @@
 //!     the `[Cancel]` click (modal dismisses, app stays) proves the modal's
 //!     click→dispatch path. The destructive actions remain keyboard-tested.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{TuiDeck, write_hook_line};
 use spec::spec;

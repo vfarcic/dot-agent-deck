@@ -3,7 +3,7 @@
 //! Interactive Haiku work across a remote upgrade. SSH and the downloaded
 //! release are owned stand-ins; the daemon, agent, attached TUI and CLI are real.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/remote_upgrade.rs"]
 mod upgrade_fixture;
 

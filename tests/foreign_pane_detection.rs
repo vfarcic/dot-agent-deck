@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 /// Scenario: Spawn one `cat`-backed agent carrying a known pane id, then ask the
 /// registry about that pane, about a pane id no agent was spawned with (the

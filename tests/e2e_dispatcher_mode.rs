@@ -11,7 +11,7 @@
 //! acts on the goal, and invokes `dot-agent-deck dispatch` itself; the assertion
 //! is on the resulting worktree, so nothing here is a stand-in.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

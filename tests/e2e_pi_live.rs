@@ -74,7 +74,7 @@
 use std::process::Stdio;
 use std::time::Duration;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use dot_agent_deck::config;

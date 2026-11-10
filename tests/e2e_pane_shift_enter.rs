@@ -57,7 +57,7 @@
 //! gated on the `e2e` feature so CI's `cargo test-fast` never compiles it.
 //! Flaky-tolerant (real agent) per CLAUDE.md rule 4 — run once, not looped.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

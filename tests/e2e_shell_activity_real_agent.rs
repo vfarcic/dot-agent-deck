@@ -37,7 +37,7 @@
 //! and this file's real-agent tier has no CI credentials, so a local run is
 //! the only way to exercise it at all.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

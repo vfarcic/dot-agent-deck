@@ -36,7 +36,7 @@
 //! absolute path, and the daemon's process sampling was measured on Linux
 //! (`/proc/<pid>/exe`); the macOS sampling path is not exercised here.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

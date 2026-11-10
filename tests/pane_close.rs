@@ -7,7 +7,7 @@
 //! AttachStream, then returns a controlled StopAgent error so the observable
 //! local pane registry can prove whether teardown completed or was retained.
 
-// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs` — the synthetic
+// Issue #322. Fast-tier, does NOT link `tests/common/lib.rs` — the synthetic
 // daemon below binds a `daemon.sock` in its scratch dir, so live `/tmp`
 // sampling during a recorded `cargo test-e2e` caught five of this file's
 // directories holding a LISTENing socket. `#[path]`-including the ~40-line

@@ -1,6 +1,6 @@
 //! Detach a **unit-test** process from any real deck — issue #666 follow-up.
 //!
-//! `tests/harness_isolation.rs` states the rule and `tests/common/mod.rs`
+//! `tests/harness_isolation.rs` states the rule and `tests/common/lib.rs`
 //! enforces it for the integration suite: running the tests from inside a deck
 //! pane means this process inherits that pane's `DOT_AGENT_DECK_SOCKET` /
 //! `_ATTACH_SOCKET` / `_PANE_ID` / `_AGENT_ID`, anything spawned inherits them
@@ -67,7 +67,7 @@
 use std::sync::OnceLock;
 
 /// The deck identity variables, in the order `tests/harness_isolation.rs` lists
-/// them. Kept in step with `tests/common/mod.rs`'s `DECK_ENDPOINT_VARS`; the two
+/// them. Kept in step with `tests/common/lib.rs`'s `DECK_ENDPOINT_VARS`; the two
 /// cannot share a constant because the lib target does not link that file.
 ///
 /// Issue #1077 added `DOT_AGENT_DECK_PANE_CAPABILITY`. It is not an endpoint, but it

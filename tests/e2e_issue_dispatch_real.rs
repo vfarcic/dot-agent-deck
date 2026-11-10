@@ -78,7 +78,7 @@
 //! `cargo test-fast` never compiles it; flaky-tolerant (real LLM + real network)
 //! per CLAUDE.md rule 4 — it is NOT looped for flakiness.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

@@ -631,7 +631,7 @@ fn collect_tests_at_ref(reference: &str) -> Result<BTreeMap<String, TestEntry>, 
         }
         // Skip the harness module itself — it carries no #[spec] but
         // is huge and slows the parse for no reason.
-        if f == "tests/common/mod.rs" {
+        if f == "tests/common/lib.rs" {
             continue;
         }
         let body = git_show(reference, &f)?;
@@ -661,7 +661,7 @@ fn collect_tests_on_disk(root: &Path) -> Result<BTreeMap<String, TestEntry>, Str
     // tests/ — parse every .rs (minus the huge spec-less harness module).
     let tests_dir = root.join("tests");
     walk_rs_files(&tests_dir, &mut |abs_path| {
-        if abs_path.ends_with("common/mod.rs") {
+        if abs_path.ends_with("common/lib.rs") {
             return Ok(());
         }
         let rel = rel_to_root(root, abs_path)?;

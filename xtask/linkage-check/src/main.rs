@@ -237,6 +237,13 @@ mod release_workflow_wiring;
 #[cfg(test)]
 mod renovate_lock_file_maintenance;
 mod repo_state;
+/// Issue #2081: which automated-review findings on a pull request nobody has
+/// answered, which `.claude/skills/pr-create/unanswered-findings.sh` decides
+/// from Qodo's and Greptile's comments and the PR's threads. Tests only, and
+/// Unix only: the script is driven under `bash` against an offline `gh`
+/// stand-in.
+#[cfg(all(test, unix))]
+mod review_findings;
 /// Issue #1256: when the automated review apps have finished, which
 /// `.claude/skills/pr-create/wait-reviews.sh` decides from `reviewers.json`
 /// for every skill that waits on a review. Tests only, and Unix only: the
@@ -359,7 +366,7 @@ const TESTS_DIR: &str = "tests";
 ///
 /// It used to be an enumerated list — `tests/e2e_*.rs`, `tests/common/`, and
 /// two named files — because covering the rest of the fast tier was priced at
-/// pulling `tests/common/mod.rs` into six more binaries and duplicating its
+/// pulling `tests/common/lib.rs` into six more binaries and duplicating its
 /// ~530 executions to contain small L1 `TempDir`s. That price was real when it
 /// was measured, and it is no longer what the choice costs: `src/test_temp.rs`
 /// is deliberately self-contained, so a fast-tier crate `#[path]`-includes it
@@ -664,15 +671,15 @@ fn check_self_contained(root: &Path) -> Vec<String> {
 /// `run_daemon_with` first.
 ///
 /// **What satisfies it.** `common::init_test_env()` for the files that link the
-/// harness, or `child_lifetime_bound::arm()` for the ones that deliberately do
-/// not (`tests/common/child_lifetime_bound.rs` is `#[path]`-includable on its
-/// own, because `tests/common/mod.rs` is ~420 KB of PTY harness and pulling it
-/// into a fast-tier crate to reach one variable is a real compile cost). Either
-/// marker anywhere in the file clears it. Since issue #678 neither call writes
-/// anything — the cap is pinned by a constructor in
-/// `tests/common/child_lifetime_bound.rs` that runs before `main` — so what a
-/// marker really proves is that the file includes the module carrying that
-/// constructor, because neither call compiles without it.
+/// harness crate, or `child_lifetime_bound::arm()` for the ones that do not
+/// (`tests/common/child_lifetime_bound.rs` is `#[path]`-includable on its own).
+/// Either marker anywhere in the file clears it. Since issue #678 neither call
+/// writes anything — the cap is pinned before `main`, by the constructor in
+/// `tests/common/child_lifetime_bound.rs` for a file that includes it, and by
+/// the one the harness's `link!()` defines in each binary that links the
+/// harness (issue #2083) — so what a marker really proves is that the file
+/// reaches the module whose `arm()` checks that constructor ran, because
+/// neither call compiles without it, and `arm()` panics if it did not run.
 ///
 /// **The view both halves are matched over** is comment-stripped AND
 /// literal-blanked ([`blank_string_literal_contents`]), so prose about either
@@ -765,7 +772,7 @@ fn lifetime_bound_armed_re() -> Regex {
 ///    `.with_env(VAR, "900")`, `(VAR, "300")`, `(VAR.into(), "300".into())`,
 ///    including the multi-line `.env(\n VAR,\n "900",\n)` spelling;
 /// 2. a `const …MAX_LIFETIME…_SECS` binding with a literal value, which is how
-///    `tests/common/mod.rs`'s `WRAP_TEST_MAX_LIFETIME_SECS = "120"` reaches the
+///    `tests/common/lib.rs`'s `WRAP_TEST_MAX_LIFETIME_SECS = "120"` reaches the
 ///    nine `wrap_io.rs` sites that pass it by name rather than by literal.
 ///
 /// Shape 2 is a proxy and is honest about it: a cap computed at run time, or
@@ -807,7 +814,7 @@ fn overlong_lifetime_cap_rule(secs: u64) -> String {
 ///
 /// `\s*` spans newlines, which is what covers the multi-line `.env(` spelling
 /// `tests/wrap_io.rs` uses. The optional `.into()` covers the owned-`String`
-/// push in `tests/common/mod.rs`, and the optional `&` the borrowed spelling.
+/// push in `tests/common/lib.rs`, and the optional `&` the borrowed spelling.
 fn lifetime_cap_pin_re() -> Regex {
     Regex::new(r#""DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS"\s*(?:\.into\(\))?\s*,\s*&?\s*"(\d+)""#)
         .expect("lifetime cap pin regex compiles")
@@ -2544,7 +2551,7 @@ mod tests {
         let covers = |rel: &str| git_ctor_rule_covers(&root.join(rel), root, &tests_dir);
 
         assert!(covers("tests/e2e_issue_dispatch.rs"));
-        assert!(covers("tests/common/mod.rs"));
+        assert!(covers("tests/common/lib.rs"));
         assert!(covers("tests/worktree_reclaim.rs"));
         // A directory rule, so a file that does not exist yet inherits it.
         assert!(covers("tests/some_future_suite.rs"));
@@ -2571,7 +2578,7 @@ mod tests {
         };
 
         assert!(covers("tests/e2e_handshake.rs", true));
-        assert!(covers("tests/common/mod.rs", false));
+        assert!(covers("tests/common/lib.rs", false));
         assert!(covers("tests/daemon_protocol.rs", false));
         assert!(covers("src/dispatch.rs", false));
 
@@ -2761,7 +2768,7 @@ mod tests {
     #[test]
     fn unarmed_agent_spawn_violations_accepts_either_arming_marker() {
         let via_harness = concat!(
-            "mod common;\n",
+            "dot_agent_deck_test_harness::link!();\n",
             "\n",
             "fn start() {\n",
             "    common::init_test_env();\n",
@@ -3035,7 +3042,7 @@ mod tests {
         assert!(found[0].starts_with("tests/wrap_io.rs:4: "), "{}", found[0]);
     }
 
-    /// The tuple and owned-`String` spellings `tests/common/mod.rs` uses at its
+    /// The tuple and owned-`String` spellings `tests/common/lib.rs` uses at its
     /// two `env_clear` sites.
     #[test]
     fn overlong_lifetime_cap_reads_tuple_and_owned_pin_shapes() {
@@ -3049,10 +3056,10 @@ mod tests {
         );
 
         for src in [&tuple, &owned] {
-            let found = overlong_lifetime_cap_violations("tests/common/mod.rs", src);
+            let found = overlong_lifetime_cap_violations("tests/common/lib.rs", src);
             assert_eq!(found.len(), 1, "{src}\n{found:#?}");
             assert!(
-                found[0].starts_with("tests/common/mod.rs:2: "),
+                found[0].starts_with("tests/common/lib.rs:2: "),
                 "{}",
                 found[0]
             );
@@ -3069,10 +3076,10 @@ mod tests {
             "pub const WRAP_TEST_MAX_LIFETIME_SECS: &str = \"{}\";\n",
             CAP + 1
         );
-        let found = overlong_lifetime_cap_violations("tests/common/mod.rs", &over);
+        let found = overlong_lifetime_cap_violations("tests/common/lib.rs", &over);
         assert_eq!(found.len(), 1, "{found:#?}");
         assert!(
-            found[0].starts_with("tests/common/mod.rs:1: "),
+            found[0].starts_with("tests/common/lib.rs:1: "),
             "{}",
             found[0]
         );

@@ -5,7 +5,7 @@
 //! Serialize runs sharing the permanent issue, including on one host. Immediate
 //! reruns need the same account and host; foreign records retain their TTL.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

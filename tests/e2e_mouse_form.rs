@@ -13,7 +13,7 @@
 //! The form opens
 //! focused on the Mode field (NewPaneFormState::new).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

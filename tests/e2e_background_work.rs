@@ -3,7 +3,7 @@
 //! Synthetic hooks and real detached processes against the daemon and TUI.
 #[path = "common/background_work.rs"]
 mod background_work;
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use background_work::{Fixture, PANE};
 use dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID;

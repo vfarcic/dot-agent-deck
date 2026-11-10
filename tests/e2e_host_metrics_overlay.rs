@@ -3,7 +3,7 @@
 //! Synthetic PTY coverage of the attached deck's real host sampler. No real
 //! agent is started.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 
