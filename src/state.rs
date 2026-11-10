@@ -157,6 +157,17 @@ const MAX_TRACKED_SUBAGENT_ID_BYTES: usize = 256;
 /// it shows what the card showed before Waiting existed.
 const AWAITED_SAMPLE_GRACE_MS: i64 = 2 * crate::daemon::POLL_INTERVAL.as_millis() as i64;
 
+/// Issue #1757 (Qodo on PR #2250): how long after a turn ends a card that
+/// reads `Idle` can still turn [`SessionStatus::Waiting`] —
+/// [`AWAITED_SAMPLE_GRACE_MS`] for the sample that finds a command started just
+/// before the turn ended, plus one poll for that change to reach a reader. A
+/// "the work is done" signal (the TUI's idle bell and blinking dot, the `close`
+/// verb's busy check) waits this long after a turn ends before it trusts an
+/// `Idle`, so a turn that ends as Waiting gives one such signal, at its later
+/// `Idle`, not one at each.
+pub(crate) const TURN_SETTLE_MS: i64 =
+    AWAITED_SAMPLE_GRACE_MS + crate::daemon::POLL_INTERVAL.as_millis() as i64;
+
 /// Issue #1678: the daemon's private record of one card's background work —
 /// what [`BackgroundWork`] is computed from. Held in
 /// [`AppState::background_tracks`] keyed by card id, never on [`SessionState`]
@@ -4476,6 +4487,26 @@ impl AppState {
             .get(&session_id)
             .and_then(|track| track.published)
             .filter(|work| !work.is_empty())
+    }
+
+    /// Issue #1757 (Qodo on PR #2250): how much longer the card for `pane_id`
+    /// may still turn Waiting — the rest of [`TURN_SETTLE_MS`] after its turn
+    /// ended at the daemon, measured against `now_ms`. `None` when its turn is
+    /// not over, ended longer ago than that, or this state keeps no background
+    /// record for it (a client, or a pane that never reported a turn
+    /// boundary). The `close` verb waits this out before it reads the busy
+    /// facts, so an `Idle` that is about to become Waiting is not read as done.
+    pub fn pane_turn_settling_ms(&self, pane_id: &str, now_ms: i64) -> Option<i64> {
+        let session_id = self.pane_session_id(pane_id)?;
+        let track = self.background_tracks.get(&session_id)?;
+        if !(track.reports_turn_boundaries && track.turn_ended) {
+            return None;
+        }
+        let remaining = track
+            .turn_ended_ms
+            .saturating_add(TURN_SETTLE_MS)
+            .saturating_sub(now_ms);
+        (remaining > 0).then_some(remaining.min(TURN_SETTLE_MS))
     }
 
     /// Issue #447: [`Self::apply_event`], plus the one daemon-side consumer of

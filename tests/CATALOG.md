@@ -1757,6 +1757,22 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the daemon clearing the registry copy after a failed look (the `agent_pty` unit test `publishing_opencode_private_servers_clears_every_unnamed_agent` pins the registry half; `run_monitor`'s wiring is untested), a replacement that runs before the watch's first look (it is taken for the spawn's client), a reused pid that is again the client's direct `serve --stdio` child, a live OpenCode.
 - **Platform coverage:** mac+linux+windows.
 
+##### status/waiting/019 — A turn that ends as Waiting rings the idle bell once, at its final Idle (issue #1757).
+- **Layer:** L1 unit (`src/ui.rs`, fast tier).
+- **Agent:** none; one session fixture fed to the TUI's bell transition check every 100 ms on an injected clock, following the daemon's sequence for a command first sampled after the turn's `Idle`.
+- **Asserts:** with the idle bell on, Working → Idle → (500 ms later) Waiting → Idle rings exactly once, at the final Idle; through the first Idle the card is held as settling, which draws a steady dot; a plain Working → Idle rings once it has stayed Idle for the settle window (`bell_respects_config_toggle_on`).
+- **Does not assert:** the terminal bell write, the rendered dot on a live grid (the settling card's lit tick is chosen at the grid's call site), the desktop app (it has no idle bell, blink or notification).
+- **Verified load-bearing:** red (two bells) with the settle window set to zero.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/020 — A close sent right after a worker's turn ends waits for the turn to settle, then refuses a card that turned Waiting (issue #1757).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames for the worker, then the monitor's command sample and `ShellBusy` applied 300 ms after the `Idle`.
+- **Asserts:** a close of the reported-done orchestration sent while the worker reads Idle is refused as busy with a message naming Waiting, and stops no pane.
+- **Does not assert:** the shell-activity monitor's own sampling (the sample is applied by hand), a close sent after the settle window (the existing background-work close tests).
+- **Verified load-bearing:** red (the close is not refused) with the settle wait removed from the close's fact reading.
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
 ### Agent protocol
 
 #### agent/readiness

@@ -893,6 +893,24 @@ async fn facts(
     state: &SharedState,
     registry: &AgentPtyRegistry,
 ) -> (TargetFacts, Vec<Option<crate::state::SessionStatus>>) {
+    // Issue #1757 (Qodo on PR #2250): a member whose turn ended a moment ago
+    // can still turn Waiting once the daemon samples a command it started just
+    // before the end, so its `Idle` is not yet proof the work is done. Wait out
+    // the rest of that window (at most `TURN_SETTLE_MS`), without holding the
+    // lock, then read the facts.
+    let settle_ms = {
+        let state = state.read().await;
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        members
+            .iter()
+            .filter(|m| !m.exited)
+            .filter_map(|m| m.record.pane_id_env.as_deref())
+            .filter_map(|p| state.pane_turn_settling_ms(p, now_ms))
+            .max()
+    };
+    if let Some(ms) = settle_ms {
+        tokio::time::sleep(std::time::Duration::from_millis(ms.unsigned_abs())).await;
+    }
     let (statuses, background) = {
         let state = state.read().await;
         let live_panes = || {
@@ -1800,6 +1818,7 @@ mod tests {
     use crate::daemon_client::{DaemonClient, StartAgentOptions};
     use crate::daemon_protocol::{UnitSelector, bind_attach_listener, serve_attach_with_counter};
     use crate::dispatched_units::{Dispatcher, NewUnit};
+    use spec::spec;
 
     /// A real attach server over a real registry, with agents started through
     /// the socket the way a client starts them.
@@ -2243,6 +2262,110 @@ mod tests {
         assert!(deck.live(&dispatcher), "the dispatcher is untouched");
         // A finished instance takes no new pane.
         assert!(deck.registry.is_instance_closing("orch-1"));
+        deck.shutdown().await;
+    }
+
+    /// Scenario: A dispatched orchestration has reported done and its worker's
+    /// turn has just ended, so the card reads Idle; 300 ms later the daemon
+    /// samples a command the worker started just before the end, and the card
+    /// turns Waiting. A close sent in that window waits for the turn to settle
+    /// and is refused as busy, naming Waiting, and stops nothing.
+    #[spec("status/waiting/020")]
+    #[tokio::test]
+    async fn status_waiting_020_a_close_right_after_a_turn_ends_waits_for_it_to_settle() {
+        let deck = Deck::new().await;
+        let dispatcher = deck.start("disp", "sleep 30", None).await;
+        let orch = deck
+            .start(
+                "o-orch",
+                "sleep 30",
+                Some(("orch-st", "orchestrator", true)),
+            )
+            .await;
+        let worker = deck
+            .start("o-coder", "sleep 30", Some(("orch-st", "coder", false)))
+            .await;
+        deck.orch_unit("team-st", ("disp", &dispatcher), "orch-st", "o-orch", &orch);
+        deck.report_done("o-orch", &orch);
+        let frame = |event_type: &str| {
+            serde_json::from_value::<crate::event::AgentEvent>(serde_json::json!({
+                "session_id": "o-coder-session", "pane_id": "o-coder",
+                "agent_id": worker.clone(), "agent_type": "claude_code",
+                "event_type": event_type, "timestamp": chrono::Utc::now()
+            }))
+            .expect("a hook frame")
+        };
+        {
+            let mut state = deck.state.write().await;
+            state.apply_event(frame("session_start"));
+            state.apply_event(frame("thinking"));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            state.apply_event(frame("idle"));
+            assert_eq!(
+                state.pane_status_of("o-coder"),
+                Some(crate::state::SessionStatus::Idle),
+                "premise: the command is not sampled yet"
+            );
+            assert!(
+                state
+                    .pane_turn_settling_ms("o-coder", chrono::Utc::now().timestamp_millis())
+                    .is_some(),
+                "premise: the turn has just ended"
+            );
+        }
+        // The monitor's next sample, within the grace after the Idle.
+        let sampler = {
+            let state = deck.state.clone();
+            let worker = worker.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                let mut state = state.write().await;
+                state.observe_command_sessions("o-coder", &worker, &[23456].into_iter().collect());
+                state.apply_event(crate::event::AgentEvent {
+                    session_id: "o-coder-session".into(),
+                    agent_type: crate::event::AgentType::None,
+                    event_type: crate::event::EventType::ShellBusy,
+                    tool_name: None,
+                    tool_detail: None,
+                    cwd: None,
+                    timestamp: chrono::Utc::now(),
+                    user_prompt: None,
+                    metadata: Default::default(),
+                    pane_id: Some("o-coder".into()),
+                    agent_id: Some(worker),
+                    agent_version: None,
+                    schema_version: None,
+                    live_target: None,
+                    background: None,
+                    background_revision: None,
+                });
+            })
+        };
+        let claim = deck.claim("disp", &dispatcher);
+
+        let report = deck
+            .close(by_name("team-st"), Some(claim), false, false)
+            .await;
+        sampler.await.expect("the sample lands");
+        assert_eq!(
+            deck.state.read().await.pane_status_of("o-coder"),
+            Some(crate::state::SessionStatus::Waiting),
+            "premise: the late sample turned the card Waiting"
+        );
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Refused, "{target:?}");
+        assert_eq!(target.reason, Some(CloseRefusalReason::Busy));
+        assert!(
+            target
+                .message
+                .as_deref()
+                .is_some_and(|m| m.contains("Waiting")),
+            "the refusal names Waiting: {target:?}"
+        );
+        assert!(
+            deck.live(&orch) && deck.live(&worker),
+            "no pane may be stopped"
+        );
         deck.shutdown().await;
     }
 

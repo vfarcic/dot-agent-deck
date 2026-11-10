@@ -337,9 +337,16 @@ fn forced_note(t: &CloseTarget) -> Option<String> {
                     .iter()
                     .filter_map(|p| p.status.as_deref())
                     .find(|s| {
+                        // Issue #1757: the statuses `is_busy` refuses,
+                        // Waiting among them.
                         matches!(
                             *s,
-                            "Thinking" | "Working" | "Compacting" | "WaitingForInput" | "Blocked"
+                            "Thinking"
+                                | "Working"
+                                | "Compacting"
+                                | "WaitingForInput"
+                                | "Blocked"
+                                | "Waiting"
                         )
                     })
                     .unwrap_or("busy");
@@ -843,6 +850,45 @@ mod tests {
             "bidi override must be escaped: {text}"
         );
         assert!(text.contains("evil\\nname"), "{text}");
+    }
+
+    /// Issue #1757 (Qodo on PR #2250): a close forced over the busy refusal
+    /// names the status that made the pane busy for every status the busy
+    /// check refuses — Waiting included — and says only "was busy" for one it
+    /// does not.
+    #[test]
+    fn a_forced_busy_close_names_every_busy_status() {
+        use crate::state::SessionStatus;
+        for status in [
+            SessionStatus::Thinking,
+            SessionStatus::Working,
+            SessionStatus::Compacting,
+            SessionStatus::WaitingForInput,
+            SessionStatus::Blocked,
+            SessionStatus::Waiting,
+            SessionStatus::Idle,
+            SessionStatus::Error,
+            SessionStatus::Unknown,
+        ] {
+            let shown = format!("{status:?}");
+            let mut closed = target(CloseOutcome::Closed);
+            closed.forced_over = vec![CloseRefusalReason::Busy];
+            closed.panes = vec![ClosePane {
+                agent_id: "7".into(),
+                pane_id: Some("p1".into()),
+                role: None,
+                is_orchestrator: false,
+                status: Some(shown.clone()),
+                exited: false,
+                stopped: Some(true),
+            }];
+            let want = if crate::dispatched_units::is_busy(&status) {
+                format!("(forced: was {shown})")
+            } else {
+                "(forced: was busy)".to_string()
+            };
+            assert_eq!(forced_note(&closed).as_deref(), Some(want.as_str()));
+        }
     }
 
     /// Scenario: reviewer nit-1 — `--all --yes` applied a listing the daemon

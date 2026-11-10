@@ -1268,6 +1268,7 @@ mod tests {
             (SessionStatus::Compacting, true),
             (SessionStatus::WaitingForInput, true),
             (SessionStatus::Blocked, true),
+            (SessionStatus::Waiting, true),
             (SessionStatus::Idle, false),
             (SessionStatus::Error, false),
             (SessionStatus::Unknown, false),
