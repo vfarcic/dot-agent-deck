@@ -182,10 +182,24 @@ fn preserve_modal_click_miss_is_consumed() {
     // would be gone and this would fail. No copy may have leaked to the pane
     // behind.
     let (ccol, crow) = deck.wait_for_in_grid("[Cancel]");
+    // PRD #385: a copy no longer always says "Copied to clipboard" — under the
+    // harness, with the native clipboard off, it says it went out over OSC 52
+    // — so the check is on the copy itself: no OSC 52 sequence reached the
+    // terminal, and no copy status of either wording is on screen.
+    let grid = deck.snapshot_grid();
+    for status in [
+        "Copied to clipboard",
+        "Sent to terminal clipboard",
+        "Not copied",
+    ] {
+        assert!(
+            !grid.contains(status),
+            "a modal-interior click must not leak into a text selection/copy behind the popup ({status:?} shown):\n{grid}"
+        );
+    }
     assert!(
-        !deck.snapshot_grid().contains("Copied to clipboard"),
-        "a modal-interior click must not leak into a text selection/copy behind the popup:\n{}",
-        deck.snapshot_grid()
+        !deck.stream_text().contains("\x1b]52;"),
+        "a modal-interior click must not leak into a copy behind the popup (an OSC 52 sequence was written):\n{grid}"
     );
     deck.click(ccol, crow);
     deck.wait_for_absence("Quit dot-agent-deck?");

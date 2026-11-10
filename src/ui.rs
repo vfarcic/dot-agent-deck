@@ -2010,6 +2010,9 @@ struct UiState {
     selection: Option<TextSelection>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
     focused_pane_rect: Option<Rect>,
+    /// PRD #385 M2: every pane the last frame drew, with its outer rect, so a
+    /// press selects in the pane under the pointer (set during render).
+    drawn_pane_rects: Vec<(String, Rect)>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<LastClick>, // PRD #80 review FIX 4: region-aware multi-click state
     /// PRD #80: screen rects of the clickable buttons rendered this frame,
@@ -2434,6 +2437,9 @@ impl LastClick {
 /// Tracks an in-progress or completed mouse text selection within a pane.
 #[derive(Debug, Clone)]
 struct TextSelection {
+    /// PRD #385 M2: the pane the selection was made in. The text is copied
+    /// from it and the highlight drawn over it, whichever pane is focused.
+    pane_id: String,
     /// Pane-relative start column (0-based, within inner area).
     start_col: u16,
     /// Pane-relative start row.
@@ -2442,8 +2448,14 @@ struct TextSelection {
     end_col: u16,
     /// Pane-relative end row.
     end_row: u16,
-    /// The focused pane's Rect at selection start (screen coordinates).
+    /// The selection's pane's Rect at selection start (screen coordinates).
     pane_rect: Rect,
+    /// PRD #385 M3: the tab the selection was made on; switching away clears it.
+    deck: Option<DeckKey>,
+    /// PRD #385 M3: what the release copied, once it has. The selection then
+    /// stays on screen for as long as the cells under it still show this text
+    /// ([`selection_still_shows_copy`]).
+    copied: Option<String>,
 }
 
 impl UiState {
@@ -2502,6 +2514,7 @@ impl UiState {
             session_snapshot_write_failed: false,
             selection: None,
             focused_pane_rect: None,
+            drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             config_gen_state: config::ConfigGenState::load(),
@@ -5993,6 +6006,263 @@ fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offse
     trimmed.to_string()
 }
 
+/// What a left-button press, drag or release over the pane area did that the
+/// caller has to finish ([`pane_selection_mouse`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PaneMouseOutcome {
+    /// The pane the press focused, because it was under the pointer and not
+    /// focused. The caller records it as the tab's focus.
+    focused: Option<String>,
+    /// Text a release copied, for the caller to deliver.
+    copy: Option<String>,
+}
+
+/// The pane whose content area is under a screen cell, among the panes the
+/// last frame drew, with the cell's position inside that content area.
+fn pane_under_pointer(
+    drawn: &[(String, Rect)],
+    column: u16,
+    row: u16,
+) -> Option<(&str, Rect, u16, u16)> {
+    drawn.iter().find_map(|(id, rect)| {
+        pane_inner_coords(*rect, column, row).map(|(col, row)| (id.as_str(), *rect, col, row))
+    })
+}
+
+/// PRD #385: a left-button press, drag or release over the pane area, the
+/// mouse half of text selection. Out of `run_tui` so the L1 seam
+/// ([`PaneSelectionSeam`]) drives the code the live loop runs.
+///
+/// M2: the press is hit-tested against every pane the last frame drew, not the
+/// focused one. A press in a pane that is not focused focuses it and starts the
+/// selection there in the same gesture, and the selection, the copied text and
+/// the highlight all belong to that pane.
+///
+/// M3: a drag or multi-click selection stays after the release that copied it;
+/// a plain click leaves none. What clears a kept one is elsewhere: the next
+/// press ([`clear_selection_on_press`]), typing into its pane
+/// ([`clear_selection_on_pane_input`]), a tab switch
+/// ([`clear_selection_on_tab_switch`]), and its pane closing or its text moving
+/// ([`selection_still_shows_copy`], checked as each frame draws).
+fn pane_selection_mouse(
+    ui: &mut UiState,
+    embedded: &EmbeddedPaneController,
+    mouse: &crossterm::event::MouseEvent,
+    deck: Option<DeckKey>,
+    now: std::time::Instant,
+) -> PaneMouseOutcome {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut outcome = PaneMouseOutcome::default();
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((pane_id, rect, col, row)) =
+                pane_under_pointer(&ui.drawn_pane_rects, mouse.column, mouse.row)
+                    .map(|(id, rect, col, row)| (id.to_string(), rect, col, row))
+            else {
+                return outcome;
+            };
+            if embedded.focused_pane_id().as_deref() != Some(pane_id.as_str())
+                && embedded.focus_pane(&pane_id).is_ok()
+            {
+                outcome.focused = Some(pane_id.clone());
+            }
+            let inner = pane_inner_rect(rect);
+            let (inner_w, inner_h) = (inner.width, inner.height);
+            // Detect multi-click (double/triple). Require same row and nearby
+            // column (within 3 cells) to handle slight mouse movement between
+            // clicks, AND the same click region (PRD #80 review FIX 4) so a
+            // card/picker click can't seed a pane double-click. Screen
+            // coordinates, so two clicks at the same spot of two different
+            // panes are two single clicks.
+            let click_count = LastClick::next_count(
+                ui.last_click,
+                now,
+                mouse.column,
+                mouse.row,
+                ClickRegion::Pane,
+            );
+            ui.last_click = Some(LastClick {
+                at: now,
+                col: mouse.column,
+                row: mouse.row,
+                count: click_count,
+                region: ClickRegion::Pane,
+            });
+            let selection = |start_col, start_row, end_col, end_row| TextSelection {
+                pane_id: pane_id.clone(),
+                start_col,
+                start_row,
+                end_col,
+                end_row,
+                pane_rect: rect,
+                deck,
+                copied: None,
+            };
+
+            match click_count {
+                2 => {
+                    // Double-click: select word.
+                    if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                        && let Ok(parser) = screen_arc.lock()
+                    {
+                        let offset = screen_row_offset(parser.screen(), rect);
+                        let (wstart, wend) = word_bounds_at(parser.screen(), row, col, offset);
+                        ui.selection = Some(selection(wstart, row, wend, row));
+                    }
+                }
+                3 => {
+                    // Triple-click: select paragraph (contiguous non-blank
+                    // lines around the clicked row).
+                    if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                        && let Ok(parser) = screen_arc.lock()
+                    {
+                        let offset = screen_row_offset(parser.screen(), rect);
+                        let screen = parser.screen();
+                        let screen_rows = crate::vt_grid::size(screen).0;
+                        let is_blank_row = |wr: u16| -> bool {
+                            let sr = wr + offset;
+                            if sr >= screen_rows {
+                                return true;
+                            }
+                            let cols = crate::vt_grid::size(screen).1;
+                            (0..cols).all(|c| {
+                                screen
+                                    .cell(sr, c)
+                                    .map(|cell| {
+                                        let ch = cell.contents();
+                                        ch.is_empty() || ch.trim().is_empty()
+                                    })
+                                    .unwrap_or(true)
+                            })
+                        };
+                        let mut start_r = row;
+                        while start_r > 0 && !is_blank_row(start_r - 1) {
+                            start_r -= 1;
+                        }
+                        let mut end_r = row;
+                        while end_r + 1 < inner_h && !is_blank_row(end_r + 1) {
+                            end_r += 1;
+                        }
+                        ui.selection =
+                            Some(selection(0, start_r, inner_w.saturating_sub(1), end_r));
+                    }
+                }
+                _ => {
+                    // Single click: start drag selection.
+                    ui.selection = Some(selection(col, row, col, row));
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Extend the selection the press started; one a release already
+            // copied is finished.
+            if let Some(ref mut sel) = ui.selection
+                && sel.copied.is_none()
+            {
+                let inner_x = sel.pane_rect.x + 1;
+                let inner_y = sel.pane_rect.y + 1;
+                let inner_w = sel.pane_rect.width.saturating_sub(2);
+                let inner_h = sel.pane_rect.height.saturating_sub(2);
+                sel.end_col = mouse
+                    .column
+                    .saturating_sub(inner_x)
+                    .min(inner_w.saturating_sub(1));
+                sel.end_row = mouse
+                    .row
+                    .saturating_sub(inner_y)
+                    .min(inner_h.saturating_sub(1));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let was_multiclick = ui.last_click.map(|l| l.count >= 2).unwrap_or(false);
+            let Some(sel) = ui.selection.as_mut().filter(|sel| sel.copied.is_none()) else {
+                return outcome;
+            };
+            // Only copy when the selection is a real drag or multi-click, not
+            // a plain single click, and from the pane the selection is in.
+            let text =
+                if was_multiclick || sel.start_col != sel.end_col || sel.start_row != sel.end_row {
+                    embedded.get_screen(&sel.pane_id).and_then(|screen_arc| {
+                        let parser = screen_arc.lock().ok()?;
+                        let offset = screen_row_offset(parser.screen(), sel.pane_rect);
+                        Some(extract_selection_text(parser.screen(), sel, offset))
+                    })
+                } else {
+                    None
+                };
+            match text {
+                // Kept on screen, showing what was copied.
+                Some(text) if !text.is_empty() => {
+                    sel.copied = Some(text.clone());
+                    outcome.copy = Some(text);
+                }
+                // A plain click, or nothing to copy: nothing to keep showing.
+                _ => ui.selection = None,
+            }
+        }
+        _ => {}
+    }
+    outcome
+}
+
+/// PRD #385 M3: a mouse press clears the selection a drag or multi-click left
+/// on screen, wherever it lands. Called before anything else the press does,
+/// so a press that starts a new selection replaces the old one and a press on a
+/// button, a card or a dialog clears it too.
+fn clear_selection_on_press(ui: &mut UiState, mouse: &crossterm::event::MouseEvent) {
+    if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385 M3: input reaching the pane a selection belongs to clears it.
+///
+/// A lone `Esc` does not: in pane input it belongs to the pane's program
+/// (decision 5 of the PRD), and an `Esc` that also dropped the selection would
+/// make dismissing something in the agent cost the user their highlight.
+fn clear_selection_on_pane_input(ui: &mut UiState, pane_id: &str, bytes: &[u8]) {
+    if bytes != b"\x1b"
+        && ui
+            .selection
+            .as_ref()
+            .is_some_and(|sel| sel.pane_id == pane_id)
+    {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385 M3: a selection belongs to the tab it was made on, and a tab
+/// switch clears it rather than hiding it until the user comes back.
+fn clear_selection_on_tab_switch(ui: &mut UiState, deck: Option<DeckKey>) {
+    if ui.selection.as_ref().is_some_and(|sel| sel.deck != deck) {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385 decision 6: whether `sel`, drawn over a pane drawn at `rect` whose
+/// screen is `screen`, would show exactly what was copied.
+///
+/// vt100 keeps no position for a line that survives it scrolling, only how
+/// many lines its scrollback holds, and that count stops growing once the
+/// scrollback is full; so the selection cannot follow its text up the screen.
+/// What can be checked is the invariant itself: the pane is still where the
+/// selection was made, and the cells under it still hold the copied text. Any
+/// output, scroll, clear or resize that changes either is content moving under
+/// the selection, and the caller clears it. A live drag has copied nothing
+/// yet; it shows what a release would copy, by construction.
+fn selection_still_shows_copy(sel: &TextSelection, screen: &vt100::Screen, rect: Rect) -> bool {
+    if rect != sel.pane_rect {
+        return false;
+    }
+    match &sel.copied {
+        None => true,
+        Some(copied) => {
+            let offset = screen_row_offset(screen, sel.pane_rect);
+            extract_selection_text(screen, sel, offset) == *copied
+        }
+    }
+}
+
 /// Build the OSC 52 "set clipboard" escape sequence carrying `text`.
 ///
 /// Split out of [`copy_to_clipboard_osc52`] so the *bytes* are constructed in
@@ -6131,6 +6401,44 @@ fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -
         end += 1;
     }
     (start, end)
+}
+
+/// [`Action::ForwardToPane`]: write a keystroke's bytes to the focused pane.
+/// Out of `dispatch_action` so the L1 selection seam ([`PaneSelectionSeam`])
+/// types through the code the live loop runs.
+fn forward_to_focused_pane(ui: &mut UiState, embedded: &EmbeddedPaneController, bytes: &[u8]) {
+    let Some(pane_id) = embedded.focused_pane_id() else {
+        return;
+    };
+    clear_selection_on_pane_input(ui, &pane_id, bytes);
+    // Reset scrollback to live output on any keystroke.
+    embedded.reset_scrollback(&pane_id);
+    // PRD #76 M2.20: separate a CR-bearing keystroke from
+    // the preceding typed bytes so the agent TUI treats it
+    // as a standalone submit, not newline-in-input.
+    let sleep =
+        submit_debounce_duration(std::time::Instant::now(), ui.last_pane_keystroke_at, bytes);
+    if !sleep.is_zero() {
+        std::thread::sleep(sleep);
+    }
+    if let Err(e) = embedded.write_raw_bytes(&pane_id, bytes) {
+        // `write_raw_bytes` already phrases the disconnected cases in
+        // the user's terms, so surface it as-is rather than prefixing
+        // it with a second, internal-sounding failure label.
+        //
+        // PRD #1666 part 2 (G-fix7c): except a pane lost to a deck
+        // restart, which the next frame drops and names in the one
+        // restart notice (`process_restart_drops`), not in a
+        // sentence per pane. The submit debounce above can hold an
+        // Enter typed during the disconnect until after the reattach
+        // found the restarted deck.
+        if embedded.pane_lost_reason(&pane_id)
+            != Some(crate::embedded_pane::PaneLostReason::DeckRestarted)
+        {
+            ui.status_message = Some((e.to_string(), std::time::Instant::now()));
+        }
+    }
+    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
 }
 
 fn handle_pane_input_key(key: KeyEvent, application_cursor: bool) -> Action {
@@ -11623,40 +11931,8 @@ fn dispatch_action(
             cancel_new_pane_form(ui);
         }
         Action::ForwardToPane(bytes) => {
-            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                && let Some(pane_id) = embedded.focused_pane_id()
-            {
-                // Reset scrollback to live output on any keystroke.
-                embedded.reset_scrollback(&pane_id);
-                // PRD #76 M2.20: separate a CR-bearing keystroke from
-                // the preceding typed bytes so the agent TUI treats it
-                // as a standalone submit, not newline-in-input.
-                let sleep = submit_debounce_duration(
-                    std::time::Instant::now(),
-                    ui.last_pane_keystroke_at,
-                    &bytes,
-                );
-                if !sleep.is_zero() {
-                    std::thread::sleep(sleep);
-                }
-                if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
-                    // `write_raw_bytes` already phrases the disconnected cases in
-                    // the user's terms, so surface it as-is rather than prefixing
-                    // it with a second, internal-sounding failure label.
-                    //
-                    // PRD #1666 part 2 (G-fix7c): except a pane lost to a deck
-                    // restart, which the next frame drops and names in the one
-                    // restart notice (`process_restart_drops`), not in a
-                    // sentence per pane. The submit debounce above can hold an
-                    // Enter typed during the disconnect until after the reattach
-                    // found the restarted deck.
-                    if embedded.pane_lost_reason(&pane_id)
-                        != Some(crate::embedded_pane::PaneLostReason::DeckRestarted)
-                    {
-                        ui.status_message = Some((e.to_string(), std::time::Instant::now()));
-                    }
-                }
-                ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                forward_to_focused_pane(ui, embedded, &bytes);
             }
         }
         // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
@@ -14066,6 +14342,7 @@ pub fn run_tui(
                 let _ = event::read()?;
             }
         }
+        clear_selection_on_tab_switch(&mut ui, deck_key(tab_manager.active_tab()));
         draw_frame(
             &mut terminal,
             &mut ui,
@@ -14591,6 +14868,9 @@ pub fn run_tui(
 
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
+                // PRD #385 M3: a press clears a kept selection before anything
+                // else handles it.
+                clear_selection_on_press(&mut ui, &mouse);
                 // PRD #80 M2/M3: clickable affordances take precedence. A
                 // left-button Down on a recorded rect fires its Action through
                 // the SAME `dispatch_action` funnel as the keystroke, then
@@ -15044,204 +15324,77 @@ pub fn run_tui(
                                 std::time::Instant::now(),
                             );
                         }
+                        // Ctrl+click opens hyperlinks.
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
-                        ) => {
-                            // Ctrl+click opens hyperlinks.
-                            let has_modifier = mouse
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL);
-                            if has_modifier {
-                                // Issue #362: the same content-area hit test the
-                                // wheel arm above now uses.
-                                if let Some(rect) = ui.focused_pane_rect
-                                    && let Some((_, row)) =
-                                        pane_inner_coords(rect, mouse.column, mouse.row)
-                                    && let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
-                                    && let Ok(hmap) = hmap_arc.lock()
-                                    && let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                    && let Ok(parser) = screen_arc.lock()
-                                {
-                                    let offset = screen_row_offset(parser.screen(), rect);
-                                    let screen_row = row + offset;
-                                    if let Some(url) = hmap.get_row(screen_row) {
-                                        let url = url.to_string();
-                                        drop(parser);
-                                        drop(hmap);
-                                        if open::that(&url).is_ok() {
-                                            ui.status_message = Some((
-                                                opened_link_status(&url),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            } else if let Some(rect) = ui.focused_pane_rect {
-                                // Issue #362: same content-area hit test as above.
-                                let inner = pane_inner_rect(rect);
-                                let (inner_w, inner_h) = (inner.width, inner.height);
-                                if let Some((col, row)) =
+                        ) if mouse
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            // Issue #362: the same content-area hit test the
+                            // wheel arm above now uses.
+                            if let Some(rect) = ui.focused_pane_rect
+                                && let Some((_, row)) =
                                     pane_inner_coords(rect, mouse.column, mouse.row)
-                                {
-                                    // Detect multi-click (double/triple).
-                                    // Require same row and nearby column (within 3 cells)
-                                    // to handle slight mouse movement between clicks, AND
-                                    // the same click region (PRD #80 review FIX 4) so a
-                                    // card/picker click can't seed a pane double-click.
-                                    // These coords are pane-relative — a distinct region
-                                    // from the screen-coord card/picker clicks.
-                                    let now = std::time::Instant::now();
-                                    let click_count = LastClick::next_count(
-                                        ui.last_click,
-                                        now,
-                                        col,
-                                        row,
-                                        ClickRegion::Pane,
-                                    );
-                                    ui.last_click = Some(LastClick {
-                                        at: now,
-                                        col,
-                                        row,
-                                        count: click_count,
-                                        region: ClickRegion::Pane,
-                                    });
-
-                                    match click_count {
-                                        2 => {
-                                            // Double-click: select word.
-                                            if let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                                && let Ok(parser) = screen_arc.lock()
-                                            {
-                                                let offset =
-                                                    screen_row_offset(parser.screen(), rect);
-                                                let (wstart, wend) = word_bounds_at(
-                                                    parser.screen(),
-                                                    row,
-                                                    col,
-                                                    offset,
-                                                );
-                                                ui.selection = Some(TextSelection {
-                                                    start_col: wstart,
-                                                    start_row: row,
-                                                    end_col: wend,
-                                                    end_row: row,
-                                                    pane_rect: rect,
-                                                });
-                                            }
-                                        }
-                                        3 => {
-                                            // Triple-click: select paragraph (contiguous
-                                            // non-blank lines around the clicked row).
-                                            if let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                                && let Ok(parser) = screen_arc.lock()
-                                            {
-                                                let offset =
-                                                    screen_row_offset(parser.screen(), rect);
-                                                let screen = parser.screen();
-                                                let screen_rows = crate::vt_grid::size(screen).0;
-                                                let is_blank_row = |wr: u16| -> bool {
-                                                    let sr = wr + offset;
-                                                    if sr >= screen_rows {
-                                                        return true;
-                                                    }
-                                                    let cols = crate::vt_grid::size(screen).1;
-                                                    (0..cols).all(|c| {
-                                                        screen
-                                                            .cell(sr, c)
-                                                            .map(|cell| {
-                                                                let ch = cell.contents();
-                                                                ch.is_empty()
-                                                                    || ch.trim().is_empty()
-                                                            })
-                                                            .unwrap_or(true)
-                                                    })
-                                                };
-                                                let mut start_r = row;
-                                                while start_r > 0 && !is_blank_row(start_r - 1) {
-                                                    start_r -= 1;
-                                                }
-                                                let mut end_r = row;
-                                                while end_r + 1 < inner_h
-                                                    && !is_blank_row(end_r + 1)
-                                                {
-                                                    end_r += 1;
-                                                }
-                                                ui.selection = Some(TextSelection {
-                                                    start_col: 0,
-                                                    start_row: start_r,
-                                                    end_col: inner_w.saturating_sub(1),
-                                                    end_row: end_r,
-                                                    pane_rect: rect,
-                                                });
-                                            }
-                                        }
-                                        _ => {
-                                            // Single click: start drag selection.
-                                            ui.selection = Some(TextSelection {
-                                                start_col: col,
-                                                start_row: row,
-                                                end_col: col,
-                                                end_row: row,
-                                                pane_rect: rect,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        crossterm::event::MouseEventKind::Drag(
-                            crossterm::event::MouseButton::Left,
-                        ) => {
-                            // Extend selection.
-                            if let Some(ref mut sel) = ui.selection {
-                                let inner_x = sel.pane_rect.x + 1;
-                                let inner_y = sel.pane_rect.y + 1;
-                                let inner_w = sel.pane_rect.width.saturating_sub(2);
-                                let inner_h = sel.pane_rect.height.saturating_sub(2);
-                                sel.end_col = mouse
-                                    .column
-                                    .saturating_sub(inner_x)
-                                    .min(inner_w.saturating_sub(1));
-                                sel.end_row = mouse
-                                    .row
-                                    .saturating_sub(inner_y)
-                                    .min(inner_h.saturating_sub(1));
-                            }
-                        }
-                        crossterm::event::MouseEventKind::Up(
-                            crossterm::event::MouseButton::Left,
-                        ) => {
-                            let was_multiclick =
-                                ui.last_click.map(|l| l.count >= 2).unwrap_or(false);
-                            // Only copy when the selection is a real drag or multi-click,
-                            // not a plain single click.
-                            if let Some(ref sel) = ui.selection
-                                && (was_multiclick
-                                    || sel.start_col != sel.end_col
-                                    || sel.start_row != sel.end_row)
+                                && let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
+                                && let Ok(hmap) = hmap_arc.lock()
                                 && let Some(screen_arc) = embedded.get_screen(&pane_id)
                                 && let Ok(parser) = screen_arc.lock()
                             {
-                                let offset = screen_row_offset(parser.screen(), sel.pane_rect);
-                                let text = extract_selection_text(parser.screen(), sel, offset);
-                                // The native write can wait (bounded); do not
-                                // hold the pane's parser, which its reader
-                                // thread feeds, while it does.
-                                drop(parser);
-                                // PRD #385: native clipboard and OSC 52, and a
-                                // status line that says which of them went out.
-                                let outcome = crate::clipboard::deliver(&mut clipboard, &text);
-                                if let Some(message) = crate::clipboard::status_message(outcome) {
-                                    ui.status_message =
-                                        Some((message.to_string(), std::time::Instant::now()));
+                                let offset = screen_row_offset(parser.screen(), rect);
+                                let screen_row = row + offset;
+                                if let Some(url) = hmap.get_row(screen_row) {
+                                    let url = url.to_string();
+                                    drop(parser);
+                                    drop(hmap);
+                                    if open::that(&url).is_ok() {
+                                        ui.status_message = Some((
+                                            opened_link_status(&url),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
                                 }
-                            }
-                            // Keep selection visible after multi-click; clear on single-click.
-                            if !was_multiclick {
-                                ui.selection = None;
                             }
                         }
                         _ => {}
+                    }
+                }
+                // PRD #385 M2: a left press, drag or release selects in the pane
+                // under the pointer, focused or not; the pane focus above is
+                // only for the wheel and Ctrl+click.
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                            | crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left
+                            )
+                            | crossterm::event::MouseEventKind::Up(
+                                crossterm::event::MouseButton::Left
+                            )
+                    )
+                    && !mouse
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    let outcome = pane_selection_mouse(
+                        &mut ui,
+                        embedded,
+                        &mouse,
+                        deck_key(tab_manager.active_tab()),
+                        std::time::Instant::now(),
+                    );
+                    if let Some(focused) = &outcome.focused {
+                        tab_manager.record_focus(focused);
+                    }
+                    if let Some(text) = outcome.copy {
+                        // PRD #385: native clipboard and OSC 52, and a status
+                        // line that says which of them went out.
+                        let outcome = crate::clipboard::deliver(&mut clipboard, &text);
+                        if let Some(message) = crate::clipboard::status_message(outcome) {
+                            ui.status_message =
+                                Some((message.to_string(), std::time::Instant::now()));
+                        }
                     }
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
@@ -15269,6 +15422,8 @@ pub fn run_tui(
                     if use_bracketed {
                         payload.extend_from_slice(b"\x1b[201~");
                     }
+                    // PRD #385 M3: a paste is typing into the pane too.
+                    clear_selection_on_pane_input(&mut ui, &pane_id, &payload);
                     let _ = embedded.write_raw_bytes(&pane_id, &payload);
                     // PRD #76 M2.20: a paste is a forwarded keystroke event
                     // too — mark the timestamp so a following Enter
@@ -17144,7 +17299,7 @@ fn render_frame(
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
-            ui.focused_pane_rect = render_terminal_panes(
+            let drawn = render_terminal_panes(
                 frame,
                 embedded,
                 right,
@@ -17160,6 +17315,7 @@ fn render_frame(
                 now,
                 zoomed,
             );
+            record_drawn_panes(ui, drawn);
         }
 
         render_overlays(frame, ui);
@@ -17209,7 +17365,7 @@ fn render_frame(
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
-            ui.focused_pane_rect = render_terminal_panes(
+            let drawn = render_terminal_panes(
                 frame,
                 embedded,
                 right,
@@ -17225,6 +17381,7 @@ fn render_frame(
                 now,
                 zoomed,
             );
+            record_drawn_panes(ui, drawn);
         }
         render_overlays(frame, ui);
         return;
@@ -17251,7 +17408,7 @@ fn render_frame(
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
-        ui.focused_pane_rect = render_terminal_panes(
+        let drawn = render_terminal_panes(
             frame,
             embedded,
             right,
@@ -17267,6 +17424,7 @@ fn render_frame(
             now,
             zoomed,
         );
+        record_drawn_panes(ui, drawn);
     }
 
     render_overlays(frame, ui);
@@ -18054,6 +18212,28 @@ fn scroll_notice_visible(
         .is_some_and(|armed| now.saturating_duration_since(armed) < COMMAND_BANNER_TTL)
 }
 
+/// What [`render_terminal_panes`] drew, for the mouse and the selection.
+#[derive(Debug, Default)]
+struct DrawnPanes {
+    /// The focused pane's outer rect, when it was drawn.
+    focused: Option<Rect>,
+    /// Every pane drawn, with its outer rect, in drawing order.
+    panes: Vec<(String, Rect)>,
+    /// PRD #385: the selection can no longer be shown as it was copied (its
+    /// pane closed, moved, or its text changed), so it is to be cleared.
+    selection_stale: bool,
+}
+
+/// Keep what a frame drew on [`UiState`]: the rects the mouse is hit-tested
+/// against next, and the selection only while it is still showable.
+fn record_drawn_panes(ui: &mut UiState, drawn: DrawnPanes) {
+    ui.focused_pane_rect = drawn.focused;
+    ui.drawn_pane_rects = drawn.panes;
+    if drawn.selection_stale {
+        ui.selection = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
@@ -18109,10 +18289,19 @@ fn render_terminal_panes(
     // nothing else. Every caller that cannot be on a zoomed orchestration tab
     // passes `false`.
     zoomed: bool,
-) -> Option<Rect> {
-    let ctrl = embedded?;
+) -> DrawnPanes {
+    let mut drawn = DrawnPanes::default();
+    let Some(ctrl) = embedded else {
+        return drawn;
+    };
+    // PRD #385 M3: the pane a kept selection belongs to has closed.
+    if let Some(sel) = selection
+        && ctrl.get_screen(&sel.pane_id).is_none()
+    {
+        drawn.selection_stale = true;
+    }
     if pane_ids.is_empty() {
-        return None;
+        return drawn;
     }
     let input_active = mode == UiMode::PaneInput;
     let command_mode = mode == UiMode::Normal;
@@ -18214,6 +18403,7 @@ fn render_terminal_panes(
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
                     }
+                    drawn.panes.push((pane_id.clone(), chunks[i]));
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -18246,6 +18436,7 @@ fn render_terminal_panes(
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
                     }
+                    drawn.panes.push((pane_id.clone(), chunks[i]));
                     if is_focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -18334,10 +18525,22 @@ fn render_terminal_panes(
         render_cannot_scroll_notice(frame.buffer_mut(), *rect);
     }
 
-    // Render selection highlight over the focused pane.
-    if let Some(sel) = selection
-        && let Some(rect) = focused_pane_rect
-    {
+    // PRD #385: draw the selection highlight over the pane the selection
+    // belongs to (M2), and only while its cells still show what was copied
+    // (decision 6). One whose text moved is reported stale, so the caller
+    // clears it rather than leaving it to reappear.
+    let shown_selection = selection.as_ref().and_then(|sel| {
+        let (_, rect) = drawn.panes.iter().find(|(id, _)| *id == sel.pane_id)?;
+        let screen_arc = ctrl.get_screen(&sel.pane_id)?;
+        let parser = screen_arc.lock().ok()?;
+        if selection_still_shows_copy(sel, parser.screen(), *rect) {
+            Some((sel, *rect))
+        } else {
+            drawn.selection_stale = true;
+            None
+        }
+    });
+    if let Some((sel, rect)) = shown_selection {
         let inner_x = rect.x + 1;
         let inner_y = rect.y + 1;
         let inner_w = rect.width.saturating_sub(2);
@@ -18372,7 +18575,8 @@ fn render_terminal_panes(
         }
     }
 
-    focused_pane_rect
+    drawn.focused = focused_pane_rect;
+    drawn
 }
 
 fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
@@ -24981,6 +25185,181 @@ pub fn render_command_banner_pane_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// PRD #385 M2/M3 L1 seam: panes tiled over a `TestBackend` frame, driven by
+/// the mouse and the keyboard through the functions the live loop calls, so a
+/// test sees the selection, its highlight and its copies the way a user does.
+///
+/// The panes are inert seam panes (no daemon, no agent); each is sized to the
+/// inner area of its tiled rect, as `resize_panes_to_layout` sizes a live one.
+/// Copies are collected rather than delivered, so no test reaches a clipboard.
+#[doc(hidden)]
+pub struct PaneSelectionSeam {
+    ui: UiState,
+    ctrl: EmbeddedPaneController,
+    _inputs: Vec<crate::embedded_pane::SeamChildInput>,
+    pane_ids: Vec<String>,
+    area: Rect,
+    deck: DeckKey,
+    copies: Vec<String>,
+}
+
+#[doc(hidden)]
+impl PaneSelectionSeam {
+    /// `panes` are `(pane id, bytes already on its screen)`, tiled over a
+    /// `width` x `height` frame, with `focused` focused and keys reaching it
+    /// (`UiMode::PaneInput`).
+    pub fn tiled(width: u16, height: u16, panes: &[(&str, &[u8])], focused: &str) -> Self {
+        let area = Rect::new(0, 0, width, height);
+        let pane_ids: Vec<String> = panes.iter().map(|(id, _)| (*id).to_string()).collect();
+        let rects = pane_stack_rects(area, &pane_ids, PaneLayout::Tiled, Some(focused));
+        let inner = |rect: Rect| {
+            let inner = pane_inner_rect(rect);
+            (inner.height.max(1), inner.width.max(1))
+        };
+        let (first_id, first_bytes) = panes[0];
+        let (rows, cols) = inner(rects[0]);
+        let (ctrl, first_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+            first_id,
+            rows,
+            cols,
+            first_bytes,
+            false,
+        );
+        let mut inputs = vec![first_input];
+        for (i, (id, bytes)) in panes.iter().enumerate().skip(1) {
+            let (rows, cols) = inner(rects[i]);
+            inputs.push(ctrl.add_scroll_seam_pane(id, rows, cols, bytes));
+        }
+        ctrl.focus_pane(focused)
+            .expect("the focused pane is one of the panes");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.mode = UiMode::PaneInput;
+        Self {
+            ui,
+            ctrl,
+            _inputs: inputs,
+            pane_ids,
+            area,
+            deck: DeckKey::Dashboard,
+            copies: Vec::new(),
+        }
+    }
+
+    /// The panes drawn on the current tab: every seam pane on the dashboard,
+    /// none on the other tab.
+    fn drawn_ids(&self) -> Vec<String> {
+        match self.deck {
+            DeckKey::Dashboard => self.pane_ids.clone(),
+            DeckKey::Orchestration(_) => Vec::new(),
+        }
+    }
+
+    /// Draw a frame the way `render_frame` draws the pane column.
+    pub fn render(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // As `run_tui` does right before it draws.
+        clear_selection_on_tab_switch(&mut self.ui, Some(self.deck));
+        let ids = self.drawn_ids();
+        let mut terminal = Terminal::new(TestBackend::new(self.area.width, self.area.height))
+            .expect("TestBackend should construct");
+        let mut drawn = DrawnPanes::default();
+        terminal
+            .draw(|frame| {
+                drawn = render_terminal_panes(
+                    frame,
+                    Some(&self.ctrl),
+                    self.area,
+                    &ids,
+                    PaneLayout::Tiled,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &self.ui.selection,
+                    None,
+                    self.ui.mode,
+                    CommandBannerVisibility::Hidden,
+                    None,
+                    std::time::Instant::now(),
+                    false,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        record_drawn_panes(&mut self.ui, drawn);
+        terminal.backend().buffer().clone()
+    }
+
+    /// The outer rect `pane_id` is drawn in.
+    pub fn pane_rect(&self, pane_id: &str) -> Rect {
+        let ids = self.drawn_ids();
+        let focused = self.ctrl.focused_pane_id();
+        let rects = pane_stack_rects(self.area, &ids, PaneLayout::Tiled, focused.as_deref());
+        let i = ids
+            .iter()
+            .position(|id| id == pane_id)
+            .expect("the pane is drawn");
+        rects[i]
+    }
+
+    pub fn focused_pane_id(&self) -> Option<String> {
+        self.ctrl.focused_pane_id()
+    }
+
+    /// One mouse report at a screen cell, as the live mouse arm receives it.
+    pub fn mouse(&mut self, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        let event = crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // The live mouse arm's order: the press clears first, then the
+        // selection half (no button, card or dialog is drawn in the seam).
+        clear_selection_on_press(&mut self.ui, &event);
+        let outcome = pane_selection_mouse(
+            &mut self.ui,
+            &self.ctrl,
+            &event,
+            Some(self.deck),
+            std::time::Instant::now(),
+        );
+        if let Some(text) = outcome.copy {
+            self.copies.push(text);
+        }
+    }
+
+    /// A key typed while the focused pane takes input.
+    pub fn key(&mut self, key: KeyEvent) {
+        if let Action::ForwardToPane(bytes) = handle_pane_input_key(key, false) {
+            forward_to_focused_pane(&mut self.ui, &self.ctrl, &bytes);
+        }
+    }
+
+    /// Switch from the dashboard to another tab, or back.
+    pub fn switch_tab(&mut self) {
+        self.deck = match self.deck {
+            DeckKey::Dashboard => DeckKey::Orchestration(1),
+            DeckKey::Orchestration(_) => DeckKey::Dashboard,
+        };
+    }
+
+    /// The pane goes away, as it does when it is closed.
+    pub fn close_pane(&mut self, pane_id: &str) {
+        self.ctrl.forget_pane(pane_id);
+        self.pane_ids.retain(|id| id != pane_id);
+    }
+
+    /// New output from the pane's program.
+    pub fn feed(&self, pane_id: &str, bytes: &[u8]) {
+        let screen = self.ctrl.get_screen(pane_id).expect("the pane exists");
+        screen.lock().unwrap().process(bytes);
+    }
+
+    /// Every copy a release delivered, oldest first.
+    pub fn copies(&self) -> &[String] {
+        &self.copies
+    }
 }
 
 /// What one scroll input did to the focused agent pane, including the observable

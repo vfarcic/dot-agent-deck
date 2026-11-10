@@ -7698,6 +7698,36 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** what a real terminal reports in each mode; the Windows console path, which sets mouse input through the console API rather than these sequences.
 - **Platform coverage:** mac+linux.
 
+#### mouse/select
+
+##### mouse/select/001 — A drag in a pane that is not focused focuses it and copies its text in one gesture (PRD #385 M2).
+- **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (two `bash` panes stand in for agents: one restored with `--continue`, one opened from the new-pane form with no command; each prints a shell-computed sentinel).
+- **Asserts:** with both panes tiled on the dashboard in command mode and the second one focused (thick `┃` border), one drag across the first pane's sentinel writes an OSC 52 sequence whose payload is exactly that sentinel and never the focused pane's, moves the thick border to the dragged pane, and shows the OSC 52-only status (`Sent to terminal clipboard (OSC 52)`), since the harness turns the native clipboard off.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); the native clipboard write or its status wording (`clipboard/*`); orchestration-tab panes; a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/002 — A press in a pane that is not focused focuses it, and the drag highlights that pane (PRD #385 M2).
+- **Layer:** L1 (`PaneSelectionSeam`: inert panes tiled over a `TestBackend` frame, driven through the live loop's mouse functions; `insta` snapshot of the frame with the highlighted cells marked).
+- **Agent:** none.
+- **Asserts:** with pane `a` focused, a left press on pane `b`'s first cell focuses `b`; dragging four cells right highlights exactly `bravo` inside `b`'s content area and no cell of `a`.
+- **Does not assert:** copy delivery (`mouse/select/001`, `clipboard/*`); multi-click word/paragraph selection; the stacked layout, which draws only the focused pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/003 — A drag selection stays after the release and is cleared by a press, typing into its pane, a tab switch or its pane closing (PRD #385 M3).
+- **Layer:** L1 (`PaneSelectionSeam`).
+- **Agent:** none.
+- **Asserts:** after a drag over `bravo` is released, `bravo` is copied once and stays highlighted; the next press (in another pane) removes it, and the plain click that press makes leaves no highlight; a lone `Esc` typed into the pane leaves it, while a typed `x` removes it; switching tab and back leaves none; closing the pane that owns it leaves none on the pane that remains.
+- **Does not assert:** that the live loop calls the tab-switch check with the real active tab (the seam passes its own); paste, which goes through the same clearing function as typing; a press on a button, card or dialog (the seam draws none).
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/004 — A kept highlight never shows text other than what was copied (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, output fed straight into the panes' vt100 parsers).
+- **Agent:** none.
+- **Asserts:** after `bravo` is copied from pane `b`, output in pane `a` and output on another line of `b` keep the `bravo` highlight; after output that scrolls `b`, overwrites the selected cells, or clears the screen, the highlighted cells show either nothing or exactly `bravo`.
+- **Does not assert:** that the selection follows its text as it scrolls (the deck clears it instead: vt100 keeps no position for a scrolled line); a resize, which clears it through the same pane-rect check.
+- **Platform coverage:** mac+linux+windows.
+
 #### clipboard/deliver
 
 ##### clipboard/deliver/001 — A copied selection goes to the native clipboard and as OSC 52, and the status line says only what happened (PRD #385 M1).
