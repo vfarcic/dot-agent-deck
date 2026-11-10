@@ -2694,12 +2694,12 @@ fn dispatch_close_004_close_keep_worktree_keeps_a_real_units_clean_worktree() {
         deck.snapshot_grid()
     );
     // …and the claim is TRUE: the clean worktree, which an ordinary close removes,
-    // is still on disk with the agent's sentinel in its `.dot-agent-deck/`. Checked
-    // again after a pause, so a removal that lands late cannot pass unseen.
-    std::thread::sleep(Duration::from_secs(3));
+    // is still on disk with the agent's sentinel in its `.dot-agent-deck/`. Watched
+    // over a window, so a removal that lands late cannot pass unseen.
     assert!(
-        expected_worktree.is_dir(),
-        "the deck said the worktree was kept on request, but {} is gone.\nGrid:\n{}",
+        !common::wait_until(Duration::from_secs(3), || !expected_worktree.is_dir()),
+        "the deck said the worktree was kept on request, but {} disappeared within \
+         3s of the close.\nGrid:\n{}",
         expected_worktree.display(),
         deck.snapshot_grid()
     );

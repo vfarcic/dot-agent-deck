@@ -3368,8 +3368,33 @@ fn slot_churn_outcome(pane_id_env: &str, replacement_stops: u32, elapsed: Durati
 /// [`CLOSE_SLOT_RESOLVE_TOTAL_BUDGET`] of wall clock across all rounds
 /// (enforced both by the checks in the loop and, structurally, by the timeout
 /// wrapped around it here). Exhausting either completes the teardown and
-/// returns [`slot_churn_outcome`] — never a silent `Done`.
+/// returns [`slot_churn_outcome`] — never a silent `Done` — except that a
+/// keep-worktree close cut off by the structural timeout retains its pane and
+/// fails instead (issue #1958), since the stop it cancelled may have been the
+/// one carrying the keep.
 async fn resolve_pane_slot_after_not_found(
+    client: &DaemonClient,
+    pane_id_env: &str,
+    already_stopped: [String; 2],
+    io_state: &AtomicU8,
+    keep_worktree: bool,
+) -> (String, StopOutcome) {
+    resolve_pane_slot_within(
+        CLOSE_SLOT_RESOLVE_TOTAL_BUDGET,
+        client,
+        pane_id_env,
+        already_stopped,
+        io_state,
+        keep_worktree,
+    )
+    .await
+}
+
+/// [`resolve_pane_slot_after_not_found`] with its total wall-clock `budget`
+/// passed in, so a test can reach the hard-deadline arm without waiting out
+/// [`CLOSE_SLOT_RESOLVE_TOTAL_BUDGET`].
+async fn resolve_pane_slot_within(
+    budget: Duration,
     client: &DaemonClient,
     pane_id_env: &str,
     already_stopped: [String; 2],
@@ -3380,7 +3405,7 @@ async fn resolve_pane_slot_after_not_found(
     // cancels the loop mid-round and therefore cannot return it.
     let mut last_tried = already_stopped[1].clone();
     let chased = tokio::time::timeout(
-        CLOSE_SLOT_RESOLVE_TOTAL_BUDGET,
+        budget,
         chase_pane_slot_owner(
             client,
             pane_id_env,
@@ -3401,10 +3426,27 @@ async fn resolve_pane_slot_after_not_found(
         // we no longer know whether the stop landed. Keeping the bound here
         // rather than only in the loop's arithmetic also means a later edit to
         // any single arm cannot quietly unbound the whole path.
+        //
+        // Issue #1958: a close that asked to keep the worktree does not
+        // complete here. The cancelled stop may have been the one carrying the
+        // keep, so nothing says the daemon heard it — and a pane forgotten now
+        // leaves the user no way to ask again. Retain the pane and report a
+        // failure they can retry; the ordinary close keeps the behaviour above.
+        Err(_) if keep_worktree => {
+            tracing::warn!(
+                pane_id = %pane_id_env,
+                agent_id = %last_tried,
+                budget_ms = budget.as_millis() as u64,
+                "close_pane: keep-worktree close hit its total budget mid-round — retaining the \
+                 pane, since the keep may not have reached the daemon"
+            );
+            let message = keep_close_unconfirmed(&last_tried);
+            (last_tried, StopOutcome::Failed(message))
+        }
         Err(_) => {
             tracing::warn!(
                 pane_id = %pane_id_env,
-                budget_ms = CLOSE_SLOT_RESOLVE_TOTAL_BUDGET.as_millis() as u64,
+                budget_ms = budget.as_millis() as u64,
                 "close_pane: pane-slot resolution hit its total budget mid-round — completing the \
                  close without confirming the slot is empty"
             );
@@ -3414,6 +3456,15 @@ async fn resolve_pane_slot_after_not_found(
             )
         }
     }
+}
+
+/// Issue #1958: what a keep-worktree close says when it ran out of time before
+/// the daemon confirmed the stop of `agent_id`, the last one it sent.
+fn keep_close_unconfirmed(agent_id: &str) -> String {
+    format!(
+        "ran out of time before the daemon confirmed it stopped agent {agent_id} and kept \
+         the worktree; the pane is still here, close it again to retry"
+    )
 }
 
 /// PRD #241 F3b: the re-resolution loop behind
@@ -3483,13 +3534,15 @@ async fn chase_pane_slot_owner(
                     "close_pane: a replacement agent now owns this pane slot — stopping it \
                      instead of orphaning it"
                 );
+                // Recorded before the stop is sent, so a deadline that cancels
+                // it mid-flight still names the agent it was for.
+                last_tried.clone_from(&id);
                 let stop = tokio::time::timeout(
                     CTRL_W_STOP_TIMEOUT,
                     stop_for_close(client, &id, keep_worktree),
                 )
                 .await;
                 let class = classify_stop(stop, &id);
-                last_tried.clone_from(&id);
                 if let Some(outcome) = class.resolved() {
                     return outcome;
                 }
@@ -8203,5 +8256,142 @@ mod resize_worker_tests {
         }
         worker.abort();
         drop(resize_tx);
+    }
+}
+
+/// Issue #1958 (PR #2268 review): the pane-slot resolution's hard deadline
+/// against a keep-worktree close.
+#[cfg(all(test, unix))]
+mod keep_close_deadline_tests {
+    use super::*;
+    use crate::daemon_protocol::{
+        AttachResponse, KIND_REQ, PROTOCOL_VERSION, read_frame, write_resp,
+    };
+
+    /// A daemon whose pane slot `pane` is held by `agent-2`, and whose every
+    /// `stop-agent` is recorded (id, keep) and then never answered.
+    struct HangingStopDaemon {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        stops: Arc<Mutex<Vec<(String, bool)>>>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    impl HangingStopDaemon {
+        fn spawn() -> Self {
+            let dir = crate::test_temp::tempdir().expect("scratch dir for the socket");
+            let path = dir.path().join("hang.sock");
+            let listener = tokio::net::UnixListener::bind(&path).expect("bind the fake daemon");
+            let stops = Arc::new(Mutex::new(Vec::new()));
+            let log = Arc::clone(&stops);
+            let server = tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let log = Arc::clone(&log);
+                    tokio::spawn(async move {
+                        while let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await {
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&payload).expect("a JSON request");
+                            let reply = match request["op"].as_str().unwrap_or("?") {
+                                "hello" => {
+                                    AttachResponse::hello(PROTOCOL_VERSION).with_capabilities()
+                                }
+                                "list-agents" => AttachResponse::agent_records(vec![
+                                    serde_json::from_value(serde_json::json!({
+                                        "id": "agent-2",
+                                        "pane_id_env": "pane",
+                                        "rows": 24,
+                                        "cols": 80,
+                                    }))
+                                    .expect("a minimal agent record"),
+                                ]),
+                                "stop-agent" => {
+                                    log.lock().unwrap().push((
+                                        request["id"].as_str().unwrap_or("?").to_string(),
+                                        request["keep_worktree"] == true,
+                                    ));
+                                    std::future::pending::<()>().await;
+                                    unreachable!()
+                                }
+                                other => panic!("unexpected request {other}"),
+                            };
+                            if write_resp(&mut stream, &reply).await.is_err() {
+                                return;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                _dir: dir,
+                path,
+                stops,
+                server,
+            }
+        }
+
+        fn stops(&self) -> Vec<(String, bool)> {
+            self.stops.lock().unwrap().clone()
+        }
+    }
+
+    impl Drop for HangingStopDaemon {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    /// Scenario: both of a close's stops came back not-found, the daemon names
+    /// a replacement in the pane slot, and the replacement's stop is still
+    /// unanswered when the resolution's total deadline fires. The ordinary
+    /// close completes with the unverified warning, as before; a close that
+    /// asked to keep the worktree instead fails with a message saying the keep
+    /// was not confirmed and the user can retry, so its pane is retained.
+    #[tokio::test]
+    async fn a_keep_close_cut_off_by_the_slot_deadline_fails_for_a_retry() {
+        for keep in [false, true] {
+            let daemon = HangingStopDaemon::spawn();
+            let client = DaemonClient::new(daemon.path.clone());
+            let io_state = AtomicU8::new(IO_ATTACHED);
+            let (last_tried, outcome) = tokio::time::timeout(
+                Duration::from_secs(10),
+                resolve_pane_slot_within(
+                    Duration::from_secs(1),
+                    &client,
+                    "pane",
+                    ["agent-0".to_string(), "agent-1".to_string()],
+                    &io_state,
+                    keep,
+                ),
+            )
+            .await
+            .expect("the total budget bounds the resolution");
+            assert_eq!(
+                daemon.stops(),
+                vec![("agent-2".to_string(), keep)],
+                "keep={keep}: the replacement's stop reached the daemon with the close's keep \
+                 and was still pending at the deadline"
+            );
+            assert_eq!(last_tried, "agent-2", "keep={keep}: names the cut-off stop");
+            match (keep, outcome) {
+                (false, StopOutcome::DoneUnverified(warning)) => {
+                    assert_eq!(warning, slot_churn_warning("pane"));
+                }
+                (true, StopOutcome::Failed(message)) => {
+                    assert!(
+                        message.contains("agent-2")
+                            && message.contains("kept the worktree")
+                            && message.contains("retry"),
+                        "the failure says the keep was not confirmed and how to retry: {message}"
+                    );
+                }
+                (keep, StopOutcome::Done) => panic!("keep={keep}: a cut-off close read as Done"),
+                (keep, StopOutcome::DoneUnverified(w)) => {
+                    panic!("keep={keep}: the pane would be forgotten: {w}")
+                }
+                (keep, StopOutcome::Failed(m)) => panic!("keep={keep}: unexpected failure: {m}"),
+                (keep, StopOutcome::Refused(m)) => panic!("keep={keep}: unexpected refusal: {m}"),
+                (keep, StopOutcome::TimedOut) => panic!("keep={keep}: unexpected stop timeout"),
+            }
+        }
     }
 }

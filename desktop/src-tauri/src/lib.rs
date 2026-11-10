@@ -5143,6 +5143,17 @@ async fn stop_agent_action(
     Ok(scope)
 }
 
+/// Issue #1958: what an orchestration's keep close says when the daemon did not
+/// say within [`ORCHESTRATION_ROLE_STOP_TIMEOUT`] whether it can keep the
+/// worktree. Nothing was closed.
+fn keep_capability_unanswered_message() -> String {
+    format!(
+        "the daemon did not say within {}s whether it can keep the worktree, so no role was \
+         closed",
+        ORCHESTRATION_ROLE_STOP_TIMEOUT.as_secs()
+    )
+}
+
 /// PRD #1223 U4 — close a whole orchestration on the deck `deck_id` names:
 /// [`stop_roles_concurrently`] over every role the webview listed, then detach
 /// each confirmed role's terminal.
@@ -5193,15 +5204,28 @@ async fn stop_orchestration_action(
     if let Err(error) = daemon.require_compatible() {
         return (Some(scope), Err(error.into()));
     }
-    if keep_worktree
-        && matches!(daemon.client.capabilities().await, Ok(capabilities) if !capabilities.supports_keep_worktree())
-    {
-        return (
-            Some(scope),
-            Err(dot_agent_deck::daemon_client::KEEP_WORKTREE_UNSUPPORTED
-                .to_string()
-                .into()),
-        );
+    // Bounded like the role stops below (PR #2268 review): with the capability
+    // cache cleared, this is a fresh `Hello`, and a daemon that accepts the
+    // connection but never answers it would otherwise hold the close forever.
+    // A timeout refuses the close before any role is stopped. A transport
+    // error is left to the role stops, which each check on their own bounded
+    // connection.
+    if keep_worktree {
+        let refusal = match tokio::time::timeout(
+            ORCHESTRATION_ROLE_STOP_TIMEOUT,
+            daemon.client.capabilities(),
+        )
+        .await
+        {
+            Ok(Ok(capabilities)) if !capabilities.supports_keep_worktree() => {
+                Some(dot_agent_deck::daemon_client::KEEP_WORKTREE_UNSUPPORTED.to_string())
+            }
+            Ok(_) => None,
+            Err(_) => Some(keep_capability_unanswered_message()),
+        };
+        if let Some(refusal) = refusal {
+            return (Some(scope), Err(refusal.into()));
+        }
     }
     // PRD #1666 part 2 (G-fix4): each stop bound to the daemon process that
     // listed its role, so a role listed before a restart is not stopped on a
