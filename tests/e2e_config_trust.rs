@@ -1,0 +1,1087 @@
+#![cfg(all(feature = "e2e", unix))]
+
+//! PRD #1885 — the deck runs nothing from a project's orchestration that the
+//! user has not approved, or that changed since they did. L2 coverage of the
+//! user-visible contract in three parts:
+//!
+//! - `config-trust/cli/*`: the real `dot-agent-deck trust list | approve |
+//!   revoke` against an isolated state dir — no daemon involved.
+//! - `config-trust/prompt/*` and `config-trust/restore/*`: the TUI's trust
+//!   prompt on the New Agent form and on session restore, through a PTY.
+//! - `config-trust/respawn/*`, `config-trust/schedule/001` and
+//!   `config-trust/dispatch/001`: the unattended paths refuse, report the
+//!   refusal to whoever asked, and start nothing.
+//!
+//! Every role command is a token-free stand-in (`env TRUST_ROLE=<role> cat`,
+//! `sleep 600`). `config-trust/schedule/002` lives in `e2e_issue_dispatch.rs`
+//! beside the `gh` stub it needs, and `config-trust/live/001` in
+//! `e2e_config_trust_live.rs` (lane 2).
+
+dot_agent_deck_test_harness::link!();
+#[path = "support/inbox_view.rs"]
+mod inbox_view;
+
+use std::path::{Path, PathBuf};
+use std::process::Output;
+use std::time::Duration;
+
+use common::TuiDeck;
+use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
+use spec::spec;
+
+/// The `config-trust` fixture's one orchestration.
+const ORCH: &str = "trust-orch";
+/// The fixture's `coder` command, and the same text with one character changed.
+const CODER_COMMAND: &str = "env TRUST_ROLE=coder cat";
+const CODER_COMMAND_EDITED: &str = "env TRUST_ROLE=coded cat";
+/// The trust prompt's title and footer (the spec's binding text).
+const PROMPT_TITLE: &str = "Review project commands";
+const PROMPT_FOOTER: &str = "a approve and start · Esc cancel · ↑↓ scroll";
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+fn text(output: &Output) -> String {
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn describe(output: &Output) -> String {
+    format!(
+        "exit {:?}\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+}
+
+fn canonical(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|e| panic!("canonicalize {}: {e}", path.display()))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// The refusal every unattended path reports (spec: "Unattended refusal"):
+/// the orchestration, the project, why, and the exact command that approves it.
+fn assert_refusal(message: &str, project: &Path, why: &str) {
+    let project = canonical(project);
+    for needle in [
+        ORCH,
+        project.as_str(),
+        why,
+        "dot-agent-deck trust approve",
+        &format!("--orchestration {ORCH}"),
+    ] {
+        assert!(
+            message.contains(needle),
+            "the refusal must contain {needle:?}; it read:\n{message}"
+        );
+    }
+}
+
+/// Write the `config-trust` orchestration into `dir` with `coder` running
+/// `coder_command`, optionally with a third `reviewer` role.
+fn write_trust_config(dir: &Path, coder_command: &str, with_reviewer: bool) {
+    let mut toml = format!(
+        "[[orchestrations]]\n\
+         name = \"{ORCH}\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"env TRUST_ROLE=orchestrator cat\"\n\
+         start = true\n\
+         description = \"TRUST-DESC-ORCH coordinates the stand-ins\"\n\
+         prompt_template = \"TRUST-PROMPT-ORCH coordinate the stand-in team\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"coder\"\n\
+         command = \"{coder_command}\"\n\
+         clear = true\n\
+         description = \"TRUST-DESC-CODER does the stand-in work\"\n\
+         prompt_template = \"TRUST-PROMPT-CODER do the stand-in work\"\n"
+    );
+    if with_reviewer {
+        toml.push_str(
+            "\n[[orchestrations.roles]]\n\
+             name = \"reviewer\"\n\
+             command = \"env TRUST_ROLE=reviewer cat\"\n",
+        );
+    }
+    std::fs::write(dir.join(".dot-agent-deck.toml"), toml).expect("write the trust config");
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/cli/*: the `trust` CLI against an isolated state dir
+// ---------------------------------------------------------------------------
+
+/// An isolated `HOME` + state dir and one git project holding the
+/// `config-trust` orchestration, committed so a linked worktree can be cut.
+struct CliSandbox {
+    _scratch: tempfile::TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    state: PathBuf,
+    project: PathBuf,
+}
+
+impl CliSandbox {
+    fn new() -> Self {
+        let scratch = common::race_safe_tempdir();
+        let root = scratch.path().to_path_buf();
+        let home = root.join("home");
+        let state = root.join("state");
+        let project = root.join("project");
+        for dir in [&home, &project] {
+            std::fs::create_dir_all(dir).expect("create sandbox dir");
+        }
+        write_trust_config(&project, CODER_COMMAND, false);
+        for args in [
+            &["-c", "init.defaultBranch=main", "init", "-q"][..],
+            &["add", "-A"],
+            &["commit", "-q", "-m", "init"],
+        ] {
+            let status = common::fixture_git(&project, &root)
+                .args(args)
+                .status()
+                .expect("run git");
+            assert!(
+                status.success(),
+                "git {args:?} failed in the sandbox project"
+            );
+        }
+        CliSandbox {
+            _scratch: scratch,
+            root,
+            home,
+            state,
+            project,
+        }
+    }
+
+    /// Run `dot-agent-deck trust <args…>` from `cwd` with no terminal, the
+    /// sandbox's HOME and state dir, and `extra` on top.
+    fn trust_from(&self, cwd: &Path, args: &[&str], extra: &[(&str, &str)]) -> Output {
+        let mut cmd = std::process::Command::new(common::contained_deck_binary());
+        cmd.arg("trust")
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .env("HOME", &self.home)
+            .env("DOT_AGENT_DECK_STATE_DIR", &self.state)
+            .stdin(std::process::Stdio::null());
+        if let Ok(path) = std::env::var("PATH") {
+            cmd.env("PATH", path);
+        }
+        for (k, v) in extra {
+            cmd.env(k, v);
+        }
+        cmd.output().expect("run `dot-agent-deck trust`")
+    }
+
+    fn trust(&self, args: &[&str]) -> Output {
+        self.trust_from(&self.project, args, &[])
+    }
+
+    fn project_arg(&self) -> String {
+        self.project.to_string_lossy().into_owned()
+    }
+
+    /// `trust list`'s stdout, asserting it exits 0.
+    fn list(&self) -> String {
+        let listed = self.trust(&["list"]);
+        assert!(
+            listed.status.success(),
+            "`trust list` must exit 0: {}",
+            describe(&listed)
+        );
+        String::from_utf8_lossy(&listed.stdout).into_owned()
+    }
+
+    /// The `list` line for this project's orchestration, if any.
+    fn list_line(&self) -> Option<String> {
+        let project = canonical(&self.project);
+        self.list()
+            .lines()
+            .find(|l| l.contains(&project) && l.contains(ORCH))
+            .map(str::to_string)
+    }
+
+    fn approve_yes(&self) {
+        let approved = self.trust(&["approve", &self.project_arg(), "--yes"]);
+        assert!(
+            approved.status.success(),
+            "`trust approve <dir> --yes` must approve: {}",
+            describe(&approved)
+        );
+    }
+}
+
+fn state_word(line: &str) -> Option<&str> {
+    line.split_whitespace()
+        .find(|w| matches!(*w, "current" | "changed" | "missing"))
+}
+
+/// Scenario: In an isolated state dir, run `trust approve <project> --yes` on
+/// a project whose orchestration has two roles. It must exit 0 and print each
+/// role's command, description and prompt text, and `trust list` must then
+/// show one line for the project and orchestration marked `current`.
+#[spec("config-trust/cli/001")]
+#[test]
+fn cli_001_approve_yes_then_list_shows_current() {
+    let sandbox = CliSandbox::new();
+    let empty = sandbox.list();
+    assert!(
+        !empty.trim().is_empty() && !empty.contains(ORCH),
+        "with no approvals `trust list` prints a line saying so, naming nothing: {empty:?}"
+    );
+
+    let approved = sandbox.trust(&["approve", &sandbox.project_arg(), "--yes"]);
+    assert!(
+        approved.status.success(),
+        "approve --yes: {}",
+        describe(&approved)
+    );
+    let printed = String::from_utf8_lossy(&approved.stdout);
+    for needle in [
+        ORCH,
+        "orchestrator",
+        "coder",
+        "env TRUST_ROLE=orchestrator cat",
+        CODER_COMMAND,
+        "TRUST-DESC-ORCH coordinates the stand-ins",
+        "TRUST-PROMPT-CODER do the stand-in work",
+    ] {
+        assert!(
+            printed.contains(needle),
+            "`--yes` still prints what it approved; {needle:?} is missing from:\n{printed}"
+        );
+    }
+
+    let line = sandbox
+        .list_line()
+        .unwrap_or_else(|| panic!("`trust list` must list the approval:\n{}", sandbox.list()));
+    assert_eq!(state_word(&line), Some("current"), "list line: {line:?}");
+}
+
+/// Scenario: Approve a project with `--yes`, then change one character of a
+/// role's `command` in its `.dot-agent-deck.toml`. `trust list` must now mark
+/// the approval `changed`, and putting the text back marks it `current` again.
+#[spec("config-trust/cli/002")]
+#[test]
+fn cli_002_editing_one_character_reads_as_changed() {
+    let sandbox = CliSandbox::new();
+    sandbox.approve_yes();
+    write_trust_config(&sandbox.project, CODER_COMMAND_EDITED, false);
+    let line = sandbox.list_line().expect("the approval is still listed");
+    assert_eq!(state_word(&line), Some("changed"), "list line: {line:?}");
+
+    write_trust_config(&sandbox.project, CODER_COMMAND, false);
+    let line = sandbox.list_line().expect("the approval is still listed");
+    assert_eq!(state_word(&line), Some("current"), "list line: {line:?}");
+}
+
+/// Scenario: Approve a project, then `trust revoke <project>`: it exits 0 and
+/// `trust list` no longer shows the project. A second revoke has nothing to
+/// remove, so it exits non-zero with a message.
+#[spec("config-trust/cli/003")]
+#[test]
+fn cli_003_revoke_removes_and_a_second_revoke_fails() {
+    let sandbox = CliSandbox::new();
+    sandbox.approve_yes();
+    let revoked = sandbox.trust(&["revoke", &sandbox.project_arg()]);
+    assert!(revoked.status.success(), "revoke: {}", describe(&revoked));
+    assert!(
+        sandbox.list_line().is_none(),
+        "a revoked approval must not be listed:\n{}",
+        sandbox.list()
+    );
+
+    let again = sandbox.trust(&["revoke", &sandbox.project_arg()]);
+    assert!(
+        !again.status.success() && !text(&again).trim().is_empty(),
+        "revoking when nothing is approved must fail with a message: {}",
+        describe(&again)
+    );
+}
+
+/// Scenario: Run `trust approve <project>` with no terminal on stdin and no
+/// `--yes`. It must refuse — non-zero exit, a message naming `--yes` — and
+/// store nothing, so `trust list` still shows no approval for the project.
+#[spec("config-trust/cli/004")]
+#[test]
+fn cli_004_approve_without_a_terminal_or_yes_refuses() {
+    let sandbox = CliSandbox::new();
+    let refused = sandbox.trust(&["approve", &sandbox.project_arg()]);
+    assert!(
+        !refused.status.success(),
+        "approve with no TTY and no --yes must refuse: {}",
+        describe(&refused)
+    );
+    assert!(
+        text(&refused).contains("--yes"),
+        "the refusal must name --yes: {}",
+        describe(&refused)
+    );
+    assert!(
+        sandbox.list_line().is_none(),
+        "a refused approve must store nothing:\n{}",
+        sandbox.list()
+    );
+}
+
+/// Scenario: Run `trust approve <project> --yes` with the deck's pane identity
+/// (`DOT_AGENT_DECK_PANE_ID`) in its environment, as from inside a pane the
+/// deck started. It must refuse with `run it from a terminal outside the deck`
+/// and store nothing, while `trust list` and `trust revoke` still run there.
+#[spec("config-trust/cli/005")]
+#[test]
+fn cli_005_approve_inside_a_deck_pane_refuses() {
+    let sandbox = CliSandbox::new();
+    let pane = [(dot_agent_deck::agent_pty::DOT_AGENT_DECK_PANE_ID, "pane-7")];
+    let refused = sandbox.trust_from(
+        &sandbox.project,
+        &["approve", &sandbox.project_arg(), "--yes"],
+        &pane,
+    );
+    assert!(
+        !refused.status.success(),
+        "approve inside a deck pane must refuse even with --yes: {}",
+        describe(&refused)
+    );
+    assert!(
+        text(&refused).contains("run it from a terminal outside the deck"),
+        "the refusal must say where to run it: {}",
+        describe(&refused)
+    );
+    assert!(
+        sandbox.list_line().is_none(),
+        "nothing was approved:\n{}",
+        sandbox.list()
+    );
+
+    let listed = sandbox.trust_from(&sandbox.project, &["list"], &pane);
+    assert!(
+        listed.status.success(),
+        "list is allowed in a pane: {}",
+        describe(&listed)
+    );
+    sandbox.approve_yes();
+    let revoked = sandbox.trust_from(&sandbox.project, &["revoke", &sandbox.project_arg()], &pane);
+    assert!(
+        revoked.status.success(),
+        "revoke is allowed in a pane: {}",
+        describe(&revoked)
+    );
+    assert!(
+        sandbox.list_line().is_none(),
+        "revoked:\n{}",
+        sandbox.list()
+    );
+}
+
+/// Scenario: Cut a linked git worktree of the project and run `trust approve
+/// <worktree> --yes`. The approval must be stored under the MAIN checkout (the
+/// list line names the main path, not the worktree's), and `trust revoke
+/// <main checkout>` must then find and remove it.
+#[spec("config-trust/cli/006")]
+#[test]
+fn cli_006_a_linked_worktree_shares_its_main_checkouts_approval() {
+    let sandbox = CliSandbox::new();
+    let worktree = sandbox.root.join("project-wt");
+    let added = common::fixture_git(&sandbox.project, &sandbox.root)
+        .args(["worktree", "add", "-q", "-b", "wt"])
+        .arg(&worktree)
+        .status()
+        .expect("git worktree add");
+    assert!(added.success(), "git worktree add failed");
+
+    let worktree_arg = worktree.to_string_lossy().into_owned();
+    let approved = sandbox.trust_from(&worktree, &["approve", &worktree_arg, "--yes"], &[]);
+    assert!(
+        approved.status.success(),
+        "approve from the worktree: {}",
+        describe(&approved)
+    );
+
+    let listed = sandbox.list();
+    let worktree_canonical = canonical(&worktree);
+    let line = sandbox.list_line().unwrap_or_else(|| {
+        panic!("the approval must be listed under the main checkout:\n{listed}")
+    });
+    assert_eq!(state_word(&line), Some("current"), "list line: {line:?}");
+    assert!(
+        !listed.contains(&worktree_canonical),
+        "a linked worktree is not a project of its own; the list names it:\n{listed}"
+    );
+
+    let revoked = sandbox.trust(&["revoke", &sandbox.project_arg()]);
+    assert!(
+        revoked.status.success(),
+        "the main checkout must find the approval its worktree made: {}",
+        describe(&revoked)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// TUI helpers
+// ---------------------------------------------------------------------------
+
+/// Ctrl+n, confirm the current directory, choose the fixture's (single)
+/// orchestration and submit — the `open_orchestration` sequence the
+/// `pane/spawn` and `pane/restart` tests use.
+fn choose_orchestration(deck: &TuiDeck) {
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // confirm current dir -> New Agent form
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\x1b[C"); // Right -> [Orch: trust-orch]
+    deck.send_keys(b"\r"); // Mode -> Name
+    deck.send_keys(b"\r"); // submit (Command is hidden for an orchestration)
+}
+
+fn role_records(attach: &Path) -> Vec<AgentRecord> {
+    common::agent_records_on(attach)
+        .into_iter()
+        .filter(|r| matches!(r.tab_membership, Some(TabMembership::Orchestration { .. })))
+        .collect()
+}
+
+fn role_record(attach: &Path, role: &str) -> Option<AgentRecord> {
+    role_records(attach).into_iter().find(|r| {
+        matches!(
+            &r.tab_membership,
+            Some(TabMembership::Orchestration { role_name, .. }) if role_name == role
+        )
+    })
+}
+
+/// Whether no orchestration role appears on the daemon for the whole `window`.
+fn no_roles_for(attach: &Path, window: Duration) -> bool {
+    !common::wait_until(window, || !role_records(attach).is_empty())
+}
+
+fn wait_for_prompt(deck: &TuiDeck) -> String {
+    let shown = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        deck.snapshot_grid().contains(PROMPT_TITLE)
+    });
+    assert!(
+        shown,
+        "the trust prompt ({PROMPT_TITLE:?}) never appeared.\nRoles on the daemon: {:?}\nGrid:\n{}",
+        role_records(deck.attach_socket_path())
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    deck.snapshot_grid()
+}
+
+/// Whether some line of `grid` shows `role` marked `changed`.
+fn role_marked_changed(grid: &str, role: &str) -> bool {
+    grid.lines()
+        .any(|l| l.contains(role) && l.contains("changed"))
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/prompt/*: the New Agent form's trust prompt
+// ---------------------------------------------------------------------------
+
+/// Scenario: Launch the deck on a project whose orchestration was never
+/// approved, press Ctrl+n and choose it. The `Review project commands` prompt
+/// must show the project, the orchestration, `not approved before`, each
+/// role's command, description and prompt text and the footer, with nothing
+/// spawned. `Esc` closes it with nothing spawned; choosing again and pressing
+/// `a` starts both roles and `trust list` shows the approval `current`.
+#[spec("config-trust/prompt/001")]
+#[test]
+fn prompt_001_an_unapproved_orchestration_asks_before_anything_starts() {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    choose_orchestration(&deck);
+    let grid = wait_for_prompt(&deck);
+    let project_name = Path::new(&canonical(deck.workdir()))
+        .file_name()
+        .expect("the project dir has a name")
+        .to_string_lossy()
+        .into_owned();
+    for needle in [
+        project_name.as_str(),
+        ORCH,
+        "not approved before",
+        "orchestrator",
+        "env TRUST_ROLE=orchestrator cat",
+        CODER_COMMAND,
+        "TRUST-DESC-ORCH",
+        "TRUST-PROMPT-ORCH",
+        "TRUST-DESC-CODER",
+        "TRUST-PROMPT-CODER",
+        PROMPT_FOOTER,
+    ] {
+        assert!(
+            grid.contains(needle),
+            "the trust prompt must show {needle:?}.\nGrid:\n{grid}"
+        );
+    }
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(2)),
+        "nothing may be spawned while the prompt is open: {:?}",
+        role_records(&attach)
+    );
+
+    deck.send_keys(b"\x1b"); // Esc -> cancel
+    deck.wait_for_absence(PROMPT_TITLE);
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(2)),
+        "Esc must spawn nothing: {:?}",
+        role_records(&attach)
+    );
+
+    choose_orchestration(&deck);
+    wait_for_prompt(&deck);
+    deck.send_keys(b"a"); // approve and start
+    let started = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "orchestrator").is_some() && role_record(&attach, "coder").is_some()
+    });
+    assert!(
+        started,
+        "`a` must approve and start both roles; roles = {:?}\nGrid:\n{}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+
+    let listed = deck.run_deck_cli(deck.workdir(), &["trust", "list"]);
+    let listed = text(&listed);
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.contains(ORCH) && state_word(l) == Some("current")),
+        "approving in the prompt must store the approval:\n{listed}"
+    );
+}
+
+/// Scenario: Launch on an approved project, then change one character of the
+/// `coder` role's command on disk. Ctrl+n and choosing the orchestration must
+/// show the prompt with `coder` marked `changed`. Pressing Enter must not
+/// approve: the prompt stays and nothing is spawned.
+#[spec("config-trust/prompt/002")]
+#[test]
+fn prompt_002_a_changed_role_is_marked_and_enter_does_not_approve() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    let attach = deck.attach_socket_path().to_path_buf();
+    write_trust_config(deck.workdir(), CODER_COMMAND_EDITED, false);
+
+    choose_orchestration(&deck);
+    let grid = wait_for_prompt(&deck);
+    assert!(
+        role_marked_changed(&grid, "coder"),
+        "the role whose command changed must be marked `changed`.\nGrid:\n{grid}"
+    );
+    assert!(
+        grid.contains(CODER_COMMAND_EDITED),
+        "the prompt shows the command as it reads now.\nGrid:\n{grid}"
+    );
+
+    deck.send_keys(b"\r"); // Enter must NOT approve
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(3)),
+        "Enter must not approve or spawn anything: {:?}",
+        role_records(&attach)
+    );
+    assert!(
+        deck.snapshot_grid().contains(PROMPT_TITLE),
+        "the prompt stays open after Enter.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    let listed = text(&deck.run_deck_cli(deck.workdir(), &["trust", "list"]));
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.contains(ORCH) && state_word(l) == Some("changed")),
+        "the stored approval is still the old text:\n{listed}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/restore/001: session restore
+// ---------------------------------------------------------------------------
+
+/// TOML basic-string escape for the paths and names staged below.
+fn toml_str(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// Stage a `session.toml` holding one orchestration pane, in the
+/// `OrchestrationSnapshot` key names `session/restore/008` stages.
+fn stage_orchestration_session(session_file: &Path, project: &Path, roles: &[&str]) {
+    let dir = toml_str(&project.to_string_lossy());
+    let roles = roles
+        .iter()
+        .map(|r| format!("\"{r}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let toml = format!(
+        "[[panes]]\n\
+         dir = \"{dir}\"\n\
+         name = \"orchestrator\"\n\
+         command = \"sleep 600\"\n\n\
+         [panes.orchestration]\n\
+         version = 1\n\
+         roles = [{roles}]\n\
+         start_role_index = 0\n\
+         orchestrator_prompt = \"TRUST-RESTORED-PROMPT\"\n\
+         config_name = \"restore-orch\"\n\
+         project_path = \"{dir}\"\n\
+         started_role_indices = [0, 1, 2]\n"
+    );
+    std::fs::write(session_file, toml).expect("stage session.toml");
+}
+
+fn write_restore_config(project: &Path, coder_command: &str) {
+    let toml = format!(
+        "[[orchestrations]]\n\
+         name = \"restore-orch\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"sleep 600\"\n\
+         start = true\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"coder\"\n\
+         command = \"{coder_command}\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"reviewer\"\n\
+         command = \"sleep 600\"\n"
+    );
+    std::fs::write(project.join(".dot-agent-deck.toml"), toml).expect("write restore config");
+}
+
+/// Scenario: Approve a project's orchestration with the real CLI, change one
+/// character of its `coder` command, and stage a saved session holding that
+/// orchestration. Launching the TUI on an empty daemon must show the trust
+/// prompt with `coder` marked `changed` and the action `a approve and
+/// restore`, with none of its roles spawned; pressing `a` restores them.
+#[spec("config-trust/restore/001")]
+#[test]
+fn restore_001_a_changed_restored_orchestration_asks_before_restoring() {
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("restore-project");
+    let state = scratch.path().join("state");
+    let home = scratch.path().join("approve-home");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::create_dir_all(&home).expect("create approve HOME");
+    write_restore_config(&project, "sleep 600");
+
+    // Approve exactly as a user does, into the state dir the deck will use.
+    let mut approve = std::process::Command::new(common::contained_deck_binary());
+    approve
+        .args(["trust", "approve"])
+        .arg(&project)
+        .arg("--yes")
+        .current_dir(&project)
+        .env_clear()
+        .env("HOME", &home)
+        .env("DOT_AGENT_DECK_STATE_DIR", &state)
+        .stdin(std::process::Stdio::null());
+    if let Ok(path) = std::env::var("PATH") {
+        approve.env("PATH", path);
+    }
+    let approved = approve.output().expect("run trust approve");
+    assert!(
+        approved.status.success(),
+        "precondition approve: {}",
+        describe(&approved)
+    );
+
+    write_restore_config(&project, "sleep 601"); // one character changed
+    let session_file = scratch.path().join("session.toml");
+    stage_orchestration_session(
+        &session_file,
+        &project,
+        &["orchestrator", "coder", "reviewer"],
+    );
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(140, 50)
+        .with_env("DOT_AGENT_DECK_SESSION", session_file.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_STATE_DIR", state.to_string_lossy())
+        .launch_with_fixture("plain-project");
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    let grid = wait_for_prompt(&deck);
+    for needle in ["restore-orch", "a approve and restore", "sleep 601"] {
+        assert!(
+            grid.contains(needle),
+            "the restore prompt must show {needle:?}.\nGrid:\n{grid}"
+        );
+    }
+    assert!(
+        role_marked_changed(&grid, "coder"),
+        "the changed role must be marked `changed`.\nGrid:\n{grid}"
+    );
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(2)),
+        "a changed orchestration restores nothing until approved: {:?}",
+        role_records(&attach)
+    );
+
+    deck.send_keys(b"a");
+    let restored = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "coder").is_some() && role_record(&attach, "reviewer").is_some()
+    });
+    assert!(
+        restored,
+        "`a` must approve and restore the orchestration; roles = {:?}\nGrid:\n{}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/respawn/*: agent verbs refuse after a config change
+// ---------------------------------------------------------------------------
+
+/// A deck on the (pre-approved) `config-trust` fixture with its orchestration
+/// open and both roles running. Returns the deck, the orchestrator's pane id
+/// and coder's current agent id.
+fn open_approved_orchestration() -> (TuiDeck, String, String) {
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    choose_orchestration(&deck);
+    let attach = deck.attach_socket_path().to_path_buf();
+    let up = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "orchestrator").is_some() && role_record(&attach, "coder").is_some()
+    });
+    assert!(
+        up,
+        "precondition: the approved orchestration opens with both roles, no prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    let orchestrator = role_record(&attach, "orchestrator")
+        .and_then(|r| r.pane_id_env)
+        .expect("the orchestrator has a pane id");
+    let coder = role_record(&attach, "coder").expect("coder is up").id;
+    (deck, orchestrator, coder)
+}
+
+/// Run `dot-agent-deck <args…>` as the agent in `caller_pane` would.
+fn agent_verb(deck: &TuiDeck, caller_pane: &str, args: &[&str]) -> Output {
+    std::process::Command::new(common::contained_deck_binary())
+        .args(args)
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("run the agent verb")
+}
+
+/// Coder's agent id must still be the one it had before the refused verb.
+fn assert_coder_untouched(deck: &TuiDeck, coder_before: &str) {
+    let attach = deck.attach_socket_path();
+    let unchanged = !common::wait_until(Duration::from_secs(2), || {
+        role_record(attach, "coder").is_none_or(|r| r.id != coder_before)
+    });
+    assert!(
+        unchanged,
+        "a refused verb must start no new process for coder (was {coder_before}); roles = {:?}",
+        role_records(attach)
+            .iter()
+            .map(|r| (&r.id, &r.tab_membership))
+            .collect::<Vec<_>>()
+    );
+}
+
+/// Scenario: Open the approved orchestration, then change one character of the
+/// `clear = true` coder role's command on disk. `delegate --to coder` from the
+/// orchestrator must fail with the refusal (orchestration, project, `changed
+/// since you approved it`, the approve command) and coder keeps its process.
+#[spec("config-trust/respawn/001")]
+#[test]
+fn respawn_001_delegate_to_a_clear_role_refuses_after_a_change() {
+    let (deck, orchestrator, coder) = open_approved_orchestration();
+    write_trust_config(deck.workdir(), CODER_COMMAND_EDITED, false);
+
+    let out = agent_verb(
+        &deck,
+        &orchestrator,
+        &["delegate", "--to", "coder", "--task", "TRUST-DELEGATE-TASK"],
+    );
+    assert!(
+        !out.status.success(),
+        "the delegate must be refused: {}",
+        describe(&out)
+    );
+    assert_refusal(&text(&out), deck.workdir(), "changed since you approved it");
+    assert_coder_untouched(&deck, &coder);
+}
+
+/// Scenario: Open the approved orchestration, change one character of coder's
+/// command, then run `pane restart coder --force` from the orchestrator. It must
+/// fail with the refusal text and coder keeps its process.
+#[spec("config-trust/respawn/002")]
+#[test]
+fn respawn_002_pane_restart_refuses_after_a_change() {
+    let (deck, orchestrator, coder) = open_approved_orchestration();
+    write_trust_config(deck.workdir(), CODER_COMMAND_EDITED, false);
+
+    let out = agent_verb(
+        &deck,
+        &orchestrator,
+        &["pane", "restart", "coder", "--force"],
+    );
+    assert!(
+        !out.status.success(),
+        "the restart must be refused: {}",
+        describe(&out)
+    );
+    assert_refusal(&text(&out), deck.workdir(), "changed since you approved it");
+    assert_coder_untouched(&deck, &coder);
+}
+
+/// Scenario: Open the approved orchestration, add a `reviewer` role to its
+/// config on disk, then run `pane spawn reviewer` from the orchestrator. It
+/// must fail with the refusal text, and no reviewer appears on the daemon.
+#[spec("config-trust/respawn/003")]
+#[test]
+fn respawn_003_pane_spawn_refuses_after_a_change() {
+    let (deck, orchestrator, _coder) = open_approved_orchestration();
+    write_trust_config(deck.workdir(), CODER_COMMAND, true);
+
+    let out = agent_verb(&deck, &orchestrator, &["pane", "spawn", "reviewer"]);
+    assert!(
+        !out.status.success(),
+        "the spawn must be refused: {}",
+        describe(&out)
+    );
+    assert_refusal(&text(&out), deck.workdir(), "changed since you approved it");
+    let attach = deck.attach_socket_path();
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || role_record(attach, "reviewer")
+            .is_some()),
+        "a refused spawn starts no reviewer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/schedule/001: a scheduled fire
+// ---------------------------------------------------------------------------
+
+/// Scenario: Register a schedule whose working dir holds a never-approved
+/// orchestration and fire it with run-now. Nothing spawns, and `schedule list`
+/// shows the refusal (`never approved`, the project, the approve command).
+/// After `trust approve`, the same run-now spawns the orchestrator.
+#[spec("config-trust/schedule/001")]
+#[test]
+fn schedule_001_an_unapproved_scheduled_orchestration_is_refused_and_reported() {
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("scheduled-project");
+    std::fs::create_dir_all(&project).expect("create project");
+    write_trust_config(&project, CODER_COMMAND, false);
+    let toml = format!(
+        "[[scheduled_tasks]]\n\
+         name = \"trust-sched\"\n\
+         cron = \"0 0 1 1 *\"\n\
+         working_dir = \"{}\"\n\
+         command = \"cat\"\n\
+         prompt = \"TRUST-SCHED-PROMPT\"\n\
+         enabled = true\n",
+        toml_str(&project.to_string_lossy())
+    );
+    let daemon = common::spawn_daemon_serve_untrusted(Some(&toml), "0", &[]);
+
+    daemon.run_now("trust-sched").expect("run-now");
+    let schedule_list = || text(&daemon.run_schedule_cli(&["list"]));
+    let reported = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        schedule_list().contains("never approved")
+    });
+    let listed = schedule_list();
+    assert!(
+        reported,
+        "`schedule list` must show the refused fire:\n{listed}"
+    );
+    assert_refusal(&listed, &project, "never approved");
+    assert!(
+        daemon.agent_records().is_empty(),
+        "a refused fire spawns nothing: {:?}",
+        daemon.agent_records()
+    );
+
+    daemon.approve_project_trust(&project);
+    daemon
+        .run_now("trust-sched")
+        .expect("run-now after approval");
+    assert!(
+        daemon
+            .wait_for_agent_where(
+                |r| matches!(
+                    &r.tab_membership,
+                    Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+                ),
+                common::load_scaled(Duration::from_secs(15)),
+            )
+            .is_some(),
+        "once approved, the same fire opens the orchestration"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/dispatch/001: `dot-agent-deck dispatch --orchestration`
+// ---------------------------------------------------------------------------
+
+/// Removes a dispatch worktree (a sibling of the harness tempdir) on drop.
+struct SiblingWorktreeGuard(PathBuf);
+
+impl Drop for SiblingWorktreeGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn dispatch_worktree_of(deck: &TuiDeck, unit: &str) -> PathBuf {
+    let work = deck.workdir();
+    work.parent()
+        .expect("fixture dir has a parent")
+        .join(format!(
+            "{}-dispatch-{unit}",
+            work.file_name()
+                .expect("fixture dir has a name")
+                .to_string_lossy()
+        ))
+}
+
+/// Open a plain dashboard pane named `caller` running `cat` and return its
+/// pane id.
+fn open_caller(deck: &TuiDeck) -> String {
+    deck.send_keys(b"\x0e"); // Ctrl+n -> directory picker
+    deck.send_keys(b" "); // confirm current dir -> New Agent form
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t"); // Mode (No mode) -> Name
+    deck.send_keys(&[0x7f; 96]);
+    deck.send_keys(b"caller");
+    deck.send_keys(b"\t"); // Name -> Command
+    deck.send_keys(&[0x7f; 400]);
+    deck.send_keys(b"cat");
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    deck.wait_for_absence("[Submit]");
+    let find = || {
+        common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .find(|r| r.display_name.as_deref() == Some("caller"))
+            .and_then(|r| r.pane_id_env)
+    };
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || find()
+            .is_some()),
+        "the caller pane never started.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    find().expect("the caller is up")
+}
+
+/// Scenario: From a plain pane in a never-approved project, run `dispatch
+/// <unit> --orchestration trust-orch`: the refusal reaches the caller's inbox
+/// and no worktree is created. After `trust approve` of the main checkout, a second dispatch
+/// succeeds and the orchestration's roles run in the unit's linked worktree,
+/// which shares the main checkout's approval.
+#[spec("config-trust/dispatch/001")]
+#[test]
+fn dispatch_001_dispatch_orchestration_refuses_until_approved() {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .impersonating_pane_signals()
+        .with_pty_size(160, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    common::commit_fixture_repo(deck.workdir());
+    let caller = open_caller(&deck);
+    let dispatch = |unit: &str| {
+        agent_verb(
+            &deck,
+            &caller,
+            &[
+                "dispatch",
+                unit,
+                "--task",
+                "TRUST-DISPATCH-TASK",
+                "--orchestration",
+                ORCH,
+            ],
+        )
+    };
+
+    let refused_wt = dispatch_worktree_of(&deck, "trust-refused");
+    let _g1 = SiblingWorktreeGuard(refused_wt.clone());
+    // `dispatch` returns at once and posts its outcome to the caller's inbox
+    // (`dispatch_return`); a refusal arrives there, not as an exit status.
+    let out = dispatch("trust-refused");
+    let attach = deck.attach_socket_path();
+    let refused = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        inbox_view::count_containing(attach, &caller, "never approved") > 0
+    });
+    let inbox = inbox_view::text(attach, &caller);
+    assert!(
+        refused,
+        "the refusal must reach the caller's inbox.\nCLI: {}\nInbox:\n{inbox}",
+        describe(&out)
+    );
+    assert_refusal(&inbox, deck.workdir(), "never approved");
+    assert!(
+        !refused_wt.exists(),
+        "a refused dispatch creates no worktree"
+    );
+    assert!(
+        role_records(deck.attach_socket_path()).is_empty(),
+        "a refused dispatch spawns nothing"
+    );
+
+    deck.approve_project_trust(deck.workdir());
+    let unit_wt = dispatch_worktree_of(&deck, "trust-approved");
+    let _g2 = SiblingWorktreeGuard(unit_wt.clone());
+    let out = dispatch("trust-approved");
+    assert!(
+        out.status.success(),
+        "an approved dispatch runs: {}",
+        describe(&out)
+    );
+    let unit_name = unit_wt
+        .file_name()
+        .expect("worktree has a name")
+        .to_string_lossy()
+        .into_owned();
+    let in_unit = common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+        role_records(deck.attach_socket_path()).iter().any(|r| {
+            r.cwd
+                .as_deref()
+                .and_then(|cwd| Path::new(cwd).file_name().map(|n| n == unit_name.as_str()))
+                .unwrap_or(false)
+        })
+    });
+    assert!(
+        in_unit,
+        "the approved dispatch's roles must run in its worktree {}; roles = {:?}",
+        unit_wt.display(),
+        role_records(deck.attach_socket_path())
+            .iter()
+            .map(|r| (&r.cwd, &r.tab_membership))
+            .collect::<Vec<_>>()
+    );
+}

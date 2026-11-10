@@ -2871,3 +2871,136 @@ fn dispatch_031_hanging_claim_does_not_hold_queue() {
     );
     stub.assert_no_unhandled_calls();
 }
+
+/// Scenario: A scheduled issue dispatch whose repository's orchestration was
+/// never approved is refused on its first fire, after the clone and before any
+/// worktree, with `schedule list` showing `never approved`. Once the clone is
+/// approved, a fire dispatches issue 7 and warms its worktree's devbox (a stub
+/// that records each run). Then the remote's default branch changes the role's
+/// command by one character: the next fire, for issue 8, is refused with
+/// `changed since you approved it`, creates no worktree and runs no warm-up.
+#[spec("config-trust/schedule/002")]
+#[test]
+fn config_trust_schedule_002_a_changed_default_branch_is_refused_before_warm_up() {
+    const REPO: &str = "acme/trust";
+    const TASK: &str = "trust-task";
+    let toml_with = |command: &str| {
+        format!(
+            "[[orchestrations]]\nname = \"trust-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{command}\"\nstart = true\n"
+        )
+    };
+
+    let stub = GhStub::new();
+    let remote = stub.repo_dir(REPO).join("remote");
+    init_remote_with_orch_toml(&remote, Some(&toml_with("cat")));
+    std::fs::write(remote.join("devbox.json"), "{\"packages\": []}\n").expect("write devbox.json");
+    run_git(&remote, &["add", "-A"]);
+    run_git(&remote, &["commit", "-q", "-m", "devbox"]);
+    stub.seed_state(REPO);
+    stub.set_issues(REPO, &[7]);
+
+    // A `devbox` ahead of the real one on PATH: each warm-up appends a line.
+    let warmups = stub.bindir.join("warmups.log");
+    let devbox = stub.bindir.join("devbox");
+    std::fs::write(
+        &devbox,
+        format!("#!/bin/sh\necho warm >> '{}'\n", warmups.display()),
+    )
+    .expect("write devbox stub");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&devbox, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod devbox stub");
+    }
+    let warmup_count = || {
+        std::fs::read_to_string(&warmups)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace");
+    let work_str = work.to_string_lossy().into_owned();
+    let toml = dispatch_task(TASK, &work_str, "TRUSTDISP-{{issue_number}}", REPO, 5);
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    let schedule_list = || {
+        let out = daemon.run_schedule_cli(&["list"]);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    let clone = derive_issue_paths(&work, TASK, 7).clone_dir;
+
+    // 1. Never approved: refused after the clone is provisioned.
+    daemon.run_now(TASK).expect("run-now 1");
+    assert!(
+        common::wait_until(w(), || schedule_list().contains("never approved")),
+        "the first fire must be refused as never approved:\n{}",
+        schedule_list()
+    );
+    let listed = schedule_list();
+    for needle in [
+        "trust-orch",
+        "dot-agent-deck trust approve",
+        "--orchestration trust-orch",
+    ] {
+        assert!(
+            listed.contains(needle),
+            "the refusal must contain {needle:?}:\n{listed}"
+        );
+    }
+
+    // 2. Approved: issue 7 dispatches and its worktree is warmed.
+    let wt7 = derive_issue_paths(&work, TASK, 7).worktree_dir;
+    assert!(!wt7.exists(), "a refused fire creates no worktree");
+    assert_eq!(warmup_count(), 0, "a refused fire runs no devbox warm-up");
+    daemon.approve_project_trust(&clone);
+    daemon.run_now(TASK).expect("run-now 2");
+    assert!(
+        daemon
+            .wait_for_agent_where(|r| orchestrator_in(r, &wt7), w())
+            .is_some(),
+        "once approved, issue 7 dispatches its orchestration"
+    );
+    assert_eq!(
+        warmup_count(),
+        1,
+        "precondition: the approved dispatch warmed its worktree"
+    );
+
+    // 3. The default branch changes the command by one character.
+    std::fs::write(remote.join(".dot-agent-deck.toml"), toml_with("cas")).expect("edit remote");
+    run_git(&remote, &["commit", "-q", "-am", "change the role command"]);
+    stub.set_issues(REPO, &[7, 8]);
+    // Re-fired until a fire runs: one made while issue 7's run is still
+    // finishing is skipped as "previous run still active".
+    assert!(
+        common::wait_until(w(), || {
+            schedule_list().contains("changed since you approved it") || {
+                let _ = daemon.run_now(TASK);
+                false
+            }
+        }),
+        "a default branch that changed the role's command must be refused:\n{}",
+        schedule_list()
+    );
+    let wt8 = derive_issue_paths(&work, TASK, 8).worktree_dir;
+    assert!(
+        !wt8.exists(),
+        "a refused fire creates no worktree for issue 8"
+    );
+    assert_eq!(warmup_count(), 1, "a refused fire runs no devbox warm-up");
+    assert_eq!(
+        count_orchestrators(&daemon),
+        1,
+        "a refused fire spawns nothing"
+    );
+}

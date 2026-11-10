@@ -271,6 +271,134 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
 - **Platform coverage:** mac+linux.
 
+### Project config trust (PRD #1885)
+
+#### config-trust/cli
+
+##### config-trust/cli/001 — `trust approve --yes` prints what it approves and `trust list` shows it `current`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`): the real binary against an isolated HOME and state dir; no daemon.
+- **Agent:** none.
+- **Asserts:** with no approvals `list` exits 0 and names nothing; `approve <dir> --yes` exits 0 and prints each role's command, description and prompt text; `list` then shows one line for the project (canonical path) and orchestration whose state word is `current`.
+- **Does not assert:** the y/N question on a terminal (the `trust_cli` unit tests own it); the list line's exact layout.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/002 — Changing one character of a role's command reads as `changed`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** after an approval, a one-character edit to a role `command` makes `list` show `changed`; restoring the text shows `current` again.
+- **Does not assert:** which other keys void an approval (unit tests own the field list).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/003 — `trust revoke` removes an approval and fails when there is nothing to revoke.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `revoke <dir>` exits 0 and the project leaves `list`; a second `revoke` exits non-zero with a message.
+- **Does not assert:** `--orchestration`-scoped revoke.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/004 — `trust approve` without a terminal and without `--yes` refuses.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** non-zero exit, a message naming `--yes`, and nothing stored.
+- **Does not assert:** the terminal question itself.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/005 — `trust approve` inside a deck pane refuses; `list` and `revoke` still run.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none; the pane identity is `DOT_AGENT_DECK_PANE_ID` in the CLI's environment.
+- **Asserts:** `approve --yes` with the pane identity exits non-zero with `run it from a terminal outside the deck` and stores nothing; `list` exits 0 and `revoke` removes an approval with the same identity present.
+- **Does not assert:** the other pane-identity variables, or a run from a real pane's shell.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/006 — A linked git worktree shares its main checkout's approval.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `approve <linked worktree> --yes` stores the approval under the main checkout (the list line names the main path, never the worktree's) as `current`, and `revoke <main checkout>` finds it.
+- **Does not assert:** a non-git project's identity (the canonical config directory).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/prompt
+
+##### config-trust/prompt/001 — The New Agent form asks before starting a never-approved orchestration.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), launched with `without_trust_preapproval`.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`).
+- **Asserts:** Ctrl+n + choosing the orchestration shows `Review project commands` with the project, the orchestration, `not approved before`, every role's command, description and prompt text and the footer `a approve and start · Esc cancel · ↑↓ scroll`, and no role is on the daemon; `Esc` closes it with nothing spawned; choosing again and pressing `a` starts both roles and `trust list` shows the approval `current`.
+- **Does not assert:** scrolling; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/002 — A changed role is marked `changed`, and Enter does not approve.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** after a one-character edit to an approved role's command, the prompt shows that role marked `changed` with its new command; Enter leaves the prompt open, spawns nothing, and the stored approval still reads `changed`.
+- **Does not assert:** the no-prompt open of an approved, unchanged orchestration (every other orchestration test opens one under the harness pre-approval).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/restore
+
+##### config-trust/restore/001 — A restored orchestration whose command changed asks before restoring.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** on a daemon-empty start the prompt shows the orchestration, the changed command, `coder` marked `changed` and `a approve and restore`, with no role spawned; `a` restores the roles.
+- **Does not assert:** cancelling a restore prompt; several restored orchestrations.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/respawn
+
+##### config-trust/respawn/001 — A delegate to a `clear = true` role refuses after its config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** the delegate exits non-zero with the refusal (orchestration, project, `changed since you approved it`, `dot-agent-deck trust approve … --orchestration trust-orch`), and coder keeps its agent id.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/002 — `pane restart` refuses after the role's config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane restart coder --force` exits non-zero with the refusal text, and coder keeps its agent id.
+- **Does not assert:** a restart of a crashed pane.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/003 — `pane spawn` refuses after a role was added to the config.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane spawn reviewer` exits non-zero with the refusal text, and no reviewer appears on the daemon.
+- **Does not assert:** spawning a role whose text is unchanged.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/schedule
+
+##### config-trust/schedule/001 — A scheduled fire into a never-approved orchestration is refused and reported.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins.
+- **Asserts:** run-now spawns nothing and `schedule list` shows the refusal (`never approved`, the project, the approve command); after `trust approve`, the same run-now opens the orchestration.
+- **Does not assert:** the TUI schedule manager's rendering of the refusal (a `ui.rs` unit test owns it); a cron-driven fire.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/002 — An issue dispatch whose default branch changed a role is refused before the devbox warm-up.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins; a `devbox` stub on `PATH` records each warm-up.
+- **Asserts:** the first fire is refused `never approved` with no worktree and no warm-up; after approving the clone, a fire dispatches issue 7 and warms its worktree once; after the remote's default branch changes the role command by one character, the next fire is refused `changed since you approved it`, creates no worktree for issue 8, runs no further warm-up and spawns nothing.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/dispatch
+
+##### config-trust/dispatch/001 — `dispatch --orchestration` refuses until approved, then runs in a worktree that shares the approval.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane.
+- **Agent:** stand-ins.
+- **Asserts:** from a never-approved project the refusal reaches the caller's inbox (where `dispatch` posts its outcome), no worktree is created and nothing spawns; after `trust approve` of the main checkout a second dispatch succeeds and the roles run in the unit's linked worktree.
+- **Does not assert:** `dispatch --single` or `--command` (not gated).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/live
+
+##### config-trust/live/001 — A real agent starts only after the trust prompt is approved. [reel]
+- **Layer:** L2 PTY-attached, **lane 2** (`tests/e2e_config_trust_live.rs`).
+- **Agent:** real interactive Claude Code on Haiku (`--allowedTools Bash Read`), credentials imported, work dir trusted.
+- **Asserts:** Ctrl+n on a never-approved project shows `Review project commands` with the role's `claude …` command and nothing running; `a` starts the agent, which creates the uniquely named sentinel `config_trust_live_5e81c3.txt` its prompt asks for.
+- **Does not assert:** the agent's wording.
+- **Platform coverage:** mac+linux.
+
 ### Session pull requests
 
 #### session/pr
