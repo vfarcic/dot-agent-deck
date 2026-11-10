@@ -465,6 +465,8 @@ jq -r --slurpfile wt "$WORKTREES" --rawfile ledger "$LEDGER" '
 - **Join on the branch**, `agent/dispatch-<name>` in all three. The two documents can spell the worktree path differently.
 - **Keep only units this run dispatched; the ledger is what does it.** Run from this pane, `close --all` lists every open unit this pane's agent dispatched, so another runner's units do not appear, but an earlier run's from this pane do; without the ledger the join would close those too. **Check the selection before you close anything**: every row is a unit the ledger names, and every ledger unit whose PR merged has a row. A ledger unit with no row is still to be explained — its PR is not merged, or it has left the deck. If the listing shows none of this run's units although they are still on the deck, this pane's agent has been replaced since it dispatched them, and the deck closes only for the agent that dispatched: report it and leave the closing to the runner, from a shell.
 
+**A unit that closed its issue instead of opening a PR is not in that selection**, because it has no merged PR (step 8's relevance check: already fixed, obsolete or a duplicate). Add it by hand when all three hold: its report says it closed the issue, `gh issue view <n> --json state` reads `CLOSED`, and `gh pr list --head '<branch>' --state all` returns nothing. It must still be a ledger unit, so the same check of the selection applies. Take its `unit_id` from the same `close --all --json` listing.
+
 **Close each selected unit by its unit id, one at a time**, using the `unit_id` the join took from `.listed[]`:
 
 ```bash
