@@ -667,6 +667,23 @@ fn write_restore_config(project: &Path, coder_command: &str) {
     std::fs::write(project.join(".dot-agent-deck.toml"), toml).expect("write restore config");
 }
 
+/// Run `dot-agent-deck trust <args…>` from `project` with no terminal, in
+/// `home` and the `state` dir the restore tests hand the deck.
+fn restore_trust_cli(project: &Path, state: &Path, home: &Path, args: &[&str]) -> Output {
+    let mut cmd = std::process::Command::new(common::contained_deck_binary());
+    cmd.arg("trust")
+        .args(args)
+        .current_dir(project)
+        .env_clear()
+        .env("HOME", home)
+        .env("DOT_AGENT_DECK_STATE_DIR", state)
+        .stdin(std::process::Stdio::null());
+    if let Ok(path) = std::env::var("PATH") {
+        cmd.env("PATH", path);
+    }
+    cmd.output().expect("run `dot-agent-deck trust`")
+}
+
 /// Scenario: Approve a project's orchestration with the real CLI, change one
 /// character of its `coder` command, and stage a saved session holding that
 /// orchestration. Launching the TUI on an empty daemon must show the trust
@@ -684,20 +701,12 @@ fn restore_001_a_changed_restored_orchestration_asks_before_restoring() {
     write_restore_config(&project, "sleep 600");
 
     // Approve exactly as a user does, into the state dir the deck will use.
-    let mut approve = std::process::Command::new(common::contained_deck_binary());
-    approve
-        .args(["trust", "approve"])
-        .arg(&project)
-        .arg("--yes")
-        .current_dir(&project)
-        .env_clear()
-        .env("HOME", &home)
-        .env("DOT_AGENT_DECK_STATE_DIR", &state)
-        .stdin(std::process::Stdio::null());
-    if let Ok(path) = std::env::var("PATH") {
-        approve.env("PATH", path);
-    }
-    let approved = approve.output().expect("run trust approve");
+    let approved = restore_trust_cli(
+        &project,
+        &state,
+        &home,
+        &["approve", &project.to_string_lossy(), "--yes"],
+    );
     assert!(
         approved.status.success(),
         "precondition approve: {}",
@@ -748,6 +757,112 @@ fn restore_001_a_changed_restored_orchestration_asks_before_restoring() {
             .map(|r| &r.tab_membership)
             .collect::<Vec<_>>(),
         deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Approve a project's orchestration with the real CLI, change one
+/// character of its `coder` command, and stage a saved session holding that
+/// orchestration followed by a plain `sleep 600` pane. Launching the TUI shows
+/// the restore prompt; `Esc` closes it, none of the orchestration's roles
+/// start, the plain pane is restored, and `trust list` still reads `changed`.
+#[spec("config-trust/restore/002")]
+#[test]
+fn restore_002_cancelling_the_restore_prompt_leaves_the_orchestration_unrestored() {
+    const PLAIN: &str = "r-plain";
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("restore-project");
+    let plain_dir = scratch.path().join("plain-dir");
+    let state = scratch.path().join("state");
+    let home = scratch.path().join("approve-home");
+    for dir in [&project, &plain_dir, &home] {
+        std::fs::create_dir_all(dir).expect("create sandbox dir");
+    }
+    write_restore_config(&project, "sleep 600");
+    let approved = restore_trust_cli(
+        &project,
+        &state,
+        &home,
+        &["approve", &project.to_string_lossy(), "--yes"],
+    );
+    assert!(
+        approved.status.success(),
+        "precondition approve: {}",
+        describe(&approved)
+    );
+    write_restore_config(&project, "sleep 601"); // one character changed
+
+    // The orchestration pane first, so a restore that stops at the cancelled
+    // orchestration instead of carrying on would also lose the plain pane.
+    let session_file = scratch.path().join("session.toml");
+    stage_orchestration_session(
+        &session_file,
+        &project,
+        &["orchestrator", "coder", "reviewer"],
+    );
+    let mut session = std::fs::read_to_string(&session_file).expect("read staged session");
+    session.push_str(&format!(
+        "\n[[panes]]\ndir = \"{}\"\nname = \"{PLAIN}\"\ncommand = \"sleep 600\"\n",
+        toml_str(&plain_dir.to_string_lossy())
+    ));
+    std::fs::write(&session_file, session).expect("stage the plain pane");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(140, 50)
+        .with_env("DOT_AGENT_DECK_SESSION", session_file.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_STATE_DIR", state.to_string_lossy())
+        .launch_with_fixture("plain-project");
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    let grid = wait_for_prompt(&deck);
+    assert!(
+        grid.contains("a approve and restore") && grid.contains("restore-orch"),
+        "precondition: the restore prompt for `restore-orch`.\nGrid:\n{grid}"
+    );
+
+    deck.send_keys(b"\x1b"); // Esc
+    let closed = common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+        !deck.snapshot_grid().contains(PROMPT_TITLE)
+    });
+    assert!(
+        closed,
+        "`Esc` must close the restore prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    let plain_restored = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        deck.snapshot_grid().contains(PLAIN)
+            && common::agent_records_on(&attach)
+                .iter()
+                .any(|r| r.display_name.as_deref() == Some(PLAIN))
+    });
+    assert!(
+        plain_restored,
+        "cancelling one orchestration must still restore the rest of the session (`{PLAIN}`).\nAgents: {:?}\nGrid:\n{}",
+        common::agent_records_on(&attach)
+            .iter()
+            .map(|r| &r.display_name)
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(3)),
+        "a cancelled restore must start none of the orchestration's roles: {:?}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>()
+    );
+
+    let listed = restore_trust_cli(&project, &state, &home, &["list"]);
+    let project_canonical = canonical(&project);
+    let line = text(&listed)
+        .lines()
+        .find(|l| l.contains(&project_canonical) && l.contains("restore-orch"))
+        .map(str::to_string);
+    assert_eq!(
+        line.as_deref().and_then(state_word),
+        Some("changed"),
+        "`Esc` must store nothing: the approval still reads `changed`.\n{}",
+        describe(&listed)
     );
 }
 

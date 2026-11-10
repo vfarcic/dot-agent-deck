@@ -339,7 +339,14 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with.
 - **Agent:** stand-ins (`sleep 600`).
 - **Asserts:** on a daemon-empty start the prompt shows the orchestration, the changed command, `coder` marked `changed` and `a approve and restore`, with no role spawned; `a` restores the roles.
-- **Does not assert:** cancelling a restore prompt; several restored orchestrations.
+- **Does not assert:** cancelling a restore prompt (restore/002 does); several restored orchestrations.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/002 — Cancelling the restore prompt leaves the orchestration unrestored and restores the rest of the session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session holding the changed orchestration followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing.
+- **Does not assert:** that the orchestration can be reopened afterwards; several restored orchestrations.
 - **Platform coverage:** mac+linux.
 
 #### config-trust/respawn

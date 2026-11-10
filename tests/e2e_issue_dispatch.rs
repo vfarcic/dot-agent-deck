@@ -748,6 +748,72 @@ fn wait_for_claim_dispatch(daemon: &common::DaemonProc, stub: &GhStub, work: &Pa
     stub.assert_no_unhandled_calls();
 }
 
+/// PRD #1885 (decision 2): an issue dispatch's project is its persistent clone,
+/// and a fire refuses to open the clone's orchestration until that clone is
+/// approved. The clone does not exist before the first fire, so a test about
+/// what a dispatch does AFTER that check makes the clone itself: a `git clone`
+/// of `repo`'s fixture remote into the directory the scheduler derives for
+/// `task`, which a fire then refreshes instead of cloning (a local-path origin
+/// passes its origin check). It then approves the clone in `daemon`'s store.
+/// Call it before the first run-now. Returns the clone directory.
+///
+/// This skips the scheduler's own `gh repo clone`, so a test whose point
+/// includes that clone uses [`fire_refused_then_approve`] instead.
+fn approve_dispatch_clone(
+    daemon: &common::DaemonProc,
+    stub: &GhStub,
+    repo: &str,
+    work: &Path,
+    task: &str,
+) -> PathBuf {
+    let clone = derive_issue_paths(work, task, 0).clone_dir;
+    let remote = stub.repo_dir(repo).join("remote");
+    let status = common::fixture_git(work, work)
+        .args(["clone", "--quiet"])
+        .arg(&remote)
+        .arg(&clone)
+        .status()
+        .expect("run git clone");
+    assert!(
+        status.success(),
+        "pre-clone {remote:?} into {clone:?} failed"
+    );
+    daemon.approve_project_trust(&clone);
+    clone
+}
+
+/// PRD #1885, for a test whose point includes the scheduler's own first-fire
+/// `gh repo clone`: fire `task`, wait for the refusal its never-approved clone
+/// earns (the fire clones and stops before listing issues, so it makes no other
+/// GitHub call), approve the clone the fire made, and fire again, re-firing
+/// while the refused run is still finishing. What the test then observes is the
+/// second fire, against the clone the first one made.
+fn fire_refused_then_approve(daemon: &common::DaemonProc, work: &Path, task: &str) {
+    daemon.run_now(task).expect("run-now (refused)");
+    assert!(
+        common::wait_until(w(), || scheduler_messages(daemon).iter().any(|line| {
+            line.contains(&format!("task {task:?}: refused:")) && line.contains("never approved")
+        })),
+        "a never-approved clone must be refused on its first fire: {:?}",
+        scheduler_messages(daemon)
+    );
+    daemon.approve_project_trust(&derive_issue_paths(work, task, 0).clone_dir);
+    let skipped = || {
+        scheduler_messages(daemon)
+            .iter()
+            .filter(|line| line.contains(&format!("skipped fire of {task:?}")))
+            .count()
+    };
+    assert!(
+        common::wait_until(w(), || {
+            let before = skipped();
+            daemon.run_now(task).expect("run-now (approved)");
+            skipped() == before
+        }),
+        "the approved fire must start once the refused run has finished"
+    );
+}
+
 /// Scenario: Fire a gated schedule with a fresh collaborator claim on issue 7, an unclaimed sibling, and unaffiliated authors copying the collaborator's record onto issues 9 and 10.
 /// Only the collaborator's issue skips, identifying its actual GitHub login, while both copied claims permit dispatch.
 /// With an hourly schedule and a 3-hour reader TTL, a 24-hour-old collaborator claim stating a 168-hour lifetime still skips, while its legacy-format counterpart dispatches.
@@ -787,6 +853,7 @@ fn dispatch_032_fresh_foreign_claim_skips_with_claimant() {
         .unwrap();
     }
     let daemon = claim_daemon(&stub, &claim_task(&work, Some(true), 168, "0 0 * * *"));
+    approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
     daemon.run_now("dispatch-task").unwrap();
     wait_for_claim_dispatch(&daemon, &stub, &work, 8);
     for issue in [9, 10] {
@@ -833,6 +900,7 @@ fn dispatch_032_fresh_foreign_claim_skips_with_claimant() {
     stub.seed_claim_lifetime("acme/widgets", 7, 168);
     let foreign = stub.marker_comments("acme/widgets", 7);
     let daemon = claim_daemon(&stub, &claim_task(&work, Some(true), 3, "0 * * * *"));
+    approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
     daemon.run_now("dispatch-task").unwrap();
     wait_for_claim_dispatch(&daemon, &stub, &work, 8);
     assert!(
@@ -874,6 +942,7 @@ fn dispatch_033_stale_foreign_claim_dispatches_and_advances_age() {
     let foreign = stub.marker_comments("acme/widgets", 7).remove(0);
     let before = chrono::Utc::now();
     let daemon = claim_daemon(&stub, &claim_task(&work, Some(true), 168, "0 0 * * *"));
+    approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
     daemon.run_now("dispatch-task").unwrap();
     wait_for_claim_dispatch(&daemon, &stub, &work, 7);
     let records = stub.marker_comments("acme/widgets", 7);
@@ -893,7 +962,7 @@ fn dispatch_033_stale_foreign_claim_dispatches_and_advances_age() {
     );
 }
 
-/// Scenario: Dispatch issue 7, SIGKILL its daemon, delete the workspace and daemon state, then fire a fresh daemon against unchanged GitHub state.
+/// Scenario: Dispatch issue 7, SIGKILL its daemon, delete the workspace and daemon state, then fire a fresh daemon against unchanged GitHub state, approving the clone it makes after its first fire is refused.
 /// An own dead claim and an additional stale foreign claim permit recovery; an additional fresh foreign claim blocks it.
 #[spec("scheduler/dispatch/034")]
 #[test]
@@ -913,6 +982,7 @@ fn dispatch_034_sigkill_workspace_loss_recovers_without_repo_write() {
         // The initial dispatch deliberately has gating off, so the live-foreign
         // arm can start with BOTH records already persisted before the crash.
         let daemon = claim_daemon(&stub, &claim_task(&work, Some(false), 168, "0 0 * * *"));
+        approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
         daemon.run_now("dispatch-task").unwrap();
         wait_for_claim_dispatch(&daemon, &stub, &work, 7);
         let state = stub.state("acme/widgets");
@@ -938,7 +1008,10 @@ fn dispatch_034_sigkill_workspace_loss_recovers_without_repo_write() {
             state,
             "GitHub state survives workspace loss unchanged"
         );
-        daemon.run_now("dispatch-task").unwrap();
+        // The workspace loss took the clone with it, and the fresh daemon has a
+        // fresh approval store: the fire re-clones, is refused, and fires again
+        // once the new clone is approved.
+        fire_refused_then_approve(&daemon, &work, "dispatch-task");
         if foreign_age == Some(1) {
             assert!(
                 common::wait_until(w(), || scheduler_messages(&daemon)
@@ -978,6 +1051,7 @@ fn dispatch_035_default_and_false_disable_gating_but_write_claim() {
         );
         let foreign = stub.marker_comments("acme/widgets", 7).remove(0);
         let daemon = claim_daemon(&stub, &claim_task(&work, gating, 168, "0 0 * * *"));
+        approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
         daemon.run_now("dispatch-task").unwrap();
         wait_for_claim_dispatch(&daemon, &stub, &work, 7);
         let records = stub.marker_comments("acme/widgets", 7);
@@ -1017,6 +1091,7 @@ fn dispatch_036_worktree_skip_refreshes_owner_once_per_half_ttl() {
                 .count()
         };
         let daemon = claim_daemon(&stub, &claim_task(&work, gating, ttl, "0 0 * * *"));
+        approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
         daemon.run_now("dispatch-task").unwrap();
         wait_for_claim_dispatch(&daemon, &stub, &work, 7);
         assert!(common::wait_until(w(), || completed_fires(&daemon) == 1));
@@ -1123,6 +1198,7 @@ fn dispatch_037_short_ttl_warns_and_disables_gating() {
         &stub,
         &claim_task(&work, Some(true), 100, "0 9 * * MON-FRI"),
     );
+    approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
     daemon.run_now("dispatch-task").unwrap();
     wait_for_claim_dispatch(&daemon, &stub, &work, 7);
     let log =
@@ -1178,6 +1254,7 @@ fn dispatch_038_removed_label_releases_fresh_foreign_claim() {
     .unwrap();
 
     let daemon = claim_daemon(&stub, &claim_task(&work, Some(true), 168, "0 0 * * *"));
+    approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
     daemon.run_now("dispatch-task").unwrap();
     wait_for_claim_dispatch(&daemon, &stub, &work, 7);
     let messages = scheduler_messages(&daemon);
@@ -1263,6 +1340,7 @@ fn dispatch_039_claim_read_failure_dispatches_with_warning() {
                 ("DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS", "2000"),
             ],
         );
+        approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
         daemon.run_now("dispatch-task").unwrap();
         wait_for_claim_dispatch(&daemon, &stub, &work, 7);
         let messages = scheduler_messages(&daemon);
@@ -1349,6 +1427,7 @@ fn dispatch_040_failed_refresh_preserves_clean_worktree_skip() {
                 ("DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS", "2000"),
             ],
         );
+        approve_dispatch_clone(&daemon, &stub, "acme/widgets", &work, "dispatch-task");
         let completed = || {
             scheduler_messages(&daemon)
                 .iter()
@@ -1438,7 +1517,7 @@ fn dispatch_040_failed_refresh_preserves_clean_worktree_skip() {
 // Tests
 // ---------------------------------------------------------------------------
 
-/// Scenario: Fire a two-issue dispatch against an unlabelled repo, a repo whose token cannot provision an existing label, and a missing label whose first provisioning attempt fails transiently.
+/// Scenario: Fire a two-issue dispatch against an unlabelled repo, a repo whose token cannot provision an existing label, and a missing label whose first provisioning attempt fails transiently; the first fire clones the repo and is refused until that clone is approved, then fires again.
 /// Both issue worktrees and agents appear with their prompts, and both issues receive the claimed label.
 /// Provisioning happens once unless the label is missing after a transient failure, when one retry recovers it.
 #[spec("scheduler/dispatch/001")]
@@ -1473,9 +1552,10 @@ fn dispatch_001_clone_worktree_spawn() {
         let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
         let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
 
-        daemon
-            .run_now("dispatch-task")
-            .expect("run-now dispatch-task");
+        // This test is about the scheduler's own clone, so the clone is not
+        // made for it: the first fire clones and is refused (PRD #1885), and the
+        // fire it covers is the one after the clone is approved.
+        fire_refused_then_approve(&daemon, &work, "dispatch-task");
 
         let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
 
@@ -1595,6 +1675,7 @@ fn dispatch_002_idempotent_skip_existing_worktree() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
 
@@ -1676,6 +1757,7 @@ fn dispatch_003_skip_open_pr() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     daemon
         .run_now("dispatch-task")
@@ -1793,6 +1875,7 @@ fn dispatch_004_orchestration_vs_single_agent() {
         ("DOT_AGENT_DECK_WRAP_BIN", wrapper_stub_str.as_str()),
     ];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, orch_repo, &work, "task-orch");
 
     daemon.run_now("task-orch").expect("run-now task-orch");
     daemon.run_now("task-plain").expect("run-now task-plain");
@@ -1888,6 +1971,7 @@ fn dispatch_005_respects_max_per_run() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     daemon
         .run_now("dispatch-task")
@@ -1958,6 +2042,7 @@ fn dispatch_006_close_removes_worktree_preserves_clone() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     daemon
         .run_now("dispatch-task")
@@ -2040,6 +2125,7 @@ fn dispatch_007_one_issue_fails_others_dispatch() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     daemon
         .run_now("dispatch-task")
@@ -2111,6 +2197,7 @@ fn dispatch_008_refire_after_close_redispatches() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     // Learn the exact host field from this daemon's genuine record, so the
     // forgery remains byte-for-byte valid when its digest representation changes.
@@ -2306,6 +2393,7 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     daemon
         .run_now("dispatch-task")
@@ -2392,6 +2480,7 @@ fn dispatch_012_worktree_present_skips_without_pr_check() {
     let ghdir = stub.ghstub_dir();
     let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
     let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "dispatch-task");
 
     let paths = derive_issue_paths(Path::new(&work_str), "dispatch-task", 7);
 
@@ -2504,6 +2593,7 @@ fn dispatch_029_read_only_claim_failure_keeps_agent_running() {
         "0",
         &[("PATH", &path), ("GHSTUB_DIR", &ghdir)],
     );
+    approve_dispatch_clone(&daemon, &stub, repo, work.path(), "dispatch-task");
     daemon
         .run_now("dispatch-task")
         .expect("fire read-only dispatch");
@@ -2578,6 +2668,7 @@ fn dispatch_029_read_only_claim_failure_keeps_agent_running() {
         "0",
         &[("PATH", &path), ("GHSTUB_DIR", &ghdir)],
     );
+    approve_dispatch_clone(&daemon, &stub, repo, work.path(), "dispatch-task");
     daemon
         .run_now("dispatch-task")
         .expect("fire lookup recovery");
@@ -2664,6 +2755,7 @@ fn dispatch_030_spawn_failure_writes_no_claim() {
         "0",
         &[("PATH", &path), ("GHSTUB_DIR", &ghdir)],
     );
+    approve_dispatch_clone(&daemon, &stub, repo, work.path(), "dispatch-task");
     daemon.run_now("dispatch-task").expect("fire failing spawn");
     assert!(
         daemon.wait_for_stderr_contains("issue #7 of acme/widgets failed:", w()),
@@ -2723,6 +2815,7 @@ fn dispatch_031_hanging_claim_does_not_hold_queue() {
             ("DOT_AGENT_DECK_ISSUE_CLAIM_TIMEOUT_MS", "1500"),
         ],
     );
+    approve_dispatch_clone(&daemon, &stub, repo, work.path(), "dispatch-task");
     daemon.run_now("dispatch-task").expect("fire two issues");
     let first = derive_issue_paths(work.path(), "dispatch-task", 7);
     assert!(
@@ -2813,6 +2906,7 @@ fn dispatch_031_hanging_claim_does_not_hold_queue() {
             ("DOT_AGENT_DECK_ISSUE_CLAIM_BUDGET_MS", "3000"),
         ],
     );
+    approve_dispatch_clone(&daemon, &stub, repo, work.path(), "dispatch-task");
     let started = std::time::Instant::now();
     daemon.run_now("dispatch-task").expect("fire budget run");
     // Fixed responsiveness bound: the old call-by-call waits need at least
