@@ -469,6 +469,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
 - When `DAD_REMOTE_EXEC=rwx` is set in your environment
   (docs/develop/rwx.md): the helper already runs its cargo commands in an RWX
   sandbox, and every OTHER cargo command that compiles (a build, a
+  `cargo check` or `cargo clippy` run outside the helper, a
   `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
   filtered to a single test, since a filter narrows what runs, not what compiles) goes
   through `rwx sandbox exec -- <command>`, `cargo mutants` included (do not
