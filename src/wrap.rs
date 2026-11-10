@@ -537,7 +537,10 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// Such a command can also move Codex away from what `codex_spawn_prep`
 /// prepared: `CODEX_HOME=… codex` and `cd … && codex` start, but in a home or
 /// directory the wrapper did not install and trust its hooks for, as
-/// `env CODEX_HOME=… codex` and launcher scripts already did (#1703).
+/// `env CODEX_HOME=… codex` and launcher scripts already did. The wrapper reads
+/// the `-c` script it is handed for that ([`command_may_move_codex`]) and then
+/// claims no prompt reports for the pane (#1703); a launcher script stays
+/// opaque to it.
 pub fn wrap_launch_command(command: &str, agent_type: &AgentType, shell: &str) -> LaunchCommand {
     let spec = crate::agent_registry::spec(agent_type);
     if spec.strategy != Some(crate::agent_registry::IntegrationStrategy::Wrapper) {
@@ -1025,6 +1028,13 @@ struct CodexSpawnPrep {
     /// other identity: the wrapper installs nothing for them and so knows
     /// nothing about their channels, and the deck keeps answering those from
     /// the type as it always has.
+    ///
+    /// Issue #1703: also `true` for a Codex identity whose wrapped command can
+    /// start Codex in a home or directory other than the ones this spawn
+    /// installed and trusted the hooks for ([`command_may_move_codex`]) — a
+    /// `CODEX_HOME` assignment, an `env` that sets, unsets or clears it or
+    /// changes directory, a `cd`. Whatever the trust step recorded, it recorded
+    /// it for a home and directory Codex may not use.
     prompt_reports_unavailable: bool,
 }
 
@@ -1057,6 +1067,7 @@ struct CodexSpawnPrep {
 ///   won't run the hooks and events degrade to stdout classification (fail-closed).
 fn codex_spawn_prep(
     program: &str,
+    args: &[String],
     agent_type: &AgentType,
     pane_id: Option<&str>,
 ) -> CodexSpawnPrep {
@@ -1126,10 +1137,189 @@ fn codex_spawn_prep(
         }
     }
 
+    // Issue #1703: the install and the trust above are for the wrapper's own
+    // home and directory. A command that can move Codex off either one may
+    // start it where none of the deck's hooks will run, so this spawn cannot
+    // claim a prompt report will come, whatever the trust step recorded.
+    let moves_codex = codex_identity && command_may_move_codex(program, args);
+    if moves_codex {
+        tracing::info!(
+            "codex: the launch command can set its own CODEX_HOME or working directory, where \
+             the deck's hooks may not run, so this pane declares that no submitted-prompt \
+             report will come and its status is read from Codex's output"
+        );
+    }
+
     CodexSpawnPrep {
         pinned_home,
-        prompt_reports_unavailable: codex_identity && !prompt_hook_live,
+        prompt_reports_unavailable: codex_identity && (!prompt_hook_live || moves_codex),
     }
+}
+
+/// Shells whose `-c` script [`command_may_move_codex`] reads. A shell missing
+/// here is treated like a launcher script: opaque.
+const SCRIPT_SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "oksh", "ash", "yash", "posh", "fish", "csh",
+    "tcsh", "nu", "elvish", "xonsh",
+];
+
+/// Issue #1703: whether the wrapped command can start Codex with a
+/// `CODEX_HOME` or a working directory other than the wrapper's, which are
+/// what [`codex_spawn_prep`] installs and trusts the deck's hooks for.
+///
+/// It reads what the wrapper is handed and nothing it would have to run:
+///
+/// - `env …`: a `CODEX_HOME=` assignment, `-u CODEX_HOME`, a cleared
+///   environment (`-i`, `-`), a directory change (`-C`, `--chdir`) or a split
+///   string (`-S`), and then the command `env` runs, read the same way;
+/// - `codex …`: its own `-C`/`--cd`;
+/// - a shell from [`SCRIPT_SHELLS`] with a `-c` script — the shape a pane runs
+///   a command such as `CODEX_HOME=… codex` or `cd … && codex` in (issue
+///   #1685): any word of the script that names `CODEX_HOME`, a `cd`, `pushd`,
+///   `popd` or `chdir`, a `-C`/`--cd`/`--chdir` option, or an `env` that moves
+///   Codex as above.
+///
+/// Errs towards `true`, which costs a pane its delivery retry and nothing
+/// else: the script is split on whitespace and shell punctuation, not parsed,
+/// so a quoted `cd` or a `make -C …` before Codex counts. A launcher script
+/// (`./run-codex.sh`, `devbox run codex-big`) is opaque here and reads `false`;
+/// one that sets `CODEX_HOME` or changes directory inside itself is the
+/// residual the user docs name.
+fn command_may_move_codex(program: &str, args: &[String]) -> bool {
+    let name = std::path::Path::new(program)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(program);
+    match name {
+        "env" => env_may_move_codex(args),
+        "codex" => args.iter().any(|arg| is_directory_option(arg)),
+        shell if SCRIPT_SHELLS.contains(&shell) => {
+            shell_script(args).is_some_and(script_may_move_codex)
+        }
+        _ => false,
+    }
+}
+
+/// `-C`/`--cd` (Codex), `-C`/`--chdir` (`env`), with or without an attached
+/// value.
+fn is_directory_option(arg: &str) -> bool {
+    (arg.starts_with("-C") && !arg.starts_with("--"))
+        || arg == "--cd"
+        || arg.starts_with("--cd=")
+        || arg == "--chdir"
+        || arg.starts_with("--chdir=")
+}
+
+/// [`command_may_move_codex`] for `env`'s arguments.
+fn env_may_move_codex(args: &[String]) -> bool {
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let arg = arg.as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == "-" || arg == "--ignore-environment" || arg == "--split-string" {
+            return true;
+        }
+        if arg.starts_with("--split-string=") || is_directory_option(arg) {
+            return true;
+        }
+        if arg == "--unset" {
+            if rest.next().is_some_and(|name| name == "CODEX_HOME") {
+                return true;
+            }
+            continue;
+        }
+        if let Some(name) = arg.strip_prefix("--unset=") {
+            if name == "CODEX_HOME" {
+                return true;
+            }
+            continue;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        if let Some(cluster) = arg.strip_prefix('-') {
+            for (at, flag) in cluster.char_indices() {
+                match flag {
+                    'i' | 'S' => return true,
+                    'u' | 'P' => {
+                        let attached = &cluster[at + 1..];
+                        let value = if attached.is_empty() {
+                            rest.next().map(String::as_str)
+                        } else {
+                            Some(attached)
+                        };
+                        if flag == 'u' && value == Some("CODEX_HOME") {
+                            return true;
+                        }
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        if crate::event::is_env_assignment(arg) {
+            if arg.starts_with("CODEX_HOME=") {
+                return true;
+            }
+            continue;
+        }
+        // The first word that is neither an option nor an assignment is the
+        // command `env` runs.
+        let command: Vec<String> = rest.cloned().collect();
+        return command_may_move_codex(arg, &command);
+    }
+    let command: Vec<String> = rest.cloned().collect();
+    command
+        .split_first()
+        .is_some_and(|(program, args)| command_may_move_codex(program, args))
+}
+
+/// The script of a shell invoked with `-c` (alone or in a cluster such as
+/// `-lc`), or `None` when the shell runs a file or reads standard input.
+fn shell_script(args: &[String]) -> Option<&str> {
+    let mut has_c = false;
+    let mut rest = args.iter();
+    while let Some(arg) = rest.next() {
+        let arg = arg.as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == "-o" || arg == "+o" || arg == "-O" || arg == "+O" {
+            rest.next();
+            continue;
+        }
+        if arg.starts_with("--") {
+            continue;
+        }
+        match arg.strip_prefix('-').or_else(|| arg.strip_prefix('+')) {
+            Some(cluster) if !cluster.is_empty() => has_c |= cluster.contains('c'),
+            _ => return has_c.then_some(arg),
+        }
+    }
+    if has_c {
+        rest.next().map(String::as_str)
+    } else {
+        None
+    }
+}
+
+/// [`command_may_move_codex`] for a shell's `-c` script.
+fn script_may_move_codex(script: &str) -> bool {
+    let words: Vec<String> = script
+        .split(|c: char| c.is_whitespace() || ";&|(){}`".contains(c))
+        .map(|word| word.trim_matches(|c| c == '\'' || c == '"' || c == '\\' || c == '$'))
+        .filter(|word| !word.is_empty())
+        .map(str::to_string)
+        .collect();
+    words.iter().enumerate().any(|(at, word)| {
+        word.contains("CODEX_HOME")
+            || matches!(word.as_str(), "cd" | "pushd" | "popd" | "chdir")
+            || is_directory_option(word)
+            || (word == "env" && env_may_move_codex(&words[at + 1..]))
+    })
 }
 
 /// PRD #20 R20-002: the last catchable termination signal delivered to the
@@ -2620,7 +2810,7 @@ pub fn run_wrap(agent_override: Option<&str>, command: &[String]) -> ExitCode {
     let CodexSpawnPrep {
         pinned_home,
         prompt_reports_unavailable,
-    } = codex_spawn_prep(program, &agent_type, pane_id.as_deref());
+    } = codex_spawn_prep(program, args, &agent_type, pane_id.as_deref());
 
     let agent_type_is_codex = agent_type == AgentType::Codex;
     let emitter = Arc::new(Emitter {
@@ -3773,6 +3963,70 @@ mod tests {
             plain.ends_with(" wrap --agent codex -- devbox run codex-big"),
             "{plain:?}"
         );
+    }
+
+    /// Issue #1703: which wrapped commands can start Codex in a home or
+    /// directory the wrapper did not install and trust its hooks for.
+    #[test]
+    fn command_may_move_codex_reads_assignments_env_and_directory_changes() {
+        let argv = |words: &[&str]| -> (String, Vec<String>) {
+            let (program, args) = words.split_first().expect("a program");
+            (
+                program.to_string(),
+                args.iter().map(|arg| arg.to_string()).collect(),
+            )
+        };
+        for moves in [
+            &["/bin/zsh", "-c", "CODEX_HOME=/elsewhere codex"][..],
+            &["bash", "-lc", "cd project && codex"],
+            &["sh", "-c", "export CODEX_HOME=/elsewhere; codex"],
+            &["sh", "-c", "pushd /x >/dev/null; codex"],
+            &["sh", "-c", "env -C /x codex"],
+            &["sh", "-c", "env -i PATH=/usr/bin codex"],
+            &["sh", "-c", "(cd /x; codex)"],
+            &["fish", "-c", "set -x CODEX_HOME /x; codex"],
+            &["sh", "-c", "codex --cd /x"],
+            &["sh", "-o", "pipefail", "-c", "cd /x && codex"],
+            &["env", "CODEX_HOME=/elsewhere", "codex"],
+            &["/usr/bin/env", "FOO=1", "CODEX_HOME=/x", "codex"],
+            &["env", "-u", "CODEX_HOME", "codex"],
+            &["env", "-uCODEX_HOME", "codex"],
+            &["env", "--unset=CODEX_HOME", "codex"],
+            &["env", "-i", "codex"],
+            &["env", "-", "codex"],
+            &["env", "-C", "/x", "codex"],
+            &["env", "--chdir=/x", "codex"],
+            &["env", "-S", "CODEX_HOME=/x codex"],
+            &["env", "FOO=1", "sh", "-c", "cd /x && codex"],
+            &["env", "-u", "FOO", "sh", "-c", "cd /x && codex"],
+            &["codex", "-C", "/x"],
+            &["/opt/bin/codex", "--cd=/x"],
+        ] {
+            let (program, args) = argv(moves);
+            assert!(command_may_move_codex(&program, &args), "{moves:?}");
+        }
+        for stays in [
+            &["codex"][..],
+            &[
+                "codex",
+                "-c",
+                "shell_environment_policy.set={}",
+                "fix the bug",
+            ],
+            &["/bin/sh", "-c", "codex"],
+            &["bash", "-c", "FOO=1 codex --model x"],
+            &["env", "FOO=1", "codex"],
+            &["env", "-u", "FOO", "codex"],
+            &["env"],
+            // A launcher script or a shell running a file is opaque here.
+            &["./run-codex.sh"],
+            &["devbox", "run", "codex-big"],
+            &["sh", "launcher.sh", "cd"],
+            &["unknown-shell", "-c", "cd /x && codex"],
+        ] {
+            let (program, args) = argv(stays);
+            assert!(!command_may_move_codex(&program, &args), "{stays:?}");
+        }
     }
 
     /// Issue #1685: the classification behind the two launch shapes.
