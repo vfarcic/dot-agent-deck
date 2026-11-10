@@ -378,6 +378,7 @@ The human gates in steps 5 and 6 do not cover this, and it is worth being precis
 - **The finish, which depends on the unit's class** (decided by you, per unit, and recorded in step 5's ledger):
   - **A bug-fix unit** reviews, fixes and merges its own PR: put the procedure in the next subsection into the task.
   - **Any other unit** gets a stop instruction: open the PR, request review from the other maintainer, and **stop**. Per CLAUDE.md rule 8 nobody merges their own unapproved PR, and for the admin that would succeed silently rather than fail.
+  - **Tell a stopped unit what a later go-ahead means**, in these words: *"If the maintainer later tells you to merge, in any words ('merge', 'go ahead'), that is the instruction to run the procedure in `.claude/skills/issue-queue/SKILL.md`, section 'Bug-fix units review, fix and merge their own PR', on this PR: resolve conflicts, answer the bot findings, request the agent review, and merge through `/merge-pr` once it approves. Do not ask them to spell it out."* Measured on 2026-11-09 (issue #2095): twelve of the maintainer's messages to eleven units waiting at their PR were that procedure typed out by hand ("resolve the conflicts, run the approval workflow and, if it's green, merge it"), because the task told the unit only how to stop.
 
 ### Bug-fix units review, fix and merge their own PR
 

@@ -12778,11 +12778,20 @@ const cleanup = await mod.setup(api);
 for (let n = 1; n <= 20; n++) {{
   handlers.get("form.created")?.({{ type: "form.created", data: {{ form: {{ id: "frm_" + n, sessionID: "s1", title: "Q" + n, fields: [{{ key: "ok", type: "boolean" }}] }} }} }});
 }}
-await sleep(1500);
 const count = () => execSync("ps -eo args").toString().split(String.fromCharCode(10)).filter((l) => l.includes("sleep 39")).length;
+// Poll rather than sleep a fixed time: on a loaded box sixteen children can
+// take longer than any fixed wait to start, and unloading before they have
+// started makes them look never spawned (issue #2095's gate run). The extra
+// settle after the sixteenth lets a broken cap show its seventeenth child.
+const until = async (done, ms) => {{
+  const end = Date.now() + ms;
+  while (!done() && Date.now() < end) await sleep(50);
+}};
+await until(() => count() >= 16, 30000);
+await sleep(300);
 const held = count();
 cleanup?.();
-await sleep(500);
+await until(() => count() === 0, 30000);
 console.log(JSON.stringify({{ held, after: count() }}));
 process.exit(0);
 "#,
@@ -12791,7 +12800,17 @@ process.exit(0);
         )
         .unwrap();
         let result = run_inbox_driver(&driver);
-        let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+        // The plain reports are fire-and-forget children that can outlive the
+        // driver, so give a loaded box a bounded moment to log them.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let logged = loop {
+            let logged = std::fs::read_to_string(&calls).unwrap_or_default();
+            let plain = logged.lines().filter(|l| *l == "hook").count();
+            if plain >= 4 || std::time::Instant::now() >= deadline {
+                break logged;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
         let awaits = logged.lines().filter(|l| *l == "await-answer").count();
         let plain = logged.lines().filter(|l| *l == "hook").count();
         assert_eq!(awaits, 16, "{logged}");
