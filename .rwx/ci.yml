@@ -364,6 +364,12 @@ tasks:
   - key: desktop-browser
     if: ${{ tasks.backend.values.rust == 'true' }}
     use: [code, pnpm]
+    # `playwright install --with-deps` apt-installs about 150 packages from the
+    # Ubuntu mirror on every run, and on PR #2267 a slow mirror used up the whole
+    # timeout before a test ran (exit 137 mid-download). The tool cache keeps
+    # those packages and the downloaded browsers, as `desktop-driver`'s does, so a
+    # warm run's install finds them in place.
+    tool-cache: ci-desktop-browser-v1
     timeout: 20m
     run: |
       cd desktop
