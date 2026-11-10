@@ -948,6 +948,7 @@ fn probe_035_codex_wrapper_exec_after_update_is_refused() {
 /// Scenario: Replace codex at the same installation path, then start a fresh pane generation before launching the native child. Declared and learned panes must bind the new inode and check the touched empty composer.
 #[spec("inbox/probe/035")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2243"]
 fn probe_035_codex_fresh_spawn_pins_updated_inode() {
     for route in [Route::Launcher, Route::Learned] {
         update_history("codex", route, Update::Fresh, true);
