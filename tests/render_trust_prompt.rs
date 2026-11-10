@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 
 use dot_agent_deck::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
 use dot_agent_deck::project_trust::{ApprovalStore, ProjectTrustView, TrustCheck, role_texts};
-use dot_agent_deck::trust_prompt::{PromptAction, render_to_buffer};
+use dot_agent_deck::trust_prompt::{
+    CLEAR_FALSE, CLEAR_LABEL, CLEAR_TRUE, PromptAction, START_FALSE, START_LABEL, START_TRUE,
+    render_to_buffer,
+};
 use spec::spec;
 
 const PROJECT: &str = "/work/demo-project";
@@ -66,6 +69,63 @@ fn text(view: &ProjectTrustView, action: PromptAction, scroll: u16, w: u16, h: u
         .join("\n")
 }
 
+/// The rows of `screen` that belong to role `name`: its `Role:` row and every
+/// row after it up to the next role, the removed-roles line or the footer.
+fn role_block(screen: &str, name: &str) -> String {
+    let head = format!("Role: {name}");
+    let mut lines = screen.lines().skip_while(|l| !l.contains(&head));
+    let first = lines
+        .next()
+        .unwrap_or_else(|| panic!("role {name:?} is not listed:\n{screen}"));
+    std::iter::once(first)
+        .chain(lines.take_while(|l| {
+            !l.contains("Role: ") && !l.contains("Removed since") && !l.contains("a approve")
+        }))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The row the prompt shows for a flag: `<label>: <value>`, in the words both
+/// clients share (`src/trust_prompt.rs`).
+fn flag_row(label: &str, value: &str) -> String {
+    format!("{label}: {value}")
+}
+
+/// Assert role `name`'s block in `screen` shows `start` and `clear` as the
+/// given values, and not the opposite ones.
+fn assert_flags(screen: &str, name: &str, start: bool, clear: bool) {
+    let block = role_block(screen, name);
+    let (start_shown, start_other) = if start {
+        (START_TRUE, START_FALSE)
+    } else {
+        (START_FALSE, START_TRUE)
+    };
+    let (clear_shown, clear_other) = if clear {
+        (CLEAR_TRUE, CLEAR_FALSE)
+    } else {
+        (CLEAR_FALSE, CLEAR_TRUE)
+    };
+    for (label, want, other) in [
+        (START_LABEL, start_shown, start_other),
+        (CLEAR_LABEL, clear_shown, clear_other),
+    ] {
+        let want = flag_row(label, want);
+        assert!(
+            block
+                .lines()
+                .any(|l| l.trim_start_matches('│').trim_start().starts_with(&want)),
+            "role {name:?} must show {want:?}.\nRole block:\n{block}\nWhole prompt:\n{screen}"
+        );
+        let other = flag_row(label, other);
+        assert!(
+            !block
+                .lines()
+                .any(|l| l.trim_start_matches('│').trim_start().starts_with(&other)),
+            "role {name:?} must not show {other:?}.\nRole block:\n{block}"
+        );
+    }
+}
+
 /// The approved orchestration the "changed" cases start from: three roles.
 fn approved_team() -> OrchestrationConfig {
     orchestration(vec![
@@ -85,7 +145,7 @@ fn changed_team() -> OrchestrationConfig {
     ])
 }
 
-/// Scenario: Draw the trust prompt for an orchestration that was never approved, as the New Agent form opens it. The popup must be titled `Review project commands`, say `not approved before`, list every role's command, description and prompt with no role marked, and end with the `a approve and start · Esc cancel · ↑↓ scroll` footer and no "more" hint, since everything fits.
+/// Scenario: Draw the trust prompt for an orchestration that was never approved, as the New Agent form opens it. The popup must be titled `Review project commands`, say `not approved before`, list every role's command, description, prompt and `start` / `clear` values with no role marked, and end with the `a approve and start · Esc cancel · ↑↓ scroll` footer and no "more" hint, since everything fits.
 #[spec("config-trust/prompt/003")]
 #[test]
 fn prompt_003_trust_prompt_render_snapshots() {
@@ -116,10 +176,12 @@ fn prompt_003_trust_prompt_render_snapshots() {
             "unexpected {unwanted:?}:\n{never}"
         );
     }
+    assert_flags(&never, "orchestrator", true, false);
+    assert_flags(&never, "coder", false, false);
     insta::assert_snapshot!("prompt_003_never_approved_start", never);
 }
 
-/// Scenario: Approve a three-role orchestration, then change one role's command, add a role and remove another, and draw the prompt the New Agent form shows. It must say `changed since you approved it`, mark the edited role `changed` and the added one `new`, leave the untouched role unmarked, and name the removed role under `Removed since you approved it`.
+/// Scenario: Approve a three-role orchestration, then change one role's command, add a role and remove another, and draw the prompt the New Agent form shows. It must say `changed since you approved it`, mark the edited role `changed` and the added one `new`, leave the untouched role unmarked, name the removed role under `Removed since you approved it`, and show every listed role's `start` and `clear` values.
 #[spec("config-trust/prompt/003")]
 #[test]
 fn prompt_003_changed_orchestration_marks_roles() {
@@ -152,7 +214,59 @@ fn prompt_003_changed_orchestration_marks_roles() {
         !changed.contains("Role: reviewer"),
         "a removed role is not listed as a role:\n{changed}"
     );
+    assert_flags(&changed, "orchestrator", true, false);
+    assert_flags(&changed, "coder", false, false);
+    assert_flags(&changed, "tester", false, false);
     insta::assert_snapshot!("prompt_003_changed_start", changed);
+}
+
+/// Scenario: Approve a three-role orchestration, then change nothing but flags: first the `coder` worker's `clear` from false to true, then the `start` role moved from `orchestrator` to `coder`. Each time the prompt must mark exactly the roles whose flag moved as `changed` and show every role's `start` and `clear` values, so the user can see the flag they are approving.
+#[spec("config-trust/prompt/003")]
+#[test]
+fn prompt_003_flag_only_change_shows_start_and_clear() {
+    // 1. `clear` false -> true on an approved worker, nothing else.
+    let mut cleared = approved_team();
+    cleared.roles[1].clear = true;
+    let screen = text(
+        &view(Some(&approved_team()), &cleared),
+        PromptAction::Start,
+        0,
+        100,
+        50,
+    );
+    assert!(
+        screen.contains("State: changed since you approved it"),
+        "{screen}"
+    );
+    assert!(screen.contains("Role: coder  changed"), "{screen}");
+    for unmarked in ["orchestrator", "reviewer"] {
+        let head = role_block(&screen, unmarked);
+        let head = head.lines().next().unwrap_or_default();
+        assert!(
+            !head.contains("changed") && !head.contains("new"),
+            "role {unmarked:?} did not change and is not marked: {head:?}"
+        );
+    }
+    assert_flags(&screen, "coder", false, true);
+    assert_flags(&screen, "orchestrator", true, false);
+    assert_flags(&screen, "reviewer", false, false);
+
+    // 2. The start role moves from `orchestrator` to `coder`.
+    let mut moved = approved_team();
+    moved.roles[0].start = false;
+    moved.roles[1].start = true;
+    let screen = text(
+        &view(Some(&approved_team()), &moved),
+        PromptAction::Start,
+        0,
+        100,
+        50,
+    );
+    assert!(screen.contains("Role: orchestrator  changed"), "{screen}");
+    assert!(screen.contains("Role: coder  changed"), "{screen}");
+    assert_flags(&screen, "orchestrator", false, false);
+    assert_flags(&screen, "coder", true, false);
+    assert_flags(&screen, "reviewer", false, false);
 }
 
 /// Scenario: Draw the same changed orchestration as session restore asks about it. The footer must offer `a approve and restore` instead of `a approve and start`, with the same role marks.

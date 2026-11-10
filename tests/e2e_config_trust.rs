@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};
+use dot_agent_deck::trust_prompt::{CLEAR_LABEL, CLEAR_TRUE, START_LABEL, START_TRUE};
 use spec::spec;
 
 /// The `config-trust` fixture's one orchestration.
@@ -575,8 +576,9 @@ fn prompt_001_an_unapproved_orchestration_asks_before_anything_starts() {
 
 /// Scenario: Launch on an approved project, then change one character of the
 /// `coder` role's command on disk. Ctrl+n and choosing the orchestration must
-/// show the prompt with `coder` marked `changed`. Pressing Enter must not
-/// approve: the prompt stays and nothing is spawned.
+/// show the prompt with `coder` marked `changed`, and the `start` and `clear`
+/// values the config sets on screen. Pressing Enter must not approve: the
+/// prompt stays and nothing is spawned.
 #[spec("config-trust/prompt/002")]
 #[test]
 fn prompt_002_a_changed_role_is_marked_and_enter_does_not_approve() {
@@ -597,6 +599,17 @@ fn prompt_002_a_changed_role_is_marked_and_enter_does_not_approve() {
         grid.contains(CODER_COMMAND_EDITED),
         "the prompt shows the command as it reads now.\nGrid:\n{grid}"
     );
+    // The fixture sets `start = true` on `orchestrator` and `clear = true` on
+    // `coder`; the prompt shows both flags in the words both clients share.
+    for want in [
+        format!("{START_LABEL}: {START_TRUE}"),
+        format!("{CLEAR_LABEL}: {CLEAR_TRUE}"),
+    ] {
+        assert!(
+            grid.contains(&want),
+            "the prompt must show the role flag {want:?}.\nGrid:\n{grid}"
+        );
+    }
 
     deck.send_keys(b"\r"); // Enter must NOT approve
     assert!(
