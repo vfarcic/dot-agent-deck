@@ -2824,6 +2824,37 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
+   * Scenario (issue #1073, Qodo on PR #2259): show two terminals, let one
+   * attach and hold the other's attach in flight, then stop their deck's
+   * daemon and only then let the held attach resolve. The installed session is
+   * forgotten, and the late attach is detached rather than installed, so no
+   * input reaches the stopped daemon and the next declaration re-attaches.
+   */
+  it("forgets the stopped deck's sessions, an attach still in flight included", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+
+    attach.hold("agent-2");
+    const showing = bridge.setShownTerminals([on("agent-1"), on("agent-2")]);
+    await vi.waitFor(() => expect(attachedAgentIds().sort()).toEqual(["agent-1", "agent-2"]));
+    await settle();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
+
+    await bridge.runAction({ type: "stop_daemon", deckId: on("agent-1").deckId });
+    attach.release();
+    await Promise.allSettled([showing]);
+    await settle();
+
+    expect(detachedAgentIds()).toContain("agent-2");
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on("agent-2"), "x")).rejects.toThrow(/not attached/);
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario (PRD #1487, Qodo 4200693875): show a terminal on the deck, then
    * upgrade its daemon three times. A failure that left the old daemon
    * answering keeps the session usable; a restart that failed verifying after

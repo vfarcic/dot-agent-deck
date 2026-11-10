@@ -235,6 +235,21 @@ describe("stopping a whole daemon from its card (issue #1073)", () => {
     expect(runAction).toHaveBeenCalledTimes(1);
   });
 
+  /** Scenario: A remote daemon accepts the stop but has not gone yet when the app stops waiting; the Dashboard shows the daemon's own "still shutting down" sentence, naming the daemon, until it is dismissed. */
+  it("says what the stop did, naming the daemon", async () => {
+    const still = "The daemon accepted the stop and is still shutting down; its agents are being closed.";
+    const runAction = vi.fn(async () => ({ ok: true, message: still }) as DeckActionResult);
+    render(<AgentOverview runtime={live(runAction)} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(card(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-stop"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+
+    const notice = await screen.findByTestId("overview-daemon-notice");
+    expect(notice).toHaveTextContent(`${FIXTURE_REMOTE_DAEMON_ID}: ${still}`);
+    fireEvent.click(within(notice).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByTestId("overview-daemon-notice")).not.toBeInTheDocument();
+  });
+
   /** Scenario: The local daemon's card offers Stop daemon too, and it stops the local daemon by its own id. */
   it("stops the local daemon from its own card", async () => {
     const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);

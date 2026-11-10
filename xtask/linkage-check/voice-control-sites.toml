@@ -199,6 +199,12 @@ reason = "Dismisses the dashboard's new-agent notice: a dismissal."
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
+code = "() => setDaemonNotice(undefined)"
+reason = "Dismisses the dashboard's Stop daemon result notice (issue #1073): a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
 code = "onUpgrade"
 reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
 

@@ -1869,6 +1869,8 @@ type Unsubscribe = () => void;
 
 interface PendingTerminalAttachment {
   lifecycle: number;
+  /** The deck the attach is for, so a teardown of that deck alone can cancel it (issue #1073). */
+  deckId: string;
   channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>;
   output: Uint8Array[];
   stateEvents: DesktopTerminalStateDto[];
@@ -4487,6 +4489,7 @@ export class TauriDeckBridge implements DeckBridge {
       const onOutput = new Channel<ArrayBuffer>();
       const attempt: PendingTerminalAttachment = {
         lifecycle,
+        deckId: target.deckId,
         channel: onOutput,
         output: [],
         stateEvents: [],
@@ -5730,12 +5733,23 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   /**
-   * Forget every terminal session on `deckId` after its daemon was replaced —
-   * the crate already detached them. Other decks' sessions are untouched, and
-   * `shown` is kept for the reason `stop_daemon` keeps it: re-declaring it
-   * re-attaches against the new daemon.
+   * Forget every terminal session on `deckId` after its daemon was replaced or
+   * stopped — the crate already detached them. Other decks' sessions are
+   * untouched, and `shown` is kept on purpose: re-declaring it re-attaches
+   * against whatever daemon answers next.
+   *
+   * An attach still in flight on that deck is cancelled too (issue #1073,
+   * Qodo on PR #2259): dropping its pending entry and channel is what makes
+   * the post-await guard in the attach detach its late result instead of
+   * installing a session for a daemon that is gone.
    */
   private forgetDeckSessions(deckId: string): void {
+    for (const [key, pending] of Array.from(this.pendingAttachments.entries())) {
+      if (pending.deckId !== deckId) continue;
+      this.pendingAttachments.delete(key);
+      this.attached.delete(key);
+      if (this.terminalChannels.get(key) === pending.channel) this.terminalChannels.delete(key);
+    }
     for (const [key, session] of Array.from(this.sessions.entries())) {
       if (session.target.deckId !== deckId) continue;
       this.sessions.delete(key);

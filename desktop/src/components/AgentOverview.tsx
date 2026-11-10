@@ -1059,6 +1059,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
+  /** Issue #1073 — what the last Stop daemon did, in the crate's own sentence, naming the daemon. */
+  const [daemonNotice, setDaemonNotice] = useState<string>();
   /**
    * Issue #1247 — the form the dialog handed back when it was last closed,
    * replayed by the next open. Here rather than in the dialog because closing
@@ -1569,8 +1571,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       label: "Stop daemon",
       busyLabel: "Stopping…",
       action: async () => {
+        setDaemonNotice(undefined);
         try {
-          await runtime.runAction({ type: "stop_daemon", deckId });
+          // The crate's own sentence: "stopped" only for a daemon it saw go,
+          // and "still shutting down" for one that accepted and had not gone
+          // when it stopped waiting, whose card may still read connected.
+          const result = await runtime.runAction({ type: "stop_daemon", deckId });
+          setDaemonNotice(`${deckName(target)}: ${result.message ?? "Daemon stopped."}`);
         } catch {
           // The runtime files the refusal under its global error.
         }
@@ -1691,6 +1698,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
             <div className="overview-banner" role="status" data-testid="overview-new-agent-notice">
               <span>{newAgentNotice}</span>
               <button type="button" aria-label="Dismiss" onClick={() => setNewAgentNotice(undefined)}><X size={13} /></button>
+            </div>
+          )}
+          {daemonNotice && (
+            <div className="overview-banner" role="status" data-testid="overview-daemon-notice">
+              <span>{displayText(daemonNotice, DISPLAY_LIMITS.message)}</span>
+              <button type="button" aria-label="Dismiss" onClick={() => setDaemonNotice(undefined)}><X size={13} /></button>
             </div>
           )}
           {/*
