@@ -260,6 +260,60 @@ pub struct TokenOwner {
     pub facts: AttestFacts,
 }
 
+/// Issue #2104: the tokens of generations this daemon has taken down, kept
+/// only so the hook loop can tell a refused [`Refusal::UnknownToken`] that is
+/// teardown from one that is not.
+///
+/// Closing or respawning an agent removes its record, and its token with it,
+/// before the child has exited, so the dying agent's own last hook — Claude
+/// Code's `SessionEnd`, mostly — presents a token nobody owns and is refused.
+/// Telemetry put that at nine refusals in ten (issue #2104). The refusal is
+/// right and stays; what this set changes is only how loudly it is logged.
+/// A token in here resolves to nothing in [`HookTokenDirectory`]: membership
+/// grants no admission, and [`classify`] never reads it.
+///
+/// Holds a SHA-256 digest of each token rather than the token, so a retired
+/// capability is not kept in memory for longer than its record was. Bounded
+/// at [`Self::CAPACITY`], oldest first out; a token evicted from it is merely
+/// warned about again, which is the behaviour before this set existed.
+#[derive(Debug, Default)]
+pub(crate) struct RetiredHookTokens {
+    order: std::collections::VecDeque<[u8; 32]>,
+    digests: std::collections::HashSet<[u8; 32]>,
+}
+
+impl RetiredHookTokens {
+    /// How many retired tokens are remembered. A dying agent's last hook
+    /// arrives within a second of its teardown (issue #2104 measured 102 of
+    /// 116 within one), so this only has to outlast the teardowns of one busy
+    /// burst; 32 bytes each, so the bound costs 32 KiB at most.
+    pub(crate) const CAPACITY: usize = 1024;
+
+    fn digest(token: &str) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(token.as_bytes()).into()
+    }
+
+    /// Remember that `token`'s generation was taken down.
+    pub(crate) fn record(&mut self, token: &str) {
+        let digest = Self::digest(token);
+        if !self.digests.insert(digest) {
+            return;
+        }
+        self.order.push_back(digest);
+        while self.order.len() > Self::CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.digests.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whether `token` belongs to a generation this daemon took down.
+    pub(crate) fn contains(&self, token: &str) -> bool {
+        self.digests.contains(&Self::digest(token))
+    }
+}
+
 /// PRD #1666 part 3, round 5 (plan D7): how an orchestration instance came to
 /// be, written by the daemon's spawn path and never taken from the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1127,5 +1181,34 @@ mod tests {
         assert_eq!(normalise(Some("")), None);
         assert_eq!(normalise(Some("   ")), None);
         assert_eq!(normalise(Some(" abc ")), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn retired_hook_tokens_remember_a_retired_token_and_nothing_else() {
+        let mut retired = RetiredHookTokens::default();
+        let gone = mint();
+        let live = mint();
+        assert!(!retired.contains(&gone));
+        retired.record(&gone);
+        assert!(retired.contains(&gone));
+        assert!(!retired.contains(&live));
+        // Recording the same token twice keeps one entry.
+        retired.record(&gone);
+        assert_eq!(retired.order.len(), 1);
+    }
+
+    #[test]
+    fn retired_hook_tokens_are_bounded_oldest_first() {
+        let mut retired = RetiredHookTokens::default();
+        let first = mint();
+        retired.record(&first);
+        let rest: Vec<String> = (0..RetiredHookTokens::CAPACITY).map(|_| mint()).collect();
+        for token in &rest {
+            retired.record(token);
+        }
+        assert_eq!(retired.order.len(), RetiredHookTokens::CAPACITY);
+        assert_eq!(retired.digests.len(), RetiredHookTokens::CAPACITY);
+        assert!(!retired.contains(&first), "the oldest entry is evicted");
+        assert!(rest.iter().all(|t| retired.contains(t)));
     }
 }
