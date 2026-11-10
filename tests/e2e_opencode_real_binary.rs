@@ -205,7 +205,10 @@ fn procs(home: &Path) -> Vec<Proc> {
 
 /// Whether `pid` is `ancestor` or descends from it among `all`.
 fn descends(all: &[Proc], mut pid: u32, ancestor: u32) -> bool {
-    for _ in 0..64 {
+    // A walk up the parent links, which stops at a pid it has seen (a cycle,
+    // possible in a snapshot taken while pids are reused) or one outside `all`.
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(pid) {
         if pid == ancestor {
             return true;
         }
