@@ -271,7 +271,7 @@ fn existing_plugin_artifacts() -> Vec<PathBuf> {
 /// file at its pin, so it writes its own template. Only a daemon built with
 /// this check keeps from downgrading: one built before it writes its own
 /// template as it always did.
-const PLUGIN_TEMPLATE_REVISION: u32 = 2;
+const PLUGIN_TEMPLATE_REVISION: u32 = 3;
 
 /// Render the plugin JavaScript with `BINARY_PATH` pinned to `binary_path`.
 ///
@@ -2802,9 +2802,14 @@ const SERVER_INBOX_JS: &str = r#"// OpenCode's subcommands (1.18.35 `--help`): a
 const INBOX_SUBCOMMANDS = new Set(["completion", "acp", "mcp", "attach", "run", "debug",
   "providers", "auth", "agent", "upgrade", "uninstall", "serve", "web", "models", "stats",
   "export", "import", "github", "pr", "session", "plugin", "plug", "db"]);
+// Issue #1730: the command word is the deck the line's author runs from, an
+// absolute path since then and a bare `dot-agent-deck` before, so any one
+// shell word is taken.
 const INBOX_DOORBELL = new RegExp(
   __DOORBELL_PREFIX_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + " " + INBOX_ID +
-    __DOORBELL_SUFFIX_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+    __DOORBELL_WAITING_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
+    __DOORBELL_COMMAND_WORD_JSON__ +
+    __DOORBELL_FETCH_JSON__.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
 const INBOX_HANDLED =
   "[dot-agent-deck: the message this line announced was already handed over. Nothing is waiting.]";
 const INBOX_RECEIVER = "__dotAgentDeckReceiver";
@@ -10933,8 +10938,8 @@ await wait(1500);
     fn the_template_revision_is_bumped_with_the_template() {
         use sha2::Digest;
         const RECORDED: (u32, &str) = (
-            2,
-            "4539aee833d48aed338e7d42d4c9dc24210cb54bf27782a5ea2a64da241d4a38",
+            3,
+            "1c6fdda00d6759bf5a35f09c5d6961ebd4602553562d1cca8698df747f401408",
         );
         let digest = sha2::Sha256::digest(plugin_template("/opt/dot-agent-deck").as_bytes());
         let digest: String = digest.iter().map(|b| format!("{b:02x}")).collect();

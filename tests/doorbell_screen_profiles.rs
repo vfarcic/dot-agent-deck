@@ -1757,6 +1757,13 @@ fn replay_transaction(
         settling: false,
         submit_route: true,
         still_admitted: true,
+        // The command word the recorded agent was shown: the measurements
+        // predate issue #1730, so their line names a bare `dot-agent-deck`.
+        command: line
+            .split_once(dot_agent_deck::doorbell::LINE_WAITING)
+            .and_then(|(_, rest)| rest.strip_suffix(dot_agent_deck::doorbell::LINE_FETCH))
+            .expect("the recorded line names a command word")
+            .to_string(),
     };
     let cell = LatchCell::default();
     let counter = AttemptCounter::default();

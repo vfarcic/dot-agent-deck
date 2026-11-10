@@ -195,6 +195,31 @@ def at(row, col):
     return ('\x1b[%d;%dH' % (row + 1, col + 1)).encode()
 
 
+def wrapped(composer, width):
+    """The composer's text as the rows the agent draws it in: one row while it
+    fits, else wrapped at word boundaries into rows of `width`, as the real
+    agent wraps a long line (a word wider than a row is split). Joined at
+    single spaces, the rows give the text back; text holding a control
+    character is drawn as it is, on one row."""
+    text = composer.decode('utf-8', 'replace')
+    if len(text) <= width or any(ord(c) < 32 for c in text):
+        return [text]
+    rows, row = [], None
+    for word in text.split(' '):
+        if row is None:
+            row = word
+        elif len(row) + 1 + len(word) <= width:
+            row += ' ' + word
+        else:
+            rows.append(row)
+            row = word
+        while len(row) > width:
+            rows.append(row[:width])
+            row = row[width:]
+    rows.append(row)
+    return rows
+
+
 def redraw():
     cols, rows = os.get_terminal_size(0)
     out = bytearray(MARKER)
@@ -243,15 +268,23 @@ def redraw():
         return
     prompt_row = row
     out += at(prompt_row, 0) + b'\x1b[1m\xe2\x80\xba\x1b[0m '
-    if composer:
+    lines = wrapped(composer, cols - 2)
+    if len(lines) > 1:
+        # Issue #1730: a line longer than the row (the doorbell line naming
+        # the deck's absolute path) continues at the composer's indent.
+        out += lines[0].encode()
+        for i, line in enumerate(lines[1:], 1):
+            out += at(prompt_row + i, 0) + b'  ' + line.encode()
+    elif composer:
         out += bytes(composer)
     else:
         out += b'\x1b[2mAsk Codex to do anything\x1b[0m'
-    out += at(prompt_row + 2, 2) + b'gpt-test low \xc2\xb7 ~/work'
+    below = len(lines) - 1
+    out += at(prompt_row + below + 2, 2) + b'gpt-test low \xc2\xb7 ~/work'
     if not composer:
         out += at(prompt_row + 3, 2) + b'? for shortcuts'
-    shown = len(composer.decode('utf-8', 'replace'))
-    out += at(prompt_row, 2 + shown)
+    shown = len(lines[-1])
+    out += at(prompt_row + below, 2 + shown)
     out += b'\x1b[?2026l'
     os.write(1, bytes(out))
 

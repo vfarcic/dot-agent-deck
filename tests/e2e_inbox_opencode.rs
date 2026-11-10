@@ -1259,7 +1259,7 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
     );
     let text = event["output"]["parts"][0]["text"].as_str().unwrap();
     assert!(text.contains("[dot-agent-deck message") && text.contains(BODY));
-    assert!(!text.contains("waiting, run: dot-agent-deck inbox fetch"));
+    assert!(!text.contains(dot_agent_deck::doorbell::LINE_WAITING.trim_end()));
     state(&op.daemon, &op.pane, &id, "fetched");
     op.assistant("unrelated-human-message");
     assert!(
@@ -1292,7 +1292,7 @@ fn opencode_011_doorbell_intercepts_and_acks_matching_assistant_only() {
     assert!(
         !history["output"]["parts"]
             .to_string()
-            .contains("waiting, run: dot-agent-deck inbox fetch"),
+            .contains(dot_agent_deck::doorbell::LINE_WAITING.trim_end()),
         "a recalled handled doorbell must not ask the model to fetch a newer task"
     );
 

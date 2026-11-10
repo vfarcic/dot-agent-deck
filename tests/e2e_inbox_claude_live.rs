@@ -319,7 +319,7 @@ impl Claude {
             );
             assert!(
                 !inbox::screen(&self.deck, &self.pane)
-                    .contains("waiting, run: dot-agent-deck inbox fetch")
+                    .contains(dot_agent_deck::doorbell::LINE_WAITING.trim_end())
             );
         }
     }

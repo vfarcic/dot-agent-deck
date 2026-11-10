@@ -312,7 +312,12 @@ fn pi_020_live_unarmed_doorbell_waits_for_registration_and_transforms_in_place()
         "submit during receiver-visible registration delay; {}",
         pi.evidence()
     );
-    pi.prompt(&dot_agent_deck::doorbell::doorbell_line(&id));
+    pi.prompt(&dot_agent_deck::doorbell::doorbell_line_naming(
+        &id,
+        common::contained_deck_binary()
+            .to_str()
+            .expect("the harness deck path is UTF-8"),
+    ));
     pi.done(&id, name);
     pi.wait_report("committed", &id);
     pi.assert_receipt_order(&id);
