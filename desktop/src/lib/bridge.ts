@@ -2944,6 +2944,17 @@ export function pendingDeckSnapshot(deck: ObservedDeckDto, clientProtocolVersion
   return snapshot;
 }
 
+/**
+ * Issue #1757: whether an agent's work is under way. A Waiting agent is waiting
+ * on a command it started this turn and will resume when it finishes, so to the
+ * user it is busy, exactly as a Running one is. The workflow node's `active`
+ * stage, the snapshot's `currentNode` and the toolbar's "active" count all read
+ * this one predicate, so they cannot disagree about which agent is current.
+ */
+export function isWorkUnderWay(status: AgentStatus): boolean {
+  return status === "running" || status === "waiting";
+}
+
 export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnapshot, evidence?: EvidenceItem[], handoffs?: HandoffEdge[]): DeckSnapshot {
   /*
     PRD #742 M5. This was `dto.connection.socketPath` — `Endpoint::describe()`,
@@ -2972,7 +2983,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // its tile, rather than falling through to `queued` — it is alive, it is
     // not waiting its turn, and a person has to act on it.
     // Issue #1757: a Waiting agent's work is still under way, so its node is active.
-    status: agent.status === "running" || agent.status === "waiting" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
+    status: isWorkUnderWay(agent.status) ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
     // No attempt: it was read straight off the hardcoded per-agent one, so
     // every live node claimed a retry count no daemon tracks (PRD #745 M8).
     enabled: true,
@@ -3026,7 +3037,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     health: dto.connection.status === "incompatible" ? "failed" : dto.connection.status === "disconnected" ? "idle" : agents.some((agent) => agent.status === "failed") ? "failed" : agents.some((agent) => agent.status === "blocked") ? "attention" : "healthy",
     elapsed: previous?.elapsed ?? "—",
     spend: previous?.spend ?? 0,
-    currentNode: Math.max(1, agents.findIndex((agent) => agent.status === "running") + 1),
+    currentNode: Math.max(1, agents.findIndex((agent) => isWorkUnderWay(agent.status)) + 1),
     totalNodes: agents.length,
     // No currentAttempt, for the same reason as the per-agent one.
     paused: false,

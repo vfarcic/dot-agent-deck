@@ -507,6 +507,56 @@ describe("TauriDeckBridge", () => {
     expect(mapDesktopSnapshot(disconnected, first).hostMetrics).toBeUndefined();
   });
 
+  /**
+   * Issue #1757 (Qodo on PR #2250): a Waiting agent's node is `active`, so the
+   * snapshot's `currentNode` has to point at it too. It used to search for
+   * `running` alone, so a fleet whose only work under way was Waiting reported
+   * node 1 while node 2 was the active one.
+   */
+  /** Scenario (issue #1757): a fleet whose only agent with work under way is Waiting reports that agent's node as current, and the active stage and the current node agree. */
+  it("points currentNode at a Waiting agent when it is the only one with work under way", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const fleet = structuredClone(snapshot);
+    const base = fleet.agents[0];
+    fleet.agents = [
+      { ...base, id: "agent-1", paneId: "pane-1", status: "idle" },
+      { ...base, id: "agent-2", paneId: "pane-2", status: "waiting" },
+      { ...base, id: "agent-3", paneId: "pane-3", status: "idle" },
+    ];
+    const mapped = mapDesktopSnapshot(fleet);
+    expect(mapped.stages.map((stage) => stage.status)).toEqual(["queued", "active", "queued"]);
+    expect(mapped.currentNode).toBe(2);
+    expect(mapped.stages[mapped.currentNode - 1].status).toBe("active");
+  });
+
+  /** Scenario (issue #1757): the control — a Running agent is still the current node, and an earlier active agent wins over a later Waiting one. */
+  it("still points currentNode at a Running agent, and at the first agent with work under way", async () => {
+    const { mapDesktopSnapshot } = await import("./bridge");
+    const fleet = structuredClone(snapshot);
+    const base = fleet.agents[0];
+    fleet.agents = [
+      { ...base, id: "agent-1", paneId: "pane-1", status: "idle" },
+      { ...base, id: "agent-2", paneId: "pane-2", status: "idle" },
+      { ...base, id: "agent-3", paneId: "pane-3", status: "working" },
+    ];
+    expect(mapDesktopSnapshot(fleet).currentNode).toBe(3);
+    fleet.agents[2] = { ...fleet.agents[2], status: "waiting" };
+    fleet.agents[1] = { ...fleet.agents[1], status: "working" };
+    const mixed = mapDesktopSnapshot(fleet);
+    expect(mixed.stages.map((stage) => stage.status)).toEqual(["queued", "active", "active"]);
+    expect(mixed.currentNode).toBe(2);
+    // Nothing under way at all keeps the floor of node 1.
+    fleet.agents = fleet.agents.map((agent) => ({ ...agent, status: "idle" }));
+    expect(mapDesktopSnapshot(fleet).currentNode).toBe(1);
+  });
+
+  /** Scenario (issue #1757): only Running and Waiting count as work under way; every other status, Needs input included, does not. */
+  it("treats only Running and Waiting as work under way", async () => {
+    const { isWorkUnderWay } = await import("./bridge");
+    const statuses = ["queued", "running", "needs_input", "waiting", "idle", "passed", "failed", "stopped", "blocked"] as const;
+    expect(statuses.filter((status) => isWorkUnderWay(status))).toEqual(["running", "waiting"]);
+  });
+
   it("falls back through daemon-sourced cwds only, and says so when there are none", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
     const empty = structuredClone(snapshot);
