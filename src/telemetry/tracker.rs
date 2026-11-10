@@ -4636,22 +4636,23 @@ pub(crate) mod tests {
         let mut tracker = RunTracker::new();
         tracker.begin_run(start("p1"), 0);
         tracker.observe_event(&event("p1", EventType::SessionStart), 1);
-        let count = MAX_PR_NUMBERS_PER_RUN as u64 + 1;
+        assert_eq!(
+            MAX_PR_NUMBERS_PER_RUN, 32,
+            "docs/telemetry.md and the changelog promise 32"
+        );
+        let count = 33;
         for n in 1..=count {
             tracker.observe_event(&pr_report("p1", Some(n), Some(n)), 10 + n);
         }
         tracker.end_run("p1", EndReason::Exited, None, 100);
         let spans = tracker.take_finished();
         let run = run_span_of(&spans);
-        let kept: Vec<u64> = (1..count).collect();
+        let kept: String = (1..=32).map(|n| format!("{n},")).collect();
         assert_eq!(
             attr(run, AttrKey::PrNumbers),
-            Some(&AttrValue::Str(pr_numbers_value(&kept)))
+            Some(&AttrValue::Str(format!(",{kept}")))
         );
-        assert_eq!(
-            attr(run, AttrKey::PrNumber),
-            Some(&AttrValue::Int(i64::try_from(count).unwrap()))
-        );
+        assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(33)));
     }
 
     fn agent_identity_of(attributes: &[Attribute]) -> Vec<Attribute> {
