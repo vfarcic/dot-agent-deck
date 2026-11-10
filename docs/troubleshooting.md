@@ -783,6 +783,41 @@ If card and pane borders are broken or shifted, a card's bottom-right corner is 
 
 The borders should line up again. If they are still off, quit the TUI, choosing **Detach** so your agents keep running, and start it again. The desktop app is not affected by this setting.
 
+## Copy and paste
+
+*Applies to the TUI.* The desktop app copies a selection straight to your computer's clipboard, so this section does not apply to it.
+
+### What the status line says after a copy
+
+When you copy text from a pane, by dragging across it or with [copy mode](keyboard-shortcuts.md#copy-mode), the status line says where it went:
+
+- **`Copied to clipboard`**: the text is on the clipboard of the machine the TUI runs on. The TUI asks your terminal as well, so when that machine is not the one in front of you, the text reaches your own clipboard only if your terminal accepts the request (next entry).
+- **`Sent to terminal clipboard (OSC 52); if paste is empty, see Troubleshooting`**: the deck could not reach a clipboard on the machine it runs on, which is normal over ssh and on a machine with no desktop session, so it asked your terminal to put the text on the clipboard instead, using the OSC 52 escape sequence. Whether the text arrives depends on your terminal; the next entry says how to check.
+- **`Not copied: no clipboard was reachable`**: neither way worked, and nothing was copied.
+
+### Paste is empty after "Sent to terminal clipboard (OSC 52)"
+
+Your terminal, or something between it and the deck, ignored the request:
+
+- **iTerm2** honours it once you allow it: Settings → General → Selection, turn on **Applications in terminal may access clipboard**.
+- **tmux** passes it on to your terminal only with `set -g set-clipboard on` in `~/.tmux.conf` (then run `tmux source-file ~/.tmux.conf`). Your terminal outside tmux still has to accept it.
+- **kitty, WezTerm, Ghostty, Alacritty and Windows Terminal** accept it without a setting in their default configuration.
+- **macOS Terminal.app and GNOME Terminal** (and other terminals built on the same VTE library, such as Tilix and Terminator) did not support it when this page was written, and older Konsole releases ignore it too. In these, use the terminal's own selection (below), run the TUI on the machine you are sitting at, or use the desktop app, which copies to your computer's clipboard wherever its agents run.
+
+To check, copy something and paste it into another application. If it still does not arrive, try once outside tmux or screen, to see which layer drops it.
+
+### Paste does nothing on macOS
+
+On macOS, paste is `Cmd+V`. `Ctrl+V` is a different key there and does not paste the clipboard.
+
+### Copied text disappears when the TUI exits (Linux)
+
+On Linux with X11 or Wayland, the program that copied the text keeps it until something else takes it over. If no clipboard manager is running, text you copied in the TUI can be gone once you quit it. Paste it before you quit, or run a clipboard manager, such as KDE Plasma's Klipper, `cliphist` or `clipman` on Wayland, or `parcellite` on X11.
+
+### The terminal's own selection copies text from two panes at once
+
+Many terminals let you select with the terminal itself while the TUI is running, usually by holding `Shift` while you drag (`Option` in iTerm2). That selection is the terminal's, not the deck's, so it runs across the whole width of the window, borders and neighbouring panes included. It copies with your terminal's own copy key and works when OSC 52 does not, so it is the fallback for a terminal that ignores OSC 52. To copy text from one pane only, drag without the modifier key, or use [copy mode](keyboard-shortcuts.md#copy-mode) (`v` in command mode) when the mouse does not reach the deck.
+
 ## Configuration and schedules
 
 ### A setting or environment variable has no effect

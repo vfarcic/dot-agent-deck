@@ -21040,14 +21040,18 @@ fn render_help_overlay(
             // says which way each one goes.
             "Scroll focused pane",
         ),
+        // PRD #385 M5/M7: from the binding table, so a remapped key shows.
+        help_key_line(&n(KbAction::CopyMode), "Copy mode (select & copy)"),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
     let right: Vec<Line> = vec![
-        // These two lines describe every pane.
+        // These lines describe every pane.
         Line::styled("  Mouse", cyan),
         Line::from(""),
         Line::from("  Mouse click     Focus pane"),
+        // PRD #385: in the pane under the pointer, copied on release.
+        Line::from("  Drag            Select & copy"),
         Line::from("  Ctrl+click      Open hyperlink"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),

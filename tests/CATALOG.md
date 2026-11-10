@@ -7692,7 +7692,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/help/001 — The `?` help overlay documents the canonical post-button-bar shortcut set.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively.
+- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively; its Mouse column has a `Drag` row reading `Select & copy` and a `Mouse click` row reading `Focus pane` (PRD #385 M7); the copy-mode row shows `v` by default and `x` once `[dashboard] copy_mode = "x"` is bound.
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
 
