@@ -68,7 +68,7 @@ on:
   workflow_dispatch:
     inputs:
       build_macos:
-        description: Run build-macos (the only macOS job). false skips it.
+        description: Run build-macos and the two jobs it aggregates (the only macOS jobs). false skips them.
         type: boolean
         default: true
       linux_jobs:
@@ -340,7 +340,7 @@ jobs:
       # every bundle would ship to users with nothing saying so.
       - run: "! grep -rl __dadDriver dist/"
       # Issue #1981 M10: the JUnit report, kept on green runs as well as red
-      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      # ones. Attempt-named for the reason spelled out on `build-macos-tests`.
       - name: Preserve this attempt's vitest results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -637,7 +637,7 @@ jobs:
       # green tick and deletes the evidence — so the trace and the HTML report
       # are the whole record of a failure. Both are written only on failure
       # (`trace: retain-on-failure`), and the attempt is in the artifact name for
-      # the reason spelled out on `build-macos`: a job-level re-run overwrites
+      # the reason spelled out on `build-macos-tests`: a job-level re-run overwrites
       # the conclusion in place, and upload-artifact v4+ refuses to overwrite an
       # existing name.
       - name: Preserve this attempt's browser report
@@ -655,7 +655,7 @@ jobs:
           # nobody opens a failure trace from a PR that closed two months ago.
           retention-days: 7
       # Issue #1981 M10: the JUnit report, kept on green runs as well as red
-      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      # ones. Attempt-named for the reason spelled out on `build-macos-tests`.
       - name: Preserve this attempt's browser test results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -813,7 +813,7 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1920x1080x24 -dpi 96" pnpm test:driver
       # The harness writes a failing scenario's screenshot, page text,
       # terminal text and every sandbox log under `desktop/driver-results/`.
-      # Attempt-named for the reason spelled out on `build-macos`.
+      # Attempt-named for the reason spelled out on `build-macos-tests`.
       - name: Preserve this attempt's driver results
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -825,7 +825,7 @@ jobs:
           # tidiness rather than a leak.
           retention-days: 7
       # Issue #1981 M10: the JUnit report, kept on green runs as well as red
-      # ones. Attempt-named for the reason spelled out on `build-macos`.
+      # ones. Attempt-named for the reason spelled out on `build-macos-tests`.
       - name: Preserve this attempt's driver test results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
@@ -1071,7 +1071,7 @@ jobs:
       - run: cargo test --locked --manifest-path vendor/crossterm/Cargo.toml --lib event::source::unix::mio::tests
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
-      # `build-macos` below — the masking is a property of re-running any job,
+      # `build-macos-tests` below — the masking is a property of re-running any job,
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
@@ -1413,7 +1413,7 @@ jobs:
             --extract-to . --extract-overwrite --retries 1
       # Issue #564: keep THIS attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
-      # `build-macos`. It matters more here than anywhere else in this file:
+      # `build-macos-tests`. It matters more here than anywhere else in this file:
       # the e2e tier is the flakiest signal in the repository, a re-run is the
       # only remedy on offer (`retries = 0`), and the JUnit XML carries the
       # per-test wall clock that is the only way to tell a timing blip from a
@@ -1790,7 +1790,7 @@ jobs:
       - run: cargo nextest run --workspace
       # Issue #564: keep this attempt's results after a job-level re-run
       # overwrites the conclusion. Full rationale on the identical step in
-      # `build-macos` below — the masking is a property of re-running any job,
+      # `build-macos-tests` below — the masking is a property of re-running any job,
       # not of macOS, so all three test jobs carry it.
       - name: Preserve this attempt's test results
         if: always()
@@ -1805,38 +1805,52 @@ jobs:
   # workflow (release.yml builds both apple targets), so a macOS-only break —
   # e.g. the libc *mut/*const `openpty` and `ioctl` request-type differences in
   # src/wrap.rs — stayed invisible on PRs and first surfaced at release time
-  # (broke the v0.34.0 build). This job closes that gap. The runner is Apple
+  # (broke the v0.34.0 build). These jobs close that gap. The runner is Apple
   # Silicon, so this covers aarch64-apple-darwin exactly; x86_64-apple-darwin
   # shares the same libc apple bindings, so a host build catches the same class.
   #
   # Unlike build-windows (where the unix daemon/attach/e2e suites are gated to
   # Unix at the source level and compile to empty crates), macOS *is* unix, so
   # `cargo nextest run` runs the same test-fast tier as the Linux `build` job.
-  build-macos:
+  #
+  # NOT on pull requests: macOS runs on pushes to `main` (and on a dispatch or
+  # a merge-queue run). It ran the same fast tier as the Linux `test` job and
+  # was the slowest required check of a PR (5-18 minutes). Measured over 545
+  # runs (2026-10-06..21) it failed where Linux passed 3% of the time, so a
+  # macOS-only defect now surfaces on `main` instead: `notify-main-red` opens
+  # an issue, the merging skill's post-merge watch (`merge-pr`) owns the fix,
+  # and `tag-release.yml` refuses to release a `main` these jobs left red.
+  # A manual run can skip them with `build_macos=false` (issue #2090,
+  # docs/develop/ci-on-demand.md); the input defaults to true.
+  #
+  # Issue #2098: three jobs, not one. `build-macos` was the critical path of
+  # `main`'s CI (p50 20.9, p90 24.0 min over the 59 push runs to 2026-11-10).
+  # Its step timings on a typical run (42742768384): `cargo build` 1m41,
+  # clippy 39s, then the nextest step, which is 7m19 compiling the test
+  # profile and 10m04 running 9014 tests on the runner's three cores (the
+  # tests' summed time divided by three, so the run is slot-bound). The
+  # dependencies come from the cache; what compiles is the workspace itself.
+  # So the run is what splitting shortens: `build-macos-tests` runs the tier
+  # in two nextest partitions on two runners, each compiling the test profile
+  # and running half, and `build-macos-clippy` takes `cargo build` and clippy
+  # off that path. Two partitions and not more because a Free account runs
+  # at most five macOS jobs at once across every workflow (release.yml uses
+  # macOS too) and `main` pushes arrive in bursts, so a third partition would
+  # trade compile time for queue time. `build-macos` itself is now the
+  # aggregate, so the required context, `notify-main-red` and the merge
+  # skills keep reading one name.
+  #
+  # The `if:` below is repeated on all three jobs: the aggregate adds
+  # `always()` so a failed partition still reports, and without the rest of
+  # it the aggregate would run (and pass) on the pull requests the other two
+  # skip.
+  build-macos-clippy:
     needs: changes
-    # NOT on pull requests: macOS runs on pushes to `main` (and on a dispatch or
-    # a merge-queue run). It ran the same fast tier as the Linux `test` job and
-    # was the slowest required check of a PR (5-18 minutes). Measured over 545
-    # runs (2026-10-06..21) it failed where Linux passed 3% of the time, so a
-    # macOS-only defect now surfaces on `main` instead: `notify-main-red` opens
-    # an issue, the merging skill's post-merge watch (`merge-pr`) owns the fix,
-    # and `tag-release.yml` refuses to release a `main` this job left red.
-    # A manual run can skip it with `build_macos=false` (issue #2090,
-    # docs/develop/ci-on-demand.md); the input defaults to true.
     if: github.event_name != 'pull_request' && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && (github.event_name != 'workflow_dispatch' || inputs.build_macos)
     runs-on: macos-latest
-    # Line tables keep file:line in panics and backtraces and drop the rest of
-    # the debug info, which is most of a test build's link time — the same
-    # setting the Linux `test` and `e2e-build` jobs use. JOB-wide rather than on
-    # the nextest step: `cargo build`, clippy and nextest below share one
-    # profile, and setting it on the nextest step alone would make nextest
-    # rebuild what `cargo build` had just compiled. Measured on 2026-10-18 over
-    # three warm runs against the eleven before: the job's median went from
-    # ~17.0 to ~14.1 minutes (nextest step ~850s -> ~718s). macOS runners vary
-    # by several minutes run to run, so read that as ~2-3 minutes, not exact.
+    # See `build-macos-tests` for this env.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      # Issue #326: see the `changes` job's `version` step.
       DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -1849,21 +1863,107 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
-        with:
-          tool: cargo-nextest@0.9.146
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail macOS-only and be unreproducible on the Linux
       # pre-push gate.
       - run: cargo clippy -- -D warnings
+
+  build-macos-tests:
+    needs: changes
+    if: github.event_name != 'pull_request' && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && (github.event_name != 'workflow_dispatch' || inputs.build_macos)
+    runs-on: macos-latest
+    strategy:
+      # A red partition must not cancel the other: its results are the
+      # evidence the attempt-named artifact below keeps.
+      fail-fast: false
+      matrix:
+        partition: [1, 2]
+    # Line tables keep file:line in panics and backtraces and drop the rest of
+    # the debug info, which is most of a test build's link time — the same
+    # setting the Linux `test` and `e2e-build` jobs use. JOB-wide rather than on
+    # the nextest step, so every cargo invocation in the job shares one
+    # profile. Measured on 2026-10-18 over three warm runs against the eleven
+    # before: the job's median went from ~17.0 to ~14.1 minutes (nextest step
+    # ~850s -> ~718s). macOS runners vary by several minutes run to run (the
+    # same 9010 tests have run in 293s and in 604s on the same image), so read
+    # that as ~2-3 minutes, not exact.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      # Issue #326: see the `changes` job's `version` step.
+      DAD_VERSION: ${{ needs.changes.outputs.dad_version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
+        with:
+          toolchain: 1.99.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
+      # Issue #2089: two of the three `build-macos` re-runs on `main` on
+      # 2026-11-09 were this download answering HTTP 504 for the whole of
+      # install-action's own curl retries (about a minute), not a test. So a
+      # failed download is tried once more after a pause, and only a second
+      # failure fails the job.
+      - id: nextest
+        continue-on-error: true
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-nextest@0.9.146
+      - if: steps.nextest.outcome == 'failure'
+        run: sleep 60
+      - if: steps.nextest.outcome == 'failure'
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        with:
+          tool: cargo-nextest@0.9.146
       # `--workspace` (issue #489), for the reason spelled out on the
       # build-windows step: the `test-fast` alias carries the flag on every
       # platform, so this job must run the xtask tests to keep "green locally"
-      # and "green in CI" the same claim on macOS. Unlike the clippy step above
-      # there is nothing to match-and-narrow here — the clippy divergence is
-      # about `--all-targets --features e2e`, not about package selection.
-      - run: cargo nextest run --workspace
+      # and "green in CI" the same claim on macOS. Unlike the clippy step in
+      # `build-macos-clippy` there is nothing to match-and-narrow here — the
+      # clippy divergence is about `--all-targets --features e2e`, not about
+      # package selection.
+      #
+      # `count:` deals each test binary's tests out to the partitions in turn,
+      # so both halves get a share of every slow binary; each partition still
+      # builds every test binary, which is why the compile is not halved.
+      # TEMPORARY probe (issue #2089 item 3), removed before the PR.
+      - name: Probe first-launch cost
+        env:
+          PARTITION: ${{ matrix.partition }}
+        run: |
+          set +e
+          sw_vers; sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          csrutil status
+          spctl --status
+          spctl developer-mode 2>&1 | head -5
+          if [ "$PARTITION" = 2 ]; then
+            sudo spctl developer-mode enable-terminal; echo "enable-terminal rc=$?"
+            sudo spctl --master-disable; echo "master-disable rc=$?"
+            spctl --status
+          fi
+          cat > "$RUNNER_TEMP/probe.sh" <<'EOS'
+          ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
+          i=0
+          while :; do
+            i=$((i+1)); d=$(mktemp -d); f="$d/s$i"
+            printf '#!/bin/sh\nexit 3\n' > "$f"; chmod +x "$f"
+            a=$(ms); "$f"; b=$(ms); "$f"; c=$(ms)
+            echo "$(date +%T) first=$((b-a))ms second=$((c-b))ms load=$(sysctl -n vm.loadavg)"
+            rm -rf "$d"; sleep 10
+          done
+          EOS
+          nohup bash "$RUNNER_TEMP/probe.sh" > "$RUNNER_TEMP/probe.log" 2>&1 &
+          sleep 25; cat "$RUNNER_TEMP/probe.log"
+      - run: cargo nextest run --workspace --partition count:${{ matrix.partition }}/2
+      - name: Probe log
+        if: always()
+        run: |
+          cat "$RUNNER_TEMP/probe.log"
+          awk '{sub("first=","",$2); sub("ms","",$2); print $2}' "$RUNNER_TEMP/probe.log" | sort -n | awk '{a[NR]=$1} END {print "first-launch n="NR" p50="a[int(NR/2)+1]"ms p90="a[int(NR*0.9)+1]"ms max="a[NR]"ms"}'
+          ps -Ao pcpu,comm -r | head -6
       # Issue #564: preserve THIS attempt's test results, so a job-level re-run
       # cannot destroy the evidence from a failing one.
       #
@@ -1883,7 +1983,9 @@ jobs:
       # attempt, and upload-artifact v4+ refuses to overwrite an existing name,
       # so a fixed name would make the re-run's upload fail outright. With the
       # attempt in the name, attempt 1's results sit alongside attempt 2's and
-      # the failing attempt stays readable after its conclusion is gone.
+      # the failing attempt stays readable after its conclusion is gone. The
+      # partition is in the name for the same refusal: the two partitions of
+      # one attempt upload side by side (issue #2098).
       #
       # The payload is nextest's JUnit XML — the only structured record of a
       # run: per-test WALL CLOCK plus the full failure message. The duration is
@@ -1900,9 +2002,24 @@ jobs:
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
-          name: nextest-macos-attempt-${{ github.run_attempt }}
+          name: nextest-macos-attempt-${{ github.run_attempt }}-part-${{ matrix.partition }}
           path: target/nextest/default/junit.xml
           if-no-files-found: warn
+
+  # The context the `main-protected` ruleset requires and the job
+  # `notify-main-red` names: green only when the clippy job and both test
+  # partitions are (issue #2098). Skipped, which the ruleset counts as passing,
+  # on the pull requests and the runs the other two skip.
+  build-macos:
+    needs: [changes, build-macos-clippy, build-macos-tests]
+    if: always() && github.event_name != 'pull_request' && needs.changes.outputs.devbox_only != 'true' && needs.changes.outputs.flake_only != 'true' && (github.event_name != 'workflow_dispatch' || inputs.build_macos)
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: |
+          failed="$(printf '%s' "$NEEDS_JSON" | jq -r '[to_entries[] | select(.value.result != "success") | "\(.key)=\(.value.result)"] | join(", ")')"
+          if [ -n "$failed" ]; then echo "not green: $failed"; exit 1; fi
 
   # `cargo audit` reads Cargo.lock, which a devbox-only PR cannot touch.
   security:
