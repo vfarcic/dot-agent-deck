@@ -10,8 +10,6 @@ expression: never
 
 
 
-
-
   ┌ Review project commands ─────────────────────────────────────────────────────────────────────┐
   │ Project: /work/demo-project                                                                  │
   │ Orchestration: team                                                                          │
@@ -22,11 +20,15 @@ expression: never
   │                                                                                              │
   │ Role: orchestrator                                                                           │
   │   command: claude                                                                            │
+  │   start: true — the orchestration starts with this role                                      │
+  │   clear: false — keeps running between tasks                                                 │
   │   description: The orchestrator of the team                                                  │
   │   prompt: Coordinate the team.                                                               │
   │                                                                                              │
   │ Role: coder                                                                                  │
   │   command: claude --model sonnet                                                             │
+  │   start: false                                                                               │
+  │   clear: false — keeps running between tasks                                                 │
   │   description: The coder of the team                                                         │
   │   prompt: Write the code.                                                                    │
   │                                                                                              │

@@ -54,7 +54,7 @@ fn view(approved: Option<&OrchestrationConfig>, current: &OrchestrationConfig) -
     TrustCheck::evaluate(&store, project, Path::new(PROJECT), current).view()
 }
 
-fn text(view: &ProjectTrustView, action: PromptAction, scroll: u16, w: u16, h: u16) -> String {
+fn text(view: &ProjectTrustView, action: PromptAction, scroll: usize, w: u16, h: u16) -> String {
     let buffer = render_to_buffer(view, action, scroll, w, h);
     let area = buffer.area;
     (0..area.height)
@@ -91,6 +91,12 @@ fn flag_row(label: &str, value: &str) -> String {
     format!("{label}: {value}")
 }
 
+/// A rendered popup row with the screen margin and the popup's left border
+/// stripped: the popup is centred, so a row reads `  │   start: …`.
+fn flag_text(row: &str) -> &str {
+    row.trim_start().trim_start_matches('│').trim_start()
+}
+
 /// Assert role `name`'s block in `screen` shows `start` and `clear` as the
 /// given values, and not the opposite ones.
 fn assert_flags(screen: &str, name: &str, start: bool, clear: bool) {
@@ -111,16 +117,12 @@ fn assert_flags(screen: &str, name: &str, start: bool, clear: bool) {
     ] {
         let want = flag_row(label, want);
         assert!(
-            block
-                .lines()
-                .any(|l| l.trim_start_matches('│').trim_start().starts_with(&want)),
+            block.lines().any(|l| flag_text(l).starts_with(&want)),
             "role {name:?} must show {want:?}.\nRole block:\n{block}\nWhole prompt:\n{screen}"
         );
         let other = flag_row(label, other);
         assert!(
-            !block
-                .lines()
-                .any(|l| l.trim_start_matches('│').trim_start().starts_with(&other)),
+            !block.lines().any(|l| flag_text(l).starts_with(&other)),
             "role {name:?} must not show {other:?}.\nRole block:\n{block}"
         );
     }
@@ -320,7 +322,7 @@ fn prompt_003_long_prompt_scrolls_under_fixed_footer() {
     );
 
     // Past the end clamps to the last page.
-    let end = text(&v, PromptAction::Start, u16::MAX, w, h);
+    let end = text(&v, PromptAction::Start, usize::MAX, w, h);
     assert!(end.contains("(more above)"), "{end}");
     assert!(!end.contains("below)"), "{end}");
     assert!(
@@ -336,7 +338,7 @@ fn prompt_003_long_prompt_scrolls_under_fixed_footer() {
     insta::assert_snapshot!("prompt_003_long_scrolled_end", end);
 }
 
-/// Scenario: Draw a never-approved orchestration whose first role's prompt runs to 70,000 short lines (more rows than a terminal widget can scroll), followed by a second role with a distinctive command, scrolled as far down as the prompt goes. Either that second role's command is on screen there, or the prompt does not offer `a approve` at all: approval is never offered for a command the user cannot scroll to.
+/// Scenario: Draw a never-approved orchestration whose first role's prompt runs to 70,000 short lines (more rows than a terminal widget can scroll), followed by a second role with a distinctive command, scrolled as far down as the prompt goes. The second role's command must be on screen there, with the footer reading `(more above)` and still offering `a approve`, so the user can always scroll to every command they would approve.
 #[spec("config-trust/prompt/003")]
 #[test]
 fn prompt_003_a_prompt_beyond_65535_rows_cannot_hide_a_later_role() {
@@ -346,12 +348,18 @@ fn prompt_003_a_prompt_beyond_65535_rows_cannot_hide_a_later_role() {
         role("orchestrator", "claude", &huge_prompt),
         role("coder", LATER_COMMAND, "Write the code."),
     ]);
-    let end = text(&view(None, &team), PromptAction::Start, u16::MAX, 100, 40);
-    let offers_approval = end.contains("a approve");
+    let end = text(&view(None, &team), PromptAction::Start, usize::MAX, 100, 40);
     assert!(
-        end.contains(LATER_COMMAND) || !offers_approval,
-        "scrolled to the end, the prompt still offers approval but the later role's command \
-         {LATER_COMMAND:?} is unreachable — `a` would approve a command the user cannot see.\n\
-         Last page:\n{end}"
+        end.contains(LATER_COMMAND),
+        "scrolled to the end, the later role's command {LATER_COMMAND:?} is not on screen — \
+         `a` would approve a command the user cannot scroll to.\nLast page:\n{end}"
+    );
+    assert!(
+        end.contains("(more above)") && !end.contains("below)"),
+        "scrolled as far as it goes, the footer must say there is nothing below:\n{end}"
+    );
+    assert!(
+        end.contains("a approve and start · Esc cancel · ↑↓ scroll"),
+        "the footer stays on screen at the end:\n{end}"
     );
 }

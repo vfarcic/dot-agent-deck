@@ -470,9 +470,10 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
 /// against a fresh (empty) daemon with NO flag. The restore must NOT build a
 /// half-broken orchestration tab, and (PRD #1885) must not restore the saved
 /// pane as a plain card either, since that would run its saved command without
-/// a trust check: the deck lands on the empty dashboard, and a clear
-/// `session_warnings` message NAMING the missing orchestration (`tdd-cycle`)
-/// and saying it was not restored is flushed to stderr at teardown.
+/// a trust check: the deck lands on the empty dashboard, the saved command
+/// (which touches a sentinel file) never runs, and a clear `session_warnings`
+/// message NAMING the missing orchestration (`tdd-cycle`) and saying it was
+/// not restored is flushed to stderr at teardown.
 #[spec("session/restore/009")]
 #[test]
 fn restore_009_orchestration_config_drift_warns_and_leaves_it_unrestored() {
@@ -488,11 +489,12 @@ fn restore_009_orchestration_config_drift_warns_and_leaves_it_unrestored() {
 
     let session_dir = common::race_safe_tempdir();
     let session_file = session_dir.path().join("session.toml");
+    let sentinel = session_dir.path().join("restore_009_saved_command_ran");
     stage_orchestration_snapshot(
         &session_file,
         project_dir.path(),
         "orchestrator",
-        "sleep 600",
+        &sentinel_command(&sentinel),
         &["orchestrator", "coder", "reviewer"],
         0,
         "Build the feature end to end",
@@ -514,16 +516,23 @@ fn restore_009_orchestration_config_drift_warns_and_leaves_it_unrestored() {
     // dashboard. PRD #1258: load-scaled, because the deck lazy-spawns its
     // daemon before it can restore anything.
     deck.wait_for_string("No active agents");
-    assert_drifted_snapshot_left_unrestored(&deck);
+    assert_drifted_snapshot_left_unrestored(&deck, &sentinel);
+}
+
+/// The saved start-role command the drifted snapshots of `session/restore/009`,
+/// `/010` and `/012` carry: it touches `sentinel` before it idles, so a restore
+/// that ran it — as a plain pane or otherwise — leaves the file behind.
+fn sentinel_command(sentinel: &Path) -> String {
+    format!("touch '{}'; exec sleep 600", sentinel.display())
 }
 
 /// The drifted orchestration snapshot of `session/restore/009`, `/010` and
-/// `/012` restored nothing: no `orchestrator` card appears, and the clean
+/// `/012` restored nothing: no `orchestrator` card appears, the clean
 /// teardown flushes a warning naming `tdd-cycle` and saying it was not
-/// restored. PRD #1885: a snapshot that cannot be resolved cannot be
-/// trust-checked, so it is never restored as a plain pane running its saved
-/// command.
-fn assert_drifted_snapshot_left_unrestored(deck: &TuiDeck) {
+/// restored, and the saved command never ran (`sentinel` was never written).
+/// PRD #1885: a snapshot that cannot be resolved cannot be trust-checked, so
+/// it is never restored as a plain pane running its saved command.
+fn assert_drifted_snapshot_left_unrestored(deck: &TuiDeck, sentinel: &Path) {
     let restored = common::wait_until(Duration::from_secs(3), || {
         deck.snapshot_grid().contains("orchestrator")
     });
@@ -541,6 +550,14 @@ fn assert_drifted_snapshot_left_unrestored(deck: &TuiDeck) {
     deck.send_keys(b"\r"); // Enter → Detach (default) → clean teardown + flush
     deck.wait_for_stream_string("tdd-cycle");
     deck.wait_for_stream_string("was not restored");
+    // The restore is over by teardown; give a command it might have spawned
+    // a moment to run before reading the sentinel.
+    let ran = common::wait_until(Duration::from_secs(2), || sentinel.exists());
+    assert!(
+        !ran,
+        "the drifted snapshot's saved command ran: {} was written",
+        sentinel.display()
+    );
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` that still defines
@@ -551,10 +568,11 @@ fn assert_drifted_snapshot_left_unrestored(deck: &TuiDeck) {
 /// Launch against a fresh (empty) daemon with NO flag. The restore must NOT
 /// reach into the empty `role_pane_ids` at the start cursor and panic
 /// (startup crash-loop): it must treat the zero-role re-resolution as drift,
-/// leave the orchestration unrestored (PRD #1885: no plain card running its
-/// saved command), reach the empty dashboard, and surface a `session_warnings`
-/// message naming the orchestration (`tdd-cycle`), flushed to stderr on a clean
-/// detach-quit — which a panicked process can never reach.
+/// leave the orchestration unrestored (PRD #1885: no plain card, and its saved
+/// command, which touches a sentinel file, never runs), reach the empty
+/// dashboard, and surface a `session_warnings` message naming the
+/// orchestration (`tdd-cycle`), flushed to stderr on a clean detach-quit —
+/// which a panicked process can never reach.
 #[spec("session/restore/010")]
 #[test]
 fn restore_010_zero_role_reresolved_orchestration_is_left_unrestored_without_panic() {
@@ -569,11 +587,12 @@ fn restore_010_zero_role_reresolved_orchestration_is_left_unrestored_without_pan
     // Empty saved role set → the name+order drift guard passes (saved [] ==
     // current []), so the rebuild proceeds into the start-role index path; the
     // saved start cursor (0) is out of range for a zero-role config.
+    let sentinel = session_dir.path().join("restore_010_saved_command_ran");
     stage_orchestration_snapshot(
         &session_file,
         project_dir.path(),
         "orchestrator",
-        "sleep 600",
+        &sentinel_command(&sentinel),
         &[], // zero saved roles — matches the whittled config
         0,   // start cursor 0 — out of range for an empty role set
         "Build the feature end to end",
@@ -593,7 +612,7 @@ fn restore_010_zero_role_reresolved_orchestration_is_left_unrestored_without_pan
     // No panic / crash-loop: the deck reaches its empty dashboard. A startup
     // panic indexing an empty `role_pane_ids` would never draw it.
     deck.wait_for_string("No active agents");
-    assert_drifted_snapshot_left_unrestored(&deck);
+    assert_drifted_snapshot_left_unrestored(&deck, &sentinel);
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` named `tdd-cycle`
@@ -897,8 +916,9 @@ fn orchestrator_marked_roles(deck: &TuiDeck) -> Vec<String> {
 /// tampering). Launch against a fresh (empty) daemon with NO flag. The divergent
 /// `project_path` config must NOT be auto-run: the planted `phantom-reviewer`
 /// role must never materialize as a deck card, and (PRD #1885) the saved pane
-/// is not restored as a plain card either: the teardown warning names
-/// `tdd-cycle` as not restored.
+/// is not restored as a plain card either — its saved command, which touches a
+/// sentinel file, never runs — while the teardown warning names `tdd-cycle` as
+/// not restored.
 #[spec("session/restore/012")]
 #[test]
 fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
@@ -926,11 +946,12 @@ fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
     // `dir` (saved_pane.dir) = saved_dir; `project_path` = planted_dir — the
     // divergence. The saved role set matches the planted config so today's
     // name+order drift guard passes and the planted config would auto-run.
+    let sentinel = session_dir.path().join("restore_012_saved_command_ran");
     stage_orchestration_snapshot(
         &session_file,
         saved_dir.path(), // saved_pane.dir — the legitimate working dir
         "orchestrator",
-        "sleep 600",
+        &sentinel_command(&sentinel),
         &["orchestrator", "phantom-reviewer"],
         0,
         "Build the feature end to end",
@@ -965,7 +986,7 @@ fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
     // Positive guard: restore still ran and refused — the teardown warning
     // names the orchestration as not restored, proving the test asserted a
     // refusal, not a no-op load.
-    assert_drifted_snapshot_left_unrestored(&deck);
+    assert_drifted_snapshot_left_unrestored(&deck, &sentinel);
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` (`tdd-cycle` with an
