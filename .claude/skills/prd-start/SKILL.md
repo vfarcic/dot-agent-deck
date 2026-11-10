@@ -111,7 +111,7 @@ bash .claude/skills/prd-start/prd-source.sh [issue-id]
 Then act on exactly one outcome, and report it with the evidence (commit SHAs, `file:line` on `origin/main`, PR numbers):
 
 - **Fully landed, or obsolete or superseded**: close it with `/prd-close`, giving that evidence as the reason, and **stop**: no readiness check and no implementation. For an issue PRD that is a closing comment and `gh issue close`; for a file PRD `/prd-close` archives the file, which is a commit and goes through a PR.
-- **Partly landed**: record what landed before starting. For an issue PRD, post a `### PRD progress — YYYY-MM-DD` comment naming each landed milestone and its evidence ([`issue-prd.md`](issue-prd.md)); for a file PRD, tick those milestones in the file, with the evidence beside them. Then continue with the readiness check below for what remains, and start from there.
+- **Partly landed**: record what landed before starting. For an issue PRD, post a `### PRD progress — YYYY-MM-DD` comment naming each landed milestone and its evidence ([`issue-prd.md`](issue-prd.md)); for a file PRD, note them now and tick them in the file, with the evidence beside them, only once Step 3 has put you on the feature branch (never on `main`; see "Landed milestones (file PRDs)" there). Then continue with the readiness check below for what remains, and start from there.
 - **Still needed**: continue with the readiness check below.
 
 **Ambiguous evidence means "still needed": proceed, and say in your report what you could not settle.** Never close a PRD on ambiguity. A PRD closed wrongly drops real work without anyone being shown it, while one started wrongly costs a unit, which is likely to meet the landed code once it reads the files it is about to change.
@@ -178,6 +178,10 @@ This prevents others from picking up the same PRD and working on it in parallel.
 ### Work Log (issue PRDs)
 
 **For an issue PRD, start its work log** once the branch is settled, with a comment naming the branch (the format is in [`issue-prd.md`](issue-prd.md), "Comments"): `### PRD progress — YYYY-MM-DD` followed by "Started on branch `[branch-name]`." It tells the next reader of the issue where the work is.
+
+### Landed milestones (file PRDs)
+
+**If Step 2's relevance check found a file PRD partly landed**, tick the landed milestones in `prds/[issue-id]-*.md` now, on the feature branch, with the evidence beside each; the change rides this branch's PR. An issue PRD already has its progress comment from Step 2.
 
 ### Step 3 Checkpoint (REQUIRED)
 

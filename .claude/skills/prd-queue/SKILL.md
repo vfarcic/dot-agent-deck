@@ -641,10 +641,16 @@ lifecycle, and it covers what /prd-full does not.
   one worker verifies the PRD and each milestone against origin/main and
   reports the outcome with its evidence (commit SHAs, file:line, PR numbers),
   so the code reading stays out of your context. Fully landed or obsolete:
-  close it via /prd-close with that evidence, delegate nothing else, and stop
-  (notify `ABANDONED: closed, <reason>`, or the merge-gate message for a file
-  PRD's archive PR). Partly landed: record what landed in the PRD and plan
-  only what remains. Ambiguous: proceed and say so; never close on it.
+  close it with that evidence and delegate no implementation. /prd-close asks
+  for a yes/no before closing; under dispatch nobody is there to answer, so
+  the worker's evidence IS that answer, and you do not wait for one. An issue
+  PRD closes with no file change: post /prd-close's closing comment and run
+  its `gh issue close` yourself, notify `ABANDONED: closed, <reason>`, and
+  stop. A file PRD's closure is an archive commit and a PR, so delegate that
+  one closure-only task to release (/prd-close's file path: archive, gates,
+  commit, /pr-create), then send the merge-gate message and stop. Partly
+  landed: record what landed in the PRD and plan only what remains.
+  Ambiguous: proceed and say so; never close on it.
 - You are already isolated. dot-agent-deck cut this worktree and you are on
   branch agent/dispatch-prd-<n>. Neither you nor any worker creates a branch or
   a worktree: skip /pr-create's "Create feature branch" step and open the PR from
