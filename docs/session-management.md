@@ -298,7 +298,7 @@ The workspace is saved after every new agent, rename, tab change and agent chang
 
 ### Orchestration tabs come back too
 
-Orchestration tabs return with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it. If the project's `.dot-agent-deck.toml` has changed since (the file is missing, the orchestration was renamed or a role was removed), the deck shows a warning and restores that pane as a plain dashboard pane instead.
+Orchestration tabs return with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it. When the agents are gone and the deck starts the roles again, it starts only the roles that had a pane when the workspace was last saved. A role whose pane you had closed comes back as an empty card with nothing running in it; to start it, have the orchestrator run [`dot-agent-deck pane spawn <role>`](orchestration.md#commands). A workspace saved by an earlier version of the deck starts every role. If the project's `.dot-agent-deck.toml` has changed since (the file is missing, the orchestration was renamed or a role was removed), the deck shows a warning and restores that pane as a plain dashboard pane instead.
 
 ### Starting Fresh
 
