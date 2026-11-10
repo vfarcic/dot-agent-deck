@@ -2,7 +2,7 @@ import { act, fireEvent, render, screen, waitFor, within } from "@testing-librar
 import { useCallback, useMemo, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { approvedProjectTrust } from "./test/projectTrust";
-import { APPROVE_AND_START, REVIEW_DECK_CHANGED, TRUST_TITLE, type ProjectTrust, type ProjectTrustTarget } from "./lib/projectTrust";
+import { APPROVE_AND_START, REVIEW_DECK_CHANGED, reviewDeckChangedNotice, TRUST_TITLE, type ProjectTrust, type ProjectTrustTarget } from "./lib/projectTrust";
 import { deckName } from "./lib/displayText";
 import { createFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_DAEMON_ID } from "./data/fixture";
 import { agentKey } from "./lib/agentKey";
@@ -867,8 +867,10 @@ describe("ControlDeck", () => {
    * same project path with byte-identical config text and keep separate
    * approvals. The Runs review is opened on deck A and names it; the user
    * presses Approve and start, and while that approval is on its way the
-   * selected deck changes to B. The review closes saying why, the approval
-   * went to A alone, and nothing is activated on either deck. A review opened
+   * selected deck changes to B. The review closes saying why — that nothing
+   * started, that the approval already sent may still be recorded on A, and
+   * how to revoke it there — the approval went to A alone, and nothing is
+   * activated on either deck. A review opened
    * on A and approved while A is still selected approves and activates on A,
    * never on whatever is selected at the approval.
    */
@@ -904,10 +906,56 @@ describe("ControlDeck", () => {
 
     rerender(<ControlDeck runtime={{ ...live, snapshot: deckB, fleet: [live.snapshot, deckB] }} />);
     await waitFor(() => expect(screen.queryByTestId("project-trust-dialog")).toBeNull());
-    expect(screen.getByText(REVIEW_DECK_CHANGED)).toBeInTheDocument();
+    /* NEW-1: the approval was already sent, so the notice must not say nothing was approved. */
+    const deck = deckName(live.snapshot.connection);
+    const notice = reviewDeckChangedNotice({ busy: true, deckName: deck, view: { project: "/home/dev/code/deck", orchestration: "dot-agent-deck" } });
+    expect(notice.message).not.toBe(REVIEW_DECK_CHANGED);
+    expect(notice.message).not.toContain("Nothing was approved");
+    const toast = screen.getByTestId("toast");
+    expect(toast).toHaveTextContent("Nothing was started");
+    expect(toast).toHaveTextContent(`the approval already sent may still be recorded on deck ${deck}`);
+    expect(toast).toHaveTextContent("dot-agent-deck trust revoke /home/dev/code/deck --orchestration dot-agent-deck on that deck's host");
+    expect(toast).not.toHaveTextContent("Nothing was approved");
+    expect(screen.queryByText(REVIEW_DECK_CHANGED)).toBeNull();
     await act(async () => { release({ ...review, state: "approved" }); await Promise.resolve(); });
 
     expect(approvedOn).toEqual([DECK_A]);
+    expect(live.runAction).not.toHaveBeenCalledWith(expect.objectContaining({ type: "activate_orchestration" }));
+  });
+
+  /**
+   * PRD #1885 re-check NEW-1. Scenario: the Runs review is opened on deck A
+   * and, before Approve and start is pressed, the selected deck changes to B.
+   * The review closes saying that nothing was approved or started, and no
+   * approval or activation reached either deck.
+   */
+  it("says nothing was approved when the selected deck changes before the review is approved", async () => {
+    const review: ProjectTrust = {
+      kind: "review",
+      project: "/home/dev/code/deck",
+      orchestration: "dot-agent-deck",
+      state: "never_approved",
+      roles: [{ name: "orchestrator", command: "sh ./agent.sh", start: true, clear: true }],
+      removedRoles: [],
+      digest: "same-text-on-both-decks",
+    };
+    const projectTrustState = vi.fn(async (_target: ProjectTrustTarget) => structuredClone(review));
+    const approveProjectTrust = vi.fn(async (_target: ProjectTrustTarget) => ({ ...review, state: "approved" as const }));
+    const live = liveWithProject({ projectTrustState, approveProjectTrust });
+    const deckB = { ...live.snapshot, connection: { ...live.snapshot.connection, deckId: DECK_B, socketPath: "/run/user/1000/deck-b.sock" } };
+    const { rerender } = render(<ControlDeck runtime={live} />);
+    await chooseTheOnlyProject();
+
+    fireEvent.click(screen.getByTestId("activate-orchestration"));
+    fireEvent.click(screen.getAllByRole("button", { name: "Activate orchestration" }).at(-1)!);
+    await screen.findByTestId("project-trust-dialog");
+
+    rerender(<ControlDeck runtime={{ ...live, snapshot: deckB, fleet: [live.snapshot, deckB] }} />);
+    await waitFor(() => expect(screen.queryByTestId("project-trust-dialog")).toBeNull());
+    expect(screen.getByTestId("toast")).toHaveTextContent(REVIEW_DECK_CHANGED);
+    expect(screen.getByTestId("toast")).not.toHaveTextContent("may still be recorded");
+    expect(reviewDeckChangedNotice({ busy: false, deckName: "any", view: { project: "/p", orchestration: "o" } })).toEqual({ message: REVIEW_DECK_CHANGED });
+    expect(approveProjectTrust).not.toHaveBeenCalled();
     expect(live.runAction).not.toHaveBeenCalledWith(expect.objectContaining({ type: "activate_orchestration" }));
   });
 

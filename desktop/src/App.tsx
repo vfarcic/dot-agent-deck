@@ -92,7 +92,7 @@ import { deckScreenSnapshot } from "./lib/deckScreen";
 import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
-import { approveShownReview, isNotApproved, REVIEW_DECK_CHANGED, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
+import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
@@ -2365,7 +2365,10 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   useEffect(() => {
     if (shownTrustReview === undefined || shownTrustReview.target.deckId === orchestrationDeckId) return;
     cancelTrustReview();
-    setNotice(REVIEW_DECK_CHANGED);
+    /* Pressed Approve and start already? Then the approval may be recorded on
+       the deck it went to, and the notice says so and how to undo it. */
+    const said = reviewDeckChangedNotice(shownTrustReview);
+    setNotice(said.message, said.detail);
   }, [shownTrustReview, orchestrationDeckId, cancelTrustReview]);
 
   const requestLaunch = (config: OrchestrationLaunchConfig) => {

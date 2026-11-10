@@ -49,7 +49,11 @@ export const REVIEW_CHANGED = "Nothing was approved: the project commands on scr
 export const REVIEW_COVERED = "Nothing was approved: something is open over the project commands review.";
 /** Shown in the dialog while an approval is on its way to the deck. */
 export const APPROVAL_IN_FLIGHT_NOTE = "The approval has been sent to the deck. Cancel now and nothing starts, but the deck may still record the approval.";
-/** Said when the Runs screen's review closes because the selected deck changed under it. */
+/**
+ * Said when the Runs screen's review closes because the selected deck changed
+ * under it before Approve and start was pressed. Once it was pressed the
+ * approval may already be on the deck: `reviewDeckChangedNotice` says that.
+ */
 export const REVIEW_DECK_CHANGED = "The project commands review was closed because the selected deck changed. Nothing was approved or started.";
 
 /** The deck a review is for, as the dialog labels it. */
@@ -170,6 +174,24 @@ export interface ShownReview {
  */
 export function reviewToken(review: Pick<ShownReview, "id" | "view">): string {
   return `${review.id}:${review.view.digest}`;
+}
+
+/**
+ * What the Runs screen says when `review` closes because the selected deck
+ * changed. Before Approve and start was pressed, nothing was approved or
+ * started. While the approval is on its way (`busy`), nothing starts either,
+ * but the deck it was sent to may still record it — so the sentence names
+ * that deck, and its `detail` gives the command that takes the approval back
+ * (a detail, because the toast clips its sentence and a clipped command is no
+ * use).
+ */
+export function reviewDeckChangedNotice(review: Pick<ShownReview, "busy" | "deckName"> & { view: Pick<ProjectTrustView, "project" | "orchestration"> }): { message: string; detail?: string } {
+  if (!review.busy) return { message: REVIEW_DECK_CHANGED };
+  const deck = review.deckName === undefined ? "the deck it was sent to" : `deck ${review.deckName}`;
+  return {
+    message: `The project commands review was closed because the selected deck changed. Nothing was started, but the approval already sent may still be recorded on ${deck}`,
+    detail: `to undo it, run dot-agent-deck trust revoke ${review.view.project} --orchestration ${review.view.orchestration} on that deck's host`,
+  };
 }
 
 /** Numbers every review the app shows, so no two share a token. */

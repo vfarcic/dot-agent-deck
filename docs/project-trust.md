@@ -21,7 +21,7 @@ The review is titled **Review project commands** and shows:
 - **Orchestration:** its name.
 - **State:** `not approved before`, or `changed since you approved it`.
 - For each role: its name, then `command`, `agent` (when the role sets one), `start` (`true` on the role the orchestration starts with), `clear` (`true` when the role's agent is restarted before each task, `false` when it keeps running between tasks), `description` and `prompt` (the role's `prompt_template`), in full. A role whose text changed since your approval is marked `changed`, and one your approval did not have is marked `new`.
-- **Deck:** in the desktop app, the deck the orchestration would start on. The approval is recorded on that deck and the orchestration starts there. If you switch to another deck while the review is open, the review closes and nothing is approved or started.
+- **Deck:** in the desktop app, the deck the orchestration would start on. The approval is recorded on that deck and the orchestration starts there. If you switch to another deck while the review is open, the review closes and nothing starts. If you switch before pressing **Approve and start**, nothing is approved either. If you switch after pressing it, the approval may already be recorded on the deck you started from, and the app tells you the `dot-agent-deck trust revoke` command to run on that deck's host to undo it.
 - **Removed since you approved it:** the roles your approval had that the file no longer defines.
 
 **TUI:**

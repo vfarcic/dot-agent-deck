@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState, type KeyboardEvent } from "react";
+import { useCallback, useLayoutEffect, useState, type KeyboardEvent } from "react";
 import { ShieldAlert } from "lucide-react";
 
 import { insideVoicePeer, overlayAbove, OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
@@ -61,8 +61,12 @@ export function ProjectTrustDialog({ review, onApprove, onCancel }: { review: Sh
   /* Voice's approve, published with this review's token while it is on
      screen. Voice reads the token when the words are declared and approves
      only while it is still this one (`approveShownReview`), and only while
-     nothing is drawn over the dialog. */
-  useEffect(() => publishReview({
+     nothing is drawn over the dialog.
+     A LAYOUT effect, so the token is published in the same commit that puts
+     its text on the page: a passive effect runs later, and in between the
+     page showed re-shown text while voice still read the old token (and the
+     old review's approve). */
+  useLayoutEffect(() => publishReview({
     token,
     approve: () => {
       if (overlayAbove(ref.current)) return REVIEW_COVERED;
