@@ -431,7 +431,7 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 
 | Outcome | Exit status | Printed on stderr |
 |---|---|---|
-| Accepted for every named role | 0 | `Delegated …`, naming the pane each role's worker runs in and the task id the deck gave the task; check the inbox badge for delivery. |
+| Accepted for every named role | 0 | `Delegated …`, naming the pane each role's worker runs in and the task id the deck queued the task under; check the inbox badge, or `dot-agent-deck inbox list --all`, for delivery. |
 | Accepted for some roles, not others | 0 | `Warning: …` naming the roles that were missed and why, followed by the `Delegated …` line for the roles that were accepted. Re-send only to the missed roles; repeating the whole command gives the accepted roles the task twice. |
 | Accepted for no role | non-zero | `Error: delegate from pane … reached no worker for role(s): …`, or `… was NOT sent: every worker it reached still owes a work-done …` |
 | Refused: the caller is not the orchestrator | non-zero | `Error: delegate from pane … failed: pane … is the \`<role>\` role, not this orchestration's orchestrator, so it may not delegate.` |

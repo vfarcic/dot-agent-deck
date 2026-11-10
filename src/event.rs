@@ -2791,7 +2791,8 @@ pub struct DelegateResponse {
     pub message_ids: Vec<String>,
     /// Issue #545: the worker pane each dispatched role resolved to, one entry
     /// per pane in fan-out order, so `delegate` can tell the orchestrator which
-    /// worker received the task. Without it a delegate that reached the wrong
+    /// worker the task was queued for. The same claim as [`Self::delivered`]:
+    /// queued to a pane that resolved at delegate time, not yet read by it. Without it a delegate that reached the wrong
     /// worker was as silent as one that reached the right one, and the
     /// orchestrator found out only if the eventual report looked wrong.
     ///
@@ -2812,7 +2813,7 @@ pub struct DeliveredPane {
     /// The pane's `DOT_AGENT_DECK_PANE_ID` — the id `daemon status` prints in
     /// its PANE column and a worker's report names.
     pub pane_id: String,
-    /// The inbox id of the task message posted to this pane, the same id
+    /// The inbox id of the task message queued for this pane, the same id
     /// [`DelegateResponse::message_ids`] carries for it.
     #[serde(default)]
     pub message_id: String,
