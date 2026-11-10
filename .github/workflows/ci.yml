@@ -1899,8 +1899,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.99.0
+      # `shared-key` replaces the job id in the cache key, and `build-macos`
+      # gives the key the single job used before the split, so the partitions
+      # restore the cache `main` already holds instead of starting cold (a
+      # cold partition compiled for 8 to 15 minutes in the run that measured
+      # this). Both partitions build the same thing, so they share one key;
+      # `build-macos-clippy` keeps its own, because a cache saved after a
+      # clippy-only build would hold none of the libraries the tests link.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
+          shared-key: build-macos
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       # Issue #2089: two of the three `build-macos` re-runs on `main` on
       # 2026-11-09 were this download answering HTTP 504 for the whole of
@@ -1929,41 +1937,7 @@ jobs:
       # `count:` deals each test binary's tests out to the partitions in turn,
       # so both halves get a share of every slow binary; each partition still
       # builds every test binary, which is why the compile is not halved.
-      # TEMPORARY probe (issue #2089 item 3), removed before the PR.
-      - name: Probe first-launch cost
-        env:
-          PARTITION: ${{ matrix.partition }}
-        run: |
-          set +e
-          sw_vers; sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
-          csrutil status
-          spctl --status
-          spctl developer-mode 2>&1 | head -5
-          if [ "$PARTITION" = 2 ]; then
-            sudo spctl developer-mode enable-terminal; echo "enable-terminal rc=$?"
-            sudo spctl --master-disable; echo "master-disable rc=$?"
-            spctl --status
-          fi
-          cat > "$RUNNER_TEMP/probe.sh" <<'EOS'
-          ms() { perl -MTime::HiRes=time -e 'printf "%d\n", time*1000'; }
-          i=0
-          while :; do
-            i=$((i+1)); d=$(mktemp -d); f="$d/s$i"
-            printf '#!/bin/sh\nexit 3\n' > "$f"; chmod +x "$f"
-            a=$(ms); "$f"; b=$(ms); "$f"; c=$(ms)
-            echo "$(date +%T) first=$((b-a))ms second=$((c-b))ms load=$(sysctl -n vm.loadavg)"
-            rm -rf "$d"; sleep 10
-          done
-          EOS
-          nohup bash "$RUNNER_TEMP/probe.sh" > "$RUNNER_TEMP/probe.log" 2>&1 &
-          sleep 25; cat "$RUNNER_TEMP/probe.log"
       - run: cargo nextest run --workspace --partition count:${{ matrix.partition }}/2
-      - name: Probe log
-        if: always()
-        run: |
-          cat "$RUNNER_TEMP/probe.log"
-          awk '{sub("first=","",$2); sub("ms","",$2); print $2}' "$RUNNER_TEMP/probe.log" | sort -n | awk '{a[NR]=$1} END {print "first-launch n="NR" p50="a[int(NR/2)+1]"ms p90="a[int(NR*0.9)+1]"ms max="a[NR]"ms"}'
-          ps -Ao pcpu,comm -r | head -6
       # Issue #564: preserve THIS attempt's test results, so a job-level re-run
       # cannot destroy the evidence from a failing one.
       #
