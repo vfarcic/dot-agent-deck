@@ -15,6 +15,8 @@
 
 mod common;
 
+use std::time::{Duration, Instant};
+
 use common::TuiDeck;
 use spec::spec;
 
@@ -110,11 +112,19 @@ fn copymode_keys_001_v_pages_back_selects_and_yanks_a_sentinel() {
     deck.wait_until_grid("copy mode", |g| chip(g, " COPY "));
     deck.capture_screen_when("the copy-mode cursor", copy_cursor);
 
-    for _ in 0..10 {
+    // Page back until the sentinel is on screen. Each PageUp waits for the
+    // view to move, so paging past the top of the history fails that wait
+    // rather than spinning, and the deadline bounds the whole walk.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
         let before = deck.snapshot_grid();
         if before.contains(sentinel) {
             break;
         }
+        assert!(
+            Instant::now() < deadline,
+            "the sentinel did not come into view by paging back.\nFinal grid:\n{before}"
+        );
         deck.send_bytes(PAGE_UP);
         deck.wait_until_grid("the view paged back", |g| g != before);
     }

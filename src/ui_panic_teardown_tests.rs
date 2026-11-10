@@ -26,7 +26,8 @@ const CASE: &str = "DOT_AGENT_DECK_TEST_PANIC_TEARDOWN_CASE";
 const PROBE: &str = "panic-teardown-probe raw=";
 const ENTER_ALTERNATE_SCREEN: &str = "\x1b[?1049h";
 const LEAVE_ALTERNATE_SCREEN: &str = "\x1b[?1049l";
-const TEST: &str = "a_contained_panic_leaves_the_terminal_set_up_and_any_other_hands_it_back";
+const TEST: &str =
+    "native_004_a_contained_panic_leaves_the_terminal_set_up_and_any_other_hands_it_back";
 
 /// A pseudo-terminal pair, 80 columns by 24 rows.
 fn open_pty() -> (std::fs::File, std::fs::File) {
@@ -258,7 +259,7 @@ fn child(case: &str) {
 /// Scenario: The deck sets its terminal up as it does at start, with its whole panic-hook stack, in a pseudo-terminal, and then the native clipboard's worker panics (a fake opener) or a guarded parser feed panics. The terminal stays in raw mode on the alternate screen for the TUI that keeps running, while a panic on an ordinary thread, the control, hands the terminal back.
 #[spec("clipboard/native/004")]
 #[test]
-fn a_contained_panic_leaves_the_terminal_set_up_and_any_other_hands_it_back() {
+fn native_004_a_contained_panic_leaves_the_terminal_set_up_and_any_other_hands_it_back() {
     if let Ok(case) = std::env::var(CASE) {
         return child(&case);
     }
