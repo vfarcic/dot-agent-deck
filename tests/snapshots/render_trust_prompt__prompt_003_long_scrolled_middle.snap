@@ -4,6 +4,8 @@ expression: middle
 ---
 
   ┌ Review project commands ─────────────────────────────────────────────────┐
+  │     Step 03: do the next thing carefully.                                │
+  │     Step 04: do the next thing carefully.                                │
   │     Step 05: do the next thing carefully.                                │
   │     Step 06: do the next thing carefully.                                │
   │     Step 07: do the next thing carefully.                                │
@@ -16,8 +18,6 @@ expression: middle
   │     Step 14: do the next thing carefully.                                │
   │     Step 15: do the next thing carefully.                                │
   │     Step 16: do the next thing carefully.                                │
-  │     Step 17: do the next thing carefully.                                │
-  │     Step 18: do the next thing carefully.                                │
   │                                                                          │
   │ a approve and start · Esc cancel · ↑↓ scroll   (more above and below)    │
   └──────────────────────────────────────────────────────────────────────────┘

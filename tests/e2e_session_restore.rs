@@ -468,15 +468,14 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
 /// `[panes.orchestration]` block still references the OLD `config_name =
 /// "tdd-cycle"` (a config-drift: the orchestration was renamed/removed). Launch
 /// against a fresh (empty) daemon with NO flag. The restore must NOT build a
-/// half-broken orchestration tab: the saved pane falls back to a PLAIN dashboard
-/// card (its saved name `orchestrator`, no `coder`/`reviewer` role panes), and a
-/// clear `session_warnings` message NAMING the missing orchestration
-/// (`tdd-cycle`) is surfaced — flushed to stderr at teardown, so we detach-quit
-/// and scan the byte stream. RED today: there is no snapshot-fallback restore
-/// branch, so no drift is detected and no warning is ever emitted.
+/// half-broken orchestration tab, and (PRD #1885) must not restore the saved
+/// pane as a plain card either, since that would run its saved command without
+/// a trust check: the deck lands on the empty dashboard, and a clear
+/// `session_warnings` message NAMING the missing orchestration (`tdd-cycle`)
+/// and saying it was not restored is flushed to stderr at teardown.
 #[spec("session/restore/009")]
 #[test]
-fn restore_009_orchestration_config_drift_warns_and_falls_back_to_plain_pane() {
+fn restore_009_orchestration_config_drift_warns_and_leaves_it_unrestored() {
     let project_dir = common::race_safe_tempdir();
     // The project config exists, but the orchestration was renamed — so the
     // snapshot's `config_name = "tdd-cycle"` no longer resolves.
@@ -510,43 +509,38 @@ fn restore_009_orchestration_config_drift_warns_and_falls_back_to_plain_pane() {
         )
         .launch_with_fixture("minimal");
 
-    // Fallback: the saved orchestrator pane returns as a PLAIN dashboard card
-    // (its saved name), never an orchestration tab.
-    // PRD #1258: load-scaled, because the deck lazy-spawns its daemon before it
-    // can restore anything, and on a STARVED run that alone outlasted a fixed
-    // 10 s (the daemon's pre-bind work measured 5.7 s in the same run).
-    let fell_back = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+    // Nothing of the drifted orchestration restores — no tab, and no plain
+    // card running its saved command — so the deck lands on the empty
+    // dashboard. PRD #1258: load-scaled, because the deck lazy-spawns its
+    // daemon before it can restore anything.
+    deck.wait_for_string("No active agents");
+    assert_drifted_snapshot_left_unrestored(&deck);
+}
+
+/// The drifted orchestration snapshot of `session/restore/009`, `/010` and
+/// `/012` restored nothing: no `orchestrator` card appears, and the clean
+/// teardown flushes a warning naming `tdd-cycle` and saying it was not
+/// restored. PRD #1885: a snapshot that cannot be resolved cannot be
+/// trust-checked, so it is never restored as a plain pane running its saved
+/// command.
+fn assert_drifted_snapshot_left_unrestored(deck: &TuiDeck) {
+    let restored = common::wait_until(Duration::from_secs(3), || {
         deck.snapshot_grid().contains("orchestrator")
     });
     assert!(
-        fell_back,
-        "PRD #89 M2b.3 drift: a snapshot whose orchestration no longer resolves must restore \
-         the saved pane as a PLAIN dashboard card (`orchestrator`), but it never appeared.\n\
-         Final grid:\n{}",
+        !restored,
+        "a drifted orchestration snapshot must not restore as a plain `orchestrator` card \
+         (its saved command would run unchecked).\nFinal grid:\n{}",
         deck.snapshot_grid()
     );
-
-    // It must be a PLAIN pane, NOT a half-broken orchestration tab: the other
-    // roles must not have been spawned.
-    let grid = deck.snapshot_grid();
-    assert!(
-        !grid.contains("reviewer"),
-        "config drift must fall back to a plain pane, never a half-broken orchestration tab — \
-         but a `reviewer` role pane was rebuilt.\nFinal grid:\n{grid}"
-    );
-
-    // The drift must surface a clear warning NAMING the missing orchestration.
     // `session_warnings` are flushed to stderr at teardown, so detach-quit and
-    // scan the cumulative byte stream. RED today: no drift branch → no warning.
-    //
-    // The restored pane auto-focuses (PaneInput), where Ctrl+C is forwarded to
-    // the pane; detach to Normal mode first so Ctrl+C reaches the global quit.
-    deck.send_keys(b"\x04"); // Ctrl+D → detach to Normal mode
-    deck.wait_for_absence("[Command Mode Ctrl+D]"); // pane no longer focused
+    // scan the cumulative byte stream. Nothing is focused, so Ctrl+C reaches
+    // the global quit.
     deck.send_keys(b"\x03"); // Ctrl+C → quit-confirm modal
     deck.wait_for_string("Quit dot-agent-deck?");
     deck.send_keys(b"\r"); // Enter → Detach (default) → clean teardown + flush
     deck.wait_for_stream_string("tdd-cycle");
+    deck.wait_for_stream_string("was not restored");
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` that still defines
@@ -557,15 +551,13 @@ fn restore_009_orchestration_config_drift_warns_and_falls_back_to_plain_pane() {
 /// Launch against a fresh (empty) daemon with NO flag. The restore must NOT
 /// reach into the empty `role_pane_ids` at the start cursor and panic
 /// (startup crash-loop): it must treat the zero-role re-resolution as drift,
-/// restore the saved pane as a PLAIN dashboard card (`orchestrator`), and surface
-/// a `session_warnings` message naming the orchestration (`tdd-cycle`), flushed
-/// to stderr on a clean detach-quit. RED today: `resolve_orchestration_for_restore`
-/// only compares names (it passes for `[] == []`) and `load_project_config` runs
-/// no validation, so the rebuild proceeds and `role_pane_ids[start_idx]` indexes
-/// an empty vec — panicking at startup before any fallback pane appears.
+/// leave the orchestration unrestored (PRD #1885: no plain card running its
+/// saved command), reach the empty dashboard, and surface a `session_warnings`
+/// message naming the orchestration (`tdd-cycle`), flushed to stderr on a clean
+/// detach-quit — which a panicked process can never reach.
 #[spec("session/restore/010")]
 #[test]
-fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
+fn restore_010_zero_role_reresolved_orchestration_is_left_unrestored_without_panic() {
     let project_dir = common::race_safe_tempdir();
     // The project config still names `tdd-cycle`, but its role set was whittled
     // to empty — load_project_config does not run config_validation, so this
@@ -598,35 +590,10 @@ fn restore_010_zero_role_reresolved_orchestration_falls_back_without_panic() {
         )
         .launch_with_fixture("minimal");
 
-    // No panic / crash-loop: the saved pane returns as a PLAIN dashboard card
-    // (its saved name `orchestrator`). RED today: the startup panic prevents any
-    // pane from ever rendering, so this times out — the final grid captures the
-    // `index out of bounds` panic text rather than a dashboard.
-    // PRD #1258: load-scaled, because the deck lazy-spawns its daemon before it
-    // can restore anything, and on a STARVED run that alone outlasted a fixed
-    // 10 s (the daemon's pre-bind work measured 5.7 s in the same run).
-    let fell_back = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
-        deck.snapshot_grid().contains("orchestrator")
-    });
-    assert!(
-        fell_back,
-        "PRD #89 review-fix F2: a snapshot re-resolving to a zero-role orchestration must \
-         fall back to a PLAIN dashboard pane (`orchestrator`) WITHOUT panicking, but the \
-         pane never appeared — the restore path likely panicked indexing an empty \
-         role_pane_ids at startup.\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
-
-    // The drift must surface a clear warning NAMING the orchestration, flushed
-    // to stderr at clean teardown — which a panicked process can never reach.
-    // The restored pane auto-focuses (PaneInput); detach to Normal mode first so
-    // Ctrl+C reaches the global quit (mirrors session/restore/009).
-    deck.send_keys(b"\x04"); // Ctrl+D → detach to Normal mode
-    deck.wait_for_absence("[Command Mode Ctrl+D]"); // pane no longer focused
-    deck.send_keys(b"\x03"); // Ctrl+C → quit-confirm modal
-    deck.wait_for_string("Quit dot-agent-deck?");
-    deck.send_keys(b"\r"); // Enter → Detach (default) → clean teardown + flush
-    deck.wait_for_stream_string("tdd-cycle");
+    // No panic / crash-loop: the deck reaches its empty dashboard. A startup
+    // panic indexing an empty `role_pane_ids` would never draw it.
+    deck.wait_for_string("No active agents");
+    assert_drifted_snapshot_left_unrestored(&deck);
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` named `tdd-cycle`
@@ -929,16 +896,15 @@ fn orchestrator_marked_roles(deck: &TuiDeck) -> Vec<String> {
 /// dir (a DIVERGENCE: capture always writes them equal, so this only happens via
 /// tampering). Launch against a fresh (empty) daemon with NO flag. The divergent
 /// `project_path` config must NOT be auto-run: the planted `phantom-reviewer`
-/// role must never materialize as a deck card; the saved pane must still restore
-/// as a PLAIN card. RED today: restore re-resolves the OrchestrationConfig from
-/// the un-cross-checked `project_path` and auto-runs the planted config, spawning
-/// `phantom-reviewer`.
+/// role must never materialize as a deck card, and (PRD #1885) the saved pane
+/// is not restored as a plain card either: the teardown warning names
+/// `tdd-cycle` as not restored.
 #[spec("session/restore/012")]
 #[test]
 fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
     // The legitimate saved working directory — what `saved_pane.dir` records. It
     // holds NO orchestration config, so a re-resolution from HERE correctly
-    // drifts to a plain pane.
+    // drifts and leaves the orchestration unrestored.
     let saved_dir = common::race_safe_tempdir();
 
     // A separate, attacker-influenced directory whose planted config defines a
@@ -996,17 +962,10 @@ fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
         grid = deck.snapshot_grid()
     );
 
-    // Positive guard: restore still ran — the saved pane returns as a PLAIN card
-    // (`orchestrator`), proving the test asserted a refusal, not a no-op load.
-    let restored = common::wait_until(Duration::from_secs(10), || {
-        deck.snapshot_grid().contains("orchestrator")
-    });
-    assert!(
-        restored,
-        "the saved pane must still restore (as a plain card `orchestrator`) when the \
-         divergent planted config is refused.\nFinal grid:\n{}",
-        deck.snapshot_grid()
-    );
+    // Positive guard: restore still ran and refused — the teardown warning
+    // names the orchestration as not restored, proving the test asserted a
+    // refusal, not a no-op load.
+    assert_drifted_snapshot_left_unrestored(&deck);
 }
 
 /// Scenario: Stage an orchestration `.dot-agent-deck.toml` (`tdd-cycle` with an

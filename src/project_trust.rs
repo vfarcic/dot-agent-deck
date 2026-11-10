@@ -309,18 +309,15 @@ pub fn digest(project: &Path, orchestration: &str, roles: &[ApprovedRole]) -> St
 /// make two projects one.
 pub fn project_identity(config_dir: &Path) -> io::Result<PathBuf> {
     let canonical = std::fs::canonicalize(config_dir)?;
-    let Some(main) = crate::worktree_owner::main_worktree_of(&canonical) else {
+    // One verified geometry, not separate git answers: a `.git` file copied
+    // from another checkout's linked worktree fails its back-pointer check
+    // and keys the directory on itself (never approved).
+    let Some(geometry) = crate::worktree_owner::verified_geometry_of(&canonical) else {
         return Ok(canonical);
     };
-    let Some(top) = crate::worktree_owner::worktree_toplevel_of(&canonical) else {
-        return Ok(canonical);
-    };
-    let (Ok(main), Ok(top)) = (std::fs::canonicalize(&main), std::fs::canonicalize(&top)) else {
-        return Ok(canonical);
-    };
-    match canonical.strip_prefix(&top) {
-        Ok(rel) if rel.as_os_str().is_empty() => Ok(main),
-        Ok(rel) => Ok(main.join(rel)),
+    match canonical.strip_prefix(&geometry.toplevel) {
+        Ok(rel) if rel.as_os_str().is_empty() => Ok(geometry.main),
+        Ok(rel) => Ok(geometry.main.join(rel)),
         Err(_) => Ok(canonical),
     }
 }
@@ -586,6 +583,13 @@ impl TrustCheck {
 
 /// The refusal text: names the orchestration, the project, whether it was never
 /// approved or changed since, and the exact command that approves it.
+///
+/// Escaped for display ([`crate::untrusted_text::escape_control_and_bidi`]):
+/// every name and path in it comes from the project's config, and the text
+/// reaches the scheduler's stderr, the daemon log and agent-verb diagnostics,
+/// so a control or bidi character in it is shown, never obeyed. The raw names
+/// stay in [`TrustCheck`] for identity; for an ordinary name the escaping
+/// changes nothing and the approve command stays copy-pasteable.
 pub fn refusal_text(
     project: &Path,
     config_dir: &Path,
@@ -611,12 +615,12 @@ pub fn refusal_text(
             }
         }
     };
-    format!(
+    crate::untrusted_text::escape_control_and_bidi(&format!(
         "orchestration '{orchestration}' of project {} {state}, so nothing from it was \
          started. Review and approve it from a terminal outside the deck with: {}",
         project.display(),
         approve_command(config_dir, orchestration)
-    )
+    ))
 }
 
 /// `dot-agent-deck trust approve <dir> --orchestration <name>`, each argument
@@ -677,8 +681,10 @@ pub fn log_refusal(path: &str, check: &TrustCheck) {
     if let Some(refusal) = check.refusal() {
         tracing::warn!(
             path,
-            project = %check.project.display(),
-            orchestration = %check.orchestration,
+            project = %crate::untrusted_text::escape_control_and_bidi(
+                &check.project.display().to_string()
+            ),
+            orchestration = %crate::untrusted_text::escape_control_and_bidi(&check.orchestration),
             verdict = check.verdict.word(),
             "{refusal}"
         );
@@ -1316,6 +1322,22 @@ prompt_template = "Be brief."
         write_config(&sub, TEAM);
         assert_eq!(project_identity(&sub).unwrap(), main.join("sub"));
         assert_eq!(verdict(&store, &sub, "team"), TrustVerdict::NeverApproved);
+
+        // A `.git` file copied from the linked worktree into an unrelated
+        // directory makes git call that directory part of the repository, but
+        // the administrative directory points back at the real worktree, so
+        // the copy is keyed on itself and borrows nothing.
+        let forged = scratch.path().join("forged");
+        write_config(&forged, TEAM);
+        std::fs::copy(linked.join(".git"), forged.join(".git")).unwrap();
+        assert_eq!(
+            project_identity(&forged).unwrap(),
+            std::fs::canonicalize(&forged).unwrap()
+        );
+        assert_eq!(
+            verdict(&store, &forged, "team"),
+            TrustVerdict::NeverApproved
+        );
     }
 
     #[test]

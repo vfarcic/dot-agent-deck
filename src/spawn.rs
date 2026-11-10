@@ -699,10 +699,10 @@ pub async fn approval_refusal(
     {
         Ok(check) => check,
         Err(e) => {
-            return Some(format!(
+            return Some(crate::untrusted_text::escape_control_and_bidi(&format!(
                 "orchestration '{}' was not started: its approval could not be checked ({e})",
                 orchestration.name
-            ));
+            )));
         }
     };
     crate::project_trust::log_refusal(path, &check);

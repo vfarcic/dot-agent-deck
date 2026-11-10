@@ -186,6 +186,108 @@ pub fn decide_for_dir(
     })
 }
 
+/// What re-sending a running orchestration's instructions to its start role
+/// (the remit re-arm after a compaction or a `/clear`) may publish.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Rearm {
+    /// The text being recomposed is the approved text.
+    Publish,
+    /// The text the tab holds is not the approved text, but the config as it
+    /// now reads is, with the same roles in the same order: re-arm from that.
+    PublishApproved(OrchestrationConfig),
+    /// Publish nothing, and say why.
+    Refuse(String),
+}
+
+/// The lead of every re-arm refusal.
+fn rearm_lead(name: &str) -> String {
+    format!("Orchestration '{name}': its instructions were not sent to its coordinator again")
+}
+
+/// Decide what a remit re-arm of `current` — the orchestration text a running
+/// tab holds, which a warm reattach read from the config without asking — may
+/// publish, from the daemon's `answer` to the trust-state request for it.
+///
+/// A re-arm is an unattended path: it never prompts. It publishes `current`
+/// only when the daemon says the config is approved and its text is
+/// `current`'s; when the config as `reread` reads it now is the approved text
+/// with the same roles, it publishes that instead. With an older daemon it
+/// checks `current` itself against the approval store with `local`. Anything
+/// else refuses with the command that approves it.
+pub fn decide_rearm(
+    answer: Result<GatedQuery<ProjectTrustView>, String>,
+    current: &OrchestrationConfig,
+    reread: impl FnOnce() -> Option<OrchestrationConfig>,
+    local: impl FnOnce() -> TrustCheck,
+) -> Rearm {
+    let lead = rearm_lead(&current.name);
+    match answer {
+        Ok(GatedQuery::Answered(view)) if view.state == "approved" => {
+            if roles_match(current, &view) {
+                return Rearm::Publish;
+            }
+            match reread() {
+                Some(fresh) if fresh.name == current.name && roles_match(&fresh, &view) => {
+                    let same_roles = fresh.roles.len() == current.roles.len()
+                        && fresh
+                            .roles
+                            .iter()
+                            .zip(&current.roles)
+                            .all(|(a, b)| a.name == b.name && a.start == b.start);
+                    if same_roles {
+                        Rearm::PublishApproved(fresh)
+                    } else {
+                        Rearm::Refuse(format!(
+                            "{lead}: its roles changed since it was opened. Open it again to \
+                             use the new roles."
+                        ))
+                    }
+                }
+                _ => Rearm::Refuse(format!(
+                    "{lead}: its config changed while it was being checked."
+                )),
+            }
+        }
+        Ok(GatedQuery::Answered(view)) => {
+            let state = if view.state == "changed" {
+                CHANGED_SINCE_APPROVAL
+            } else {
+                "was never approved"
+            };
+            Rearm::Refuse(format!(
+                "{lead}, because its config {state}. Review and approve it from a terminal \
+                 outside the deck with: {}",
+                crate::project_trust::approve_command(
+                    Path::new(&view.config_dir),
+                    &view.orchestration
+                )
+            ))
+        }
+        Ok(GatedQuery::Unsupported) => match local().refusal() {
+            None => Rearm::Publish,
+            Some(refusal) => Rearm::Refuse(format!("{lead}. {OLDER_DAEMON_NOTE} {refusal}")),
+        },
+        Err(e) => Rearm::Refuse(format!("{lead}: its approval could not be checked ({e}).")),
+    }
+}
+
+/// [`decide_rearm`], with the TUI's own read-only check of `current` against
+/// the approval store for an older daemon.
+pub fn decide_rearm_for_dir(
+    answer: Result<GatedQuery<ProjectTrustView>, String>,
+    dir: &Path,
+    current: &OrchestrationConfig,
+    reread: impl FnOnce() -> Option<OrchestrationConfig>,
+) -> Rearm {
+    decide_rearm(answer, current, reread, || {
+        crate::project_trust::check_blocking(
+            &crate::project_trust::TrustStore::default_location(),
+            dir,
+            current,
+        )
+    })
+}
+
 /// Whether an approval request failed because the config changed after the
 /// prompt showed it ([`crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED`]):
 /// the prompt then shows the new text and asks again.
@@ -258,8 +360,8 @@ fn push_text(
 
 /// The prompt's body for `view`, wrapped to `width` columns: the project, the
 /// orchestration and its state, then every role's name (marked `changed` or
-/// `new`), command, agent, description and prompt text, then any role the
-/// approval had that the orchestration no longer has.
+/// `new`), command, agent, `start` and `clear` flags, description and prompt
+/// text, then any role the approval had that the orchestration no longer has.
 pub fn body_lines(view: &ProjectTrustView, width: usize) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     push_field(&mut out, 0, "Project", &view.project, width);
@@ -310,6 +412,30 @@ pub fn body_lines(view: &ProjectTrustView, width: usize) -> Vec<Line<'static>> {
         if let Some(agent) = &role.text.agent {
             push_field(&mut out, 2, "agent", agent, width);
         }
+        // Both flags on every role, so moving the start role or changing
+        // nothing but a flag is visible in what is approved.
+        push_field(
+            &mut out,
+            2,
+            START_LABEL,
+            if role.text.start {
+                START_TRUE
+            } else {
+                START_FALSE
+            },
+            width,
+        );
+        push_field(
+            &mut out,
+            2,
+            CLEAR_LABEL,
+            if role.text.clear {
+                CLEAR_TRUE
+            } else {
+                CLEAR_FALSE
+            },
+            width,
+        );
         push_text(
             &mut out,
             2,
@@ -347,8 +473,9 @@ pub struct PromptLayout {
     /// The footer row's position, `(x, y)`, when the popup has room for it.
     pub footer: Option<(u16, u16)>,
     /// The furthest the body can scroll: rows of body below the last row shown
-    /// at scroll 0.
-    pub max_scroll: u16,
+    /// at scroll 0. A `usize`, not ratatui's `u16` scroll offset, so a body
+    /// longer than 65,535 rows is reachable to its end.
+    pub max_scroll: usize,
 }
 
 /// The widest the popup grows.
@@ -357,12 +484,16 @@ const MAX_WIDTH: u16 = 120;
 /// Draw the prompt for `view` over `area`, its body scrolled down by `scroll`
 /// rows (clamped to the body's end), and say where it went. The body scrolls;
 /// the footer stays on the popup's last inner row.
+///
+/// Only the visible window of rows is handed to ratatui, whose own scroll
+/// offset is a `u16`: a body of more than 65,535 rows (a long prompt is valid
+/// config) must still let the user reach every later role before approving it.
 pub fn render(
     frame: &mut Frame,
     area: Rect,
     view: &ProjectTrustView,
     action: PromptAction,
-    scroll: u16,
+    scroll: usize,
 ) -> PromptLayout {
     let popup_width = area.width.saturating_sub(4).clamp(1, MAX_WIDTH);
     let text_width = usize::from(popup_width.saturating_sub(4));
@@ -392,9 +523,7 @@ pub fn render(
 
     let footer_rows: u16 = 2;
     let body_rows = inner.height.saturating_sub(footer_rows);
-    let max_scroll = u16::try_from(lines.len())
-        .unwrap_or(u16::MAX)
-        .saturating_sub(body_rows);
+    let max_scroll = lines.len().saturating_sub(usize::from(body_rows));
     let scroll = scroll.min(max_scroll);
     let body_area = Rect::new(
         inner.x.saturating_add(1),
@@ -402,7 +531,13 @@ pub fn render(
         inner.width.saturating_sub(2),
         body_rows,
     );
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body_area);
+    // `body_lines` wraps to the width already, so one line is one row.
+    let window: Vec<Line<'static>> = lines
+        .into_iter()
+        .skip(scroll)
+        .take(usize::from(body_rows))
+        .collect();
+    frame.render_widget(Paragraph::new(window), body_area);
 
     let footer = (inner.height >= footer_rows).then(|| {
         let row = inner.y + inner.height - 1;
@@ -434,14 +569,15 @@ pub fn render(
 }
 
 /// L1 entry point: the prompt for `view` drawn alone on a `width` × `height`
-/// terminal, scrolled by `scroll`, as the buffer a `TestBackend` holds.
+/// terminal, scrolled by `scroll` rows, as the buffer a `TestBackend` holds.
 pub fn render_to_buffer(
     view: &ProjectTrustView,
     action: PromptAction,
-    scroll: u16,
+    scroll: impl Into<usize>,
     width: u16,
     height: u16,
 ) -> Buffer {
+    let scroll = scroll.into();
     let backend = ratatui::backend::TestBackend::new(width, height);
     let mut terminal = ratatui::Terminal::new(backend).expect("a test terminal");
     terminal
@@ -566,6 +702,86 @@ mod tests {
         assert_eq!(gate, Gate::Refuse(CHANGED_WHILE_OPENING.to_string()));
     }
 
+    /// A remit re-arm publishes the text the tab holds only when it is the
+    /// approved text; it never prompts, and a changed or never-approved
+    /// config refuses with the approving command.
+    #[test]
+    fn a_rearm_publishes_only_approved_text() {
+        let held = orchestration("cat");
+        let rearm = decide_rearm(
+            Ok(GatedQuery::Answered(view_of(&held, "approved"))),
+            &held,
+            || panic!("no re-read for a match"),
+            unused_check,
+        );
+        assert_eq!(rearm, Rearm::Publish);
+
+        for state in ["never_approved", "changed"] {
+            match decide_rearm(
+                Ok(GatedQuery::Answered(view_of(&held, state))),
+                &held,
+                || None,
+                unused_check,
+            ) {
+                Rearm::Refuse(message) => {
+                    assert!(message.contains("'team'"), "{message}");
+                    assert!(
+                        message.contains(
+                            "dot-agent-deck trust approve /work/project --orchestration team"
+                        ),
+                        "{message}"
+                    );
+                }
+                other => panic!("{state}: expected a refusal, got {other:?}"),
+            }
+        }
+
+        assert!(matches!(
+            decide_rearm(Err("no answer".to_string()), &held, || None, unused_check),
+            Rearm::Refuse(m) if m.contains("could not be checked")
+        ));
+    }
+
+    /// The tab holds text a warm reattach read before the config changed: the
+    /// newer read is re-armed when it is the approved text with the same
+    /// roles, and nothing when the roles moved or the read is not approved.
+    #[test]
+    fn a_rearm_of_stale_text_uses_only_an_approved_read_with_the_same_roles() {
+        let held = orchestration("cat");
+        let approved = orchestration("cut");
+        let view = view_of(&approved, "approved");
+        assert_eq!(
+            decide_rearm(
+                Ok(GatedQuery::Answered(view.clone())),
+                &held,
+                || Some(approved.clone()),
+                unused_check,
+            ),
+            Rearm::PublishApproved(approved.clone())
+        );
+        assert!(matches!(
+            decide_rearm(
+                Ok(GatedQuery::Answered(view)),
+                &held,
+                || Some(orchestration("cot")),
+                unused_check,
+            ),
+            Rearm::Refuse(_)
+        ));
+
+        let mut renamed = approved.clone();
+        renamed.roles[1].name = "writer".to_string();
+        assert!(matches!(
+            decide_rearm(
+                Ok(GatedQuery::Answered(view_of(&renamed, "approved"))),
+                &held,
+                || Some(renamed.clone()),
+                unused_check,
+            ),
+            Rearm::Refuse(m) if m.contains("roles changed")
+        ));
+    }
+
     #[test]
     fn a_failed_request_opens_nothing() {
         let chosen = orchestration("cat");
@@ -624,7 +840,13 @@ mod tests {
         let mut view = view_of(&chosen, "changed");
         view.roles[1].change = Some(RoleChange::Changed);
         view.removed_roles = vec!["reviewer".to_string()];
-        let shown = grid(&render_to_buffer(&view, PromptAction::Start, 0, 120, 40));
+        let shown = grid(&render_to_buffer(
+            &view,
+            PromptAction::Start,
+            0usize,
+            120,
+            40,
+        ));
         for needle in [
             TITLE,
             "/work/project",
@@ -646,7 +868,13 @@ mod tests {
             "{shown}"
         );
         let never = view_of(&chosen, "never_approved");
-        let shown = grid(&render_to_buffer(&never, PromptAction::Restore, 0, 120, 40));
+        let shown = grid(&render_to_buffer(
+            &never,
+            PromptAction::Restore,
+            0usize,
+            120,
+            40,
+        ));
         assert!(shown.contains(NOT_APPROVED_BEFORE), "{shown}");
         assert!(shown.contains("a approve and restore"), "{shown}");
     }
@@ -657,7 +885,13 @@ mod tests {
     fn control_characters_in_config_text_are_shown_escaped() {
         let chosen = orchestration("cat\u{1b}[2J\u{202e}evil");
         let view = view_of(&chosen, "never_approved");
-        let shown = grid(&render_to_buffer(&view, PromptAction::Start, 0, 120, 40));
+        let shown = grid(&render_to_buffer(
+            &view,
+            PromptAction::Start,
+            0usize,
+            120,
+            40,
+        ));
         assert!(shown.contains("\\u{1b}[2J"), "{shown}");
         assert!(shown.contains("\\u{202e}evil"), "{shown}");
         assert!(!shown.contains('\u{1b}'));
@@ -675,7 +909,13 @@ mod tests {
                 .join("\n"),
         );
         let view = view_of(&chosen, "never_approved");
-        let top = grid(&render_to_buffer(&view, PromptAction::Start, 0, 100, 30));
+        let top = grid(&render_to_buffer(
+            &view,
+            PromptAction::Start,
+            0usize,
+            100,
+            30,
+        ));
         assert!(
             top.contains("LINE-1\u{20}") || top.contains("LINE-1 "),
             "{top}"

@@ -1490,7 +1490,12 @@ fn delegate_verdict(
 ) -> DelegateVerdict {
     let blocked_note = blocked_workers_note(resp);
     if let Some(error) = resp.error.as_deref() {
-        let mut message = format!("Error: delegate from pane {pane_id} failed: {error}");
+        // The daemon's error can name roles and paths from a project config:
+        // shown, never obeyed.
+        let mut message = format!(
+            "Error: delegate from pane {pane_id} failed: {}",
+            dot_agent_deck::untrusted_text::escape_control_and_bidi(error)
+        );
         if let Some(note) = blocked_note {
             message.push('\n');
             message.push_str(&note);

@@ -1812,10 +1812,11 @@ enum TrustPromptPurpose {
 struct TrustPromptState {
     /// The daemon's view: the text shown, and the digest an approval carries.
     view: crate::project_trust::ProjectTrustView,
-    /// How many body rows are scrolled off the top (clamped when drawn).
-    scroll: u16,
+    /// How many body rows are scrolled off the top (clamped when drawn). A
+    /// `usize`, so a body longer than 65,535 rows scrolls to its end.
+    scroll: usize,
     /// The furthest the last frame could scroll, so the keys clamp too.
-    max_scroll: u16,
+    max_scroll: usize,
     purpose: TrustPromptPurpose,
 }
 
@@ -4960,8 +4961,8 @@ fn surface_one_orchestration(
                 // `resolve_orchestration_for_restore` rebuild this tab on
                 // restore. That snapshot otherwise freezes at tab-open time —
                 // grow it here too, so a role added via `pane spawn` survives
-                // the next session flush instead of drift-triggering the
-                // restore fallback to a plain pane. Conditional on the entry
+                // the next session flush instead of drift-leaving the tab
+                // unrestored. Conditional on the entry
                 // existing: a tab opened via the batch daemon-surfacing path
                 // never captures `pane_metadata` at all (a separate,
                 // pre-existing gap out of scope here) and must not have one
@@ -7176,7 +7177,7 @@ fn handle_trust_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
         ui.mode = UiMode::Normal;
         return Action::Continue;
     };
-    const PAGE: u16 = 10;
+    const PAGE: usize = 10;
     let plain = !key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
@@ -12303,8 +12304,8 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 /// PRD #89 M2b.3 — rebuild one saved orchestration tab on the daemon-empty
 /// restore path: the orchestrator and role panes in saved order, the saved
 /// prompt replayed to the start role, the start cursor. Answers the tab's
-/// index, or why it could not be opened (the caller restores the saved pane
-/// as a plain pane then).
+/// index, or why it could not be opened (the caller leaves it unrestored
+/// then).
 ///
 /// PRD #1885: called only for an orchestration whose commands and prompts are
 /// approved as `orch_config` holds them — at startup, and again once a trust
@@ -12468,6 +12469,44 @@ fn restore_trust_gate(
     )
 }
 
+/// PRD #1885: whether a remit re-arm (compaction or `/clear` on the start
+/// role) may publish `config`, the text the running tab holds — which a warm
+/// reattach read from the config without a trust check. Answers `true` when it
+/// is the approved text (adopting the config as it now reads when that is the
+/// approved text with the same roles); otherwise reports why nothing was sent,
+/// in the status line and the log, and answers `false`. Never prompts.
+fn rearm_trust_gate(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    config: &mut OrchestrationConfig,
+    cwd: &str,
+) -> bool {
+    let name = config.name.clone();
+    let dir = std::path::Path::new(cwd);
+    let answer = pane.project_trust_state(cwd, &name);
+    let reread = || {
+        load_project_config(dir)
+            .ok()
+            .flatten()
+            .and_then(|c| c.orchestrations.into_iter().find(|o| o.name == name))
+    };
+    match crate::trust_prompt::decide_rearm_for_dir(answer, dir, config, reread) {
+        crate::trust_prompt::Rearm::Publish => true,
+        crate::trust_prompt::Rearm::PublishApproved(fresh) => {
+            *config = fresh;
+            true
+        }
+        crate::trust_prompt::Rearm::Refuse(message) => {
+            // Names a project path and orchestration from the config: shown,
+            // never obeyed.
+            let shown = crate::untrusted_text::escape_control_and_bidi(&message);
+            tracing::warn!(cwd = %crate::untrusted_text::escape_control_and_bidi(cwd), "{shown}");
+            ui.status_message = Some((shown, std::time::Instant::now()));
+            false
+        }
+    }
+}
+
 /// PRD #1885: restore a saved orchestration the startup restore held back,
 /// once its trust prompt was approved: re-resolved from the saved session and
 /// gated again, so what opens is exactly the approved text (and a config that
@@ -12553,8 +12592,9 @@ fn open_next_trust_restore(ui: &mut UiState) {
 ///   added/removed/renamed/reordered) — the tab the user saved no longer
 ///   exists as saved.
 ///
-/// On `Err`, the caller surfaces the reason via `session_warnings` and falls
-/// back to a PLAIN dashboard pane (never a half-broken orchestration tab).
+/// On `Err`, the caller surfaces the reason via `session_warnings` and leaves
+/// the orchestration unrestored (never a half-broken orchestration tab, and,
+/// since PRD #1885, never a plain pane running its saved command unchecked).
 ///
 /// On `Ok`, returns the resolved config AND the validated start-role index to
 /// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
@@ -12570,7 +12610,7 @@ fn resolve_orchestration_for_restore(
     // config at a divergent `project_path` would execute a `.dot-agent-deck.toml`
     // an attacker controls. Canonicalize both and refuse to re-resolve unless
     // they name the same directory; a divergence (or a `project_path` that no
-    // longer resolves) is treated as drift -> plain-pane fallback, so the
+    // longer resolves) is treated as drift -> left unrestored, so the
     // planted config is never executed.
     let project_dir = std::path::Path::new(&snap.project_path);
     let canon_project = project_dir.canonicalize().map_err(|e| {
@@ -12640,11 +12680,11 @@ fn resolve_orchestration_for_restore(
     // is structurally valid yet role-less, and a tampered cursor could point
     // past the end. Either would index an empty/short `role_pane_ids` and panic
     // at startup (crash-loop). Treat an out-of-range cursor — which includes
-    // every index of an empty role set — as drift, so the caller falls back to
-    // a plain pane instead of panicking.
+    // every index of an empty role set — as drift, so the caller leaves it
+    // unrestored instead of panicking.
     if snap.start_role_index >= orch.roles.len() {
         return Err(format!(
-            "orchestration '{}' has no role at saved start index {} (role count {}) — falling back",
+            "orchestration '{}' has no role at saved start index {} (role count {})",
             snap.config_name,
             snap.start_role_index,
             orch.roles.len()
@@ -13898,8 +13938,9 @@ pub fn run_tui(
             // `OrchestrationConfig` from `project_path` + `config_name`. On
             // success we `continue`; on drift (config gone, orchestration
             // renamed/removed, role set changed) we push a clear warning NAMING
-            // the orchestration and fall through to the plain-pane restore below
-            // — never a half-broken tab. Unlike warm-daemon hydration (session/restore/007), this
+            // the orchestration and leave it unrestored — never a half-broken
+            // tab, and (PRD #1885) never a plain pane running its saved command
+            // without a trust check. Unlike warm-daemon hydration (session/restore/007), this
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
@@ -13950,20 +13991,28 @@ pub fn run_tui(
                                 continue;
                             }
                             Err(e) => {
-                                ui.session_warnings.push(format!(
-                                    "Warning: failed to rebuild orchestration '{}': {e}; restoring '{}' as a plain pane",
-                                    orch_snap.config_name, saved_pane.name
-                                ));
-                                // Fall through to the plain-pane restore below.
+                                ui.session_warnings.push(
+                                    crate::untrusted_text::escape_control_and_bidi(&format!(
+                                        "Warning: failed to rebuild orchestration '{}': {e}; \
+                                         it was not restored",
+                                        orch_snap.config_name
+                                    )),
+                                );
+                                continue;
                             }
                         }
                     }
                     Err(reason) => {
-                        ui.session_warnings.push(format!(
-                            "Warning: {reason}; restoring '{}' as a plain pane",
-                            saved_pane.name
-                        ));
-                        // Fall through to the plain-pane restore below.
+                        // PRD #1885: a snapshot that no longer resolves cannot
+                        // be trust-checked, so it stays unrestored. Restoring
+                        // it as a plain pane would run its saved command — the
+                        // start role's, as captured — with no approval.
+                        ui.session_warnings
+                            .push(crate::untrusted_text::escape_control_and_bidi(&format!(
+                                "Warning: {reason}; orchestration '{}' was not restored",
+                                orch_snap.config_name
+                            )));
+                        continue;
                     }
                 }
             }
@@ -14589,6 +14638,12 @@ pub fn run_tui(
                         // The former reads that section back off the existing
                         // file first and carries it forward, falling back to
                         // today's no-task behavior when there is none.
+                        //
+                        // PRD #1885: and only the approved text. A warm
+                        // reattach adopted `config` from the file without a
+                        // trust check, so it is checked here, before anything
+                        // is published from it.
+                        && rearm_trust_gate(&mut ui, &*pane, config, cwd)
                         && let Some(published) =
                             reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
                     {
@@ -14715,7 +14770,18 @@ pub fn run_tui(
                                     >= CLEAR_REASSERT_RETRY_FLOOR
                             });
 
-                    if no_delivery_pending && !permanently_excluded && retry_floor_ok {
+                    if no_delivery_pending
+                        && !permanently_excluded
+                        && retry_floor_ok
+                        && !rearm_trust_gate(&mut ui, &*pane, config, cwd)
+                    {
+                        // PRD #1885: not the approved text, and the gate said
+                        // why. This `/clear` is settled — retrying it every
+                        // frame would only repeat the refusal.
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                        ui.orchestration_remit_clear_retry_at.remove(id);
+                    } else if no_delivery_pending && !permanently_excluded && retry_floor_ok {
                         ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
                         // See the compaction re-arm's identical comment above:
                         // `reassert_orchestrator_prompt` reads any existing
