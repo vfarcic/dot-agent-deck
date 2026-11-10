@@ -194,3 +194,124 @@ fn close_confirm_008_a_long_kept_path_keeps_its_tail() {
         );
     }
 }
+
+/// The row `label` is drawn on, as the dialog paints an option: the selection
+/// cursor (or a space), a space, then the label.
+fn option_row(text: &str, label: &str) -> Option<usize> {
+    text.lines()
+        .position(|l| l.contains(&format!("> {label}")) || l.contains(&format!("  {label}")))
+}
+
+/// Scenario: Arm the close confirmation for a selection whose dispatched worktree the daemon can keep, and render it in the pane and the tab scope. Each offers Cancel, Close and `Close, keep worktree` top to bottom with Cancel still the default; Down, Down, Enter answers the keep choice, while Down, Enter is still the ordinary close.
+#[spec("prompt/close-confirm/011")]
+#[test]
+fn close_confirm_011_a_dispatched_worktree_offers_close_keep_worktree() {
+    const PATH: &str = "/home/dev/code/deck-dispatch-keep-me";
+    const KEEP: &str = "Close, keep worktree";
+
+    // Issue #1958: the TUI arms the third choice only when the daemon
+    // advertises the keep and its close preview names the selection's
+    // dispatched worktree — whatever that tree's state.
+    let armed = CloseConfirmState {
+        dispatched_worktree: Some(PATH.to_string()),
+        ..CloseConfirmState::default()
+    };
+
+    for (scope, header, close_desc) in [
+        (
+            CloseScope::Pane,
+            "Close selected agent?",
+            "stop the agent and remove it",
+        ),
+        (
+            CloseScope::Tab,
+            "Close this tab and all its agents?",
+            "stop all agents and remove the tab",
+        ),
+    ] {
+        let state = CloseConfirmState {
+            scope,
+            ..armed.clone()
+        };
+        let text = buffer_to_text(&render_close_confirm_to_buffer(&state, 80, 24));
+        assert!(text.contains(header), "{scope:?}\n{text}");
+        let cancel = option_row(&text, "Cancel").expect("Cancel drawn");
+        let close = text
+            .lines()
+            .position(|l| l.contains(close_desc) && !l.contains(KEEP))
+            .unwrap_or_else(|| panic!("the ordinary {scope:?} Close drawn\n{text}"));
+        let keep = option_row(&text, KEEP)
+            .unwrap_or_else(|| panic!("{scope:?}: `{KEEP}` not offered\n{text}"));
+        assert!(
+            cancel < close && close < keep,
+            "{scope:?}: the order is Cancel, Close, `{KEEP}`\n{text}"
+        );
+        assert!(
+            text.contains("> Cancel"),
+            "{scope:?}: Cancel stays the default selection\n{text}"
+        );
+        assert!(
+            !text.contains(&format!("> {KEEP}")),
+            "{scope:?}: the keep choice must not be pre-selected\n{text}"
+        );
+        // The popup grows for the third row: the keyboard hint is still inside it.
+        let hint = text
+            .lines()
+            .position(|l| l.contains("Up/Down: navigate"))
+            .unwrap_or_else(|| panic!("{scope:?}: hint line clipped\n{text}"));
+        assert!(keep < hint, "{scope:?}\n{text}");
+    }
+
+    // A dirty tree warns AND offers the keep: the warning, the three choices
+    // and the hint all fit.
+    let dirty = CloseConfirmState {
+        kept_worktree: Some(KeptWorktree {
+            path: PATH.to_string(),
+            confirmed_dirty: true,
+            on_request: false,
+        }),
+        ..armed.clone()
+    };
+    let text = buffer_to_text(&render_close_confirm_to_buffer(&dirty, 80, 24));
+    let warn = text
+        .lines()
+        .position(|l| l.contains("Uncommitted work here is KEPT"))
+        .unwrap_or_else(|| panic!("dirty warning drawn\n{text}"));
+    let keep = option_row(&text, KEEP).unwrap_or_else(|| panic!("keep offered\n{text}"));
+    let hint = text
+        .lines()
+        .position(|l| l.contains("Up/Down: navigate"))
+        .unwrap_or_else(|| panic!("hint line clipped\n{text}"));
+    assert!(warn < keep && keep < hint, "{text}");
+
+    // The keyboard reaches the third choice, and only Enter there keeps.
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+    let mut keyed = armed.clone();
+    let _ = handle_close_confirm_key(&mut keyed, down);
+    let _ = handle_close_confirm_key(&mut keyed, down);
+    assert_eq!(keyed.selected, 2, "Down twice from Cancel reaches the keep");
+    let _ = handle_close_confirm_key(&mut keyed, down);
+    assert_eq!(keyed.selected, 2, "there is nothing below the keep");
+    let keyed_text = buffer_to_text(&render_close_confirm_to_buffer(&keyed, 80, 24));
+    assert!(keyed_text.contains(&format!("> {KEEP}")), "{keyed_text}");
+    assert!(matches!(
+        handle_close_confirm_key(&mut keyed, enter),
+        Action::ConfirmCloseKeepWorktree
+    ));
+
+    let mut plain = armed.clone();
+    let _ = handle_close_confirm_key(&mut plain, down);
+    assert!(
+        matches!(
+            handle_close_confirm_key(&mut plain, enter),
+            Action::ConfirmCloseSelected
+        ),
+        "Close next to a keep choice is still the ordinary close"
+    );
+    let mut cancel = armed;
+    assert!(matches!(
+        handle_close_confirm_key(&mut cancel, enter),
+        Action::DismissModal
+    ));
+}

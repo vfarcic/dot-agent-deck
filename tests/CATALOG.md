@@ -2076,6 +2076,13 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Does not assert:** the state seam's own supersession rule (`status/supersede/005`); tab identity binding (`mouse/tabstrip/003`); that a `None` → `Some` identity transition is treated as the same card (a deliberate agreement with the state seam, unit-tested at `resolve_close_plan`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/close-confirm/011 — A close whose selection has a dispatched worktree the daemon can keep offers `Close, keep worktree` as a third choice (issue #1958).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`, plus `handle_close_confirm_key`).
+- **Agent:** none.
+- **Asserts:** a `CloseConfirmState` armed with `dispatched_worktree: Some(path)` draws Cancel, Close and `Close, keep worktree` top to bottom in both the pane scope and the tab scope (each with its own header and Close description), Cancel stays the default, and the keyboard hint is still inside the popup — also with the dirty-tree warning drawn above the choices; Down twice from Cancel reaches the keep choice and stops there, Enter on it returns `Action::ConfirmCloseKeepWorktree`, Enter on Close still returns `Action::ConfirmCloseSelected` and Enter on Cancel `Action::DismissModal`.
+- **Does not assert:** how the TUI decides to arm it (the daemon's `CAP_KEEP_WORKTREE` and the close preview's `dispatched_worktree`, unit-tested in `daemon_client`), the keep row's description, mouse buttons, or the close itself (`prompt/close-confirm/012`).
+- **Platform coverage:** mac+linux+windows.
+
 ##### prompt/close-confirm/012 — Ctrl+W's `Close, keep worktree` closes a clean dispatched unit and keeps its worktree, saying so on the status line (issue #1958).
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
 - **Agent:** none — identity-recording `cat` probe.

@@ -2558,7 +2558,7 @@ impl EmbeddedPaneController {
     /// An empty match is reported as SUCCESS: the card is backed by nothing, so
     /// "close it" has already been achieved and the caller should drop the card
     /// rather than preserve an unclosable one.
-    fn stop_unattached_pane(&self, card: &BoundPane) -> Result<(), PaneError> {
+    fn stop_unattached_pane(&self, card: &BoundPane, keep_worktree: bool) -> Result<(), PaneError> {
         let pane_id = card.pane_id.as_str();
         // PRD #1666 part 2 (G-fix5, G-fix6): the card's agent is looked up only
         // on the daemon process it was attached on here, or else the one the
@@ -2620,7 +2620,11 @@ impl EmbeddedPaneController {
         let stop_client = bound_to_known(&self.client, incarnation.as_ref());
         let stop_id = agent_id.clone();
         match self.runtime.block_on(async move {
-            tokio::time::timeout(CTRL_W_STOP_TIMEOUT, stop_client.stop_agent(&stop_id)).await
+            tokio::time::timeout(
+                CTRL_W_STOP_TIMEOUT,
+                stop_for_close(&stop_client, &stop_id, keep_worktree),
+            )
+            .await
         }) {
             Ok(Ok(())) => {
                 tracing::info!(
@@ -2652,6 +2656,11 @@ impl EmbeddedPaneController {
                     other_protocol_close_notice(daemon, local),
                 );
                 Ok(())
+            }
+            // Issue #1958: the daemon cannot keep the worktree, so nothing
+            // was sent: a refusal, never a failure to retry as a plain close.
+            Ok(Err(e @ ClientError::KeepWorktreeUnsupported)) => {
+                Err(PaneError::Refused(e.to_string()))
             }
             Ok(Err(e)) => Err(PaneError::CommandFailed(format!(
                 "Failed to stop agent {agent_id} behind pane {pane_id}: {e}"
@@ -3137,6 +3146,10 @@ enum StopOutcome {
     /// A genuine failure: the agent may still be alive. Retain the pane and
     /// surface this message.
     Failed(String),
+    /// Issue #1958: the close asked to keep its worktree and the daemon cannot,
+    /// so nothing was sent. Retain the pane and surface this message as a
+    /// refusal, not as a failure to retry.
+    Refused(String),
     /// The stop RPC never answered.
     TimedOut,
 }
@@ -3163,6 +3176,9 @@ enum StopClass {
     /// was attached on this binary's protocol, so this daemon replaced the one
     /// it ran under, and the close cannot be checked or retried against it.
     OtherProtocol { daemon: Option<u32>, local: u32 },
+    /// Issue #1958: the stop asked to keep the worktree and the daemon does not
+    /// advertise the keep, so nothing was sent.
+    KeepRefused(String),
 }
 
 impl StopClass {
@@ -3181,6 +3197,7 @@ impl StopClass {
             StopClass::Stopped => Some(StopOutcome::Done),
             StopClass::NotFound => None,
             StopClass::Failed(msg) => Some(StopOutcome::Failed(msg)),
+            StopClass::KeepRefused(msg) => Some(StopOutcome::Refused(msg)),
             StopClass::TimedOut => Some(StopOutcome::TimedOut),
             // The close completes — the agent is not reachable through this
             // deck any more — and says why nothing was stopped here, in the
@@ -3194,6 +3211,22 @@ impl StopClass {
                 other_protocol_close_notice(daemon, local),
             )),
         }
+    }
+}
+
+/// Issue #1958: the `stop-agent` a Ctrl+W close sends — keeping the dispatched
+/// worktree when `keep_worktree` is set. Every stop of one close carries the
+/// same flag, retries and replacement stops included, because the daemon
+/// removes the worktree on whichever of them is the last live agent in it.
+async fn stop_for_close(
+    client: &DaemonClient,
+    id: &str,
+    keep_worktree: bool,
+) -> Result<(), ClientError> {
+    if keep_worktree {
+        client.stop_agent_keeping_worktree(id).await
+    } else {
+        client.stop_agent(id).await
     }
 }
 
@@ -3211,6 +3244,7 @@ fn classify_stop(
         Ok(Err(ClientError::ProtocolMismatch { daemon, local })) => {
             StopClass::OtherProtocol { daemon, local }
         }
+        Ok(Err(e @ ClientError::KeepWorktreeUnsupported)) => StopClass::KeepRefused(e.to_string()),
         Ok(Err(e)) => StopClass::Failed(e.to_string()),
         Err(_) => StopClass::TimedOut,
     }
@@ -3339,6 +3373,7 @@ async fn resolve_pane_slot_after_not_found(
     pane_id_env: &str,
     already_stopped: [String; 2],
     io_state: &AtomicU8,
+    keep_worktree: bool,
 ) -> (String, StopOutcome) {
     // Owned out here so the id survives the hard-deadline arm below, which
     // cancels the loop mid-round and therefore cannot return it.
@@ -3351,6 +3386,7 @@ async fn resolve_pane_slot_after_not_found(
             already_stopped,
             io_state,
             &mut last_tried,
+            keep_worktree,
         ),
     )
     .await;
@@ -3390,6 +3426,7 @@ async fn chase_pane_slot_owner(
     already_stopped: [String; 2],
     io_state: &AtomicU8,
     last_tried: &mut String,
+    keep_worktree: bool,
 ) -> StopOutcome {
     let mut already_stopped: Vec<String> = already_stopped.into();
     let started = tokio::time::Instant::now();
@@ -3445,7 +3482,11 @@ async fn chase_pane_slot_owner(
                     "close_pane: a replacement agent now owns this pane slot — stopping it \
                      instead of orphaning it"
                 );
-                let stop = tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&id)).await;
+                let stop = tokio::time::timeout(
+                    CTRL_W_STOP_TIMEOUT,
+                    stop_for_close(client, &id, keep_worktree),
+                )
+                .await;
                 let class = classify_stop(stop, &id);
                 last_tried.clone_from(&id);
                 if let Some(outcome) = class.resolved() {
@@ -4697,152 +4738,35 @@ fn process_agent_output_chunk(
     }
 }
 
-impl PaneController for EmbeddedPaneController {
-    /// The production implementation of the on-demand attach: resolve
-    /// `pane_id` through `list_agents` and wire the daemon's pane. Delegates to
-    /// the inherent [`EmbeddedPaneController::hydrate_pane`], which is a no-op
-    /// returning `true` when the pane is already wired.
-    fn try_hydrate_pane(&self, card: &BoundPane) -> bool {
-        self.hydrate_pane(card)
-    }
-
-    fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
-        let mut panes = self.panes.lock().unwrap();
-        if !panes.contains_key(pane_id) {
-            return Err(PaneError::CommandFailed(format!(
-                "Pane {pane_id} not found"
-            )));
-        }
-        for (id, pane) in panes.iter_mut() {
-            pane.is_focused = id == pane_id;
-        }
-        Ok(())
-    }
-
-    /// PRD #83: surface the inherent [`EmbeddedPaneController::focused_pane_id`]
-    /// through the trait so `TabManager`'s tab-switch focus capture can
-    /// read it via `Arc<dyn PaneController>`.
-    fn focused_pane_id(&self) -> Option<String> {
-        EmbeddedPaneController::focused_pane_id(self)
-    }
-
-    /// PRD #110 followup: snapshot the daemon-side `agent_id` currently
-    /// bound to a pane. Brand-new pane creation sites call this right
-    /// after `create_pane_with_options` returns so the local placeholder
-    /// can be born with the correct `agent_id` and the strict-equality
-    /// reuse guard in `AppState::apply_event` accepts the agent's first
-    /// `SessionStart` event. The id is held under a `Mutex` because PRD
-    /// #92 F12 rotates it on F9 clear=true respawns; we clone the latest
-    /// value while the lock is held and never await across it.
-    fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
-        self.pane_attachment(pane_id)
-            .map(|attachment| attachment.agent_id)
-    }
-
-    fn forget_pane(&self, pane_id: &str) -> bool {
-        // Dropping the pane drops its `StreamBackend`, which aborts the I/O
-        // task and closes the socket — including a reattach loop the stop's
-        // STREAM_END started, which would otherwise poll for a replacement
-        // agent that is not coming.
-        let removed = self.panes.lock().unwrap().remove(pane_id);
-        removed.is_some()
-    }
-
-    fn create_pane_with_options(
-        &self,
-        command: Option<&str>,
-        cwd: Option<&str>,
-        opts: AgentSpawnOptions<'_>,
-    ) -> Result<(String, String), PaneError> {
-        // The pane ID is allocated up front because it has to be injected into
-        // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
-        // below fails, the ID is intentionally consumed (a gap in the
-        // sequence is harmless and avoids racing concurrent `create_pane`
-        // calls to revert the counter).
-        let pane_id = self.allocate_id();
-        // Single source of truth for the in-session label, local Pane.name,
-        // and the daemon's StartAgent.display_name. `resolve_display_name`
-        // applies trim + `is_valid_display_name` + shell fallback, so all
-        // downstream sites store the SAME string by construction — fixing
-        // the divergence M2.11 fixup-3 reviewer P2 / auditor LOW called
-        // out (bare `"   "`, surround whitespace, and control-byte
-        // commands all converge here).
-        let resolved = agent_pty::resolve_display_name(opts.display_name, command);
-
-        let result = self.create_stream_pane(
-            pane_id,
-            command,
-            cwd,
-            &resolved,
-            opts.tab_membership,
-            opts.agent_type,
-            opts.rows,
-            opts.cols,
-            opts.seed,
-            opts.remember_command,
-            opts.authoring_kind,
-        );
-        result.map(|id| (id, resolved))
-    }
-
+impl EmbeddedPaneController {
     /// PRD #1666 part 2 (G-fix6): a card with a local pane closes it exactly as
-    /// [`Self::close_pane`] does, bound to the process it was attached on; one
-    /// without stops its agent only on the process the card was learned from.
+    /// [`PaneController::close_pane`] does, bound to the process it was
+    /// attached on; one without stops its agent only on the process the card
+    /// was learned from.
     ///
     /// G-fix7: a local pane under the same pane id that was attached on another
     /// process is not the card's. A live one is someone else's agent, and the
     /// close is refused with [`crate::daemon_client::AGENT_GONE_AFTER_RESTART`];
     /// one that lost its agent is dropped, and the card's own agent is stopped
     /// on its own process.
-    fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+    ///
+    /// Issue #1958: `keep_worktree` rides on every stop the close sends.
+    fn close_card_with(&self, card: &BoundPane, keep_worktree: bool) -> Result<(), PaneError> {
         match self.local_pane_for(card) {
-            LocalPaneFor::Card => self.close_pane(&card.pane_id),
+            LocalPaneFor::Card => self.close_pane_with(&card.pane_id, keep_worktree),
             LocalPaneFor::Other if !self.drop_replaced_local_pane(card) => Err(PaneError::Refused(
                 crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
             )),
-            LocalPaneFor::Other | LocalPaneFor::None => self.stop_unattached_pane(card),
+            LocalPaneFor::Other | LocalPaneFor::None => {
+                self.stop_unattached_pane(card, keep_worktree)
+            }
         }
     }
 
-    /// PRD #1666 part 2 (G-fix7): focus the local pane behind `card` only when
-    /// it is the card's. A live pane attached on another process is refused
-    /// with [`crate::daemon_client::AGENT_GONE_AFTER_RESTART`]; one that lost
-    /// its agent is dropped and reads as no local pane, so the caller's attach
-    /// of the card's own agent takes its place.
-    fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
-        match self.local_pane_for(card) {
-            LocalPaneFor::Card => self.focus_pane(&card.pane_id),
-            LocalPaneFor::Other if !self.drop_replaced_local_pane(card) => Err(PaneError::Refused(
-                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
-            )),
-            LocalPaneFor::Other | LocalPaneFor::None => self.focus_pane(&card.pane_id),
-        }
-    }
-
-    fn local_pane_is_cards(&self, card: &BoundPane) -> bool {
-        matches!(self.local_pane_for(card), LocalPaneFor::Card)
-    }
-
-    fn pane_incarnation(&self, pane_id: &str) -> Option<Incarnation> {
-        self.pane_attachment(pane_id)
-            .and_then(|attachment| attachment.incarnation)
-    }
-
-    fn panes_lost_to_restart(&self) -> Vec<(String, Option<Incarnation>)> {
-        let panes = self.panes.lock().unwrap();
-        panes
-            .iter()
-            .filter(|(_, pane)| {
-                *pane.backend.lost.lock().unwrap() == Some(PaneLostReason::DeckRestarted)
-            })
-            .map(|(id, pane)| {
-                let attached_on = pane.backend.attached.lock().unwrap().incarnation.clone();
-                (id.clone(), attached_on)
-            })
-            .collect()
-    }
-
-    fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+    /// The Ctrl+W close of `pane_id` — [`PaneController::close_pane`], and
+    /// with `keep_worktree` (issue #1958) every stop it sends asks the daemon
+    /// to keep the dispatched worktree.
+    fn close_pane_with(&self, pane_id: &str, keep_worktree: bool) -> Result<(), PaneError> {
         // Hold the registry lock across the whole close so a stop-agent
         // failure can leave the pane in place for the user to retry. The
         // backend teardown (blocking child reap or async stop-agent) is
@@ -4873,7 +4797,10 @@ impl PaneController for EmbeddedPaneController {
                     // the pane id is the controller's own, with no card stamp.
                     // A card's close comes through `close_card` and carries
                     // the process the card was learned from.
-                    return self.stop_unattached_pane(&BoundPane::held_by_controller(pane_id));
+                    return self.stop_unattached_pane(
+                        &BoundPane::held_by_controller(pane_id),
+                        keep_worktree,
+                    );
                 }
             }
         };
@@ -4939,7 +4866,7 @@ impl PaneController for EmbeddedPaneController {
             // Attempt 1: the id this pane was bound to when the close started.
             let first = tokio::time::timeout(
                 CTRL_W_STOP_TIMEOUT,
-                client.stop_agent(&initial_agent_id),
+                stop_for_close(&client, &initial_agent_id, keep_worktree),
             )
             .await;
             if let Some(outcome) = classify_stop(first, &initial_agent_id).resolved() {
@@ -4957,8 +4884,11 @@ impl PaneController for EmbeddedPaneController {
                 retry_agent_id = %retry_id,
                 "close_pane: stop-agent returned 'not found'; retrying once with currently-bound agent id"
             );
-            let second =
-                tokio::time::timeout(CTRL_W_STOP_TIMEOUT, client.stop_agent(&retry_id)).await;
+            let second = tokio::time::timeout(
+                CTRL_W_STOP_TIMEOUT,
+                stop_for_close(&client, &retry_id, keep_worktree),
+            )
+            .await;
             if let Some(outcome) = classify_stop(second, &retry_id).resolved() {
                 return (retry_id, outcome);
             }
@@ -4976,6 +4906,7 @@ impl PaneController for EmbeddedPaneController {
                 &pane_id_env,
                 [initial_agent_id, retry_id],
                 &io_state,
+                keep_worktree,
             )
             .await
         });
@@ -5076,9 +5007,180 @@ impl PaneController for EmbeddedPaneController {
                     "stop-agent timed out for pane {pane_id}"
                 )))
             }
+            StopOutcome::Refused(message) => {
+                // Issue #1958: the close asked to keep the worktree and the
+                // daemon cannot, so no stop was sent and the agent is
+                // untouched. Same restore as a failure, but said as the
+                // refusal it is — the user chose to keep the worktree, and a
+                // plain close would remove it.
+                tracing::warn!(
+                    agent_id = %agent_id,
+                    "keep-worktree close refused by the daemon — pane retained"
+                );
+                let restored = Pane {
+                    backend: s,
+                    screen: pane.screen,
+                    name: pane.name,
+                    is_focused: pane.is_focused,
+                    command: pane.command,
+                    cwd: pane.cwd,
+                    mouse_mode: pane.mouse_mode,
+                    hyperlinks: pane.hyperlinks,
+                    bytes_since_spawn: pane.bytes_since_spawn,
+                    scroll_notice_armed_at: pane.scroll_notice_armed_at,
+                };
+                self.panes
+                    .lock()
+                    .unwrap()
+                    .insert(pane_id.to_string(), restored);
+                Err(PaneError::Refused(message))
+            }
+        }
+    }
+}
+
+impl PaneController for EmbeddedPaneController {
+    /// The production implementation of the on-demand attach: resolve
+    /// `pane_id` through `list_agents` and wire the daemon's pane. Delegates to
+    /// the inherent [`EmbeddedPaneController::hydrate_pane`], which is a no-op
+    /// returning `true` when the pane is already wired.
+    fn try_hydrate_pane(&self, card: &BoundPane) -> bool {
+        self.hydrate_pane(card)
+    }
+
+    fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        let mut panes = self.panes.lock().unwrap();
+        if !panes.contains_key(pane_id) {
+            return Err(PaneError::CommandFailed(format!(
+                "Pane {pane_id} not found"
+            )));
+        }
+        for (id, pane) in panes.iter_mut() {
+            pane.is_focused = id == pane_id;
+        }
+        Ok(())
+    }
+
+    /// PRD #83: surface the inherent [`EmbeddedPaneController::focused_pane_id`]
+    /// through the trait so `TabManager`'s tab-switch focus capture can
+    /// read it via `Arc<dyn PaneController>`.
+    fn focused_pane_id(&self) -> Option<String> {
+        EmbeddedPaneController::focused_pane_id(self)
+    }
+
+    /// PRD #110 followup: snapshot the daemon-side `agent_id` currently
+    /// bound to a pane. Brand-new pane creation sites call this right
+    /// after `create_pane_with_options` returns so the local placeholder
+    /// can be born with the correct `agent_id` and the strict-equality
+    /// reuse guard in `AppState::apply_event` accepts the agent's first
+    /// `SessionStart` event. The id is held under a `Mutex` because PRD
+    /// #92 F12 rotates it on F9 clear=true respawns; we clone the latest
+    /// value while the lock is held and never await across it.
+    fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+        self.pane_attachment(pane_id)
+            .map(|attachment| attachment.agent_id)
+    }
+
+    fn forget_pane(&self, pane_id: &str) -> bool {
+        // Dropping the pane drops its `StreamBackend`, which aborts the I/O
+        // task and closes the socket — including a reattach loop the stop's
+        // STREAM_END started, which would otherwise poll for a replacement
+        // agent that is not coming.
+        let removed = self.panes.lock().unwrap().remove(pane_id);
+        removed.is_some()
+    }
+
+    fn create_pane_with_options(
+        &self,
+        command: Option<&str>,
+        cwd: Option<&str>,
+        opts: AgentSpawnOptions<'_>,
+    ) -> Result<(String, String), PaneError> {
+        // The pane ID is allocated up front because it has to be injected into
+        // the child's environment as DOT_AGENT_DECK_PANE_ID. If the spawn
+        // below fails, the ID is intentionally consumed (a gap in the
+        // sequence is harmless and avoids racing concurrent `create_pane`
+        // calls to revert the counter).
+        let pane_id = self.allocate_id();
+        // Single source of truth for the in-session label, local Pane.name,
+        // and the daemon's StartAgent.display_name. `resolve_display_name`
+        // applies trim + `is_valid_display_name` + shell fallback, so all
+        // downstream sites store the SAME string by construction — fixing
+        // the divergence M2.11 fixup-3 reviewer P2 / auditor LOW called
+        // out (bare `"   "`, surround whitespace, and control-byte
+        // commands all converge here).
+        let resolved = agent_pty::resolve_display_name(opts.display_name, command);
+
+        let result = self.create_stream_pane(
+            pane_id,
+            command,
+            cwd,
+            &resolved,
+            opts.tab_membership,
+            opts.agent_type,
+            opts.rows,
+            opts.cols,
+            opts.seed,
+            opts.remember_command,
+            opts.authoring_kind,
+        );
+        result.map(|id| (id, resolved))
+    }
+
+    /// See [`EmbeddedPaneController::close_card_with`].
+    fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.close_card_with(card, false)
+    }
+
+    fn close_card_keeping_worktree(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.close_card_with(card, true)
+    }
+
+    /// PRD #1666 part 2 (G-fix7): focus the local pane behind `card` only when
+    /// it is the card's. A live pane attached on another process is refused
+    /// with [`crate::daemon_client::AGENT_GONE_AFTER_RESTART`]; one that lost
+    /// its agent is dropped and reads as no local pane, so the caller's attach
+    /// of the card's own agent takes its place.
+    fn focus_card(&self, card: &BoundPane) -> Result<(), PaneError> {
+        match self.local_pane_for(card) {
+            LocalPaneFor::Card => self.focus_pane(&card.pane_id),
+            LocalPaneFor::Other if !self.drop_replaced_local_pane(card) => Err(PaneError::Refused(
+                crate::daemon_client::AGENT_GONE_AFTER_RESTART.to_string(),
+            )),
+            LocalPaneFor::Other | LocalPaneFor::None => self.focus_pane(&card.pane_id),
         }
     }
 
+    fn local_pane_is_cards(&self, card: &BoundPane) -> bool {
+        matches!(self.local_pane_for(card), LocalPaneFor::Card)
+    }
+
+    fn pane_incarnation(&self, pane_id: &str) -> Option<Incarnation> {
+        self.pane_attachment(pane_id)
+            .and_then(|attachment| attachment.incarnation)
+    }
+
+    fn panes_lost_to_restart(&self) -> Vec<(String, Option<Incarnation>)> {
+        let panes = self.panes.lock().unwrap();
+        panes
+            .iter()
+            .filter(|(_, pane)| {
+                *pane.backend.lost.lock().unwrap() == Some(PaneLostReason::DeckRestarted)
+            })
+            .map(|(id, pane)| {
+                let attached_on = pane.backend.attached.lock().unwrap().incarnation.clone();
+                (id.clone(), attached_on)
+            })
+            .collect()
+    }
+
+    fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+        self.close_pane_with(pane_id, false)
+    }
+
+    fn close_pane_keeping_worktree(&self, pane_id: &str) -> Result<(), PaneError> {
+        self.close_pane_with(pane_id, true)
+    }
     fn list_panes(&self) -> Result<Vec<PaneInfo>, PaneError> {
         let panes = self.panes.lock().unwrap();
         let mut list: Vec<(u64, PaneInfo)> = panes

@@ -76,7 +76,7 @@ A chord works only while its command is on its default letter and no other comma
 
 ### `Ctrl+W` closes only from command mode
 
-While you type in a pane, `Ctrl+W` is passed through (it deletes the previous word in shells and editors). In command mode it opens a confirmation that defaults to **Cancel**; choose **Close** to stop the agent and remove its card.
+While you type in a pane, `Ctrl+W` is passed through (it deletes the previous word in shells and editors). In command mode it opens a confirmation that defaults to **Cancel**; choose **Close** to stop the agent and remove its card. For a dispatched unit, a third choice, **Close, keep worktree**, closes it the same way but leaves its worktree on disk.
 
 ### `Ctrl+Z` zooms the focused agent pane
 
@@ -217,7 +217,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Rename** | `r` | Type the new name · `Enter` confirms · `Esc` cancels |
 | **Generate config** | `g` | `Up` / `Down` (or `k` / `j`) to choose **Yes**, **No** or **Never** · `Enter` confirms · `Esc` cancels. **Yes** asks the selected agent to write `.dot-agent-deck.toml`; **Never** stops offering it for that directory. |
 | **Quit** | `Ctrl+C` in command mode | `Up` / `Down` (or `k` / `j`) to choose **Detach** (default), **Stop** or **Cancel** · `Enter` confirms · `Esc` dismisses · `Ctrl+C` again leaves immediately. Clicking the footer's `[Quit Ctrl+C]` opens this same dialog. **Detach** keeps the agents running; **Stop** stops them and the daemon, asking once more first while agents are running. See [Resuming Sessions](session-management.md#resuming-sessions). |
-| **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed ahead that is still waiting to be read when it opens is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
+| **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close**, and for a dispatched unit **Close, keep worktree** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed ahead that is still waiting to be read when it opens is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
 | **Upgrade** | `u`, or a click on the footer's update notice | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Upgrade** · `Enter` confirms · `Esc` closes · `PageUp` / `PageDown` (or the mouse wheel) scroll a plan too long for the terminal; **Upgrade** waits until the whole plan has been on screen. It asks about one copy at a time; after one copy is upgraded, **Cancel** skips the next. A copy the TUI cannot upgrade offers only **Close**. See [Upgrade from the TUI](installation.md#upgrade-from-the-tui). |
 | **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
 | **Help overlay** | `?` | `?`, `Esc` or `q` closes it |
