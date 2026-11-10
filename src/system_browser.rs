@@ -761,7 +761,15 @@ mod tests {
             shown,
             "Opening https://github.com/o/r/pull/12 in the browser"
         );
-        assert_eq!(msg, "Opened https://github.com/o/r/pull/12");
+        // Either settled outcome of a launch that went through: on a loaded
+        // macOS box the first launch of a freshly written script can outlast
+        // `LAUNCH_GRACE` (PR #2177), and the watch then settles as still
+        // running. What this test is about is the argument vector below.
+        assert!(
+            msg == "Opened https://github.com/o/r/pull/12"
+                || msg == "Opening https://github.com/o/r/pull/12 in the browser",
+            "the launch went through: {msg}"
+        );
         assert_eq!(
             wait_for_file(&record),
             "1|https://github.com/o/r/pull/12|\n"
