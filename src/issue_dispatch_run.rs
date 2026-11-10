@@ -163,11 +163,17 @@ pub fn worktree_of_record(record: &AgentRecord) -> Option<PathBuf> {
 
 /// If `worktree_dir` is a dispatched worktree, drop its registry entry and
 /// return it (owning clone + removal policy); `None` otherwise (an ordinary
-/// agent's cwd, or an entry already taken). The close watcher only calls this
-/// once it has confirmed (via [`worktree_still_in_use`]) that the LAST agent
-/// rooted in the worktree has closed, so for a multi-role orchestration the
-/// entry survives every earlier sibling close and is taken exactly once, on the
-/// final close.
+/// agent's cwd, or an entry already taken). Whoever takes the entry owns the
+/// tree's fate, and the entry is never put back.
+///
+/// Two kinds of caller take it. An ORDINARY cleanup takes it to remove the
+/// tree, and only once nothing it can see still runs there:
+/// [`cleanup_after_stop`] after [`worktree_still_in_use`] finds no live agent
+/// rooted in it, and `close_agents::cleanup_worktree` after it holds the
+/// directory against new spawns — so for a multi-role orchestration the entry
+/// survives every earlier ordinary sibling close. An EXPLICIT keep
+/// ([`keep_on_request`]) takes it before stopping anything, whatever siblings
+/// still run in the tree, so that no ordinary cleanup finds it afterwards.
 pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<WorktreeEntry> {
     worktrees
         .lock()
@@ -276,8 +282,11 @@ pub fn dispatched_worktree_of_panes(
 
 /// Issue #1958: keep `worktree` on request — take its registry entry, so that
 /// no cleanup, this close's or any other's, finds an entry to remove, and
-/// answer the keep to report. `None` when the deck holds no entry for it: an
-/// unrecorded tree is not removed by a close, so there is nothing to keep.
+/// answer the keep to report. `None` when the deck holds no entry for it: the
+/// tree was never recorded, another keep already holds it, or an ordinary
+/// cleanup has already taken it for removal. None of those is a keep this call
+/// made, so the caller reports none — and, having asked to keep, runs no
+/// ordinary removal either.
 ///
 /// Called SYNCHRONOUSLY by `StopAgent` and `CloseAgents` once the close is
 /// admitted and before any agent is stopped, whatever else still runs in the

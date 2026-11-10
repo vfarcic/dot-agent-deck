@@ -7362,10 +7362,27 @@ async fn handle_connection(
             // daemon no longer records: no close removes it, and the user finds
             // and removes it with `dot-agent-deck worktree reclaim`. The entry is
             // not put back — that would hand the tree to the next ordinary close.
+            //
+            // Round 2: a latch that finds no entry is NOT a keep and is not
+            // reported as one. The ordinary cleanups take the entry only once
+            // they see nothing running in the tree, so for an agent they saw
+            // running there it means an unrecorded tree or one another keep
+            // already holds. For an agent whose process had already exited, or
+            // one started in the tree after an ordinary stop's cleanup looked,
+            // it can also be a tree that cleanup already took for removal; that
+            // removal is not undone, and the cleanup that owns it reports what
+            // it did.
             let kept_on_request = if keep_worktree {
-                dispatched_worktree.as_deref().and_then(|worktree| {
+                let kept = dispatched_worktree.as_deref().and_then(|worktree| {
                     crate::issue_dispatch_run::keep_on_request(&worktree_registry, worktree)
-                })
+                });
+                if kept.is_none() && dispatched_worktree.is_some() {
+                    tracing::info!(
+                        agent_id = %id,
+                        "stop: keep requested, but the deck holds no record of the agent's worktree to keep"
+                    );
+                }
+                kept
             } else {
                 None
             };
@@ -7430,19 +7447,24 @@ async fn handle_connection(
                         // Issue #1958: a keep latched above has nothing left to
                         // clean up; its report is broadcast from here, after
                         // the stop, once — the same place an ordinary stop's
-                        // verdict comes from.
+                        // verdict comes from. A stop that ASKED to keep never
+                        // takes the ordinary removal path, whatever its latch
+                        // found: a latch that found no entry means another keep
+                        // already holds the tree, an ordinary cleanup already
+                        // owns its removal, or the deck never recorded it — and
+                        // an entry recorded again since is not this stop's to
+                        // remove. Only a latched keep is reported as one.
                         tokio::spawn(async move {
                             registry.pause_point("stop-worktree-cleanup").await;
-                            let kept = match kept_on_request {
-                                Some(kept) => Some(kept),
-                                None => {
-                                    crate::issue_dispatch_run::cleanup_after_stop(
-                                        &registry.agent_records_for_worktree_cleanup(),
-                                        &worktree_registry,
-                                        &worktree,
-                                    )
-                                    .await
-                                }
+                            let kept = if keep_worktree {
+                                kept_on_request
+                            } else {
+                                crate::issue_dispatch_run::cleanup_after_stop(
+                                    &registry.agent_records_for_worktree_cleanup(),
+                                    &worktree_registry,
+                                    &worktree,
+                                )
+                                .await
                             };
                             if let Some(kept) = kept {
                                 // Errs only when nothing is subscribed (a

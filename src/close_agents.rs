@@ -1761,7 +1761,9 @@ async fn close_one(
         };
         if freed && let Some(worktree) = worktree {
             out.worktree_verdict = Some(if keep_worktree {
-                // The latch found no record of it: nothing to keep or remove.
+                // The latch found no record of it — never recorded, held by
+                // another keep, or taken by an ordinary cleanup that owns its
+                // removal — so this close kept nothing and removes nothing.
                 WorktreeVerdict {
                     path: worktree.to_string_lossy().into_owned(),
                     verdict: WorktreeVerdictKind::NotRecorded,
@@ -1809,19 +1811,31 @@ pub async fn cleanup_worktree(
     let worktrees = worktrees.clone();
     let event_tx = event_tx.clone();
     let task = tokio::spawn(async move {
-        let Some(entry) = crate::issue_dispatch_run::take_worktree(&worktrees, &worktree) else {
+        let recorded = worktrees
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&worktree);
+        if !recorded {
             return WorktreeVerdictKind::NotRecorded;
-        };
+        }
+        registry.pause_point("close-worktree-cleanup").await;
+        // Issue #1958 round 2: the hold comes BEFORE the entry is taken. Taking
+        // it first and putting it back when something still ran in the tree hid
+        // the entry for that window, and a keep latched in it
+        // ([`crate::issue_dispatch_run::keep_on_request`]) found nothing to
+        // keep — then the restored entry handed the tree to the next ordinary
+        // close. Now the entry is never taken while anything this daemon runs
+        // is rooted in the tree, and a keep latches before its agent's record
+        // goes, so a cleanup that gets the hold finds the entry already taken
+        // by any keep admitted for an agent still running there.
         let Some(_removal_hold) = registry.hold_dir_for_removal(&worktree) else {
-            // Something still runs in it. Put the entry back so the close that
-            // stops it can clean up.
-            crate::issue_dispatch_run::record_worktree(
-                &worktrees,
-                &worktree,
-                &entry.clone_dir,
-                entry.policy,
-            );
+            // Something still runs in it; the entry stays for the close that
+            // stops it.
             return WorktreeVerdictKind::StillInUse;
+        };
+        let Some(entry) = crate::issue_dispatch_run::take_worktree(&worktrees, &worktree) else {
+            // A keep took it between the look above and the hold.
+            return WorktreeVerdictKind::NotRecorded;
         };
         let removal = crate::issue_dispatch_run::remove_worktree_outcome(
             &worktree,
@@ -3625,6 +3639,282 @@ mod tests {
         assert!(wt.exists(), "the tree is kept");
         assert!(sentinel.exists(), "the ignored sentinel survives");
         assert!(!deck.worktrees.lock().unwrap().contains_key(&wt));
+        deck.shutdown().await;
+    }
+
+    /// Every `WorktreeKept` broadcast already sent, without waiting: the
+    /// callers wait on the request or the pause that follows each broadcast
+    /// first, so a count read here is the whole count.
+    fn drain_worktree_kept(
+        events: &mut broadcast::Receiver<BroadcastMsg>,
+    ) -> Vec<crate::issue_dispatch_run::KeptWorktree> {
+        let mut kept = Vec::new();
+        loop {
+            match events.try_recv() {
+                Ok(BroadcastMsg::WorktreeKept(k)) => kept.push(k),
+                Ok(_) | Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => return kept,
+            }
+        }
+    }
+
+    /// Scenario: issue #1958 round 2 (G1) — a dispatched unit U and two
+    /// unrelated agents V and W share one clean recorded worktree. U is closed
+    /// the ordinary way and its worktree cleanup is held where it used to have
+    /// taken the record before checking whether anything else runs in the
+    /// tree; meanwhile V is closed keeping the worktree. Once U's cleanup is
+    /// let go, W — whatever remains — is closed the ordinary way. The tree and
+    /// its ignored sentinel survive, and exactly one kept-on-request is
+    /// reported.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_ordinary_cleanup_checking_a_shared_tree_cannot_swallow_a_keep() {
+        let deck = Deck::new().await;
+        let (u, _id, wt) = single_in_worktree(&deck, "solo").await;
+        let sentinel = ignored_sentinel(&deck.dir.path().join("repo-solo"), &wt);
+        let v = deck.start_in("v", "sleep 30", None, &wt).await;
+        let w = deck.start_in("w", "sleep 30", None, &wt).await;
+        let mut events = deck.event_tx.subscribe();
+
+        let (u_reached, u_release) = deck.registry.pause_at_for_test("close-worktree-cleanup");
+        let client = deck.other_client();
+        let close_u = tokio::spawn(async move {
+            client
+                .close_agents(by_name("solo"), None, false, false, false)
+                .await
+                .expect("a report")
+        });
+        u_reached
+            .await
+            .expect("U's worktree cleanup is held inside its check");
+        assert!(!deck.live(&u), "U is stopped before its cleanup runs");
+
+        let (v_done, v_done_release) = deck
+            .registry
+            .pause_at_for_test("stop-worktree-cleanup-done");
+        deck.client
+            .stop_agent_keeping_worktree(&v)
+            .await
+            .expect("this daemon keeps");
+        v_done.await.expect("V's stop finishes its worktree step");
+        let _ = v_done_release.send(());
+        let _ = u_release.send(());
+        let report = close_u.await.expect("the close task");
+        assert_eq!(
+            report.targets[0].outcome,
+            CloseOutcome::Closed,
+            "{report:?}"
+        );
+
+        let report = deck
+            .close(
+                CloseSelector::Pane {
+                    pane_id: "w".into(),
+                },
+                None,
+                false,
+                false,
+            )
+            .await;
+        assert_eq!(
+            report.targets[0].outcome,
+            CloseOutcome::Closed,
+            "{report:?}"
+        );
+        assert!(!deck.live(&v) && !deck.live(&w));
+        assert!(
+            wt.exists(),
+            "an ordinary cleanup's check hid the record from V's keep, and a later close removed the tree: {report:?}"
+        );
+        assert!(sentinel.exists(), "the ignored sentinel survives");
+        assert_eq!(
+            drain_worktree_kept(&mut events),
+            vec![crate::issue_dispatch_run::KeptWorktree::on_request(&wt)],
+            "exactly one kept-on-request, from V's keep"
+        );
+        deck.shutdown().await;
+    }
+
+    /// Scenario: issue #1958 round 2 (G1) — an agent is stopped asking to keep
+    /// its worktree when the deck holds no record of that tree, so there is
+    /// nothing to keep; the tree is recorded again before the stop's own
+    /// cleanup runs. That cleanup still removes nothing: a stop that asked to
+    /// keep never takes the ordinary removal path, and reports no keep it did
+    /// not make.
+    #[tokio::test]
+    async fn a_keep_stop_that_found_no_record_never_removes() {
+        let deck = Deck::new().await;
+        let repo = deck.dir.path().join("repo-nr");
+        let wt = deck.dir.path().join("repo-nr-dispatch");
+        init_repo_with_worktree(deck.dir.path(), &repo, &wt);
+        let sentinel = ignored_sentinel(&repo, &wt);
+        let agent = deck.start_in("nr", "sleep 30", None, &wt).await;
+        let mut events = deck.event_tx.subscribe();
+
+        let (cleanup_reached, cleanup_release) =
+            deck.registry.pause_at_for_test("stop-worktree-cleanup");
+        let (done_reached, done_release) = deck
+            .registry
+            .pause_at_for_test("stop-worktree-cleanup-done");
+        deck.client
+            .stop_agent_keeping_worktree(&agent)
+            .await
+            .expect("this daemon keeps");
+        cleanup_reached.await.expect("the stop's cleanup is held");
+        crate::issue_dispatch_run::record_worktree(
+            &deck.worktrees,
+            &wt,
+            &repo,
+            crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+        );
+        let _ = cleanup_release.send(());
+        done_reached.await.expect("the stop's cleanup finishes");
+        let _ = done_release.send(());
+
+        assert!(!deck.live(&agent));
+        assert!(
+            wt.exists(),
+            "a stop that asked to keep ran the ordinary removal"
+        );
+        assert!(sentinel.exists(), "the ignored sentinel survives");
+        assert!(
+            drain_worktree_kept(&mut events).is_empty(),
+            "nothing was kept on request, so nothing is reported as kept"
+        );
+        deck.shutdown().await;
+    }
+
+    /// Scenario: issue #1958 round 2 (G3) — a close asking to keep the
+    /// worktree is refused: once because the caller's claim is forged, once
+    /// by the default policy because the unit's agent is busy. Either way the
+    /// deck still records the tree, which is untouched, and no keep is
+    /// reported.
+    #[tokio::test]
+    async fn a_refused_keep_close_keeps_the_record_and_reports_no_keep() {
+        let deck = Deck::new().await;
+        let (agent, _id, wt) = single_in_worktree(&deck, "solo").await;
+        let mut events = deck.event_tx.subscribe();
+        let forged = CallerClaim {
+            pane_id: "disp".to_string(),
+            token: "0".repeat(crate::hook_provenance::TOKEN_LEN),
+        };
+        let report = deck
+            .client
+            .close_agents(by_name("solo"), Some(forged), false, false, true)
+            .await
+            .expect("a report");
+        assert_eq!(
+            report.refused.expect("refused whole").reason,
+            CloseRefusalReason::NotAttested
+        );
+        assert!(deck.live(&agent));
+        assert!(
+            deck.worktrees.lock().unwrap().contains_key(&wt),
+            "an unauthorized keep must not take the record"
+        );
+
+        deck.thinking("solo", &agent).await;
+        let report = deck
+            .client
+            .close_agents(by_name("solo"), None, false, false, true)
+            .await
+            .expect("a report");
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Refused, "{target:?}");
+        assert_eq!(target.reason, Some(CloseRefusalReason::Busy), "{target:?}");
+        assert_eq!(target.worktree_verdict, None, "{target:?}");
+        assert!(deck.live(&agent));
+        assert!(
+            deck.worktrees.lock().unwrap().contains_key(&wt),
+            "a keep the default policy refused must not take the record"
+        );
+        assert!(wt.exists());
+        assert!(
+            drain_worktree_kept(&mut events).is_empty(),
+            "a refused close reports no keep"
+        );
+        deck.shutdown().await;
+    }
+
+    /// Scenario: issue #1958 round 2 (G3) — a stop asking to keep the
+    /// worktree is admitted, and then stopping the agent fails. The agent
+    /// still runs, the tree is on disk, the deck no longer records it (so no
+    /// later close removes it), and the keep is reported exactly once — both
+    /// through a pane's stop and through the close verb.
+    #[tokio::test]
+    async fn an_admitted_keep_whose_stop_fails_keeps_the_tree_and_reports_once() {
+        let deck = Deck::new().await;
+        let (agent, _id, wt) = single_in_worktree(&deck, "solo").await;
+        let mut events = deck.event_tx.subscribe();
+        deck.registry.fail_next_close_for_test(&agent);
+        deck.client
+            .stop_agent_keeping_worktree(&agent)
+            .await
+            .expect_err("the injected stop failure is reported");
+        assert!(deck.live(&agent), "the failed stop left the agent running");
+        assert!(wt.exists());
+        assert!(!deck.worktrees.lock().unwrap().contains_key(&wt));
+        assert_eq!(
+            drain_worktree_kept(&mut events),
+            vec![crate::issue_dispatch_run::KeptWorktree::on_request(&wt)]
+        );
+
+        let (other, _id, other_wt) = single_in_worktree(&deck, "verb").await;
+        deck.registry.fail_next_close_for_test(&other);
+        let report = deck
+            .client
+            .close_agents(by_name("verb"), None, false, false, true)
+            .await
+            .expect("a report");
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Failed, "{target:?}");
+        assert_eq!(
+            target.worktree_verdict,
+            Some(WorktreeVerdict {
+                path: other_wt.to_string_lossy().into_owned(),
+                verdict: WorktreeVerdictKind::KeptOnRequest,
+            })
+        );
+        assert!(deck.live(&other));
+        assert!(other_wt.exists());
+        assert!(!deck.worktrees.lock().unwrap().contains_key(&other_wt));
+        assert_eq!(
+            drain_worktree_kept(&mut events),
+            vec![crate::issue_dispatch_run::KeptWorktree::on_request(
+                &other_wt
+            )]
+        );
+        deck.shutdown().await;
+    }
+
+    /// Scenario: issue #1958 round 2 (G3) — the TUI's tab close and the
+    /// desktop's orchestration close put "keep worktree" on every role's stop.
+    /// Both roles share one tree; it and its ignored sentinel survive, and the
+    /// keep is reported exactly once, not once per role.
+    #[tokio::test]
+    async fn a_keep_on_every_role_of_a_shared_tree_reports_once() {
+        let deck = Deck::new().await;
+        let (o, w, wt, sentinel) = two_roles_in_worktree(&deck, "orch-fan").await;
+        let mut events = deck.event_tx.subscribe();
+        for agent in [&o, &w] {
+            let (done, done_release) = deck
+                .registry
+                .pause_at_for_test("stop-worktree-cleanup-done");
+            deck.client
+                .stop_agent_keeping_worktree(agent)
+                .await
+                .expect("this daemon keeps");
+            done.await
+                .expect("the role's stop finishes its worktree step");
+            let _ = done_release.send(());
+        }
+        assert!(!deck.live(&o) && !deck.live(&w));
+        assert!(wt.exists());
+        assert!(sentinel.exists(), "the ignored sentinel survives");
+        assert_eq!(
+            drain_worktree_kept(&mut events),
+            vec![crate::issue_dispatch_run::KeptWorktree::on_request(&wt)],
+            "one kept-on-request for the shared tree"
+        );
         deck.shutdown().await;
     }
 
