@@ -703,9 +703,9 @@ async fn bounded_role_stop<D: OrchestrationDaemon + Sync>(
 /// A handle per role because each is bound to the daemon process that listed
 /// that role (PRD #1666 part 2, G-fix4).
 ///
-/// `keep_worktree` (issue #1958) goes on EVERY role's stop: the deck cleans
-/// the dispatched worktree up on whichever stop ends up last, and which one
-/// that is depends on how the concurrent stops land.
+/// `keep_worktree` (issue #1958) goes on EVERY role's stop: the deck keeps the
+/// dispatched worktree at the first stop carrying the keep that it handles,
+/// and which one that is depends on how the concurrent stops land.
 async fn stop_roles_concurrently<D: OrchestrationDaemon + Sync>(
     roles: &[(&D, &StartedRole)],
     keep_worktree: bool,
@@ -5158,8 +5158,11 @@ async fn stop_agent_action(
 ///
 /// `keep_worktree` (issue #1958) keeps the orchestration's dispatched
 /// worktree: it goes on every role's stop. A deck whose capabilities say it
-/// cannot keep is refused before ANY role is stopped; each stop also checks on
-/// its own connection, so a deck replaced since stops nothing either.
+/// cannot keep is refused before ANY role is stopped. Each stop also checks the
+/// capability on its own connection, which is bound to the process that listed
+/// its role, so a role's stop is never sent to a successor process. The
+/// fan-out is concurrent, so if the deck is replaced partway through, roles
+/// already stopped on the old process stay stopped.
 async fn stop_orchestration_action(
     state: &DesktopState,
     deck_id: &str,

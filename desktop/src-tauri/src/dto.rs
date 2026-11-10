@@ -1424,7 +1424,7 @@ pub enum DesktopAction {
         roles: Vec<StopOrchestrationRole>,
         /// Issue #1958: keep the orchestration's dispatched worktree — "Close
         /// all N roles, keep worktree". Applied to EVERY role's stop, because
-        /// the deck cleans the worktree up on whichever stop ends up last.
+        /// the deck keeps the tree at whichever of them it handles first.
         /// Absent means false.
         #[serde(default)]
         keep_worktree: bool,

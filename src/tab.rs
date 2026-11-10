@@ -1499,7 +1499,8 @@ impl TabManager {
 
     /// Issue #1958: [`Self::close_tab`], keeping the dispatched worktree the
     /// tab's roles share when `keep_worktree` is set — every role pane's stop
-    /// carries the keep, because the daemon cleans up on whichever is last.
+    /// carries the keep, because the daemon keeps the tree at the first stop
+    /// that carries it, whichever one it handles first.
     pub fn close_tab_with(
         &mut self,
         index: usize,

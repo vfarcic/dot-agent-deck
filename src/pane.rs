@@ -118,8 +118,9 @@ pub fn close_panes_concurrently(
 
 /// Issue #1958: [`close_panes_concurrently`], keeping the dispatched worktree
 /// when `keep_worktree` is set — every pane goes through
-/// [`PaneController::close_pane_keeping_worktree`], because the daemon
-/// removes the worktree on whichever stop of the fan-out is the last one.
+/// [`PaneController::close_pane_keeping_worktree`]: the daemon keeps the tree
+/// at the first stop that carries the keep, so carrying it on every stop keeps
+/// the tree whichever one the daemon handles first.
 pub fn close_panes_concurrently_with(
     controller: &dyn PaneController,
     pane_ids: &[String],

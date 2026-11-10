@@ -274,34 +274,45 @@ pub fn dispatched_worktree_of_panes(
     })
 }
 
-/// The worktree half of a `StopAgent` (PRD #120 M2.4, PRD #220, issue #1958),
-/// run detached once the agent is stopped. Only when no agent in
-/// `live_records` is still rooted in `worktree` was this the last stop, and
-/// only then is the registry entry taken: removed under its policy, or — with
-/// `keep` — left on disk whatever its state. Taking the entry on a keep is the
-/// point: a later ordinary close of an agent restarted in the same directory
-/// finds no record and cannot remove the tree. Answers what to broadcast as
+/// Issue #1958: keep `worktree` on request — take its registry entry, so that
+/// no cleanup, this close's or any other's, finds an entry to remove, and
+/// answer the keep to report. `None` when the deck holds no entry for it: an
+/// unrecorded tree is not removed by a close, so there is nothing to keep.
+///
+/// Called SYNCHRONOUSLY by `StopAgent` and `CloseAgents` once the close is
+/// admitted and before any agent is stopped, whatever else still runs in the
+/// tree. Deciding it later, in the cleanup that follows the stop, lost the keep
+/// to every cleanup that ran first: a sibling role's earlier ordinary stop
+/// whose cleanup ran after this one's stop, or a successor started in the same
+/// directory that made this cleanup think it was not the last.
+pub fn keep_on_request(worktrees: &WorktreeRegistry, worktree: &Path) -> Option<KeptWorktree> {
+    take_worktree(worktrees, worktree)?;
+    tracing::info!(
+        worktree = %crate::config_validation::escape_field_for_log(
+            &worktree.to_string_lossy(),
+            crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+        ),
+        "dispatch: worktree kept on request at close"
+    );
+    Some(KeptWorktree::on_request(worktree))
+}
+
+/// The worktree half of an ordinary `StopAgent` (PRD #120 M2.4, PRD #220), run
+/// detached once the agent is stopped. Only when no agent in `live_records` is
+/// still rooted in `worktree` was this the last stop, and only then is the
+/// registry entry taken and the tree removed under its policy. A stop that
+/// keeps the tree took the entry before it stopped anything
+/// ([`keep_on_request`]), so this finds none. Answers what to broadcast as
 /// `WorktreeKept`: `None` when the tree was removed or nothing was done.
 pub async fn cleanup_after_stop(
     live_records: &[AgentRecord],
     worktrees: &WorktreeRegistry,
     worktree: &Path,
-    keep: bool,
 ) -> Option<KeptWorktree> {
     if worktree_still_in_use(live_records, worktree) {
         return None;
     }
     let entry = take_worktree(worktrees, worktree)?;
-    if keep {
-        tracing::info!(
-            worktree = %crate::config_validation::escape_field_for_log(
-                &worktree.to_string_lossy(),
-                crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
-            ),
-            "dispatch: worktree kept on request at close"
-        );
-        return Some(KeptWorktree::on_request(worktree));
-    }
     remove_worktree(worktree, &entry.clone_dir, entry.policy).await
 }
 
@@ -4681,55 +4692,48 @@ mod tests {
         }
     }
 
-    /// Issue #1958 (U3): `StopAgent`'s cleanup with keep — on the last stop it
-    /// takes the entry and leaves the tree on disk whatever its state and
-    /// policy, answering a keep on request; on a stop that is not the last it
-    /// does nothing and the entry stays. Without keep a clean tree is still
-    /// removed.
+    /// Issue #1958 (U3, F1): a keep on request takes the entry and leaves the
+    /// tree on disk whatever its state and policy, and whatever else still
+    /// runs in it; a later ordinary stop's cleanup then finds no record and
+    /// removes nothing. A tree the deck never recorded has nothing to keep.
+    /// Without a keep, a clean tree is still removed by the last stop and left
+    /// alone by one that is not.
     #[tokio::test]
-    async fn the_stop_cleanup_keeps_on_request_and_takes_the_entry() {
+    async fn a_keep_on_request_takes_the_entry_so_no_cleanup_removes_the_tree() {
         let tmp = crate::test_temp::tempdir().unwrap();
         let repo = tmp.path().join("repo");
         let wt = tmp.path().join("repo-dispatch-x");
         init_repo_with_worktree(tmp.path(), &repo, &wt);
         let reg = new_worktree_registry();
 
-        // Not the last agent in the tree: nothing happens, keep or not.
-        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
-        let sibling = vec![pane_in("pane-2", &wt)];
-        assert_eq!(cleanup_after_stop(&sibling, &reg, &wt, true).await, None);
-        assert!(reg.lock().unwrap().contains_key(&wt), "the entry stays");
+        assert_eq!(keep_on_request(&reg, &wt), None, "nothing recorded");
 
-        // The last stop, clean, under either policy: kept, entry taken.
         for policy in [RemovalPolicy::KeepIfDirty, RemovalPolicy::Force] {
             record_worktree(&reg, &wt, &repo, policy);
-            let kept = cleanup_after_stop(&[], &reg, &wt, true)
-                .await
-                .expect("a keep is reported");
+            let kept = keep_on_request(&reg, &wt).expect("a keep is reported");
             assert_eq!(kept, KeptWorktree::on_request(&wt));
             assert!(kept.on_request && !kept.confirmed_dirty);
-            assert!(wt.exists(), "{policy:?}: the clean tree is kept");
             assert!(
                 !reg.lock().unwrap().contains_key(&wt),
                 "{policy:?}: the entry is taken, so no later close removes it"
             );
+            assert_eq!(cleanup_after_stop(&[], &reg, &wt).await, None);
+            assert!(wt.exists(), "{policy:?}: the clean tree is kept");
         }
 
         // Dirty and kept on request: reported as on request, not as dirty.
         std::fs::write(wt.join("scratch.txt"), "work").unwrap();
         record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
-        let kept = cleanup_after_stop(&[], &reg, &wt, true).await.unwrap();
-        assert!(kept.on_request, "{kept:?}");
-        assert!(wt.join("scratch.txt").exists());
+        assert!(keep_on_request(&reg, &wt).unwrap().on_request);
         std::fs::remove_file(wt.join("scratch.txt")).unwrap();
 
-        // A later stop finds no record and removes nothing.
-        assert_eq!(cleanup_after_stop(&[], &reg, &wt, false).await, None);
-        assert!(wt.exists());
-
-        // Without keep, the existing behaviour: a clean tree is removed.
+        // Without a keep: a stop that is not the last leaves the entry, and
+        // the last stop removes a clean tree.
         record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
-        assert_eq!(cleanup_after_stop(&[], &reg, &wt, false).await, None);
+        let sibling = vec![pane_in("pane-2", &wt)];
+        assert_eq!(cleanup_after_stop(&sibling, &reg, &wt).await, None);
+        assert!(reg.lock().unwrap().contains_key(&wt), "the entry stays");
+        assert_eq!(cleanup_after_stop(&[], &reg, &wt).await, None);
         assert!(!wt.exists());
     }
 

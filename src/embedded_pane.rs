@@ -3216,8 +3216,9 @@ impl StopClass {
 
 /// Issue #1958: the `stop-agent` a Ctrl+W close sends — keeping the dispatched
 /// worktree when `keep_worktree` is set. Every stop of one close carries the
-/// same flag, retries and replacement stops included, because the daemon
-/// removes the worktree on whichever of them is the last live agent in it.
+/// same flag, retries and replacement stops included: the daemon keeps the
+/// tree at the first stop that carries the keep, and a stop sent without it
+/// could remove the tree if it reached the daemon first.
 async fn stop_for_close(
     client: &DaemonClient,
     id: &str,

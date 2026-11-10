@@ -595,8 +595,8 @@ async fn a_keep_close_on_a_deck_that_cannot_keep_stops_nothing() {
 
 /// Scenario (issue #1958): on a deck that advertises the keep, "Close agent,
 /// keep worktree" sends its stop with the keep, and "Close all 2 roles, keep
-/// worktree" sends the keep on EVERY role's stop — the deck cleans up on
-/// whichever stop lands last.
+/// worktree" sends the keep on EVERY role's stop — the deck keeps the tree at
+/// whichever of them it handles first.
 #[tokio::test]
 async fn a_keep_close_sends_the_keep_on_every_stop() {
     let _selection = crate::dto::SELECTION_LOCK.lock().await;

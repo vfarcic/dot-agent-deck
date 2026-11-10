@@ -3695,10 +3695,11 @@ impl DaemonClient {
         Ok(())
     }
 
-    /// Issue #1958: [`Self::stop_agent`], keeping the dispatched worktree if
-    /// this stop is the one that would remove it — the last live agent in it.
-    /// Closing an orchestration, send it for EVERY role: the daemon cleans up
-    /// on whichever stop ends up last.
+    /// Issue #1958: [`Self::stop_agent`], keeping the dispatched worktree the
+    /// agent was started in, whatever else still runs there: the daemon drops
+    /// its record of the tree before it stops the agent, so no later close
+    /// removes it. Closing an orchestration, send it for EVERY role, so the
+    /// tree is kept whichever stop the daemon handles first.
     ///
     /// **A daemon that does not advertise
     /// [`crate::daemon_protocol::CAP_KEEP_WORKTREE`] is a HARD error

@@ -2297,14 +2297,13 @@ pub enum AttachRequest {
     },
     StopAgent {
         id: String,
-        /// Issue #1958: if this stop ends the last live agent in a dispatched
-        /// worktree — the stop that would otherwise remove it — keep the tree
-        /// on disk whatever its state and drop the daemon's record of it, so no
-        /// later close of an agent restarted in the same directory can remove
-        /// it either. Reported as a `WorktreeKept` broadcast with `on_request`.
-        /// No effect on a stop that is not the last one in its worktree, which
-        /// is why a client closing an orchestration sets it on every role's
-        /// stop.
+        /// Issue #1958: keep the dispatched worktree the stopped agent was
+        /// started in on disk, whatever its state and whatever else still runs
+        /// in it, by dropping the daemon's record of the tree before the agent
+        /// is stopped — so no later close, of a sibling role or of an agent
+        /// restarted in the same directory, can remove it. Reported once as a
+        /// `WorktreeKept` broadcast with `on_request`, by the stop that took
+        /// the record.
         ///
         /// **Withheld unless the daemon advertises [`CAP_KEEP_WORKTREE`]**: an
         /// older daemon would drop the key and remove the tree. No
@@ -2341,9 +2340,11 @@ pub enum AttachRequest {
         /// Resolve and report, stop nothing.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dry_run: bool,
-        /// Issue #1958: keep every worktree this close frees, whatever its
-        /// state, reported as [`WorktreeVerdictKind::KeptOnRequest`]. A dry run
-        /// reports the keep it would make. **Withheld unless the daemon
+        /// Issue #1958: keep the worktree each closed target owns, whatever its
+        /// state and whatever else still runs in it, by dropping the daemon's
+        /// record of it before anything is stopped; reported as
+        /// [`WorktreeVerdictKind::KeptOnRequest`]. A dry run reports the keep
+        /// it would make and drops nothing. **Withheld unless the daemon
         /// advertises [`CAP_KEEP_WORKTREE`]**, like `StopAgent`'s.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         keep_worktree: bool,
@@ -7349,6 +7350,25 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
+            // Issue #1958 (F1): a keep is latched HERE, before anything is
+            // stopped and whatever else still runs in the tree, by taking the
+            // registry entry. Every removal goes through that entry, so no later
+            // cleanup — this stop's, a sibling role's earlier ordinary stop's,
+            // or a close of an agent started in the same directory afterwards —
+            // finds one to remove. Left to the cleanup after the stop, the keep
+            // was lost to whichever of those got there first.
+            //
+            // If the stop then fails, the agent keeps running in a tree the
+            // daemon no longer records: no close removes it, and the user finds
+            // and removes it with `dot-agent-deck worktree reclaim`. The entry is
+            // not put back — that would hand the tree to the next ordinary close.
+            let kept_on_request = if keep_worktree {
+                dispatched_worktree.as_deref().and_then(|worktree| {
+                    crate::issue_dispatch_run::keep_on_request(&worktree_registry, worktree)
+                })
+            } else {
+                None
+            };
             // PRD #1589: the teardown itself is shared with `CloseAgents`, which
             // takes the same steps in the same order — see
             // [`stop_agent_steps`]. The existing teardown is unchanged. What the
@@ -7407,21 +7427,29 @@ async fn handle_connection(
                         // instead of leaving the user with the dialog's
                         // arm-time prediction.
                         let event_tx = event_tx.clone();
-                        // Issue #1958: `keep_worktree` turns the removal into a
-                        // keep — see `cleanup_after_stop`.
+                        // Issue #1958: a keep latched above has nothing left to
+                        // clean up; its report is broadcast from here, after
+                        // the stop, once — the same place an ordinary stop's
+                        // verdict comes from.
                         tokio::spawn(async move {
-                            if let Some(kept) = crate::issue_dispatch_run::cleanup_after_stop(
-                                &registry.agent_records_for_worktree_cleanup(),
-                                &worktree_registry,
-                                &worktree,
-                                keep_worktree,
-                            )
-                            .await
-                            {
+                            registry.pause_point("stop-worktree-cleanup").await;
+                            let kept = match kept_on_request {
+                                Some(kept) => Some(kept),
+                                None => {
+                                    crate::issue_dispatch_run::cleanup_after_stop(
+                                        &registry.agent_records_for_worktree_cleanup(),
+                                        &worktree_registry,
+                                        &worktree,
+                                    )
+                                    .await
+                                }
+                            };
+                            if let Some(kept) = kept {
                                 // Errs only when nothing is subscribed (a
                                 // standalone daemon), which is not a failure.
                                 let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
                             }
+                            registry.pause_point("stop-worktree-cleanup-done").await;
                         });
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
@@ -7429,6 +7457,11 @@ async fn handle_connection(
                 Err(msg) => {
                     // PRD #126: the close failed, so the agent is still live;
                     // `stop_agent_steps` has already rolled the closing mark back.
+                    // Issue #1958: a keep latched above stands (see there), so
+                    // it is reported here, the one report it gets.
+                    if let Some(kept) = kept_on_request {
+                        let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
+                    }
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
             };
@@ -7888,9 +7921,19 @@ async fn handle_connection(
             let mut resp = AttachResponse::ok();
             resp.kept_worktree = kept;
             // Issue #1958: from the registry alone, after the probe and
-            // whatever it answered.
+            // whatever it answered. F3: each pane's owner is resolved the way
+            // `StopAgent` resolves the agent it cleans up after — an exited
+            // generation still holding its pane counts, since closing that pane
+            // is what removes its tree — and through `agent_id_for_pane_any`,
+            // which skips a generation a successor has since been published
+            // over, so a retired agent does not answer for a reused pane.
+            let owners: Vec<crate::agent_pty::AgentRecord> = pane_ids
+                .iter()
+                .filter_map(|pane| registry.agent_id_for_pane_any(pane))
+                .filter_map(|id| registry.agent_record_any(&id))
+                .collect();
             resp.dispatched_worktree = crate::issue_dispatch_run::dispatched_worktree_of_panes(
-                &registry.agent_records(),
+                &owners,
                 &worktree_registry,
                 &pane_ids,
             )
