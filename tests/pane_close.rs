@@ -37,7 +37,8 @@ use tokio::net::{UnixListener, UnixStream};
 
 struct StopErrorDaemon {
     socket_path: PathBuf,
-    stop_requests: Arc<Mutex<Vec<String>>>,
+    /// Each StopAgent's id and (issue #1958) `keep_worktree`, in order.
+    stop_requests: Arc<Mutex<Vec<(String, bool)>>>,
     list_requests: Arc<AtomicUsize>,
     shutdown: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
@@ -165,7 +166,14 @@ impl StopErrorDaemon {
     }
 
     fn stop_requests(&self) -> Vec<String> {
-        self.stop_requests.lock().unwrap().clone()
+        let stops = self.stop_requests.lock().unwrap();
+        stops.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Issue #1958: each StopAgent's `keep_worktree`, in the order received.
+    fn stop_keeps(&self) -> Vec<bool> {
+        let stops = self.stop_requests.lock().unwrap();
+        stops.iter().map(|(_, keep)| *keep).collect()
     }
 
     fn list_requests(&self) -> usize {
@@ -185,34 +193,45 @@ impl Drop for StopErrorDaemon {
 async fn handle_connection(
     mut stream: UnixStream,
     stop_plan: StopPlan,
-    stop_requests: Arc<Mutex<Vec<String>>>,
+    stop_requests: Arc<Mutex<Vec<(String, bool)>>>,
     list_requests: Arc<AtomicUsize>,
     slot_owner: Arc<AtomicUsize>,
     pane_id_env: Arc<Mutex<Option<String>>>,
     first_stop_at: Arc<Mutex<Option<Instant>>>,
 ) {
-    let Some((kind, payload)) = read_frame(&mut stream)
-        .await
-        .expect("read synthetic daemon request")
-    else {
-        return;
-    };
-    assert_eq!(kind, KIND_REQ, "controller must send a request frame");
-    let request: AttachRequest =
-        serde_json::from_slice(&payload).expect("decode synthetic daemon request");
-
-    match request {
+    // A `Hello` with `follow_on` keeps the connection for one more request,
+    // as the real daemon does: a stop that keeps the worktree (issue #1958)
+    // reads the capability on the connection that then carries the stop.
+    let request = loop {
+        let Some((kind, payload)) = read_frame(&mut stream)
+            .await
+            .expect("read synthetic daemon request")
+        else {
+            return;
+        };
+        assert_eq!(kind, KIND_REQ, "controller must send a request frame");
+        let request: AttachRequest =
+            serde_json::from_slice(&payload).expect("decode synthetic daemon request");
         // Auto-reattach checks the protocol before every lookup (PRD #1666
         // part 2), and attaches only after a positive answer, as the real
         // daemon gives one.
-        AttachRequest::Hello { .. } => {
+        if let AttachRequest::Hello { follow_on, .. } = request {
             write_resp(
                 &mut stream,
                 &AttachResponse::hello(PROTOCOL_VERSION).with_capabilities(),
             )
             .await
             .expect("reply to Hello");
+            if follow_on {
+                continue;
+            }
+            return;
         }
+        break request;
+    };
+
+    match request {
+        AttachRequest::Hello { .. } => unreachable!("answered above"),
         AttachRequest::StartAgent { env, .. } => {
             *pane_id_env.lock().unwrap() = env
                 .into_iter()
@@ -237,8 +256,11 @@ async fn handle_connection(
             // tears down the pane and drops its stream task.
             while read_frame(&mut stream).await.ok().flatten().is_some() {}
         }
-        AttachRequest::StopAgent { id, .. } => {
-            stop_requests.lock().unwrap().push(id.clone());
+        AttachRequest::StopAgent { id, keep_worktree } => {
+            stop_requests
+                .lock()
+                .unwrap()
+                .push((id.clone(), keep_worktree));
             let response = match stop_plan {
                 StopPlan::Error(stop_error) => AttachResponse::err(stop_error),
                 StopPlan::NotFound(list_plan) => {
@@ -831,6 +853,69 @@ fn stop_016_replacement_timeout_retains_pane() {
         controller.take_close_warnings().is_empty(),
         "a stop timeout must not be degraded into an unverified-close warning"
     );
+}
+
+/// Scenario: Close a pane whose original agent is gone while a replacement owns its slot, once the ordinary way and once with "Close, keep worktree". The ordinary close sends none of its three stops (the first try, the retry and the replacement's) with the keep; the keeping close sends all three with it.
+#[spec("lifecycle/stop/020")]
+#[test]
+fn stop_020_keep_rides_the_retry_and_the_replacement_stop() {
+    let plain = StopErrorDaemon::spawn_with_replacement("agent-2");
+    let (_plain_runtime, plain_controller, plain_pane) = controller_for(&plain);
+    plain_controller
+        .close_pane(&plain_pane)
+        .expect("an ordinary replacement-aware close");
+    assert_eq!(plain.stop_requests(), vec!["agent-1", "agent-1", "agent-2"]);
+    assert_eq!(
+        plain.stop_keeps(),
+        vec![false, false, false],
+        "an ordinary close asks no stop to keep the worktree"
+    );
+
+    let keeping = StopErrorDaemon::spawn_with_replacement("agent-2");
+    let (_runtime, controller, pane_id) = controller_for(&keeping);
+    let result = controller.close_pane_keeping_worktree(&pane_id);
+
+    assert!(
+        result.is_ok(),
+        "replacement-aware keep close failed: {result:?}"
+    );
+    assert!(controller.pane_ids().is_empty());
+    assert_eq!(
+        keeping.stop_requests(),
+        vec!["agent-1", "agent-1", "agent-2"],
+        "the first try, its retry and the replacement's stop"
+    );
+    assert_eq!(
+        keeping.stop_keeps(),
+        vec![true, true, true],
+        "every stop of a keeping close, retry and replacement included, carries the keep"
+    );
+}
+
+/// Scenario: Close a pane with "Close, keep worktree" while its slot is handed from replacement B to replacement C mid-stop. The close chases the handover to C, and every stop it sends on the way carries the keep.
+#[spec("lifecycle/stop/021")]
+#[test]
+fn stop_021_keep_rides_every_stop_of_a_chained_handover() {
+    let daemon = StopErrorDaemon::spawn_chained_handover();
+    let (_runtime, controller, pane_id) = controller_for(&daemon);
+
+    let result = controller.close_pane_keeping_worktree(&pane_id);
+
+    assert!(
+        result.is_ok(),
+        "chained-handover keep close failed: {result:?}"
+    );
+    let stops = daemon.stop_requests();
+    assert!(
+        stops.iter().any(|id| id == "agent-2") && stops.iter().any(|id| id == "agent-3"),
+        "the close chases B and then C: {stops:?}"
+    );
+    assert!(
+        daemon.stop_keeps().iter().all(|keep| *keep),
+        "every stop carries the keep: {stops:?} {:?}",
+        daemon.stop_keeps()
+    );
+    assert!(controller.pane_ids().is_empty());
 }
 
 struct DelayedCloseController {

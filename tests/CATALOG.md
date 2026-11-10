@@ -2087,7 +2087,14 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
 - **Agent:** none — identity-recording `cat` probe.
 - **Asserts:** with a clean dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its card selected, Ctrl+W draws Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes the agent, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk.
-- **Does not assert:** the tab/orchestration scope in the TUI (the CLI's is `dispatch/close-verb/013`), a daemon without the keep capability, or a real agent.
+- **Does not assert:** the tab/orchestration scope in the TUI (`prompt/close-confirm/013`), a daemon without the keep capability, or a real agent.
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/013 — Ctrl+W's `Close, keep worktree` on a dispatched team's tab stops both roles and keeps their shared worktree (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --orchestration`).
+- **Agent:** none — identity-recording `cat` probes for both roles.
+- **Asserts:** with a clean two-role dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its tab active, Ctrl+W draws `Close this tab and all its agents?` with Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes both roles and the tab, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk. Fails if `TabManager::close_tab_with` drops the keep on its fan-out.
+- **Does not assert:** a keep on one role of a team followed by an ordinary close of the other (the daemon-level `close_agents::tests::keeping_on_one_role_survives_an_ordinary_close_of_the_last`), a daemon without the keep capability, or a real agent.
 - **Platform coverage:** mac+linux.
 
 #### prompt/pane-input
@@ -3338,6 +3345,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none (six hydrated orchestration role panes with staggered 150–400 ms synthetic close delays).
 - **Asserts:** the close completes below a 1.0-second wall-clock ceiling versus a 1.65-second sequential sum, reports closed pane ids in original role order rather than completion order, and removes the clean tab.
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/020 — "Close, keep worktree" carries the keep on the retry and on the replacement's stop (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon that answers a follow-on `Hello` and records each StopAgent's `keep_worktree`).
+- **Agent:** none (the original agent answers exact NotFound twice and ListAgents reports replacement B, which stops).
+- **Asserts:** an ordinary close sends its three stops (first try, retry, replacement) with no keep; `close_pane_keeping_worktree` sends the same three stops, each with `keep_worktree: true`.
+- **Does not assert:** what the daemon does with the keep (`close_agents::tests`), the tab fan-out (`prompt/close-confirm/013`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/021 — "Close, keep worktree" carries the keep on every stop of a chained slot handover (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (replacement B loses its slot to C while its stop is in flight; C stops).
+- **Asserts:** the keeping close chases the handover to C and every StopAgent it sends carries `keep_worktree: true`.
+- **Does not assert:** the slot-churn bounds (`lifecycle/stop/013`, `lifecycle/stop/014`).
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/wire-restart

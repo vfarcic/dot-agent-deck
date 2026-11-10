@@ -831,6 +831,57 @@ fn close_confirm_012_ctrl_w_keep_worktree_keeps_a_clean_dispatched_tree() {
     assert_kept_with_sentinel(&worktree, &sentinel, &test.deck.snapshot_grid());
 }
 
+/// Scenario: A clean two-role unit is dispatched and its tab opened in the
+/// attached TUI. Ctrl+W on the tab offers Cancel, Close and `Close, keep
+/// worktree`; Down, Down, Enter stops both roles and removes the tab but leaves
+/// the shared worktree and its ignored `.dot-agent-deck/` on disk, and the
+/// status line says it was kept on request and where.
+#[spec("prompt/close-confirm/013")]
+#[test]
+fn close_confirm_013_ctrl_w_tab_keep_worktree_keeps_a_teams_shared_tree() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let members = test.dispatch(&caller, "kept-tab", true);
+    let worktree = test.worktrees[0].clone();
+    let sentinel = plant_ignored_sentinel(&worktree, "keep-sentinel-tab.txt");
+    let label = match &members[0].tab_membership {
+        Some(TabMembership::Orchestration { name, .. }) => name.clone(),
+        _ => panic!("dispatched team has no tab membership"),
+    };
+    test.deck.wait_until_grid("the unit's tab appears", |grid| {
+        grid.lines().take(5).any(|l| l.contains(&label))
+    });
+
+    test.deck.send_keys(b"\x04");
+    test.deck.wait_for_string("COMMAND");
+    test.deck.send_keys(b"\x1b[C");
+    // The tab shows its two roles of the three sessions (the caller's is the
+    // third).
+    test.deck.wait_for_string("2/3 agent(s)");
+    test.deck.send_keys(b"\x17");
+    test.deck
+        .wait_for_string("Close this tab and all its agents?");
+    test.deck.wait_until_grid(
+        "the tab dialog offers Cancel, Close and `Close, keep worktree`, in that order",
+        |grid| close_choice_rows(grid).is_some(),
+    );
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\r");
+
+    let path = worktree.to_string_lossy().into_owned();
+    test.deck.wait_until_grid(
+        "the status line says the shared worktree was kept on request, with its path",
+        |grid| grid.contains("Worktree kept on request:") && grid.contains(path.as_str()),
+    );
+    test.assert_gone(&members);
+    test.deck.wait_until_grid("the unit's tab is gone", |grid| {
+        !grid.lines().take(5).any(|l| l.contains(&label))
+    });
+    assert_kept_with_sentinel(&worktree, &sentinel, &test.deck.snapshot_grid());
+    test.assert_present(&[caller]);
+}
+
 /// Scenario: A completed clean single unit is closed by name with
 /// `--keep-worktree`, then a second one with `--keep-worktree --json`. Both
 /// agents go, both worktrees and their ignored `.dot-agent-deck/` stay, the
