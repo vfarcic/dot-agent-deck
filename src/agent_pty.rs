@@ -29594,7 +29594,14 @@ mod spawn_tests {
             RingOutcome::Txn(Outcome::Unresolved(Cause::WriteStalled)),
             "{report:?}"
         );
-        assert!(started.elapsed() < TXN_MAX + Duration::from_millis(500));
+        // The ring holds until TXN_MAX by design, so the slack is all scheduling: 500 ms
+        // was overrun on a loaded macOS runner (main run 42720481204). One second matches
+        // the sibling deadline check in this module.
+        assert!(
+            started.elapsed() < TXN_MAX + Duration::from_secs(1),
+            "the writer was held past its deadline: {:?}",
+            started.elapsed()
+        );
         assert!(matches!(editor.cell(), Latch::Suspended(..)));
         reached
             .recv_timeout(Duration::from_secs(1))
