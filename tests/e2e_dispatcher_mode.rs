@@ -1,14 +1,13 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
-//! L2 PTY-attached reel test for PRD #220 dispatcher mode.
+//! L2 PTY-attached real-agent test for PRD #220 dispatcher mode.
 //!
 //! Exercises the full user-visible path: launch a default deck (no experimental
 //! flag), open the new-pane form, select the "dispatcher" option, submit, give
 //! the seeded agent a goal, and verify it really dispatches — the daemon creates
 //! the sibling git worktree the feature promises.
 //!
-//! Marked [reel] — this is the genuine spawn → agent → work path (CLAUDE.md
-//! rule 4). The agent receives the dispatcher seed through its native inbox,
+//! This is the genuine spawn → agent → work path (CLAUDE.md rule 4). The agent receives the dispatcher seed through its native inbox,
 //! acts on the goal, and invokes `dot-agent-deck dispatch` itself; the assertion
 //! is on the resulting worktree, so nothing here is a stand-in.
 
@@ -496,8 +495,8 @@ fn new_pane_016_dispatcher_opens_dashboard_card_with_real_agent() {
     // the POSIX escape for a `'` inside the resolved path. The `--model` pin rides
     // after it as a plain argument (issue #1013): without one the pane ran on
     // whatever the host's managed settings selected — measured as Opus 5 at xhigh
-    // reasoning effort — which is the opposite of what a `[reel]`-marked lane-2
-    // test should bill, and silent, since nothing reports the model it picked.
+    // reasoning effort — which is the opposite of what a lane-2 test should
+    // bill, and silent, since nothing reports the model it picked.
     // Pinned HERE rather than in `real_claude_path`, which must keep returning the
     // launcher-safe absolute PATH of the bare binary so the `exec` line cannot
     // re-enter the launcher (itself named `claude`). Both agents this test brings

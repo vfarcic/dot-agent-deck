@@ -3142,8 +3142,8 @@ const FABRICATED_CLAUDE_SETTINGS_DATABASE_URL: &str =
 /// on the ground that the credential set is "never rendered". That is a
 /// convention rather than a structural property — an agent command, a
 /// contributor-authored test, an auth diagnostic or an accidental file dump
-/// paints it onto the terminal — and it is the route most reel clips take,
-/// which is the route whose `.cast` the demo reel publishes.
+/// paints it onto the terminal — and it is the route most real-agent tests
+/// take, so it is the route whose `.cast` a developer is most likely to share.
 ///
 /// **It drives the importer because the first version of it did not, and the
 /// second PR #805 audit caught that.** It called `claude_recording_redactions`
@@ -3537,8 +3537,8 @@ fn a_credential_under_an_ordinary_env_variable_name_is_registered() {
 /// PR #805 audit P2. The classification stands — a uuid, an email and an
 /// organisation name identify rather than authenticate — but this file is
 /// copied into every real-agent test's HOME, an interactive `claude` paints
-/// the account line into the pane, and that pane is what the demo reel
-/// publishes. Three field names is cheaper than accepting that.
+/// the account line into the pane, and that pane is what `full-stream.cast`
+/// records. Three field names is cheaper than accepting that.
 #[test]
 fn the_seeded_claude_json_registers_its_account_identity_fields() {
     // SAFETY: see "Environment writes" in this file's header.
@@ -3598,8 +3598,8 @@ fn the_seeded_claude_json_registers_its_account_identity_fields() {
         );
         assert!(
             identity.iter().any(|v| v == value),
-            "{what} was not returned for redaction, so it reaches the cast \
-             the demo reel publishes: {identity:?}"
+            "{what} was not returned for redaction, so it reaches the \
+             recorded cast: {identity:?}"
         );
     }
 

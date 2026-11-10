@@ -1,4 +1,4 @@
-//! Preserve completed recordings before the flat, reel-compatible files are
+//! Preserve completed recordings before the flat, current-run files are
 //! invalidated at launch. Read Claude metadata from the isolated session's
 //! transcript, never from requested defaults in settings.
 

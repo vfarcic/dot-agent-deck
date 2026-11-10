@@ -1,54 +1,6 @@
 {
   "lockfile_version": "1",
   "packages": {
-    "asciinema-agg@1.9.0": {
-      "last_modified": "2026-08-01T16:34:20Z",
-      "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#asciinema-agg",
-      "source": "devbox-search",
-      "version": "1.9.0",
-      "systems": {
-        "aarch64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/5pj8hgxs3bb0gkf686xlk185r1f599vq-agg-1.9.0",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/5pj8hgxs3bb0gkf686xlk185r1f599vq-agg-1.9.0"
-        },
-        "aarch64-linux": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/58zwz2p10jhmg2jjsp3qi3rw3iqgazx0-agg-1.9.0",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/58zwz2p10jhmg2jjsp3qi3rw3iqgazx0-agg-1.9.0"
-        },
-        "x86_64-darwin": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/2y06sschld6v74q2m6x1rywnx7v65y26-agg-1.9.0",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/2y06sschld6v74q2m6x1rywnx7v65y26-agg-1.9.0"
-        },
-        "x86_64-linux": {
-          "outputs": [
-            {
-              "name": "out",
-              "path": "/nix/store/7divipx4i04dld1kwp8bjfww2i1pmq6i-agg-1.9.0",
-              "default": true
-            }
-          ],
-          "store_path": "/nix/store/7divipx4i04dld1kwp8bjfww2i1pmq6i-agg-1.9.0"
-        }
-      }
-    },
     "asciinema@3.2.1": {
       "last_modified": "2026-08-01T16:34:20Z",
       "resolved": "github:NixOS/nixpkgs/a5cbcfe954791221bfffe2307f7d1a1bf61a871e#asciinema",

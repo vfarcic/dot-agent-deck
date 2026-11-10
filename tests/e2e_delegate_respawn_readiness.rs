@@ -7,8 +7,7 @@
 //! native hook reports submission and real status, and the worker acts on the
 //! delegated task.
 //!
-//! Both tests are local-only, flaky-tolerant pre-PR e2es. They intentionally
-//! have no reel marker because PRD #249 is a bug fix rather than a showcase.
+//! Both tests are local-only, flaky-tolerant pre-PR e2es.
 
 mod common;
 #[path = "support/inbox_doorbell.rs"]
@@ -347,8 +346,8 @@ fn delegate_014_real_claude_worker_acts_on_clear_true_delegate() {
     // `Write` is here for the footer, not the assertion (#303). The sentinel is
     // created with Bash, so this test would still pass without it — but the task
     // file's `## When done` footer then sends the worker into a `Write` approval
-    // prompt it cannot answer, and this case is `[reel]`-marked, so that dialog
-    // would be the last thing on its recorded cast.
+    // prompt it cannot answer, and that dialog would be the last thing on its
+    // recorded cast.
     let worker_command = format!("claude --model {CLAUDE_MODEL} --allowedTools Bash Read Write");
     let deck = TuiDeck::builder()
         .with_pty_size(180, 45)

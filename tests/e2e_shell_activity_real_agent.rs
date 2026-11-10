@@ -539,7 +539,7 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
         (shell_busy.timestamp - tool_start.timestamp).num_milliseconds()
     );
 
-    // Soft, reel-style confirmation that the observed ping really was the
+    // Soft confirmation that the observed ping really was the
     // one the prompt asked for — logged, not gating, since matching the
     // model's final free-text reply is inherently more phrasing-sensitive
     // than the two typed hook/synthetic events above.

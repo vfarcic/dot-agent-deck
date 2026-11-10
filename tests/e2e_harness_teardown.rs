@@ -9,9 +9,8 @@
 //! syn-parses every `#[spec]`-bearing source file in a debug build: measured
 //! 8–24s on a loaded 16-core box (2026-10-04), against 0.4s for the rest of the
 //! dump, and minutes on CI's starved 4-CPU runners. No failure consumer reads that
-//! doc — CI uploads no recordings, and the demo-reel adapter refuses any
-//! recording whose provenance is not `passed` — so the panic path no longer
-//! regenerates it.
+//! doc — CI uploads no recordings, and `cargo xtask docs --tests` rebuilds it
+//! on demand — so the panic path no longer regenerates it.
 
 mod common;
 

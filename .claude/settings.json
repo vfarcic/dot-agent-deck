@@ -1,8 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(.claude/skills/demo-reel-adapter/build.sh)",
-      "Bash(.claude/skills/demo-reel-adapter/build.sh *)"
-    ]
-  }
-}

@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! Synthetic PTY coverage of the attached deck's real host sampler. No real
-//! agent is started, and this test is deliberately not a demo-reel clip.
+//! agent is started.
 
 mod common;
 

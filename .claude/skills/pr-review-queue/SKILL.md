@@ -333,7 +333,7 @@ Derive it from `scan.sh`'s buckets, then write prose that names the real files:
 | `DEPS` | Read the version delta and the exact-pin comments in `Cargo.toml`; a lockfile-only bump still ships transitively. |
 | `SRC` | The catch-all for `src/*` that is neither protocol nor UI — **the most ordinary code PR in this repo, and the one most likely to get a lazy note.** Name the actual modules and the actual invariant each one could break. |
 | `UI_SNAPSHOT` | An `.insta` snapshot moved. Confirm the new bytes are the intended rendering, not a regression accepted by `cargo insta accept`. |
-| `CATALOG` | `tests/CATALOG.md` changed — check the ` [reel]` markers, since CLAUDE.md rule 4 makes that opt-in the difference between a clip and a silent omission. |
+| `CATALOG` | `tests/CATALOG.md` changed — check each changed entry's layer, agent and lane still describe the test it names, since CLAUDE.md rule 5 sends readers to the catalog to find the tests covering a change. |
 | `PRD` / `CHANGELOG` | Prose-only surfaces. Check the fragment's category (`.feature` / `.bugfix` / `.breaking`) matches what shipped, and CLAUDE.md rule 12's bump policy. |
 | `OTHER` | Nothing classified it, so nothing suggests a risk. Read the paths yourself and say what they are — never leave the note empty because the bucket was. |
 | Destructive operations (worktree/branch removal, file deletion, reaping) | Scrutinise the safety gates. Be specific about **what could be destroyed if a gate is wrong** — name the path or ref, not "data loss". |

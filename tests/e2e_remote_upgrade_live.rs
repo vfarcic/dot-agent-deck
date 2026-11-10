@@ -124,7 +124,7 @@ fn remote_upgrade_008_live_interactive_haiku_keeps_work_then_restarts() {
 
     // A normal attached TUI watches the old remote daemon's private endpoint.
     // Its build override matches that daemon so this viewer needs no consent.
-    // TuiDeck supplies credential-redacted casts and provenance for the reel.
+    // TuiDeck supplies credential-redacted casts and their provenance.
     let deck = common::TuiDeck::builder()
         .with_pty_size(180, 45)
         .with_imported_claude_credentials()

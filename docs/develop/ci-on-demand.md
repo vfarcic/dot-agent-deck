@@ -99,7 +99,7 @@ So "run CI instead" is never a thing anyone does here, and a task text that impl
 ## What it does not cover, and cannot
 
 - **Lane 2 — anything reaching a real agent.** No test that reaches a real agent runs on a runner, and that is a decision rather than a gap (CLAUDE.md rule 5, [`e2e-lanes.md`](e2e-lanes.md)). `cargo test-e2e-live <filter>` is yours to run whatever CI reports.
-- **The demo reel's `.cast` recordings.** CI records none; they are produced locally by running the relevant tests under `DOT_AGENT_DECK_RECORD=1` (PRD #180).
+- **`.cast` recordings.** CI records none; they are produced locally by running the relevant tests under `DOT_AGENT_DECK_RECORD=1`.
 - **Anything you have not committed and pushed.** A runner builds the pushed commit, so a green run attests to that commit and not to your working tree. A local gate cannot make that particular mistake, which is worth remembering when the thing you are about to dispatch is a fix you have only just written.
 
 ## When to reach for it

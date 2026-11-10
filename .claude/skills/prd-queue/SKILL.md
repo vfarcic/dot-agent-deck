@@ -501,10 +501,6 @@ GATES — CLAUDE.md is the authority, this is the summary:
   Where the PRD touches a real-agent path, the unit runs those tests itself with
   its own credentials, or reports that surface as UNVERIFIED. Nothing else will
   catch it.
-- Where the PRD owes a demo reel (PRD #180), the casts still have to be
-  recorded LOCALLY, because CI records none. Run only the tests the PRD adds or
-  changes, under DOT_AGENT_DECK_RECORD=1, so their casts land under
-  .dot-agent-deck/recordings/ — a filtered run, not the whole tier.
 - CLAUDE.md rule 4: a user-visible TUI change needs L1 or L2 tests, and a major
   user-facing feature needs a PTY-attached L2 test and a real-agent test.
 - CLAUDE.md rule 6: a test or check that goes red while you work is in scope, whoever
@@ -588,9 +584,9 @@ run for the merge.
 
 ### 8b — The `--orchestration` task
 
-**For a team, `/prd-full` is the wrong instruction and must not appear.** It is a single-agent skill with no notion of roles or delegation, so pointing an orchestrator at it invites the orchestrator to run the lifecycle itself instead of delegating — which defeats the entire reason a team was dispatched. It also does not cover this project's additions: the Telegram notifications, the demo reel (PRD #180), the `DOT_AGENT_DECK_RECORD=1` cast recording, the test-plan gate, and the tester→coder TDD chain.
+**For a team, `/prd-full` is the wrong instruction and must not appear.** It is a single-agent skill with no notion of roles or delegation, so pointing an orchestrator at it invites the orchestrator to run the lifecycle itself instead of delegating — which defeats the entire reason a team was dispatched. It also does not cover this project's additions: the Telegram notifications, the test-plan gate, and the tester→coder TDD chain.
 
-**The orchestrator role template already is this project's orchestration-aware expansion of that same lifecycle** (`.dot-agent-deck.toml:87–157`), and the unit receives it as lines 1–71 of its context file before it ever reaches your task. So the team task's job is to name the *subject* and the *stop*, and to get out of the workflow's way.
+**The orchestrator role template already is this project's orchestration-aware expansion of that same lifecycle** (the `orchestrator` role's `prompt_template` in `.dot-agent-deck.toml`), and the unit receives it as lines 1–71 of its context file before it ever reaches your task. So the team task's job is to name the *subject* and the *stop*, and to get out of the workflow's way.
 
 **Do not patch `/prd-full` to add delegation awareness either.** It is project-local since #1052, so the edit would survive — but a single-agent skill that also knows about teams is two procedures in one file, and the composition decision belongs to the dispatcher, which is why it lives here.
 
@@ -615,8 +611,8 @@ Goal in one line: <written by you from the document, not pasted from it>
 
 Your role template above is the authority on HOW this work is done: the
 test-plan gate, the TDD chain (tester → coder → tester), the review phase, the
-cast recording with DOT_AGENT_DECK_RECORD=1, the PRD archival (step 5), the demo
-reel, the merge gate, and the notifications. This section is the authority on WHAT the work is and where this
+scoped e2e run, the PRD archival (step 5), the merge gate, and the
+notifications. This section is the authority on WHAT the work is and where this
 unit stops. Where the two seem to disagree about procedure, the template wins.
 
 In particular: DO NOT run /prd-full, and do not delegate it to anyone. It is a

@@ -227,7 +227,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
         .launch_with_fixture("minimal");
     control.wait_for_string("No active agents");
 
-    std::fs::write(control.workdir().join(SENTINEL), "reel fixture\n")
+    std::fs::write(control.workdir().join(SENTINEL), "card-layout fixture\n")
         .expect("write card-layout sentinel");
     let cwd = control.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];

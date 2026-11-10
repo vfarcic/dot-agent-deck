@@ -144,7 +144,7 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
 
     let deck = TuiDeck::builder()
         // One live pane; wide enough for a real claude TUI to render usefully
-        // and small enough to stay legible in a reel clip.
+        // and small enough to stay legible in its recorded cast.
         .with_pty_size(110, 32)
         // Real credentials, so the daemon-spawned interactive claude
         // authenticates.
@@ -346,13 +346,13 @@ fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
         deck.snapshot_grid()
     );
 
-    // Best-effort narrative for the reel: the same filename on the deck's own
+    // Best-effort visible narrative: the same filename on the deck's own
     // vt100 stream. Logged rather than asserted — a claude TUI inside a pane can
     // hard-wrap a filename across a row boundary, which the pane-level check
     // above is normalized against and a raw stream scan is not.
     let on_screen = deck.wait_for_stream_string_within(SENTINEL, Duration::from_secs(30));
     eprintln!(
-        "reel narrative (soft): sentinel {SENTINEL:?} visible on the deck's own grid = {on_screen}"
+        "narrative (soft): sentinel {SENTINEL:?} visible on the deck's own grid = {on_screen}"
     );
 }
 

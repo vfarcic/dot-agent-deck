@@ -455,13 +455,9 @@ mod live_deck_fallback {
 // `DOT_AGENT_DECK_RECORD`. Every route that ends a run without reaching `Drop` —
 // SIGKILL, a nextest timeout, Ctrl-C, a runtime skip before launch, a failed
 // re-recording — used to leave the PREVIOUS run's `full-stream.cast` in place,
-// and `.claude/skills/demo-reel-adapter` selects a cast on path existence alone.
-// A cast from a revision predating the redaction fixes could therefore be
-// stitched into a video and uploaded to YouTube with its link in the PR body and
-// the public release notes. (The upload is private by default now, so widening
-// it beyond the channel owner and the accounts they deliberately share it with
-// is a human step — that bounds the blast radius; it does not make a stale cast
-// correct.)
+// where it reads as the current run's. A cast from a revision predating the
+// redaction fixes could therefore be replayed, attached to an issue or shared as
+// if this run had produced it.
 //
 // Both call sites of the discard are covered here: the runtime-skip one by
 // actually taking it, and the launch one by a source guard, because observing it
@@ -470,10 +466,10 @@ mod live_deck_fallback {
 // Issue #808 added the other half, and the guards for it live below the discard
 // ones in this file. Clearing is keyed to REACHING one of those two call sites,
 // and two routes do not: a FILTERED run never selects the test at all, and
-// `skip_unless!` evaluates its preflight before `_skip_if_err` is entered. The
-// answer to both is that the adapter checks PROVENANCE rather than existence, so
-// what has to hold here is that the harness writes a sidecar the adapter can
-// read, and that the two ends of that contract cannot drift apart silently.
+// `skip_unless!` evaluates its preflight before `_skip_if_err` is entered. For
+// both, the `provenance.json` sidecar says which run produced a cast, so what
+// has to hold here is that the harness writes it, and writes it in an order
+// that cannot vouch for a cast it did not produce.
 
 /// The artifacts the harness dumps — the set the discard has to clear. Mirrors
 /// `RECORDING_ARTIFACTS` in `tests/common/mod.rs`; the guard below proves the two
@@ -487,15 +483,6 @@ const RECORDING_ARTIFACTS: [&str; 7] = [
     "daemon.log",
     "deck.log",
 ];
-
-fn adapter_build_script() -> String {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join(".claude")
-        .join("skills")
-        .join("demo-reel-adapter")
-        .join("build.sh");
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
-}
 
 fn harness_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -543,7 +530,7 @@ fn a_runtime_skip_discards_the_previous_recording() {
         assert!(
             !path.exists(),
             "{} survived a runtime skip, so an interrupted or skipped run can \
-             still hand the demo reel an artifact it did not produce",
+             still leave an artifact it did not produce in the current view",
             path.display()
         );
     }
@@ -567,8 +554,8 @@ fn a_runtime_skip_discards_the_previous_recording() {
 ///
 /// PR #805's second audit named the old warn-and-continue a fail-open and it was
 /// right: a warning only helps if somebody reads it, the run that printed it was
-/// still reported as PASSED, and the artifact it could not remove still satisfies
-/// the demo-reel adapter's existence check. Unix-only, because "a deletion that
+/// still reported as PASSED, and the artifact it could not remove still reads as
+/// the current run's. Unix-only, because "a deletion that
 /// fails for a reason other than NotFound" is arranged here through `EISDIR`.
 #[cfg(unix)]
 #[test]
@@ -595,7 +582,7 @@ fn a_discard_that_cannot_delete_a_stale_artifact_fails_the_run() {
     let payload = outcome.expect_err(
         "the discard must FAIL the run when it cannot remove a stale artifact — a \
          warning leaves the run green with a recording it did not produce, which \
-         is exactly what the demo-reel adapter then publishes",
+         then reads as the current run's",
     );
     let message = payload
         .downcast_ref::<String>()
@@ -630,8 +617,8 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
 
     let discard = body.find("discard_previous_recording(&test_name)").expect(
         "try_launch_inner no longer discards the previous recording — an \
-             interrupted run can leave a stale cast for the demo reel to \
-             publish (PR #805 audit blocker 3)",
+             interrupted run can leave a stale cast that reads as the current \
+             run's (PR #805 audit blocker 3)",
     );
     let spawn = body
         .find("slave.spawn_command")
@@ -641,7 +628,7 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
         discard < spawn,
         "the discard must run BEFORE the deck is spawned: from the spawn onwards \
          the run can be killed at any instant, and whatever it has not \
-         overwritten is what a later reel build picks up"
+         overwritten is left looking like this run's output"
     );
 
     // The dump and the discard must agree on the file names, or the discard
@@ -690,9 +677,10 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
 /// extracts the commit and the dirty flag from the real ones while yielding no
 /// commit for anything that cannot identify a revision.
 ///
-/// The commit in `provenance.json` is a publish gate, so a parse that returns a
-/// plausible-looking non-commit is worse than one that returns nothing: an empty
-/// `commit` makes the adapter refuse the clip, which is the safe direction.
+/// The commit in `provenance.json` is what says which revision produced a cast,
+/// so a parse that returns a plausible-looking non-commit is worse than one that
+/// returns nothing: an empty `commit` claims nothing, which is the safe
+/// direction.
 #[test]
 fn the_build_id_parse_yields_a_commit_only_when_one_is_really_there() {
     for (build_id, want_commit, want_dirty) in [
@@ -707,7 +695,7 @@ fn the_build_id_parse_yields_a_commit_only_when_one_is_really_there() {
         // Longer abbreviations are fine; the floor is a minimum, not a length.
         ("0.39.2-gdeadbeefcafe1234", Some("deadbeefcafe1234"), false),
         // The `-unknown` sentinel a git-less or shallow build composes. No
-        // commit, so the adapter refuses anything recorded by such a build.
+        // commit, so nothing recorded by such a build claims a revision.
         ("0.39.2-unknown", None, false),
         // A prerelease that merely LOOKS like it carries a sha.
         ("0.1.0-gamma", None, false),
@@ -739,9 +727,8 @@ fn the_build_id_parse_yields_a_commit_only_when_one_is_really_there() {
 ///
 /// Both orders are fail-closed and they point opposite ways, which is why
 /// neither is an accident worth leaving unguarded. Written last: a dump that
-/// dies partway leaves a cast with no sidecar, and the adapter refuses a cast
-/// with no sidecar — so a torn dump produces nothing publishable rather than
-/// something publishable. Discarded first: a discard that panics partway has
+/// dies partway leaves a cast with no sidecar, so a torn dump never carries a
+/// sidecar vouching for it. Discarded first: a discard that panics partway has
 /// already removed the sidecar that would have vouched for whatever survives.
 #[test]
 fn the_provenance_sidecar_is_written_last_and_discarded_first() {
@@ -756,15 +743,14 @@ fn the_provenance_sidecar_is_written_last_and_discarded_first() {
         .find("full-stream.cast")
         .expect("dump_recordings must write the cast");
     let provenance = dump_body.find("write_provenance(").expect(
-        "dump_recordings no longer writes the provenance sidecar — the demo-reel \
-         adapter then has nothing to check and falls back to publishing on path \
-         existence (issue #808)",
+        "dump_recordings no longer writes the provenance sidecar — nothing then \
+         says which run produced a cast (issue #808)",
     );
     assert!(
         cast < provenance,
         "the provenance sidecar must be written AFTER the cast it vouches for: a \
-         dump that dies in between must leave a cast the adapter refuses, not one \
-         it accepts"
+         dump that dies in between must leave a cast with no sidecar, not one \
+         that a sidecar vouches for"
     );
 
     let list = source
@@ -782,115 +768,6 @@ fn the_provenance_sidecar_is_written_last_and_discarded_first() {
         prov_pos < cast_pos,
         "provenance.json must be discarded BEFORE full-stream.cast: the discard \
          panics on the first failure, so removing the sidecar first means a \
-         partial discard leaves nothing publishable"
-    );
-}
-
-/// Scenario: Read every field the harness's `write_provenance` puts in
-/// `provenance.json` and every field the adapter's `build.sh` reads out of it,
-/// then assert the adapter's read set is a subset of the harness's write set and
-/// that both sides agree on the schema number.
-///
-/// The two halves of this contract live in different languages and neither
-/// compiles the other, so drift is invisible until a reel build refuses every
-/// clip. That failure is at least safe — an unreadable field reads as absent and
-/// the adapter refuses — but it is also silent until somebody tries to publish,
-/// which for a lane-2-only artifact can be weeks. Cheap to check here instead.
-///
-/// Deliberately one-directional: a field the harness writes and the adapter
-/// ignores (`test`, the recording's own name) breaks nothing, while a field the
-/// adapter requires and the harness stopped writing breaks everything.
-#[test]
-fn the_provenance_contract_the_adapter_reads_is_the_one_the_harness_writes() {
-    let source = harness_source();
-    let script = adapter_build_script();
-
-    let literal = source
-        .split_once("let provenance = serde_json::json!({")
-        .expect("write_provenance must build the sidecar with a json! literal")
-        .1;
-    let literal = literal
-        .split_once("});")
-        .expect("unterminated json! literal")
-        .0;
-    let mut written: Vec<String> = Vec::new();
-    let mut rest = literal;
-    while let Some((_, after)) = rest.split_once('"') {
-        let (name, tail) = after.split_once('"').expect("unterminated field name");
-        written.push(name.to_string());
-        rest = tail;
-    }
-    assert!(
-        written.len() >= 8,
-        "found only {} field names in the provenance literal — this guard has \
-         stopped guarding anything: {written:?}",
-        written.len()
-    );
-
-    // The adapter's read set, taken from the one jq filter that destructures the
-    // sidecar: each field appears there as `(.<name> // …)`.
-    let filter = script
-        .split_once("if ! fields=\"$(jq -r '")
-        .expect("build.sh must read the sidecar through a single jq filter")
-        .1;
-    let filter = filter
-        .split_once("' \"$file\"")
-        .expect("unterminated jq filter")
-        .0;
-    let mut read: Vec<String> = Vec::new();
-    let mut rest = filter;
-    while let Some((_, after)) = rest.split_once("(.") {
-        let name: String = after
-            .chars()
-            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .collect();
-        if !name.is_empty() && after[name.len()..].starts_with(" //") {
-            read.push(name);
-        }
-        rest = after;
-    }
-    assert!(
-        read.len() >= 8,
-        "found only {} fields in the adapter's jq filter — this guard has stopped \
-         guarding anything: {read:?}",
-        read.len()
-    );
-
-    for field in &read {
-        assert!(
-            written.iter().any(|w| w == field),
-            "`.claude/skills/demo-reel-adapter/build.sh` reads provenance field \
-             `{field}`, which `write_provenance` in tests/common/mod.rs does not \
-             write. The adapter treats an absent field as a refusal, so the reel \
-             would silently stop selecting every clip. Write the field, or stop \
-             reading it. (harness writes: {written:?})"
-        );
-    }
-
-    // The schema number gates the whole sidecar, so a bump on one side alone
-    // refuses every clip.
-    let harness_schema = source
-        .split_once("const RECORDING_PROVENANCE_SCHEMA: u32 = ")
-        .expect("RECORDING_PROVENANCE_SCHEMA must exist")
-        .1
-        .split_once(';')
-        .expect("unterminated const")
-        .0
-        .trim()
-        .to_string();
-    let adapter_schema = script
-        .split_once("\nPROVENANCE_SCHEMA=")
-        .expect("build.sh must declare PROVENANCE_SCHEMA")
-        .1
-        .lines()
-        .next()
-        .expect("PROVENANCE_SCHEMA has no value")
-        .trim()
-        .to_string();
-    assert_eq!(
-        harness_schema, adapter_schema,
-        "the harness writes provenance schema {harness_schema} and the adapter \
-         only accepts {adapter_schema} — every clip would be refused. Bump both \
-         in the same commit."
+         partial discard leaves nothing vouched for"
     );
 }
