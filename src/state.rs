@@ -4699,11 +4699,11 @@ impl AppState {
         // still at its prompt (#1365 item 3), and for a turn that then ended
         // on an error: the wait it reported is over, the failure is news.
         let reopen_settled = matches!(kind, StopKind::WaitingOnDelegation | StopKind::Failed);
-        // A failure replaces a wait still pending for the same agent: that
-        // watch would report a wait, and the failure is what the orchestrator
-        // has to hear (PR #2239 review). Its cooldown is kept.
-        if kind == StopKind::Failed {
-            registry.cancel_waiting_notice(pane_id, live_agent_id);
+        // A failure replaces a wait of the same agent, whose watch would
+        // report a wait; a repeated failure keeps the episode it already has,
+        // and its deadline (PR #2239 review). The cooldown is kept.
+        if kind == StopKind::Failed && !registry.open_failure_episode_slot(pane_id, live_agent_id) {
+            return;
         }
         let Some(armed) = registry.arm_waiting_notice(
             pane_id,
@@ -4713,6 +4713,9 @@ impl AppState {
         ) else {
             return;
         };
+        if kind == StopKind::Failed {
+            registry.mark_failure_episode(pane_id, armed.seq);
+        }
         tracing::debug!(
             pane_id = %pane_id,
             role = %role,
