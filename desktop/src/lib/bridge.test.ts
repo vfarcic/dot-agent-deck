@@ -2889,6 +2889,40 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   });
 
   /**
+   * Scenario (issue #1073, the agent reviewer on PR #2259): hold one agent's
+   * attach in flight, push it out of the warm set, then show it again, which
+   * queues a replay behind the outstanding attach BEFORE any stop. Then stop
+   * its deck's daemon and let the held attach resolve. The queued replay was
+   * declared against the daemon that is now stopped, so it is dropped with the
+   * deck's other sessions rather than attaching after the stop.
+   */
+  it("drops a replay queued before the deck's stop", async () => {
+    const { TauriDeckBridge, MAX_WARM_TERMINALS } = await import("./bridge");
+    const attach = holdableAttach();
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+
+    attach.hold("agent-1");
+    const showing = bridge.setShownTerminals([on("agent-1")]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
+    for (let index = 2; index <= MAX_WARM_TERMINALS + 2; index += 1) {
+      await bridge.setShownTerminals([on(`agent-${index}`)]);
+    }
+    const reshowing = bridge.setShownTerminals([on("agent-1")]);
+    await settle();
+    expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(1);
+
+    await bridge.runAction({ type: "stop_daemon", deckId: on("agent-1").deckId });
+    attach.release();
+    await Promise.allSettled([showing, reshowing]);
+    await settle();
+
+    expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(1);
+    await bridge.dispose();
+  });
+
+  /**
    * Scenario (PRD #1487, Qodo 4200693875): show a terminal on the deck, then
    * upgrade its daemon three times. A failure that left the old daemon
    * answering keeps the session usable; a restart that failed verifying after

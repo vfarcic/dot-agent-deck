@@ -5748,9 +5748,15 @@ export class TauriDeckBridge implements DeckBridge {
    * An attach still in flight on that deck is cancelled too (issue #1073,
    * Qodo on PR #2259): dropping its pending entry and channel is what makes
    * the post-await guard in the attach detach its late result instead of
-   * installing a session for a daemon that is gone.
+   * installing a session for a daemon that is gone. A replay queued behind
+   * such an attach (`attachRequested`, which a warm-set eviction can leave
+   * while the invocation is still outstanding) was declared against the same
+   * daemon and is dropped with it; a later declaration attaches afresh.
    */
   private forgetDeckSessions(deckId: string): void {
+    for (const [key, requested] of Array.from(this.attachRequested.entries())) {
+      if (requested.deckId === deckId) this.attachRequested.delete(key);
+    }
     for (const [key, pending] of Array.from(this.pendingAttachments.entries())) {
       if (pending.deckId !== deckId) continue;
       pending.cancelled = true;
