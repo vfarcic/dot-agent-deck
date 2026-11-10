@@ -491,6 +491,40 @@ fn copymode_keys_004_copy_mode_closes_when_another_client_closes_the_last_pane()
     assert_eq!(seam.mode(), "Normal");
 }
 
+/// Scenario: Copy mode is open, with a selection, on the dashboard's only pane when that pane goes away without the close handler running (it is only forgotten). The very first whole frame drawn after that is in command mode with no COPY chip and no copy-mode cursor, and a later `y` copies nothing.
+#[spec("copymode/keys/004")]
+#[test]
+fn copymode_keys_004_the_first_frame_without_the_pane_leaves_copy_mode() {
+    let mut seam = CopyModeSeam::new(80, 20, &numbered_lines());
+    seam.render_frame();
+    chars(&mut seam, "vkv");
+    let buf = seam.render_frame();
+    assert!(
+        chip_row(&buf).starts_with(" COPY"),
+        "copy mode opens on the dashboard's pane: {:?}",
+        chip_row(&buf)
+    );
+
+    seam.close_pane();
+    let buf = seam.render_frame();
+    assert!(
+        chip_row(&buf).starts_with(" COMMAND"),
+        "the first frame without the pane is in command mode: {:?}",
+        chip_row(&buf)
+    );
+    assert!(
+        cells(&buf, is_cursor).is_empty() && cells(&buf, is_selected).is_empty(),
+        "no copy-mode cursor or selection is left on screen"
+    );
+    assert_eq!(seam.mode(), "Normal");
+    chars(&mut seam, "y");
+    assert!(
+        seam.copies().is_empty(),
+        "y after the pane went away must copy nothing, got {:?}",
+        seam.copies()
+    );
+}
+
 /// Eight lines whose first eight columns are `VISIBLE<n>` and the rest a
 /// suffix a narrower pane does not show.
 fn visible_hidden_lines() -> Vec<u8> {
@@ -573,12 +607,30 @@ fn copymode_keys_003_an_oversized_screen_and_a_shrink_while_selected() {
     assert_eq!(shown, "w04-abcdefghijklmnop\nrow05-abcdefghijklmnop");
 }
 
-/// Scenario: The pane shows `你AB`, a two-column glyph and two letters, and the row is drawn with no gap after the glyph. In copy mode, moving right from the glyph lands on `A` and then `B`; selections forward and backward over the glyph highlight it and copy it whole; a cursor that starts, or moves up, onto the glyph's right half is put on the glyph. Each time the copied text is exactly the highlighted text.
+/// Scenario: The pane shows `你AB`, a two-column glyph and two letters, and the row is drawn with no gap after the glyph. In copy mode, moving right from the glyph lands on `A` and then `B`; selections forward and backward over the glyph highlight it and copy it whole; a cursor that starts, or moves up, onto the glyph's right half is put on the glyph. The same holds for a zero-width-joiner emoji and a flag, each drawn cell by cell as the screen holds it, and each time the copied text is exactly the highlighted text.
 #[spec("copymode/keys/005")]
 #[test]
 fn copymode_keys_005_a_wide_glyph_is_highlighted_and_copied_whole() {
-    let cases: [(&str, &[u8], &str, &str); 5] = [
+    let cases: [(&str, &[u8], &str, &str); 8] = [
         ("`gll`, select, yank", "你AB".as_bytes(), "gllvy", "B"),
+        (
+            "the letter after a joined emoji",
+            "👩\u{200d}💻AB".as_bytes(),
+            "glllvy",
+            "B",
+        ),
+        (
+            "across both cells of a joined emoji",
+            "👩\u{200d}💻AB".as_bytes(),
+            "gvlly",
+            "👩\u{200d}💻A",
+        ),
+        (
+            "a flag's second indicator",
+            "🇺🇸AB".as_bytes(),
+            "glvly",
+            "🇸A",
+        ),
         ("forward from the glyph", "你AB".as_bytes(), "gvly", "你A"),
         (
             "backward onto the glyph",

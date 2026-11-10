@@ -251,3 +251,31 @@ fn widget_004_a_wide_glyph_takes_its_own_two_columns_and_no_more() {
     assert_eq!(buf[(inner.x, inner.y)].symbol(), "你");
     assert_eq!(buf[(inner.x + 2, inner.y)].symbol(), "好");
 }
+
+/// Scenario: Vt100 screens hold a zero-width-joiner emoji (`👩‍💻AB`, which the screen keeps as two two-column cells) and a regional-indicator flag (`🇺🇸AB`, two one-column cells), each followed by two letters. Render each through `TerminalWidget`. Every screen cell is drawn in its own column with that cell's own text, so the letters sit where the screen has them and a selection made in screen columns shows the text it copies.
+#[spec("render/widget/004")]
+#[test]
+fn widget_004_every_screen_cell_is_drawn_in_its_own_column() {
+    for text in ["👩\u{200d}💻AB", "🇺🇸AB", "你好AB"] {
+        let mut parser = dot_agent_deck::vt_grid::parser(3, 12, 0);
+        parser.process(text.as_bytes());
+        let cells: Vec<(u16, String)> = (0..12)
+            .filter_map(|col| {
+                let cell = parser.screen().cell(0, col)?;
+                (!cell.is_wide_continuation() && !cell.contents().is_empty())
+                    .then(|| (col, cell.contents().to_string()))
+            })
+            .collect();
+        let area = Rect::new(0, 0, 14, 5);
+        let buf = render_widget(parser, area, false);
+        let inner = inner_of(area);
+        for (col, contents) in cells {
+            assert_eq!(
+                buf[(inner.x + col, inner.y)].symbol(),
+                contents,
+                "{text:?}: screen column {col} is drawn in its own column:\n{}",
+                inner_dump(&buf, inner)
+            );
+        }
+    }
+}

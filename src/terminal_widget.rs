@@ -1,10 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use ratatui::buffer::Buffer;
+use std::num::NonZeroU16;
+
+use ratatui::buffer::{Buffer, CellDiffOption, CellWidth};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Borders, Widget};
 
 use crate::palette;
 use crate::state::SessionStatus;
@@ -80,6 +82,21 @@ fn cell_style(cell: &vt100::Cell) -> Style {
 
     style = style.add_modifier(modifiers);
     style
+}
+
+/// The text a screen cell is drawn with: its contents, or a blank for an
+/// empty cell. Contents a terminal would not draw as one cell of text (a
+/// control character, or text that takes no column on its own) is drawn as a
+/// blank too, as ratatui drops such text when it lays out a string.
+fn drawable_symbol(contents: &str) -> &str {
+    if contents.is_empty()
+        || contents.contains(char::is_control)
+        || unicode_width::UnicodeWidthStr::width(contents) == 0
+    {
+        " "
+    } else {
+        contents
+    }
 }
 
 /// A Ratatui widget that renders a vt100 terminal screen.
@@ -310,53 +327,56 @@ impl Widget for TerminalWidget {
         let (rows, cols) = drawn_screen_size(screen, inner);
         let (rows, cols) = (usize::from(rows), usize::from(cols));
 
+        // PRD #385: each screen cell is written into the buffer cell at its
+        // own column, with that cell's own text, rather than joining a row's
+        // cells into one string for ratatui to split into graphemes again.
+        // Re-splitting can join what the screen keeps in separate cells (a
+        // zero-width-joiner emoji, a flag's two indicators) and move every
+        // later cell left, while a mouse selection and copy mode select and
+        // copy by screen column, so the highlight would show other text than
+        // a copy takes. Writing by column keeps drawn column == screen column
+        // for every cell; a sequence the screen split is drawn split.
         for row_idx in 0..rows {
-            let mut spans = Vec::new();
-            let mut col = 0;
-            let mut run_text = String::new();
-            let mut run_style = Style::default();
-
-            while col < cols {
+            let y = inner.y + row_idx as u16;
+            for col in 0..cols {
+                let x = inner.x + col as u16;
                 let cell = screen.cell(row_idx as u16, col as u16);
-                // PRD #385: a wide glyph already takes this column, its
-                // second; a blank for it would push the rest of the row one
-                // column right of the screen's own columns, so a selection
-                // made in screen columns would show other text than it copies.
+                // A wide glyph's second column: the glyph drawn in the column
+                // before it covers it, as `Buffer::set_stringn` leaves it.
                 if cell.is_some_and(|cell| cell.is_wide_continuation()) {
-                    col += 1;
+                    if let Some(hidden) = buf.cell_mut((x, y)) {
+                        hidden.reset();
+                    }
                     continue;
                 }
-                let (ch, style) = match cell {
-                    Some(cell) => {
-                        let c = cell.contents();
-                        let s = cell_style(cell);
-                        (if c.is_empty() { " " } else { c }, s)
-                    }
-                    None => (" ", Style::default()),
+                let (symbol, style, width) = match cell {
+                    Some(cell) => (
+                        drawable_symbol(cell.contents()),
+                        cell_style(cell),
+                        if cell.is_wide() { 2 } else { 1 },
+                    ),
+                    None => (" ", Style::default(), 1),
                 };
-                if style == run_style && !run_text.is_empty() {
-                    run_text.push_str(ch);
-                } else {
-                    if !run_text.is_empty() {
-                        spans.push(Span::styled(std::mem::take(&mut run_text), run_style));
-                    }
-                    run_text.push_str(ch);
-                    run_style = style;
+                // A wide glyph whose second column is past what this pane
+                // draws is not drawn, as a selection does not copy it.
+                if width == 2 && col + 1 >= cols {
+                    continue;
                 }
-                col += 1;
+                let Some(target) = buf.cell_mut((x, y)) else {
+                    continue;
+                };
+                target.set_symbol(symbol).set_style(style);
+                // The screen decides how many columns a cell takes. Where
+                // ratatui would measure the text otherwise (a variation
+                // selector, a text-presentation emoji), the screen's width is
+                // forced, so ratatui's diff skips the same columns after the
+                // cell as the screen does.
+                if symbol.cell_width() != width
+                    && let Some(forced) = NonZeroU16::new(width)
+                {
+                    target.set_diff_option(CellDiffOption::ForcedWidth(forced));
+                }
             }
-            if !run_text.is_empty() {
-                spans.push(Span::styled(run_text, run_style));
-            }
-
-            let line = Line::from(spans);
-            let line_area = Rect {
-                x: inner.x,
-                y: inner.y + row_idx as u16,
-                width: inner.width,
-                height: 1,
-            };
-            Paragraph::new(line).render(line_area, buf);
         }
 
         // Render a visible block cursor when the pane is focused AND live, and

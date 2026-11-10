@@ -17510,6 +17510,13 @@ fn render_frame(
             &[]
         };
         reconcile_copy_mode(ui, embedded, drawn);
+        // PRD #385: a frame that draws no pane leaves no pane to hit-test or
+        // to finish a drag in. Without this the last frame's rects outlive
+        // it, and a drag over blank space where a now-hidden pane was drawn
+        // would select, focus and copy that pane.
+        if panes_area.is_none() {
+            record_drawn_panes(ui, DrawnPanes::default());
+        }
     }
     // PRD #385: an overlay opened mid-drag takes the gesture and its
     // unfinished highlight, before this frame draws either.
@@ -18623,6 +18630,14 @@ fn record_drawn_panes(ui: &mut UiState, drawn: DrawnPanes) {
     ui.drawn_pane_rects = drawn.panes;
     if drawn.selection_stale {
         ui.selection = None;
+    }
+    // PRD #385: a drag still under way in a pane this frame did not draw has
+    // nothing on screen to finish over, so its release must not copy.
+    let drag_pane_hidden = ui.selection.as_ref().is_some_and(|sel| {
+        sel.copied.is_none() && !ui.drawn_pane_rects.iter().any(|(id, _)| *id == sel.pane_id)
+    });
+    if drag_pane_hidden {
+        cancel_pane_gesture(ui);
     }
     // PRD #385 M5: copy mode ends with its pane, and its frozen screen is let
     // go once the UI has left copy mode by any path.
@@ -25734,6 +25749,9 @@ pub struct PaneSelectionSeam {
     copies: Vec<String>,
     layout: PaneLayout,
     banner: CommandBannerVisibility,
+    /// The panes belong to an orchestration tab: that tab draws them and the
+    /// dashboard does not ([`Self::on_orchestration_tab`]).
+    orchestration_owned: bool,
 }
 
 #[doc(hidden)]
@@ -25804,7 +25822,22 @@ impl PaneSelectionSeam {
             copies: Vec::new(),
             layout: PaneLayout::Tiled,
             banner: CommandBannerVisibility::Hidden,
+            orchestration_owned: false,
         }
+    }
+
+    /// The panes are an orchestration's role panes, and that orchestration's
+    /// tab is the active one: the dashboard leaves them out.
+    pub fn on_orchestration_tab(mut self) -> Self {
+        self.orchestration_owned = true;
+        self.deck = DeckKey::Orchestration(1);
+        self
+    }
+
+    /// The panes move to an orchestration, whose tab is not the active one:
+    /// the dashboard stops drawing them, though they keep running.
+    pub fn move_panes_to_orchestration(&mut self) {
+        self.orchestration_owned = true;
     }
 
     /// Command mode, with the COMMAND MODE banner over the focused pane when
@@ -25836,13 +25869,77 @@ impl PaneSelectionSeam {
         self.area = Rect::new(0, 0, width, height);
     }
 
-    /// The panes drawn on the current tab: every seam pane on the dashboard,
+    /// The panes drawn on the current tab: every seam pane on the tab that
+    /// owns them (the dashboard, unless [`Self::on_orchestration_tab`] or
+    /// [`Self::move_panes_to_orchestration`] gave them to an orchestration),
     /// none on the other tab.
     fn drawn_ids(&self) -> Vec<String> {
-        match self.deck {
-            DeckKey::Dashboard => self.pane_ids.clone(),
-            DeckKey::Orchestration(_) => Vec::new(),
+        match (self.deck, self.orchestration_owned) {
+            (DeckKey::Dashboard, false) | (DeckKey::Orchestration(_), true) => {
+                self.pane_ids.clone()
+            }
+            _ => Vec::new(),
         }
+    }
+
+    /// Draw a whole frame the way the run loop does ([`draw_frame`]): the
+    /// production layout of the active tab, its cards, panes and bottom bar.
+    /// Unlike [`Self::render`], a tab with no pane to draw takes the layout's
+    /// own no-pane path.
+    pub fn render_frame(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // As `run_tui` does right before it draws.
+        clear_selection_on_tab_switch(&mut self.ui, Some(self.deck));
+        self.ui.pane_layout = self.layout;
+        let mut terminal = Terminal::new(TestBackend::new(self.area.width, self.area.height))
+            .expect("TestBackend should construct");
+        let snapshot = AppState::default();
+        let filtered = filter_sessions(&snapshot, &self.ui);
+        let owned = |owned: bool| {
+            if owned {
+                self.pane_ids.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        let (tab_view, active_index) = match self.deck {
+            DeckKey::Dashboard => (
+                ActiveTabView::Dashboard {
+                    exclude_pane_ids: owned(self.orchestration_owned),
+                    zoomed: false,
+                },
+                0,
+            ),
+            DeckKey::Orchestration(_) => (
+                ActiveTabView::Orchestration {
+                    role_pane_ids: owned(self.orchestration_owned),
+                    split_narrow: false,
+                    zoomed: false,
+                },
+                1,
+            ),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into(), "orchestration".into()],
+            active_index,
+            orchestration_statuses: vec![None, Some(Vec::new())],
+        };
+        let sources = FrameSources {
+            snapshot: &snapshot,
+            filtered: &filtered,
+            tick: 0,
+            has_pane_control: true,
+            pane: &self.ctrl,
+            tab_view: &tab_view,
+            tab_bar: &tab_bar,
+            features: Features::test_with(false),
+            show_hook_notice: false,
+            wall_now: Utc::now(),
+        };
+        draw_frame(&mut terminal, &mut self.ui, &sources).expect("the frame draws");
+        terminal.backend().buffer().clone()
     }
 
     /// Draw a frame the way `render_frame` draws the pane column.
@@ -25894,6 +25991,15 @@ impl PaneSelectionSeam {
 
     pub fn focused_pane_id(&self) -> Option<String> {
         self.ctrl.focused_pane_id()
+    }
+
+    /// The outer rect the last frame drew `pane_id` in, if it drew it.
+    pub fn drawn_pane_rect(&self, pane_id: &str) -> Option<Rect> {
+        self.ui
+            .drawn_pane_rects
+            .iter()
+            .find(|(id, _)| id == pane_id)
+            .map(|(_, rect)| *rect)
     }
 
     /// One mouse report at a screen cell, as the live mouse arm receives it.

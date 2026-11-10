@@ -3889,11 +3889,11 @@ note).
 - **Does not assert:** the release-mode log-once line; the upstream sizing that produces the capped parser (covered by `resize/layout/002`); the general area-larger-than-screen `min` fallback with the guard OFF (covered by `render/widget/002`).
 - **Platform coverage:** mac+linux+windows.
 
-##### render/widget/004 — A wide (two-column) glyph is drawn in the two columns it has on the screen, with no extra blank after it (PRD #385 decision 6).
+##### render/widget/004 — Every screen cell is drawn in its own column: a wide (two-column) glyph takes the two columns it has on the screen, and a cell is never joined with its neighbour (PRD #385 decision 6).
 - **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`, `tests/render_terminal_widget.rs`).
 - **Agent:** none.
-- **Asserts:** with `你好AB` on a vt100 screen's first row, the inner area shows `你` in column 0, `好` in column 2, `A` in column 4 and `B` in column 5, the screen's own columns.
-- **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks or emoji sequences; colours.
+- **Asserts:** with `你好AB` on a vt100 screen's first row, the inner area shows `你` in column 0, `好` in column 2, `A` in column 4 and `B` in column 5, the screen's own columns; for `👩‍💻AB` (a zero-width-joiner emoji the screen keeps as two two-column cells), `🇺🇸AB` (a flag kept as two one-column cells) and `你好AB`, every screen cell's own text is drawn in that cell's column.
+- **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag; colours.
 - **Platform coverage:** mac+linux+windows.
 
 #### render/layout
@@ -7773,7 +7773,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/select/010 — A drag over wide (two-column) glyphs copies exactly what its highlight shows (PRD #385 decision 6).
 - **Layer:** L1 (`PaneSelectionSeam`, `tests/mouse_select.rs`).
 - **Agent:** none.
-- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column.
+- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) drags copy `AB` and `💻A`, and on `🇺🇸AB` they copy `🇸AB` and `AB`, each matching its highlight.
 - **Does not assert:** double- and triple-click word and paragraph selection over wide glyphs; a glyph cut by the pane's edge.
 - **Platform coverage:** mac+linux+windows.
 
@@ -7783,6 +7783,13 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Asserts:** in command mode, a press and drag across the sentinel, then `?` with the button held and the release over the drawn Help overlay, write no OSC 52 sequence and show no copy status, and Help stays open; after Help closes, a click on `[New Agent n/Ctrl+N]` opens the directory picker; a press and drag followed by a terminal focus-out report (`CSI O`) and then the release write no OSC 52 sequence and show no copy status.
 - **Does not assert:** each other overlay and modal one by one (they share the check `overlay_blocks_mouse` decides); the unfinished highlight's cells while Help is open; a real agent, so it carries no ` [reel]` marker.
 - **Platform coverage:** mac+linux.
+
+##### mouse/select/012 — A frame that draws no pane leaves nothing to select: a drag where a hidden pane was drawn copies nothing (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam::render_frame`: the run loop's `draw_frame` with the production layout of the active tab, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** two orchestration role panes are drawn on their tab; after a switch to the dashboard, whose whole frame draws no pane while both keep running, a press, drag and release over the second pane's former cells copy nothing, leave the first pane focused and highlight nothing; a drag under way in a dashboard pane when the panes move to an orchestration (so the next frame draws none) copies nothing on release.
+- **Does not assert:** the real binary; a pane hidden while other panes are still drawn (the same post-frame check covers it).
+- **Platform coverage:** mac+linux+windows.
 
 #### clipboard/deliver
 
@@ -7842,15 +7849,15 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### copymode/keys/004 — Copy mode closes when another client closes the last pane, and a pane reusing that id does not inherit it (PRD #385 M5).
 - **Layer:** L1 (`CopyModeSeam::render_frame`: the run loop's `draw_frame` with the production layout over the dashboard tab, and the daemon's pane-closure report applied through `apply_pane_closure`, `tests/copy_mode.rs`).
 - **Agent:** none.
-- **Asserts:** with copy mode open and a selection made on the dashboard's only pane, after the pane is closed externally the first whole frame shows the ` COMMAND ` chip, no copy-mode cursor and no selection, and a later `y` copies nothing (no OSC 52 send); when a new pane is attached under the closed pane's id before any frame is drawn, `y` copies nothing and the UI is in command mode.
+- **Asserts:** with copy mode open and a selection made on the dashboard's only pane, after the pane is closed externally the first whole frame shows the ` COMMAND ` chip, no copy-mode cursor and no selection, and a later `y` copies nothing (no OSC 52 send); when a new pane is attached under the closed pane's id before any frame is drawn, `y` copies nothing and the UI is in command mode; when the pane is only forgotten, with no closure handler leaving copy mode, the very first whole frame is still in command mode with no chip, cursor or selection, and `y` copies nothing, which pins the frame's own pre-draw check.
 - **Does not assert:** the real binary or a second client (the closure report is applied as the run loop applies it); an orchestration tab closing under copy mode, which leaves the pane undrawn and closes copy mode through the same pre-frame check.
 - **Platform coverage:** mac+linux+windows.
 
 ##### copymode/keys/005 — Copy mode highlights and copies a wide (two-column) glyph whole (PRD #385 decision 6).
 - **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
 - **Agent:** none.
-- **Asserts:** the row `你AB` is drawn with no gap after the glyph; `g l l`, select, yank copies `B` with `B` highlighted; a forward selection from the glyph copies `你A`, a backward one onto it `你AB`; a copy-mode cursor that opens on, or moves up onto, a glyph's right half is put on the glyph, so the selection copies `你A` and `你b`; each time the highlighted text, read as a terminal draws it, is the copied text.
-- **Does not assert:** a glyph cut by the pane's right edge (it is not drawn and copies as nothing); emoji sequences or combining marks.
+- **Asserts:** the row `你AB` is drawn with no gap after the glyph; `g l l`, select, yank copies `B` with `B` highlighted; a forward selection from the glyph copies `你A`, a backward one onto it `你AB`; a copy-mode cursor that opens on, or moves up onto, a glyph's right half is put on the glyph, so the selection copies `你A` and `你b`; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) `g l l l` then yank copies `B`, and a selection over both emoji cells copies `👩‍💻A`; on `🇺🇸AB` a selection from the flag's second indicator copies `🇸A`; each time the highlighted text, read as a terminal draws it, is the copied text.
+- **Does not assert:** a glyph cut by the pane's right edge (it is not drawn and copies as nothing); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag.
 - **Platform coverage:** mac+linux+windows.
 
 ##### copymode/keys/006 — A remapped key that leaves copy mode is not also taken as a jump, and copy mode's entry key can be remapped (PRD #385 M5).

@@ -523,3 +523,115 @@ fn select_010_a_drag_over_wide_glyphs_copies_what_it_highlights() {
         );
     }
 }
+
+/// Scenario: A pane shows `👩‍💻AB`, a zero-width-joiner emoji its screen keeps as two two-column cells, or `🇺🇸AB`, a flag kept as two one-column cells. Drags over the letters after them, over part of the emoji and over the flag's second indicator each copy exactly the text the highlight shows.
+#[spec("mouse/select/010")]
+#[test]
+fn select_010_a_drag_over_joined_emoji_and_flags_copies_what_it_highlights() {
+    // `👩‍` 0-1, `💻` 2-3, A 4, B 5; and `🇺` 0, `🇸` 1, A 2, B 3.
+    let cases: [(&str, &str, u16, u16, &str); 4] = [
+        (
+            "the letters after a joined emoji",
+            "👩\u{200d}💻AB",
+            4,
+            5,
+            "AB",
+        ),
+        (
+            "from the emoji's second cell",
+            "👩\u{200d}💻AB",
+            2,
+            4,
+            "💻A",
+        ),
+        ("a flag's second indicator on", "🇺🇸AB", 1, 3, "🇸AB"),
+        ("the letters after a flag", "🇺🇸AB", 2, 3, "AB"),
+    ];
+    for (what, text, from, to, expected) in cases {
+        let mut seam = PaneSelectionSeam::tiled(40, 8, &[("a", text.as_bytes())], "a");
+        seam.render();
+        let (x, y) = first_cell(seam.pane_rect("a"));
+        press(&mut seam, x + from, y);
+        drag(&mut seam, x + to, y);
+        release(&mut seam, x + to, y);
+        assert_eq!(
+            seam.copies().last().map(String::as_str),
+            Some(expected),
+            "{what}: the copy"
+        );
+        let buf = seam.render();
+        assert_eq!(
+            visible_highlighted_text(&buf),
+            expected,
+            "{what}: the highlight\n{}",
+            frame_with_highlight(&buf)
+        );
+    }
+}
+
+/// Two orchestration role panes, `a` focused, drawn by a whole frame of the
+/// orchestration tab.
+fn orchestration_panes() -> PaneSelectionSeam {
+    let mut seam = PaneSelectionSeam::tiled(60, 16, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], "a")
+        .on_orchestration_tab();
+    let buf = seam.render_frame();
+    assert!(
+        frame_with_highlight(&buf).contains("bravo-right-text"),
+        "the orchestration tab draws its panes:\n{}",
+        frame_with_highlight(&buf)
+    );
+    seam
+}
+
+/// Scenario: Two orchestration panes are drawn on their tab, then the user switches to the dashboard, which draws no pane while both keep running. A drag over blank dashboard space where the second pane used to be copies nothing and focuses no pane; and a drag already under way in a dashboard pane when that pane moves to an orchestration copies nothing on release.
+#[spec("mouse/select/012")]
+#[test]
+fn select_012_a_frame_with_no_pane_leaves_nothing_to_select() {
+    let mut seam = orchestration_panes();
+    let rect = seam
+        .drawn_pane_rect("b")
+        .expect("the orchestration tab drew `b`");
+    seam.switch_tab();
+    let buf = seam.render_frame();
+    assert!(
+        !frame_with_highlight(&buf).contains("bravo"),
+        "the dashboard draws no orchestration pane:\n{}",
+        frame_with_highlight(&buf)
+    );
+    let (x, y) = first_cell(rect);
+    press(&mut seam, x, y);
+    drag(&mut seam, x + 4, y);
+    release(&mut seam, x + 4, y);
+    assert!(
+        seam.copies().is_empty(),
+        "a drag where a hidden pane used to be copied {:?}",
+        seam.copies()
+    );
+    assert_eq!(
+        seam.focused_pane_id().as_deref(),
+        Some("a"),
+        "no focus change"
+    );
+    let buf = seam.render_frame();
+    assert!(
+        highlighted(&buf).is_empty(),
+        "nothing is highlighted:\n{}",
+        frame_with_highlight(&buf)
+    );
+
+    // A drag under way when its pane stops being drawn.
+    let mut seam = PaneSelectionSeam::tiled(60, 16, &[("a", LEFT_PANE), ("b", RIGHT_PANE)], "a");
+    seam.render_frame();
+    let rect = seam.drawn_pane_rect("b").expect("the dashboard drew `b`");
+    let (x, y) = first_cell(rect);
+    press(&mut seam, x, y);
+    drag(&mut seam, x + 4, y);
+    seam.move_panes_to_orchestration();
+    seam.render_frame();
+    release(&mut seam, x + 4, y);
+    assert!(
+        seam.copies().is_empty(),
+        "the release of a drag whose pane is no longer drawn copied {:?}",
+        seam.copies()
+    );
+}
