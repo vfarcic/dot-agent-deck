@@ -607,6 +607,88 @@ fn copymode_keys_003_an_oversized_screen_and_a_shrink_while_selected() {
     assert_eq!(shown, "w04-abcdefghijklmnop\nrow05-abcdefghijklmnop");
 }
 
+/// Twenty lines `L00-…` to `L19-…`, the last with no newline after it.
+fn short_screen_lines() -> Vec<u8> {
+    (0..20)
+        .map(|n| format!("L{n:02}-text"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// The pane's content rows below the first `drawn` ones: the rows a screen
+/// shorter than its pane leaves blank.
+fn undrawn_rows(rect: Rect, drawn: u16) -> std::ops::Range<u16> {
+    rect.y + 1 + drawn..rect.y + rect.height - 1
+}
+
+/// Scenario: The pane's terminal screen is 4 rows tall while the pane has room for more, so the rows below the screen are blank, and copy mode is scrolled back into the history. A selection from a history line down to the last drawn row yanks exactly the highlighted text. A selection that runs on below the drawn rows, made by anchoring on a history line and moving up until the view follows, highlights only drawn rows, and the highlighted text is the part of the yank the pane shows.
+#[spec("copymode/keys/003")]
+#[test]
+fn copymode_keys_003_a_screen_shorter_than_its_pane_marks_only_drawn_rows() {
+    let mut seam = CopyModeSeam::with_screen(WIDTH, HEIGHT, &short_screen_lines(), 4, WIDTH);
+    seam.render();
+    let rect = seam.pane_rect();
+    assert!(
+        rect.height - 2 > 4 + 2,
+        "the pane must have room for blank rows below the screen, got {rect:?}"
+    );
+    let marked_below = |buf: &Buffer| {
+        cells(buf, |b, x, y| is_selected(b, x, y) || is_cursor(b, x, y))
+            .into_iter()
+            .filter(|&(_, y)| undrawn_rows(rect, 4).contains(&y))
+            .collect::<Vec<_>>()
+    };
+
+    // Scrolled into the history: from `L10` down to the last drawn row.
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::Char('k'), 9);
+    press(&mut seam, KeyCode::Char('h'), 40);
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::Char('j'), 3);
+    press(&mut seam, KeyCode::Char('l'), 40);
+    let buf = seam.render();
+    let shown = marked_text(&buf);
+    assert_eq!(marked_below(&buf), [], "{}", frame_with_marks(&buf));
+    chars(&mut seam, "y");
+    assert_eq!(
+        seam.copies().last().map(String::as_str),
+        Some(shown.as_str()),
+        "the yank copies what the frame highlights:\n{}",
+        frame_with_marks(&buf)
+    );
+    assert_eq!(shown, "L10-text\nL11-text\nL12-text\nL13-text");
+
+    // Anchored on a history line, then moved up so far that the view
+    // follows: the anchor's line is now below the drawn rows.
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::Char('k'), 9);
+    press(&mut seam, KeyCode::Char('h'), 40);
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::Char('k'), 6);
+    let buf = seam.render();
+    assert_eq!(
+        marked_below(&buf),
+        [],
+        "no cell below the drawn rows is marked:\n{}",
+        frame_with_marks(&buf)
+    );
+    let shown = marked_text(&buf);
+    chars(&mut seam, "y");
+    let yanked = seam.copies().last().cloned().unwrap_or_default();
+    let in_view = yanked.lines().take(4).collect::<Vec<_>>().join("\n");
+    assert_eq!(
+        shown,
+        in_view,
+        "the highlight is the part of the yank the pane draws:\n{}",
+        frame_with_marks(&buf)
+    );
+    assert_eq!(
+        yanked,
+        "L04-text\nL05-text\nL06-text\nL07-text\nL08-text\nL09-text\nL"
+    );
+}
+
 /// Scenario: The pane shows `你AB`, a two-column glyph and two letters, and the row is drawn with no gap after the glyph. In copy mode, moving right from the glyph lands on `A` and then `B`; selections forward and backward over the glyph highlight it and copy it whole; a cursor that starts, or moves up, onto the glyph's right half is put on the glyph. The same holds for a zero-width-joiner emoji and a flag, each drawn cell by cell as the screen holds it, and each time the copied text is exactly the highlighted text.
 #[spec("copymode/keys/005")]
 #[test]

@@ -337,23 +337,31 @@ impl CopyMode {
         })
     }
 
-    /// What the view's `row` shows besides its text.
+    /// What the view's `row` shows besides its text. A row the pane draws no
+    /// screen row on (below a screen shorter than the pane) has no marks, and
+    /// marks stop at the last drawn column: the highlight covers only cells
+    /// whose text a yank copies.
     pub fn row_marks(&self, row: u16) -> RowMarks {
+        if row >= self.shown_rows {
+            return RowMarks::default();
+        }
+        let last_col = self.shown_cols - 1;
         let line = self.top() + usize::from(row);
         let selected = self.selection().and_then(|(start, end)| {
             (start.line..=end.line).contains(&line).then(|| {
                 let first = if line == start.line { start.col } else { 0 };
                 let last = if line == end.line {
-                    end.col
+                    end.col.min(last_col)
                 } else {
-                    self.shown_cols - 1
+                    last_col
                 };
                 (first, last)
             })
         });
         RowMarks {
-            selected,
-            cursor: (self.cursor.line == line).then_some(self.cursor.col),
+            selected: selected.filter(|&(first, last)| first <= last),
+            cursor: (self.cursor.line == line && self.cursor.col <= last_col)
+                .then_some(self.cursor.col),
         }
     }
 

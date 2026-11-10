@@ -13417,8 +13417,10 @@ fn handle_key_event(
 /// same way. That thread runs under `catch_unwind` for its whole life
 /// (`clipboard::in_clipboard_worker`) and settles the native clipboard as
 /// unavailable, so copies go on as OSC 52 only; tearing the terminal down
-/// for it would leave a running TUI drawing on a restored shell. A panic on a
-/// thread arboard starts for itself is not on that thread and is not covered.
+/// for it would leave a running TUI drawing on a restored shell. The hook
+/// notes that panic's location instead, for the warning the worker logs when
+/// it catches it. A panic on a thread arboard starts for itself is not on
+/// that thread and is not covered.
 pub(crate) fn tui_panic_hook<F>(
     teardown: F,
 ) -> impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static
@@ -13427,9 +13429,16 @@ where
 {
     move |info| {
         #[cfg(panic = "unwind")]
-        if crate::embedded_pane::in_guarded_parser_feed() || crate::clipboard::in_clipboard_worker()
         {
-            return;
+            if crate::clipboard::in_clipboard_worker() {
+                // The worker catches this panic and logs it; the location is
+                // only available here.
+                crate::clipboard::note_clipboard_worker_panic(info);
+                return;
+            }
+            if crate::embedded_pane::in_guarded_parser_feed() {
+                return;
+            }
         }
         teardown(info);
     }

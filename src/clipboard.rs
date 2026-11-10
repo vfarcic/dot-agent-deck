@@ -20,7 +20,7 @@
 //! tests inject a fake so that none of them writes the clipboard of the
 //! machine running them.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, mpsc};
 use std::time::Duration;
@@ -234,6 +234,50 @@ thread_local! {
     static IN_CLIPBOARD_WORKER: Cell<bool> = const { Cell::new(false) };
 }
 
+thread_local! {
+    /// Where the clipboard worker's panic happened, as the `run_tui` panic
+    /// hook noted it through [`note_clipboard_worker_panic`] before leaving
+    /// the terminal alone. The worker takes it when it catches the panic, to
+    /// log it; it stays empty under a hook that does not note it.
+    static WORKER_PANIC_LOCATION: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// Note where a panic on the clipboard worker happened, for the warning the
+/// worker logs when it catches that panic. Called by the `run_tui` panic hook,
+/// on the panicking thread, in place of the terminal teardown.
+#[cfg_attr(panic = "abort", allow(dead_code))]
+pub(crate) fn note_clipboard_worker_panic(info: &std::panic::PanicHookInfo<'_>) {
+    if let Some(location) = info.location() {
+        WORKER_PANIC_LOCATION.with(|noted| *noted.borrow_mut() = Some(location.to_string()));
+    }
+}
+
+/// The warning logged when the clipboard worker catches a panic: what the
+/// panic said, where it happened when that was noted, and that native writes
+/// are off for the rest of the session. The message is quoted with its
+/// escapes, so a payload carrying line breaks or terminal controls cannot
+/// forge a log line.
+fn worker_panic_warning(payload: &(dyn std::any::Any + Send), location: Option<&str>) -> String {
+    let message = payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("<a panic payload that is not text>");
+    let at = location.map(|l| format!(" at {l}")).unwrap_or_default();
+    format!(
+        "the native clipboard thread panicked{at}: {message:?}; native clipboard writes are \
+         disabled for the rest of this session, and copies go out as OSC 52 only"
+    )
+}
+
+/// The warning for a panic the clipboard worker caught, on the worker
+/// thread: [`worker_panic_warning`] with the location the panic hook noted,
+/// which it takes so a later panic is not reported at this one's location.
+fn caught_worker_panic(payload: &(dyn std::any::Any + Send)) -> String {
+    let location = WORKER_PANIC_LOCATION.with(|noted| noted.borrow_mut().take());
+    worker_panic_warning(payload, location.as_deref())
+}
+
 /// True on the native clipboard's worker thread. See [`IN_CLIPBOARD_WORKER`].
 ///
 /// The `run_tui` hook reads it only under `panic = "unwind"`, for the reason
@@ -314,10 +358,8 @@ impl NativeClipboard {
                 IN_CLIPBOARD_WORKER.with(|flag| flag.set(true));
                 let served =
                     std::panic::catch_unwind(AssertUnwindSafe(|| serve(&worker_shared, opener)));
-                if served.is_err() {
-                    tracing::warn!(
-                        "the native clipboard thread panicked; copies go out as OSC 52 only"
-                    );
+                if let Err(payload) = served {
+                    tracing::warn!("{}", caught_worker_panic(&*payload));
                 }
                 let mut slot = worker_shared.lock();
                 slot.gone = true;
@@ -888,7 +930,7 @@ mod tests {
         }
     }
 
-    /// Scenario: Opening the native clipboard panics on its worker thread, as arboard's X11 constructor can when it cannot start its own thread, and so does a write. The deck's panic hook leaves the terminal alone for those panics, and the copies report the native clipboard unavailable while a panic on any other thread still gets the teardown.
+    /// Scenario: Opening the native clipboard panics on its worker thread, as arboard's X11 constructor can when it cannot start its own thread, and so does a write. The deck's panic hook leaves the terminal alone for those panics, the warning the worker logs for such a panic names its message, where it happened and that native clipboard writes are off for the session, and the copies report the native clipboard unavailable while a panic on any other thread still gets the teardown.
     #[spec("clipboard/native/003")]
     #[test]
     fn native_003_a_clipboard_thread_panic_leaves_the_terminal_alone() {
@@ -926,6 +968,22 @@ mod tests {
         );
         assert_eq!(write_panics.write("text"), NativeWrite::Unavailable);
         assert_eq!(write_panics.write("again"), NativeWrite::Unavailable);
+        // The warning the worker logs for a panic it caught, built as the
+        // worker builds it, on a thread marked as the worker, under this hook.
+        let warning = std::thread::Builder::new()
+            .name(NATIVE_THREAD_NAME.into())
+            .spawn(|| {
+                IN_CLIPBOARD_WORKER.with(|flag| flag.set(true));
+                let line = line!() + 2;
+                let payload = std::panic::catch_unwind(|| {
+                    panic!("deliberate panic in a fake clipboard open");
+                })
+                .expect_err("it panicked");
+                (line, caught_worker_panic(&*payload))
+            })
+            .unwrap()
+            .join()
+            .unwrap();
 
         std::panic::set_hook(previous);
         let torn_down = torn_down.lock().unwrap_or_else(|e| e.into_inner());
@@ -936,6 +994,32 @@ mod tests {
         assert!(
             !torn_down.iter().any(|n| n == NATIVE_THREAD_NAME),
             "the clipboard thread's panics tore the terminal down: {torn_down:?}"
+        );
+
+        let (line, warning) = warning;
+        assert!(
+            warning.contains(&format!("panicked at {}:{line}:", file!()))
+                && warning.contains("\"deliberate panic in a fake clipboard open\"")
+                && warning.contains("native clipboard writes are disabled"),
+            "the warning names the panic, where it happened and that native writes are off: \
+             {warning}"
+        );
+    }
+
+    #[test]
+    fn a_worker_panic_warning_quotes_any_text_payload() {
+        let owned: Box<dyn std::any::Any + Send> = Box::new(String::from("line\nWARN forged"));
+        let warning = worker_panic_warning(&*owned, Some("src/x.rs:1:2"));
+        assert!(
+            warning.contains("panicked at src/x.rs:1:2: \"line\\nWARN forged\";"),
+            "{warning}"
+        );
+        assert!(!warning.contains('\n'), "{warning}");
+        let other: Box<dyn std::any::Any + Send> = Box::new(7_u8);
+        let warning = worker_panic_warning(&*other, None);
+        assert!(
+            warning.starts_with("the native clipboard thread panicked: \"<a panic payload"),
+            "{warning}"
         );
     }
 }
