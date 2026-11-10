@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! Persistent hook-binary notices over the real daemon and attached dashboard.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/hook_stale.rs"]
 mod hook_stale;
 

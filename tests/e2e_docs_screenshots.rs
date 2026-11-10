@@ -19,7 +19,7 @@
 //! test there fails when they drift. `docs/develop/docs-screenshots.md` is the
 //! maintainer page.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/fake_releases.rs"]
 mod fake_releases;
 #[path = "support/inbox_doorbell.rs"]

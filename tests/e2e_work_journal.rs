@@ -11,7 +11,7 @@
 //! stand-in's own environment are the observable end-state, read from outside
 //! the daemon.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/work_journal.rs"]

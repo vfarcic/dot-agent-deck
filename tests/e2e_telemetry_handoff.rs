@@ -3,7 +3,7 @@
 //! Synthetic coverage for telemetry handoffs and daemon health.
 //! Uses inbox stand-ins and a local OTLP receiver without real agents.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]

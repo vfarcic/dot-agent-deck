@@ -9,7 +9,7 @@
 //! `TabMembership::Orchestration`), edits the project config, then attaches the
 //! real binary in a PTY and watches what it paints and what it prints on exit.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::Path;
 use std::time::Duration;

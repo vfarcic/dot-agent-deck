@@ -2,7 +2,7 @@
 
 //! The version-matched documentation CLI, driven through the real binary.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};

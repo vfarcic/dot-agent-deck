@@ -16,7 +16,7 @@
 
 use serde_json::{Value, json};
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 /// Fixed clock for every case below; nothing here reads the wall clock.
 const NOW_MS: i64 = 1_700_000_000_000;

@@ -35,7 +35,10 @@
 //! native stand-in as Armable; the production launcher/interpreter binding
 //! work stays in Q35-22. A missing e2e binding must be reported explicitly.
 
-mod common;
+// The fixture child is selected by its private environment before libtest
+// parses an agent's injected arguments, once the harness's pre-main set-up has
+// run. The normal test process returns from it.
+dot_agent_deck_test_harness::link!(then = live::native_entry);
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/live_segments.rs"]
@@ -46,15 +49,6 @@ use serde_json::{Value, json};
 use spec::spec;
 use std::fs;
 use std::time::{Duration, Instant};
-
-ctor::declarative::ctor! {
-    // The fixture child is selected by its private environment before libtest
-    // parses Codex's injected arguments. The normal test process returns.
-    #[ctor(unsafe)]
-    fn native_fixture_entry() {
-        live::native_entry();
-    }
-}
 
 fn wait_span(span: Duration) {
     let start = Instant::now();

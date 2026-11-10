@@ -2,7 +2,7 @@
 
 //! Join real interactive agent telemetry to the deck's exported run.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use dot_agent_deck::daemon_protocol::AttachRequest;

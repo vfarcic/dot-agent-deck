@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! Real hook/wait CLI children of a scripted Claude parent. No model credential.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

@@ -28,7 +28,7 @@
 //! depend on the executable bit and on the `~/.local/bin` convention that the
 //! resolver's first durable candidate names.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};

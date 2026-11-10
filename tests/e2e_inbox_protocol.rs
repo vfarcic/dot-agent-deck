@@ -5,7 +5,7 @@
 //! Message setup uses the design's PostMessage attach request (S3); implementing
 //! that enqueue seam early lets S2 run independently of producer migration (S5).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox_card;
 

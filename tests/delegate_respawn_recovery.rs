@@ -38,7 +38,7 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, TabMem
 use dot_agent_deck::event::{AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType};
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCH_PANE: &str = "recovery-orchestrator";
 const WORKER_PANE: &str = "recovery-coder";

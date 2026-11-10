@@ -52,7 +52,7 @@
 //! (PRD #77 Decision 6). All polling lives in `common` helpers so these bodies
 //! carry no raw `sleep` (linkage-check Decision 21 / rule 5).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/reconnect.rs"]

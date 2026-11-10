@@ -146,7 +146,7 @@
 //! Lane 1: no credential and no real agent — the agents are `sh -c 'sleep 600'`
 //! stand-ins, exactly as `tests/e2e_handshake.rs` and `fleet/observe/001` use.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::Write as _;
 use std::net::TcpListener;

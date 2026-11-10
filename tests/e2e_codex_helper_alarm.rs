@@ -24,7 +24,7 @@
 //! helper's e2e trace for when it started and which branch it took. The
 //! capture root is printed and kept under `/var/tmp`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use dot_agent_deck::composer_probe::classifier::{FileId, Identity};
 use dot_agent_deck::composer_probe::install::ProbeAgent;

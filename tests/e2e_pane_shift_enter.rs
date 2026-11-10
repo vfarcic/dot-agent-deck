@@ -59,7 +59,7 @@
 //!
 //! Bug fix, not a showcase: NO ` [reel]` marker on the catalog entries (PRD #180).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

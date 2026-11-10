@@ -10,7 +10,7 @@
 
 #![cfg(unix)]
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::DaemonProc;
 use dot_agent_deck::daemon_protocol::{KIND_REQ, KIND_RESP};

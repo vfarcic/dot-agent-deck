@@ -14,7 +14,7 @@
 //! Neither is observable from the state layer, and the unit tests covering
 //! `PaneLostReason`'s strings cannot reach this path at all.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

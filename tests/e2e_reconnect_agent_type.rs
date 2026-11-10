@@ -12,7 +12,7 @@
 //! Gated behind the `e2e` feature so CI (which runs only `cargo test-fast`)
 //! never compiles it (PRD #77 Decision 6).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{DaemonProc, TuiDeck, spawn_daemon_serve_with_env, write_hook_line};
 use dot_agent_deck::daemon_protocol::AttachRequest;
