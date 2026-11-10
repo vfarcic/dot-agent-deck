@@ -296,6 +296,7 @@ fn close(deck: &TuiDeck, agent: &AgentRecord) {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .expect("close stand-in pane");

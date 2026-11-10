@@ -97,6 +97,7 @@ fn stop(deck: &TuiDeck, pane: &inbox::Pane) {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: pane.agent.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();

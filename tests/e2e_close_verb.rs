@@ -551,6 +551,7 @@ fn close_verb_007_team_still_resolves_after_orchestrator_stops() {
         test.deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: members[0].id.clone(),
+            keep_worktree: false,
         },
     )
     .expect("existing StopAgent reply");

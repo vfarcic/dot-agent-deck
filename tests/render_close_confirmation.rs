@@ -71,6 +71,7 @@ fn close_confirm_007_kept_worktree_warns_before_the_keystroke() {
         kept_worktree: Some(KeptWorktree {
             path: PATH.to_string(),
             confirmed_dirty: true,
+            on_request: false,
         }),
         ..CloseConfirmState::default()
     };
@@ -100,6 +101,7 @@ fn close_confirm_007_kept_worktree_warns_before_the_keystroke() {
         kept_worktree: Some(KeptWorktree {
             path: PATH.to_string(),
             confirmed_dirty: false,
+            on_request: false,
         }),
         ..CloseConfirmState::default()
     };
@@ -139,6 +141,7 @@ fn close_confirm_008_a_long_kept_path_keeps_its_tail() {
         kept_worktree: Some(KeptWorktree {
             path: path.clone(),
             confirmed_dirty: true,
+            on_request: false,
         }),
         ..CloseConfirmState::default()
     };

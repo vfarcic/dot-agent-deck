@@ -76,6 +76,7 @@ fn close(deck: &TuiDeck, agent: &AgentRecord, receiver: &Receiver) -> serde_json
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();

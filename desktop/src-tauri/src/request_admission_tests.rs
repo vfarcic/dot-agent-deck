@@ -159,6 +159,7 @@ fn serve(op: &str) -> AttachResponse {
             reply.kept_worktree = Some(dot_agent_deck::daemon_protocol::KeptWorktree {
                 path: "/remote/project-dispatch".into(),
                 confirmed_dirty: true,
+                on_request: false,
             });
             reply
         }

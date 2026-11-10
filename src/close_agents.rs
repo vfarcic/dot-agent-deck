@@ -1046,6 +1046,7 @@ pub async fn handle_close_agents(
     caller: Option<CallerClaim>,
     force: bool,
     dry_run: bool,
+    keep_worktree: bool,
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -1106,6 +1107,7 @@ pub async fn handle_close_agents(
                 &caller,
                 force,
                 dry_run,
+                keep_worktree,
                 registry,
                 state,
                 event_tx,
@@ -1271,6 +1273,7 @@ async fn close_one(
     caller: &Caller,
     force: bool,
     dry_run: bool,
+    keep_worktree: bool,
     registry: &Arc<AgentPtyRegistry>,
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -1319,6 +1322,21 @@ async fn close_one(
     let refusals = default_refusals(&target_facts);
     if dry_run {
         out.would_refuse = refusals.iter().map(|(r, _)| *r).collect();
+        // Issue #1958: a dry run with keep says which worktree it would keep —
+        // the one this target owns, when the deck has a record of it, since an
+        // unrecorded tree is not removed by a close in the first place.
+        if keep_worktree
+            && let Some(worktree) = target_worktree(target, &members)
+            && worktrees
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains_key(&worktree)
+        {
+            out.worktree_verdict = Some(WorktreeVerdict {
+                path: worktree.to_string_lossy().into_owned(),
+                verdict: WorktreeVerdictKind::KeptOnRequest,
+            });
+        }
         return Attempt::Done(out);
     }
     // Refusals already decidable are answered here, before any admission
@@ -1700,15 +1718,7 @@ async fn close_one(
     // else is rooted there. A target no unit owns gets a verdict only for a
     // worktree the deck recorded and nothing else is using.
     if out.outcome == CloseOutcome::Closed {
-        let worktree = target
-            .unit
-            .as_ref()
-            .map(|u| u.worktree.clone())
-            .or_else(|| {
-                members
-                    .first()
-                    .and_then(|m| crate::issue_dispatch_run::worktree_of_record(&m.record))
-            });
+        let worktree = target_worktree(target, &members);
         let freed = match (target.unit.as_ref(), worktree.as_ref()) {
             (Some(unit), Some(_)) => registry.dispatched_units().get(&unit.id).is_none(),
             (None, Some(worktree)) => {
@@ -1724,12 +1734,27 @@ async fn close_one(
             (_, None) => false,
         };
         if freed && let Some(worktree) = worktree {
-            out.worktree_verdict =
-                Some(cleanup_worktree(worktree, registry, worktrees, event_tx).await);
+            out.worktree_verdict = Some(
+                cleanup_worktree(worktree, keep_worktree, registry, worktrees, event_tx).await,
+            );
         }
     }
     drop(gates);
     Attempt::Done(out)
+}
+
+/// The worktree a target owns: its unit's, else the one its first member was
+/// started in.
+fn target_worktree(target: &Resolved, members: &[Member]) -> Option<PathBuf> {
+    target
+        .unit
+        .as_ref()
+        .map(|u| u.worktree.clone())
+        .or_else(|| {
+            members
+                .first()
+                .and_then(|m| crate::issue_dispatch_run::worktree_of_record(&m.record))
+        })
 }
 
 /// PRD #1589 D6: remove a closed unit's worktree under the existing policy
@@ -1737,8 +1762,18 @@ async fn close_one(
 /// directory against new spawns while it is deleted, and answer with the
 /// typed verdict — waiting at most [`WORKTREE_CLEANUP_TIMEOUT`]. A kept tree
 /// is broadcast as `WorktreeKept`, as `StopAgent`'s detached cleanup does.
+///
+/// Issue #1958: with `keep`, the entry is taken and nothing is removed, under
+/// either policy, answered [`WorktreeVerdictKind::KeptOnRequest`] and broadcast
+/// with `on_request`. That holds even when something is still rooted in the
+/// tree, where a removal answers [`WorktreeVerdictKind::StillInUse`] and puts
+/// the entry back: putting it back on a keep would let the close that later
+/// stops that last agent remove the tree the user asked to keep, so the keep
+/// is remembered by the entry staying taken. The removal hold is not needed —
+/// nothing is deleted.
 pub async fn cleanup_worktree(
     worktree: PathBuf,
+    keep: bool,
     registry: &Arc<AgentPtyRegistry>,
     worktrees: &WorktreeRegistry,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -1751,6 +1786,12 @@ pub async fn cleanup_worktree(
         let Some(entry) = crate::issue_dispatch_run::take_worktree(&worktrees, &worktree) else {
             return WorktreeVerdictKind::NotRecorded;
         };
+        if keep {
+            let _ = event_tx.send(BroadcastMsg::WorktreeKept(
+                crate::issue_dispatch_run::KeptWorktree::on_request(&worktree),
+            ));
+            return WorktreeVerdictKind::KeptOnRequest;
+        }
         let Some(_removal_hold) = registry.hold_dir_for_removal(&worktree) else {
             // Something still runs in it. Put the entry back so the close that
             // stops it can clean up.
@@ -2041,7 +2082,7 @@ mod tests {
             dry_run: bool,
         ) -> CloseReport {
             self.client
-                .close_agents(selector, caller, force, dry_run)
+                .close_agents(selector, caller, force, dry_run, false)
                 .await
                 .expect("a report")
         }
@@ -2380,6 +2421,7 @@ mod tests {
             }),
             force: true,
             dry_run: false,
+            keep_worktree: false,
         })
         .await;
         let report = resp.close_report.expect("a close report");
@@ -3118,7 +3160,7 @@ mod tests {
         };
 
         assert_eq!(
-            cleanup_worktree(wt.clone(), &registry, &worktrees, &event_tx)
+            cleanup_worktree(wt.clone(), false, &registry, &worktrees, &event_tx)
                 .await
                 .verdict,
             WorktreeVerdictKind::NotRecorded
@@ -3127,7 +3169,7 @@ mod tests {
         record(&worktrees);
         std::fs::write(wt.join("dirty.txt"), "uncommitted").unwrap();
         assert_eq!(
-            cleanup_worktree(wt.clone(), &registry, &worktrees, &event_tx)
+            cleanup_worktree(wt.clone(), false, &registry, &worktrees, &event_tx)
                 .await
                 .verdict,
             WorktreeVerdictKind::KeptDirty
@@ -3139,7 +3181,7 @@ mod tests {
             .reserve_spawn_in_for_test(&wt)
             .expect("a start rooted in the tree");
         assert_eq!(
-            cleanup_worktree(wt.clone(), &registry, &worktrees, &event_tx)
+            cleanup_worktree(wt.clone(), false, &registry, &worktrees, &event_tx)
                 .await
                 .verdict,
             WorktreeVerdictKind::StillInUse
@@ -3151,12 +3193,185 @@ mod tests {
         registry.release_spawn_for_test(&reservation);
 
         assert_eq!(
-            cleanup_worktree(wt.clone(), &registry, &worktrees, &event_tx)
+            cleanup_worktree(wt.clone(), false, &registry, &worktrees, &event_tx)
                 .await
                 .verdict,
             WorktreeVerdictKind::Removed
         );
         assert!(!wt.exists());
+    }
+
+    /// The next `WorktreeKept` broadcast, waiting at most ten seconds.
+    async fn next_worktree_kept(
+        events: &mut broadcast::Receiver<BroadcastMsg>,
+    ) -> crate::issue_dispatch_run::KeptWorktree {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                match events.recv().await {
+                    Ok(BroadcastMsg::WorktreeKept(kept)) => return kept,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(e) => panic!("the event channel closed: {e}"),
+                }
+            }
+        })
+        .await
+        .expect("a WorktreeKept broadcast")
+    }
+
+    /// Scenario: issue #1958 (U3) — the close's worktree cleanup with keep
+    /// leaves the tree on disk whatever its state and policy, answers
+    /// kept-on-request, takes the registry entry and broadcasts the keep with
+    /// `on_request`. With something still rooted in the tree the keep is
+    /// still remembered: the entry stays taken, so the close that later stops
+    /// that agent finds no record and removes nothing.
+    #[tokio::test]
+    async fn the_worktree_cleanup_keeps_on_request() {
+        let sandbox = tempfile::tempdir().unwrap();
+        let repo = sandbox.path().join("repo");
+        let wt = sandbox.path().join("repo-dispatch-x");
+        init_repo_with_worktree(sandbox.path(), &repo, &wt);
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let worktrees = crate::issue_dispatch_run::new_worktree_registry();
+        let (event_tx, mut events) = broadcast::channel(8);
+        let record =
+            |policy| crate::issue_dispatch_run::record_worktree(&worktrees, &wt, &repo, policy);
+        let keep = || cleanup_worktree(wt.clone(), true, &registry, &worktrees, &event_tx);
+
+        assert_eq!(
+            keep().await.verdict,
+            WorktreeVerdictKind::NotRecorded,
+            "an unrecorded tree is not removed by a close, so there is nothing to keep"
+        );
+
+        for policy in [
+            crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty,
+            crate::issue_dispatch_run::RemovalPolicy::Force,
+        ] {
+            record(policy);
+            let verdict = keep().await;
+            assert_eq!(verdict.verdict, WorktreeVerdictKind::KeptOnRequest);
+            assert_eq!(verdict.path, wt.to_string_lossy());
+            assert!(wt.exists(), "{policy:?}: the clean tree is kept");
+            assert!(!worktrees.lock().unwrap().contains_key(&wt));
+            assert_eq!(
+                next_worktree_kept(&mut events).await,
+                crate::issue_dispatch_run::KeptWorktree::on_request(&wt)
+            );
+        }
+
+        record(crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty);
+        std::fs::write(wt.join("dirty.txt"), "uncommitted").unwrap();
+        assert_eq!(keep().await.verdict, WorktreeVerdictKind::KeptOnRequest);
+        assert!(next_worktree_kept(&mut events).await.on_request);
+        std::fs::remove_file(wt.join("dirty.txt")).unwrap();
+
+        record(crate::issue_dispatch_run::RemovalPolicy::KeepIfDirty);
+        let reservation = registry
+            .reserve_spawn_in_for_test(&wt)
+            .expect("a start rooted in the tree");
+        assert_eq!(keep().await.verdict, WorktreeVerdictKind::KeptOnRequest);
+        assert!(
+            !worktrees.lock().unwrap().contains_key(&wt),
+            "the keep is remembered by the entry staying taken"
+        );
+        registry.release_spawn_for_test(&reservation);
+        assert_eq!(
+            cleanup_worktree(wt.clone(), false, &registry, &worktrees, &event_tx)
+                .await
+                .verdict,
+            WorktreeVerdictKind::NotRecorded
+        );
+        assert!(wt.exists(), "a later close cannot remove a kept tree");
+    }
+
+    /// Scenario: issue #1958 (U3, U4) — through the daemon: the close dialog's
+    /// preview names a CLEAN dispatched unit's worktree; `close --dry-run
+    /// --keep-worktree` reports the keep it would make and changes nothing;
+    /// `close --keep-worktree` ends the unit, keeps the clean tree and reports
+    /// kept-on-request.
+    #[tokio::test]
+    async fn a_unit_closed_with_keep_keeps_its_clean_worktree() {
+        let deck = Deck::new().await;
+        let (agent, id, wt) = single_in_worktree(&deck, "solo").await;
+
+        let preview = deck
+            .client
+            .worktree_close_preview(vec!["solo".to_string()])
+            .await
+            .expect("preview");
+        assert_eq!(
+            preview.kept_worktree, None,
+            "precondition: the tree is clean"
+        );
+        assert_eq!(
+            preview.dispatched_worktree.as_deref(),
+            Some(wt.to_string_lossy().as_ref())
+        );
+
+        let by_name = || {
+            CloseSelector::Units(UnitSelector {
+                names: vec!["solo".into()],
+            })
+        };
+        let dry = deck
+            .client
+            .close_agents(by_name(), None, false, true, true)
+            .await
+            .expect("a report");
+        let target = &dry.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Listed, "{target:?}");
+        assert_eq!(
+            target.worktree_verdict,
+            Some(WorktreeVerdict {
+                path: wt.to_string_lossy().into_owned(),
+                verdict: WorktreeVerdictKind::KeptOnRequest,
+            })
+        );
+        assert!(deck.live(&agent), "a dry run stops nothing");
+        assert!(deck.worktrees.lock().unwrap().contains_key(&wt));
+
+        let mut events = deck.event_tx.subscribe();
+        let report = deck
+            .client
+            .close_agents(by_name(), None, false, false, true)
+            .await
+            .expect("a report");
+        let target = &report.targets[0];
+        assert_eq!(target.outcome, CloseOutcome::Closed, "{target:?}");
+        assert_eq!(
+            target.worktree_verdict.as_ref().map(|v| v.verdict),
+            Some(WorktreeVerdictKind::KeptOnRequest),
+            "{target:?}"
+        );
+        assert!(wt.exists(), "the clean tree is kept");
+        assert!(!deck.live(&agent));
+        assert!(deck.registry.dispatched_units().get(&id).is_none());
+        assert!(!deck.worktrees.lock().unwrap().contains_key(&wt));
+        assert!(next_worktree_kept(&mut events).await.on_request);
+        deck.shutdown().await;
+    }
+
+    /// Scenario: issue #1958 (U3) — `StopAgent` with keep, the way the TUI and
+    /// the desktop close: stopping a clean dispatched unit's agent keeps its
+    /// worktree, takes the record and broadcasts the keep with `on_request`.
+    #[tokio::test]
+    async fn a_stop_with_keep_keeps_the_clean_worktree() {
+        let deck = Deck::new().await;
+        let (agent, _id, wt) = single_in_worktree(&deck, "solo").await;
+        let mut events = deck.event_tx.subscribe();
+        deck.client
+            .stop_agent_keeping_worktree(&agent)
+            .await
+            .expect("this daemon keeps");
+        let kept = next_worktree_kept(&mut events).await;
+        assert_eq!(
+            kept,
+            crate::issue_dispatch_run::KeptWorktree::on_request(&wt)
+        );
+        assert!(wt.exists(), "the clean tree is kept");
+        assert!(!deck.live(&agent));
+        assert!(!deck.worktrees.lock().unwrap().contains_key(&wt));
+        deck.shutdown().await;
     }
 
     /// A dispatched orchestration `orch` with a live orchestrator and worker,
@@ -3213,7 +3428,7 @@ mod tests {
         let client = deck.other_client();
         tokio::spawn(async move {
             client
-                .close_agents(selector, caller, force, false)
+                .close_agents(selector, caller, force, false, false)
                 .await
                 .expect("a report")
         })
@@ -4091,6 +4306,7 @@ mod tests {
             &Caller::Person,
             false,
             false,
+            false,
             &deck.registry,
             &deck.state,
             &deck.event_tx,
@@ -4310,6 +4526,7 @@ mod tests {
             Some(forged),
             false,
             false,
+            false,
             &registry,
             &state,
             &event_tx,
@@ -4369,7 +4586,7 @@ mod tests {
         }
         let close = |selector: CloseSelector| {
             handle_close_agents(
-                selector, None, false, true, &registry, &state, &event_tx, &worktrees,
+                selector, None, false, true, false, &registry, &state, &event_tx, &worktrees,
             )
         };
 

@@ -803,6 +803,7 @@ fn stop_agent_from_desktop(daemon: &DaemonProc, agent_id: &str) {
     let response = daemon
         .send_attach_request(&AttachRequest::StopAgent {
             id: agent_id.into(),
+            keep_worktree: false,
         })
         .expect("desktop-shaped StopAgent over the attach socket");
     assert!(
@@ -828,6 +829,7 @@ fn stop_orchestration_from_desktop(daemon: &DaemonProc, role_agents: &[(String, 
                         &attach_socket,
                         &AttachRequest::StopAgent {
                             id: agent_id.clone(),
+                            keep_worktree: false,
                         },
                     );
                     (role, agent_id, response)

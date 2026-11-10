@@ -236,6 +236,73 @@ pub struct KeptWorktree {
     /// Whether `git status --porcelain` actually reported uncommitted work, as
     /// opposed to the probe being inconclusive. See the type docs.
     pub confirmed_dirty: bool,
+    /// Issue #1958: kept because the close asked to keep it, not because of
+    /// anything measured — `confirmed_dirty` is then `false`, since no probe
+    /// ran. Additive, omitted when `false`, so an older client reading a
+    /// keep-on-request reads an unmeasured keep, which is still true.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub on_request: bool,
+}
+
+impl KeptWorktree {
+    /// Issue #1958: the report of a worktree kept because the close asked to.
+    pub fn on_request(worktree_dir: &Path) -> Self {
+        Self {
+            path: worktree_dir.to_string_lossy().into_owned(),
+            confirmed_dirty: false,
+            on_request: true,
+        }
+    }
+}
+
+/// Issue #1958: the dispatched worktree recorded for the panes in `pane_ids`,
+/// whatever its state and its removal policy — the answer that tells a close
+/// dialog to offer "close, keep worktree". The first pane whose worktree the
+/// registry holds answers. Peeks only, like [`kept_worktree_preview`], and runs
+/// no probe, so it answers even when that preview's probe times out.
+pub fn dispatched_worktree_of_panes(
+    records: &[AgentRecord],
+    worktrees: &WorktreeRegistry,
+    pane_ids: &[String],
+) -> Option<PathBuf> {
+    let registry = worktrees.lock().unwrap_or_else(|e| e.into_inner());
+    pane_ids.iter().find_map(|pane_id| {
+        let record = records
+            .iter()
+            .find(|r| r.pane_id_env.as_deref() == Some(pane_id.as_str()))?;
+        worktree_of_record(record).filter(|worktree| registry.contains_key(worktree))
+    })
+}
+
+/// The worktree half of a `StopAgent` (PRD #120 M2.4, PRD #220, issue #1958),
+/// run detached once the agent is stopped. Only when no agent in
+/// `live_records` is still rooted in `worktree` was this the last stop, and
+/// only then is the registry entry taken: removed under its policy, or — with
+/// `keep` — left on disk whatever its state. Taking the entry on a keep is the
+/// point: a later ordinary close of an agent restarted in the same directory
+/// finds no record and cannot remove the tree. Answers what to broadcast as
+/// `WorktreeKept`: `None` when the tree was removed or nothing was done.
+pub async fn cleanup_after_stop(
+    live_records: &[AgentRecord],
+    worktrees: &WorktreeRegistry,
+    worktree: &Path,
+    keep: bool,
+) -> Option<KeptWorktree> {
+    if worktree_still_in_use(live_records, worktree) {
+        return None;
+    }
+    let entry = take_worktree(worktrees, worktree)?;
+    if keep {
+        tracing::info!(
+            worktree = %crate::config_validation::escape_field_for_log(
+                &worktree.to_string_lossy(),
+                crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+            ),
+            "dispatch: worktree kept on request at close"
+        );
+        return Some(KeptWorktree::on_request(worktree));
+    }
+    remove_worktree(worktree, &entry.clone_dir, entry.policy).await
 }
 
 /// Issue #717: would closing the panes in `pane_ids` leave a dispatched
@@ -343,6 +410,7 @@ async fn kept_worktree_preview_with(
         return Some(KeptWorktree {
             path: worktree.to_string_lossy().into_owned(),
             confirmed_dirty,
+            on_request: false,
         });
     }
     None
@@ -403,11 +471,13 @@ impl WorktreeRemoval {
             WorktreeRemoval::KeptDirty => Some(KeptWorktree {
                 path,
                 confirmed_dirty: true,
+                on_request: false,
             }),
             WorktreeRemoval::KeptCouldNotCheck | WorktreeRemoval::RemoveFailed => {
                 Some(KeptWorktree {
                     path,
                     confirmed_dirty: false,
+                    on_request: false,
                 })
             }
         }
@@ -4570,6 +4640,97 @@ mod tests {
             "no lock, no removal, and the issue says why: {outcome:?}"
         );
         assert!(wt.exists());
+    }
+
+    /// Issue #1958 (U4): the preview names the dispatched worktree a
+    /// selection owns whatever its state — a CLEAN one, which
+    /// `kept_worktree_preview` stays silent about, included — under either
+    /// policy, from any of a tab's panes, and peeks without taking. An
+    /// ordinary pane names nothing.
+    #[tokio::test]
+    async fn the_dispatched_worktree_of_panes_names_a_clean_recorded_tree() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let reg = new_worktree_registry();
+        let records = vec![pane_in("pane-1", &wt)];
+        let panes = vec!["unknown".to_string(), "pane-1".to_string()];
+
+        assert_eq!(
+            dispatched_worktree_of_panes(&records, &reg, &panes),
+            None,
+            "an unrecorded cwd is not a dispatched worktree"
+        );
+        for policy in [RemovalPolicy::KeepIfDirty, RemovalPolicy::Force] {
+            record_worktree(&reg, &wt, &repo, policy);
+            assert_eq!(
+                kept_worktree_preview(&records, &reg, &panes, PROBE).await,
+                None,
+                "precondition: the tree is clean, so nothing would be kept"
+            );
+            assert_eq!(
+                dispatched_worktree_of_panes(&records, &reg, &panes),
+                Some(wt.clone()),
+                "{policy:?}: a clean recorded tree is named"
+            );
+            assert!(
+                take_worktree(&reg, &wt).is_some(),
+                "the preview peeks, never takes"
+            );
+        }
+    }
+
+    /// Issue #1958 (U3): `StopAgent`'s cleanup with keep — on the last stop it
+    /// takes the entry and leaves the tree on disk whatever its state and
+    /// policy, answering a keep on request; on a stop that is not the last it
+    /// does nothing and the entry stays. Without keep a clean tree is still
+    /// removed.
+    #[tokio::test]
+    async fn the_stop_cleanup_keeps_on_request_and_takes_the_entry() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let reg = new_worktree_registry();
+
+        // Not the last agent in the tree: nothing happens, keep or not.
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let sibling = vec![pane_in("pane-2", &wt)];
+        assert_eq!(cleanup_after_stop(&sibling, &reg, &wt, true).await, None);
+        assert!(reg.lock().unwrap().contains_key(&wt), "the entry stays");
+
+        // The last stop, clean, under either policy: kept, entry taken.
+        for policy in [RemovalPolicy::KeepIfDirty, RemovalPolicy::Force] {
+            record_worktree(&reg, &wt, &repo, policy);
+            let kept = cleanup_after_stop(&[], &reg, &wt, true)
+                .await
+                .expect("a keep is reported");
+            assert_eq!(kept, KeptWorktree::on_request(&wt));
+            assert!(kept.on_request && !kept.confirmed_dirty);
+            assert!(wt.exists(), "{policy:?}: the clean tree is kept");
+            assert!(
+                !reg.lock().unwrap().contains_key(&wt),
+                "{policy:?}: the entry is taken, so no later close removes it"
+            );
+        }
+
+        // Dirty and kept on request: reported as on request, not as dirty.
+        std::fs::write(wt.join("scratch.txt"), "work").unwrap();
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        let kept = cleanup_after_stop(&[], &reg, &wt, true).await.unwrap();
+        assert!(kept.on_request, "{kept:?}");
+        assert!(wt.join("scratch.txt").exists());
+        std::fs::remove_file(wt.join("scratch.txt")).unwrap();
+
+        // A later stop finds no record and removes nothing.
+        assert_eq!(cleanup_after_stop(&[], &reg, &wt, false).await, None);
+        assert!(wt.exists());
+
+        // Without keep, the existing behaviour: a clean tree is removed.
+        record_worktree(&reg, &wt, &repo, RemovalPolicy::KeepIfDirty);
+        assert_eq!(cleanup_after_stop(&[], &reg, &wt, false).await, None);
+        assert!(!wt.exists());
     }
 
     #[tokio::test]

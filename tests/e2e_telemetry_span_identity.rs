@@ -183,6 +183,7 @@ fn close(deck: &TuiDeck, record: &AgentRecord) {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: record.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();

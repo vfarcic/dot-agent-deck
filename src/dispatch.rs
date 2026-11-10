@@ -3342,6 +3342,7 @@ mod tests {
                     None,
                     false,
                     false,
+                    false,
                     &registry,
                     &state,
                     &event_tx,

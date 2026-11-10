@@ -1081,7 +1081,14 @@ async fn start_list_stop_round_trip() {
 
     // stop-agent succeeds and the registry is empty afterwards.
     let mut s = UnixStream::connect(&server.path).await.unwrap();
-    write_request(&mut s, &AttachRequest::StopAgent { id: id.clone() }).await;
+    write_request(
+        &mut s,
+        &AttachRequest::StopAgent {
+            id: id.clone(),
+            keep_worktree: false,
+        },
+    )
+    .await;
     let resp = read_response(&mut s).await;
     assert!(resp.ok);
 
@@ -1097,6 +1104,7 @@ async fn stop_unknown_agent_returns_err() {
         &mut s,
         &AttachRequest::StopAgent {
             id: "does-not-exist".into(),
+            keep_worktree: false,
         },
     )
     .await;
@@ -3111,7 +3119,14 @@ async fn killing_agent_emits_stream_end_to_attached_clients() {
 
     // Stop the agent via the protocol from a separate connection.
     let mut s = UnixStream::connect(&server.path).await.unwrap();
-    write_request(&mut s, &AttachRequest::StopAgent { id: id.clone() }).await;
+    write_request(
+        &mut s,
+        &AttachRequest::StopAgent {
+            id: id.clone(),
+            keep_worktree: false,
+        },
+    )
+    .await;
     let resp = read_response(&mut s).await;
     assert!(resp.ok);
 

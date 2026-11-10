@@ -237,7 +237,7 @@ async fn handle_connection(
             // tears down the pane and drops its stream task.
             while read_frame(&mut stream).await.ok().flatten().is_some() {}
         }
-        AttachRequest::StopAgent { id } => {
+        AttachRequest::StopAgent { id, .. } => {
             stop_requests.lock().unwrap().push(id.clone());
             let response = match stop_plan {
                 StopPlan::Error(stop_error) => AttachResponse::err(stop_error),

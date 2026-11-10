@@ -265,6 +265,7 @@ fn telemetry_otlp_005_real_claude_telemetry_joins_deck_run() {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();
@@ -639,6 +640,7 @@ fn telemetry_otlp_007_real_opencode_telemetry_joins_deck_run() {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();
@@ -791,6 +793,7 @@ fn finish_native_join(
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();

@@ -1160,6 +1160,7 @@ impl Drop for Fixture {
             &self.daemon.attach_socket,
             &dot_agent_deck::daemon_protocol::AttachRequest::StopAgent {
                 id: self.agent.clone(),
+                keep_worktree: false,
             },
         );
     }
