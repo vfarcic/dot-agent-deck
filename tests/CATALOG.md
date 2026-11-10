@@ -352,8 +352,8 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### config-trust/restore/002 — Cancelling the restore prompt leaves the orchestration unrestored and restores the rest of the session.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session holding the changed orchestration followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with.
 - **Agent:** stand-ins (`sleep 600`).
-- **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing.
-- **Does not assert:** that the orchestration can be reopened afterwards; several restored orchestrations.
+- **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing; after a detach-quit the saved `session.toml` still holds the `restore-orch` snapshot, and the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** that the orchestration can be reopened from the New Agent form afterwards; several restored orchestrations; a periodic (mid-session) save while the prompt is open.
 - **Platform coverage:** mac+linux.
 
 ##### config-trust/restore/003 — A saved orchestration that can no longer be trust-checked does not fall through to a plain-pane restore.
@@ -361,6 +361,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** stand-ins (`sh -c 'touch <sentinel>; exec sleep 600'`, `sleep 600`).
 - **Asserts:** after (a) a worker role is removed from the config, (b) the orchestration is renamed, or (c) the config file is deleted, launching the TUI never writes the sentinel, restores no `orchestrator` pane and no pane in the project, starts no role, and still restores the plain pane (a trust prompt, if one appears, is cancelled first).
 - **Does not assert:** what the warning says; role reorder or role rename drift.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/004 — Quitting while a restore prompt is unanswered keeps the orchestration in the saved session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): the `config-trust/restore/002` saved session (a changed orchestration, then a plain pane) staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** with the restore prompt open and unanswered (the plain pane already restored), `Ctrl+C` and Detach quit the deck cleanly; the saved `session.toml` still holds the `restore-orch` orchestration snapshot; the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** a terminal hang-up (SIGHUP) rather than a detach; a periodic (mid-session) save while the prompt is open; the order in which several held-back restores are asked.
 - **Platform coverage:** mac+linux.
 
 #### config-trust/respawn
@@ -414,6 +421,27 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** stand-ins (`sh ./agent.sh`, `cat`).
 - **Asserts:** with repository A's `team` approved, a directory B holding byte-identical TOML, a different `agent.sh` and a `.git` file copied from A's legitimate linked worktree is refused on run-now: B's marker file is never written, `schedule list` reports the refusal with the approve command naming B, and nothing spawns in B; a run-now in A's real linked worktree still opens the orchestration.
 - **Does not assert:** the wording of the refusal reason; other forged geometries (a `.git` directory, a symlinked `.git`).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/004 — A reattached issue branch with different role text is refused with a remedy that works.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the clone's default branch approved and a local `agent/issue-7` branch changing the role command, a fire for issue 7 is refused `changed since you approved it` and spawns nothing; every directory a printed `dot-agent-deck trust approve` command names exists after the fire; running each printed approve command (with `--yes`) succeeds, and a later fire for issue 8 on the default branch still dispatches.
+- **Does not assert:** the remedy's wording, or whether it prints an approve command at all; that issue 7 itself can be dispatched afterwards; a branch pushed to the remote rather than left in the clone.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/005 — A linked worktree shares its main checkout's approval of an unnamed orchestration.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with a repository whose one orchestration has no `name` approved by `trust approve <main checkout> --yes`, a run-now schedule in the main checkout opens the orchestration, and one in a `git worktree add` linked worktree opens it too.
+- **Does not assert:** the approval's stored name; `trust list` output for an unnamed orchestration; a non-git project.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/006 — An issue dispatch of an unnamed orchestration runs once its clone is approved.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the fixture remote's one orchestration unnamed and the scheduler's clone approved, a fire for issue 7 opens the orchestration in `<clone>/.worktrees/issue-7`.
+- **Does not assert:** the refusal for an unapproved unnamed orchestration; a reattached `agent/issue-<n>` branch (`config-trust/schedule/004`).
 - **Platform coverage:** mac+linux.
 
 #### config-trust/dispatch

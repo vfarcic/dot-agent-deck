@@ -3098,3 +3098,188 @@ fn config_trust_schedule_002_a_changed_default_branch_is_refused_before_warm_up(
         "a refused fire spawns nothing"
     );
 }
+
+/// The `trust approve` commands `text` names, as `(dir, orchestration)` pairs:
+/// the argument after each `dot-agent-deck trust approve` and the one after its
+/// `--orchestration`, with any POSIX single quotes removed.
+fn printed_approve_commands(text: &str) -> Vec<(PathBuf, Option<String>)> {
+    let unquote = |s: &str| s.trim_matches('\'').to_string();
+    text.match_indices("trust approve ")
+        .filter_map(|(at, verb)| {
+            let rest = &text[at + verb.len()..];
+            let mut words = rest.split_whitespace();
+            let dir = words.next().map(unquote)?;
+            let line = rest.lines().next().unwrap_or_default();
+            let orchestration = line
+                .split_whitespace()
+                .skip_while(|w| *w != "--orchestration")
+                .nth(1)
+                .map(|w| unquote(w.trim_end_matches(['.', ',', ';', ')'])));
+            Some((PathBuf::from(dir), orchestration))
+        })
+        .collect()
+}
+
+/// Scenario: The clone's default branch is approved, but an `agent/issue-7`
+/// branch left in it by an earlier dispatch changes the role's command. A fire
+/// for issue 7 is refused; every `trust approve` command the refusal prints
+/// must name a directory that still exists, and running those commands must
+/// leave a later fire for issue 8, on the default branch, still dispatching.
+#[spec("config-trust/schedule/004")]
+#[test]
+fn config_trust_schedule_004_a_reattached_branch_refusal_names_a_usable_remedy() {
+    const REPO: &str = "acme/trust-branch";
+    const TASK: &str = "branch-task";
+    let toml_with = |command: &str| {
+        format!(
+            "[[orchestrations]]\nname = \"trust-orch\"\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{command}\"\nstart = true\n"
+        )
+    };
+
+    let stub = GhStub::new();
+    let remote = stub.repo_dir(REPO).join("remote");
+    init_remote_with_orch_toml(&remote, Some(&toml_with("cat")));
+    stub.seed_state(REPO);
+    stub.set_issues(REPO, &[7]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace");
+    let work_str = work.to_string_lossy().into_owned();
+    let toml = dispatch_task(TASK, &work_str, "BRANCHDISP-{{issue_number}}", REPO, 5);
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    let schedule_list = || {
+        let out = daemon.run_schedule_cli(&["list"]);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+
+    // The default branch is approved; `agent/issue-7` (what an earlier
+    // dispatch whose tab was closed leaves behind) changes the role command.
+    let clone = approve_dispatch_clone(&daemon, &stub, REPO, &work, TASK);
+    run_git(&clone, &["checkout", "-q", "-b", "agent/issue-7"]);
+    std::fs::write(clone.join(".dot-agent-deck.toml"), toml_with("cas")).expect("edit branch");
+    run_git(
+        &clone,
+        &["commit", "-q", "-am", "the branch changes the role"],
+    );
+    run_git(&clone, &["checkout", "-q", "main"]);
+
+    daemon.run_now(TASK).expect("run-now for issue 7");
+    assert!(
+        common::wait_until(w(), || schedule_list()
+            .contains("changed since you approved it")),
+        "precondition: the reattached branch's changed role must be refused:\n{}",
+        schedule_list()
+    );
+    let wt7 = derive_issue_paths(&work, TASK, 7).worktree_dir;
+    assert_eq!(
+        count_orchestrators(&daemon),
+        0,
+        "a refused fire spawns nothing"
+    );
+
+    // 1. The remedy the refusal prints names nothing the deck has removed.
+    let refusal = schedule_list();
+    let commands = printed_approve_commands(&refusal);
+    for (dir, _) in &commands {
+        assert!(
+            dir.exists(),
+            "the refusal tells the user to approve {}, which no longer exists after the fire \
+             (the issue worktree is {}, exists: {}).\nschedule list:\n{refusal}",
+            dir.display(),
+            wt7.display(),
+            wt7.exists()
+        );
+    }
+
+    // 2. Following it leaves the default branch's fires dispatching.
+    for (dir, orchestration) in &commands {
+        let dir_arg = dir.to_string_lossy().into_owned();
+        let mut args = vec!["trust", "approve", dir_arg.as_str()];
+        if let Some(name) = orchestration {
+            args.extend(["--orchestration", name.as_str()]);
+        }
+        args.push("--yes");
+        let followed = daemon.run_deck_cli(dir, &args);
+        assert!(
+            followed.status.success(),
+            "the approve command the refusal prints must run: {args:?}\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&followed.stdout),
+            String::from_utf8_lossy(&followed.stderr)
+        );
+    }
+    // Issue 8 alone, so the fire observed is a default-branch one.
+    stub.set_issues(REPO, &[8]);
+    let wt8 = derive_issue_paths(&work, TASK, 8).worktree_dir;
+    let dispatched = common::wait_until(w(), || {
+        daemon
+            .agent_records()
+            .iter()
+            .any(|r| orchestrator_in(r, &wt8))
+            || {
+                let _ = daemon.run_now(TASK);
+                false
+            }
+    });
+    assert!(
+        dispatched,
+        "after following the printed remedy ({commands:?}), a fire for issue 8 on the \
+         approved default branch must still dispatch.\nschedule list:\n{}",
+        schedule_list()
+    );
+}
+
+/// Scenario: The fixture repository's orchestration has no `name`. After the
+/// scheduler's clone is approved, a fire for issue 7 must open that
+/// orchestration in the issue's worktree (`<clone>/.worktrees/issue-7`), not
+/// refuse it as never approved.
+#[spec("config-trust/schedule/006")]
+#[test]
+fn config_trust_schedule_006_an_unnamed_orchestration_dispatches_once_the_clone_is_approved() {
+    const REPO: &str = "acme/unnamed";
+    const TASK: &str = "unnamed-task";
+    let stub = GhStub::new();
+    let remote = stub.repo_dir(REPO).join("remote");
+    init_remote_with_orch_toml(
+        &remote,
+        Some(
+            "[[orchestrations]]\n\n\
+             [[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n",
+        ),
+    );
+    stub.seed_state(REPO);
+    stub.set_issues(REPO, &[7]);
+
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace");
+    let work_str = work.to_string_lossy().into_owned();
+    let toml = dispatch_task(TASK, &work_str, "UNNAMED-{{issue_number}}", REPO, 5);
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    approve_dispatch_clone(&daemon, &stub, REPO, &work, TASK);
+
+    daemon.run_now(TASK).expect("run-now");
+    let wt7 = derive_issue_paths(&work, TASK, 7).worktree_dir;
+    let dispatched = daemon
+        .wait_for_agent_where(|r| orchestrator_in(r, &wt7), w())
+        .is_some();
+    let listed = daemon.run_schedule_cli(&["list"]);
+    assert!(
+        dispatched,
+        "an unnamed orchestration approved in the clone must dispatch in {}.\nschedule list:\n{}{}",
+        wt7.display(),
+        String::from_utf8_lossy(&listed.stdout),
+        String::from_utf8_lossy(&listed.stderr)
+    );
+}

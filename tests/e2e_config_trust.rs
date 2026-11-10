@@ -11,14 +11,16 @@
 //! - `config-trust/respawn/*`, `config-trust/schedule/001` and
 //!   `config-trust/dispatch/001`: the unattended paths refuse, report the
 //!   refusal to whoever asked, and start nothing; `config-trust/schedule/003`
-//!   pins that a forged `.git` file borrows no approval.
+//!   pins that a forged `.git` file borrows no approval, and
+//!   `config-trust/schedule/005` that a real linked worktree shares an
+//!   unnamed orchestration's approval.
 //! - `config-trust/rearm/001` and `config-trust/escape/001`: a warm reattach
 //!   re-arms no unapproved instructions, and refusals print no raw terminal
 //!   controls from project-chosen names.
 //!
 //! Every role command is a token-free stand-in (`env TRUST_ROLE=<role> cat`,
-//! `sleep 600`). `config-trust/schedule/002` lives in `e2e_issue_dispatch.rs`
-//! beside the `gh` stub it needs, and `config-trust/live/001` in
+//! `sleep 600`). `config-trust/schedule/002`, `/004` and `/006` live in
+//! `e2e_issue_dispatch.rs` beside the `gh` stub they need, and `config-trust/live/001` in
 //! `e2e_config_trust_live.rs` (lane 2).
 
 dot_agent_deck_test_harness::link!();
@@ -789,64 +791,148 @@ fn restore_001_a_changed_restored_orchestration_asks_before_restoring() {
     );
 }
 
+/// The plain pane `config-trust/restore/002` and `/004` save after the changed
+/// orchestration.
+const RESTORE_PLAIN: &str = "r-plain";
+
+/// A saved session holding an approved-then-changed `restore-orch` followed by
+/// a plain [`RESTORE_PLAIN`] pane, and the state dir it was approved into
+/// (`config-trust/restore/002` and `/004`).
+struct ChangedRestore {
+    _scratch: tempfile::TempDir,
+    project: PathBuf,
+    state: PathBuf,
+    home: PathBuf,
+    session_file: PathBuf,
+}
+
+impl ChangedRestore {
+    fn stage() -> Self {
+        let scratch = common::race_safe_tempdir();
+        let project = scratch.path().join("restore-project");
+        let plain_dir = scratch.path().join("plain-dir");
+        let state = scratch.path().join("state");
+        let home = scratch.path().join("approve-home");
+        for dir in [&project, &plain_dir, &home] {
+            std::fs::create_dir_all(dir).expect("create sandbox dir");
+        }
+        write_restore_config(&project, "sleep 600");
+        let approved = restore_trust_cli(
+            &project,
+            &state,
+            &home,
+            &["approve", &project.to_string_lossy(), "--yes"],
+        );
+        assert!(
+            approved.status.success(),
+            "precondition approve: {}",
+            describe(&approved)
+        );
+        write_restore_config(&project, "sleep 601"); // one character changed
+
+        // The orchestration pane first, so a restore that stops at the cancelled
+        // orchestration instead of carrying on would also lose the plain pane.
+        let session_file = scratch.path().join("session.toml");
+        stage_orchestration_session(
+            &session_file,
+            &project,
+            &["orchestrator", "coder", "reviewer"],
+        );
+        let mut session = std::fs::read_to_string(&session_file).expect("read staged session");
+        session.push_str(&format!(
+            "\n[[panes]]\ndir = \"{}\"\nname = \"{RESTORE_PLAIN}\"\ncommand = \"sleep 600\"\n",
+            toml_str(&plain_dir.to_string_lossy())
+        ));
+        std::fs::write(&session_file, session).expect("stage the plain pane");
+        ChangedRestore {
+            _scratch: scratch,
+            project,
+            state,
+            home,
+            session_file,
+        }
+    }
+
+    /// Launch the TUI on an empty daemon with this saved session and state dir,
+    /// and wait for the `restore-orch` restore prompt.
+    fn launch_to_prompt(&self) -> TuiDeck {
+        let deck = TuiDeck::builder()
+            .with_pty_size(140, 50)
+            .with_env(
+                "DOT_AGENT_DECK_SESSION",
+                self.session_file.to_string_lossy(),
+            )
+            .with_env("DOT_AGENT_DECK_STATE_DIR", self.state.to_string_lossy())
+            .launch_with_fixture("plain-project");
+        let grid = wait_for_prompt(&deck);
+        assert!(
+            grid.contains("a approve and restore") && grid.contains("restore-orch"),
+            "precondition: the restore prompt for `restore-orch`.\nGrid:\n{grid}"
+        );
+        deck
+    }
+
+    /// After the deck that held the restore prompt has quit: the saved session
+    /// still carries the `restore-orch` snapshot, and the next start on an
+    /// empty daemon asks about it again.
+    fn assert_kept_and_asked_again(&self, how: &str) {
+        let saved = std::fs::read_to_string(&self.session_file).unwrap_or_default();
+        assert!(
+            saved.contains("[panes.orchestration]")
+                && saved.contains("config_name = \"restore-orch\""),
+            "after {how}, the saved session must keep the orchestration awaiting approval \
+             (`restore-orch`), but {} now reads:\n{saved}",
+            self.session_file.display()
+        );
+        let next = TuiDeck::builder()
+            .with_pty_size(140, 50)
+            .with_env(
+                "DOT_AGENT_DECK_SESSION",
+                self.session_file.to_string_lossy(),
+            )
+            .with_env("DOT_AGENT_DECK_STATE_DIR", self.state.to_string_lossy())
+            .launch_with_fixture("plain-project");
+        let grid = wait_for_prompt(&next);
+        assert!(
+            grid.contains("a approve and restore") && grid.contains("restore-orch"),
+            "after {how}, the next start must ask about `restore-orch` again.\nGrid:\n{grid}"
+        );
+    }
+}
+
+/// Detach-quit `deck` through the quit dialog and wait for it to exit. From
+/// pane input it first leaves for command mode, so `Ctrl+C` opens the dialog.
+fn detach_quit(deck: &mut TuiDeck) {
+    if deck.snapshot_grid().contains("[Command Mode Ctrl+D]") {
+        deck.send_keys(b"\x04"); // Ctrl+D -> command mode
+        deck.wait_for_absence("[Command Mode Ctrl+D]");
+    }
+    deck.send_keys(b"\x03"); // Ctrl+C -> quit-confirm modal
+    deck.wait_for_string("Quit dot-agent-deck?");
+    deck.send_keys(b"\r"); // Enter -> Detach (default)
+    assert_eq!(
+        deck.wait_for_exit_within(common::load_scaled(Duration::from_secs(30))),
+        Some(true),
+        "the deck must detach-quit cleanly.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
 /// Scenario: Approve a project's orchestration with the real CLI, change one
 /// character of its `coder` command, and stage a saved session holding that
 /// orchestration followed by a plain `sleep 600` pane. Launching the TUI shows
 /// the restore prompt; `Esc` closes it, none of the orchestration's roles
-/// start, the plain pane is restored, and `trust list` still reads `changed`.
+/// start, the plain pane is restored, and `trust list` still reads `changed`;
+/// after a detach-quit the saved session still holds the orchestration and the
+/// next start asks about it again.
 #[spec("config-trust/restore/002")]
 #[test]
 fn restore_002_cancelling_the_restore_prompt_leaves_the_orchestration_unrestored() {
-    const PLAIN: &str = "r-plain";
-    let scratch = common::race_safe_tempdir();
-    let project = scratch.path().join("restore-project");
-    let plain_dir = scratch.path().join("plain-dir");
-    let state = scratch.path().join("state");
-    let home = scratch.path().join("approve-home");
-    for dir in [&project, &plain_dir, &home] {
-        std::fs::create_dir_all(dir).expect("create sandbox dir");
-    }
-    write_restore_config(&project, "sleep 600");
-    let approved = restore_trust_cli(
-        &project,
-        &state,
-        &home,
-        &["approve", &project.to_string_lossy(), "--yes"],
-    );
-    assert!(
-        approved.status.success(),
-        "precondition approve: {}",
-        describe(&approved)
-    );
-    write_restore_config(&project, "sleep 601"); // one character changed
-
-    // The orchestration pane first, so a restore that stops at the cancelled
-    // orchestration instead of carrying on would also lose the plain pane.
-    let session_file = scratch.path().join("session.toml");
-    stage_orchestration_session(
-        &session_file,
-        &project,
-        &["orchestrator", "coder", "reviewer"],
-    );
-    let mut session = std::fs::read_to_string(&session_file).expect("read staged session");
-    session.push_str(&format!(
-        "\n[[panes]]\ndir = \"{}\"\nname = \"{PLAIN}\"\ncommand = \"sleep 600\"\n",
-        toml_str(&plain_dir.to_string_lossy())
-    ));
-    std::fs::write(&session_file, session).expect("stage the plain pane");
-
-    let deck = TuiDeck::builder()
-        .with_pty_size(140, 50)
-        .with_env("DOT_AGENT_DECK_SESSION", session_file.to_string_lossy())
-        .with_env("DOT_AGENT_DECK_STATE_DIR", state.to_string_lossy())
-        .launch_with_fixture("plain-project");
+    const PLAIN: &str = RESTORE_PLAIN;
+    let staged = ChangedRestore::stage();
+    let (project, state, home) = (&staged.project, &staged.state, &staged.home);
+    let mut deck = staged.launch_to_prompt();
     let attach = deck.attach_socket_path().to_path_buf();
-
-    let grid = wait_for_prompt(&deck);
-    assert!(
-        grid.contains("a approve and restore") && grid.contains("restore-orch"),
-        "precondition: the restore prompt for `restore-orch`.\nGrid:\n{grid}"
-    );
 
     deck.send_keys(b"\x1b"); // Esc
     let closed = common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
@@ -881,8 +967,8 @@ fn restore_002_cancelling_the_restore_prompt_leaves_the_orchestration_unrestored
             .collect::<Vec<_>>()
     );
 
-    let listed = restore_trust_cli(&project, &state, &home, &["list"]);
-    let project_canonical = canonical(&project);
+    let listed = restore_trust_cli(project, state, home, &["list"]);
+    let project_canonical = canonical(project);
     let line = text(&listed)
         .lines()
         .find(|l| l.contains(&project_canonical) && l.contains("restore-orch"))
@@ -893,6 +979,45 @@ fn restore_002_cancelling_the_restore_prompt_leaves_the_orchestration_unrestored
         "`Esc` must store nothing: the approval still reads `changed`.\n{}",
         describe(&listed)
     );
+
+    // A declined restore is not forgotten: it stays saved and is asked again.
+    detach_quit(&mut deck);
+    staged.assert_kept_and_asked_again("`Esc` and a detach-quit");
+}
+
+/// Scenario: Stage the same saved session as `config-trust/restore/002` (a
+/// changed orchestration, then a plain pane) and launch the TUI. With the
+/// restore prompt still open and unanswered, press `Ctrl+C` and detach. The
+/// saved session must still hold the orchestration, and the next start must
+/// show its restore prompt again.
+#[spec("config-trust/restore/004")]
+#[test]
+fn restore_004_quitting_with_the_restore_prompt_open_keeps_the_orchestration_saved() {
+    let staged = ChangedRestore::stage();
+    let mut deck = staged.launch_to_prompt();
+    let attach = deck.attach_socket_path().to_path_buf();
+    let plain_restored = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        common::agent_records_on(&attach)
+            .iter()
+            .any(|r| r.display_name.as_deref() == Some(RESTORE_PLAIN))
+    });
+    assert!(
+        plain_restored,
+        "precondition: the plain pane restores while the prompt waits.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // Ctrl+C from the open prompt goes straight to the quit dialog.
+    deck.send_keys(b"\x03");
+    deck.wait_for_string("Quit dot-agent-deck?");
+    deck.send_keys(b"\r"); // Enter -> Detach (default)
+    assert_eq!(
+        deck.wait_for_exit_within(common::load_scaled(Duration::from_secs(30))),
+        Some(true),
+        "the deck must detach-quit cleanly from the restore prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    staged.assert_kept_and_asked_again("quitting with the prompt unanswered");
 }
 
 /// How the project config has drifted from a saved orchestration snapshot
@@ -1596,6 +1721,103 @@ fn schedule_003_a_forged_gitfile_does_not_borrow_another_checkouts_approval() {
             .is_some(),
         "A's real linked worktree must still share A's approval and open the orchestration.\n\
          schedule list:\n{}",
+        schedule_list()
+    );
+}
+
+/// Scenario: A git repository's one orchestration has no `name`. Approve it in
+/// the main checkout with `trust approve <main> --yes` and cut a linked
+/// worktree. A run-now schedule in the main checkout opens the orchestration,
+/// and one in the linked worktree must open it too, not refuse it as never
+/// approved.
+#[spec("config-trust/schedule/005")]
+#[test]
+fn schedule_005_an_unnamed_orchestration_is_shared_by_a_linked_worktree() {
+    const UNNAMED_CONFIG: &str = "[[orchestrations]]\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"cat\"\n\
+         start = true\n";
+    let scratch = common::race_safe_tempdir();
+    let root = scratch.path().to_path_buf();
+    let repo = root.join("unnamed-repo");
+    let worktree = root.join("unnamed-repo-wt");
+    std::fs::create_dir_all(&repo).expect("create repo");
+    std::fs::write(repo.join(".dot-agent-deck.toml"), UNNAMED_CONFIG).expect("write config");
+    for args in [
+        &["-c", "init.defaultBranch=main", "init", "-q"][..],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "init"],
+    ] {
+        let status = common::fixture_git(&repo, &root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in the repository");
+    }
+    let added = common::fixture_git(&repo, &root)
+        .args(["worktree", "add", "-q", "-b", "wt"])
+        .arg(&worktree)
+        .status()
+        .expect("git worktree add");
+    assert!(added.success(), "git worktree add failed");
+
+    let schedule = |name: &str, dir: &Path| {
+        format!(
+            "[[scheduled_tasks]]\n\
+             name = \"{name}\"\n\
+             cron = \"0 0 1 1 *\"\n\
+             working_dir = \"{}\"\n\
+             command = \"cat\"\n\
+             prompt = \"TRUST-UNNAMED-PROMPT\"\n\
+             enabled = true\n",
+            toml_str(&dir.to_string_lossy())
+        )
+    };
+    let toml = format!(
+        "{}\n{}",
+        schedule("main-sched", &repo),
+        schedule("wt-sched", &worktree)
+    );
+    let daemon = common::spawn_daemon_serve_untrusted(Some(&toml), "0", &[]);
+    daemon.approve_project_trust(&repo);
+    let schedule_list = || text(&daemon.run_schedule_cli(&["list"]));
+    let opened_in = |dir: &Path| {
+        let want = canonical(dir);
+        daemon
+            .wait_for_agent_where(
+                |r| {
+                    matches!(
+                        &r.tab_membership,
+                        Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+                    ) && r.cwd.as_deref().is_some_and(|cwd| {
+                        std::fs::canonicalize(cwd).is_ok_and(|c| c.to_string_lossy() == want)
+                    })
+                },
+                common::load_scaled(Duration::from_secs(15)),
+            )
+            .is_some()
+    };
+
+    // Control: the main checkout, where it was approved.
+    daemon
+        .run_now("main-sched")
+        .expect("run-now in the main checkout");
+    assert!(
+        opened_in(&repo),
+        "precondition: the approved unnamed orchestration opens in the main checkout.\n\
+         schedule list:\n{}",
+        schedule_list()
+    );
+
+    daemon
+        .run_now("wt-sched")
+        .expect("run-now in the linked worktree");
+    assert!(
+        opened_in(&worktree),
+        "a linked worktree shares its main checkout's approval of an unnamed orchestration, \
+         but the run-now in {} did not open it.\nschedule list:\n{}",
+        worktree.display(),
         schedule_list()
     );
 }
