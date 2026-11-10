@@ -14651,7 +14651,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
 - **Agent:** two shell/cat stand-ins in one worktree with offline gh rollups.
-- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each; the receiver gets two CI intervals and four change events in total.
+- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each, and each run's `deck.pr.numbers` names the PR (issue #2096); the receiver gets two CI intervals and four change events in total.
 - **Does not assert:** deduplication across daemons, different repositories with the same PR number or ownership handoff while checks are pending.
 - **Platform coverage:** mac+linux.
 
