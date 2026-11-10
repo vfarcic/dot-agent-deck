@@ -1773,6 +1773,30 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Verified load-bearing:** red (the close is not refused) with the settle wait removed from the close's fact reading.
 - **Platform coverage:** mac+linux (the module is `cfg(unix)`).
 
+##### status/waiting/021 — A close re-checks the settle window after each wait, so turns a worker ends while the close waits are waited out too (issue #1757, Qodo on PR #2250).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames for the worker: a turn ends just before the close, two more short turns end during its waits (at 1.1 s and 2.3 s), and the monitor's command sample and `ShellBusy` land at 2.9 s, after the second wait would have ended.
+- **Asserts:** the close of the reported-done orchestration is refused as busy with a message naming Waiting, and stops no pane.
+- **Does not assert:** the shell-activity monitor's own sampling (the sample is applied by hand), the cap (status/waiting/022).
+- **Verified load-bearing:** red (the worker is stopped) with the close waiting once per fact read instead of re-checking the window after each wait.
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/022 — A close stops waiting for a worker that keeps ending turns at its cap, and refuses it as busy (issue #1757, Qodo on PR #2250).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames ending a worker turn every 600 ms for three seconds past the cap.
+- **Asserts:** the close answers between the cap (`CLOSE_SETTLE_CAP`, three settle windows) and the cap plus 1.5 s, refused as busy with a message saying the worker kept ending turns, and stops no pane.
+- **Does not assert:** the exact cap value beyond the timing bounds, a forced close of such a worker (`--force` overrides any busy refusal).
+- **Verified load-bearing:** red with the re-check removed (the close stops the worker after one wait) and red with the cap removed (the close answers only after the worker stops).
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/023 — A close of a worker that stays quiet after its turn ends waits one settle window, not the cap (issue #1757).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames ending one worker turn just before the close.
+- **Asserts:** the close of the reported-done orchestration closes it and stops both panes within one settle window plus 1.5 s, and before the cap.
+- **Does not assert:** a close sent after the settle window (the existing background-work close tests).
+- **Verified load-bearing:** red (the close answers at the cap) with each wait running to the cap instead of to the end of the window.
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
 ### Agent protocol
 
 #### agent/readiness

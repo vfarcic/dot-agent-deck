@@ -823,6 +823,10 @@ pub struct TargetFacts {
     /// #1678): an agent whose turn is over reads `Idle` while its commands or
     /// subagents still run, so this, not the status, is what says it is busy.
     pub background: Option<BackgroundWork>,
+    /// Issue #1757: a targeted pane was still inside the settle window of a
+    /// turn it had just ended when the close stopped waiting for it, so its
+    /// `Idle` was never confirmed. Read as busy — the conservative side.
+    pub still_settling: bool,
     /// `--pane` named one role of an orchestration with other live roles.
     pub strands_orchestration: bool,
 }
@@ -857,6 +861,11 @@ pub fn default_refusals(facts: &TargetFacts) -> Vec<(RefusalReason, String)> {
     }
     if let Some(status) = facts.statuses.iter().find(|s| is_busy(s)) {
         out.push((RefusalReason::Busy, format!("was {status:?}")));
+    } else if facts.still_settling {
+        out.push((
+            RefusalReason::Busy,
+            "kept ending turns, so its work was never seen to finish".to_string(),
+        ));
     } else if let Some(work) = facts.background {
         out.push((
             RefusalReason::Busy,
@@ -1286,6 +1295,7 @@ mod tests {
             unit_reported: Some(false),
             statuses: vec![SessionStatus::Idle],
             background: None,
+            still_settling: false,
             strands_orchestration: false,
         };
         let by_name = default_refusals(&facts);
@@ -1297,6 +1307,7 @@ mod tests {
             unit_reported: Some(true),
             statuses: vec![SessionStatus::Idle, SessionStatus::Working],
             background: None,
+            still_settling: false,
             strands_orchestration: true,
         };
         let reasons: Vec<_> = default_refusals(&facts).into_iter().map(|r| r.0).collect();
@@ -1322,6 +1333,7 @@ mod tests {
                 since_ms: None,
                 awaited: 0,
             }),
+            still_settling: false,
             strands_orchestration: false,
         };
         assert_eq!(
@@ -1329,6 +1341,19 @@ mod tests {
             vec![(
                 RefusalReason::Busy,
                 "was Idle with background work running (2 commands, 1 subagent)".to_string()
+            )]
+        );
+        // A pane whose Idle was never confirmed because it kept ending turns
+        // (issue #1757) is busy too, and says so.
+        let settling = TargetFacts {
+            still_settling: true,
+            ..facts.clone()
+        };
+        assert_eq!(
+            default_refusals(&settling),
+            vec![(
+                RefusalReason::Busy,
+                "kept ending turns, so its work was never seen to finish".to_string()
             )]
         );
         // A busy status names the status, not the background work.
