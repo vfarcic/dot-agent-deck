@@ -719,27 +719,33 @@ fn status_waiting_006_inbox_waiter_is_not_a_background_command() {
     );
 }
 
-/// Scenario: Classify an OpenCode 2 pane's process table, shaped as measured on OpenCode 2.2.5: the client on the pane, its private server `opencode serve --stdio --port 0` in a POSIX session of its own, and the deck's inbox watcher and the server's other children in the server's session. On an OpenCode pane none of that is a background command; a real backgrounded shell command below the server, in a session of its own, counts once; a server started by a tool, an unread server command line, a pane of another agent and OpenCode 1.x keep today's count.
+/// Scenario: Classify an OpenCode 2 pane's process table, shaped as measured on OpenCode 2.2.5 (the client on the pane, its private server `<path>/opencode serve --stdio --port 0` as its direct child in a POSIX session of its own, the deck's inbox watcher in the server's session), given the client/server pair the daemon's OpenCode watch identified. That server and its session are not a background command; every other process counts as before: a command below the server, a `serve --stdio` a tool starts below or beside it, one a wrapper shell starts, a server whose command line was not read or no longer reads as a server, and anything on a pane with no identified server (OpenCode 1.x, an unknown version), even when its command text quotes `opencode serve --stdio`.
 #[spec("status/waiting/016")]
 #[test]
 fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     use dot_agent_deck::platform::proc::{
-        MEASURED_AGENT_SERVER_SHAPES, OPENCODE_SERVER_SHAPE, qualifying_command_sessions,
-        qualifying_command_sessions_with_servers,
+        AgentServer, is_opencode_private_server_command, qualifying_command_sessions,
+        qualifying_command_sessions_with_server,
     };
     use std::collections::HashSet;
 
+    const WRAPPER: i32 = 80090;
     const CLIENT: i32 = 80100;
     const SERVER: i32 = 80110;
     const COMMAND_SID: i32 = 80120;
     const TOOL_SERVER_SID: i32 = 80130;
-    assert_eq!(MEASURED_AGENT_SERVER_SHAPES, &[OPENCODE_SERVER_SHAPE]);
-    let servers = [OPENCODE_SERVER_SHAPE];
+    const SIBLING_SID: i32 = 80150;
+    const FORGED_SID: i32 = 80160;
+    const SERVER_ARGV: &str = "/home/user/.opencode/bin/opencode serve --stdio --port 0";
+    let identified = Some(AgentServer {
+        client_pid: CLIENT,
+        server_pid: SERVER,
+    });
     let row = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
         pid,
         ppid,
         session_id: sid,
-        has_controlling_tty: pid == CLIENT,
+        has_controlling_tty: sid == CLIENT,
         session_leader: pid == sid,
         command_line: argv.map_or(CommandLine::NotSampled, |argv| {
             CommandLine::Read(argv.to_string())
@@ -749,27 +755,26 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     let standalone = || {
         vec![
             row(CLIENT, 1, CLIENT, None),
-            row(
-                SERVER,
-                CLIENT,
-                SERVER,
-                Some("/home/user/.opencode/bin/opencode serve --stdio --port 0"),
-            ),
+            row(SERVER, CLIENT, SERVER, Some(SERVER_ARGV)),
             // The server plugin's inbox watcher and another server child, in
             // the server's own session.
             row(80111, SERVER, SERVER, None),
             row(80112, SERVER, SERVER, None),
         ]
     };
+    let count = |table: &[ProcessInfo], root: i32, server: Option<AgentServer>| {
+        qualifying_command_sessions_with_server(table, root, &[], server)
+    };
 
     let table = standalone();
     assert_eq!(
         qualifying_command_sessions(&table, CLIENT, &[]),
         Some(HashSet::from([SERVER])),
-        "premise: without the server shape the structural test counts the server"
+        "premise: without the identified server the structural test counts it"
     );
+    assert_eq!(count(&table, CLIENT, None), Some(HashSet::from([SERVER])));
     assert_eq!(
-        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        count(&table, CLIENT, identified),
         Some(HashSet::new()),
         "OpenCode's own server, and its session, are not a background command"
     );
@@ -785,43 +790,93 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     ));
     table.push(row(80121, 80120, COMMAND_SID, None));
     assert_eq!(
-        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        count(&table, CLIENT, identified),
         Some(HashSet::from([COMMAND_SID])),
         "the command below the server counts, once"
     );
 
     // A server a tool started below the agent's own is a command like any
-    // other: only the first server on a branch is the agent's.
-    table.push(row(
-        80130,
-        SERVER,
-        TOOL_SERVER_SID,
-        Some("opencode serve --stdio --port 0"),
-    ));
+    // other: only the identified pid is the agent's.
+    table.push(row(80130, SERVER, TOOL_SERVER_SID, Some(SERVER_ARGV)));
     assert_eq!(
-        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        count(&table, CLIENT, identified),
         Some(HashSet::from([COMMAND_SID, TOOL_SERVER_SID])),
         "a tool's own `serve --stdio` is not the agent's server"
     );
 
+    // A sibling of the real server — a second `serve --stdio` child of the
+    // client, in a session of its own — counts.
+    let mut table = standalone();
+    table.push(row(80150, CLIENT, SIBLING_SID, Some(SERVER_ARGV)));
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([SIBLING_SID])),
+        "a sibling of the identified server is a command"
+    );
+
+    // A wrapper shell runs the client; a process that forged a server's argv,
+    // whose parent is that shell, counts — and it would even if the identity
+    // named its pid, since its parent is not the client.
+    let wrapped = || {
+        let mut table = vec![row(WRAPPER, 1, CLIENT, None)];
+        table.extend(standalone().into_iter().map(|mut r| {
+            if r.pid == CLIENT {
+                r.ppid = WRAPPER;
+            }
+            r
+        }));
+        table.push(row(
+            80160,
+            WRAPPER,
+            FORGED_SID,
+            Some("opencode serve --stdio"),
+        ));
+        table
+    };
+    assert_eq!(
+        count(&wrapped(), WRAPPER, identified),
+        Some(HashSet::from([FORGED_SID])),
+        "a forged server under a shell is a command; the real one is not"
+    );
+    assert_eq!(
+        count(
+            &wrapped(),
+            WRAPPER,
+            Some(AgentServer {
+                client_pid: CLIENT,
+                server_pid: 80160,
+            })
+        ),
+        Some(HashSet::from([SERVER, FORGED_SID])),
+        "an identity whose pid's parent is not the client exempts nothing"
+    );
+
     // A server whose command line was not read is not recognised, so it
-    // counts as it did before rather than hiding what runs below it.
+    // counts as it did before rather than hiding what runs below it — and a
+    // readable `serve --stdio` a tool starts below it counts too.
     let mut table = standalone();
     table[1].command_line = CommandLine::Unavailable;
+    table.push(row(80130, SERVER, TOOL_SERVER_SID, Some(SERVER_ARGV)));
     assert_eq!(
-        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
-        Some(HashSet::from([SERVER])),
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([SERVER, TOOL_SERVER_SID])),
+        "an unread server counts, and so does the tool server below it"
     );
 
-    // A pane of another agent selects no server shape, so an `opencode serve
-    // --stdio` it runs is a command.
+    // The identified pid, reused since the watch looked by a process whose
+    // command line is not a server's, counts.
+    let mut table = standalone();
+    table[1].command_line = CommandLine::Read("/bin/bash -c sleep 60".to_string());
     assert_eq!(
-        qualifying_command_sessions_with_servers(&standalone(), CLIENT, &[], &[]),
+        count(&table, CLIENT, identified),
         Some(HashSet::from([SERVER])),
+        "a reused pid is not the server"
     );
 
-    // OpenCode 1.x: no private server; the watcher stays in the agent's own
-    // session, and a backgrounded command in a session of its own counts.
+    // OpenCode 1.x, and a pane whose OpenCode version the deck does not know:
+    // the watch identifies no server, so nothing is exempted — not a shell
+    // command quoting the server's words, not a `serve --stdio` a tool
+    // started as the client's own child.
     let opencode_1 = vec![
         row(CLIENT, 1, CLIENT, None),
         row(80111, CLIENT, CLIENT, None),
@@ -829,17 +884,186 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
             80140,
             CLIENT,
             80140,
-            Some("/bin/bash -c ping -c 60 127.0.0.1"),
+            Some("/bin/bash -c sleep 600; opencode serve --stdio --port 0"),
+        ),
+        row(80141, 80140, 80140, None),
+        row(
+            80145,
+            CLIENT,
+            80145,
+            Some("opencode serve --stdio --port 0"),
         ),
     ];
     assert_eq!(
-        qualifying_command_sessions_with_servers(&opencode_1, CLIENT, &[], &servers),
-        Some(HashSet::from([80140])),
+        count(&opencode_1, CLIENT, None),
+        Some(HashSet::from([80140, 80145])),
         "OpenCode 1.x counts exactly as before"
     );
     assert_eq!(
-        qualifying_command_sessions_with_servers(&opencode_1, CLIENT, &[], &servers),
+        count(&opencode_1, CLIENT, None),
         qualifying_command_sessions(&opencode_1, CLIENT, &[]),
+    );
+
+    // The command-line re-check reads words in place, not substrings.
+    for server in [
+        SERVER_ARGV,
+        "opencode serve --stdio --port 0",
+        "/opt/bin/opencode-1.18.35 serve --stdio",
+    ] {
+        assert!(is_opencode_private_server_command(server), "{server}");
+    }
+    for not_server in [
+        "/bin/bash -c opencode serve --stdio --port 0",
+        "/bin/bash -c : 'opencode serve --stdio'; sleep 60; :",
+        "python3 x.py opencode serve --stdio --port 0",
+        "/usr/bin/node /x/opencode serve --stdio",
+        "opencode serve --service",
+        "opencode --stdio serve",
+        "notopencode serve --stdio",
+        "opencode",
+        "",
+    ] {
+        assert!(
+            !is_opencode_private_server_command(not_server),
+            "{not_server}"
+        );
+    }
+}
+
+/// Scenario: The daemon's OpenCode watch looks at a pane's process tree (executables and arguments, as it samples them) and names the private server the shell-activity scan may exempt. It names one only for a client whose version is known to be 2.x, and only that client's first direct child whose executable is OpenCode and whose arguments are `serve --stdio`: not on OpenCode 1.x (where a tool can start that shape as the client's child), not for an unknown version, not a process that only forged a server's arguments, not one a wrapper shell started, and not a second server. Fed into the scan, the named server is exempted and a forged one beside it still counts.
+#[spec("status/waiting/017")]
+#[test]
+fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
+    use dot_agent_deck::opencode_mode::{ProcRow, Watch, Watched, evaluate};
+    use dot_agent_deck::platform::proc::{AgentServer, qualifying_command_sessions_with_server};
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    const OC: &str = "/home/user/.opencode/bin/opencode";
+    let proc_row = |pid: i32, ppid: i32, exe: &str, argv: &[&str]| ProcRow {
+        pid,
+        ppid,
+        exe: Some(PathBuf::from(exe)),
+        argv: (!argv.is_empty()).then(|| argv.iter().map(|a| a.to_string()).collect()),
+    };
+    let server_argv: &[&str] = &[OC, "serve", "--stdio", "--port", "0"];
+    // The pane's shell (100) runs the client (101); the client's private
+    // server (102); a forged `serve --stdio` the pane's shell started (103,
+    // a Python whose argv claims to be OpenCode).
+    let tree = || {
+        vec![
+            proc_row(100, 1, "/usr/bin/bash", &[]),
+            proc_row(101, 100, OC, &["opencode", "--standalone"]),
+            proc_row(102, 101, OC, server_argv),
+            proc_row(
+                103,
+                100,
+                "/usr/bin/python3",
+                &["opencode", "serve", "--stdio", "--port", "0"],
+            ),
+        ]
+    };
+    let watched = |spawn_version| Watched {
+        pane_id: "p".to_string(),
+        agent_id: "agent-p".to_string(),
+        root_pid: 100,
+        spawn_version,
+    };
+    let unprobed = |_: &Path| None;
+    let identify = |rows: &[ProcRow], spawn_version| {
+        let mut watch = Watch::default();
+        evaluate(
+            &[watched(spawn_version)],
+            rows,
+            &mut watch,
+            std::time::Instant::now(),
+            &unprobed,
+            &HashMap::new(),
+        );
+        watch.private_server("agent-p")
+    };
+
+    let identified = identify(&tree(), Some((2, 2, 5)));
+    assert_eq!(
+        identified,
+        Some(AgentServer {
+            client_pid: 101,
+            server_pid: 102,
+        }),
+        "a known 2.x client's private server"
+    );
+    assert_eq!(
+        identify(&tree(), Some((1, 19, 5))),
+        None,
+        "OpenCode 1.x: a `serve --stdio` child is a tool's"
+    );
+    assert_eq!(identify(&tree(), None), None, "an unknown version");
+
+    // A second server child of the client is not the one named.
+    let mut two = tree();
+    two.push(proc_row(104, 101, OC, server_argv));
+    assert_eq!(
+        identify(&two, Some((2, 2, 5))),
+        identified,
+        "the first only"
+    );
+
+    // A client whose only `serve --stdio` child is not an OpenCode executable,
+    // or that only the wrapper shell has, has no private server.
+    let forged_only: Vec<ProcRow> = tree()
+        .into_iter()
+        .filter(|r| r.pid != 102)
+        .chain([proc_row(105, 101, "/usr/bin/python3", server_argv)])
+        .collect();
+    assert_eq!(identify(&forged_only, Some((2, 2, 5))), None);
+
+    // The client gone: the identity is forgotten on the next look.
+    let mut watch = Watch::default();
+    let now = std::time::Instant::now();
+    evaluate(
+        &[watched(Some((2, 2, 5)))],
+        &tree(),
+        &mut watch,
+        now,
+        &unprobed,
+        &HashMap::new(),
+    );
+    assert!(watch.private_server("agent-p").is_some());
+    let gone: Vec<ProcRow> = tree().into_iter().filter(|r| r.pid == 100).collect();
+    evaluate(
+        &[watched(Some((2, 2, 5)))],
+        &gone,
+        &mut watch,
+        now,
+        &unprobed,
+        &HashMap::new(),
+    );
+    assert_eq!(watch.private_server("agent-p"), None);
+
+    // Fed into the scan: the same tree as the shell-activity sampler sees it.
+    let info = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id: sid,
+        has_controlling_tty: sid == 100,
+        session_leader: pid == sid,
+        command_line: argv.map_or(CommandLine::NotSampled, |a| CommandLine::Read(a.into())),
+    };
+    let table = vec![
+        info(100, 1, 100, None),
+        info(101, 100, 100, None),
+        info(102, 101, 102, Some(&server_argv.join(" "))),
+        info(103, 100, 103, Some("opencode serve --stdio --port 0")),
+    ];
+    assert_eq!(
+        qualifying_command_sessions_with_server(&table, 100, &[], identified),
+        Some(HashSet::from([103])),
+        "the identified server is exempt; the forged one beside it counts"
+    );
+    assert_eq!(
+        qualifying_command_sessions_with_server(&table, 100, &[], None),
+        Some(HashSet::from([102, 103])),
+        "with no identity, both count"
     );
 }
 

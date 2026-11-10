@@ -55,13 +55,16 @@ pub struct ProcRow {
     pub argv: Option<Vec<String>>,
 }
 
-/// The OpenCode client a pane runs: its process, its binary, and whether it
-/// has a private server of its own.
+/// The OpenCode client a pane runs: its process, its binary, and its private
+/// server, if it has one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Client {
     pub pid: i32,
     pub exe: Option<PathBuf>,
-    pub private_server: bool,
+    /// The pid of its private server: the first (breadth first) direct child
+    /// that is an OpenCode `serve --stdio` ([`private_server`]). `None` when
+    /// it has none.
+    pub private_server: Option<i32>,
 }
 
 /// OpenCode subcommands that are not an agent session (1.x and 2.x `--help`).
@@ -219,7 +222,8 @@ pub fn find_client(rows: &[ProcRow], root: i32) -> Option<Client> {
         exe: client.exe.clone(),
         private_server: tree
             .iter()
-            .any(|row| row.ppid == client.pid && private_server(row)),
+            .find(|row| row.ppid == client.pid && private_server(row))
+            .map(|row| row.pid),
     })
 }
 
@@ -250,13 +254,13 @@ pub fn notice_for(
     {
         return Some(AgentNotice::opencode_unsupported_version(v));
     }
-    if version.map(Major::of) == Some(Major::V2) && !client.private_server {
+    if version.map(Major::of) == Some(Major::V2) && client.private_server.is_none() {
         return (seen_for >= SHARED_GRACE).then(AgentNotice::opencode_shared_service);
     }
     if reporting || seen_for < SILENT_GRACE {
         return None;
     }
-    Some(if version.is_none() && !client.private_server {
+    Some(if version.is_none() && client.private_server.is_none() {
         AgentNotice::opencode_not_reporting_maybe_shared()
     } else {
         AgentNotice::opencode_not_reporting()
@@ -358,6 +362,7 @@ pub struct Watch {
     first_seen: HashMap<String, (i32, std::time::Instant)>,
     confirmed_for: HashMap<String, (i32, Major)>,
     confirmed: Vec<Major>,
+    servers: HashMap<String, crate::platform::proc::AgentServer>,
 }
 
 impl Watch {
@@ -384,12 +389,23 @@ impl Watch {
         self.first_seen.retain(|id, _| keep.contains(id.as_str()));
         self.confirmed_for
             .retain(|id, _| keep.contains(id.as_str()));
+        self.servers.retain(|id, _| keep.contains(id.as_str()));
     }
 
     /// Forget `agent_id`'s client (the pane runs none now).
     pub fn forget(&mut self, agent_id: &str) {
         self.first_seen.remove(agent_id);
         self.confirmed_for.remove(agent_id);
+        self.servers.remove(agent_id);
+    }
+
+    /// Issue #1757: the private server identified for `agent_id` on the last
+    /// look ([`evaluate`]): its client, and that client's private server, for
+    /// a client whose version is known to be 2.x. `None` otherwise — no
+    /// client, no private server, OpenCode 1.x, or a version the deck does
+    /// not know.
+    pub fn private_server(&self, agent_id: &str) -> Option<crate::platform::proc::AgentServer> {
+        self.servers.get(agent_id).copied()
     }
 
     /// Note that `agent_id`'s wrapper-started client `client_pid` runs
@@ -467,6 +483,24 @@ pub fn evaluate(
                             recorded
                         }
                     };
+                    // Issue #1757: the pair the shell-activity scan may treat
+                    // as part of the agent rather than as a command. Only on a
+                    // known 2.x: on 1.x the shell tool runs in the client, so
+                    // a tool starting `opencode serve --stdio` is this shape.
+                    match (version.map(Major::of), client.private_server) {
+                        (Some(Major::V2), Some(server_pid)) => {
+                            watch.servers.insert(
+                                w.agent_id.clone(),
+                                crate::platform::proc::AgentServer {
+                                    client_pid: client.pid,
+                                    server_pid,
+                                },
+                            );
+                        }
+                        _ => {
+                            watch.servers.remove(&w.agent_id);
+                        }
+                    }
                     let first_seen = now.checked_sub(seen_for + REPORT_SLACK);
                     let reporting = last_report
                         .get(&w.agent_id)
@@ -564,6 +598,12 @@ pub async fn run_monitor(
             Some((kept, notices)) => {
                 watch = kept;
                 for (w, notice) in notices {
+                    // Issue #1757: what the shell-activity scan may re-root
+                    // at instead of counting it as a background command.
+                    registry.set_opencode_private_server(
+                        &w.agent_id,
+                        watch.private_server(&w.agent_id),
+                    );
                     registry
                         .inbox()
                         .set_agent_notice(&w.pane_id, &w.agent_id, notice);
@@ -620,7 +660,7 @@ mod tests {
             );
             let found = find_client(&rows, 100).expect("the client is found below the wrapper");
             assert_eq!(found.pid, 102);
-            assert!(found.private_server, "{client:?}");
+            assert_eq!(found.private_server, Some(103), "{client:?}");
         }
     }
 
@@ -630,7 +670,7 @@ mod tests {
             for client in [&["opencode"][..], &["opencode", "mini"]] {
                 let rows = wrapped(client, child);
                 let found = find_client(&rows, 100).expect("found");
-                assert!(!found.private_server, "{client:?} with {child:?}");
+                assert_eq!(found.private_server, None, "{client:?} with {child:?}");
             }
         }
     }
@@ -702,7 +742,7 @@ mod tests {
         ];
         let client = find_client(&rows, 100).expect("the replaced client is found");
         assert_eq!(client.pid, 101);
-        assert!(client.private_server, "{client:?}");
+        assert!(client.private_server.is_some(), "{client:?}");
     }
 
     #[test]
@@ -715,7 +755,7 @@ mod tests {
         Client {
             pid: 1,
             exe: None,
-            private_server,
+            private_server: private_server.then_some(2),
         }
     }
 

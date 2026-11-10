@@ -290,7 +290,8 @@ id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
 (orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
 status (working, thinking, needs input, waiting, idle, blocked, error — waiting is an agent whose
-turn ended while a command it started still runs; needs input is one waiting for the user), of an
+turn ended while a command it started still runs; needs input is one waiting for the user; busy
+is working, thinking and waiting together), of an
 agent type (Claude Code,
 Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
 contains some text. The number decides: a request naming ONE agent by its name or role alone —

@@ -3676,6 +3676,15 @@ pub struct RunningAgent {
     /// when the command names a launcher script that `exec`s another binary
     /// (an old npm 1.x `bin/opencode`). Daemon-local, not on the wire.
     pub opencode_spawn_version: Option<crate::opencode_version::Version>,
+    /// Issue #1757: this generation's OpenCode 2 client and its private server,
+    /// as the daemon's OpenCode watch last identified them
+    /// ([`crate::opencode_mode::Watch::private_server`], set through
+    /// [`AgentPtyRegistry::set_opencode_private_server`]). The shell-activity
+    /// scan re-roots at that server instead of counting it as a background
+    /// command ([`crate::platform::proc::AgentServer`]). `None` until the watch
+    /// has looked, and for every pane it identifies no server in.
+    /// Daemon-local, not on the wire.
+    pub opencode_private_server: Option<crate::platform::proc::AgentServer>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -3966,18 +3975,6 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
     }
 }
 
-/// Issue #1757: which entry of
-/// [`crate::platform::proc::MEASURED_AGENT_SERVER_SHAPES`], if any, applies to
-/// a pane running `agent_type` — only OpenCode's, the one measured. A pane of
-/// any other kind re-roots at no server, so nothing below it is hidden by a
-/// shape measured against another product.
-fn agent_server_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> {
-    match agent_type {
-        Some(AgentType::OpenCode) => Some(crate::platform::proc::OPENCODE_SERVER_SHAPE.agent),
-        _ => None,
-    }
-}
-
 /// One live pane a shell-activity sample could classify, resolved under the
 /// registry lock by [`AgentPtyRegistry::shell_activity_candidates`] and then
 /// classified without it by [`AgentPtyRegistry::classify_shell_activity`].
@@ -4004,11 +4001,11 @@ pub struct ShellActivityCandidate {
     /// Empty for every kind that has never been measured, which leaves the
     /// structural session-id test standing alone.
     pub shapes: Vec<crate::platform::proc::ShellToolShape>,
-    /// Issue #1757: the measured command lines of *this* pane's agent's own
-    /// server ([`crate::platform::proc::MEASURED_AGENT_SERVER_SHAPES`]), which
-    /// the scan re-roots at instead of counting as a background command. Empty
-    /// for every kind but OpenCode.
-    pub servers: Vec<crate::platform::proc::ShellToolShape>,
+    /// Issue #1757: *this* pane's agent's own server, as the daemon's OpenCode
+    /// watch identified it ([`RunningAgent::opencode_private_server`]), which
+    /// the scan re-roots at instead of counting as a background command. `None`
+    /// for every pane but an OpenCode 2 one whose server the watch identified.
+    pub server: Option<crate::platform::proc::AgentServer>,
 }
 
 impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
@@ -15002,6 +14999,7 @@ impl AgentPtyRegistry {
             badge_command: spawn_command.clone(),
             spawn_command,
             opencode_spawn_version,
+            opencode_private_server: None,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -16031,6 +16029,8 @@ impl AgentPtyRegistry {
             spawn_command: _,
             // The fresh generation's own spawn probes again.
             opencode_spawn_version: _,
+            // And the watch identifies the fresh generation's server afresh.
+            opencode_private_server: _,
             badge_command: previous_badge_command,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
@@ -18623,6 +18623,20 @@ impl AgentPtyRegistry {
         Some(Self::classify_shell_activity(&candidates, &table))
     }
 
+    /// Issue #1757: record `agent_id`'s OpenCode 2 client and private server as
+    /// the daemon's OpenCode watch identified them
+    /// ([`RunningAgent::opencode_private_server`]); `None` clears it. An agent
+    /// no longer in the registry is ignored.
+    pub fn set_opencode_private_server(
+        &self,
+        agent_id: &str,
+        server: Option<crate::platform::proc::AgentServer>,
+    ) {
+        if let Some(agent) = self.inner.lock().agents.get_mut(agent_id) {
+            agent.opencode_private_server = server;
+        }
+    }
+
     /// PRD #2050: the live agents whose pane runs OpenCode — by the type the
     /// spawn declared or a hook revealed, or else by its command's basename —
     /// with the pid their process tree hangs from, for the daemon's watch on
@@ -18689,25 +18703,12 @@ impl AgentPtyRegistry {
                     .copied()
                     .filter(|shape| Some(shape.agent) == key)
                     .collect();
-                // Issue #1757: the type the spawn declared counts too, so the
-                // server is not counted before the agent's first report names it.
-                let server_key = agent_server_shape_key(
-                    agent
-                        .agent_type
-                        .as_ref()
-                        .or(agent.spawn_agent_type.as_ref()),
-                );
-                let servers = crate::platform::proc::MEASURED_AGENT_SERVER_SHAPES
-                    .iter()
-                    .copied()
-                    .filter(|shape| Some(shape.agent) == server_key)
-                    .collect();
                 Some(ShellActivityCandidate {
                     pane_id,
                     agent_id: agent_id.clone(),
                     shell_pid,
                     shapes,
-                    servers,
+                    server: agent.opencode_private_server,
                 })
             })
             .collect()
@@ -18756,11 +18757,11 @@ impl AgentPtyRegistry {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let sessions = crate::platform::proc::qualifying_command_sessions_with_servers(
+                let sessions = crate::platform::proc::qualifying_command_sessions_with_server(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,
-                    &candidate.servers,
+                    candidate.server,
                 )?;
                 Some((candidate, sessions))
             })
@@ -19014,6 +19015,7 @@ impl AgentPtyRegistry {
                 spawn_command: None,
                 badge_command: None,
                 opencode_spawn_version: None,
+                opencode_private_server: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real

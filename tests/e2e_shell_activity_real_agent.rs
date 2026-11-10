@@ -1129,24 +1129,40 @@ fn detached_sessions_report() -> Vec<String> {
 /// Once the awaited command has exited: the card must leave Waiting for Idle
 /// with no background line, then — D2(c), issue #1757 — whether the agent
 /// starts a completion-wake turn to report the finished command is watched for
-/// 45 s past the settle and printed with every event since the exit, and the
-/// card must end Idle either way.
-fn settle_after_exit(deck: &TuiDeck, events: &common::EventSub, agent_id: &str, label: &str) {
-    let finished_at = chrono::Utc::now();
+/// 45 s past the settle and printed with every event since `running_at`, and
+/// the card must end Idle either way.
+///
+/// `running_at` is a watermark the caller took while the command still ran
+/// (just before checking that the sentinel is absent, so it precedes the
+/// exit), so a wake the agent sent between the exit and this helper noticing the
+/// sentinel is still in the retained interval; the subscription keeps every
+/// event, and this only filters by that watermark. The sentinel's observation
+/// time is printed too: it is when the poll saw the file, not when the
+/// command exited.
+fn settle_after_exit(
+    deck: &TuiDeck,
+    events: &common::EventSub,
+    agent_id: &str,
+    label: &str,
+    running_at: chrono::DateTime<chrono::Utc>,
+) {
+    let sentinel_seen_at = chrono::Utc::now();
     let settled = deck.wait_for_grid_predicate_within(Duration::from_secs(120), card_settled_idle);
-    let after = describe_events_since(events, agent_id, finished_at);
+    let after = describe_events_since(events, agent_id, running_at);
     assert!(
         settled,
         "the card must leave Waiting and settle on Idle with no background line once the \
-         command it was waiting on has exited; events since the exit: {after:#?}\n{}",
+         command it was waiting on has exited; events since the command was last seen \
+         running: {after:#?}\n{}",
         deck.snapshot_grid()
     );
     // A completion-wake turn shows up as an agent-sent event after the exit:
-    // a Thinking (prompt-carrying or not), a tool call or a compaction.
+    // a Thinking (prompt-carrying or not), a tool call or a compaction. Looked
+    // for from the watermark, which precedes the exit.
     let woke = events.try_wait_for(
         |event| {
             event.agent_id.as_deref() == Some(agent_id)
-                && event.timestamp >= finished_at
+                && event.timestamp >= running_at
                 && matches!(
                     event.event_type,
                     EventType::Thinking | EventType::ToolStart | EventType::Compacting
@@ -1164,21 +1180,25 @@ fn settle_after_exit(deck: &TuiDeck, events: &common::EventSub, agent_id: &str, 
             Duration::from_secs(120),
         );
     }
-    let after = describe_events_since(events, agent_id, finished_at);
+    let after = describe_events_since(events, agent_id, running_at);
+    let wake_seen = woke.as_ref().map_or_else(
+        || "not seen within 45s of the settle".to_string(),
+        |wake| format!("STARTED ({:?} at {})", wake.event_type, wake.timestamp),
+    );
     eprintln!(
-        "{label} D2(c): completion-wake turn {}; events after the command exited ({}):\n{}",
-        if woke.is_some() {
-            "STARTED"
-        } else {
-            "not seen within 45s"
-        },
-        after.len(),
-        after.join("\n")
+        "{}",
+        common::redact_credentials_for_output(&format!(
+            "{label} D2(c): completion-wake turn {wake_seen}; command last seen running at \
+             {running_at}, sentinel observed at {sentinel_seen_at} (observation, not exit, \
+             time); events since the command was last seen running ({}):\n{}",
+            after.len(),
+            after.join("\n")
+        ))
     );
     assert!(
         deck.wait_for_grid_predicate_within(Duration::from_secs(30), card_settled_idle),
         "the card must end Idle with no background line after the command exited; events \
-         since the exit: {after:#?}\n{}",
+         since the command was last seen running: {after:#?}\n{}",
         deck.snapshot_grid()
     );
 }
@@ -1234,6 +1254,9 @@ fn status_waiting_008_real_claude_background_command_reads_waiting_until_it_exit
          with its background line:\n{}",
         deck.snapshot_grid()
     );
+    // The watermark the completion-wake observation keeps events from, taken
+    // before the sentinel is found absent below, so it precedes the exit.
+    let running_at = chrono::Utc::now();
     assert!(
         !sentinel_path.exists(),
         "the Waiting card was only checked once the command had already finished — the run \
@@ -1245,7 +1268,7 @@ fn status_waiting_008_real_claude_background_command_reads_waiting_until_it_exit
         "the background command never finished on its own:\n{}",
         deck.snapshot_grid()
     );
-    settle_after_exit(&deck, &events, &agent_id, "status-waiting-008");
+    settle_after_exit(&deck, &events, &agent_id, "status-waiting-008", running_at);
 }
 
 /// Scenario: Start real interactive OpenCode on the harness's cheap test model through Ctrl+N and ask it to run one shell command with the shell tool's background option — a minute of pings, then touching a uniquely named sentinel — and to end its turn at once. After OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn OpenCode starts to report the finished command).
@@ -1346,6 +1369,9 @@ fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_ex
         describe_events_since(&events, &agent_id, typed_at),
         deck.snapshot_grid()
     );
+    // The watermark the completion-wake observation keeps events from, taken
+    // before the sentinel is found absent below, so it precedes the exit.
+    let running_at = chrono::Utc::now();
     assert!(
         !sentinel_path.exists(),
         "the Waiting card was only checked once the command had already finished — the run \
@@ -1357,5 +1383,5 @@ fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_ex
         "the background command never finished on its own:\n{}",
         deck.snapshot_grid()
     );
-    settle_after_exit(&deck, &events, &agent_id, "status-waiting-009");
+    settle_after_exit(&deck, &events, &agent_id, "status-waiting-009", running_at);
 }

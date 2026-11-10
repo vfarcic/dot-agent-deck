@@ -2661,6 +2661,16 @@ action = "filter_dashboard"
 outcome = "dispatch"
 resolved_status = "waiting_for_input"
 
+# Issue #1757: "busy" is the set of statuses whose work is not done (Working,
+# Thinking and Waiting), offered as its own status, not narrowed to Working.
+[[fixtures]]
+name = "dashboard-filter-busy"
+utterance = "show only the busy agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "busy"
+
 [[fixtures]]
 name = "dashboard-clear-show-everything"
 utterance = "show everything"

@@ -199,35 +199,79 @@ pub const CLAUDE_BASH_TOOL_SHAPE: ShellToolShape = ShellToolShape {
 /// against a live agent of that kind, not that it looks plausible.
 pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHAPE];
 
-/// Issue #1757: the command line of OpenCode 2's own server — part of the
-/// agent, not a command it ran — reusing [`ShellToolShape`]'s argv-fingerprint
-/// form (an agent kind plus substrings, matched inside the whole command line).
+/// Issue #1757: OpenCode 2's private server, as the daemon's OpenCode watch
+/// positively identified it for one pane ([`crate::opencode_mode`]) — part of
+/// the agent, not a command it ran.
 ///
-/// Measured on OpenCode 2.2.5 (2026-11-10, `status/waiting/009` and PRD #2050's
-/// `src/opencode_mode.rs` measurement): `opencode --standalone` (and `opencode
-/// mini`) runs its private server as a child, `opencode serve --stdio --port
-/// 0`, in a POSIX session of its own below the pane. To the structural test that
-/// server is a detached descendant, so every OpenCode 2 card counted it as a
-/// background command (and, first sampled in the pane's first turn, as one the
-/// agent waits on). On 2.2.5 the shell tool's commands run under that server,
-/// each a session of its own below it, and the deck's server plugin's inbox
-/// watcher runs in the server's session. So the walk re-roots at the server
-/// ([`walk_with_reference_session`]) the way it does at a nested terminal: its
-/// session is the reference for its subtree, and a command detached below it
-/// still counts. OpenCode 1.x runs no such child.
+/// Measured on OpenCode 2.2.5 (2026-11-10, `status/waiting/009`, PRD #2050's
+/// `src/opencode_mode.rs` measurement, and a re-measure for round 2 of the
+/// review): `opencode --standalone` (and `opencode mini`) runs on the pane's
+/// terminal and starts its private server as a **direct child**, argv
+/// `[<path>/opencode, serve, --stdio, --port, 0]`, executable the same OpenCode
+/// binary, stdin and stdout a socketpair with the client, in a POSIX session
+/// of its own. To the structural test that server is a detached descendant, so
+/// every OpenCode 2 card counted it as a background command (and, first
+/// sampled in the pane's first turn, as one the agent waits on). The shell
+/// tool's commands run under that server, each a session of its own below it,
+/// and the deck's server plugin's inbox watcher runs in the server's session.
+/// So the walk re-roots at the server ([`walk_with_reference_session`]) the way
+/// it does at a nested terminal: its session is the reference for its subtree,
+/// and a command detached below it still counts.
 ///
-/// Like every entry here, a measured shape and nothing else: an OpenCode that
-/// names its server differently gets no re-rooting, which over-counts (visible)
-/// rather than hiding a real command.
-pub const OPENCODE_SERVER_SHAPE: ShellToolShape = ShellToolShape {
-    agent: "opencode",
-    alternatives: &[&["opencode", " serve --stdio"]],
-};
+/// **Identity, not command text.** Matching a command line's text would let
+/// any command that merely quotes `opencode serve --stdio` (a shell running
+/// it, an argument naming it, a process that forged its argv) hide itself and
+/// its session from the count. So this names one process pair the watch
+/// identified, and the scan accepts nothing else:
+///
+/// - the watch found the pane's OpenCode **client** by its executable (not its
+///   command text) and its session subcommand, and the server as that client's
+///   direct child whose executable is OpenCode and whose argv, read as argv,
+///   carries `serve` and `--stdio` ([`crate::opencode_mode::find_client`]) —
+///   the first such child, so a second one is a command;
+/// - only for a client whose version is **known to be 2.x**: OpenCode 1.x has
+///   no private server, and on 1.x the shell tool runs in the client, so a tool
+///   that starts `opencode serve --stdio` makes exactly this shape. An unknown
+///   version (a wrapper the deck could not probe) identifies no server;
+/// - the scan then re-checks the pair against its own sample
+///   ([`is_identified_agent_server`]): that pid, still the client's child, a
+///   session boundary below a client that is not itself detached, and a
+///   sampled command line whose words are an OpenCode program followed by
+///   `serve --stdio` ([`is_opencode_private_server_command`]), so a pid reused
+///   since the watch looked is not exempted.
+///
+/// On 2.x a tool's processes run under the private server (measured), so none
+/// of them is the client's child. Until the watch has looked at a new pane (it
+/// samples every [`crate::opencode_mode::POLL_INTERVAL`]), or when any check
+/// fails or a command line was not read, the server counts as a command:
+/// an over-count the user can see, never a hidden command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentServer {
+    /// The pane's OpenCode client: the server's parent.
+    pub client_pid: i32,
+    /// The client's private server.
+    pub server_pid: i32,
+}
 
-/// Issue #1757: every measured "agent's own server" command line — the catalog
-/// [`crate::agent_pty::AgentPtyRegistry::shell_activity_candidates`] selects
-/// from per pane by agent kind, as it does [`MEASURED_SHELL_TOOL_SHAPES`].
-pub const MEASURED_AGENT_SERVER_SHAPES: &[ShellToolShape] = &[OPENCODE_SERVER_SHAPE];
+/// Issue #1757: whether `command_line`, a sampled command line (`ps` joins
+/// argv with spaces), runs an OpenCode binary as its private server: the
+/// program word names an OpenCode binary ([`crate::opencode_version::opencode_name`],
+/// by file name) and the next two words are `serve` and `--stdio`, as measured
+/// on 2.2.5 (`<path>/opencode serve --stdio --port 0`). Words in fixed
+/// positions, not substrings: `bash -c 'opencode serve --stdio'` and
+/// `python x.py opencode serve --stdio` are not it. Only ever a re-check of an
+/// [`AgentServer`] the watch identified by executable; a program path with a
+/// space in it fails it, which counts the server (visible) rather than hiding
+/// a command.
+pub fn is_opencode_private_server_command(command_line: &str) -> bool {
+    let mut words = command_line.split_whitespace();
+    words
+        .next()
+        .and_then(|program| program.rsplit('/').next())
+        .is_some_and(crate::opencode_version::opencode_name)
+        && words.next() == Some("serve")
+        && words.next() == Some("--stdio")
+}
 
 /// Every transitive descendant of `root_pid` in `table`, each reported exactly
 /// once and never including `root_pid` itself.
@@ -327,29 +371,29 @@ pub fn qualifying_command_sessions(
     root_pid: i32,
     shapes: &[ShellToolShape],
 ) -> Option<HashSet<i32>> {
-    qualifying_command_sessions_with_servers(table, root_pid, shapes, &[])
+    qualifying_command_sessions_with_server(table, root_pid, shapes, None)
 }
 
 /// Issue #1757: [`qualifying_command_sessions`] for a pane whose agent runs a
-/// server of its own in a session of its own: a session-boundary descendant
-/// whose command line carries one of `servers` ([`MEASURED_AGENT_SERVER_SHAPES`],
-/// selected for the pane's agent kind) is part of the agent, so the walk
-/// re-roots at it as it does at a nested terminal. Its own session is never a
-/// command, and nor is anything in it; a command detached below it still
-/// counts.
+/// server of its own in a session of its own, identified as `server`
+/// ([`AgentServer`]): that server is part of the agent, so the walk re-roots
+/// at it as it does at a nested terminal. Its own session is never a command,
+/// and nor is anything in it; a command detached below it still counts. With
+/// `None`, or when the sample does not bear the identity out
+/// ([`is_identified_agent_server`]), this is [`qualifying_command_sessions`].
 ///
 /// It reads no command line [`command_line_targets`] did not already have
-/// sampled: a server reached through the pane's own session is a session
-/// boundary of the plain walk, which is the set that function reads, so
-/// this re-rooting adds no argv read (issue #862). A server row whose
-/// command line was not read is not re-rooted, so it counts as before.
-pub fn qualifying_command_sessions_with_servers(
+/// sampled: the server is a session boundary of the plain walk, which is the
+/// set that function reads, so this re-rooting adds no argv read (issue #862).
+/// A server row whose command line was not read is not re-rooted, so it
+/// counts as before.
+pub fn qualifying_command_sessions_with_server(
     table: &[ProcessInfo],
     root_pid: i32,
     shapes: &[ShellToolShape],
-    servers: &[ShellToolShape],
+    server: Option<AgentServer>,
 ) -> Option<HashSet<i32>> {
-    let walk = walk_with_reference_session(table, root_pid, servers)?;
+    let walk = walk_with_reference_session(table, root_pid, server)?;
     // A row whose session id could not be read is unclassifiable, not
     // "different" — counting it as different would turn an exit racing the
     // sample into a false `Working`.
@@ -428,7 +472,7 @@ pub fn qualifying_command_sessions_with_servers(
 /// what keeps those two sets identical rather than merely intended to be.
 pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
     Some(
-        walk_with_reference_session(table, root_pid, &[])?
+        walk_with_reference_session(table, root_pid, None)?
             .into_iter()
             // A row whose session id could not be read is unclassifiable, not
             // "different" — counting it as different would turn an exit racing
@@ -446,49 +490,52 @@ fn is_nested_terminal_session(row: &ProcessInfo) -> bool {
     row.session_leader && row.has_controlling_tty && row.session_id > 0
 }
 
-/// Issue #1757: is `row` the pane agent's own server — a session boundary
-/// (in a session other than the one it is compared against, and other than
-/// its parent's) whose sampled command line carries one of `servers`
-/// ([`OPENCODE_SERVER_SHAPE`])?
-fn is_agent_server_session(
+/// Issue #1757: is `row` the server `server` names ([`AgentServer`]), as this
+/// sample shows it? Its pid, its parent the identified client, the client not
+/// itself detached from `reference` (the session the client's branch is
+/// compared against), `row` a session boundary in a session of its own, and
+/// its sampled command line an OpenCode private server's
+/// ([`is_opencode_private_server_command`]). Any of that failing, or unread,
+/// is "not the server".
+fn is_identified_agent_server(
     row: &ProcessInfo,
     reference: i32,
     session_of: &HashMap<i32, i32>,
-    servers: &[ShellToolShape],
+    server: AgentServer,
 ) -> bool {
-    !servers.is_empty()
+    row.pid == server.server_pid
+        && row.ppid == server.client_pid
+        && session_of.get(&server.client_pid) == Some(&reference)
         && row.session_id > 0
         && row.session_id != reference
-        && session_of
-            .get(&row.ppid)
-            .is_none_or(|parent_session| *parent_session != row.session_id)
         && row
             .command_line
             .read()
-            .is_some_and(|argv| servers.iter().any(|shape| shape.matches(argv)))
+            .is_some_and(is_opencode_private_server_command)
 }
 
 /// [`descendants`] of `root_pid`, each paired with the session id it must be
 /// compared against: `root_pid`'s own, except below a nested terminal session
-/// ([`is_nested_terminal_session`]) or, issue #1757, the agent's own server
-/// ([`is_agent_server_session`], only with a non-empty `servers`), whose
+/// ([`is_nested_terminal_session`]) or, issue #1757, the agent's identified
+/// server ([`is_identified_agent_server`], only with a `server`), whose
 /// subtree is compared against that session. Such a session's leader is
 /// reported with its own session as its reference, so it is never detached
-/// from itself. Only the first server on a branch is the agent's own: one
-/// below it (a tool running `opencode serve --stdio`) is a command like any
-/// other. `None` has [`detached_descendants`]'s meaning.
+/// from itself. The server is one pid, so nothing else on any branch is
+/// re-rooted as it: a `serve --stdio` a tool starts, below the server or
+/// beside it, is a command like any other. `None` has
+/// [`detached_descendants`]'s meaning.
 ///
 /// Same visited-set walk as [`descendants`], for the same reason: it must
 /// terminate on a cycle.
-fn walk_with_reference_session<'t>(
-    table: &'t [ProcessInfo],
+fn walk_with_reference_session(
+    table: &[ProcessInfo],
     root_pid: i32,
-    servers: &[ShellToolShape],
-) -> Option<Vec<(&'t ProcessInfo, i32)>> {
-    let session_of: HashMap<i32, i32> = if servers.is_empty() {
-        HashMap::new()
-    } else {
+    server: Option<AgentServer>,
+) -> Option<Vec<(&ProcessInfo, i32)>> {
+    let session_of: HashMap<i32, i32> = if server.is_some() {
         table.iter().map(|row| (row.pid, row.session_id)).collect()
+    } else {
+        HashMap::new()
     };
     let root = table.iter().find(|row| row.pid == root_pid)?;
     if root.session_id <= 0 {
@@ -500,11 +547,10 @@ fn walk_with_reference_session<'t>(
     }
     let mut visited: HashSet<i32> = HashSet::new();
     visited.insert(root_pid);
-    // The third field: whether this branch already passed the agent's server.
-    let mut queue: VecDeque<(i32, i32, bool)> = VecDeque::new();
-    queue.push_back((root_pid, root.session_id, false));
+    let mut queue: VecDeque<(i32, i32)> = VecDeque::new();
+    queue.push_back((root_pid, root.session_id));
     let mut out = Vec::new();
-    while let Some((pid, reference, below_server)) = queue.pop_front() {
+    while let Some((pid, reference)) = queue.pop_front() {
         let Some(kids) = children.get(&pid) else {
             continue;
         };
@@ -512,15 +558,16 @@ fn walk_with_reference_session<'t>(
             if !visited.insert(kid.pid) {
                 continue;
             }
-            let server =
-                !below_server && is_agent_server_session(kid, reference, &session_of, servers);
-            let reference = if server || is_nested_terminal_session(kid) {
+            let is_server = server.is_some_and(|server| {
+                is_identified_agent_server(kid, reference, &session_of, server)
+            });
+            let reference = if is_server || is_nested_terminal_session(kid) {
                 kid.session_id
             } else {
                 reference
             };
             out.push((*kid, reference));
-            queue.push_back((kid.pid, reference, below_server || server));
+            queue.push_back((kid.pid, reference));
         }
     }
     Some(out)
@@ -571,8 +618,8 @@ pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec
     Some(
         // The plain walk, never re-rooted at an agent's server: this set is
         // whose command lines get read, and the server's must be among them
-        // for `qualifying_command_sessions_with_servers` to recognise it.
-        walk_with_reference_session(table, root_pid, &[])?
+        // for `qualifying_command_sessions_with_server` to recognise it.
+        walk_with_reference_session(table, root_pid, None)?
             .into_iter()
             .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
             .map(|(row, _)| row)

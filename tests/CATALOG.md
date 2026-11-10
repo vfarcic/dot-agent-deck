@@ -1691,7 +1691,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** real interactive OpenCode 2.x (the shell tool's `background` option exists only from 2) on the harness's cheap test model, spawned through Ctrl+N; skips on OpenCode 1.x.
 - **Asserts:** a directive prompt launches one background shell command (`ping -c 60 … && touch <unique sentinel>` in the fixture directory) and the turn ends; after OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not OpenCode starts a turn to report the finished command.
 - **Does not assert:** OpenCode 1.x, desktop.
-- **Found and fixed (OpenCode 2.2.5, 2026-11-10):** the card first read Waiting with `Background: 2 commands` for the one command started: `opencode --standalone` runs its server, `opencode serve --stdio --port 0`, in a POSIX session of its own below the pane, and the structural test counted it as a background command (and, first sampled in the pane's first turn, as awaited too). The scan now re-roots at that measured server on OpenCode panes (`status/waiting/016`); the test passes locally. It prints every detached session below it at the Waiting check, which is how the cause was found.
+- **Found and fixed (OpenCode 2.2.5, 2026-11-10):** the card first read Waiting with `Background: 2 commands` for the one command started: `opencode --standalone` runs its server, `opencode serve --stdio --port 0`, in a POSIX session of its own below the pane, and the structural test counted it as a background command (and, first sampled in the pane's first turn, as awaited too). The scan now re-roots at that server on OpenCode 2 panes, once the deck's OpenCode watch has identified it as the client's own private server (`status/waiting/016`, `status/waiting/017`); the test passes locally. It prints every detached session below it at the Waiting check, which is how the cause was found.
 - **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
 
 ##### status/waiting/010 — The bell does not ring on the step to Waiting, and rings on its later step to Idle (issue #1757).
@@ -1738,11 +1738,18 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** when a real process started (the window classifies first samples, not start times), the monitor's timing.
 - **Platform coverage:** mac+linux+windows.
 
-##### status/waiting/016 — OpenCode 2's own server is never a background command, so it cannot make a card read Waiting (issue #1757).
+##### status/waiting/016 — An identified OpenCode 2 private server is not a background command, so it cannot make a card read Waiting (issue #1757).
 - **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
-- **Agent:** none; process-table fixtures shaped as measured on OpenCode 2.2.5 (`opencode serve --stdio --port 0` in a session of its own below the client, the deck's inbox watcher in the server's session).
-- **Asserts:** with the OpenCode server shape the server and everything in its session yield no qualifying session (without it, the server's session counts, the defect `status/waiting/009` found); a backgrounded command below the server in a session of its own counts once; a `serve --stdio` a tool starts below the server counts; a server whose command line was not read, and a pane of another agent, keep today's count; OpenCode 1.x (no server) counts exactly as before.
-- **Does not assert:** the sampler reading the server's command line (`status/shell-activity/008` pins that session-boundary rows are read), the per-pane selection by agent type, a live OpenCode (`status/waiting/009`).
+- **Agent:** none; process-table fixtures shaped as measured on OpenCode 2.2.5 (`<path>/opencode serve --stdio --port 0` as the client's direct child in a session of its own, the deck's inbox watcher in the server's session), with the client/server pair the OpenCode watch identifies passed in.
+- **Asserts:** with the identified pair the server and everything in its session yield no qualifying session (without it, the server's session counts, the defect `status/waiting/009` found); a backgrounded command below the server counts once; a `serve --stdio` a tool starts below the server, a sibling `serve --stdio` of the client, and a forged one a wrapper shell starts all count; an identity naming a pid whose parent is not the client, a server whose command line was not read (and a readable tool server below it), and a pid whose command line no longer reads as a server all count; with no identity (OpenCode 1.x, an unknown version) a shell command quoting `opencode serve --stdio` and a `serve --stdio` child of the client count exactly as before; the command-line re-check takes words in place (program, then `serve --stdio`), not substrings.
+- **Does not assert:** the watch's identification (`status/waiting/017`), the sampler reading the server's command line (`status/shell-activity/008` pins that session-boundary rows are read), a live OpenCode (`status/waiting/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/017 — The OpenCode watch names only a known OpenCode 2 client's own private server for the scan to exempt (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process rows with executables and arguments, as the OpenCode watch samples them, shaped as measured on OpenCode 2.2.5.
+- **Asserts:** for a client whose version is known to be 2.x the watch names the client and its first direct child running the OpenCode executable with `serve --stdio`; it names nothing for OpenCode 1.x, an unknown version, a client whose only `serve --stdio` child is not an OpenCode executable, or once the client is gone; a second server child is not named; fed into the scan, the named server is exempt and a forged `serve --stdio` the wrapper shell started still counts.
+- **Does not assert:** the daemon storing the identity on the pane's agent and handing it to the scan (`run_monitor`, `shell_activity_candidates`), the watch's sampling, a live OpenCode (`status/waiting/009`).
 - **Platform coverage:** mac+linux+windows.
 
 ### Agent protocol
