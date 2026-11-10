@@ -1,0 +1,44 @@
+# Project config trust: maintainer notes (PRD #1885)
+
+The user page is [`docs/project-trust.md`](../project-trust.md). This page records what a maintainer needs and a user does not: where the decision lives, the store, the wire, which execution points are gated and which are deliberately not, and why the contract break has no `KNOWN_EFFECTS` entry. The binding decisions are the two decision records on issue #1885 (comments 6755578007 and 6756637155); this page summarises them as built, on 2026-11-10.
+
+## Where the decision lives
+
+`src/project_trust.rs` owns it: what an approval records (`ApprovedRole`: `name`, `command`, `agent`, `start`, `clear`, `description`, `prompt_template` of every resolved role, after `extends`), the project identity (`project_identity`), the store, the verdict (`TrustVerdict::{Approved, NeverApproved, Changed}`), the refusal text (`refusal_text`, which always names `dot-agent-deck trust approve <dir> --orchestration <name>`) and the digest. Every daemon-side gate calls `check_blocking` / `check_named_blocking`, which re-reads the store each time, so an approval from the CLI takes effect without a daemon restart. The TUI and the desktop do not decide: they ask the daemon (`ProjectTrustState`) and approve through it (`ApproveProjectTrust`), so both clients share one decision and one store. The TUI widget and its gate are `src/trust_prompt.rs`; the CLI is `src/trust_cli.rs`; the desktop's bridge is `desktop/src-tauri/src/trust_review.rs` and its flow `desktop/src/lib/projectTrust.ts`.
+
+**The digest is SHA-256 over the shown text**, never the config revision (`project_resolve`'s FNV hash), which is a staleness hint and not collision-resistant. Its only job is to make an approval cover exactly what a client showed: `ApproveProjectTrust` carries it, and a digest that no longer matches is refused with `trust-text-changed` and records nothing.
+
+## The store
+
+`<state_dir>/project-trust/approvals.json` (`STORE_DIR`, `STORE_FILE`), `state_dir` being `crate::config::state_dir()` (`DOT_AGENT_DECK_STATE_DIR`, else `$XDG_STATE_HOME/dot-agent-deck`, else `~/.local/state/dot-agent-deck`). The directory is created owner-only through `TrustedDir`; a write replaces the file whole (owner-only temp file, `fsync`, rename) under an exclusive lock on `approvals.lock`, so a CLI approval and a daemon approval cannot lose each other's write. The file is JSON, `{"version": 1, "approvals": [{project, orchestration, approved_at, roles: [...]}]}`; it keeps the approved text itself, not only a digest, so a prompt can mark which roles are `changed` or `new` and list removed ones. A file larger than 16 MiB is refused as not one this build wrote. An unreadable store is treated as holding no approvals and logged, which fails closed.
+
+`TrustStore::use_state_dir_for_this_process` moves where approvals are kept for a whole process (a test harness running daemon code in-process); a `cfg(test)` build uses a private directory. Neither changes whether a spawn is checked. The harness pre-approves fixture projects through the real store or the real CLI (`tests/common/lib.rs`: `approve_project_fixture`, `TuiDeck::trusting_project`, `DaemonProc::approve_project_trust`); a test that wants the prompt opts out with `without_trust_preapproval` / `spawn_daemon_serve_untrusted`.
+
+**Project identity:** `project_identity` resolves a directory in a git repository to the repository's main working tree, joined with the config directory's position inside its own worktree (so two configs in two subdirectories of one repository stay two projects). Anything git cannot answer falls back to the canonical config directory, which can only split projects, never merge two. An orchestration with no `name` takes the directory's basename, so a linked worktree's unnamed orchestration does not share the main checkout's approval; delegate lookups by name have the same pre-existing limitation there.
+
+## The wire
+
+`CAP_PROJECT_TRUST` (`"project-trust"`) gates two attach requests, `ProjectTrustState { path, orchestration }` and `ApproveProjectTrust { path, orchestration, digest }`, with the reply on `AttachResponse::project_trust`. Every sender withholds them unless the daemon advertises the capability (CLAUDE.md rule 18, second rung), so there is no `PROTOCOL_VERSION` bump. `PrepareOrchestration` gained the typed error code `not-approved` (`PROJECT_ERR_NOT_APPROVED`); a client that does not know the code still shows the sentence after it, which names the CLI fix. The hook socket has no verb that approves: only a client acting on a user's answer and `dot-agent-deck trust approve` do, and the CLI refuses inside a deck pane (`PANE_IDENTITY_ENV`).
+
+A client meeting a daemon without the capability: the TUI never prompts, reads the store itself read-only and refuses an unapproved orchestration with `OLDER_DAEMON_NOTE` and the approve command; the desktop cannot read the deck's store (it may be on another host, and a client-side read is what the desktop project boundary forbids), so it answers `Unsupported` with `older_deck_refusal` and starts nothing.
+
+## The contract break, and why `KNOWN_EFFECTS` has no entry
+
+The new refusals on existing requests (the desktop's prepare and prepared start, `delegate`, `pane restart`, `pane spawn`, `dispatch`) are declared as a contract break, after issue #1233's precedent: `changelog.d/1885.breaking.md` and `CONTRACT_BREAKS` entry `1885-unapproved-project-config-refused`. The wire did not move, so `PROTOCOL_VERSION` did not either. `cargo xver`'s setup TUI answers the trust prompt with `a`, so the sandbox project is approved in the serving daemon's store before any tell runs, and no tell meets the break; [`cross-version-harness.md`](cross-version-harness.md) has the detail.
+
+## Execution points
+
+Gated in the daemon, refusing and reporting (never prompting): a scheduled fire and Run now (shape override included), a scheduled issue dispatch, `dispatch`, every `delegate` (the worker's `prompt_template` is project text reaching an agent, so not only `clear = true` roles; checked at reply and again at a respawn), `pane restart` and `pane spawn`, and the desktop's `PrepareOrchestration` and the prepared start's re-read. Issue dispatch and `dispatch` check **before** the worktree's `devbox` warm-up: issue dispatch creates the worktree unwarmed, checks the config the spawn will read (a reattached `agent/issue-<n>` branch's own), and on a refusal removes the worktree so the issue is retried once approved. A refused schedule fire is recorded by `src/schedule_outcome.rs` beside the store and shown by `schedule list` and the TUI's Schedules manager (`refused`); the next fire clears it before it runs.
+
+Prompting, in a client: the TUI's New Agent form and session restore (restore holds back each unapproved orchestration for its own prompt, restores the rest, and leaves a cancelled one unrestored), the desktop's New agent dialog and the Runs screen's Activate.
+
+Deliberately not gated, and stated on the user page:
+
+- the raw attach-socket `StartAgent`, which takes an arbitrary command by design (control-plane scoping, #1886);
+- `dispatch --command` / `--agent`, an agent-chosen command (T2, #1887);
+- a schedule's own `command`, from the user's global config;
+- the desktop Runs screen's role profiles, which are the user's own commands behind an existing disclosure dialog (the project prompt text that path hands an agent is gated);
+- restore's replay of the orchestrator prompt saved in `session.toml`, which is gated by the current config's approval but not recomposed from it;
+- `devbox.json` and the rest of a project's build inputs.
+
+**Honest limit:** the store and the CLI are reachable by any process running as the user, agents included; refusing the CLI inside a deck pane stops an agent that keeps the deck's environment, not one that drops it or writes the file. Closing that is #1886's.

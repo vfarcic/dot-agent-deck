@@ -85,6 +85,8 @@ A new tab opens with one pane per role. The role cards are in the left sidebar, 
 3. Under **Mode**, pick the `Orch: team` chip. There is no **Command** field: each role runs its own `command`.
 4. Optionally type a **Name** for the run, then press **Activate orchestration**.
 
+The first time you start an orchestration, and again after its roles' commands, descriptions or prompts change, both clients show **Review project commands** before anything starts: read what each role will run and be told, then press `a` in the TUI or **Approve and start** in the desktop app. Schedules and dispatched units can start it only after you have approved it. See [Approving Project Commands](project-trust.md).
+
 The Dashboard shows an **ORCHESTRATION** group with a numbered row per role and an **ORCHESTRATOR** badge on the orchestrator. Click a row to open that role's terminal. See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
 
 ![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
@@ -414,7 +416,7 @@ The orchestrator can delegate one task to several roles at once (`--to reviewer 
 
 ### Commands
 
-These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane.
+These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane, and are refused, starting nothing, when the orchestration's roles changed in `.dot-agent-deck.toml` since you approved them; the message names the `dot-agent-deck trust approve` command to run from a terminal outside the deck ([Approving Project Commands](project-trust.md#work-that-runs-while-you-are-away)).
 
 | Command | Who runs it | What it does |
 |---|---|---|

@@ -505,6 +505,16 @@ If the daemon is replaced by one on another attach protocol while the TUI is ope
 
 ## Orchestration and delegation
 
+### An orchestration is not approved
+
+A schedule, `dispatch`, `delegate`, `pane restart` or `pane spawn` fails with, or `schedule list` shows, a message such as:
+
+```text
+orchestration 'team' of project /home/you/code/demo changed since you approved it (roles: coder (changed)), so nothing from it was started. Review and approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
+```
+
+The deck runs an orchestration's commands and prompts only after you have approved them as the project's `.dot-agent-deck.toml` now reads, and work that runs without you never asks. Run the command in the message from a terminal outside the deck, read what it prints, and answer `y`; or open the orchestration in the TUI or the desktop app and approve it there. If the review comes back in every worktree of a repository, give the orchestration a `name`. See [Approving Project Commands](project-trust.md).
+
 ### "DOT_AGENT_DECK_PANE_ID environment variable not set"
 
 `delegate`, `work-done`, `dispatch`, `pane spawn` or `pane restart` exits 1 with:

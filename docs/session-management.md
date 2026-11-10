@@ -300,6 +300,8 @@ The workspace is saved after every new agent, rename, tab change and agent chang
 
 Orchestration tabs return with the orchestrator and its prompt, the role panes in their original order, and the start-role cursor where you left it. If the project's `.dot-agent-deck.toml` has changed since (the file is missing, the orchestration was renamed or a role was removed), the deck shows a warning and restores that pane as a plain dashboard pane instead.
 
+When the agents are gone and the deck starts an orchestration tab again, it first checks that you approved that orchestration as its file now reads. For each one you have not, it shows **Review project commands** after restoring the rest: `a` restores the tab, `Esc` leaves it out. See [Approving Project Commands](project-trust.md#restoring-a-saved-workspace).
+
 ### Starting Fresh
 
 To start the next launch from an empty dashboard, clear the saved workspace:
