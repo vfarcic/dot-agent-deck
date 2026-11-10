@@ -729,9 +729,10 @@ describe("TauriDeckBridge", () => {
     const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
-    await bridge.runAction({ type: "stop_daemon" });
+    await bridge.runAction({ type: "stop_daemon", deckId: "deck-000000000000dec1" });
 
-    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon" } });
+    // Issue #1073: the deck goes through untouched — the crate resolves it.
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon", deckId: "deck-000000000000dec1" } });
     const listed = mapDesktopSnapshot({ ...snapshot, agents: [{ ...snapshot.agents[0], incarnation: "listed-process-a" }] }).agents[0];
     expect(listed.incarnation).toBe("listed-process-a");
     for (const action of [
@@ -946,7 +947,7 @@ describe("TauriDeckBridge", () => {
     invoke.mockResolvedValueOnce({ ok: true });
     invoke.mockResolvedValueOnce({ ok: true, agentId: 42 });
 
-    expect(await bridge.runAction({ type: "stop_daemon" })).not.toHaveProperty("agentId");
+    expect(await bridge.runAction({ type: "stop_daemon", deckId: "deck-000000000000dec1" })).not.toHaveProperty("agentId");
     expect(await bridge.runAction({ type: "start_agent", deckId: "deck-000000000000dec1" })).not.toHaveProperty("agentId");
     await bridge.dispose();
   });

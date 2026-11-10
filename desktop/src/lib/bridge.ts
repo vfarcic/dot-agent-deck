@@ -93,8 +93,10 @@ export interface DesktopSnapshotDto {
     deckId: string;
     /** `"local"` or `"remote"` — PRD #741 M7. Always present. */
     deckKind: string;
-    /** Why Stop and Replace are unavailable; present exactly for a remote deck. */
+    /** Why Replace is unavailable; present exactly for a remote deck. */
     localOnlyReason?: string;
+    /** Why Stop daemon cannot act on this deck while it answers (issue #1073). */
+    stopDaemonReason?: string;
     /** Why the app is on the local deck when the stored selection named another. */
     selectionFallback?: string;
     /**
@@ -1837,7 +1839,7 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
-  | { type: "stop_daemon"; force?: boolean }
+  | { type: "stop_daemon"; deckId: string; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
 
 /**
@@ -3004,6 +3006,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       daemonBuildVersion: dto.connection.daemonBuildVersion,
       deckKind: dto.connection.deckKind === "remote" ? "remote" : "local",
       localOnlyReason: dto.connection.localOnlyReason,
+      ...(dto.connection.stopDaemonReason === undefined ? {} : { stopDaemonReason: dto.connection.stopDaemonReason }),
       selectionFallback: dto.connection.selectionFallback,
       projectActionsReason: dto.connection.projectActionsReason,
       newAgentReason: dto.connection.newAgentReason,
@@ -5146,16 +5149,13 @@ export class TauriDeckBridge implements DeckBridge {
       } catch (cause) {
         throw actionErrorFrom(cause);
       }
-      if (action.type === "stop_daemon") {
-        this.sessions.clear();
-        this.sessionKeys.clear();
-        this.attached.clear();
-        this.terminalChannels.clear();
-        // Nothing is attached any more, so nothing is warm. `shown` is left
-        // alone on purpose: it mirrors what the UI is displaying, which a
-        // daemon stop does not change, and re-declaring it re-attaches.
-        this.warm.clear();
-        this.lifecycle += 1;
+      if (action.type === "stop_daemon" && result?.ok !== false) {
+        // Issue #1073: the stopped deck's sessions only — the crate detached
+        // exactly those, and every other deck's terminals belong to daemons
+        // this stop never touched. `shown` is left alone on purpose: it mirrors
+        // what the UI is displaying, which a daemon stop does not change, and
+        // re-declaring it re-attaches.
+        this.forgetDeckSessions(action.deckId);
       }
       // The crate already returned `agentId` for every agent-scoped action and
       // this dropped it, which left a started agent's id — the one thing the

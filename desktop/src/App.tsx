@@ -64,6 +64,7 @@ import { HookBinaryNotices } from "./components/HookBinaryNotice";
 import { ORCHESTRATION_TITLE_TAKEN, liveOrchestrationDirectories, liveOrchestrationTitles } from "./lib/newAgent";
 import { useAgentProfiles } from "./hooks/useAgentProfiles";
 import { useDeckRuntime } from "./hooks/useDeckRuntime";
+import { stopDaemonConfirmCopy, stopDaemonOffer } from "./lib/stopDaemon";
 import { useDaemonProjects } from "./hooks/useDaemonProjects";
 import { usePromptLibrary } from "./hooks/usePromptLibrary";
 import { useDesktopSettings, type DesktopSettingsState } from "./hooks/useDesktopSettings";
@@ -2043,7 +2044,9 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * report that a daemon had stopped gracefully.
    */
   const remoteDeck = snapshot.connection.deckKind === "remote";
-  const canControlDaemon = !remoteDeck && (snapshot.connection.status === "connected" || snapshot.connection.daemonDetected === true);
+  /* Issue #1073: Stop daemon reaches a remote deck too, over the wire stop, unless its daemon is too old for it. */
+  const stopOffer = stopDaemonOffer(snapshot.connection);
+  const canControlDaemon = stopOffer.offered && stopOffer.reason === undefined;
   /*
    * The connection banner's buttons, decided once so the buttons it renders and
    * the sentence that explains them (`incompatibleRemedy`) cannot disagree. An
@@ -2233,16 +2236,22 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
 
   const requestStop = () => {
     if (!selectedAgent) {
-      if (!canControlDaemon) return;
-      const liveAgents = snapshot.connection.runningAgentCount;
+      const deckId = snapshot.connection.deckId;
+      if (!canControlDaemon || deckId === undefined) return;
       setConfirm({
-        title: "Stop the local daemon?",
-        body: liveAgents && liveAgents > 0
-          ? `The daemon reports ${liveAgents} live agent${liveAgents === 1 ? "" : "s"}. This safe stop will be refused until those agents are closed individually.`
-          : "This stops the daemon running on this machine. No live agents are reported, so this only shuts down the daemon.",
+        ...stopDaemonConfirmCopy(snapshot.connection),
         label: "Stop daemon",
         busyLabel: "Stopping…",
-        action: async () => { await perform({ type: "stop_daemon" }, "Local daemon stopped."); },
+        action: async () => {
+          // The crate's own sentence: "stopped" only for a daemon it saw go, and
+          // "still shutting down" for one that accepted and had not gone yet.
+          try {
+            const result = await runtime.runAction({ type: "stop_daemon", deckId });
+            setNotice(result.message ?? "Daemon stopped.");
+          } catch (cause) {
+            setNotice(cause instanceof Error ? cause.message : String(cause));
+          }
+        },
       });
       return;
     }
@@ -2557,7 +2566,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               className="button danger compact"
               data-testid="stop-run"
               aria-label={selectedAgent ? `Close ${selectedAgent.role}` : "Stop daemon"}
-              title={selectedAgent ? `Close ${selectedAgent.role}` : canControlDaemon ? "Stop the local daemon" : snapshot.connection.localOnlyReason ?? "Daemon is not connected"}
+              title={selectedAgent ? `Close ${selectedAgent.role}` : canControlDaemon ? (remoteDeck ? `Stop the daemon on ${deckName(snapshot.connection)}` : "Stop the daemon on this machine") : stopOffer.offered ? stopOffer.reason : "Daemon is not connected"}
               disabled={!selectedAgent && !canControlDaemon}
               onClick={requestStop}
             ><CircleStop size={14} /><span>{selectedAgent ? "Close" : "Stop"}</span></button>
@@ -2591,7 +2600,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               `NoRemoteSocket` fallback leaves the app CONNECTED, so without this
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
-            */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Stop and Replace are absent on a remote deck, said once. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
+            */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Replace is absent on a remote deck, said once. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
             {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
