@@ -279,3 +279,124 @@ fn widget_004_every_screen_cell_is_drawn_in_its_own_column() {
         }
     }
 }
+
+/// Render `parser`'s screen through a `TerminalWidget` into a fresh buffer
+/// sized to `area`, keeping the parser so the next frame reads the same screen.
+fn render_shared(parser: &Arc<Mutex<vt100::Parser>>, area: Rect) -> Buffer {
+    let widget = TerminalWidget::new(parser.clone(), "pane".to_string(), false);
+    let mut buf = Buffer::empty(area);
+    widget.render(area, &mut buf);
+    buf
+}
+
+/// The bytes ratatui's `CrosstermBackend` writes to bring a terminal showing
+/// `prev` to `next`, through the same `Buffer::diff` the deck's frames use.
+fn emitted_bytes(prev: &Buffer, next: &Buffer) -> Vec<u8> {
+    use ratatui::backend::{Backend, CrosstermBackend};
+    let mut bytes = Vec::new();
+    {
+        let mut backend = CrosstermBackend::new(&mut bytes);
+        backend
+            .draw(prev.diff(next).into_iter())
+            .expect("drawing into a Vec cannot fail");
+        Backend::flush(&mut backend).expect("flushing a Vec cannot fail");
+    }
+    bytes
+}
+
+/// Every cell of a vt100 `display` as one line per row, with the colours and
+/// attributes a reader would see, so two displays compare cell for cell.
+fn display_dump(display: &vt100::Parser) -> String {
+    let (rows, cols) = dot_agent_deck::vt_grid::size(display.screen());
+    (0..rows)
+        .map(|row| {
+            let cells: Vec<String> = (0..cols)
+                .map(|col| {
+                    let cell = display.screen().cell(row, col).expect("in bounds");
+                    let contents = match cell.contents() {
+                        "" => " ",
+                        other => other,
+                    };
+                    format!(
+                        "{contents}{}{}{}{}{}",
+                        if cell.is_wide_continuation() { "~" } else { "" },
+                        if cell.inverse() { "!" } else { "" },
+                        if cell.underline() { "_" } else { "" },
+                        match cell.bgcolor() {
+                            vt100::Color::Default => String::new(),
+                            other => format!("bg{other:?}"),
+                        },
+                        match cell.fgcolor() {
+                            vt100::Color::Default => String::new(),
+                            other => format!("fg{other:?}"),
+                        },
+                    )
+                })
+                .collect();
+            format!("  [{row}] {}", cells.join("|"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Draw `before` on a pane, then rewrite the pane's screen as `after`, and
+/// return what a terminal shows after the incremental redraw and what it
+/// shows after a fresh render of the same second frame.
+fn incremental_and_fresh(before: &str, after: &str) -> (String, String) {
+    let area = Rect::new(0, 0, 18, 5);
+    let pane = Arc::new(Mutex::new(dot_agent_deck::vt_grid::parser(3, 16, 0)));
+    pane.lock().unwrap().process(before.as_bytes());
+    let first = render_shared(&pane, area);
+    let mut incremental = dot_agent_deck::vt_grid::parser(area.height, area.width, 0);
+    incremental.process(&emitted_bytes(&Buffer::empty(area), &first));
+
+    pane.lock()
+        .unwrap()
+        .process(format!("\x1b[0m\x1b[H\x1b[2J{after}").as_bytes());
+    let second = render_shared(&pane, area);
+    incremental.process(&emitted_bytes(&first, &second));
+    let mut fresh = dot_agent_deck::vt_grid::parser(area.height, area.width, 0);
+    fresh.process(&emitted_bytes(&Buffer::empty(area), &second));
+    (display_dump(&incremental), display_dump(&fresh))
+}
+
+/// Scenario: A pane shows `☀︎AB` (a sun in text presentation, one column), then its program rewrites the row as `☀️AB` (emoji presentation, two columns). Draw both frames through `TerminalWidget`, ratatui's buffer diff and its crossterm backend into a vt100 display. The display after the incremental redraw shows the same row as a fresh render of the second frame, with `A` and `B` right after the sun's two columns rather than shifted one column right.
+#[spec("render/widget/005")]
+#[test]
+fn widget_005_a_glyph_that_turns_wide_does_not_shift_the_rest_of_its_row() {
+    let (incremental, fresh) = incremental_and_fresh("☀\u{fe0e}AB", "☀\u{fe0f}AB");
+    assert_eq!(
+        incremental, fresh,
+        "after an incremental redraw the terminal shows what a fresh render shows\n\
+         incremental:\n{incremental}\nfresh:\n{fresh}"
+    );
+}
+
+/// Scenario: For each pair of pane contents — wide glyphs replaced by narrow text, a styled wide glyph replaced by narrow ones, a wide glyph replaced by a sequence whose width the screen and ratatui measure differently, and the sun turning narrow again — draw the first and then the second through `TerminalWidget`, ratatui's buffer diff and its crossterm backend into a vt100 display. Each incremental redraw shows what a fresh render of the second frame shows.
+#[spec("render/widget/005")]
+#[test]
+fn widget_005_every_width_transition_redraws_as_a_fresh_render_does() {
+    for (before, after) in [
+        ("你好AB", "xyAB"),
+        ("👩\u{200d}💻AB", "xyAB"),
+        ("☀\u{fe0f}AB", "xyAB"),
+        ("☀\u{fe0f}AB", "☀\u{fe0e}AB"),
+        ("你好AB", "☀\u{fe0f}AB"),
+        ("☀\u{fe0f}AB", "👩\u{200d}💻AB"),
+        ("👩\u{200d}💻AB", "☀\u{fe0f}AB"),
+        ("\u{1b}[4;7;44m☀\u{fe0f}AB", "x "),
+        ("\u{1b}[4;7;44m👩\u{200d}💻AB", "x "),
+        ("\u{1b}[4;7;44m你 ", "☀\u{fe0f} "),
+        ("\u{1b}[4;7;44m你", "ｶﾞ"),
+        ("\u{1b}[4;7;44m你", "⌚\u{fe0e}"),
+        ("\u{1b}[4;7;44m你", "🙂\u{fe0e}"),
+        ("\u{1b}[4;7;44m🙂\u{fe0e}", "x"),
+    ] {
+        let (incremental, fresh) = incremental_and_fresh(before, after);
+        assert_eq!(
+            incremental, fresh,
+            "{before:?} -> {after:?}: after an incremental redraw the terminal shows what a \
+             fresh render shows\nincremental:\n{incremental}\nfresh:\n{fresh}"
+        );
+    }
+}

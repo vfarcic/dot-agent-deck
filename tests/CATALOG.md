@@ -3896,6 +3896,13 @@ note).
 - **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag; colours.
 - **Platform coverage:** mac+linux+windows.
 
+##### render/widget/005 — A cell that changes width between two frames is redrawn where a fresh render draws it: a glyph turning wide (VS16) does not shift the rest of its row (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` → ratatui's `Buffer::diff` → `CrosstermBackend<Vec<u8>>` → a vt100 parser standing in for the host terminal, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** after drawing `☀︎AB` and then `☀️AB`, the display shows `A` and `B` in the two columns right after the sun's two, cell for cell (contents, wide continuation, inverse, underline, colours) the same as a fresh render of the second frame; the same holds for CJK, zero-width-joiner and VS16 glyphs replaced by narrow text, styled wide glyphs replaced by narrow ones (the trailing column's colour is cleared), `ｶﾞ` and `⌚︎`/`🙂︎` (widths the screen and ratatui measure differently), the sun turning narrow again, and wide-to-wide replacements.
+- **Does not assert:** how a real host terminal or font draws these sequences (the display is vt100's model); transitions in rows other than the first; scrolled-back screens.
+- **Platform coverage:** mac+linux+windows.
+
 #### render/layout
 
 ##### render/layout/001 — After a tab/layout switch with N panes the embedded pane's bottom rows show correct (non-stale) content — no off-by-one row shift.

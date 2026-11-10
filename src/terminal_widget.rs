@@ -371,7 +371,16 @@ impl Widget for TerminalWidget {
                 // selector, a text-presentation emoji), the screen's width is
                 // forced, so ratatui's diff skips the same columns after the
                 // cell as the screen does.
-                if symbol.cell_width() != width
+                //
+                // A two-column cell is forced even when ratatui measures it
+                // the same. Without it, ratatui's diff follows a glyph that
+                // carries VS16 (U+FE0F) with an update for its second column,
+                // and the crossterm backend prints that update without moving
+                // the cursor, so it lands one column past the glyph and
+                // every later cell on the row is drawn one column right
+                // (`render/widget/005`). A forced width makes the diff skip
+                // the second column, as it does for any other wide glyph.
+                if (width > 1 || symbol.cell_width() != width)
                     && let Some(forced) = NonZeroU16::new(width)
                 {
                     target.set_diff_option(CellDiffOption::ForcedWidth(forced));
