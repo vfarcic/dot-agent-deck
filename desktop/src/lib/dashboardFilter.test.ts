@@ -231,6 +231,16 @@ describe("Waiting is its own status, never Idle or Needs input (issue #1757)", (
     expect(ids(filter({ statuses: [status as DashboardFilter["statuses"][number]] }), fleet)).toEqual(expected);
   });
 
+  /// Scenario: say "show only busy agents", which reaches the dashboard as `status` = `busy`. Busy is every agent whose work is not done, so the Working and the Waiting agent stay and the Idle and Needs input agents go; the header names each status it covers.
+  it("reads a voice busy param as the busy statuses, Waiting included", () => {
+    const spoken = dashboardFilterFromParams([{ name: "status", value: "busy" }]);
+    expect(spoken.statuses).toEqual(["working", "thinking", "waiting"]);
+    expect(ids(spoken, fleet)).toEqual(["waiting", "working"]);
+    expect(buildDashboardFilterHeader(spoken, 2, 4).summary).toBe("Showing 2 of 4 agents · Working or Thinking or Waiting");
+    // An inherited property name is no status set.
+    expect(dashboardFilterFromParams([{ name: "status", value: "constructor" }]).statuses).toEqual([]);
+  });
+
   /// Scenario: say "show only the agents that are waiting", which reaches the dashboard as `status` = `waiting`. The voice filter shows the Waiting agent alone, and the header names it.
   it("agrees for a voice status param and names it in the header", () => {
     const spoken = dashboardFilterFromParams([{ name: "status", value: "waiting" }]);

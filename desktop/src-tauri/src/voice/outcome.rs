@@ -3664,14 +3664,19 @@ impl Heard {
     }
 
     fn phrase(&self, phrase: &str) -> bool {
-        let wanted = spoken_words(phrase);
+        self.sequence(&spoken_words(phrase))
+    }
+
+    /// Whether these words were heard, in order: one word by [`Self::word`]'s
+    /// rule, several as a run of consecutive words.
+    fn sequence(&self, wanted: &[String]) -> bool {
         match wanted.len() {
             0 => false,
             1 => self.word(&wanted[0]),
             width => self.words.windows(width).any(|window| {
                 window
                     .iter()
-                    .zip(&wanted)
+                    .zip(wanted)
                     .all(|(heard, wanted)| same_word(heard, wanted))
             }),
         }
@@ -5947,8 +5952,16 @@ const DASHBOARD_KINDS: [(&str, &str, &[&str]); 5] = [
 /// is not Needs input. The labels are the dashboard filter's, which say Needs
 /// input as the TUI's cards do (issue #1676). Issue #1757: "waiting" is the
 /// Waiting card's word, so it is Waiting's name and no longer Needs input's.
-const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 7] = [
-    ("working", "Working", &["working", "busy"]),
+///
+/// Issue #1757: "busy" is not one status but a set — every status
+/// [`STATE_WORDS`] calls busy that the filter offers (Compacting has no entry
+/// of its own and is filtered under Working's column). It travels as the id
+/// [`DASHBOARD_BUSY_STATUS`], which the frontend's `dashboardFilterFromParams`
+/// expands into those statuses, so "show only busy agents" keeps a Waiting
+/// agent: its work is not done.
+const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 8] = [
+    ("working", "Working", &["working"]),
+    (DASHBOARD_BUSY_STATUS, "Busy", &["busy"]),
     ("thinking", "Thinking", &["thinking"]),
     (
         "waiting_for_input",
@@ -5964,6 +5977,10 @@ const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 7] = [
         &["error", "errors", "errored", "failed", "failing"],
     ),
 ];
+
+/// Issue #1757: the dashboard status id that stands for the busy SET (see
+/// [`DASHBOARD_STATUSES`]).
+const DASHBOARD_BUSY_STATUS: &str = "busy";
 
 /// The agent types the dashboard filter offers, by the wire id the agents
 /// report ([`agent_type_spoken`] says how each is called).
@@ -6017,7 +6034,18 @@ fn facet_heard(kind: ParamKind, value: &str, transcript: &str, decks: &[VoiceDec
     };
     let names: Vec<String> = match kind {
         ParamKind::AgentKind => of_set(&DASHBOARD_KINDS),
-        ParamKind::AgentStatus => of_set(&DASHBOARD_STATUSES),
+        // Issue #1757: a status is heard in the transcript's STATE words, where
+        // "waiting for input" is the one word for Needs input
+        // ([`state_word_sequence`]). Read word by word, its first word would
+        // ground a resolver answer of Waiting, and "show agents waiting for
+        // input" would hide the very agents asked for; and "waiting" alone
+        // never grounds Needs input.
+        ParamKind::AgentStatus => {
+            let heard = Heard::from_words(state_word_sequence(transcript));
+            return of_set(&DASHBOARD_STATUSES)
+                .iter()
+                .any(|name| heard.sequence(&state_word_sequence(name)));
+        }
         ParamKind::AgentTypeRef => agent_type_spoken(value)
             .iter()
             .map(|name| (*name).to_string())
@@ -6796,6 +6824,124 @@ mod tests {
                     if action == "filter_dashboard"
                     && params.iter().any(|param| param.name == "status" && param.value == value)),
                 "{said:?} must select status {value:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario (issue #1757): ask to see only the busy agents. "Busy" is
+    /// every agent whose work is not done, Waiting included, so it selects the
+    /// busy status set (which the dashboard expands into Working, Thinking and
+    /// Waiting), not Working alone; and a model that narrows "busy" to
+    /// "working" is refused rather than allowed to hide the Waiting agents.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_busy_selects_the_busy_set() {
+        let fleet = vec![
+            role_agent_in_state("1", "tester", "working"),
+            role_agent_in_state("2", "coder", "waiting"),
+            role_agent_in_state("3", "reviewer", "idle"),
+        ];
+        let filter = |said: &'static str, answered: &'static str| {
+            let fleet = fleet.clone();
+            async move {
+                let resolver = StubResolver::new().answering(
+                    said,
+                    IntentAnswer::new("filter_dashboard").with_param("status", answered),
+                );
+                run(&resolver, Screen::Overview, &fleet, said).await
+            }
+        };
+        for said in ["show only busy agents", "show me the busy agents"] {
+            let outcome = filter(said, "busy").await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                    if action == "filter_dashboard"
+                    && params.iter().any(|param| param.name == "status" && param.value == "busy")),
+                "{said:?} must select the busy set, got {outcome:?}"
+            );
+        }
+        let outcome = filter("show only busy agents", "working").await;
+        assert!(
+            !matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.iter().any(|param| param.name == "status")),
+            "\"busy\" narrowed to Working must not filter by it: {outcome:?}"
+        );
+        // Working alone is still Working.
+        let outcome = filter("show only working agents", "working").await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                if params.iter().any(|param| param.name == "status" && param.value == "working")),
+            "{outcome:?}"
+        );
+    }
+
+    /// Scenario (issue #1757, audit): a wrong or hostile resolver crosses the
+    /// two waiting meanings. "Show agents waiting for input" answered as
+    /// Waiting, and "show waiting agents" answered as Needs input, are each
+    /// refused rather than filtering by a status the user did not ask for;
+    /// with another facet beside it, only the crossed status is dropped.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_refuses_a_crossed_waiting_meaning() {
+        for (said, answered) in [
+            ("show only agents waiting for input", "waiting"),
+            ("show agents waiting for input", "Waiting"),
+            (
+                "show only the agents that are waiting for input",
+                "waiting agents",
+            ),
+            ("show waiting agents", "waiting for input"),
+            ("show only the agents that are waiting", "needs input"),
+            ("show only the agents that are waiting", "waiting_for_input"),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("filter_dashboard").with_param("status", answered),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::ParamMissing { action, .. } if action == "filter_dashboard"),
+                "{said:?} answered as {answered:?} must be refused, got {outcome:?}"
+            );
+        }
+        let said = "show the codex agents waiting for input";
+        let resolver = StubResolver::new().answering(
+            said,
+            IntentAnswer::new("filter_dashboard")
+                .with_param("status", "waiting")
+                .with_param("agent_type", "codex"),
+        );
+        let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+        let VoiceOutcome::Dispatch {
+            params, sentence, ..
+        } = &outcome
+        else {
+            panic!("{outcome:?}");
+        };
+        assert_eq!(params.len(), 1, "{params:?}");
+        assert_eq!(params[0].value, "codex");
+        assert!(sentence.contains("not filtered by status"), "{sentence}");
+        // The intended readings still pass.
+        for (said, answered, value) in [
+            (
+                "show agents waiting for input",
+                "waiting for input",
+                "waiting_for_input",
+            ),
+            ("show waiting agents", "waiting", "waiting"),
+            (
+                "show only agents that are waiting or waiting for input",
+                "waiting",
+                "waiting",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("filter_dashboard").with_param("status", answered),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. }
+                    if params.iter().any(|param| param.name == "status" && param.value == value)),
+                "{said:?} answered as {answered:?} must select {value:?}, got {outcome:?}"
             );
         }
     }

@@ -145,13 +145,16 @@ fn wait_held_id(id: &str) -> Option<&str> {
 const MAX_TRACKED_SUBAGENT_ID_BYTES: usize = 256;
 
 /// Issue #1757: how long after a turn ends a command may first be sampled and
-/// still count as started in that turn ([`BackgroundWork::awaited`]). The
-/// shell-activity monitor samples every [`crate::daemon::POLL_INTERVAL`], so a
-/// command the agent started just before its turn ended can first be seen up
-/// to one interval after the `Idle` — and a slow sample (a loaded box) can push
-/// that toward a second. Two intervals cover both. A command first sampled
-/// later than this was not started in the turn that ended: it keeps today's
-/// Idle with the Background line.
+/// still be classified as started in that turn ([`BackgroundWork::awaited`]).
+/// This is a classification policy, not a measurement of when the process
+/// started: the shell-activity monitor samples every
+/// [`crate::daemon::POLL_INTERVAL`], so a command the agent started just before
+/// its turn ended is usually first seen up to one interval after the `Idle`,
+/// and two intervals leave room for one slow sample. A sample that fails or
+/// overruns by more than that can see a command started during the turn only
+/// later, and such a command is then classified as an earlier turn's: Idle
+/// with the Background line rather than Waiting — the conservative side, since
+/// it shows what the card showed before Waiting existed.
 const AWAITED_SAMPLE_GRACE_MS: i64 = 2 * crate::daemon::POLL_INTERVAL.as_millis() as i64;
 
 /// Issue #1678: the daemon's private record of one card's background work —
@@ -282,6 +285,7 @@ impl BackgroundTrack {
     fn note_genuine_event(&mut self, event: &AgentEvent, new_conversation: bool, now_ms: i64) {
         if new_conversation {
             self.subagents.clear();
+            self.start_conversation_clock(now_ms);
         }
         let subagent = event.metadata.get(crate::event::SUBAGENT_ID_METADATA_KEY);
         match event.event_type {
@@ -324,6 +328,22 @@ impl BackgroundTrack {
                 self.turn_ended = false;
             }
             _ => {}
+        }
+    }
+
+    /// Issue #1757: a new conversation started on this card (a `SessionStart`
+    /// under a new session id, with or without a `SessionEnd` before it), so its
+    /// turns start no earlier than `now_ms`. The sampled commands keep their
+    /// first-seen ages, so one the previous conversation left running reads as
+    /// an earlier turn's: Idle with the Background line, never Waiting. When the
+    /// previous turn had ended, the card stays "between turns" (its background
+    /// line stays up), but no turn of the new conversation has ended yet, so the
+    /// end stamp moves out of reach: nothing is awaited until a turn of the new
+    /// conversation starts and ends, which stamps both edges afresh.
+    fn start_conversation_clock(&mut self, now_ms: i64) {
+        self.turn_started_ms = now_ms;
+        if self.turn_ended {
+            self.turn_ended_ms = i64::MIN;
         }
     }
 
@@ -6681,7 +6701,21 @@ fn push_delivery_notice_carrier(session: &mut SessionState, notice: String) {
 /// by the activity watermark the other snapshot fields are weighed by: the
 /// aggregate can change (a command ending, a spawn retired) with no producer
 /// activity at all. Re-merging the copy the card already holds adds nothing.
+///
+/// Issue #1757: whichever copy wins, the card's status is then folded against
+/// it, because the two halves of a snapshot are ordered by different clocks. A
+/// kept card can refuse the snapshot's status (an equal activity stamp) yet take
+/// its newer aggregate — a retirement clears the aggregate without moving the
+/// activity watermark — and without this fold it would read Waiting with no
+/// background work, or Idle over an aggregate that awaits a command.
 fn merge_snapshot_background(session: &mut SessionState, snap: &SessionSnapshot) {
+    merge_snapshot_background_copy(session, snap);
+    let held = held_background(session).and_then(|(background, _)| background);
+    fold_waiting_status(session, held.as_ref());
+}
+
+/// The revision-ordered merge half of [`merge_snapshot_background`].
+fn merge_snapshot_background_copy(session: &mut SessionState, snap: &SessionSnapshot) {
     let Some(revision) = snap.background_revision else {
         return;
     };
@@ -20277,6 +20311,162 @@ mod tests {
             .pane_background_of(CLI_PANE)
             .expect("the carried-over command is still background work");
         assert_eq!((work.commands, awaited_of(Some(work))), (1, 0));
+    }
+
+    /// Scenario: A pane's turn starts a command and ends while it runs, so the card reads Waiting; then the agent starts a new conversation (a SessionStart under a new session id, with no SessionEnd) and that conversation's first report is an Idle with no prompt before it. The old conversation's command keeps its age but reads as an earlier turn's — Idle with the Background line, on the SessionStart and on the Idle — and a command started in a real turn of the new conversation makes the card Waiting again.
+    #[spec("status/waiting/014")]
+    #[test]
+    fn status_waiting_014_a_new_conversation_starts_a_new_turn_clock() {
+        // The record alone, at fixed times.
+        let report = |event_type: &str| -> AgentEvent {
+            serde_json::from_value(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        let sessions = |sids: &[i32]| -> HashSet<i32> { sids.iter().copied().collect() };
+        let mut track = BackgroundTrack::for_agent(Some(CLI_AGENT_ID.into()));
+        track.reports_turn_boundaries = true;
+        track.note_genuine_event(&report("thinking"), false, 100);
+        track.observe_commands(&sessions(&[11]), 150);
+        track.note_genuine_event(&report("idle"), false, 200);
+        assert_eq!(awaited_of(track.aggregate()), 1, "premise: Waiting");
+        // A new conversation starts within the sampling grace of that end, so
+        // only the reset (not the grace) can rule 11 out.
+        track.note_genuine_event(&report("session_start"), true, 300);
+        let work = track.aggregate().expect("the old command is still shown");
+        assert_eq!((work.commands, awaited_of(Some(work))), (1, 0));
+        assert_eq!(work.since_ms, Some(150), "the command keeps its age");
+        // A command first sampled before any turn of the new conversation has
+        // ended is not awaited either, however close to the SessionStart.
+        track.observe_commands(&sessions(&[11, 12]), 350);
+        track.note_genuine_event(&report("idle"), false, 400);
+        assert_eq!(
+            awaited_of(track.aggregate()),
+            0,
+            "an Idle with no turn before it ends no turn of the new conversation"
+        );
+        // A real turn of the new conversation stamps both edges afresh.
+        track.note_genuine_event(&report("thinking"), false, 500);
+        track.observe_commands(&sessions(&[11, 12, 13]), 550);
+        track.note_genuine_event(&report("idle"), false, 600);
+        assert_eq!(awaited_of(track.aggregate()), 1, "13 only");
+        // A new conversation in the middle of a turn moves its start too.
+        let mut mid = BackgroundTrack::for_agent(Some(CLI_AGENT_ID.into()));
+        mid.reports_turn_boundaries = true;
+        mid.note_genuine_event(&report("thinking"), false, 100);
+        mid.observe_commands(&sessions(&[21]), 150);
+        mid.note_genuine_event(&report("session_start"), true, 200);
+        mid.note_genuine_event(&report("idle"), false, 300);
+        assert_eq!(
+            awaited_of(mid.aggregate()),
+            0,
+            "21 predates the conversation"
+        );
+
+        // The daemon-owned card.
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        let frame = |event_type: &str, session_id: &str| {
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": session_id, "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(5));
+        state.apply_event(frame("session_start", "conversation-a"));
+        state.apply_event(frame("thinking", "conversation-a"));
+        tick();
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &[3001].into_iter().collect());
+        state.apply_event(frame("idle", "conversation-a"));
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(waiting_status_1757()),
+            "premise"
+        );
+
+        tick();
+        state.apply_event(frame("session_start", "conversation-b"));
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(SessionStatus::Idle),
+            "the new conversation's SessionStart must not fold back into Waiting"
+        );
+        tick();
+        state.apply_event(frame("idle", "conversation-b"));
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(SessionStatus::Idle),
+            "the old conversation's command is an earlier turn's"
+        );
+        let work = state
+            .pane_background_of(CLI_PANE)
+            .expect("the old command keeps its Background line");
+        assert_eq!((work.commands, awaited_of(Some(work))), (1, 0));
+
+        // A command genuinely started in the new conversation.
+        tick();
+        state.apply_event(frame("thinking", "conversation-b"));
+        tick();
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &[3001, 3002].into_iter().collect());
+        state.apply_event(frame("idle", "conversation-b"));
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(waiting_status_1757()));
+        let work = state.pane_background_of(CLI_PANE).expect("both commands");
+        assert_eq!((work.commands, awaited_of(Some(work))), (2, 1));
+    }
+
+    /// Scenario: A pane's turn runs from 1000 to 2000 ms and commands are first sampled at fixed times around it. A command first sampled exactly at the turn's start, or within the sampling grace after its end up to the last millisecond of it, is classified as this turn's and makes the aggregate await it; one first sampled a millisecond before the turn started, or a millisecond past the grace, is classified as an earlier turn's.
+    #[spec("status/waiting/015")]
+    #[test]
+    fn status_waiting_015_the_sampling_grace_boundary_at_fixed_times() {
+        let report = |event_type: &str| -> AgentEvent {
+            serde_json::from_value(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "claude_code", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        assert_eq!(
+            AWAITED_SAMPLE_GRACE_MS, 1_000,
+            "two 500 ms polls; the e2e tests' PAST_THE_TURN sits above it"
+        );
+        let awaited_when_first_sampled_at = |first_seen: i64| {
+            let mut track = BackgroundTrack::for_agent(Some(CLI_AGENT_ID.into()));
+            track.reports_turn_boundaries = true;
+            // An earlier turn, so the one below starts on an ended-turn edge.
+            track.note_genuine_event(&report("thinking"), false, 10);
+            track.note_genuine_event(&report("idle"), false, 20);
+            track.note_genuine_event(&report("thinking"), false, 1_000);
+            track.note_genuine_event(&report("idle"), false, 2_000);
+            track.observe_commands(&[7].into_iter().collect(), first_seen);
+            awaited_of(track.aggregate())
+        };
+        for (first_seen, want, what) in [
+            (999, 0, "a millisecond before the turn started"),
+            (1_000, 1, "at the turn's start"),
+            (1_500, 1, "inside the turn"),
+            (2_000, 1, "at the turn's end"),
+            (
+                2_000 + AWAITED_SAMPLE_GRACE_MS,
+                1,
+                "the last millisecond of grace",
+            ),
+            (
+                2_001 + AWAITED_SAMPLE_GRACE_MS,
+                0,
+                "a millisecond past the grace",
+            ),
+        ] {
+            assert_eq!(
+                awaited_when_first_sampled_at(first_seen),
+                want,
+                "first sampled at {first_seen} ms: {what}"
+            );
+        }
     }
 
     /// Issue #1757: a client card folded into Waiting the way a daemon

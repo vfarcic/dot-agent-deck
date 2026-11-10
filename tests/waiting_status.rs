@@ -315,3 +315,119 @@ fn status_waiting_005_public_readers_decide_waiting_by_d4() {
     working.apply_event(frame("thinking", Some((cleared(), 3))));
     assert!(!working.agent_doorbell_idle(AGENT, PANE), "control");
 }
+
+/// A [`frame`] stamped at `at` rather than now, so a test can match a
+/// snapshot's activity watermark to the card's exactly.
+fn frame_at(
+    event_type: &str,
+    background: Option<(Value, u64)>,
+    at: chrono::DateTime<chrono::Utc>,
+) -> AgentEvent {
+    let mut event = frame(event_type, background);
+    event.timestamp = at;
+    event
+}
+
+/// A hydration snapshot for [`PANE`]'s agent: `status`, the background copy
+/// at `revision`, and the activity watermark `at`.
+fn snapshot_at(
+    status: &str,
+    background: Value,
+    revision: u64,
+    at: chrono::DateTime<chrono::Utc>,
+) -> SessionSnapshot {
+    serde_json::from_value(json!({
+        "status": status, "agent_type": "claude_code", "tool_count": 0,
+        "background": background, "background_revision": revision,
+        "last_activity_ms": at.timestamp_millis(),
+    }))
+    .unwrap()
+}
+
+/// Scenario: A client already holds the pane's card when a hydration snapshot arrives whose activity stamp is no newer than the card's, so the card keeps its own status but takes the snapshot's newer background revision. A Waiting card given a newer cleared aggregate (a retirement, which moves no activity stamp) reads Idle with no background line, and an Idle card given a newer aggregate that awaits a command reads Waiting; a fresh card still hydrates Waiting.
+#[spec("status/waiting/013")]
+#[test]
+fn status_waiting_013_kept_card_hydration_folds_the_winning_aggregate() {
+    // Millisecond-exact, so the snapshot's stamp equals the card's.
+    let at = chrono::DateTime::from_timestamp_millis(chrono::Utc::now().timestamp_millis())
+        .expect("a valid instant");
+
+    // A kept Waiting card; the daemon then retired its spawn's background work
+    // and the snapshot reports Idle at the same activity watermark.
+    let mut tui = client();
+    tui.apply_event(frame_at("session_start", None, at));
+    tui.apply_event(frame_at("thinking", Some((cleared(), 1)), at));
+    tui.apply_event(frame_at("idle", Some((work(1, 1), 2)), at));
+    assert_eq!(card(&tui).status, SessionStatus::Waiting, "premise");
+    assert_eq!(card(&tui).last_activity, at, "premise: equal watermark");
+    let retired = snapshot_at("Idle", cleared(), 3, at);
+    tui.seed_hydrated_session(PANE.into(), None, None, Some(AGENT.into()), Some(&retired));
+    assert!(
+        card(&tui).background_work().is_none(),
+        "the newer cleared aggregate is taken"
+    );
+    assert_eq!(
+        card(&tui).status,
+        SessionStatus::Idle,
+        "a card with no background work must not stay Waiting"
+    );
+
+    // The same race with an OLDER snapshot stamp: the status is refused all the
+    // more, and the fold still follows the winning aggregate.
+    let mut tui = client();
+    tui.apply_event(frame_at("session_start", None, at));
+    tui.apply_event(frame_at("thinking", Some((cleared(), 1)), at));
+    tui.apply_event(frame_at("idle", Some((work(1, 1), 2)), at));
+    let older = at - chrono::Duration::seconds(5);
+    tui.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some(AGENT.into()),
+        Some(&snapshot_at("Idle", cleared(), 3, older)),
+    );
+    assert_eq!(card(&tui).status, SessionStatus::Idle, "older stamp");
+
+    // A kept Idle card whose snapshot carries a newer aggregate that awaits a
+    // command reads Waiting.
+    let mut tui = client();
+    tui.apply_event(frame_at("session_start", None, at));
+    tui.apply_event(frame_at("thinking", Some((cleared(), 1)), at));
+    tui.apply_event(frame_at("idle", Some((cleared(), 2)), at));
+    assert_eq!(card(&tui).status, SessionStatus::Idle, "premise");
+    tui.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some(AGENT.into()),
+        Some(&snapshot_at("Waiting", work(1, 1), 3, at)),
+    );
+    assert_eq!(
+        card(&tui).background_work().map(|w| w.awaited),
+        Some(1),
+        "the newer awaited aggregate is taken"
+    );
+    assert_eq!(card(&tui).status, SessionStatus::Waiting);
+
+    // An older snapshot revision changes neither the copy nor the status.
+    let mut tui = waiting_client();
+    tui.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some(AGENT.into()),
+        Some(&snapshot_at("Idle", cleared(), 1, older)),
+    );
+    assert_eq!(card(&tui).status, SessionStatus::Waiting, "older revision");
+
+    // Control: a fresh card still hydrates Waiting from a Waiting snapshot.
+    let mut fresh = client();
+    fresh.seed_hydrated_session(
+        PANE.into(),
+        None,
+        None,
+        Some(AGENT.into()),
+        Some(&snapshot_at("Waiting", work(1, 1), 5, at)),
+    );
+    assert_eq!(card(&fresh).status, SessionStatus::Waiting, "fresh card");
+}

@@ -13,13 +13,6 @@ use serde_json::json;
 use spec::spec;
 use std::time::Duration;
 
-/// Issue #1757: a command first sampled within the daemon's sampling grace
-/// after a turn ends (two shell-activity polls, 1 s) counts as started in that
-/// turn and reads Waiting (`status/waiting/007`). The tests here that are
-/// about a command left running from before keep today's Idle by starting it
-/// later than that.
-const PAST_THE_TURN: Duration = Duration::from_millis(1_500);
-
 /// Scenario: Send genuine-shaped Claude start/Stop hooks to a daemon-owned stand-in, then keep a real detached command alive. The card stays Idle with one background command, clears when it ends, and hides the aggregate during a new turn; a pane without hook reports retains legacy shell promotion.
 #[spec("status/background/001")]
 #[test]
@@ -27,7 +20,7 @@ fn background_001_reporting_turn_stays_idle_while_command_runs() {
     let f = Fixture::new(AgentType::ClaudeCode);
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
     f.hook("claude-code", "Stop", json!({}));
-    std::thread::sleep(PAST_THE_TURN);
+    f.wait_past_the_sampling_grace();
     f.command("one", true);
     f.wait_commands(1);
     assert_eq!(
@@ -330,7 +323,7 @@ fn background_006_monitor_count_edges_no_idle_spam_and_replacement() {
     let mut f = Fixture::new(AgentType::ClaudeCode);
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
     f.hook("claude-code", "Stop", json!({}));
-    std::thread::sleep(PAST_THE_TURN);
+    f.wait_past_the_sampling_grace();
     for (name, enabled, count) in [("one", true, 1), ("two", true, 2), ("two", false, 1)] {
         let before = f.events.snapshot().len();
         f.command(name, enabled);
@@ -519,7 +512,9 @@ fn status_waiting_007_card_waits_on_this_turns_command() {
         "UserPromptSubmit",
         json!({"prompt": "turn 2"}),
     );
+    let before = f.events.snapshot().len();
     f.command("one", true);
+    f.wait_sampled_in_turn(before);
     let ended = f.hook("claude-code", "Stop", json!({}));
     f.wait_commands(1);
     let live = f.live();
@@ -548,7 +543,9 @@ fn status_waiting_007_card_waits_on_this_turns_command() {
         "UserPromptSubmit",
         json!({"prompt": "turn 3"}),
     );
+    let before = f.events.snapshot().len();
     f.command("two", true);
+    f.wait_sampled_in_turn(before);
     f.hook("claude-code", "Stop", json!({}));
     f.wait_commands(1);
     assert_eq!(f.live()["status"], json!("Waiting"), "turn 3's own command");

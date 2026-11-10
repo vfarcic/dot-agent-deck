@@ -45,9 +45,10 @@ mod unix;
 mod windows;
 
 pub use scan::{
-    CLAUDE_BASH_TOOL_SHAPE, CommandLine, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo, ShellToolShape,
-    command_line_targets, descendant_shell_activity, descendants, detached_descendants,
-    fill_command_lines, qualifying_command_sessions, shell_tool_candidates,
+    CLAUDE_BASH_TOOL_SHAPE, CommandLine, MEASURED_AGENT_SERVER_SHAPES, MEASURED_SHELL_TOOL_SHAPES,
+    OPENCODE_SERVER_SHAPE, ProcessInfo, ShellToolShape, command_line_targets,
+    descendant_shell_activity, descendants, detached_descendants, fill_command_lines,
+    qualifying_command_sessions, qualifying_command_sessions_with_servers, shell_tool_candidates,
 };
 
 /// What a single-agent teardown learned about the direct child's exit.

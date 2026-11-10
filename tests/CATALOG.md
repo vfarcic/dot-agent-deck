@@ -1674,7 +1674,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### status/waiting/007 — An ended turn whose own command still runs reads Waiting on the attached card, then Idle when it exits; an earlier turn's command keeps Idle (issue #1757).
 - **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
 - **Agent:** none; daemon-owned Python parent with real detached Bash sessions and Claude-shaped hooks through the real hook CLI.
-- **Asserts:** a turn that starts a command and ends while it runs reads Waiting in the daemon's snapshot (`awaited` 1) and `● Waiting` with `Background: 1 command` on the rendered card; the command's exit returns it to Idle with no background line; a command started in one turn and still running when a later turn ends reads Idle with `Background: 1 command`.
+- **Asserts:** a turn that starts a command and ends while it runs reads Waiting in the daemon's snapshot (`awaited` 1) and `● Waiting` with `Background: 1 command` on the rendered card — each Stop sent only after the monitor's `ShellBusy` showed the daemon sampled the command during the live turn, so a slow start cannot push its first sample past the grace (that boundary is `status/waiting/015`); the command's exit returns it to Idle with no background line; a command started in one turn and still running when a later turn ends reads Idle with `Background: 1 command`.
 - **Does not assert:** a real agent, the desktop.
 - **Platform coverage:** mac+linux.
 
@@ -1691,7 +1691,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** real interactive OpenCode 2.x (the shell tool's `background` option exists only from 2) on the harness's cheap test model, spawned through Ctrl+N; skips on OpenCode 1.x.
 - **Asserts:** a directive prompt launches one background shell command (`ping -c 60 … && touch <unique sentinel>` in the fixture directory) and the turn ends; after OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not OpenCode starts a turn to report the finished command.
 - **Does not assert:** OpenCode 1.x, desktop.
-- **Known failure (OpenCode 2.2.5, 2026-11-10):** the card reads Waiting but with `Background: 2 commands` for the one command started. `opencode --standalone` runs its server, `opencode serve --stdio --port 0`, in a POSIX session of its own below the pane; OpenCode has no measured shell-tool shape, so the structural test counts that server as a background command, and because it is first sampled in the pane's first turn it counts as awaited too. The test prints every detached session below it at the Waiting check, which is how this was found.
+- **Found and fixed (OpenCode 2.2.5, 2026-11-10):** the card first read Waiting with `Background: 2 commands` for the one command started: `opencode --standalone` runs its server, `opencode serve --stdio --port 0`, in a POSIX session of its own below the pane, and the structural test counted it as a background command (and, first sampled in the pane's first turn, as awaited too). The scan now re-roots at that measured server on OpenCode panes (`status/waiting/016`); the test passes locally. It prints every detached session below it at the Waiting check, which is how the cause was found.
 - **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
 
 ##### status/waiting/010 — The bell does not ring on the step to Waiting, and rings on its later step to Idle (issue #1757).
@@ -1713,6 +1713,36 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Agent:** none; a Codex wrapper output frame (prompt hook unavailable) applied to a client card folded into Waiting.
 - **Asserts:** the output frame classified as Thinking moves the Waiting card to Thinking.
 - **Does not assert:** the wrapper's classification, the shell-activity monitor's own `Idle`-or-Waiting re-emit check (no seam below the running monitor).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/013 — A kept card folds Idle and Waiting against the background copy a hydration snapshot leaves it with (issue #1757).
+- **Layer:** L1 protocol/fold, fast tier (`waiting_status.rs`).
+- **Agent:** none; daemon-shaped broadcasts at a millisecond-exact instant, then hydration snapshots for the card the client already holds.
+- **Asserts:** a Waiting card given a snapshot whose activity stamp equals (and, separately, predates) the card's — so its Idle status is refused — but whose newer background revision is cleared reads Idle with no background line; an Idle card given a newer revision that awaits a command reads Waiting; an older snapshot revision changes neither; a fresh card still hydrates Waiting.
+- **Does not assert:** the daemon building the snapshot, the attach protocol carrying it, rendering.
+- **Verified load-bearing:** red with the fold after `merge_snapshot_background` removed.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/014 — A new conversation starts a new turn clock, so the old conversation's command reads as an earlier turn's (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; Claude-shaped reports and command samples fed to one pane's background record at fixed times, and to a daemon-owned `AppState` with an ownership stub.
+- **Asserts:** after a turn that ends with its own command running (Waiting), a `SessionStart` under a new session id with no `SessionEnd` reads Idle with the old command's Background line and age kept, and so does that conversation's Idle with no prompt before it, even within the sampling grace of the old turn's end; a command started in a real turn of the new conversation reads Waiting again (two commands, one awaited); a new conversation started mid-turn moves the turn's start too.
+- **Does not assert:** a `SessionEnd` (covered by `status/background/012`), the hook path (`status/background/002`).
+- **Verified load-bearing:** red with the reset on a new conversation removed.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/015 — The sampling grace is a fixed classification window around the turn (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; one pane's background record driven at fixed times.
+- **Asserts:** with a turn from 1000 to 2000 ms, a command first sampled at 1000, 1500, 2000 or exactly 1000 ms (two polls) after the end is awaited; one first sampled at 999 ms or a millisecond past the grace is not; the grace is 1000 ms, below the lane-1 tests' `PAST_THE_TURN`.
+- **Does not assert:** when a real process started (the window classifies first samples, not start times), the monitor's timing.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/016 — OpenCode 2's own server is never a background command, so it cannot make a card read Waiting (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process-table fixtures shaped as measured on OpenCode 2.2.5 (`opencode serve --stdio --port 0` in a session of its own below the client, the deck's inbox watcher in the server's session).
+- **Asserts:** with the OpenCode server shape the server and everything in its session yield no qualifying session (without it, the server's session counts, the defect `status/waiting/009` found); a backgrounded command below the server in a session of its own counts once; a `serve --stdio` a tool starts below the server counts; a server whose command line was not read, and a pane of another agent, keep today's count; OpenCode 1.x (no server) counts exactly as before.
+- **Does not assert:** the sampler reading the server's command line (`status/shell-activity/008` pins that session-boundary rows are read), the per-pane selection by agent type, a live OpenCode (`status/waiting/009`).
 - **Platform coverage:** mac+linux+windows.
 
 ### Agent protocol

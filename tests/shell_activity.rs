@@ -719,6 +719,130 @@ fn status_waiting_006_inbox_waiter_is_not_a_background_command() {
     );
 }
 
+/// Scenario: Classify an OpenCode 2 pane's process table, shaped as measured on OpenCode 2.2.5: the client on the pane, its private server `opencode serve --stdio --port 0` in a POSIX session of its own, and the deck's inbox watcher and the server's other children in the server's session. On an OpenCode pane none of that is a background command; a real backgrounded shell command below the server, in a session of its own, counts once; a server started by a tool, an unread server command line, a pane of another agent and OpenCode 1.x keep today's count.
+#[spec("status/waiting/016")]
+#[test]
+fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
+    use dot_agent_deck::platform::proc::{
+        MEASURED_AGENT_SERVER_SHAPES, OPENCODE_SERVER_SHAPE, qualifying_command_sessions,
+        qualifying_command_sessions_with_servers,
+    };
+    use std::collections::HashSet;
+
+    const CLIENT: i32 = 80100;
+    const SERVER: i32 = 80110;
+    const COMMAND_SID: i32 = 80120;
+    const TOOL_SERVER_SID: i32 = 80130;
+    assert_eq!(MEASURED_AGENT_SERVER_SHAPES, &[OPENCODE_SERVER_SHAPE]);
+    let servers = [OPENCODE_SERVER_SHAPE];
+    let row = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id: sid,
+        has_controlling_tty: pid == CLIENT,
+        session_leader: pid == sid,
+        command_line: argv.map_or(CommandLine::NotSampled, |argv| {
+            CommandLine::Read(argv.to_string())
+        }),
+    };
+    // What the sampler reads: a command line for each session-boundary row.
+    let standalone = || {
+        vec![
+            row(CLIENT, 1, CLIENT, None),
+            row(
+                SERVER,
+                CLIENT,
+                SERVER,
+                Some("/home/user/.opencode/bin/opencode serve --stdio --port 0"),
+            ),
+            // The server plugin's inbox watcher and another server child, in
+            // the server's own session.
+            row(80111, SERVER, SERVER, None),
+            row(80112, SERVER, SERVER, None),
+        ]
+    };
+
+    let table = standalone();
+    assert_eq!(
+        qualifying_command_sessions(&table, CLIENT, &[]),
+        Some(HashSet::from([SERVER])),
+        "premise: without the server shape the structural test counts the server"
+    );
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        Some(HashSet::new()),
+        "OpenCode's own server, and its session, are not a background command"
+    );
+
+    // A real backgrounded command: the shell tool's child of the server, in a
+    // session of its own, with its own child.
+    let mut table = standalone();
+    table.push(row(
+        80120,
+        SERVER,
+        COMMAND_SID,
+        Some("/bin/bash -c ping -c 60 127.0.0.1 && touch sentinel"),
+    ));
+    table.push(row(80121, 80120, COMMAND_SID, None));
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        Some(HashSet::from([COMMAND_SID])),
+        "the command below the server counts, once"
+    );
+
+    // A server a tool started below the agent's own is a command like any
+    // other: only the first server on a branch is the agent's.
+    table.push(row(
+        80130,
+        SERVER,
+        TOOL_SERVER_SID,
+        Some("opencode serve --stdio --port 0"),
+    ));
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        Some(HashSet::from([COMMAND_SID, TOOL_SERVER_SID])),
+        "a tool's own `serve --stdio` is not the agent's server"
+    );
+
+    // A server whose command line was not read is not recognised, so it
+    // counts as it did before rather than hiding what runs below it.
+    let mut table = standalone();
+    table[1].command_line = CommandLine::Unavailable;
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&table, CLIENT, &[], &servers),
+        Some(HashSet::from([SERVER])),
+    );
+
+    // A pane of another agent selects no server shape, so an `opencode serve
+    // --stdio` it runs is a command.
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&standalone(), CLIENT, &[], &[]),
+        Some(HashSet::from([SERVER])),
+    );
+
+    // OpenCode 1.x: no private server; the watcher stays in the agent's own
+    // session, and a backgrounded command in a session of its own counts.
+    let opencode_1 = vec![
+        row(CLIENT, 1, CLIENT, None),
+        row(80111, CLIENT, CLIENT, None),
+        row(
+            80140,
+            CLIENT,
+            80140,
+            Some("/bin/bash -c ping -c 60 127.0.0.1"),
+        ),
+    ];
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&opencode_1, CLIENT, &[], &servers),
+        Some(HashSet::from([80140])),
+        "OpenCode 1.x counts exactly as before"
+    );
+    assert_eq!(
+        qualifying_command_sessions_with_servers(&opencode_1, CLIENT, &[], &servers),
+        qualifying_command_sessions(&opencode_1, CLIENT, &[]),
+    );
+}
+
 /// Scenario: builds three pairs of fixture tables from the measured
 /// `getsid`/`ps` captures in `.dot-agent-deck/386-argv-notes.md` and the
 /// PRD — Table A (backbone plus the Bash-tool descendant), Table B (backbone

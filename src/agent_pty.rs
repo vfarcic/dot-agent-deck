@@ -3966,6 +3966,18 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
     }
 }
 
+/// Issue #1757: which entry of
+/// [`crate::platform::proc::MEASURED_AGENT_SERVER_SHAPES`], if any, applies to
+/// a pane running `agent_type` — only OpenCode's, the one measured. A pane of
+/// any other kind re-roots at no server, so nothing below it is hidden by a
+/// shape measured against another product.
+fn agent_server_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> {
+    match agent_type {
+        Some(AgentType::OpenCode) => Some(crate::platform::proc::OPENCODE_SERVER_SHAPE.agent),
+        _ => None,
+    }
+}
+
 /// One live pane a shell-activity sample could classify, resolved under the
 /// registry lock by [`AgentPtyRegistry::shell_activity_candidates`] and then
 /// classified without it by [`AgentPtyRegistry::classify_shell_activity`].
@@ -3992,6 +4004,11 @@ pub struct ShellActivityCandidate {
     /// Empty for every kind that has never been measured, which leaves the
     /// structural session-id test standing alone.
     pub shapes: Vec<crate::platform::proc::ShellToolShape>,
+    /// Issue #1757: the measured command lines of *this* pane's agent's own
+    /// server ([`crate::platform::proc::MEASURED_AGENT_SERVER_SHAPES`]), which
+    /// the scan re-roots at instead of counting as a background command. Empty
+    /// for every kind but OpenCode.
+    pub servers: Vec<crate::platform::proc::ShellToolShape>,
 }
 
 impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
@@ -18672,11 +18689,25 @@ impl AgentPtyRegistry {
                     .copied()
                     .filter(|shape| Some(shape.agent) == key)
                     .collect();
+                // Issue #1757: the type the spawn declared counts too, so the
+                // server is not counted before the agent's first report names it.
+                let server_key = agent_server_shape_key(
+                    agent
+                        .agent_type
+                        .as_ref()
+                        .or(agent.spawn_agent_type.as_ref()),
+                );
+                let servers = crate::platform::proc::MEASURED_AGENT_SERVER_SHAPES
+                    .iter()
+                    .copied()
+                    .filter(|shape| Some(shape.agent) == server_key)
+                    .collect();
                 Some(ShellActivityCandidate {
                     pane_id,
                     agent_id: agent_id.clone(),
                     shell_pid,
                     shapes,
+                    servers,
                 })
             })
             .collect()
@@ -18725,10 +18756,11 @@ impl AgentPtyRegistry {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let sessions = crate::platform::proc::qualifying_command_sessions(
+                let sessions = crate::platform::proc::qualifying_command_sessions_with_servers(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,
+                    &candidate.servers,
                 )?;
                 Some((candidate, sessions))
             })
