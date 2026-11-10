@@ -484,7 +484,10 @@ fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
             matches!(&record.tab_membership, Some(TabMembership::Orchestration { role_name, .. }) if role_name == role)
         })
     };
+    let first = record("coder").expect("first worker");
     let orchestrator = record("orchestrator").expect("orchestrator");
+    // Opened before the respawn: nothing is replayed.
+    let events = common::subscribe_events_on(deck.attach_socket_path());
     let output = std::process::Command::new(bin)
         .args([
             "delegate",
@@ -514,6 +517,17 @@ fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
     );
     let second_id = run_id_in("pi-reported.env").unwrap();
     let replacement = record("coder").expect("replacement worker");
+    // `agent-event` returns once its report is written, not once the daemon
+    // has applied it: close only after the replacement's last report has
+    // been broadcast, which is the stream telemetry reads, in order.
+    events.wait_for(
+        |e| {
+            e.pane_id == first.pane_id_env
+                && e.agent_id.as_deref() == Some(replacement.id.as_str())
+                && e.event_type == dot_agent_deck::event::EventType::Idle
+        },
+        Duration::from_secs(15),
+    );
     close(&deck, &replacement);
 
     let pane = replacement.pane_id_env.as_deref().unwrap();
