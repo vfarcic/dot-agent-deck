@@ -116,10 +116,11 @@ pub const NOT_CONFIRMED_MESSAGE: &str = "Clipboard write not confirmed yet";
 
 /// The status line for a copy, derived only from what [`deliver`] reports.
 ///
-/// It claims a copy only when the native write confirmed one. When the OSC 52
-/// sequence went out, it says so; with the native write unavailable or refused
-/// it points at the troubleshooting page, because whether that lands depends on
-/// the user's terminal. A native write that had not answered yet may still
+/// It claims a copy only when the native write confirmed one, and then says
+/// nothing about OSC 52. Without a confirmed native write, the message names
+/// OSC 52 when that sequence went out; with the native write unavailable or
+/// refused it also points at the troubleshooting page, because whether that
+/// lands depends on the user's terminal. A native write that had not answered yet may still
 /// land, so it is reported as pending, never as a copy and never as a
 /// failure. `None` (nothing to copy) yields no message at all.
 pub fn status_message(outcome: Option<CopyOutcome>) -> Option<&'static str> {
