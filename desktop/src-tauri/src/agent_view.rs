@@ -1177,6 +1177,7 @@ mod tests {
             commands,
             subagents,
             since_ms: Some(1_700_000_000_000),
+            awaited: 0,
         }
     }
 

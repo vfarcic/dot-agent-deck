@@ -805,6 +805,9 @@ pub fn is_busy(status: &SessionStatus) -> bool {
             | SessionStatus::Compacting
             | SessionStatus::WaitingForInput
             | SessionStatus::Blocked
+            // Issue #1757: its turn ended, but a command it started in that
+            // turn still runs — closing would kill that work.
+            | SessionStatus::Waiting
     )
 }
 
@@ -1316,6 +1319,7 @@ mod tests {
                 commands: 2,
                 subagents: 1,
                 since_ms: None,
+                awaited: 0,
             }),
             strands_orchestration: false,
         };

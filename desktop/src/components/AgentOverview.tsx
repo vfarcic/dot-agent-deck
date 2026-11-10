@@ -147,6 +147,7 @@ export function agentDomKey(agent: Pick<OverviewAgent, "daemonId" | "id">): stri
 const FIXTURE_DAEMON_STATUS: Partial<Record<AgentStatus, DesktopAgentDto["status"]>> = {
   running: "working",
   needs_input: "waiting_for_input",
+  waiting: "waiting",
   idle: "idle",
   failed: "error",
   blocked: "blocked",
@@ -362,7 +363,9 @@ function roleIndexOf(agent: OverviewAgent): number {
  * Statuses in the order an operator scans them: what needs attention first.
  * Idle comes after every state a person has to act on (issue #1676).
  */
-const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "idle", "queued", "passed", "stopped"];
+// Issue #1757: Waiting after the states a person acts on, before Idle — its
+// work is not done, but nothing needs the user.
+const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "waiting", "idle", "queued", "passed", "stopped"];
 
 export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
   return STATUS_ORDER

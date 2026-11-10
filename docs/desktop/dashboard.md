@@ -47,7 +47,7 @@ By default a row shows **Status**, **Agent**, **Uptime** and **Working directory
 To show only the agents you care about right now, use the filter at the top of the Dashboard:
 
 1. Type into **Filter agents** to show only agents whose name, orchestration role, orchestration, working directory or last prompt contains what you typed. Case does not matter.
-2. Press **Filter** to choose from four lists: **Kind** (orchestration roles, single agents, dispatchers, schedule agents or schedule: issues agents), **Status** (Working, Thinking, Needs input, Idle, Blocked, Error), **Agent type** (Claude Code, Codex, OpenCode, Pi, Devin) and **Daemon**. Tick as many entries as you like.
+2. Press **Filter** to choose from four lists: **Kind** (orchestration roles, single agents, dispatchers, schedule agents or schedule: issues agents), **Status** (Working, Thinking, Needs input, Waiting, Idle, Blocked, Error), **Agent type** (Claude Code, Codex, OpenCode, Pi, Devin) and **Daemon**. Tick as many entries as you like.
 
 Dispatchers, schedule agents and schedule: issues agents are the agents started with the **dispatcher**, **schedule** and **schedule: issues** modes of [New agent](new-agent.md), in the desktop app or the TUI. An agent started that way by an earlier release of the deck is listed under single agents.
 
@@ -63,13 +63,14 @@ The filter stays while you move between screens and lasts until you clear it or 
 
 ## Statuses
 
-The desktop app shows five statuses. Each covers one or more of the words the TUI shows on its cards:
+The desktop app shows six statuses. Each covers one or more of the words the TUI shows on its cards:
 
 | Desktop | TUI | Meaning |
 | --- | --- | --- |
 | **RUNNING** | Thinking, Working, Compacting | The agent is busy. An agent that has reported no status at all yet, for example a plain shell or an agent whose hooks are not installed, also shows **RUNNING**. |
 | **NEEDS INPUT** | Needs Input | The agent is waiting for you: a permission answer or other input. Answer it in its pane, or from the app or by voice when the deck knows the question; its row then shows `QUESTION` and how long it has waited, and the app sends one notification once it has waited 10 minutes ([When a question waits](../session-management.md#when-a-question-waits)). |
-| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands or subagents it left running keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
+| **WAITING** | Waiting | The agent's turn ended while a command it started in that turn is still running. Its mark is hollow, in **RUNNING**'s colour: its work is not finished, but nothing needs you. It turns **IDLE** when the command ends. Open its pane to see what is still running ([Work left running after a turn](../session-management.md#work-left-running-after-a-turn)). |
+| **IDLE** | Idle | The agent finished its turn and is waiting for its next prompt. Commands it left running from an earlier turn, and subagents it left running, keep it **IDLE**; open its pane to see what is still running. A status this build does not recognise, from a newer daemon, also shows **IDLE**, as it does in the TUI. |
 | **error** (counted under **FAILED**) | Error | Something went wrong, including a message the deck could not deliver. Read the notice and open the pane. |
 | **BLOCKED** | Blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. Open the agent's pane to see which limit, and when it resets if the provider says. |
 

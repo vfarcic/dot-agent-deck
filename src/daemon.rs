@@ -3880,7 +3880,7 @@ fn classify_owned(
 // measurement — including the 19-20s field sample this is a response to, and
 // what could NOT be reproduced — is in
 // `prds/386-descendant-scan-shell-activity-signal.md` (M5).
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // Issue #429: an upper bound on how long a tick WAITS for a sample —
 // deliberately not a bound on how long the sample's child may live (see
@@ -4421,9 +4421,12 @@ async fn run_shell_activity_monitor_with<S, F>(
                 // emit on every tick until the session materializes.
                 let regressed = busy
                     && card.is_some_and(|card| {
+                        // Issue #1757: Waiting reads like Idle here — its
+                        // prompt is free.
                         matches!(
                             card.status,
                             crate::state::SessionStatus::Idle
+                                | crate::state::SessionStatus::Waiting
                                 | crate::state::SessionStatus::Unknown
                         )
                     });

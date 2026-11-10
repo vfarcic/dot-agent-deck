@@ -2399,6 +2399,9 @@ const DAEMON_STATUS: Record<string, AgentStatus> = {
   working: "running",
   compacting: "running",
   waiting_for_input: "needs_input",
+  // Issue #1757: its own column, never Needs input's — the daemon's `waiting`
+  // is an agent whose turn ended while a command it started still runs.
+  waiting: "waiting",
   idle: "idle",
   error: "failed",
   // Issue #714: a distinct state, not `failed` — the agent is alive and its
@@ -2968,7 +2971,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // Issue #714: a quota-blocked agent keeps its own node state, as it does on
     // its tile, rather than falling through to `queued` — it is alive, it is
     // not waiting its turn, and a person has to act on it.
-    status: agent.status === "running" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
+    // Issue #1757: a Waiting agent's work is still under way, so its node is active.
+    status: agent.status === "running" || agent.status === "waiting" ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
     // No attempt: it was read straight off the hardcoded per-agent one, so
     // every live node claimed a retry count no daemon tracks (PRD #745 M8).
     enabled: true,

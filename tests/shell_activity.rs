@@ -654,6 +654,71 @@ fn background_005_scan_deduplicates_qualifying_sessions_and_reroots() {
     );
 }
 
+/// Scenario: Classify a Claude pane's process table that holds the deck's own inbox waiter — `sh -c '<deck>' inbox wait --agent claude-code` and the deck process under it — in a session of its own, and an OpenCode-style watcher left in the agent's session. Neither is a background command, so neither can make a card read Waiting; a real Bash-tool command beside the waiter still counts.
+#[spec("status/waiting/006")]
+#[test]
+fn status_waiting_006_inbox_waiter_is_not_a_background_command() {
+    use dot_agent_deck::platform::proc::qualifying_command_sessions;
+    use std::collections::HashSet;
+
+    const WAITER_SID: i32 = 70118;
+    let shape = dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
+    let waiter = |sid: i32| {
+        vec![
+            // Claude Code runs a hook as `sh -c <command>`.
+            ProcessInfo {
+                pid: 70120,
+                ppid: AGENT_PID,
+                session_id: sid,
+                has_controlling_tty: false,
+                session_leader: sid != AGENT_SID,
+                command_line: CommandLine::Read(
+                    "/bin/sh -c '/home/user/.local/bin/dot-agent-deck' inbox wait --agent claude-code"
+                        .to_string(),
+                ),
+            },
+            ProcessInfo {
+                pid: 70121,
+                ppid: 70120,
+                session_id: sid,
+                has_controlling_tty: false,
+                session_leader: false,
+                command_line: CommandLine::Read(
+                    "/home/user/.local/bin/dot-agent-deck inbox wait --agent claude-code"
+                        .to_string(),
+                ),
+            },
+        ]
+    };
+
+    // A Claude pane, the waiter in a session of its own: the argv cross-check
+    // refuses it.
+    let mut table = backbone_rows(false);
+    table.extend(waiter(WAITER_SID));
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::new()),
+        "the deck's own waiter is not a background command"
+    );
+    // Control: a real Bash-tool command beside it still counts, alone.
+    table.push(bash_tool_descendant_row());
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID])),
+        "the waiter must not hide or join a real command"
+    );
+
+    // An agent with no measured shape (OpenCode, Pi): its watcher stays in the
+    // agent's own session, so the structural test alone refuses it.
+    let mut table = backbone_rows(false);
+    table.extend(waiter(AGENT_SID));
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[]),
+        Some(HashSet::new()),
+        "a watcher in the agent's own session is not a background command"
+    );
+}
+
 /// Scenario: builds three pairs of fixture tables from the measured
 /// `getsid`/`ps` captures in `.dot-agent-deck/386-argv-notes.md` and the
 /// PRD — Table A (backbone plus the Bash-tool descendant), Table B (backbone

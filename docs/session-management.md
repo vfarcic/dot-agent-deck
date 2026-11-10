@@ -20,12 +20,13 @@ The daemon sets each agent's status from the events its hooks report (see [Insta
 | **Working** | `Working` | running | The agent is running a tool; the card shows which. | Nothing. |
 | **Compacting** | `Compacting` | running | The agent is compressing its context window. | Nothing. |
 | **Needs Input** | `WaitingForInput` | needs input | The agent is waiting for a permission answer, a choice from a menu, or other input. | Answer it in the pane. In the desktop app you can also [answer it by voice](desktop/voice.md#answering-an-agents-question). In the TUI's command mode, `y` / `n` on the selected card types `y` or `n` into the pane: Codex takes that as approve / deny, while Claude Code and OpenCode ignore it. |
-| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. Work it left running is shown beside it; see [Work left running after a turn](#work-left-running-after-a-turn). | Give it the next prompt. |
+| **Idle** | `Idle` | idle | The agent finished its turn and is waiting for a prompt. Work it left running from an earlier turn, or subagents it left running, are shown beside it; see [Work left running after a turn](#work-left-running-after-a-turn). | Give it the next prompt. |
+| **Waiting** | `Waiting` | waiting | The agent's turn ended while a command it started in that turn is still running, such as a build or a server it ran in the background. Its work is not finished, but nothing needs you. The `Background:` line under it says what is running; see [Work left running after a turn](#work-left-running-after-a-turn). | Nothing: it turns **Idle** when the command ends. You can still give it a prompt. |
 | **Error** | `Error` | error | The agent reported a failure, or a deck message could not be delivered. Provider failures include an API error or a model the account cannot use. | Read the pane and any `not delivered: …` notice. |
 | **Blocked** | `Blocked` | blocked | The agent's provider refused it because a usage limit or credit pool is exhausted. | Wait for the limit to reset, switch account or provider, or add credit. See [Blocked](#blocked). |
 | **No agent** | — | — | The pane is not running an agent the deck recognises (for example a plain shell), or the agent has not reported yet. | If it is an agent, see [Troubleshooting → Hooks](troubleshooting.md#hooks). |
 
-A newer daemon can report a status this build does not know; both the TUI and the desktop app show it as **Idle**.
+A newer daemon can report a status this build does not know; both the TUI and the desktop app show it as **Idle**. That is how an older TUI or desktop app shows **Waiting**: as **Idle**, with the `Background:` line under it.
 
 ### Which agents report which status
 
@@ -73,7 +74,7 @@ Limits:
 
 ### Work left running after a turn
 
-An agent can end its turn and leave something running: a command it started in the background (a dev server, a long build, a `sleep`), or a subagent that keeps working after the main agent has answered. The card then reads **Idle**, because the agent is waiting for its next prompt, and a line under it says what is still running and for how long:
+An agent can end its turn and leave something running: a command it started in the background (a dev server, a long build, a `sleep`), or a subagent that keeps working after the main agent has answered. A line under the card's status then says what is still running and for how long:
 
 ```
 Background: 2 commands, 1 subagent · 3h 12m
@@ -84,6 +85,23 @@ Background: 2 commands, 1 subagent · 3h 12m
 - If the deck cannot tell how long something has been running, the line shows the counts without a time.
 - In the TUI the line is on the card, under `Dir:`. In the desktop app it is in the agent's pane, under the agent's command and model, and on its tile on the Daemons screen, in the same words. The Dashboard row shows the status only.
 
+What the status reads depends on when the agent started the command:
+
+- **Waiting**, when a command it started in the turn that just ended is still running. The agent has handed that work off and its result is still to come, so the card does not read **Idle** yet. It turns **Idle** when those commands end.
+- **Idle**, when everything still running was started in an earlier turn, or only subagents are still running.
+
+So a command keeps a card on **Waiting** only until the agent's next turn ends. For example:
+
+- A dev server the agent started in the background reads **Waiting** until it exits or the agent finishes another turn. If you do not want that, ask the agent to stop the server, or send it any prompt.
+- If you send the agent a prompt while a command from its last turn is still running, and that turn ends with the command still running, the card reads **Idle** with the `Background:` line.
+
+While a card reads **Waiting**:
+
+- The agent can take a prompt or a message, as an **Idle** one can; sending one starts its next turn as usual.
+- In the TUI its status dot does not blink and the terminal bell does not ring, because its work is not finished. The dot starts blinking when it turns **Idle**, and the bell rings then if you have the idle bell on ([Configuration](configuration.md#turn-the-tuis-terminal-bell-on-or-off)). The stats bar counts it as `waiting`.
+- Closing the agent with `dot-agent-deck close` is refused as busy unless you add `--force`, as it is for any card with work still running.
+- In the desktop app its mark is hollow, in the colour of **running**, and the Dashboard's status filter offers **Waiting**.
+
 A command that has been running for hours is easy to spot this way. To stop it, open the agent's pane and ask the agent to stop it, or stop it yourself in the pane.
 
 What each agent reports:
@@ -92,12 +110,15 @@ What each agent reports:
 |---|---|---|---|---|---|
 | Background commands | Yes | Yes | Yes | Yes | Yes |
 | Background subagents | Yes | Yes | Yes | No | No |
+| **Waiting** while a command it started in its last turn runs | Yes | Yes | Yes | Yes | Yes |
 
-- On Windows, background commands are not counted for any agent; subagents still are.
+- On Windows, background commands are not counted for any agent; subagents still are. So no card reads **Waiting** on Windows.
+- **Waiting** says only that the agent started the command in that turn and that it is still running, not that the agent will pick up its result by itself when it ends.
 - An OpenCode subagent counts while its session is working, and stops counting when that session finishes, fails or is deleted.
 - The deck's Pi extension and Devin hooks do not report subagents, so a Pi or Devin card counts commands only.
 - Until an agent has reported a status of its own, a command it runs can still turn its card **Working**, and no `Background:` line appears.
 - A TUI or desktop app older than the daemon does not show the line and can show such a card as **Working**. With a daemon older than the app, cards behave the same way: a command left running turns the card **Working**, with no `Background:` line.
+- A TUI or desktop app that shows the `Background:` line but not **Waiting** shows a **Waiting** card as **Idle** with the line. With a daemon that does not report **Waiting**, a newer app shows such a card as **Idle** with the line too.
 
 ### Blocked
 

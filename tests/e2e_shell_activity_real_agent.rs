@@ -138,7 +138,7 @@ fn background_live_fixture(suffix: &str) -> (TuiDeck, common::EventSub, String) 
     (deck, events, id)
 }
 
-/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then ask for one Bash run_in_background ping writing a unique sentinel. After its native Stop the rendered card stays Idle with one background command; kill only that command found in this test's descendant tree and watch the indicator disappear.
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then ask for one Bash run_in_background ping writing a unique sentinel. After its native Stop the rendered card reads Waiting (issue #1757: the command was started in the turn that just ended) with one background command; kill only that command found in this test's descendant tree and watch the card return to Idle with the indicator gone.
 #[spec("status/background/007")]
 #[test]
 fn background_007_real_background_command_clears_after_scoped_kill() {
@@ -179,11 +179,14 @@ fn background_007_real_background_command_clears_after_scoped_kill() {
     );
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
+    // Issue #1757: the turn that started the command ended while it runs, so
+    // the card reads Waiting rather than Idle.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid
+            .contains("Waiting")
             && grid.contains("Background: 1 command")
             && !grid.contains("Working")),
-        "ended turn and live command must both be visible:\n{}",
+        "ended turn and live command must both be visible as Waiting:\n{}",
         deck.snapshot_grid()
     );
 
@@ -221,8 +224,9 @@ fn background_007_real_background_command_clears_after_scoped_kill() {
     dot_agent_deck::platform::proc::force_kill_pid(ping as u32).expect("kill this test's own ping");
     assert!(
         deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid.contains("Idle")
+            && !grid.contains("Waiting")
             && !grid.contains("Background:")),
-        "indicator did not clear after command ended:\n{}",
+        "indicator did not clear, or the card stayed Waiting, after command ended:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -309,8 +313,13 @@ fn background_008_real_background_subagent_clears_on_paired_stop() {
     }
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
+    // Issue #1757: the subagent's own commands are counted as background
+    // commands too, and one first sampled before the main turn ended (or just
+    // after it) was started in that turn, so the card may read Waiting.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| (grid
+            .contains("Idle")
+            || grid.contains("Waiting"))
             && grid
                 .lines()
                 .any(|line| line.contains("Background:") && line.contains("1 subagent"))
@@ -572,7 +581,7 @@ const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
 /// unreasonably long wait.
 const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then direct it to make one default-settings Bash call running a sentinel-tagged ping and finish its turn immediately when Bash returns. Require its real Stop-mapped Idle hook after the 120-second cap (PRECONDITION NOT MET if absent), then assert the rendered badge reads Idle with Background: 1 command while the sentinel-tagged shell and its ping remain live.
+/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then direct it to make one default-settings Bash call running a sentinel-tagged ping and finish its turn immediately when Bash returns. Require its real Stop-mapped Idle hook after the 120-second cap (PRECONDITION NOT MET if absent), then assert the rendered badge reads Waiting (issue #1757: the turn that started the ping is the one that ended) with Background: 1 command while the sentinel-tagged shell and its ping remain live.
 #[spec("status/shell-activity/006")]
 #[test]
 fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background() {
@@ -740,11 +749,14 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
     deck.wait_for_string("Dir:");
 
     // The turn ended, while its command is still alive: both facts must be
-    // presented together rather than conflated into a Working badge.
+    // presented together rather than conflated into a Working badge. Issue
+    // #1757: the ping was started in the turn that ended, so the card reads
+    // Waiting, not Idle.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid
+            .contains("Waiting")
             && grid.contains("Background: 1 command")),
-        "after the real Stop the card must read Idle with Background: 1 command:\n{}",
+        "after the real Stop the card must read Waiting with Background: 1 command:\n{}",
         deck.snapshot_grid()
     );
     assert!(

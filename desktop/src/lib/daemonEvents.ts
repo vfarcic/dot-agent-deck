@@ -63,7 +63,9 @@ const EVENT_TITLES: Record<string, string> = {
   compacting: "Compacting context",
   subagent_start: "Subagent started",
   subagent_stop: "Subagent finished",
-  waiting_for_input: "Waiting for input",
+  // Issue #1757: the card's words for this state, so "Waiting" on screen
+  // means only the Waiting status.
+  waiting_for_input: "Needs input",
   permission_request: "Permission requested",
   idle: "Idle",
   error: "Agent reported an error",

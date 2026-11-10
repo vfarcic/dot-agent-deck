@@ -1441,10 +1441,10 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the falling edge (`ShellIdle` once the command completes — that is `004`'s job against a stand-in, not repeated here against a real agent), the >120s-cap user-visible badge scenario (`status/shell-activity/006`, M6b), or no-false-positive-at-idle (`status/shell-activity/007`, M6c). The soft sentinel-content check on the model's final reply is logged, not gating — matching the model's free-text reply is more phrasing-sensitive than the two typed events the test actually gates on.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
-##### status/shell-activity/006 — After a real interactive Haiku Claude agent's Bash call crosses the 120s cap and its native Stop arrives, the rendered badge reads Idle with Background: 1 command while the ping is still running (#1678). [reel]
+##### status/shell-activity/006 — After a real interactive Haiku Claude agent's Bash call crosses the 120s cap and its native Stop arrives, the rendered badge reads Waiting with Background: 1 command while the ping is still running (#1678, #1757). [reel]
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
 - **Agent:** a real interactive `claude --model claude-haiku-4-5-20251001 --allowedTools Bash` pane, spawned through the normal Ctrl+N new-pane flow with per-folder trust pre-seeded, exactly as a user would drive it.
-- **Asserts:** a directive prompt asks for one real Bash call running ping -c 200 against a unique sentinel with default settings, followed immediately by the end of the main turn without polling or inspecting the command. After ToolStart the test requires the real native Stop-mapped Idle event within 157 seconds and at least 120 seconds after ToolStart; absent hooks fail explicitly with PRECONDITION NOT MET and include the final pane for diagnosis. Once Stop arrives, the rendered card reads Idle with Background: 1 command and never Working. A process walk from this test's own pid independently confirms the sentinel-tagged tool shell and its ping are still live.
+- **Asserts:** a directive prompt asks for one real Bash call running ping -c 200 against a unique sentinel with default settings, followed immediately by the end of the main turn without polling or inspecting the command. After ToolStart the test requires the real native Stop-mapped Idle event within 157 seconds and at least 120 seconds after ToolStart; absent hooks fail explicitly with PRECONDITION NOT MET and include the final pane for diagnosis. Once Stop arrives, the rendered card reads Waiting (issue #1757: the ping was started in the turn that ended) with Background: 1 command and never Working. A process walk from this test's own pid independently confirms the sentinel-tagged tool shell and its ping are still live.
 - **Does not assert:** anything about the discriminator's internals (`descendant_shell_activity`, `003`) or the pane primitive in isolation (`004`) — this test observes the full pipeline's user-visible output. Does not assert the eventual falling edge once the 200s ping finishes. A `PRECONDITION NOT MET` panic is a setup failure requiring diagnosis; it asserts nothing about the rendered `Working`/`Idle` badge.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
@@ -1537,16 +1537,16 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Asserts:** subscribers receive count changes 1→2→1 despite unchanged busy=true; Idle+busy produces no repeated identical shell event for three seconds; replacing the spawn in the same pane cannot give its successor the old command aggregate or restamp observations with its identity.
 - **Does not assert:** a deterministically paused scan crossing replacement (there is no exposed deferred-sampler seam); real agent subprocess lifetime (007); desktop.
 
-##### status/background/007 — Real interactive Haiku background Bash work stays visible after Stop and clears on scoped kill (#1678). [reel]
+##### status/background/007 — Real interactive Haiku background Bash work reads Waiting after Stop and clears to Idle on scoped kill (#1678, #1757). [reel]
 - **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
 - **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
-- **Asserts:** directive prompt launches run_in_background Bash writing a unique sentinel; native Stop arrives; rendered card reads Idle and Background: 1 command; a live ping is located via a process walk from this test's own pid and killed by exact pid; the indicator disappears while Idle remains.
+- **Asserts:** directive prompt launches run_in_background Bash writing a unique sentinel; native Stop arrives; rendered card reads Waiting (issue #1757: the command was started in the turn that ended) and Background: 1 command; a live ping is located via a process walk from this test's own pid and killed by exact pid; the indicator disappears and the card reads Idle.
 - **Does not assert:** capped default-timeout behavior (status/shell-activity/006), subagents (008), desktop.
 
 ##### status/background/008 — Real interactive Haiku subagent work stays visible after the main Stop and clears on its paired stop (#1678).
 - **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
 - **Agent:** real interactive Claude Haiku plus one real Haiku subagent, onboarding/trust seeded and allowedTools Bash Agent.
-- **Asserts:** one background Agent receives three exact slow Bash commands writing unique start/completion sentinels at absolute paths in the fixture directory (the start timeout reports observed Bash hook commands and cwd); after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
+- **Asserts:** one background Agent receives three exact slow Bash commands writing unique start/completion sentinels at absolute paths in the fixture directory (the start timeout reports observed Bash hook commands and cwd); after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist, and a subagent command first sampled within the main turn makes it read Waiting instead, issue #1757); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
 - **Does not assert:** exact Claude transcript phrasing, desktop, other agent integrations.
 
 ##### status/background/009 — A shell-activity sample that answers after its spawn was replaced touches neither the successor's card nor the broadcast (#1678).
@@ -1626,6 +1626,78 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Verified load-bearing:** red with the snapshot overlay of `subagent_wait` disabled.
 - **Does not assert:** the attach protocol carrying the snapshot (`ListAgents` / `AgentRecord.live`, covered by the rehydration tests); the rendered badge.
 - **Platform coverage:** mac+linux.
+
+#### status/waiting
+
+##### status/waiting/001 — Only a command started in the turn that just ended counts as awaited, and that card reads Waiting (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; Claude-shaped turn reports and command samples fed to one pane's background record at fixed times, and to a daemon-owned `AppState` with an ownership stub.
+- **Asserts:** in a pane's first turn every sampled command counts; a command first sampled during an earlier turn does not; a command first sampled after Stop but at or after the turn's start does; only an ended turn followed by a new one moves the turn's start (a tool call inside the turn, a repeated Idle and a subagent's events do not); a subagent alone is never awaited. The daemon's card reads Waiting with `awaited` 1, returns to Idle when a sample shows the command gone, moves to Thinking on a new turn, and reads Idle with its background line when the command is carried over into a later turn's end.
+- **Does not assert:** the shell-activity monitor's sampling (`status/background/006`), a client's fold (002), rendering (004).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/002 — A client folds Idle plus an awaited command into Waiting, and back to Idle when a newer aggregate clears it (issue #1757).
+- **Layer:** L1 protocol/fold, fast tier (`waiting_status.rs`).
+- **Agent:** none; daemon-shaped broadcasts and a serialized snapshot applied to a fresh client `AppState`.
+- **Asserts:** Idle carrying `awaited` 1 reads Waiting; a repeated Idle without an aggregate keeps it; a newer empty aggregate returns it to Idle and an older replay cannot bring Waiting back; an aggregate counting the command with `awaited` 0 reads Idle with the background line; Thinking and a tool call move a Waiting card as they move an Idle one; a card hydrated from a Waiting snapshot reads Waiting and clears like a live one.
+- **Does not assert:** how the daemon decides `awaited` (001), rendering (004), the desktop.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/003 — Waiting and `awaited` keep the wire compatible in both directions (issue #1757).
+- **Layer:** L1 unit, fast tier (`waiting_status.rs`).
+- **Agent:** none.
+- **Asserts:** Waiting serializes as the bare string `"Waiting"`; a reader that predates it decodes the whole snapshot with the status as Unknown and keeps the background counts; an aggregate without `awaited` decodes to 0 and a client reading it shows Idle with the background line; `awaited` 0 is omitted, so that wire is byte-for-byte the older shape.
+- **Does not assert:** a full mixed-version daemon connection (CLAUDE.md rule 12's cross-version run).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/004 — The TUI card shows Waiting in its own colour above the background line, at Normal and Minimal density (issue #1757).
+- **Layer:** L1 widget, fixed-clock insta snapshot (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Waiting card rendered through the production card seam.
+- **Asserts:** the top border reads `● Waiting` in a colour that is not Idle's, Working's or Needs Input's; `Background: 1 command · 5m` sits beneath it; at Minimal the one content row is that background line (snapshots `status_waiting_004_normal_card`, `status_waiting_004_minimal_card`).
+- **Does not assert:** the live fold (002), Compact density, the desktop tile.
+- **Platform coverage:** mac+linux.
+
+##### status/waiting/005 — Every reader of busy-versus-idle decides Waiting by one rule: its prompt is free, but its work is not done (issue #1757).
+- **Layer:** L1 unit (`waiting_status.rs`, `render_dashboard.rs`, `src/doorbell.rs`, `src/daemon_status.rs`; fast tier).
+- **Agent:** none.
+- **Asserts:** the bell never rings for Waiting, even with every switch on; its card's status dot does not blink where an Idle card's does; the close refusal counts it as busy; it has its own colour and ranks between the working states and Idle; telemetry publishes `awaiting_command` while Needs input keeps `waiting`; `daemon status` prints and publishes `Waiting` with schema version 2; the doorbell treats a Waiting agent as idle, and its queued messages as a stalled wake rather than one its status explains.
+- **Does not assert:** the doorbell loop's `working` hold fact (no seam reaches it below the running loop), the bell firing on the later Waiting → Idle edge (010), the desktop or voice (desktop tests).
+- **Platform coverage:** mac+linux.
+
+##### status/waiting/006 — The deck's own inbox waiter is never a background command, so it cannot make a card read Waiting (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process-table fixtures with the measured Claude fingerprint.
+- **Asserts:** a Claude pane's `sh -c '<deck>' inbox wait --agent claude-code` waiter and its deck child in a session of their own yield no qualifying session; a real Bash-tool command beside it still counts, alone; a watcher left in the agent's own session yields none under the structural test alone (OpenCode, Pi).
+- **Does not assert:** a live waiter's process tree (only read from code: `src/hooks_manage.rs`, `src/inbox_receiver.js`), monitor timing.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/007 — An ended turn whose own command still runs reads Waiting on the attached card, then Idle when it exits; an earlier turn's command keeps Idle (issue #1757).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned Python parent with real detached Bash sessions and Claude-shaped hooks through the real hook CLI.
+- **Asserts:** a turn that starts a command and ends while it runs reads Waiting in the daemon's snapshot (`awaited` 1) and `● Waiting` with `Background: 1 command` on the rendered card; the command's exit returns it to Idle with no background line; a command started in one turn and still running when a later turn ends reads Idle with `Background: 1 command`.
+- **Does not assert:** a real agent, the desktop.
+- **Platform coverage:** mac+linux.
+
+##### status/waiting/010 — The bell does not ring on the step to Waiting, and rings on its later step to Idle (issue #1757).
+- **Layer:** L1 unit (`src/ui.rs`, fast tier).
+- **Agent:** none; session fixtures fed to the TUI's bell transition check.
+- **Asserts:** with the idle bell on, Working → Waiting rings nothing and the later Waiting → Idle rings.
+- **Does not assert:** the terminal bell write, the desktop's notifications.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/011 — A subagent's answered prompt returns a Waiting card to Waiting (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; Claude-shaped subagent frames applied to a client card folded into Waiting.
+- **Asserts:** a subagent's permission request moves a Waiting card to Needs Input, and that subagent's tool call ending returns it to Waiting rather than Thinking.
+- **Does not assert:** the daemon's own fold (001), a main-thread prompt.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/012 — Codex output moves a Waiting card as it moves an Idle one (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; a Codex wrapper output frame (prompt hook unavailable) applied to a client card folded into Waiting.
+- **Asserts:** the output frame classified as Thinking moves the Waiting card to Thinking.
+- **Does not assert:** the wrapper's classification, the shell-activity monitor's own `Idle`-or-Waiting re-emit check (no seam below the running monitor).
+- **Platform coverage:** mac+linux+windows.
 
 ### Agent protocol
 

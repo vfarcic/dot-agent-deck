@@ -18369,6 +18369,12 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
             "blocked",
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
         ),
+        // Issue #1757: the card's word, `Waiting`; Needs input is `needs input`.
+        (
+            stats.awaiting,
+            "waiting",
+            Style::default().fg(palette::status_color(&SessionStatus::Waiting)),
+        ),
         (stats.idle, "idle", text_primary()),
     ];
 
@@ -23403,6 +23409,8 @@ fn fit_card_rows(
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
+    // Issue #1757: Waiting does not blink — its work is not done, so there is
+    // nothing yet to draw the eye to; the dot starts blinking when it turns Idle.
     let needs_attention =
         *status == SessionStatus::WaitingForInput || *status == SessionStatus::Idle;
     if needs_attention && (tick / 30) % 2 == 1 {
@@ -23473,6 +23481,8 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
         SessionStatus::Compacting => ("Compacting", style),
         SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
         SessionStatus::Idle => ("Idle", style),
+        // Issue #1757: not bold — nothing needs the user.
+        SessionStatus::Waiting => ("Waiting", style),
         SessionStatus::Error => ("Error", style),
         // Issue #714: bold like "Needs Input" — a person has to act.
         SessionStatus::Blocked => ("Blocked", style.add_modifier(Modifier::BOLD)),
@@ -36643,6 +36653,26 @@ mod tests {
 
         let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
         assert!(need_bell);
+    }
+
+    /// Scenario: A card goes from Working to Waiting — its turn ended while a command it started still runs — and later to Idle when that command exits, with the bell's idle switch on. Nothing rings on the step to Waiting, because the work is not done; the bell rings on the later step from Waiting to Idle.
+    #[spec("status/waiting/010")]
+    #[test]
+    fn status_waiting_010_bell_rings_on_the_later_step_to_idle() {
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::Waiting));
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+        let (need_bell, last) = compute_bell_needed(&sessions, &last, &config);
+        assert!(!need_bell, "Working -> Waiting: the work is not done");
+
+        sessions.insert("a".into(), make_session(SessionStatus::Idle));
+        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        assert!(need_bell, "Waiting -> Idle: the work is done now");
     }
 
     #[test]

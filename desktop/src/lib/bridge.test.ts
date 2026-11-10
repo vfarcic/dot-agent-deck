@@ -1101,6 +1101,7 @@ describe("TauriDeckBridge", () => {
       working: "running",
       compacting: "running",
       waiting_for_input: "needs_input",
+      waiting: "waiting",
       idle: "idle",
       error: "failed",
       blocked: "blocked",

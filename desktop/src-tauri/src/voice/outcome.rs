@@ -4716,16 +4716,62 @@ fn word_sequence(text: &str) -> Vec<String> {
 /// The daemon status words a reference BY STATE names, by the words a user
 /// says for each: "stuck" is any agent waiting on someone — for input, on a
 /// refusing provider, or after an error.
-const STATE_WORDS: [(&str, &[&str]); 8] = [
+///
+/// Issue #1757: "waiting" alone is the Waiting card's word (its turn ended
+/// while a command it started still runs); Needs input is said as "waiting for
+/// input", "needs input" or "need input", which [`state_word_sequence`] reads
+/// as the one word [`NEEDS_INPUT_WORD`]. "Busy" includes Waiting: its work is
+/// not done.
+const STATE_WORDS: [(&str, &[&str]); 9] = [
     ("stuck", &["waiting_for_input", "blocked", "error"]),
-    ("waiting", &["waiting_for_input"]),
+    ("waiting", &["waiting"]),
+    (NEEDS_INPUT_WORD, &["waiting_for_input"]),
     ("working", &["working"]),
-    ("busy", &["working", "thinking", "compacting"]),
+    ("busy", &["working", "thinking", "compacting", "waiting"]),
     ("thinking", &["thinking"]),
     ("idle", &["idle"]),
     ("blocked", &["blocked"]),
     ("failed", &["error"]),
 ];
+
+/// Issue #1757: the one word [`state_word_sequence`] makes of a phrase for
+/// Needs input, so "waiting for input" never reads as "waiting".
+const NEEDS_INPUT_WORD: &str = "needs_input";
+
+/// The phrases a user says for Needs input, as [`word_sequence`] words.
+const NEEDS_INPUT_PHRASES: [&[&str]; 3] = [
+    &["waiting", "for", "input"],
+    &["needs", "input"],
+    &["need", "input"],
+];
+
+/// [`word_sequence`], with each of [`NEEDS_INPUT_PHRASES`] read as the one
+/// word [`NEEDS_INPUT_WORD`] (issue #1757).
+fn state_word_sequence(text: &str) -> Vec<String> {
+    let words = word_sequence(text);
+    let mut merged = Vec::with_capacity(words.len());
+    let mut at = 0;
+    while at < words.len() {
+        let phrase = NEEDS_INPUT_PHRASES.iter().find(|phrase| {
+            words.len() - at >= phrase.len()
+                && phrase
+                    .iter()
+                    .zip(&words[at..])
+                    .all(|(want, word)| *want == word.as_str())
+        });
+        match phrase {
+            Some(phrase) => {
+                merged.push(NEEDS_INPUT_WORD.to_string());
+                at += phrase.len();
+            }
+            None => {
+                merged.push(words[at].clone());
+                at += 1;
+            }
+        }
+    }
+    merged
+}
 
 /// The words around a state that say nothing more about the agent.
 const STATE_FILLER: [&str; 14] = [
@@ -4769,14 +4815,14 @@ fn agents_in_state<'a>(
     transcript: &str,
     agents: &'a [DesktopAgent],
 ) -> Vec<&'a DesktopAgent> {
-    let heard: BTreeSet<String> = word_sequence(transcript).into_iter().collect();
+    let heard: BTreeSet<String> = state_word_sequence(transcript).into_iter().collect();
     let said: BTreeSet<&str> = STATE_WORDS
         .iter()
         .filter(|(state, _)| heard.contains(*state))
         .flat_map(|(_, named)| named.iter().copied())
         .collect();
     let mut statuses: BTreeSet<&str> = BTreeSet::new();
-    for word in &word_sequence(spoken) {
+    for word in &state_word_sequence(spoken) {
         if let Some((_, named)) = STATE_WORDS.iter().find(|(state, _)| state == word) {
             let grounded: Vec<&str> = named
                 .iter()
@@ -5899,15 +5945,17 @@ const DASHBOARD_KINDS: [(&str, &str, &[&str]); 5] = [
 /// columns as [`DASHBOARD_KINDS`]. Each is one of the daemon's own status
 /// words, which the dashboard keeps apart: Working is not Thinking, and Idle
 /// is not Needs input. The labels are the dashboard filter's, which say Needs
-/// input as the TUI's cards do (issue #1676).
-const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 6] = [
+/// input as the TUI's cards do (issue #1676). Issue #1757: "waiting" is the
+/// Waiting card's word, so it is Waiting's name and no longer Needs input's.
+const DASHBOARD_STATUSES: [(&str, &str, &[&str]); 7] = [
     ("working", "Working", &["working", "busy"]),
     ("thinking", "Thinking", &["thinking"]),
     (
         "waiting_for_input",
         "Needs input",
-        &["waiting for input", "waiting", "needs input", "need input"],
+        &["waiting for input", "needs input", "need input"],
     ),
+    ("waiting", "Waiting", &["waiting"]),
     ("idle", "Idle", &["idle"]),
     ("blocked", "Blocked", &["blocked"]),
     (
@@ -6713,6 +6761,85 @@ mod tests {
                 "{said:?} must select status {value:?}, got {outcome:?}"
             );
         }
+    }
+
+    /// Scenario (issue #1757): ask for the agents that are waiting, and for
+    /// the agents that need input. "Waiting" is the word the Waiting card
+    /// shows, so it selects the Waiting status; "need input" and "waiting for
+    /// input" still select Needs input.
+    #[tokio::test]
+    async fn voice_outcome_dashboard_filter_waiting_is_not_needs_input() {
+        for (said, spoken, value) in [
+            (
+                "show only the agents that are waiting",
+                "waiting",
+                "waiting",
+            ),
+            (
+                "show only agents that need input",
+                "need input",
+                "waiting_for_input",
+            ),
+            (
+                "show only agents waiting for input",
+                "waiting for input",
+                "waiting_for_input",
+            ),
+        ] {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("filter_dashboard").with_param("status", spoken),
+            );
+            let outcome = run(&resolver, Screen::Overview, &fleet(), said).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { action, params, .. }
+                    if action == "filter_dashboard"
+                    && params.iter().any(|param| param.name == "status" && param.value == value)),
+                "{said:?} must select status {value:?}, got {outcome:?}"
+            );
+        }
+    }
+
+    /// Scenario (issue #1757): name an agent by its state when one agent is
+    /// Waiting and another Needs input. "The waiting agent" is the Waiting
+    /// one, "the agent waiting for input" is the other, and "the busy agent"
+    /// includes a Waiting agent, whose work is not done.
+    #[tokio::test]
+    async fn voice_outcome_waiting_agent_is_named_by_its_own_state() {
+        let fleet = vec![
+            role_agent_in_state("1", "tester", "waiting"),
+            role_agent_in_state("2", "coder", "waiting_for_input"),
+        ];
+        let open = |said: &'static str, answered: &'static str, fleet: Vec<DesktopAgent>| async move {
+            let resolver = StubResolver::new().answering(
+                said,
+                IntentAnswer::new("open_agent").with_param("agent", answered),
+            );
+            run(&resolver, Screen::Deck, &fleet, said).await
+        };
+        for (said, answered, want) in [
+            ("open the waiting agent", "the waiting agent", "1"),
+            (
+                "open the agent waiting for input",
+                "the agent waiting for input",
+                "2",
+            ),
+        ] {
+            let outcome = open(said, answered, fleet.clone()).await;
+            assert!(
+                matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == want),
+                "{said:?} must open agent {want}, got {outcome:?}"
+            );
+        }
+        let busy = vec![
+            role_agent_in_state("1", "tester", "waiting"),
+            role_agent_in_state("2", "coder", "idle"),
+        ];
+        let outcome = open("open the busy agent", "the busy agent", busy).await;
+        assert!(
+            matches!(&outcome, VoiceOutcome::Dispatch { params, .. } if params[0].value == "1"),
+            "\"busy\" includes a Waiting agent: {outcome:?}"
+        );
     }
 
     /// Scenario: ask for Codex agents or agents on build box. The type and

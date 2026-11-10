@@ -532,6 +532,134 @@ fn background_017_minimal_card_keeps_the_delivery_notice_ahead_of_background() {
     );
 }
 
+/// Scenario: Hydrate a card whose turn ended while a command it started in that turn still runs, and render it at Normal and Minimal density. The top border reads `Waiting` in a colour of its own — not Idle's, Working's or Needs Input's — with `Background: 1 command · 5m` beneath it, and at Minimal the one content row is that background line.
+#[spec("status/waiting/004")]
+#[test]
+fn status_waiting_004_card_shows_waiting_above_its_background_line() {
+    let now = render_now();
+    // Issue #1757: the wire form a daemon sends, so this file compiles before
+    // `SessionStatus::Waiting` and `BackgroundWork::awaited` exist.
+    let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+        "status": "Waiting", "agent_type": "claude_code", "tool_count": 0,
+        "last_activity_ms": now.timestamp_millis(),
+        "background": {"commands": 1, "subagents": 0, "since_ms": now.timestamp_millis() - 300_000, "awaited": 1},
+        "background_revision": 1,
+    }))
+    .unwrap();
+    let mut state = AppState::default();
+    state.register_pane("waiting-card".into());
+    state.seed_hydrated_session("waiting-card".into(), None, None, None, Some(&snapshot));
+    let session = state.sessions.values().next().unwrap().clone();
+    let render = |density: CardDensityKind, width: u16| {
+        render_card_to_buffer(
+            &session,
+            Some("waiting"),
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            density.rendered_height(),
+        )
+    };
+
+    let buffer = render(CardDensityKind::Normal, 80);
+    let normal = buffer_to_text(&buffer);
+    let top = normal.lines().next().unwrap();
+    assert!(
+        top.ends_with("● Waiting ┐"),
+        "the status badge reads Waiting:\n{normal}"
+    );
+    let rows: Vec<&str> = normal
+        .lines()
+        .map(|line| line.trim_matches(['│', ' ']))
+        .collect();
+    assert!(
+        rows.contains(&"Background: 1 command · 5m"),
+        "the Background line stays under the Waiting status:\n{normal}"
+    );
+    // The badge's colour: the `W` of `Waiting` on the top border.
+    let label_x = top
+        .chars()
+        .collect::<Vec<_>>()
+        .windows(7)
+        .position(|w| w.iter().collect::<String>() == "Waiting")
+        .expect("Waiting on the top border") as u16;
+    let colour = buffer[(label_x, 0)].fg;
+    for other in [
+        SessionStatus::Idle,
+        SessionStatus::Working,
+        SessionStatus::WaitingForInput,
+    ] {
+        assert_ne!(
+            colour,
+            dot_agent_deck::palette::status_color(&other),
+            "Waiting needs a colour distinct from {other:?}"
+        );
+    }
+    insta::assert_snapshot!("status_waiting_004_normal_card", normal);
+
+    let minimal = buffer_to_text(&render(CardDensityKind::Minimal, 80));
+    let lines: Vec<&str> = minimal.lines().collect();
+    assert_eq!(lines.len(), 3, "a Minimal card is three rows:\n{minimal}");
+    assert!(lines[0].ends_with("● Waiting ┐"), "{minimal}");
+    assert_eq!(
+        lines[1].trim_matches(['│', ' ']),
+        "Background: 1 command · 5m",
+        "at Minimal the one content row is the background line"
+    );
+    insta::assert_snapshot!("status_waiting_004_minimal_card", minimal);
+}
+
+/// Scenario: Render a Waiting card and an Idle card in the half of the blink cycle where an Idle card's status dot goes dark. The Idle card's dot blinks to say its work is done; the Waiting card's dot stays lit, because its work is not done yet.
+#[spec("status/waiting/005")]
+#[test]
+fn status_waiting_005_waiting_card_dot_does_not_flash() {
+    let now = render_now();
+    let card_top = |status: &str, tick: u64| {
+        let snapshot: SessionSnapshot = serde_json::from_value(serde_json::json!({
+            "status": status, "agent_type": "claude_code", "tool_count": 0,
+            "last_activity_ms": now.timestamp_millis(),
+            "background": {
+                "commands": 1, "subagents": 0, "since_ms": now.timestamp_millis(),
+                "awaited": u32::from(status == "Waiting"),
+            },
+            "background_revision": 1,
+        }))
+        .unwrap();
+        let mut state = AppState::default();
+        state.register_pane("flash-card".into());
+        state.seed_hydrated_session("flash-card".into(), None, None, None, Some(&snapshot));
+        let session = state.sessions.values().next().unwrap().clone();
+        let rendered = buffer_to_text(&render_card_to_buffer(
+            &session,
+            Some("flash"),
+            Some(1),
+            CardDensityKind::Normal,
+            tick,
+            now,
+            false,
+            80,
+            CardDensityKind::Normal.rendered_height(),
+        ));
+        rendered.lines().next().unwrap().to_string()
+    };
+    // Control: an Idle card's dot goes dark at tick 30.
+    assert!(
+        card_top("Idle", 30).ends_with("  Idle ┐"),
+        "{}",
+        card_top("Idle", 30)
+    );
+    for tick in [0, 30, 45] {
+        let top = card_top("Waiting", tick);
+        assert!(
+            top.ends_with("● Waiting ┐"),
+            "tick {tick}: a Waiting card's dot never blinks: {top}"
+        );
+    }
+}
+
 /// Scenario: Render a single dashboard card for a Working agent with a Read
 /// tool and recent prompt into an 80-column, Normal-density L1 buffer, then
 /// snapshot it. The title must carry the card number, display name, and status
@@ -2354,6 +2482,7 @@ fn overlay_buffers() -> Vec<(&'static str, ratatui::buffer::Buffer)> {
         waiting: 1,
         errors: 1,
         blocked: 0,
+        awaiting: 0,
         idle: 1,
         compacting: 1,
         total_tools: 42,

@@ -25,9 +25,11 @@ export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 /**
  * The status an agent is shown in. `needs_input` and `idle` are the TUI's
  * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
- * finished its turn are two states, never one.
+ * finished its turn are two states, never one. `waiting` is the TUI's Waiting
+ * (issue #1757): the agent's turn ended while a command it started in that turn
+ * still runs — its work is not done, but nothing needs the user.
  */
-export type AgentStatus = "queued" | "running" | "needs_input" | "idle" | "passed" | "failed" | "stopped" | "blocked";
+export type AgentStatus = "queued" | "running" | "needs_input" | "waiting" | "idle" | "passed" | "failed" | "stopped" | "blocked";
 
 /**
  * The words a status is shown as. Each is its own id except Needs input, whose
@@ -39,7 +41,7 @@ export function statusLabel(status: AgentStatus): string {
 }
 
 /** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
-export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "waiting" | "idle" | "error" | "blocked" | "unknown";
 
 /**
  * Issue #714: why an agent is `blocked` — the agent reported that its provider

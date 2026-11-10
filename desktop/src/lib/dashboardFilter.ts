@@ -36,7 +36,7 @@ export type DashboardKind = "orchestration" | "single" | "dispatcher" | "schedul
  * even though the dashboard's status column merges Working with Thinking,
  * because "show only working agents" is not a request for thinking ones.
  */
-export type DashboardStatus = "working" | "thinking" | "waiting_for_input" | "idle" | "blocked" | "error";
+export type DashboardStatus = "working" | "thinking" | "waiting_for_input" | "waiting" | "idle" | "blocked" | "error";
 
 export type DashboardFilterFacet = keyof DashboardFilter;
 
@@ -61,6 +61,9 @@ export const DASHBOARD_STATUSES: readonly { id: DashboardStatus; label: string }
   { id: "working", label: "Working" },
   { id: "thinking", label: "Thinking" },
   { id: "waiting_for_input", label: "Needs input" },
+  // Issue #1757: the TUI card's word for an agent whose turn ended while a
+  // command it started still runs.
+  { id: "waiting", label: "Waiting" },
   { id: "idle", label: "Idle" },
   { id: "blocked", label: "Blocked" },
   { id: "error", label: "Error" },
@@ -112,6 +115,7 @@ function kindOf(agent: DashboardFilterFacts): DashboardKind | undefined {
 const COLUMN_FILTER_STATUS: Partial<Record<AgentStatus, DashboardStatus>> = {
   running: "working",
   needs_input: "waiting_for_input",
+  waiting: "waiting",
   idle: "idle",
   failed: "error",
   blocked: "blocked",

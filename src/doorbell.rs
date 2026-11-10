@@ -626,7 +626,9 @@ pub(crate) fn ring_effect(outcome: RingOutcome, cr_reached: bool) -> RingEffect 
 
 /// Whether an agent in `status` is doing something the user can already see,
 /// so its messages waiting is not a stalled wake: working, compacting,
-/// waiting on the user's answer, or blocked by a usage limit.
+/// waiting on the user's answer, or blocked by a usage limit. Not Idle, and
+/// not Waiting (issue #1757): a Waiting agent's prompt is free as an Idle one's
+/// is, so messages sitting unread beside it are a stalled wake.
 fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool {
     use crate::state::SessionStatus;
     matches!(
@@ -929,10 +931,13 @@ async fn run_tick(
             if !queued || slot.nudged.is_some_and(|turns| turns != input.turns) {
                 slot.nudged = None;
             }
+            // Issue #1757: Waiting is not working — its prompt is free, as an
+            // Idle agent's is.
             let working = !matches!(
                 status,
                 Some(
                     crate::state::SessionStatus::Idle
+                        | crate::state::SessionStatus::Waiting
                         | crate::state::SessionStatus::WaitingForInput
                 )
             );
@@ -1529,6 +1534,23 @@ mod tests {
         for status in [Some(SessionStatus::Idle), Some(SessionStatus::Error), None] {
             assert!(!status_explains_waiting(status.as_ref()), "{status:?}");
         }
+    }
+
+    /// Scenario: Ask the doorbell whether an agent that is Waiting — its turn ended while a command it started still runs — explains the messages queued for it. It does not: a Waiting agent's prompt is free, as an Idle one's is, so messages that sit unread beside it are a stalled wake rather than an agent visibly busy.
+    #[spec("status/waiting/005")]
+    #[test]
+    fn status_waiting_005_waiting_does_not_explain_waiting_messages() {
+        use crate::state::SessionStatus;
+        // Issue #1757: read through the wire name so this module compiles
+        // before the variant exists; `Unknown` until then, which would pass
+        // this assertion by accident.
+        let waiting: SessionStatus = serde_json::from_value(serde_json::json!("Waiting")).unwrap();
+        assert_ne!(
+            waiting,
+            SessionStatus::Unknown,
+            "issue #1757: SessionStatus::Waiting does not exist yet"
+        );
+        assert!(!status_explains_waiting(Some(&waiting)));
     }
 
     #[test]

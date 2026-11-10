@@ -13,6 +13,13 @@ use serde_json::json;
 use spec::spec;
 use std::time::Duration;
 
+/// Issue #1757: a command first sampled within the daemon's sampling grace
+/// after a turn ends (two shell-activity polls, 1 s) counts as started in that
+/// turn and reads Waiting (`status/waiting/007`). The tests here that are
+/// about a command left running from before keep today's Idle by starting it
+/// later than that.
+const PAST_THE_TURN: Duration = Duration::from_millis(1_500);
+
 /// Scenario: Send genuine-shaped Claude start/Stop hooks to a daemon-owned stand-in, then keep a real detached command alive. The card stays Idle with one background command, clears when it ends, and hides the aggregate during a new turn; a pane without hook reports retains legacy shell promotion.
 #[spec("status/background/001")]
 #[test]
@@ -20,6 +27,7 @@ fn background_001_reporting_turn_stays_idle_while_command_runs() {
     let f = Fixture::new(AgentType::ClaudeCode);
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
     f.hook("claude-code", "Stop", json!({}));
+    std::thread::sleep(PAST_THE_TURN);
     f.command("one", true);
     f.wait_commands(1);
     assert_eq!(
@@ -322,6 +330,7 @@ fn background_006_monitor_count_edges_no_idle_spam_and_replacement() {
     let mut f = Fixture::new(AgentType::ClaudeCode);
     f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
     f.hook("claude-code", "Stop", json!({}));
+    std::thread::sleep(PAST_THE_TURN);
     for (name, enabled, count) in [("one", true, 1), ("two", true, 2), ("two", false, 1)] {
         let before = f.events.snapshot().len();
         f.command(name, enabled);
@@ -476,5 +485,97 @@ fn background_014_natural_exit_clears_the_attached_card_only() {
     assert!(
         cleared && clear.is_some(),
         "natural exit must clear the attached card and broadcast a newer explicit-zero frame for the departed agent; cleared={cleared}, clear={clear:?}, frames={frames:?}\n{departed_grid}"
+    );
+}
+
+/// Scenario: A Claude-shaped stand-in reports a turn that starts a real detached command and ends while the command runs: the attached card reads Waiting with `Background: 1 command`, and when the command exits it reads Idle with no background line. A command started in one turn and still running when a later turn ends leaves the card Idle with its background line.
+#[spec("status/waiting/007")]
+#[test]
+fn status_waiting_007_card_waits_on_this_turns_command() {
+    let f = Fixture::new(AgentType::ClaudeCode);
+    let grid_within = |what: &str, predicate: &dyn Fn(&str) -> bool| {
+        assert!(
+            f.deck.wait_for_grid_predicate_within(
+                common::load_scaled(Duration::from_secs(10)),
+                |grid| predicate(grid)
+            ),
+            "{what}:\n{}",
+            f.deck.snapshot_grid()
+        );
+    };
+    f.hook("claude-code", "SessionStart", json!({"source": "startup"}));
+    // Turn 1 ends with nothing running, so the turns below each start after
+    // an ended one.
+    f.hook(
+        "claude-code",
+        "UserPromptSubmit",
+        json!({"prompt": "turn 1"}),
+    );
+    f.hook("claude-code", "Stop", json!({}));
+
+    // Turn 2 starts a command and ends while it runs.
+    f.hook(
+        "claude-code",
+        "UserPromptSubmit",
+        json!({"prompt": "turn 2"}),
+    );
+    f.command("one", true);
+    let ended = f.hook("claude-code", "Stop", json!({}));
+    f.wait_commands(1);
+    let live = f.live();
+    assert_eq!(
+        live["status"],
+        json!("Waiting"),
+        "a turn that ended while its own command runs is Waiting: {live} (Stop broadcast {ended})"
+    );
+    assert_eq!(live["background"]["awaited"], json!(1), "{live}");
+    grid_within("the card reads Waiting with its Background line", &|grid| {
+        grid.contains("● Waiting") && grid.contains("Background: 1 command")
+    });
+
+    // The command exits: Idle, and the Background line goes.
+    f.command("one", false);
+    f.wait_commands(0);
+    assert_eq!(f.live()["status"], json!("Idle"));
+    grid_within("the card returns to Idle", &|grid| {
+        grid.contains("Idle") && !grid.contains("Waiting") && !grid.contains("Background:")
+    });
+
+    // Turn 3 starts a command and ends while it runs; turn 4 then ends while
+    // it still runs, so by then it is an earlier turn's command.
+    f.hook(
+        "claude-code",
+        "UserPromptSubmit",
+        json!({"prompt": "turn 3"}),
+    );
+    f.command("two", true);
+    f.hook("claude-code", "Stop", json!({}));
+    f.wait_commands(1);
+    assert_eq!(f.live()["status"], json!("Waiting"), "turn 3's own command");
+    f.hook(
+        "claude-code",
+        "UserPromptSubmit",
+        json!({"prompt": "turn 4"}),
+    );
+    let ended = f.hook("claude-code", "Stop", json!({}));
+    assert_eq!(
+        ended["background"]["commands"],
+        json!(1),
+        "turn 4's Stop still counts the command: {ended}"
+    );
+    let live = f.live();
+    assert_eq!(
+        live["status"],
+        json!("Idle"),
+        "a command carried over from an earlier turn keeps today's Idle: {live}"
+    );
+    assert_eq!(live["background"]["awaited"].as_u64().unwrap_or(0), 0);
+    grid_within(
+        "Idle with the carried-over command's Background line",
+        &|grid| {
+            grid.contains("Idle")
+                && !grid.contains("Waiting")
+                && grid.contains("Background: 1 command")
+        },
     );
 }

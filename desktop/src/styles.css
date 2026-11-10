@@ -609,6 +609,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
 .agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
+/* Issue #1757: Waiting — the turn ended while a command it started still runs.
+   Running's colour, hollow: its work is not done, but it is not working now. */
+.agent-state-mark.status-waiting { color: var(--teal); background: transparent; box-shadow: inset 0 0 0 2px var(--teal); }
 .agent-title-line { display: flex; align-items: center; gap: 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
 /* Issue #2001: the title is the agent's name, which can be long, so it is the
@@ -622,6 +625,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
+.status-label.status-waiting { color: var(--teal); background: transparent; outline: 1px dashed var(--teal); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
 /* Issue #2075 — a question waiting, and for how long: the overview's ORCHESTRATOR

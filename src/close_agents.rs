@@ -2022,6 +2022,11 @@ mod tests {
             state.apply_event(frame("session_start"));
             state.apply_event(frame("idle"));
             state.observe_command_sessions(pane, agent, &[12345].into_iter().collect());
+            // Issue #1757: a command started in the turn that just ended reads
+            // Waiting, so this one carries over into a later turn's end to keep
+            // the card Idle. The gap keeps that turn's start after its sample.
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            state.apply_event(frame("thinking"));
             state.apply_event(frame("idle"));
             assert_eq!(
                 state.pane_status_of(pane),
