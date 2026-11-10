@@ -3889,6 +3889,13 @@ note).
 - **Does not assert:** the release-mode log-once line; the upstream sizing that produces the capped parser (covered by `resize/layout/002`); the general area-larger-than-screen `min` fallback with the guard OFF (covered by `render/widget/002`).
 - **Platform coverage:** mac+linux+windows.
 
+##### render/widget/004 — A wide (two-column) glyph is drawn in the two columns it has on the screen, with no extra blank after it (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** with `你好AB` on a vt100 screen's first row, the inner area shows `你` in column 0, `好` in column 2, `A` in column 4 and `B` in column 5, the screen's own columns.
+- **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks or emoji sequences; colours.
+- **Platform coverage:** mac+linux+windows.
+
 #### render/layout
 
 ##### render/layout/001 — After a tab/layout switch with N panes the embedded pane's bottom rows show correct (non-stale) content — no off-by-one row shift.
@@ -7763,6 +7770,13 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Does not assert:** that a selection survives a resize (it is cleared when its pane moves); the zoomed layout, which draws through the stacked one.
 - **Platform coverage:** mac+linux+windows.
 
+##### mouse/select/010 — A drag over wide (two-column) glyphs copies exactly what its highlight shows (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column.
+- **Does not assert:** double- and triple-click word and paragraph selection over wide glyphs; a glyph cut by the pane's edge.
+- **Platform coverage:** mac+linux+windows.
+
 #### clipboard/deliver
 
 ##### clipboard/deliver/001 — A copied selection goes to the native clipboard and as OSC 52, and the status line says only what happened (PRD #385 M1).
@@ -7807,16 +7821,58 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### copymode/keys/002 — Leaving copy mode without a yank copies nothing and leaves the pane where it was; live output does not move copy mode's view; an empty pane and the alternate screen behave (PRD #385 M5).
 - **Layer:** L1 (`CopyModeSeam`: one inert pane and the bottom bar over a `TestBackend` frame, keys through the live loop's `handle_key_event`, `tests/copy_mode.rs`).
 - **Agent:** none.
-- **Asserts:** after paging and setting a selection, `Esc`, and `q` after the pane was first scrolled back in command mode, return to command mode with no copy and no status message, the pane at the scroll offset it had before and showing what it showed before; forty lines of output while copy mode is open leave its view unchanged, its bottom shows no new line and a yank copies none, and after leaving the pane shows the new output; on an empty pane copy mode opens with the cursor at the first cell, `PageUp` and `g` leave it there (no history) and `G` moves it to the last row, `y` with no selection keeps copy mode open, and an empty selection leaves it without a copy or a status; on a full-screen program's alternate screen copy mode has no history to page into and copies that screen's text; and copy mode closes, copying nothing, once the pane it is open on closes.
+- **Asserts:** after paging and setting a selection, `Esc`, and `q` after the pane was first scrolled back in command mode, return to command mode with no copy and no status message, the pane at the scroll offset it had before and showing what it showed before; forty lines of output while copy mode is open leave its view unchanged, its bottom shows no new line and a yank copies none, and after leaving the pane shows the new output; on an empty pane copy mode opens with the cursor at the first cell, `PageUp` and `g` leave it there (no history) and `G` moves it to the last row, `y` with no selection keeps copy mode open, and an empty selection leaves it without a copy or a status; on a full-screen program's alternate screen copy mode has no history to page into and copies that screen's text; and copy mode closes, copying nothing, once the pane it is open on closes, the very first frame after the close already in command mode.
 - **Does not assert:** the real binary (`copymode/keys/001`); a pane that stays open but leaves the screen (the stacked layout giving its slot to another pane), which closes copy mode through the same not-drawn check.
 - **Platform coverage:** mac+linux+windows.
 
 ##### copymode/keys/003 — Copy mode on a pane whose screen is larger than the pane keeps its cursor on drawn cells and yanks what is highlighted (PRD #385 decision 6).
 - **Layer:** L1 (`CopyModeSeam::with_screen`: the pane's vt100 screen sized apart from its pane, `tests/copy_mode.rs`).
 - **Agent:** none.
-- **Asserts:** with a 28 x 9 pane over a 20 x 50 screen whose cursor is on row 19, `v` opens copy mode with exactly one cursor cell drawn; after moving and selecting across two lines with the cursor pushed far right, the cursor is still inside the pane, and `y` copies exactly the highlighted text, `abcdefghijklmnopqrstuvwx` and the next line's first 28 columns.
-- **Does not assert:** a screen smaller than its pane; a resize while copy mode is open (it takes the new drawn size from the next frame).
+- **Asserts:** with a 28 x 9 pane over a 20 x 50 screen whose cursor is on row 19, `v` opens copy mode with exactly one cursor cell drawn; after moving and selecting across two lines with the cursor pushed far right, the cursor is still inside the pane, and `y` copies exactly the highlighted text, `abcdefghijklmnopqrstuvwx` and the next line's first 28 columns. With an 8 x 20 screen shown in a 3 x 8 content area (`VISIBLE0` to `VISIBLE2`), the cursor opens on a drawn row, `G` puts it on the last drawn row, and a two-row selection yanks `VISIBLE0` and `V` with no hidden suffix. With the frame shrunk while a selection is open, the very first frame after the shrink draws the cursor inside the smaller pane and the yank is exactly that frame's highlighted text.
+- **Does not assert:** a screen smaller than its pane; a grow while copy mode is open.
 - **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/004 — Copy mode closes when another client closes the last pane, and a pane reusing that id does not inherit it (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam::render_frame`: the run loop's `draw_frame` with the production layout over the dashboard tab, and the daemon's pane-closure report applied through `apply_pane_closure`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with copy mode open and a selection made on the dashboard's only pane, after the pane is closed externally the first whole frame shows the ` COMMAND ` chip, no copy-mode cursor and no selection, and a later `y` copies nothing (no OSC 52 send); when a new pane is attached under the closed pane's id before any frame is drawn, `y` copies nothing and the UI is in command mode.
+- **Does not assert:** the real binary or a second client (the closure report is applied as the run loop applies it); an orchestration tab closing under copy mode, which leaves the pane undrawn and closes copy mode through the same pre-frame check.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/005 — Copy mode highlights and copies a wide (two-column) glyph whole (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** the row `你AB` is drawn with no gap after the glyph; `g l l`, select, yank copies `B` with `B` highlighted; a forward selection from the glyph copies `你A`, a backward one onto it `你AB`; a copy-mode cursor that opens on, or moves up onto, a glyph's right half is put on the glyph, so the selection copies `你A` and `你b`; each time the highlighted text, read as a terminal draws it, is the copied text.
+- **Does not assert:** a glyph cut by the pane's right edge (it is not drawn and copies as nothing); emoji sequences or combining marks.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/006 — A remapped key that leaves copy mode is not also taken as a jump, and copy mode's entry key can be remapped (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam` with a card for the pane and keybindings parsed from TOML, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with `[global] jump_1 = "y"`, a yank copies once and leaves the deck in command mode with the card selection unchanged and no byte sent to the pane; with `jump_1 = "q"`, `q` leaves the same way without a copy; with `[dashboard] copy_mode = "x"`, `v` does not open copy mode and `x` does; binding `copy_mode` to the key `jump_1` has is reported as a conflict naming `copy_mode`, and then neither key opens copy mode.
+- **Does not assert:** the real binary; remapping copy mode's own keys, which are fixed.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/007 — A yank drops only the cells nothing was written to (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** a no-break space selected alone is copied; spaces the program wrote are kept on the row the selection ends on, `ab   `; a row the selection runs through to its end loses its trailing spaces, `ab` then `c`; a selection running into never-written cells copies the written text only, `cd`.
+- **Does not assert:** the mouse path's own cases (it shares the row extraction); tabs, which vt100 stores as cursor movement over unwritten cells.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/008 — Nothing typed or pasted while copy mode is open reaches the pane's program, and Ctrl+C opens the quit dialog (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`, keys through `handle_key_event` and a paste through the run loop's `forward_paste`, with the pane's child-input recorder, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** while copy mode is open, unbound printable keys, a digit, `Ctrl+D`, `Ctrl+W`, the movement and selection keys, `Tab`, `Backspace`, `PageUp` and a paste send no byte to the pane and copy mode stays open; `Ctrl+C` then puts the UI in the quit dialog with no byte sent and nothing copied.
+- **Does not assert:** mouse reports and the real binary's event loop (`copymode/keys/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/009 — Keys, a paste and mouse reports sent while copy mode is open reach no program, end to end (PRD #385 M5).
+- **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` runs `cat -v` with mouse reporting and bracketed paste turned on, so any byte it receives is shown).
+- **Asserts:** after copy mode receives printable keys, a digit, `Ctrl+D`, `Ctrl+W`, movement keys, `PageUp`, a bracketed paste and a mouse press, drag, release and wheel report, `q` returns to command mode and `Ctrl+D` to typing; `ENDMARK` typed then appears alone on its line in the program's output, no pasted text or escape sequence appears, and no OSC 52 copy was written.
+- **Does not assert:** the native clipboard (the harness turns it off); a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
 
 #### copymode/render
 

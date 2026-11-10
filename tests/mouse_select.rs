@@ -457,3 +457,69 @@ fn select_009_stacked_and_resized_panes_copy_and_show_the_same_text() {
         );
     }
 }
+
+/// The text the highlighted cells show as a terminal draws them: a cell hidden
+/// under the wide glyph before it is skipped.
+fn visible_highlighted_text(buf: &Buffer) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let area = buf.area;
+    let mut lines = Vec::new();
+    for y in area.y..area.y + area.height {
+        let mut line = String::new();
+        let mut x = area.x;
+        while x < area.x + area.width {
+            let symbol = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+            if is_highlighted(buf, x, y) {
+                line.push_str(symbol);
+            }
+            x += symbol.width().max(1) as u16;
+        }
+        if !line.is_empty() {
+            lines.push(line.trim_end().to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+/// Scenario: A pane shows `你AB 漢字x`, with two-column glyphs among the letters. Drags forward and backward over the glyphs, ending on either half of a glyph, each copy exactly the text the highlight shows, with no space added for a glyph's second column.
+#[spec("mouse/select/010")]
+#[test]
+fn select_010_a_drag_over_wide_glyphs_copies_what_it_highlights() {
+    // Columns: 你 0-1, A 2, B 3, space 4, 漢 5-6, 字 7-8, x 9.
+    let cases: [(&str, u16, u16, &str); 4] = [
+        ("forward from a glyph's left half", 0, 2, "你A"),
+        ("forward to a glyph's right half", 2, 8, "AB 漢字"),
+        (
+            "backward from the end to a glyph's left half",
+            9,
+            0,
+            "你AB 漢字x",
+        ),
+        (
+            "forward from a glyph's left half to a right half",
+            0,
+            6,
+            "你AB 漢",
+        ),
+    ];
+    for (what, from, to, expected) in cases {
+        let mut seam = PaneSelectionSeam::tiled(40, 8, &[("a", "你AB 漢字x".as_bytes())], "a");
+        seam.render();
+        let (x, y) = first_cell(seam.pane_rect("a"));
+        press(&mut seam, x + from, y);
+        drag(&mut seam, x + to, y);
+        release(&mut seam, x + to, y);
+        assert_eq!(
+            seam.copies().last().map(String::as_str),
+            Some(expected),
+            "{what}: the copy"
+        );
+        let buf = seam.render();
+        assert_eq!(
+            visible_highlighted_text(&buf),
+            expected,
+            "{what}: the highlight\n{}",
+            frame_with_highlight(&buf)
+        );
+    }
+}

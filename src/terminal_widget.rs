@@ -318,6 +318,14 @@ impl Widget for TerminalWidget {
 
             while col < cols {
                 let cell = screen.cell(row_idx as u16, col as u16);
+                // PRD #385: a wide glyph already takes this column, its
+                // second; a blank for it would push the rest of the row one
+                // column right of the screen's own columns, so a selection
+                // made in screen columns would show other text than it copies.
+                if cell.is_some_and(|cell| cell.is_wide_continuation()) {
+                    col += 1;
+                    continue;
+                }
                 let (ch, style) = match cell {
                     Some(cell) => {
                         let c = cell.contents();

@@ -4233,6 +4233,7 @@ fn apply_pane_closure(
     ui.pane_declared_agent.remove(pane_id);
     ui.pane_display_names.remove(pane_id);
     ui.pane_names.remove(pane_id);
+    leave_copy_mode_on_pane(ui, pane_id);
     let left_active_tab = tab_outcome
         .as_ref()
         .is_some_and(|o| o.tab_removed && o.was_active);
@@ -4405,6 +4406,7 @@ fn process_restart_drops(
     for pane_id in &panes {
         left_focused_pane |= focused.as_deref() == Some(pane_id.as_str());
         pane.forget_pane(pane_id);
+        leave_copy_mode_on_pane(ui, pane_id);
         // G-fix7f: named here, so a placeholder its attachment handed in is not
         // drawn, or named again, when the stream next opens.
         state.blocking_write().retire_held_placeholders(pane_id);
@@ -6009,26 +6011,22 @@ fn extract_selection_text(
         }
         let col_start = if widget_row == sr { sc } else { 0 };
         let col_end = if widget_row == er { ec } else { shown_cols - 1 };
-        for col in col_start..=col_end.min(shown_cols - 1) {
-            if let Some(cell) = screen.cell(screen_row, col) {
-                let ch = cell.contents();
-                if ch.is_empty() {
-                    result.push(' ');
-                } else {
-                    result.push_str(ch);
-                }
-            }
-        }
-        // Trim trailing spaces per line and add newline between lines.
+        // Each row cut as copy mode cuts it: a row the selection runs
+        // through loses its trailing spaces, the row it ends on keeps what
+        // was written there.
+        result.push_str(&crate::copy_mode::row_text(
+            screen,
+            screen_row,
+            col_start,
+            col_end.min(shown_cols - 1),
+            shown_cols,
+            widget_row == er,
+        ));
         if widget_row < er {
-            let trimmed = result.trim_end_matches(' ');
-            let trimmed_len = trimmed.len();
-            result.truncate(trimmed_len);
             result.push('\n');
         }
     }
-    let trimmed = result.trim_end_matches(' ');
-    trimmed.to_string()
+    result
 }
 
 /// What a left-button press, drag or release over the pane area did that the
@@ -6347,6 +6345,60 @@ fn leave_copy_mode(ui: &mut UiState) {
     }
 }
 
+/// PRD #385 M5: close copy mode when it is open on `pane_id`, which has just
+/// closed, so a pane attached later under the same id never inherits its
+/// frozen screen or selection.
+fn leave_copy_mode_on_pane(ui: &mut UiState, pane_id: &str) {
+    if ui
+        .copy_mode
+        .as_ref()
+        .is_some_and(|copy| copy.pane_id() == pane_id)
+    {
+        leave_copy_mode(ui);
+    }
+}
+
+/// PRD #385 M5: settle copy mode against the panes a frame is about to draw,
+/// before anything in it is drawn, so the frame (its mode chip included)
+/// shows the outcome. Copy mode closes when its pane is not among `panes` (it
+/// closed, or no pane is drawn at all) or has no content area to draw in;
+/// otherwise its cursor and selection are brought onto the cells this frame
+/// draws of its screen.
+fn reconcile_copy_mode(
+    ui: &mut UiState,
+    embedded: Option<&EmbeddedPaneController>,
+    panes: &[(String, Rect)],
+) {
+    let Some(copy) = ui.copy_mode.as_mut() else {
+        return;
+    };
+    if ui.mode != UiMode::CopyMode {
+        ui.copy_mode = None;
+        return;
+    }
+    let live = embedded.is_some_and(|ctrl| ctrl.get_screen(copy.pane_id()).is_some());
+    let rect = panes
+        .iter()
+        .find(|(id, _)| id == copy.pane_id())
+        .map(|(_, rect)| *rect)
+        .filter(|rect| {
+            let inner = pane_inner_rect(*rect);
+            inner.width > 0 && inner.height > 0
+        });
+    let Some(rect) = rect.filter(|_| live) else {
+        leave_copy_mode(ui);
+        return;
+    };
+    let frozen = copy.frozen();
+    let shown = frozen
+        .lock()
+        .ok()
+        .map(|parser| pane_viewport(parser.screen(), rect));
+    if let Some(shown) = shown {
+        copy.set_shown(shown);
+    }
+}
+
 /// PRD #385 M5 (decision 7): copy mode's keys, select-and-yank only. Arrows
 /// or `h`/`j`/`k`/`l` move, `PageUp`/`PageDown` page through the history,
 /// `g`/`G` go to its top and bottom, `v` or `Space` starts the selection (or
@@ -6393,6 +6445,40 @@ fn handle_copy_mode_key(key: KeyEvent, ui: &mut UiState) -> Action {
         _ => {}
     }
     Action::Continue
+}
+
+/// Handle a paste from the terminal: in pane input it goes to the focused
+/// pane, wrapped in bracketed-paste markers when the pane's program turned
+/// them on; in any other mode (command mode, copy mode, a dialog) it goes
+/// nowhere.
+fn forward_paste(ui: &mut UiState, pane: &dyn PaneController, text: &str) {
+    if ui.mode == UiMode::PaneInput
+        && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+        && let Some(pane_id) = embedded.focused_pane_id()
+    {
+        embedded.reset_scrollback(&pane_id);
+        let use_bracketed = embedded
+            .get_screen(&pane_id)
+            .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
+            .unwrap_or(false);
+        let mut payload = Vec::new();
+        if use_bracketed {
+            payload.extend_from_slice(b"\x1b[200~");
+        }
+        payload.extend_from_slice(text.as_bytes());
+        if use_bracketed {
+            payload.extend_from_slice(b"\x1b[201~");
+        }
+        // PRD #385 M3: a paste is typing into the pane too.
+        clear_selection_on_pane_input(ui, &pane_id, &payload);
+        let _ = embedded.write_raw_bytes(&pane_id, &payload);
+        // PRD #76 M2.20: a paste is a forwarded keystroke event
+        // too — mark the timestamp so a following Enter
+        // (`Action::ForwardToPane(b"\r")`) is debounced and
+        // arrives at the agent as a standalone submit, not fused
+        // with the paste tail.
+        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+    }
 }
 
 /// PRD #385: put `text` on the clipboard by both routes and set the status
@@ -13001,8 +13087,10 @@ fn handle_key_event(
     }
 
     // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
-    // resolves the digits from config so they can be remapped.
-    if !is_ctrl_c && ui.mode == UiMode::Normal {
+    // resolves the digits from config so they can be remapped. PRD #385: only
+    // for a key nothing above took, so a copy-mode key that has just left
+    // copy mode for command mode (`y`, `q`, ...) is not also a jump.
+    if action.is_none() && !is_ctrl_c && ui.mode == UiMode::Normal {
         const JUMP_ACTIONS: [KbAction; 9] = [
             KbAction::Jump1,
             KbAction::Jump2,
@@ -15658,33 +15746,7 @@ pub fn run_tui(
 
             // Handle paste: wrap in bracketed paste sequences if the child app enabled it.
             if let Event::Paste(text) = ev {
-                if ui.mode == UiMode::PaneInput
-                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                    && let Some(pane_id) = embedded.focused_pane_id()
-                {
-                    embedded.reset_scrollback(&pane_id);
-                    let use_bracketed = embedded
-                        .get_screen(&pane_id)
-                        .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
-                        .unwrap_or(false);
-                    let mut payload = Vec::new();
-                    if use_bracketed {
-                        payload.extend_from_slice(b"\x1b[200~");
-                    }
-                    payload.extend_from_slice(text.as_bytes());
-                    if use_bracketed {
-                        payload.extend_from_slice(b"\x1b[201~");
-                    }
-                    // PRD #385 M3: a paste is typing into the pane too.
-                    clear_selection_on_pane_input(&mut ui, &pane_id, &payload);
-                    let _ = embedded.write_raw_bytes(&pane_id, &payload);
-                    // PRD #76 M2.20: a paste is a forwarded keystroke event
-                    // too — mark the timestamp so a following Enter
-                    // (`Action::ForwardToPane(b"\r")`) is debounced and
-                    // arrives at the agent as a standalone submit, not fused
-                    // with the paste tail.
-                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                }
+                forward_paste(&mut ui, &*pane, &text);
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
                 }
@@ -17386,6 +17448,26 @@ fn render_frame(
     // once. This call is what covers a mode change made anywhere outside the
     // drain — the per-frame `reconcile_pane_input_scrollback` drop out of
     // `PaneInput`, a daemon-driven state change, the startup focus.
+    //
+    // PRD #385 M5: copy mode is settled against the panes this frame draws
+    // first, so a copy mode whose pane is gone (including when no pane is
+    // drawn at all) is already closed in this frame's mode and chip.
+    let embedded = pane_controller
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>();
+    {
+        let FrameContent::Cards {
+            panes_area,
+            pane_rects,
+            ..
+        } = &layout.content;
+        let drawn: &[(String, Rect)] = if panes_area.is_some() {
+            pane_rects
+        } else {
+            &[]
+        };
+        reconcile_copy_mode(ui, embedded, drawn);
+    }
     let now = std::time::Instant::now();
     observe_command_mode_edge(ui, now);
     let banner_visibility = ui.command_banner.visibility(now);
@@ -17393,11 +17475,6 @@ fn render_frame(
     // PRD #13: the canvas is left unpainted so the terminal's own background
     // shows through (`Color::Reset`). Filling it with an absolute color was
     // the original light-terminal bug — a black slab over a light theme.
-
-    // Determine if we have embedded terminal panes to show on the right.
-    let embedded = pane_controller
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>();
 
     // PRD #84 M3/M4 — one layout pass per frame (invariant 1). The single
     // `FrameLayout` is computed once by the caller from the live frame area and
@@ -18508,23 +18585,6 @@ fn record_drawn_panes(ui: &mut UiState, drawn: DrawnPanes) {
     }
     if ui.mode != UiMode::CopyMode {
         ui.copy_mode = None;
-    }
-    // PRD #385: copy mode keeps its cursor and selection on what its pane
-    // draws, which a resize can change.
-    if let Some(copy) = ui.copy_mode.as_mut()
-        && let Some((_, rect)) = ui
-            .drawn_pane_rects
-            .iter()
-            .find(|(id, _)| id == copy.pane_id())
-    {
-        let frozen = copy.frozen();
-        let shown = frozen
-            .lock()
-            .ok()
-            .map(|parser| pane_viewport(parser.screen(), *rect));
-        if let Some(shown) = shown {
-            copy.set_shown(shown);
-        }
     }
 }
 
@@ -25870,9 +25930,12 @@ impl crate::clipboard::ClipboardBackend for SeamClipboard {
 pub struct CopyModeSeam {
     ui: UiState,
     ctrl: Arc<EmbeddedPaneController>,
-    _input: crate::embedded_pane::SeamChildInput,
+    input: crate::embedded_pane::SeamChildInput,
     tab_manager: TabManager,
     state: SharedState,
+    /// The cards the key handler resolves against (none unless
+    /// [`Self::with_card`] added one).
+    snapshot: AppState,
     width: u16,
     height: u16,
     clipboard: SeamClipboard,
@@ -25914,13 +25977,152 @@ impl CopyModeSeam {
         Self {
             ui,
             ctrl,
-            _input: input,
+            input,
             tab_manager,
             state: Arc::new(tokio::sync::RwLock::new(AppState::default())),
+            snapshot: AppState::default(),
             width,
             height,
             clipboard: SeamClipboard::default(),
         }
+    }
+
+    /// Bind keys from a keybindings TOML, as `.dot-agent-deck.toml`'s
+    /// sections do; returns the warnings it raised (conflicts among them).
+    pub fn bind(&mut self, toml: &str) -> Vec<String> {
+        let (config, warnings) =
+            KeybindingConfig::from_toml_str(toml).expect("the keybindings TOML parses");
+        self.ui.keybindings = config;
+        warnings
+    }
+
+    /// Give the pane a dashboard card, card 1, so a jump key can focus it.
+    pub fn with_card(mut self) -> Self {
+        let now = Utc::now();
+        let session = SessionState {
+            session_id: "copy-card".to_string(),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            blocked: None,
+            active_tool: None,
+            started_at: now,
+            last_activity: now,
+            recent_events: std::collections::VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: Some(Self::PANE_ID.to_string()),
+            agent_id: None,
+            display_name: None,
+            shell_synthetic_working: false,
+            native_hooks_reported: false,
+            last_native_hook_at: None,
+            orchestration_orphaned: false,
+            subagent_wait: None,
+            output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
+            incarnation: Default::default(),
+        };
+        self.snapshot
+            .sessions
+            .insert(session.session_id.clone(), session.clone());
+        self.state
+            .blocking_write()
+            .sessions
+            .insert(session.session_id.clone(), session);
+        self
+    }
+
+    /// Every byte the pane's program has been sent since the last call.
+    pub fn forwarded(&mut self) -> Vec<u8> {
+        self.input.drain_bytes()
+    }
+
+    /// The highlighted card, if a key selected one.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.ui.selected_index
+    }
+
+    /// The UI mode, by name (`Normal` is command mode).
+    pub fn mode(&self) -> String {
+        format!("{:?}", self.ui.mode)
+    }
+
+    /// A paste from the terminal, as the live loop handles it.
+    pub fn paste(&mut self, text: &str) {
+        forward_paste(&mut self.ui, &*self.ctrl, text);
+    }
+
+    /// The frame becomes `width` x `height`; the pane's screen keeps its size,
+    /// as it does until the resize reaches it.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+    }
+
+    /// The daemon reports the pane closed (another client stopped its agent),
+    /// as the live loop applies that report.
+    pub fn close_pane_externally(&mut self) {
+        let closure = crate::state::PaneClosure {
+            pane_id: Self::PANE_ID.to_string(),
+            agent_id: None,
+            queued_at: Utc::now(),
+        };
+        apply_pane_closure(
+            &self.state,
+            &*self.ctrl,
+            &mut self.tab_manager,
+            &mut self.ui,
+            &closure,
+        );
+    }
+
+    /// A new pane is attached under the seam pane's id, showing `bytes`, as
+    /// the daemon can reuse a closed pane's id.
+    pub fn reattach_pane(&mut self, bytes: &[u8]) {
+        self.input = self.ctrl.add_scroll_seam_pane(
+            Self::PANE_ID,
+            self.height.saturating_sub(3).max(1),
+            self.width.saturating_sub(2).max(1),
+            bytes,
+        );
+    }
+
+    /// Draw a whole frame the way the run loop does ([`draw_frame`]): the
+    /// production layout over the dashboard tab, cards, panes and bottom bar.
+    pub fn render_frame(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(self.width, self.height))
+            .expect("TestBackend should construct");
+        let filtered = filter_sessions(&self.snapshot, &self.ui);
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+            zoomed: false,
+        };
+        let tab_bar = TabBarInfo {
+            show: false,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let sources = FrameSources {
+            snapshot: &self.snapshot,
+            filtered: &filtered,
+            tick: 0,
+            has_pane_control: true,
+            pane: &*self.ctrl,
+            tab_view: &tab_view,
+            tab_bar: &tab_bar,
+            features: Features::test_with(false),
+            show_hook_notice: false,
+            wall_now: Utc::now(),
+        };
+        draw_frame(&mut terminal, &mut self.ui, &sources).expect("the frame draws");
+        terminal.backend().buffer().clone()
     }
 
     fn pane_rect_for(width: u16, height: u16) -> Rect {
@@ -25935,15 +26137,14 @@ impl CopyModeSeam {
     /// One key, as the live loop handles it: resolved and dispatched, then any
     /// copy it made delivered.
     pub fn key(&mut self, key: KeyEvent) {
-        let snapshot = AppState::default();
-        let filtered: Vec<(&String, &SessionState)> = Vec::new();
+        let filtered = filter_sessions(&self.snapshot, &self.ui);
         let _ = handle_key_event(
             key,
             &mut self.ui,
             &*self.ctrl,
             &self.state,
             &mut self.tab_manager,
-            &snapshot,
+            &self.snapshot,
             &filtered,
             Rect::new(0, 0, self.width, self.height),
         );
@@ -25957,6 +26158,12 @@ impl CopyModeSeam {
         let pane = self.pane_rect();
         let bar = Rect::new(0, self.height.saturating_sub(1), self.width, 1);
         let ids = [Self::PANE_ID.to_string()];
+        // As `render_frame` does before it draws.
+        reconcile_copy_mode(
+            &mut self.ui,
+            Some(&*self.ctrl),
+            &[(Self::PANE_ID.to_string(), pane)],
+        );
         let mut terminal = Terminal::new(TestBackend::new(self.width, self.height))
             .expect("TestBackend should construct");
         let mut drawn = DrawnPanes::default();

@@ -18,6 +18,10 @@
 //! Selection is a stream, as a mouse drag is: from the anchor to the cursor,
 //! running to the end of each line in between.
 //!
+//! **Whole glyphs.** A wide (two-column) glyph is one stop for the cursor and
+//! is selected, highlighted and copied whole: the cursor never rests on its
+//! second column.
+//!
 //! **Only drawn cells.** A pane draws its screen from the top-left cell,
 //! clipped to the pane (`terminal_widget::drawn_screen_size`), and the screen
 //! can be larger than the pane while another attached client decides its
@@ -105,7 +109,7 @@ impl CopyMode {
                 col: 0,
             }
         };
-        Self {
+        let mut copy = Self {
             pane_id: pane_id.into(),
             frozen: Arc::new(Mutex::new(parser)),
             history,
@@ -116,7 +120,9 @@ impl CopyMode {
             view,
             cursor,
             anchor: None,
-        }
+        };
+        copy.cursor = copy.glyph_start(copy.cursor);
+        copy
     }
 
     /// `pos` with its line and column each at most `last`'s.
@@ -145,8 +151,10 @@ impl CopyMode {
             line: self.total_lines() - 1,
             col: shown_cols - 1,
         };
-        self.cursor = Self::clamp_pos(self.cursor, last);
-        self.anchor = self.anchor.map(|pos| Self::clamp_pos(pos, last));
+        self.cursor = self.glyph_start(Self::clamp_pos(self.cursor, last));
+        self.anchor = self
+            .anchor
+            .map(|pos| self.glyph_start(Self::clamp_pos(pos, last)));
         self.keep_cursor_in_view();
         self.scroll_frozen_to(self.view);
     }
@@ -185,7 +193,20 @@ impl CopyMode {
         let page = self.page();
         match movement {
             Move::Left => self.cursor.col = self.cursor.col.saturating_sub(1),
-            Move::Right => self.cursor.col = (self.cursor.col + 1).min(last_col),
+            Move::Right => {
+                // Past the second column of a wide glyph, when the next stop
+                // is still drawn.
+                let mut next = Pos {
+                    col: self.cursor.col + 1,
+                    ..self.cursor
+                };
+                if self.is_continuation(next) {
+                    next.col += 1;
+                }
+                if next.col <= last_col {
+                    self.cursor = next;
+                }
+            }
             Move::Up => self.cursor.line = self.cursor.line.saturating_sub(1),
             Move::Down => self.cursor.line = (self.cursor.line + 1).min(last_line),
             Move::PageUp => {
@@ -208,8 +229,46 @@ impl CopyMode {
                 };
             }
         }
+        self.cursor = self.glyph_start(self.cursor);
         self.keep_cursor_in_view();
         self.scroll_frozen_to(self.view);
+    }
+
+    /// Run `f` on the frozen screen scrolled so that `line` is on it, with that
+    /// line's row; the view is put back afterwards.
+    fn on_line<R>(&self, line: usize, f: impl FnOnce(&vt100::Screen, u16) -> R) -> Option<R> {
+        let mut parser = self.frozen.lock().ok()?;
+        let (offset, row) = if line < self.history {
+            (self.history - line, 0)
+        } else {
+            (0, u16::try_from(line - self.history).ok()?)
+        };
+        parser.screen_mut().set_scrollback(offset);
+        let result = f(parser.screen(), row);
+        parser.screen_mut().set_scrollback(self.view);
+        Some(result)
+    }
+
+    /// Whether `pos` is the second column of a wide glyph.
+    fn is_continuation(&self, pos: Pos) -> bool {
+        self.on_line(pos.line, |screen, row| {
+            screen
+                .cell(row, pos.col)
+                .is_some_and(|cell| cell.is_wide_continuation())
+        })
+        .unwrap_or(false)
+    }
+
+    /// `pos`, or the glyph's first column when `pos` is a wide glyph's second.
+    fn glyph_start(&self, pos: Pos) -> Pos {
+        if pos.col > 0 && self.is_continuation(pos) {
+            Pos {
+                col: pos.col - 1,
+                ..pos
+            }
+        } else {
+            pos
+        }
     }
 
     /// Scroll the view just enough to show the cursor.
@@ -267,9 +326,9 @@ impl CopyMode {
         }
     }
 
-    /// The selected text, or `None` with nothing selected. A line that ends
-    /// inside the selection loses its trailing blanks and ends in a newline,
-    /// unless the terminal wrapped it onto the next one.
+    /// The selected text, or `None` with nothing selected. Each line is cut
+    /// as [`row_text`] cuts it, and ends in a newline unless the terminal
+    /// wrapped it onto the next one.
     pub fn yank(&self) -> Option<String> {
         let (start, end) = self.selection()?;
         let Ok(mut parser) = self.frozen.lock() else {
@@ -290,28 +349,74 @@ impl CopyMode {
             } else {
                 self.shown_cols - 1
             };
-            let mut segment = String::new();
-            for col in first..=last.min(self.shown_cols - 1) {
-                match screen.cell(row, col) {
-                    Some(cell) if cell.is_wide_continuation() => {}
-                    Some(cell) if !cell.contents().is_empty() => segment.push_str(cell.contents()),
-                    _ => segment.push(' '),
-                }
-            }
-            if line == end.line {
-                text.push_str(segment.trim_end());
-            } else if screen.row_wrapped(row) && last == self.cols - 1 {
-                // Joined only when the whole row is drawn: a row clipped at
-                // the pane's edge ends where the highlight does.
-                text.push_str(&segment);
-            } else {
-                text.push_str(segment.trim_end());
+            let last = last.min(self.shown_cols - 1);
+            // Joined only when the whole row is drawn: a row clipped at the
+            // pane's edge ends where the highlight does.
+            let joined = line != end.line && screen.row_wrapped(row) && last == self.cols - 1;
+            // The user chose where the selection ends, and a joined row runs
+            // on into the next, so their written spaces are kept.
+            let keep_spaces = line == end.line || joined;
+            text.push_str(&row_text(
+                screen,
+                row,
+                first,
+                last,
+                self.shown_cols,
+                keep_spaces,
+            ));
+            if line != end.line && !joined {
                 text.push('\n');
             }
         }
         parser.screen_mut().set_scrollback(self.view);
         Some(text)
     }
+}
+
+/// The text a copy takes from `screen`'s `row`, columns `first..=last`, of a
+/// pane that draws `drawn_cols` columns. Shared by copy mode and the mouse
+/// selection, so both cut a row the same way:
+///
+/// - A wide glyph is copied once, and a glyph whose second column is past
+///   the drawn columns is not drawn and not copied.
+/// - Cells nothing was written to (never written, or erased) read as spaces
+///   between text, and are dropped after the last written cell: they are the
+///   terminal's padding, not text.
+/// - Everything written is kept, whatever it is (a no-break space included),
+///   except that with `keep_spaces` false (a row the selection runs through to
+///   its end rather than ending on) trailing ASCII spaces are dropped as well.
+pub(crate) fn row_text(
+    screen: &vt100::Screen,
+    row: u16,
+    first: u16,
+    last: u16,
+    drawn_cols: u16,
+    keep_spaces: bool,
+) -> String {
+    let mut text = String::new();
+    let mut written = 0;
+    for col in first..=last {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        if cell.is_wide() && col + 1 >= drawn_cols {
+            break;
+        }
+        if cell.has_contents() {
+            text.push_str(cell.contents());
+            written = text.len();
+        } else {
+            text.push(' ');
+        }
+    }
+    text.truncate(written);
+    if !keep_spaces {
+        text.truncate(text.trim_end_matches(' ').len());
+    }
+    text
 }
 
 #[cfg(test)]

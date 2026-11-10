@@ -226,3 +226,28 @@ fn widget_003_over_cap_inner_area_does_not_trip_the_contract_guard() {
          more columns to show, so painting anything there would be invented content"
     );
 }
+
+/// Scenario: A vt100 screen holds `你好AB` on its first row: two two-column
+/// glyphs, then two letters. Render it through `TerminalWidget`. Each glyph
+/// takes the two columns it takes on the screen and nothing more, so `A` is
+/// drawn in the inner area's fifth column, as it is on the screen, and the
+/// row reads `你好AB` with no gap after either glyph.
+#[spec("render/widget/004")]
+#[test]
+fn widget_004_a_wide_glyph_takes_its_own_two_columns_and_no_more() {
+    let mut parser = dot_agent_deck::vt_grid::parser(3, 12, 0);
+    parser.process("你好AB".as_bytes());
+    assert_eq!(parser.screen().cell(0, 4).unwrap().contents(), "A");
+    let area = Rect::new(0, 0, 14, 5);
+    let buf = render_widget(parser, area, false);
+    let inner = inner_of(area);
+    assert_eq!(
+        buf[(inner.x + 4, inner.y)].symbol(),
+        "A",
+        "`A` is drawn in the column it has on the screen:\n{}",
+        inner_dump(&buf, inner)
+    );
+    assert_eq!(buf[(inner.x + 5, inner.y)].symbol(), "B");
+    assert_eq!(buf[(inner.x, inner.y)].symbol(), "你");
+    assert_eq!(buf[(inner.x + 2, inner.y)].symbol(), "好");
+}

@@ -11,6 +11,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::Color;
+use unicode_width::UnicodeWidthStr;
 
 use dot_agent_deck::clipboard::OSC52_ONLY_MESSAGE;
 use dot_agent_deck::ui::CopyModeSeam;
@@ -325,7 +326,7 @@ fn copymode_keys_002_an_empty_pane_and_the_alternate_screen() {
     assert!(bar(&seam.render()).starts_with(" COMMAND"));
 }
 
-/// Scenario: Copy mode is open on a pane when that pane closes. The next frame closes copy mode and the bottom bar is back in command mode, with nothing copied.
+/// Scenario: Copy mode is open on a pane when that pane closes. The very next frame is drawn in command mode, its bottom bar without the COPY chip, with nothing copied.
 #[spec("copymode/keys/002")]
 #[test]
 fn copymode_keys_002_copy_mode_closes_with_its_pane() {
@@ -333,9 +334,12 @@ fn copymode_keys_002_copy_mode_closes_with_its_pane() {
     chars(&mut seam, "vkv");
     assert!(bar(&seam.render()).starts_with(" COPY"));
     seam.close_pane();
-    seam.render();
     let buf = seam.render();
-    assert!(bar(&buf).starts_with(" COMMAND"), "{}", bar(&buf));
+    assert!(
+        bar(&buf).starts_with(" COMMAND"),
+        "the first frame after the pane closed must not show the COPY chip: {}",
+        bar(&buf)
+    );
     assert!(seam.copies().is_empty());
 }
 
@@ -391,4 +395,359 @@ fn copymode_keys_003_a_screen_larger_than_its_pane_selects_what_is_drawn() {
         shown, "abcdefghijklmnopqrstuvwx\nr18-abcdefghijklmnopqrstuvwx",
         "the selection runs over the two drawn lines it was made on"
     );
+}
+
+/// The text of the marked (selected or cursor) cells a terminal shows, one
+/// line per row: a cell hidden under the wide glyph before it is skipped, as
+/// the terminal does not draw it.
+fn visible_marked_text(buf: &Buffer) -> String {
+    let area = buf.area;
+    let mut lines = Vec::new();
+    for y in area.y..area.y + area.height {
+        let mut line = String::new();
+        let mut x = area.x;
+        while x < area.x + area.width {
+            let symbol = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+            if is_selected(buf, x, y) || is_cursor(buf, x, y) {
+                line.push_str(symbol);
+            }
+            x += symbol.width().max(1) as u16;
+        }
+        if !line.is_empty() {
+            lines.push(line.trim_end().to_string());
+        }
+    }
+    lines.join("\n")
+}
+
+/// A row as a terminal shows it: a cell hidden under a wide glyph skipped.
+fn visible_row(buf: &Buffer, y: u16, from: u16, to: u16) -> String {
+    let mut out = String::new();
+    let mut x = from;
+    while x < to {
+        let symbol = buf.cell((x, y)).map_or(" ", |c| c.symbol());
+        out.push_str(symbol);
+        x += symbol.width().max(1) as u16;
+    }
+    out.trim_end().to_string()
+}
+
+/// The bottom bar's mode chip, from whichever row of a whole frame carries it.
+fn chip_row(buf: &Buffer) -> String {
+    (buf.area.y..buf.area.y + buf.area.height)
+        .map(|y| row_text(buf, y))
+        .find(|row| row.starts_with(" COPY") || row.starts_with(" COMMAND"))
+        .unwrap_or_default()
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+/// Scenario: Copy mode is open, with a selection, on the only pane of the dashboard when another client stops that pane's agent, so the pane closes and the dashboard has no pane to draw. The first whole frame drawn after that (the run loop's own layout) is in command mode with no COPY chip and no copy-mode cursor, and a later `y` copies nothing. A pane the daemon attaches under the closed pane's id before any frame is drawn does not inherit copy mode either.
+#[spec("copymode/keys/004")]
+#[test]
+fn copymode_keys_004_copy_mode_closes_when_another_client_closes_the_last_pane() {
+    let mut seam = CopyModeSeam::new(80, 20, &numbered_lines());
+    seam.render_frame();
+    chars(&mut seam, "vkv");
+    let buf = seam.render_frame();
+    assert!(
+        chip_row(&buf).starts_with(" COPY"),
+        "copy mode opens on the dashboard's pane: {:?}",
+        chip_row(&buf)
+    );
+
+    seam.close_pane_externally();
+    let buf = seam.render_frame();
+    assert!(
+        chip_row(&buf).starts_with(" COMMAND"),
+        "the first frame after the pane closed is in command mode: {:?}",
+        chip_row(&buf)
+    );
+    assert!(
+        cells(&buf, is_cursor).is_empty() && cells(&buf, is_selected).is_empty(),
+        "no copy-mode cursor or selection is left on screen"
+    );
+    chars(&mut seam, "y");
+    assert!(
+        seam.copies().is_empty(),
+        "y after the pane closed must copy nothing, got {:?}",
+        seam.copies()
+    );
+
+    // The pane id is reused before a frame is drawn.
+    let mut seam = CopyModeSeam::new(80, 20, &numbered_lines());
+    seam.render_frame();
+    chars(&mut seam, "vkv");
+    seam.close_pane_externally();
+    seam.reattach_pane(b"successor-pane-text");
+    chars(&mut seam, "y");
+    assert!(
+        seam.copies().is_empty(),
+        "a pane under the reused id must not yank the closed pane's text, got {:?}",
+        seam.copies()
+    );
+    assert_eq!(seam.mode(), "Normal");
+}
+
+/// Eight lines whose first eight columns are `VISIBLE<n>` and the rest a
+/// suffix a narrower pane does not show.
+fn visible_hidden_lines() -> Vec<u8> {
+    (0..8)
+        .map(|n| format!("VISIBLE{n}-HIDDEN{n}"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// Scenario: The pane's terminal screen is 8 rows by 20 columns while the pane shows only 3 rows of 8 columns, `VISIBLE0` to `VISIBLE2`. Copy mode opens with its cursor on a drawn row, `G` keeps it on a drawn row, and a selection over the first two rows yanks `VISIBLE0` and `V`, without the hidden suffix. Then, on a pane that fits its screen, the frame shrinks while a selection is open: the very next frame draws the cursor inside the smaller pane, and the yank is exactly what that frame highlights.
+#[spec("copymode/keys/003")]
+#[test]
+fn copymode_keys_003_an_oversized_screen_and_a_shrink_while_selected() {
+    let mut seam = CopyModeSeam::with_screen(10, 6, &visible_hidden_lines(), 8, 20);
+    seam.render();
+    let rect = seam.pane_rect();
+    let inner_rows = rect.y + 1..rect.y + rect.height - 1;
+    assert_eq!(
+        pane_text(&seam.render(), rect),
+        "VISIBLE0\nVISIBLE1\nVISIBLE2"
+    );
+    chars(&mut seam, "v");
+    let cursor = cells(&seam.render(), is_cursor);
+    assert!(
+        cursor.len() == 1 && inner_rows.contains(&cursor[0].1),
+        "the cursor opens on a drawn row, got {cursor:?}"
+    );
+    chars(&mut seam, "G");
+    let cursor = cells(&seam.render(), is_cursor);
+    assert_eq!(
+        cursor,
+        [(rect.x + 1, rect.y + 3)],
+        "G goes to the last drawn row"
+    );
+    chars(&mut seam, "gvj");
+    let buf = seam.render();
+    let shown = marked_text(&buf);
+    chars(&mut seam, "y");
+    assert_eq!(seam.copies(), ["VISIBLE0\nV"]);
+    assert_eq!(shown, "VISIBLE0\nV", "{}", frame_with_marks(&buf));
+
+    // Shrink while a selection is open.
+    let lines: Vec<u8> = (0..12)
+        .map(|n| format!("row{n:02}-abcdefghijklmnopqrstuvwxyz"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes();
+    let mut seam = CopyModeSeam::new(40, 14, &lines);
+    seam.render();
+    chars(&mut seam, "v");
+    chars(&mut seam, "k");
+    press(&mut seam, KeyCode::Char('h'), 40);
+    chars(&mut seam, "llvj");
+    press(&mut seam, KeyCode::Char('l'), 40);
+    seam.render();
+    seam.resize(24, 8);
+    let buf = seam.render();
+    let rect = seam.pane_rect();
+    let cursor = cells(&buf, is_cursor);
+    assert!(
+        cursor.len() == 1
+            && cursor.iter().all(|&(x, y)| x > rect.x
+                && x < rect.x + rect.width - 1
+                && y > rect.y
+                && y < rect.y + rect.height - 1),
+        "the first frame after the shrink draws the cursor inside the pane, got {cursor:?}:\n{}",
+        frame_with_marks(&buf)
+    );
+    let shown = marked_text(&buf);
+    chars(&mut seam, "y");
+    assert_eq!(
+        seam.copies().last().map(String::as_str),
+        Some(shown.as_str()),
+        "the yank copies what the frame highlights:\n{}",
+        frame_with_marks(&buf)
+    );
+    assert_eq!(shown, "w05-abcdefghijklmnop");
+}
+
+/// Scenario: The pane shows `你AB`, a two-column glyph and two letters, and the row is drawn with no gap after the glyph. In copy mode, moving right from the glyph lands on `A` and then `B`; selections forward and backward over the glyph highlight it and copy it whole; a cursor that starts, or moves up, onto the glyph's right half is put on the glyph. Each time the copied text is exactly the highlighted text.
+#[spec("copymode/keys/005")]
+#[test]
+fn copymode_keys_005_a_wide_glyph_is_highlighted_and_copied_whole() {
+    let cases: [(&str, &[u8], &str, &str); 5] = [
+        ("`gll`, select, yank", "你AB".as_bytes(), "gllvy", "B"),
+        ("forward from the glyph", "你AB".as_bytes(), "gvly", "你A"),
+        (
+            "backward onto the glyph",
+            "你AB".as_bytes(),
+            "gllvhhy",
+            "你AB",
+        ),
+        (
+            "the pane's cursor on the glyph's right half",
+            "你AB\x1b[1;2H".as_bytes(),
+            "vly",
+            "你A",
+        ),
+        (
+            "moving up onto the glyph's right half",
+            "a你b\r\nxyz".as_bytes(),
+            "hkvly",
+            "你b",
+        ),
+    ];
+    for (what, bytes, keys, expected) in cases {
+        let mut seam = CopyModeSeam::new(WIDTH, HEIGHT, bytes);
+        let rect = seam.pane_rect();
+        let buf = seam.render();
+        let first = bytes.split(|&b| b == b'\r' || b == 0x1b).next().unwrap();
+        assert_eq!(
+            visible_row(&buf, rect.y + 1, rect.x + 1, rect.x + rect.width - 1),
+            String::from_utf8_lossy(first),
+            "{what}: the row is drawn with no gap after the wide glyph"
+        );
+        chars(&mut seam, "v");
+        let (moves, yank) = keys.split_at(keys.len() - 1);
+        chars(&mut seam, moves);
+        let buf = seam.render();
+        let shown = visible_marked_text(&buf);
+        chars(&mut seam, yank);
+        assert_eq!(
+            seam.copies(),
+            [expected],
+            "{what}: the copy\n{}",
+            frame_with_marks(&buf)
+        );
+        assert_eq!(
+            shown,
+            expected,
+            "{what}: the highlight\n{}",
+            frame_with_marks(&buf)
+        );
+    }
+}
+
+/// Scenario: With `[global] jump_1 = "y"` (and then `= "q"`), copy mode is open on the pane of card 1. `y` yanks and `q` leaves, and neither is then taken as the jump to card 1: the deck is in command mode, the card selection is unchanged, and nothing reached the pane's program. With `[dashboard] copy_mode = "x"`, `x` opens copy mode and `v` does not; binding `copy_mode` to a key `jump_1` already has is reported as a conflict and leaves copy mode unbound.
+#[spec("copymode/keys/006")]
+#[test]
+fn copymode_keys_006_a_remapped_key_is_not_dispatched_twice_and_the_entry_key_remaps() {
+    for (binding, keys, copies) in [("y", "vkvhhy", 1), ("q", "vkvhhq", 0)] {
+        let mut seam = CopyModeSeam::new(WIDTH, HEIGHT, &numbered_lines()).with_card();
+        // `jump_1` keeps the key: an action bound to it by default loses it.
+        let warnings = seam.bind(&format!("[global]\njump_1 = \"{binding}\"\n"));
+        assert!(
+            warnings.iter().all(|w| !w.contains("'jump_1' unbound")),
+            "{warnings:?}"
+        );
+        seam.render();
+        let selected = seam.selected_index();
+        chars(&mut seam, keys);
+        assert_eq!(seam.copies().len(), copies, "`{binding}`: the copies");
+        assert_eq!(
+            seam.mode(),
+            "Normal",
+            "`{binding}` leaves copy mode for command mode, not a jump into the pane"
+        );
+        assert_eq!(
+            seam.selected_index(),
+            selected,
+            "`{binding}`: the card selection is unchanged"
+        );
+        assert!(
+            seam.forwarded().is_empty(),
+            "`{binding}`: nothing reaches the pane's program"
+        );
+        assert!(bar(&seam.render()).starts_with(" COMMAND"));
+    }
+
+    let mut seam = CopyModeSeam::new(WIDTH, HEIGHT, &numbered_lines());
+    let warnings = seam.bind("[dashboard]\ncopy_mode = \"x\"\n");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    seam.render();
+    chars(&mut seam, "v");
+    assert!(bar(&seam.render()).starts_with(" COMMAND"), "v is unbound");
+    chars(&mut seam, "x");
+    assert!(
+        bar(&seam.render()).starts_with(" COPY"),
+        "x opens copy mode"
+    );
+
+    let mut seam = CopyModeSeam::new(WIDTH, HEIGHT, &numbered_lines());
+    let warnings = seam.bind("[global]\njump_1 = \"x\"\n\n[dashboard]\ncopy_mode = \"x\"\n");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.contains("conflict") && w.contains("copy_mode")),
+        "{warnings:?}"
+    );
+    seam.render();
+    chars(&mut seam, "xv");
+    assert!(
+        bar(&seam.render()).starts_with(" COMMAND"),
+        "copy_mode lost the conflict, so neither key opens it"
+    );
+}
+
+/// Scenario: Copy mode yanks what was written to the cells it highlights and drops only the blank cells nothing was written to. A no-break space selected alone is copied; spaces the program wrote are kept on the row the selection ends on, even past the last letter; a row the selection runs through to its end loses its trailing spaces; never-written cells after the text are not copied.
+#[spec("copymode/keys/007")]
+#[test]
+fn copymode_keys_007_only_unwritten_padding_is_trimmed() {
+    let screen = "X\u{a0}Y\r\nab   \r\ncd".as_bytes();
+    let cases: [(&str, &str, &str); 4] = [
+        ("a no-break space alone", "glvy", "\u{a0}"),
+        (
+            "written spaces at the selection's end",
+            "gjvllllllly",
+            "ab   ",
+        ),
+        ("a row run through to its end", "gjvjy", "ab\nc"),
+        ("a selection into unwritten cells", "gjjvlllllly", "cd"),
+    ];
+    for (what, keys, expected) in cases {
+        let mut seam = CopyModeSeam::new(WIDTH, HEIGHT, screen);
+        seam.render();
+        chars(&mut seam, "v");
+        let (moves, yank) = keys.split_at(keys.len() - 1);
+        chars(&mut seam, moves);
+        seam.render();
+        chars(&mut seam, yank);
+        assert_eq!(seam.copies(), [expected], "{what}");
+    }
+}
+
+/// Scenario: Copy mode is open on a pane. Unbound printable keys, digits, `Ctrl+D`, `Ctrl+W`, the movement and selection keys, `PageUp` and a paste from the terminal all stay in the deck: the pane's program receives nothing and copy mode stays open. `Ctrl+C` then closes copy mode and opens the quit dialog, still sending nothing to the program and copying nothing.
+#[spec("copymode/keys/008")]
+#[test]
+fn copymode_keys_008_nothing_typed_in_copy_mode_reaches_the_pane() {
+    let mut seam = CopyModeSeam::new(WIDTH, HEIGHT, &numbered_lines());
+    seam.render();
+    chars(&mut seam, "v");
+    assert!(bar(&seam.render()).starts_with(" COPY"));
+    assert!(seam.forwarded().is_empty());
+
+    chars(&mut seam, "zZ!1x");
+    seam.key(ctrl('d'));
+    seam.key(ctrl('w'));
+    chars(&mut seam, "hjklv ");
+    press(&mut seam, KeyCode::Left, 1);
+    press(&mut seam, KeyCode::Up, 1);
+    press(&mut seam, KeyCode::PageUp, 1);
+    press(&mut seam, KeyCode::Tab, 1);
+    press(&mut seam, KeyCode::Backspace, 1);
+    seam.paste("pasted-in-copy-mode");
+    assert!(
+        bar(&seam.render()).starts_with(" COPY"),
+        "copy mode is still open"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&seam.forwarded()),
+        "",
+        "nothing typed in copy mode reaches the pane's program"
+    );
+
+    seam.key(ctrl('c'));
+    assert_eq!(seam.mode(), "QuitConfirm");
+    assert!(seam.forwarded().is_empty(), "Ctrl+C is not forwarded");
+    assert!(seam.copies().is_empty());
 }

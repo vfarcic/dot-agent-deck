@@ -136,3 +136,67 @@ fn copymode_keys_001_v_pages_back_selects_and_yanks_a_sentinel() {
         |g| g.contains("Sent to terminal clipboard (OSC 52)") && chip(g, " COMMAND "),
     );
 }
+
+/// Scenario: A shell pane runs `cat -v`, which shows every byte it receives, with mouse reports and bracketed paste turned on for it. In copy mode the user types printable keys, digits, `Ctrl+D`, `Ctrl+W`, movement keys and `PageUp`, pastes text and clicks, drags and scrolls the mouse over the pane, then leaves copy mode with `q` and types `ENDMARK` into the pane. The program shows `ENDMARK` alone on its line: nothing sent while copy mode was open reached it, and nothing was copied.
+#[spec("copymode/keys/009")]
+#[test]
+fn copymode_keys_009_keys_paste_and_mouse_in_copy_mode_reach_no_program() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_continue_session("copytarget", "bash --noprofile --norc")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    deck.send_bytes(
+        b"stty -icanon -echo -isig; printf '\\033[?1000h\\033[?1006h\\033[?2004h'; \
+          echo CATREADY-$((4+5)); cat -v\r",
+    );
+    deck.wait_for_string("CATREADY-9");
+
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_until_grid("command mode", |g| chip(g, " COMMAND "));
+    deck.send_bytes(b"v");
+    deck.wait_until_grid("copy mode", |g| chip(g, " COPY "));
+
+    for bytes in [
+        &b"zZ!1x"[..],
+        b"\x04",
+        b"\x17",
+        b"hjkl",
+        b"\x1b[A",
+        PAGE_UP,
+        b"\x1b[200~PASTED-IN-COPY\x1b[201~",
+        b"\x1b[<0;40;10M",
+        b"\x1b[<32;45;10M",
+        b"\x1b[<0;45;10m",
+        b"\x1b[<64;40;10M",
+    ] {
+        deck.send_bytes(bytes);
+    }
+    deck.send_bytes(b"q");
+    deck.wait_until_grid("copy mode closed", |g| chip(g, " COMMAND "));
+    deck.send_bytes(b"\x04"); // Ctrl+D → back into the pane
+    deck.wait_until_grid("typing into the pane", |g| chip(g, " TYPING "));
+    deck.send_bytes(b"ENDMARK");
+    deck.wait_until_grid("the program shows ENDMARK", |g| g.contains("ENDMARK"));
+    let grid = deck.snapshot_grid();
+    // The pane's text on that row, between the pane's borders.
+    let line = grid
+        .lines()
+        .flat_map(|line| line.split('│'))
+        .map(str::trim)
+        .find(|text| text.contains("ENDMARK"))
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(
+        line, "ENDMARK",
+        "the program received input sent while copy mode was open:\n{grid}"
+    );
+    assert!(
+        !grid.contains("PASTED-IN-COPY") && !grid.contains("^["),
+        "a paste or a mouse report reached the program:\n{grid}"
+    );
+    assert!(
+        !deck.stream_text().contains("\x1b]52;"),
+        "nothing was copied"
+    );
+}
