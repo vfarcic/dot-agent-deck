@@ -33,7 +33,7 @@
 //!
 //! [`ScriptedDaemon`] below is a trimmed COPY of the one in
 //! `tests/e2e_tab_close_regressions.rs`, not a lift into
-//! `tests/common/mod.rs`. `common` is linked by every `tests/e2e_*.rs` file, so
+//! `tests/common/lib.rs`. `common` is linked by every `tests/e2e_*.rs` file, so
 //! editing it makes "the tests covering what you touched" the whole tier
 //! (CLAUDE.md rule 5) — too much for a ~150-line convenience with two call
 //! sites.
@@ -45,7 +45,7 @@
 //! body here sleeps or polls: every wait is a blocking read on the socket
 //! (linkage-check Decision 21).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};

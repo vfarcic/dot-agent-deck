@@ -28,7 +28,7 @@
 //! unaffected. Edit additionally starts the picker at the row's `working_dir` and
 //! pre-fills the authoring seed with the existing schedule's values.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

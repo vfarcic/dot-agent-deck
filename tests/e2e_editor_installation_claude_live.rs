@@ -12,7 +12,7 @@
 //!
 //! Real interactive Claude Code (Haiku) in an installed pane
 //! (`support/claude_installed.rs`). No e2e editor-probe assumption.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/claude_installed.rs"]

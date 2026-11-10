@@ -32,7 +32,7 @@
 //! away.) Flag-gated creation UX is covered by the `scheduler/cli`,
 //! `new-pane/issue-dispatch`, and `scheduler/manager` catalog families.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 #[path = "support/inbox_view.rs"]
 mod view;

@@ -6,7 +6,7 @@
 //! can control StopAgent outcomes while observing the production dialog, tab
 //! strip, status line, and daemon registry.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};

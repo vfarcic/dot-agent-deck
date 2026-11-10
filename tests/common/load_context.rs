@@ -118,7 +118,7 @@ static BASELINE: OnceLock<Baseline> = OnceLock::new();
 /// launch, every harness temp-dir allocation (`harness_temp_root`) and the
 /// agent preflights and importers all reach — so a test that uses none of
 /// those gets neither the hook nor this report.
-pub(crate) fn arm() {
+pub fn arm() {
     let mut first = false;
     BASELINE.get_or_init(|| {
         first = true;
@@ -145,7 +145,7 @@ pub(crate) fn arm() {
 /// The multi-line block the panic hook appends. Never panics: it runs inside
 /// the panic hook, where a second panic aborts the process and loses the
 /// original message.
-pub(crate) fn failure_report() -> String {
+pub fn failure_report() -> String {
     let Some(base) = BASELINE.get() else {
         return render_report(None, Duration::ZERO, Stall::default(), None, None, &[]);
     };

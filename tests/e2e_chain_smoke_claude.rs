@@ -2,7 +2,7 @@
 
 //! Real interactive Claude chain smoke through the native inbox and live card.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

@@ -7,7 +7,7 @@
 //! `mode/live/002` runs a genuine interactive Claude Haiku agent, with no `-p`,
 //! and walks the complete visible typing → command → scroll → typing journey.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

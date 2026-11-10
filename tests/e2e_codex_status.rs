@@ -5,7 +5,7 @@
 //! the real deck, daemon and `dot-agent-deck wrap` around a stand-in that
 //! paints TUI-shaped output and reports its turn through Codex's native hooks.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::Path;
 use std::time::Duration;

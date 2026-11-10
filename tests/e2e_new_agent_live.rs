@@ -4,7 +4,7 @@
 //! while the desktop's daemon verb sequence browses into an ordinary directory,
 //! starts an interactive cheap-model Claude there, and shows its work in a pane.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::{Read, Write};
 use std::path::Path;

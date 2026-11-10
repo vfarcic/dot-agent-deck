@@ -12,7 +12,7 @@
 //! recorded verification.
 #![cfg(target_os = "linux")]
 
-// Issue #322: fast-tier and does not link `tests/common/mod.rs`, so the
+// Issue #322: fast-tier and does not link `tests/common/lib.rs`, so the
 // crate's temp-root resolver is `#[path]`-included instead.
 #[path = "../src/test_temp.rs"]
 mod test_temp;

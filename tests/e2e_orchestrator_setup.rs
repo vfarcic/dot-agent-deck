@@ -27,11 +27,11 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-/// Issue #322: linked purely for [`common::harness_tempdir`]. This file has no
-/// PTY or daemon of its own, but its temp HOMEs must still nest under the one
-/// per-process harness root — a bare `tempfile::tempdir()` here is the first
-/// allocation the process makes, so it lands in the OS temp dir instead.
-mod common;
+// Issue #322: linked purely for [`common::harness_tempdir`]. This file has no
+// PTY or daemon of its own, but its temp HOMEs must still nest under the one
+// per-process harness root — a bare `tempfile::tempdir()` here is the first
+// allocation the process makes, so it lands in the OS temp dir instead.
+dot_agent_deck_test_harness::link!();
 
 /// Path to the freshly-built binary under test (Cargo sets this at
 /// integration-test build time).

@@ -132,7 +132,7 @@ ENGINE="${REEL_ADAPTER_ENGINE:-$SCRIPT_DIR/../demo-reel/reel.sh}"
 EXPECT_COMMIT="${REEL_ADAPTER_EXPECT_COMMIT:-}"
 
 # `provenance.json` schema this adapter understands. The harness's
-# `RECORDING_PROVENANCE_SCHEMA` (tests/common/mod.rs) must match, and
+# `RECORDING_PROVENANCE_SCHEMA` (tests/common/lib.rs) must match, and
 # `tests/harness_isolation.rs` fails the fast tier when the two drift.
 PROVENANCE_SCHEMA=1
 

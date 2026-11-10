@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", unix))]
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::fs;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};

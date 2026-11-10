@@ -9,13 +9,13 @@
 //! already had that fix, through other spawn paths. Clearing the vars from the
 //! test process covers every spawn path at once, including ones added later.
 //!
-//! The clearing happens before `main`, in a constructor in `tests/common/mod.rs`
+//! The clearing happens before `main`, in a constructor in `tests/common/lib.rs`
 //! (issue #1473), and that is also the only place the harness writes these
 //! variables: a write at run time races any thread already reading the
 //! environment (issue #678). So the tests below put the "live deck" into a
 //! re-executed child's environment at exec rather than into this process's.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 /// Scenario: A newly spawned daemon loses six seconds of its readiness window,
 /// exceeding the old five-second ceiling. Startup still
@@ -41,6 +41,46 @@ async fn harness_inprocess_daemon_survives_delayed_scheduling() {
             .await
             .expect("startup must return an endpoint that accepts connections");
     }
+}
+
+/// Scenario: Before calling anything in the harness, read this process's own
+/// state. `link!`'s constructor must already have run: the harness says so,
+/// the wrapped-child lifetime cap is pinned within its 300 s ceiling, and on
+/// Unix `XDG_RUNTIME_DIR` points at the unreachable path, so nothing this
+/// binary spawns can inherit a live deck's runtime dir.
+///
+/// Issue #2083: the harness is a library crate now, and a constructor in a
+/// library runs only if the linker pulls in the object file holding it. The
+/// constructor `link!` defines lives in this binary instead; this test fails
+/// if it did not run, which is what makes "every binary that links the harness
+/// is detached and capped before `main`" a checked property rather than an
+/// assumption about the linker.
+#[test]
+fn the_harness_constructor_ran_before_main_in_this_binary() {
+    assert!(
+        common::linked_before_main(),
+        "`link!()`'s pre-main constructor did not run in this test binary"
+    );
+    let cap = std::env::var(dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS)
+        .expect("the lifetime cap is pinned before main");
+    let secs: u64 = cap.parse().expect("the pinned cap is a number");
+    assert!(
+        (1..=300).contains(&secs),
+        "the pinned cap {secs} is outside 1..=300"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+        Some(std::ffi::OsStr::new(
+            "/dev/null/dot-agent-deck-test-no-live-deck"
+        )),
+        "the before-main detach did not redirect XDG_RUNTIME_DIR"
+    );
+    assert!(
+        std::path::Path::new(common::deck_binary_path())
+            .ends_with(format!("dot-agent-deck{}", std::env::consts::EXE_SUFFIX)),
+        "the test binary did not register the binary under test"
+    );
 }
 
 /// The five deck endpoint and identity variables, with values that mimic a live
@@ -476,7 +516,7 @@ mod live_deck_fallback {
 // read, and that the two ends of that contract cannot drift apart silently.
 
 /// The artifacts the harness dumps — the set the discard has to clear. Mirrors
-/// `RECORDING_ARTIFACTS` in `tests/common/mod.rs`; the guard below proves the two
+/// `RECORDING_ARTIFACTS` in `tests/common/lib.rs`; the guard below proves the two
 /// lists and the dump itself still agree.
 const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
@@ -501,7 +541,7 @@ fn harness_source() -> String {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("common")
-        .join("mod.rs");
+        .join("lib.rs");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
@@ -654,7 +694,7 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
     for name in RECORDING_ARTIFACTS {
         assert!(
             source.contains(&format!("\"{name}\",")),
-            "{name} is missing from RECORDING_ARTIFACTS in tests/common/mod.rs"
+            "{name} is missing from RECORDING_ARTIFACTS in tests/common/lib.rs"
         );
     }
     let mut written: Vec<String> = Vec::new();
@@ -675,7 +715,7 @@ fn tui_deck_launch_discards_the_previous_recording_before_it_spawns() {
         assert!(
             RECORDING_ARTIFACTS.contains(&name.as_str()),
             "dump_recording_files writes `{name}`, which the launch-time discard does \
-             not remove — add it to RECORDING_ARTIFACTS in tests/common/mod.rs, \
+             not remove — add it to RECORDING_ARTIFACTS in tests/common/lib.rs, \
              or an interrupted run leaves it behind (PR #805 audit blocker 3)"
         );
     }
@@ -860,7 +900,7 @@ fn the_provenance_contract_the_adapter_reads_is_the_one_the_harness_writes() {
         assert!(
             written.iter().any(|w| w == field),
             "`.claude/skills/demo-reel-adapter/build.sh` reads provenance field \
-             `{field}`, which `write_provenance` in tests/common/mod.rs does not \
+             `{field}`, which `write_provenance` in tests/common/lib.rs does not \
              write. The adapter treats an absent field as a refusal, so the reel \
              would silently stop selecting every clip. Write the field, or stop \
              reading it. (harness writes: {written:?})"

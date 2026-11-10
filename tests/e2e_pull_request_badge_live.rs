@@ -2,7 +2,7 @@
 
 //! Interactive Haiku PR-badge journey; GitHub lookup stays offline.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;

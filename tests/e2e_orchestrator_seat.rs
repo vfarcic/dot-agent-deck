@@ -28,7 +28,7 @@
 //! The config deliberately puts the worker FIRST, so the pre-#523 role-0
 //! fallback lands on a pane that is visibly the wrong one.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

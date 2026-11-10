@@ -18,7 +18,7 @@ use std::process::Command;
 
 use spec::spec;
 
-// Issue #322. Fast-tier, and deliberately does NOT link `tests/common/mod.rs`;
+// Issue #322. Fast-tier, and deliberately does NOT link `tests/common/lib.rs`;
 // the ~40-line crate-internal resolver is `#[path]`-included instead, at two
 // extra test executions rather than the harness's ~530. Every fixture here is a
 // real git repository plus its worktrees — structurally unbounded, and the
@@ -129,7 +129,7 @@ struct Fixture {
 
 /// Ambient git LOCATION variables, cleared so a fixture command's repository is
 /// the one at its cwd and nothing else. Mirrors `AMBIENT_LOCATION_VARS` in
-/// `src/worktree_owner.rs`, `tests/common/mod.rs` and
+/// `src/worktree_owner.rs`, `tests/common/lib.rs` and
 /// `xtask/linkage-check/src/repo_state.rs`.
 const AMBIENT_LOCATION_VARS: [&str; 8] = [
     "GIT_DIR",
@@ -152,7 +152,7 @@ const AMBIENT_LOCATION_VARS: [&str; 8] = [
 ///
 /// A file-local copy rather than a shared one, twice over: `src`'s
 /// `worktree_owner::fixture_git` is `#[cfg(test)] pub(crate)` and so does not
-/// exist in the library an integration test links, and `tests/common/mod.rs`
+/// exist in the library an integration test links, and `tests/common/lib.rs`
 /// is the PTY harness — this is a fast-tier test, and `mod common;` would drag
 /// that whole harness into it.
 ///

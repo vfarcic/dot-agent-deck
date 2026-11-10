@@ -307,7 +307,7 @@ else
   # `SKIP: <reason>` and return NORMALLY, so nextest counts them as PASSED.
   # Without this flag nextest suppresses passing tests' output and those skips
   # are invisible — a green run that proved nothing. See `REQUIRE_REAL_E2E_ENV`
-  # in tests/common/mod.rs. Lane 1 needs no credentials, so a SKIP here is a
+  # in tests/common/lib.rs. Lane 1 needs no credentials, so a SKIP here is a
   # missing local tool or an unmet host precondition rather than an absent key —
   # which makes it MORE interesting, not less: CI's `e2e-deterministic` job is
   # expected to run these for real.
@@ -335,7 +335,7 @@ else
     # numeric test below dies with "integer expression expected".
     #
     # DELIBERATELY MARKER-LESS. Since #502/#785 `_skip_if_err` in
-    # tests/common/mod.rs prints `SKIP: [e2e] <reason>`, and the narrower
+    # tests/common/lib.rs prints `SKIP: [e2e] <reason>`, and the narrower
     # `SKIP: \[e2e\] ` pattern docs/develop/e2e-lanes.md recommends keeps a count
     # from being polluted by the xtask and unit-test `SKIP:` lines a
     # `--workspace` run also selects. This script keeps the broader pattern for
