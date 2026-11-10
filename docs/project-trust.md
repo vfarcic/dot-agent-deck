@@ -24,6 +24,14 @@ The review is titled **Review project commands** and shows:
 - **Deck:** in the desktop app, the deck the orchestration would start on. The approval is recorded on that deck and the orchestration starts there. If you switch to another deck while the review is open, the review closes and nothing is approved or started.
 - **Removed since you approved it:** the roles your approval had that the file no longer defines.
 
+**TUI:**
+
+![The TUI's Review project commands prompt for the orchestration team in /home/dev/demo-project, State changed since you approved it: the orchestrator role unmarked, the coder role marked changed with its command now claude --model opus, the tester role marked new, each with its command, start, clear, description and prompt rows, then Removed since you approved it: reviewer, and the footer a approve and start, Esc cancel, arrow keys scroll](/img/project-trust-tui.png)
+
+**Desktop:**
+
+![The desktop app's Review project commands dialog over the agent dashboard, showing the same review: Deck: Local daemon, the project /home/dev/demo-project, orchestration team, State changed since you approved it, the orchestrator, coder (changed) and tester (new) roles with their command, start, clear, description and prompt, Removed since you approved it: reviewer, and the Cancel and Approve and start buttons](/img/project-trust-desktop.png)
+
 Read the commands and prompts as what they are: commands that will run as you, and instructions your agents will follow. Characters that could hide or disguise text, such as terminal control sequences, are shown as escapes (for example `\u{1b}`) rather than obeyed, in both clients, on the command line and in the refusal messages described below.
 
 ## Answer it

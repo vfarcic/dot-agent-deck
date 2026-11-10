@@ -1356,3 +1356,154 @@ fn docs_screenshot_restart_notice() {
             && grid.contains("No active agents")
     });
 }
+
+/// What the `project-trust` scene shows as its project's path, in place of
+/// the scene's own `/tmp` folder: the desktop fixture's `demo-project`.
+const PROJECT_TRUST_DISPLAY_DIR: &str = "/home/dev/demo-project";
+
+/// The `team` orchestration the `project-trust` scene approves first. The
+/// desktop fixture's `DOCS_TRUST_ROLES` and `DOCS_TRUST_REMOVED_ROLES` carry
+/// the review this and [`PROJECT_TRUST_CHANGED`] make, so change them together.
+const PROJECT_TRUST_APPROVED: &str = r#"[[orchestrations]]
+name = "team"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+clear = false
+prompt_template = "Break the task into steps and delegate each one."
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model sonnet"
+prompt_template = "Implement the task you are given and run the tests."
+
+[[orchestrations.roles]]
+name = "reviewer"
+command = "claude"
+prompt_template = "Review the diff and report what you find."
+"#;
+
+/// `team` as it reads after the approval: `coder`'s command changed, `tester`
+/// added, `reviewer` removed.
+const PROJECT_TRUST_CHANGED: &str = r#"[[orchestrations]]
+name = "team"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "claude"
+start = true
+clear = false
+prompt_template = "Break the task into steps and delegate each one."
+
+[[orchestrations.roles]]
+name = "coder"
+command = "claude --model opus"
+prompt_template = "Implement the task you are given and run the tests."
+
+[[orchestrations.roles]]
+name = "tester"
+command = "codex"
+prompt_template = "Write a failing test for the task, then report it."
+"#;
+
+/// Scenario: Launch the deck in a project whose `team` orchestration was
+/// approved, then change its config on disk: `coder`'s command changed,
+/// `tester` added, `reviewer` removed. Open it from New Agent (Ctrl+N, the
+/// directory, the orchestration, Enter) and capture the `Review project
+/// commands` prompt with every role, the removed one and the footer on screen.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_project_trust() {
+    html_dir();
+    // The prompt prints the project's whole path. A `/tmp` folder whose path is
+    // exactly as long as the displayed one is written over by it in the HTML,
+    // so the swap moves no cell; where `/tmp` resolves through a longer path
+    // (macOS), the displayed one is padded to that length.
+    const RANDOM: usize = 5;
+    let name_len = PROJECT_TRUST_DISPLAY_DIR.len() - "/tmp/".len();
+    let project = tempfile::Builder::new()
+        .prefix(&"dad-docs-trust-scene"[..name_len - RANDOM])
+        .rand_bytes(RANDOM)
+        .tempdir_in("/tmp")
+        .expect("create the scene's project folder");
+    let shown_path = std::fs::canonicalize(project.path())
+        .expect("canonicalize the project folder")
+        .to_str()
+        .expect("UTF-8 path")
+        .to_string();
+    let raw_path = project.path().to_str().expect("UTF-8 path").to_string();
+    let folder = project
+        .path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("a UTF-8 folder name")
+        .to_string();
+    assert!(
+        shown_path.len() >= PROJECT_TRUST_DISPLAY_DIR.len(),
+        "the project's path must be at least as long as the one displayed"
+    );
+    std::fs::write(
+        project.path().join(".dot-agent-deck.toml"),
+        PROJECT_TRUST_APPROVED,
+    )
+    .expect("write the approved config");
+    let deck = launch_with(|builder| {
+        builder
+            .with_launch_subdir(project.path())
+            .trusting_project(project.path())
+    });
+    deck.wait_for_string("No active agents");
+    std::fs::write(
+        project.path().join(".dot-agent-deck.toml"),
+        PROJECT_TRUST_CHANGED,
+    )
+    .expect("write the changed config");
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\x1b[C");
+    deck.wait_for_string("Orch: team");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    let page = deck.capture_screen_when("project-trust", |screen| {
+        let grid = screen.contents();
+        (grid.contains("Review project commands")
+            && grid.contains(&shown_path)
+            && grid.contains("changed since you approved it")
+            && grid.contains("Role: orchestrator")
+            && grid.contains("Role: coder  changed")
+            && grid.contains("Role: tester  new")
+            && grid.contains("claude --model opus")
+            && grid.contains("Write a failing test for the task, then report it.")
+            && grid.matches("description: (none)").count() == 3
+            && grid.contains("Removed since you approved it: reviewer")
+            && grid.contains("a approve and start · Esc cancel · ↑↓ scroll")
+            && !grid.contains("(more")
+            && !STARTUP_HOOK_NOTES.iter().any(|note| grid.contains(note)))
+        .then(|| render_page(screen, "project-trust (TUI)", &RenderOptions::default()))
+    });
+    let width = shown_path.len();
+    let page = page
+        .replace(&shown_path, &format!("{PROJECT_TRUST_DISPLAY_DIR:<width$}"))
+        .replace(
+            &folder,
+            &format!("{:<width$}", "demo-project", width = folder.len()),
+        );
+    for leak in [
+        shown_path.as_str(),
+        raw_path.as_str(),
+        folder.as_str(),
+        "/tmp/",
+        "/var/tmp",
+        "dad-tests-",
+        "dad-e2e-",
+        "dad-docs",
+    ] {
+        assert!(!page.contains(leak), "{leak} reaches the image");
+    }
+    write_page("project-trust", &page);
+    drop(deck);
+}

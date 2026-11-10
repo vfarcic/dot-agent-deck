@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -3096,6 +3096,13 @@ class FixtureDeckBridge implements DeckBridge {
    * deck ids. Empty by default.
    */
   private nonUnixDecks: ReadonlySet<string> = new Set();
+  /**
+   * PRD #1885 — `?trust=changed` plays the `project-trust` docs scene: the
+   * fixture project defines `team` ({@link DOCS_TRUST_ORCHESTRATION}), and its
+   * review answers `changed` instead of approved, so starting it opens the
+   * Review project commands dialog. Off by default.
+   */
+  private docsTrustReview = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
@@ -3129,6 +3136,7 @@ class FixtureDeckBridge implements DeckBridge {
     else if (older) this.olderDecks = new Set(older.split(",").map((deckId) => deckId.trim()).filter(Boolean));
     const nonUnix = new URLSearchParams(window.location.search).get("nonunix");
     if (nonUnix) this.nonUnixDecks = new Set(nonUnix.split(",").map((deckId) => deckId.trim()).filter(Boolean));
+    this.docsTrustReview = new URLSearchParams(window.location.search).get("trust") === "changed";
     this.fleet.forEach((deck) => this.markOlderDeck(deck));
   }
 
@@ -3928,6 +3936,17 @@ class FixtureDeckBridge implements DeckBridge {
   async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
     await Promise.resolve();
     const home = FIXTURE_HOMES[target.deckId ?? ""] ?? "/home/dev";
+    if (this.docsTrustReview && target.path === `${home}/demo-project` && target.orchestration === DOCS_TRUST_ORCHESTRATION.name) {
+      return {
+        kind: "review",
+        project: target.path,
+        orchestration: target.orchestration,
+        state: "changed",
+        roles: DOCS_TRUST_ROLES.map((role) => ({ ...role })),
+        removedRoles: [...DOCS_TRUST_REMOVED_ROLES],
+        digest: "fixture-digest",
+      };
+    }
     const roles = fixtureProjectOrchestrations(home, target.path)?.find((candidate) => candidate.name === target.orchestration)?.roles ?? [];
     return {
       kind: "review",
@@ -3949,7 +3968,8 @@ class FixtureDeckBridge implements DeckBridge {
     this.connectedDeck(deckId);
     if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
-    const orchestrations = (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
+    const docsTrust = this.docsTrustReview && path === `${home}/demo-project` ? [DOCS_TRUST_ORCHESTRATION] : undefined;
+    const orchestrations = docsTrust ?? (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };
     return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
