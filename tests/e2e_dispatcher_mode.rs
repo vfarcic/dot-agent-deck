@@ -2475,6 +2475,241 @@ fn dispatch_close_003_a_worktree_cleaned_while_the_dialog_is_open_is_not_reporte
     );
 }
 
+/// Add the clone-local rule that git-ignores the deck's `.dot-agent-deck/`
+/// coordination directory, as the deck does when it publishes orchestration
+/// context, in `repo`'s shared `info/exclude` — which every linked worktree of
+/// `repo` reads, including one dispatched later.
+fn ignore_deck_dir(repo: &Path) {
+    let out = common::fixture_git(repo, repo)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .expect("git available");
+    let exclude = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let exclude = if exclude.is_absolute() {
+        exclude
+    } else {
+        repo.join(exclude)
+    };
+    let mut rules = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !rules.lines().any(|l| l.trim() == "/.dot-agent-deck/") {
+        rules.push_str("\n/.dot-agent-deck/\n");
+        std::fs::create_dir_all(exclude.parent().expect("exclude has a parent"))
+            .expect("create the info dir");
+        std::fs::write(&exclude, rules).expect("ignore .dot-agent-deck/");
+    }
+}
+
+/// Scenario: Dispatch a single REAL Claude agent (Haiku), which writes a uniquely
+/// named sentinel file into its worktree's git-ignored `.dot-agent-deck/`, reports
+/// back and goes Idle, leaving the worktree clean. Select its card, press Ctrl+W,
+/// then Down, Down, Enter to choose `Close, keep worktree`: the agent goes, the
+/// worktree and the sentinel stay on disk, and the status line reads
+/// `Worktree kept on request:` with the worktree's path.
+#[spec("dispatch/close/004")]
+#[test]
+fn dispatch_close_004_close_keep_worktree_keeps_a_real_units_clean_worktree() {
+    // Decision 26 runtime-skip: missing CLI / credentials is environmental.
+    skip_unless!(common::check_claude_available());
+
+    const UNIT: &str = "keep-live";
+    /// The single-agent dispatch labels its card with the task name.
+    const CARD: &str = "dispatch-keep-live";
+    /// Uniquely named, so neither assertion can pass on some other stray file.
+    const SENTINEL: &str = "keep-live-sentinel-1958-a7d3.txt";
+    const SENTINEL_TEXT: &str = "written by the unit";
+    const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+    // A bare `claude`, so the deck recognises the agent and its card carries the
+    // status the agent reports — Idle is what the user waits for before closing.
+    // Interactive (no `-p`), pinned to the cheap model, with the tools its one
+    // short turn needs pre-allowed: Bash for the sentinel and `work-done`, Write
+    // and Read for the report file the dispatch prompt asks for.
+    let cfg = write_default_command_config(&format!(
+        "claude --model {HAIKU_MODEL} --allowedTools Bash Write Read"
+    ));
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        // Roomy, so neither the card title nor the status line's path is
+        // ellipsized — the path IS the assertion.
+        .with_pty_size(220, 50)
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_env(
+            "DOT_AGENT_DECK_CONFIG",
+            cfg.path().join("config.toml").to_string_lossy(),
+        )
+        .with_imported_claude_credentials()
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    // The minimal fixture ignores nothing; ignore the deck's own directory as a
+    // real project does, so the sentinel leaves the worktree CLEAN and keeping
+    // it can only be the user's request, not the dirty-tree protection.
+    ignore_deck_dir(deck.workdir());
+    common::commit_fixture_repo(deck.workdir());
+
+    let expected_worktree = dispatch_worktree_of(&deck, UNIT);
+    let _guard = SiblingWorktreeGuard(expected_worktree.clone());
+    // Trust the not-yet-created worktree (and its canonical spelling, for
+    // macOS's `/var` -> `/private/var` alias) so claude's first-run gates clear
+    // without a keystroke and the injected task reaches a usable agent.
+    let mut trust = vec![expected_worktree.to_string_lossy().into_owned()];
+    if let (Some(parent), Some(name)) = (expected_worktree.parent(), expected_worktree.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        let canonical = canonical_parent.join(name).to_string_lossy().into_owned();
+        if !trust.contains(&canonical) {
+            trust.push(canonical);
+        }
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &trust)
+        .expect("seed Claude onboarding and project trust");
+
+    // A caller with no command (a shell): its `--single` unit starts the deck's
+    // `default_command`, the real agent above (issue #1602).
+    let caller_pane = open_caller_pane(&deck, b"");
+
+    let task = format!(
+        "Use Bash to run exactly this command now: mkdir -p .dot-agent-deck && printf \
+         '{SENTINEL_TEXT}' > .dot-agent-deck/{SENTINEL} . Do not create, edit or delete any \
+         other file outside .dot-agent-deck, and do not ask questions."
+    );
+    let out = std::process::Command::new(common::contained_deck_binary())
+        .args(["dispatch", UNIT, "--task", &task, "--single"])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env("DOT_AGENT_DECK_PANE_ID", &caller_pane)
+        .output()
+        .expect("the dispatch CLI should run");
+    assert!(
+        out.status.success(),
+        "`dispatch --single` failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The real agent does the work: the sentinel only exists if it ran the
+    // command in its own worktree.
+    let sentinel = expected_worktree.join(".dot-agent-deck").join(SENTINEL);
+    const WORK_WAIT: Duration = Duration::from_secs(240);
+    let unit_record = || {
+        common::agent_records_on(deck.attach_socket_path())
+            .into_iter()
+            .find(|r| r.display_name.as_deref() == Some(CARD))
+    };
+    let unit_tail = || {
+        unit_record()
+            .map(|r| {
+                let text =
+                    common::strip_ansi(&common::pane_snapshot_on(deck.attach_socket_path(), &r.id));
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                lines[lines.len().saturating_sub(20)..].join("\n")
+            })
+            .unwrap_or_else(|| "<no record for the unit>".to_string())
+    };
+    assert!(
+        common::wait_until(WORK_WAIT, || std::fs::read_to_string(&sentinel)
+            .is_ok_and(|s| s.contains(SENTINEL_TEXT))),
+        "the real dispatched agent never wrote {} within {}s.\nUnit pane tail:\n{}\nGrid:\n{}",
+        sentinel.display(),
+        WORK_WAIT.as_secs(),
+        unit_tail(),
+        deck.snapshot_grid()
+    );
+    // …and finishes its turn (its report included): the user closes an Idle
+    // agent whose work is done, not one mid-turn.
+    assert!(
+        common::wait_until(WORK_WAIT, || unit_record().is_some_and(|r| r
+            .live
+            .as_ref()
+            .is_some_and(|l| l.status == SessionStatus::Idle))),
+        "the dispatched agent wrote its sentinel but never went Idle within {}s.\n\
+         Live: {:?}\nUnit pane tail:\n{}\nGrid:\n{}",
+        WORK_WAIT.as_secs(),
+        unit_record().and_then(|r| r.live.map(|l| l.status)),
+        unit_tail(),
+        deck.snapshot_grid()
+    );
+    // Premise: the tree is CLEAN, so the ordinary Close would remove it
+    // (`dispatch/close/003`) — what keeps it below is the keep choice.
+    assert_eq!(
+        porcelain(&expected_worktree),
+        "",
+        "premise: the worktree must be clean (the sentinel is in the ignored \
+         .dot-agent-deck/) so that keeping it can only be the user's request.\n\
+         Unit pane tail:\n{}",
+        unit_tail()
+    );
+
+    // Command mode. Close the CALLER card first (it is the selected one and owns
+    // no worktree), which leaves the dispatched card as the only, selected, one.
+    deck.send_keys(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("COMMAND");
+    confirm_close_selected(&deck);
+    assert!(
+        common::wait_until(Duration::from_secs(30), || {
+            let g = deck.snapshot_grid();
+            !g.contains("caller") && g.contains(CARD)
+        }),
+        "the caller card did not close, so the dispatched card is not the target \
+         below.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            let g = deck.snapshot_grid();
+            g.lines()
+                .any(|l| l.contains('\u{25b8}') && l.contains(CARD))
+        }),
+        "the dispatched card is not the selected one, so Ctrl+W would not target \
+         it.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The user's choice: Ctrl+W offers Cancel, Close and `Close, keep worktree`.
+    deck.send_keys(b"\x17"); // Ctrl+W → close confirmation
+    deck.wait_for_string("Close selected agent?");
+    deck.wait_for_string("Close, keep worktree");
+    deck.send_keys(b"\x1b[B"); // Down → Close
+    deck.send_keys(b"\x1b[B"); // Down → Close, keep worktree
+    deck.send_keys(b"\r");
+
+    // The deck says what it did, with the path, on the status line.
+    let path = expected_worktree.to_string_lossy().into_owned();
+    const CLOSE_WAIT: Duration = Duration::from_secs(60);
+    assert!(
+        common::wait_until(CLOSE_WAIT, || {
+            let g = deck.snapshot_grid();
+            g.contains("Worktree kept on request:") && g.contains(path.as_str())
+        }),
+        "after `Close, keep worktree` the status line must say the worktree was kept \
+         on request and where ({path}).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    // The agent is gone…
+    assert!(
+        common::wait_until(CLOSE_WAIT, || unit_record().is_none()),
+        "the dispatched agent was not stopped by `Close, keep worktree`.\nRecords: {:?}\nGrid:\n{}",
+        common::agent_records_on(deck.attach_socket_path())
+            .iter()
+            .map(|r| (r.id.clone(), r.display_name.clone()))
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    // …and the claim is TRUE: the clean worktree, which an ordinary close removes,
+    // is still on disk with the agent's sentinel in its `.dot-agent-deck/`. Checked
+    // again after a pause, so a removal that lands late cannot pass unseen.
+    std::thread::sleep(Duration::from_secs(3));
+    assert!(
+        expected_worktree.is_dir(),
+        "the deck said the worktree was kept on request, but {} is gone.\nGrid:\n{}",
+        expected_worktree.display(),
+        deck.snapshot_grid()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&sentinel).unwrap_or_default(),
+        SENTINEL_TEXT,
+        "the kept worktree lost the agent's sentinel in its .dot-agent-deck/"
+    );
+}
+
 /// Scenario: Launch the deck on the `orch-multi` fixture — two spawnable
 /// orchestrations where the SECOND, `gpt-side`, both `extends` the first and
 /// declares `default = true` — open one ordinary `cat` pane to dispatch from,

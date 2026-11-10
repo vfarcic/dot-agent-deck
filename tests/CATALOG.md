@@ -5757,6 +5757,13 @@ without depending on the config struct API.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close/004 — A real dispatched agent closed with `Close, keep worktree` leaves its clean worktree on disk, and the status line says it was kept on request and where (issue #1958). [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatcher_mode.rs`; `TuiDeck` on the `minimal` fixture driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → Down, Down, Enter path).
+- **Agent:** claude/haiku — a REAL interactive Claude Code (`claude --model claude-haiku-4-5-20251001`, no `-p`) as the dispatched unit; the caller pane is a shell, so the unit starts the deck's `default_command` (issue #1602).
+- **Asserts:** the agent does one directive, deterministic operation in its own worktree — writing a uniquely named sentinel file into the git-ignored `.dot-agent-deck/` — and goes Idle with the worktree clean (the premise: an ordinary Close would remove it, `dispatch/close/003`); the close confirmation offers `Close, keep worktree`; choosing it puts `Worktree kept on request:` and the worktree's path on the status line, removes the agent from the daemon, and leaves the worktree and the agent's sentinel on disk.
+- **Does not assert:** the tab/orchestration scope (the CLI's is `dispatch/close-verb/013`), a daemon without the keep capability, the desktop dialogs (`AgentOverviewStop.test.tsx`, `AgentPaneOverlay.test.tsx`), or `worktree reclaim` afterwards. The stand-in twin with no agent is `prompt/close-confirm/012`.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/close-verb
 
 ##### dispatch/close-verb/001 — A completed single unit closes from its dispatcher's environment; its worktree is removed and its branch kept.
