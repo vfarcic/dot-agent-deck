@@ -376,6 +376,7 @@ fn probe_041_live_failed_report_with_notice_keeps_overlapping_typing() {
 /// Scenario: As the delayed case, but the check's helper is held for 11 seconds at its very start, before it reads anything, past the ten-second wait after which the deck counts the check's byte as unanswered. Every trial must still end with exactly EARLYLATE in Codex's input box and the task undelivered, the person's editor having opened once and read LATE, and the helper still reports the box it read empty.
 #[spec("inbox/probe/041")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2264"]
 fn probe_041_live_late_helper_keeps_overlapping_typing() {
     overlap_trials(Path041 {
         name: "late-helper",

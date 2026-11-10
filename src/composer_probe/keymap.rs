@@ -1565,15 +1565,84 @@ impl CodexBaseline {
     /// which never passes through the shim, so only this side can carry
     /// them, and they are left out only when what remains is the baseline's
     /// launch.
+    ///
+    /// A launcher may also pass `-c` options of its own that the deck's
+    /// launch line never shows, as `devbox run codex-big`'s script does
+    /// (issue #2258). Those are accepted when none of them can set a key
+    /// binding ([`keymap_neutral_override`]) and the launch is otherwise the
+    /// baseline's: the effective `tui.keymap` the baseline's read checks is
+    /// then the bound agent's too.
     pub fn bound(&self, codex_home: &Path, args: &[OsString], cwd: &Path) -> Result<(), Hold> {
         let args = without_embedded_pair(args);
-        if codex_sources(codex_home, args, cwd)? == self.sources {
+        let launched = codex_sources(codex_home, args, cwd)?;
+        if launched == self.sources {
             return Ok(());
         }
-        match without_shim_otel(args) {
-            Some(rest) if codex_sources(codex_home, rest, cwd)? == self.sources => Ok(()),
-            _ => Err(Hold::Changed),
+        let rest = without_shim_otel(args);
+        if let Some(rest) = rest
+            && codex_sources(codex_home, rest, cwd)? == self.sources
+        {
+            return Ok(());
         }
+        let launched = match rest {
+            Some(rest) => codex_sources(codex_home, rest, cwd)?,
+            None => launched,
+        };
+        if launched.adds_only_neutral_overrides_to(&self.sources) {
+            Ok(())
+        } else {
+            Err(Hold::Changed)
+        }
+    }
+}
+
+/// Whether the `-c key=value` override `value` can't set a key binding:
+/// its key's first segment is a bare key other than `tui` (where Codex
+/// reads `tui.keymap`), `profile` or `profiles` (which can select or
+/// define another layer of settings), and it holds no control character,
+/// so a newline can't add a second key after the value (the revcxkey2
+/// review's NIT-1). `otel` and `shell_environment_policy` are left to
+/// [`without_shim_otel`] and [`without_embedded_pair`], whose shape rules
+/// decide the telemetry shim's overrides and the deck wrapper's own pair. A
+/// quoted or empty first segment, or an override with no `=`, counts as one
+/// that can.
+fn keymap_neutral_override(value: &str) -> bool {
+    let Some((key, _)) = value.split_once('=') else {
+        return false;
+    };
+    let first = key.split('.').next().unwrap_or_default().trim();
+    !first.is_empty()
+        && first
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && !matches!(
+            first,
+            "tui" | "profile" | "profiles" | "otel" | "shell_environment_policy"
+        )
+        && !value.chars().any(char::is_control)
+}
+
+impl CodexSources {
+    /// Whether these sources are `baseline`'s with only
+    /// [`keymap_neutral_override`]s added: the same files, and `baseline`'s
+    /// overrides in order among this launch's, every other one neutral.
+    fn adds_only_neutral_overrides_to(&self, baseline: &CodexSources) -> bool {
+        if self.config != baseline.config
+            || self.profile != baseline.profile
+            || self.projects != baseline.projects
+            || self.dotenv != baseline.dotenv
+        {
+            return false;
+        }
+        let mut expected = baseline.overrides.iter().peekable();
+        for value in &self.overrides {
+            if expected.peek() == Some(&value) {
+                expected.next();
+            } else if !keymap_neutral_override(value) {
+                return false;
+            }
+        }
+        expected.next().is_none()
     }
 }
 
