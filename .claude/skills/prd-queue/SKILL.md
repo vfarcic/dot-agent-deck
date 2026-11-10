@@ -479,9 +479,14 @@ GATES — CLAUDE.md is the authority, this is the summary:
   report. Anything that reaches a real agent (`cargo test-e2e-live`, or any
   command with the `e2e-live` feature) stays local.
 - The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
-  above. ci.yml carries a bare `workflow_dispatch:`, so after a push
+  above. ci.yml carries a `workflow_dispatch:`, so after a push
   `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
-  the URL that prints, not from a listing). But the helper's gates run BEFORE
+  the URL that prints, not from a listing). Sweep only the half you are
+  missing: with a working `rwx` login, `rwx run .rwx/ci.yml` runs the Linux
+  half on RWX and `-f linux_jobs=false` dispatches build-macos alone (for
+  when your gates did not run on macOS); without one, pass
+  `-f build_macos=false` when your gates ran `cargo test-fast` on macOS and
+  the change leaves build-macos's own job alone. Both default to true. But the helper's gates run BEFORE
   a commit exists, so they have already passed by the time there is anything
   to dispatch, and the helper stays the per-task gate. What a dispatch
   buys is the part no local gate covers at all — build-macos,
@@ -633,8 +638,11 @@ lifecycle, and it covers what /prd-full does not.
   optional. Send with `scripts/notify.sh "<message>"`; it enforces the explicit
   chat_id and has no inbound path, so those two rules hold by construction.
 - The full matrix can run on GitHub's runners, and it is yours to pass on.
-  ci.yml carries a bare `workflow_dispatch:`, so after a push
-  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there. It
+  ci.yml carries a `workflow_dispatch:`, so after a push
+  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there; sweep
+  only the half that is missing (`rwx run .rwx/ci.yml` for Linux,
+  `-f linux_jobs=false` or `-f build_macos=false` on the dispatch, per
+  docs/develop/ci-on-demand.md's table). It
   relieves NO gate a worker owes: `cargo xtask affected-checks --run` is the
   gate before a commit exists, so whatever it selected has already passed by
   the time there is anything to dispatch. What it buys is the part no local
