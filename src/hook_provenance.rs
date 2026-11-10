@@ -286,7 +286,9 @@ impl RetiredHookTokens {
     /// How many retired tokens are remembered. A dying agent's last hook
     /// arrives within a second of its teardown (issue #2104 measured 102 of
     /// 116 within one), so this only has to outlast the teardowns of one busy
-    /// burst; 32 bytes each, so the bound costs 32 KiB at most.
+    /// burst. Each entry is a 32-byte digest held in both `order` and
+    /// `digests`, so a full set is 64 KiB of digests plus the two
+    /// collections' own overhead.
     pub(crate) const CAPACITY: usize = 1024;
 
     fn digest(token: &str) -> [u8; 32] {
