@@ -25248,7 +25248,10 @@ mod spawn_tests {
             orchestration_id: Some("o-2094".to_string()),
         };
         let inherited = std::env::var(crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION)
-            .unwrap_or_else(|_| "<unset>".to_string());
+            .ok()
+            // The child's `${VAR:-<unset>}` reads an empty value as unset too.
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "<unset>".to_string());
         let registry = Arc::new(AgentPtyRegistry::new());
         let worker = child_observed_prompt_suggestion(
             &registry,

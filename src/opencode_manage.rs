@@ -12762,6 +12762,7 @@ process.exit(0);
             &driver,
             format!(
                 r#"import {{ execSync }} from "child_process";
+import {{ readFileSync }} from "fs";
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const handlers = new Map();
 const api = {{
@@ -12780,9 +12781,17 @@ for (let n = 1; n <= 20; n++) {{
 }}
 const count = () => execSync("ps -eo args").toString().split(String.fromCharCode(10)).filter((l) => l.includes("sleep 39")).length;
 // Poll rather than sleep a fixed span: on a loaded host the sixteen recorder
-// launches can take longer than any fixed wait. Then settle, so a cap that
-// let a seventeenth through would have time to show it.
-for (let waited = 0; waited < 20000 && count() < 16; waited += 100) {{
+// launches can take longer than any fixed wait. The poll reads this test's
+// own call log, so another process's `sleep` cannot end it early. Then
+// settle, so a cap that let a seventeenth through would have time to show it.
+const awaiting = () => {{
+  try {{
+    return readFileSync("{calls}", "utf8").split(String.fromCharCode(10)).filter((l) => l === "await-answer").length;
+  }} catch {{
+    return 0;
+  }}
+}};
+for (let waited = 0; waited < 20000 && awaiting() < 16; waited += 100) {{
   await sleep(100);
 }}
 await sleep(500);
@@ -12792,7 +12801,8 @@ await sleep(500);
 console.log(JSON.stringify({{ held, after: count() }}));
 process.exit(0);
 "#,
-                plugin = plugin.display()
+                plugin = plugin.display(),
+                calls = calls.display(),
             ),
         )
         .unwrap();
