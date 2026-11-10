@@ -29594,7 +29594,26 @@ mod spawn_tests {
             RingOutcome::Txn(Outcome::Unresolved(Cause::WriteStalled)),
             "{report:?}"
         );
-        assert!(started.elapsed() < TXN_MAX + Duration::from_millis(500));
+        // The parked write is let go only after the ring returns, so a ring
+        // that waited on it would never return: the bound is there to show the
+        // deadline ended the attempt, not a later clock. It is measured from
+        // before the ring, admission included, and the slack is for a loaded
+        // runner: on `build-macos` the ring ends about 3.1 s in, and one run
+        // (main, 2026-11-09) reached 3.6 s and failed the 500 ms slack this had
+        // (issue #2089). The writer being free is the property itself.
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < TXN_MAX + Duration::from_millis(1500),
+            "the ring ended {elapsed:?} after it started"
+        );
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok(),
+            "the ring released the writer"
+        );
         assert!(matches!(editor.cell(), Latch::Suspended(..)));
         reached
             .recv_timeout(Duration::from_secs(1))
