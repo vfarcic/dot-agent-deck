@@ -616,6 +616,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    its tooltip — and the status and badges beside it keep their full width. */
 .agent-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-title-line > :not(h2) { flex: 0 0 auto; }
+/* Issue #1798: the muted facts beside the name (the binary, a renamed role's
+   role) give way after it, so the status and badges keep their full width. */
+.agent-title-line > .agent-identity-facts { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
