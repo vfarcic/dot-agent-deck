@@ -1871,7 +1871,26 @@ fn status_008_card_shows_not_delivered_error_notice() {
         if !rendered.contains(&expected) {
             failures.push(format!("{name}: expected {expected:?} on\n{rendered}"));
         }
-        cards.push_str(&format!("=== {name} ===\n{rendered}\n"));
+        // A card in a 120-column dashboard's two-column grid is about 60
+        // columns wide: the notice wraps there, so the exit code and the rest
+        // of it are still on the card (PR #2245 review).
+        let narrow = delivery_notice_card(&notices[0], 60);
+        let words_on_card = narrow
+            .lines()
+            .map(|row| row.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !words_on_card
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains(&expected)
+        {
+            failures.push(format!(
+                "{name}: expected {expected:?} on the 60-column card\n{narrow}"
+            ));
+        }
+        cards.push_str(&format!("=== {name} ===\n{rendered}\n{narrow}\n"));
     }
     assert!(
         failures.is_empty(),

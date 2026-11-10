@@ -22930,7 +22930,14 @@ fn render_session_card(
     // Blocked reason, and an attention reason like it, so at Minimal density
     // it keeps the row ahead of background work, as the desktop tile orders
     // them (PRD #1666 MC-2, CLAUDE.md rule 22).
+    //
+    // Issue #1933: the notice says how the agent's pane ended, the exit code
+    // included, in a sentence longer than a card in a two-column grid is wide,
+    // so it wraps like the agent notice below (which takes the wrap instead
+    // when both are on the card, as the row that explains everything else).
+    let mut wrapped_notice: Option<usize> = None;
     if !is_placeholder && let Some(notice) = session.delivery_notice() {
+        wrapped_notice = Some(attention.len());
         attention.push((
             notice.to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
@@ -22957,7 +22964,6 @@ fn render_session_card(
     // shown first in this row) says what to do in a sentence longer than a
     // card is wide, so it wraps over up to [`CARD_AGENT_NOTICE_ROWS`] rows, as
     // the desktop tile shows it whole; the other notices keep one row.
-    let mut wrapped_notice: Option<usize> = None;
     if !is_placeholder && let Some(notice) = session.inbox_notice() {
         let is_agent_notice = session
             .card_inbox()
@@ -22991,7 +22997,7 @@ fn render_session_card(
         Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
     };
     let shares_row = density == CardDensity::Minimal && !attention.is_empty();
-    // The rows the agent notice may take: what the card has left after its
+    // The rows the wrapped notice may take: what the card has left after its
     // tools and every other status row, between one and
     // [`CARD_AGENT_NOTICE_ROWS`].
     let other_rows = attention.len().saturating_sub(1)
@@ -23129,7 +23135,8 @@ const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// PRD #2050: the most rows a card gives the daemon's agent notice, which
 /// leads with what to do (`crate::agent_notice`), so its first two rows carry
-/// the remedy on a card of about 60 columns.
+/// the remedy on a card of about 60 columns. Issue #1933: the delivery notice
+/// wraps over as many, so how the pane ended fits a card of that width.
 const CARD_AGENT_NOTICE_ROWS: usize = 3;
 
 /// `text` word-wrapped to `width` columns over at most `max_rows` rows, the

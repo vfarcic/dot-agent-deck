@@ -609,7 +609,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
 .agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
-.agent-title-line { display: flex; align-items: center; gap: 6px; }
+/* Issue #1798: one line while it fits. A tile crowded with badges wraps the
+   rest onto a second row rather than pushing the rename pencil, which ends the
+   line, out of the header. */
+.agent-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
 /* Issue #2001: the title is the agent's name, which can be long, so it is the
    one part of the line that gives way — cut with an ellipsis, the whole name in
@@ -643,7 +646,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-inbox-attention-actions button { padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius); color: var(--ink); background: var(--paper-strong); font: inherit; font-weight: 700; cursor: pointer; }
 .agent-inbox-attention-actions button:disabled { color: var(--faint); cursor: default; }
 .agent-inbox-attention-answer { display: block; margin-top: 3px; color: var(--ink); }
-.agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Issue #1933: the notice says how the agent's pane ended, its exit code last,
+   so it wraps rather than being cut, as the TUI card wraps it. */
+.agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; white-space: normal; overflow-wrap: anywhere; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
    about now, not a label. */
