@@ -2534,14 +2534,28 @@ mod tests {
     ) -> (String, String, std::path::PathBuf, Value) {
         let home = fixture.join("fake-operator-home");
         std::fs::create_dir_all(&home).unwrap();
-        let a = seed_versioned_deck(&fixture.join("homebrew").join("dot-agent-deck"), pinned);
+        let a_path = fixture.join("homebrew").join("dot-agent-deck");
+        let a = seed_versioned_deck(&a_path, pinned);
         let b = seed_deck(&fixture.join("local").join("dot-agent-deck"));
         install_config(agent, &home, &a).unwrap();
         let path = home.join(config_name(agent));
         surround_deck_rules(&path, None);
         let around = rules_around_the_deck(agent, &path);
-        crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b));
+        with_pin_answering(&a_path, pinned, || {
+            crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b))
+        });
         (a, b, path, around)
+    }
+
+    /// Run `f` with the probe of the pin at `a_path` answering what its stub
+    /// prints: `pinned`, or, for `None`, output that is not a version. The
+    /// decision is under test here, not the probe's timing (issue #2183).
+    #[cfg(unix)]
+    fn with_pin_answering<R>(a_path: &Path, pinned: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let answer = pinned
+            .map(str::to_string)
+            .ok_or_else(|| "its `--version` output is not a dot-agent-deck version".to_string());
+        crate::hook_binary::with_probe_answers([(a_path.to_path_buf(), answer)], f)
     }
 
     /// Issue #1637's takeover matrix for one writer.
@@ -2629,10 +2643,8 @@ mod tests {
         const RETIRED: &str = "UpgradeRetiredEvent";
         let home = fixture.join("fake-operator-home");
         std::fs::create_dir_all(&home).unwrap();
-        let a = seed_versioned_deck(
-            &fixture.join("homebrew").join("dot-agent-deck"),
-            Some("0.0.1"),
-        );
+        let a_path = fixture.join("homebrew").join("dot-agent-deck");
+        let a = seed_versioned_deck(&a_path, Some("0.0.1"));
         let b = seed_deck(&fixture.join("local").join("dot-agent-deck"));
         install_config(agent, &home, &a).unwrap();
         let path = home.join(config_name(agent));
@@ -2643,7 +2655,9 @@ mod tests {
             {"hooks":[{"type":"command", "command":a_command}]},
         ]);
         std::fs::write(&path, serde_json::to_vec_pretty(&document).unwrap()).unwrap();
-        crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b));
+        with_pin_answering(&a_path, Some("0.0.1"), || {
+            crate::hook_binary::with_takeover(takeover, || auto_install_config(agent, &home, &b))
+        });
         let after: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         (a, after["hooks"][RETIRED].clone())
     }

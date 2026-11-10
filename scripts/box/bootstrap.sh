@@ -10,6 +10,7 @@
 #   bash bootstrap.sh --repo URL [--dir D]   # also clone URL (default dir ~/code/<name>), devbox install it and install its orphan-reaper timer
 #   bash bootstrap.sh --use-vals             # also export USE_VALS=true, so devbox loads .env.vals.yaml, and install google-cloud-cli
 #   bash bootstrap.sh --relay                # also run the local telemetry relay and the per-run resource collector, and point the environment at the relay
+#   bash bootstrap.sh --remote-exec          # also export DAD_REMOTE_EXEC=rwx, so the agents send their compiles to an RWX sandbox
 #   bash bootstrap.sh --desktop              # also install what the desktop app's browser and driver test tiers need to run (with --repo, Playwright's browsers too)
 #
 # Layers, each assuming the one before:
@@ -17,7 +18,8 @@
 #      with --use-vals google-cloud-cli (Google's repo), with --desktop xvfb and the driver tier's runtime packages
 #   2. system: sysctl tuning, 8 GB swap, linger, the mem-sampler timer
 #   3. nix + devbox, then `devbox global` from devbox-global.json
-#   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT)
+#   4. PATH (and, with --use-vals, USE_VALS; with --relay, OTEL_EXPORTER_OTLP_ENDPOINT;
+#      with --remote-exec, DAD_REMOTE_EXEC)
 #      for non-interactive shells and systemd --user,
 #      so the deck daemon finds every agent and every agent inherits the same environment
 #   5. agents (claude, opencode 2.x, codex, pi, devin; a pinned opencode 1.x off PATH for tests), sem, the rwx CLI,
@@ -82,6 +84,19 @@
 # not stop the relay or the collector: `docker rm -f otelcol-hostmetrics` and
 # `systemctl --user disable --now dot-agent-deck-collector` do.
 #
+# --remote-exec is for a box whose agents should compile somewhere else (issue
+# #2097). It exports DAD_REMOTE_EXEC=rwx, which makes `cargo xtask
+# affected-checks --run` send every cargo command but `cargo fmt` to an RWX
+# sandbox, and tells the agents, through CLAUDE.md rule 5 and the role
+# templates, to run their other compiling commands as `rwx sandbox exec -- ...`
+# (docs/develop/rwx.md). The sandbox's compute is billed to the account the rwx
+# CLI is logged in as, which is why the flag is opt-in. Layer 5 installs the CLI
+# with or without it, and logging it in stays the operator's step; until it is
+# logged in, the helper runs locally and prints a note saying why. It sticks,
+# reaches a running daemon and turns off exactly as --use-vals does, through its
+# own marked block, except that turning it off unsets the variable in the
+# running systemd --user manager only while its value there is still `rwx`.
+#
 # --desktop does not stick: give it on every run that should check those
 # packages.
 
@@ -92,6 +107,7 @@ REPO_URL=""
 REPO_DIR=""
 USE_VALS_FLAG=0
 RELAY_FLAG=0
+REMOTE_EXEC_FLAG=0
 DESKTOP_FLAG=0
 RELAY_ENDPOINT=http://127.0.0.1:4318
 # The relay (layer 6). The name, image, mounts and network are the ones the
@@ -112,6 +128,7 @@ while [ $# -gt 0 ]; do
     --dir)  REPO_DIR="${2:?}"; shift 2 ;;
     --use-vals) USE_VALS_FLAG=1; shift ;;
     --relay)    RELAY_FLAG=1; shift ;;
+    --remote-exec) REMOTE_EXEC_FLAG=1; shift ;;
     --desktop)  DESKTOP_FLAG=1; shift ;;
     -h|--help) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "bootstrap.sh: unknown argument: $1" >&2; exit 2 ;;
@@ -133,12 +150,15 @@ VALS_OPEN='# >>> dad-box USE_VALS (scripts/box/bootstrap.sh --use-vals) >>>'
 VALS_CLOSE='# <<< dad-box USE_VALS <<<'
 RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
 RELAY_CLOSE='# <<< dad-box RELAY <<<'
-# --use-vals and --relay stick while their block is there, so the layers
+REXEC_OPEN='# >>> dad-box REMOTE_EXEC (scripts/box/bootstrap.sh --remote-exec) >>>'
+REXEC_CLOSE='# <<< dad-box REMOTE_EXEC <<<'
+# --use-vals, --relay and --remote-exec stick while their block is there, so the layers
 # before 4 already act on them (layer 4 checks the markers before it writes).
 RELAY_GIVEN="$RELAY_FLAG"
 if [ -f "$HOME/.bashrc" ]; then
   grep -qxF "$VALS_OPEN" "$HOME/.bashrc" && USE_VALS_FLAG=1
   grep -qxF "$RELAY_OPEN" "$HOME/.bashrc" && RELAY_FLAG=1
+  grep -qxF "$REXEC_OPEN" "$HOME/.bashrc" && REMOTE_EXEC_FLAG=1
 fi
 
 # Has env file $1 a non-empty value for every name after it? Reads names only.
@@ -334,14 +354,16 @@ touch "$HOME/.bashrc"
 # another kind or a second PATH block stops the run here, because skipping to
 # the end of the file would drop whatever follows the marker. So does a line
 # that starts like a marker (in any case, with spaces or tabs around its `#` and
-# arrows) but is not exactly one of the six above, trailing whitespace or a CRLF
+# arrows) but is not exactly one of the eight markers at the top of this script, trailing whitespace or a CRLF
 # ending included, since the rewrite would read it as ordinary text.
 if ! awk -v file="$HOME/.bashrc" \
-    -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
+    -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" \
+    -v xo="$REXEC_OPEN" -v xc="$REXEC_CLOSE" '
   function fail(msg) { print "bootstrap.sh: " file ": " msg > "/dev/stderr"; bad = 1; exit 1 }
   BEGIN {
-    kind[po] = "PATH"; kind[vo] = "USE_VALS"; kind[ro] = "RELAY"; opens[po] = opens[vo] = opens[ro] = 1
-    kind[pc] = "PATH"; kind[vc] = "USE_VALS"; kind[rc] = "RELAY"
+    kind[po] = "PATH"; kind[vo] = "USE_VALS"; kind[ro] = "RELAY"; kind[xo] = "REMOTE_EXEC"
+    opens[po] = opens[vo] = opens[ro] = opens[xo] = 1
+    kind[pc] = "PATH"; kind[vc] = "USE_VALS"; kind[rc] = "RELAY"; kind[xc] = "REMOTE_EXEC"
   }
   tolower($0) ~ /^[ \t]*#[ \t]*(>>>|<<<)[ \t]*dad-box/ {
     if (!($0 in kind)) {
@@ -382,8 +404,10 @@ fi
 # it is set. So does OTEL_EXPORTER_OTLP_ENDPOINT with --relay: the init_hook
 # keeps an endpoint the shell already has, so a vals shell inherits the local
 # relay rather than the direct endpoint unless a later setting overrides it
-# (the repository's .env, or an export further down ~/.bashrc). Each sits in its
-# own marked block right after the PATH block, and they are rewritten in place.
+# (the repository's .env, or an export further down ~/.bashrc). So does
+# DAD_REMOTE_EXEC with --remote-exec, which the agents the daemon starts and
+# `cargo xtask affected-checks` read. Each sits in its own marked block right
+# after the PATH block, and they are rewritten in place.
 OPTION_BLOCKS=()
 if [ "$USE_VALS_FLAG" = 1 ] || grep -qxF "$VALS_OPEN" "$HOME/.bashrc"; then
   USE_VALS_FLAG=1
@@ -397,6 +421,11 @@ if [ "$RELAY_FLAG" = 1 ] || grep -qxF "$RELAY_OPEN" "$HOME/.bashrc"; then
 export OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT
 $RELAY_CLOSE")
 fi
+if [ "$REMOTE_EXEC_FLAG" = 1 ]; then
+  OPTION_BLOCKS+=("$REXEC_OPEN
+export DAD_REMOTE_EXEC=rwx
+$REXEC_CLOSE")
+fi
 if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # Drops any earlier copy of the blocks and the blank lines around them, then
   # writes them back after the PATH block, so a re-run leaves the file unchanged.
@@ -406,9 +435,10 @@ if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
   # and removes its partial copy; a PATH block this run added just above stays,
   # so the file is not always byte-identical.
   if ! awk -v block="$(printf '%s\n\n' "${OPTION_BLOCKS[@]}")" \
-      -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" '
-    $0 == vo || $0 == ro { open = 1; next }
-    $0 == vc || $0 == rc { open = 0; next }
+      -v pc="$PATH_CLOSE" -v vo="$VALS_OPEN" -v vc="$VALS_CLOSE" -v ro="$RELAY_OPEN" -v rc="$RELAY_CLOSE" \
+      -v xo="$REXEC_OPEN" -v xc="$REXEC_CLOSE" '
+    $0 == vo || $0 == ro || $0 == xo { open = 1; next }
+    $0 == vc || $0 == rc || $0 == xc { open = 0; next }
     open { next }
     gap && /^$/ { next }
     gap { print ""; gap = 0 }
@@ -433,6 +463,7 @@ PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global
 EOF
 [ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
 [ "$RELAY_FLAG" = 1 ] && echo "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" >> "$HOME/.config/environment.d/999-dad-box.conf"
+[ "$REMOTE_EXEC_FLAG" = 1 ] && echo 'DAD_REMOTE_EXEC=rwx' >> "$HOME/.config/environment.d/999-dad-box.conf"
 # The user manager reads environment.d only when it starts, and linger started
 # it before this file existed: apply the same PATH to the running manager too.
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
@@ -447,6 +478,12 @@ elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORT
   # Off: clear only the value this script writes, never an endpoint the
   # operator set in the manager some other way.
   systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
+fi
+if [ "$REMOTE_EXEC_FLAG" = 1 ]; then
+  systemctl --user set-environment DAD_REMOTE_EXEC=rwx || echo "  warning: could not set DAD_REMOTE_EXEC in the running systemd --user manager (applies at next login)"
+elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DAD_REMOTE_EXEC=//p')" = rwx ]; then
+  # Off: clear only the value this script writes, as for the relay endpoint.
+  systemctl --user unset-environment DAD_REMOTE_EXEC || true
 fi
 # shellcheck source=/dev/null
 eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { print } $0 == pc { on = 0 }' "$HOME/.bashrc")"
@@ -819,6 +856,12 @@ if [ "$USE_VALS_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >
 fi
 if [ "$RELAY_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
   echo; echo "Note: a deck daemon is already running; its agents send through the relay only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if [ "$REMOTE_EXEC_FLAG" = 1 ] && pgrep -u "$ME" -f 'dot-agent-deck daemon serve' >/dev/null; then
+  echo; echo "Note: a deck daemon is already running; its agents get DAD_REMOTE_EXEC only after it is stopped and started from a fresh login (an in-app restart keeps the old environment)."
+fi
+if [ "$REMOTE_EXEC_FLAG" = 1 ] && ! have rwx; then
+  echo; echo "Note: DAD_REMOTE_EXEC=rwx is set but there is no rwx CLI on PATH, so compiles stay on this box until one is installed and logged in (rwx login)."
 fi
 if [ "$RELAY_FLAG" = 1 ] && [ -f "$HOME/.config/dot-agent-deck/otel.env" ]; then
   echo; echo "Note: nothing this script sets up reads ~/.config/dot-agent-deck/otel.env; the RELAY block in ~/.bashrc is the route to the relay now. Remove that file and whatever sources it."

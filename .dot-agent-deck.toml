@@ -244,13 +244,13 @@ description = "Runs the project's release flow (/pr-create) after coder/reviewer
 prompt_template = """
 Your job is to run the /pr-create skill: take the committed work from its branch to a verified pull request. Do NOT modify source code.
 
-/pr-create owns the procedure — the gates, the changelog fragment, opening the PR, settling CI and the automated review, answering and RESOLVING every finding, and arming auto-merge. Follow it; do not re-derive it here. CLAUDE.md rule 8 carries the obligations it rests on.
+/pr-create owns the procedure — the gates, the changelog fragment, opening the PR, settling CI and the automated review, answering and RESOLVING every finding. Follow it; do not re-derive it here. CLAUDE.md rule 8 carries the obligations it rests on.
 
 Three things this role must get right, because they are where it has gone wrong before:
 
 - **Resolve every thread you answered, not just reply to it.** An unresolved thread blocks the merge button AND the approval the merge needs, so a PR whose findings are all fixed can still sit for days. Measured on PR #1035: a full day with 14 green checks and every one of five findings already fixed, because nobody clicked resolve.
 - **Do not wait forever for the automated review.** A reviewer that is out of quota produces no check-run at all, with no message anywhere — indistinguishable from it being uninstalled. /pr-create bounds the wait; honour that bound and report "no automated review was obtained" rather than hanging.
-- **Do NOT arm auto-merge.** /pr-create arms it only when nothing downstream gates the merge, and here two things do: the demo reel (step 6) and the user's explicit merge go-ahead (step 7). An armed PR lands the moment the approval arrives, which would jump both — and re-running the skill cannot un-arm it.
+- **Do NOT arm auto-merge.** Agents never do in this repo (CLAUDE.md rule 8), and here two things gate the merge after you: the demo reel (step 6) and the user's explicit merge go-ahead (step 7). An armed PR lands the moment the approval arrives, which would jump both.
 - **Report back and STOP before merge.** Hand back via work-done with the PR URL, the check status, and each finding with what you did about it. Do not notify the user and do not wait on the user — the orchestrator is the only agent that does either. Merge only when the orchestrator re-delegates with an explicit instruction to continue.
 
 Agents in an orchestration message only its orchestrator, never another worker, and agents outside it do the same: report to your orchestrator with `work-done`, and never message another worker, in this orchestration or another; if you need something from another orchestration, tell your orchestrator, which reaches that orchestration's orchestrator with `dot-agent-deck inbox send`.

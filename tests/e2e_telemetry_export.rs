@@ -73,6 +73,18 @@ impl Receiver {
 
     // Repeat the final response after the scripted responses are exhausted.
     fn responding(responses: Vec<String>) -> Self {
+        Self::scripted(responses, None)
+    }
+
+    // Script only the responses to `path`; every other path gets 200. The
+    // daemon exports its own warnings as OTLP logs to the same endpoint, and
+    // whether one is pending when the run ends is a race, so a script meant
+    // for the trace exporter must not be spent on a `/v1/logs` request.
+    fn responding_on(path: &'static str, responses: Vec<String>) -> Self {
+        Self::scripted(responses, Some(path))
+    }
+
+    fn scripted(responses: Vec<String>, scripted_path: Option<&'static str>) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind isolated OTLP receiver");
         let addr = listener.local_addr().unwrap();
         let endpoint = format!("http://{addr}");
@@ -82,14 +94,20 @@ impl Receiver {
         let stopped = Arc::clone(&stop);
         let worker = std::thread::spawn(move || {
             // Blocking accept: Drop wakes it with a connection of its own.
-            for (count, stream) in listener.incoming().enumerate() {
+            let mut count = 0;
+            for stream in listener.incoming() {
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
                 let stream = stream.expect("accept OTLP request");
-                let response = responses.get(count).or_else(|| responses.last());
-                let response = response.map(String::as_str).unwrap_or("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
                 let mut request = read_request(&stream);
+                let response = if scripted_path.is_none_or(|path| request.path == path) {
+                    count += 1;
+                    responses.get(count - 1).or_else(|| responses.last())
+                } else {
+                    None
+                };
+                let response = response.map(String::as_str).unwrap_or("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
                 request.accepted = response.starts_with("HTTP/1.1 200");
                 captured.lock().unwrap().push(request);
                 let mut stream = stream;
@@ -811,25 +829,33 @@ fn telemetry_otlp_008_redirect_never_forwards_credentials() {
 #[test]
 fn telemetry_otlp_009_transient_failure_retries_run_once() {
     let unavailable = "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string();
-    let receiver = Receiver::responding(vec![unavailable.clone(), unavailable,
+    let receiver = Receiver::responding_on("/v1/traces", vec![unavailable.clone(), unavailable,
         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()]);
     let deck = launch(Some(&receiver), false);
     let agent = agent(&deck);
     close(&deck, &agent);
     let run = receiver.run(agent.pane_id_env.as_deref().unwrap());
     let run_id = attribute(&run, "deck.run.id");
+    // The daemon's own warnings reach the same endpoint as `/v1/logs`
+    // exports; only the trace requests carry the run being retried.
+    let traces: Vec<Request> = receiver
+        .requests()
+        .into_iter()
+        .filter(|request| request.path == "/v1/traces")
+        .collect();
+    assert!(traces.len() >= 3, "503 export failures were not retried");
     assert!(
-        receiver.requests().len() >= 3,
-        "503 export failures were not retried"
-    );
-    assert!(
-        receiver
-            .requests()
+        traces
             .iter()
             .take(2)
             .all(|request| !request.accepted
                 && String::from_utf8_lossy(&request.body).contains(&run_id)),
-        "retry must retain the original completed run batch"
+        "retry must retain the original completed run batch: {:?}",
+        receiver
+            .requests()
+            .iter()
+            .map(|request| (&request.path, request.accepted))
+            .collect::<Vec<_>>()
     );
     assert!(
         !common::wait_until(Duration::from_secs(6), || receiver
@@ -1520,6 +1546,10 @@ fn telemetry_otlp_015_ci_rounds_follow_polled_check_rollups() {
             "PATH",
             format!("{}:{}", bin.display(), common::path_with_binary_dir()),
         )
+        // An empty SHELL skips the daemon's login-shell PATH capture, which on
+        // macOS runs path_helper and moves the system dirs, and any real `gh`
+        // in them, ahead of the stub dir above.
+        .with_env("SHELL", "")
         .with_env("TELEMETRY_GH_REPLY", reply.to_string_lossy())
         .with_env("DOT_AGENT_DECK_PR_REFRESH_SECS", "1")
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)

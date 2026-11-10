@@ -134,8 +134,11 @@ pub(crate) enum ProbeAsk {
 }
 
 /// What a probe request did.
+///
+/// Off Linux only `Unavailable` is ever built, but the `e2e` control in
+/// `daemon_protocol.rs` matches every variant on every platform, so the others
+/// stay and their `dead_code` warning is allowed there.
 #[cfg(any(target_os = "linux", feature = "e2e"))]
-// Off Linux an e2e build constructs only the "no observed generation" arm.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ProbeOutcome {
