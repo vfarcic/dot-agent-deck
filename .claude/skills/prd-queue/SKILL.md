@@ -660,7 +660,7 @@ lifecycle, and it covers what /prd-full does not.
   that PR in your report and leave the red to it. Your role template does not
   say this, so tell whoever you delegate to, and treat a worker's report of a
   red it re-ran to green as unfinished.
-- STOP CONDITION. Your workflow's step 7 pauses for the user's merge go-ahead.
+- STOP CONDITION. Your workflow's step 6 pauses for the user's merge go-ahead.
   Under dispatch that pause is where this unit ENDS: send the merge-gate
   notification, report, and stop. Do not merge, and do not delegate a merge.
   Per CLAUDE.md rule 8 nobody merges their own unapproved PR, and for an admin

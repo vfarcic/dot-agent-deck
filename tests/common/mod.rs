@@ -3459,7 +3459,7 @@ impl TuiDeck {
     ///
     /// Every field is recorded for whoever reads a recording later — to tell a
     /// failure diagnostic from a passing run, and to know which revision drew
-    /// it. None of them gates anything:
+    /// it:
     ///
     /// * `schema` — lets a reader refuse a sidecar shape it does not understand
     ///   instead of misreading it. Bump it when a field's meaning changes.

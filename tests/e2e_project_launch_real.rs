@@ -131,8 +131,8 @@ const LAUNCH_TASK: &str = "Do this yourself and do not delegate - no other agent
 /// published context, only on disk — shows up in the coordinator's pane, which
 /// it can only do by having read the daemon's file and genuinely run the tool.
 /// Best-effort and logged, not gating: whether that filename also lands on the
-/// deck's own vt100 stream. Reel-eligible (PTY-attached, records a
-/// `full-stream.cast`); flaky-tolerant (real LLM) — run once, not looped.
+/// deck's own vt100 stream. PTY-attached (records a `full-stream.cast`);
+/// flaky-tolerant (real LLM) — run once, not looped.
 #[spec("project/launch/003")]
 #[test]
 fn project_launch_003_a_real_coordinator_reads_the_daemon_published_context() {
