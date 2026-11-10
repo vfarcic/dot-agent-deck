@@ -115,7 +115,15 @@ pub fn wait_budget() -> Duration {
 
 fn read_exact_budgeted(socket: &mut UnixStream, mut bytes: &mut [u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        socket.set_read_timeout(Some(wait_budget()))?;
+        // macOS refuses `SO_RCVTIMEO` with `EINVAL` once the peer has closed
+        // its end, though what it sent is still there to read: the daemon
+        // answers and closes, so re-arming before the body's read failed
+        // there (#2237). The budget armed earlier still holds, and the read
+        // drains the answer or reports the end.
+        match socket.set_read_timeout(Some(wait_budget())) {
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) => {}
+            armed => armed?,
+        }
         let read = socket.read(bytes)?;
         if read == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
