@@ -1199,7 +1199,13 @@ fn scenario(
             setup_tui.grid()
         )));
     }
-    open_orchestration(&setup_tui)?;
+    if open_orchestration(&setup_tui)? {
+        ev.step(format!(
+            "the {} TUI asked to approve the sandbox project's commands and prompts (PRD \
+             #1885's `{TRUST_PROMPT_TITLE}`); approved with `a`, as the person opening it would",
+            cast.daemon_side
+        ));
+    }
     let rows = wait_for_status(g, &cast.daemon_bin, &daemon_cli, UI_TIMEOUT, ev, every_role)?
         .map_err(|e| {
             Abort::Scenario(format!(
@@ -2971,7 +2977,14 @@ pub(crate) fn main_ui_drawn(grid: &str) -> bool {
 ///
 /// Returns only once the deck has finished opening the orchestration — see
 /// [`wait_for_orchestration_open`] for why the next keystroke depends on that.
-fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
+///
+/// A build carrying PRD #1885 asks, before it opens an orchestration whose
+/// project config nobody approved, to approve its commands and prompts — the
+/// sandbox project's config is new on every run, so the branch's TUI asks each
+/// time it is the setup TUI (the reverse pairing). That prompt is answered with
+/// `a` once its approve label is on screen, as the person opening the
+/// orchestration would; the answer is `true` when it was.
+fn open_orchestration(deck: &pty::PtyDeck) -> Result<bool, String> {
     deck.send(b"\x0e"); // Ctrl+N -> directory picker
     // The picker's own footer (`render_dir_picker`); the dashboard draws none
     // of it.
@@ -3015,7 +3028,32 @@ fn open_orchestration(deck: &pty::PtyDeck) -> Result<(), String> {
         ));
     }
     deck.send(b"\r"); // submit
-    wait_for_orchestration_open(deck)
+    let approved = approve_trust_prompt_if_shown(deck);
+    wait_for_orchestration_open(deck)?;
+    Ok(approved)
+}
+
+/// PRD #1885's trust prompt: its title, and the approve key's label as the
+/// New Agent form's prompt draws it (`src/trust_prompt.rs`).
+const TRUST_PROMPT_TITLE: &str = "Review project commands";
+const TRUST_PROMPT_APPROVE: &str = "a approve and start";
+
+/// After the New Agent form's submit: wait until the deck either shows the
+/// trust prompt's approve label or has opened the orchestration, and answer a
+/// shown prompt with `a`. The label being on screen is what the deck itself
+/// requires before it takes `a` (its confirmation draw-gate), so the key is
+/// never typed ahead of the prompt. A deck that opened the orchestration, or
+/// one that did neither in time, is left to [`wait_for_orchestration_open`] to
+/// judge.
+fn approve_trust_prompt_if_shown(deck: &pty::PtyDeck) -> bool {
+    let settled = deck.wait_for_grid(UI_TIMEOUT, |g| {
+        g.contains(TRUST_PROMPT_APPROVE) || footer_mode(g) == Some(FooterMode::Typing)
+    });
+    if settled && deck.grid().contains(TRUST_PROMPT_APPROVE) {
+        deck.send(b"a");
+        return true;
+    }
+    false
 }
 
 /// Wait until the deck has finished opening the orchestration it was just

@@ -2655,6 +2655,9 @@ mod tests {
             // but the worktree the roles run in is a HEAD checkout.
             git_in(tmp.path(), &repo, &["add", "-A"]);
             git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
+            // PRD #1885: a dispatched orchestration starts only when approved;
+            // this test is about what the dispatch writes once it starts.
+            crate::project_trust::approve_all_for_test(&repo);
 
             let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
             let ctx = DispatchContext {

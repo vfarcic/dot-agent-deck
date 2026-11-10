@@ -193,6 +193,9 @@ impl OpenCode {
                 format!("[[orchestrations]]\nname = 'offers'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = 'cat'\nstart = true\n[[orchestrations.roles]]\nname = 'worker'\ncommand = 'cat'\ntake_offers = ['{pool}']\n{clear}"),
             )
             .unwrap();
+            // PRD #1885: a delegate runs only from an approved orchestration;
+            // these tests are about the inbox, not the gate.
+            daemon.approve_project_trust(daemon.cwd());
             start["tab_membership"] = membership("worker", 1, false);
         }
         let reply = attach(&daemon, start);

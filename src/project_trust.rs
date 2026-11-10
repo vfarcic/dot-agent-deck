@@ -917,6 +917,29 @@ pub(crate) fn approve_all_for_test(config_dir: &Path) {
         .expect("fixture precondition: approve the fixture config");
 }
 
+/// Test-only: approve `orchestration`, as it is held in memory, for the
+/// project of `config_dir` in the unit-test process's own store — for a UI
+/// fixture whose orchestration is never written to disk and whose subject is
+/// not the gate.
+#[cfg(test)]
+pub(crate) fn approve_orchestration_for_test(
+    config_dir: &Path,
+    orchestration: &OrchestrationConfig,
+) {
+    let project = project_identity(config_dir).unwrap_or_else(|_| config_dir.to_path_buf());
+    TrustStore::default_location()
+        .update(|approvals| {
+            approvals.approve(
+                &project,
+                &orchestration.name,
+                role_texts(orchestration),
+                chrono::Utc::now(),
+            );
+            ((), true)
+        })
+        .expect("fixture precondition: approve the in-memory orchestration");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

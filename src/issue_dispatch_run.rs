@@ -1029,12 +1029,16 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(
+    // PRD #1885: created unwarmed, so the trust check below reads the config
+    // this worktree's (possibly reattached) branch carries before its devbox
+    // warm-up runs anything that branch configured.
+    match create_worktree_unwarmed(
         clone_dir,
         &paths.worktree_dir,
         &paths.branch,
         true,
         Creator::issue_dispatch(task_name, issue),
+        None,
     )
     .await?
     {
@@ -1049,6 +1053,21 @@ async fn dispatch_one_issue(
             return Ok(IssueOutcome::Handled);
         }
     }
+
+    // PRD #1885 (decision 7, amended): the run checked the default branch's
+    // config before any worktree existed, but an existing `agent/issue-<n>` is
+    // attached as it stands and may configure something else. So the config the
+    // spawn will read — this worktree's — is checked HERE, before the warm-up.
+    // A refusal removes the worktree this attempt just created (the branch and
+    // its commits stay), so the issue is dispatched again once it is approved
+    // rather than skipped as claimed on every later fire.
+    if let Err(refusal) = refuse_unapproved_worktree(&paths.worktree_dir, task_name, notifier).await
+    {
+        let _repo_lock = acquire_worktree_lock(clone_dir).await;
+        remove_worktree(&paths.worktree_dir, clone_dir, RemovalPolicy::Force).await;
+        return Err(refusal);
+    }
+    warm_project_environment(&paths.worktree_dir).await;
 
     // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn.
     // `spawn` registers the agent (visible to a `StopAgent`
@@ -1102,6 +1121,27 @@ async fn dispatch_one_issue(
 
     // M1.3 — the caller claims the issue and then surfaces the success.
     Ok(IssueOutcome::Dispatched { claims_unchecked })
+}
+
+/// PRD #1885: refuse — recording the refusal through `notifier` — when the
+/// orchestration `worktree_dir`'s config would open is not approved as it now
+/// reads. A directory with no config, or one that opens no orchestration,
+/// passes: what starts there is the task's own command.
+async fn refuse_unapproved_worktree(
+    worktree_dir: &Path,
+    task_name: &str,
+    notifier: &dyn Notifier,
+) -> Result<(), String> {
+    let config = crate::spawn::load_config_for_dir(worktree_dir);
+    let Some(chosen) = config
+        .as_ref()
+        .and_then(|c| crate::project_config::default_orchestration(c, worktree_dir))
+    else {
+        return Ok(());
+    };
+    crate::spawn::refuse_unless_approved(worktree_dir, chosen.config, task_name, notifier)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// PRD #421 M3.2 — the claimant whose record on `issue` is live, read from
@@ -2354,6 +2394,46 @@ pub async fn create_worktree_from(
     creator: Creator,
     start_point: Option<&str>,
 ) -> Result<WorktreeCreation, String> {
+    let created = create_worktree_unwarmed(
+        clone_dir,
+        worktree_dir,
+        branch,
+        reuse_existing_branch,
+        creator,
+        start_point,
+    )
+    .await?;
+    if created == WorktreeCreation::Created {
+        // Issue #791: materialize this worktree's project environment ONCE,
+        // HERE, before returning — so that by the time any caller spawns a
+        // role into it, there is no cold `.devbox` left to race over. The
+        // outcome is deliberately dropped: EVERY one of them, warmed or not,
+        // still reports `Created`, because a worktree that exists has been
+        // created whatever devbox did afterwards. See
+        // [`warm_project_environment`] for why none of them is an error.
+        warm_project_environment(worktree_dir).await;
+    }
+    Ok(created)
+}
+
+/// [`create_worktree_from`] WITHOUT the issue #791 warm-up: the caller owns
+/// running [`warm_project_environment`] on a `Created` worktree before it spawns
+/// anything into it.
+///
+/// PRD #1885: for issue dispatch, whose `agent/issue-<n>` branch may already
+/// exist and is then attached as it stands, so its `.dot-agent-deck.toml` can
+/// differ from the default branch's that was checked before any worktree
+/// existed. The caller checks the config the spawn will actually read — this
+/// worktree's — between creation and the warm-up, so a refused orchestration
+/// runs nothing its branch configured.
+pub async fn create_worktree_unwarmed(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    reuse_existing_branch: bool,
+    creator: Creator,
+    start_point: Option<&str>,
+) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
@@ -2465,14 +2545,6 @@ pub async fn create_worktree_from(
             // the hazard the lock is for, to protect two materializations that
             // do not touch each other's `.devbox` in the first place.
             drop(repo_lock);
-            // Issue #791: materialize this worktree's project environment ONCE,
-            // HERE, before returning — so that by the time any caller spawns a
-            // role into it, there is no cold `.devbox` left to race over. The
-            // outcome is deliberately dropped: EVERY one of them, warmed or
-            // not, still reports `Created`, because a worktree that exists has
-            // been created whatever devbox did afterwards. See
-            // [`warm_project_environment`] for why none of them is an error.
-            warm_project_environment(worktree_dir).await;
             Ok(WorktreeCreation::Created)
         }
         // Issue #692: an add killed at `SUBPROCESS_TIMEOUT` gets no chance to

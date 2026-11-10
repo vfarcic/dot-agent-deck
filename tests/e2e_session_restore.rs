@@ -410,6 +410,7 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
     // No `--continue` flag; the lazy-spawned daemon is brand new (empty), so the
     // disk snapshot is the only possible source — the snapshot-fallback path.
     let deck = TuiDeck::builder()
+        .trusting_project(project_dir.path())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
@@ -677,6 +678,7 @@ fn restore_011_saved_start_role_index_is_honored_over_config_default() {
     );
 
     let deck = TuiDeck::builder()
+        .trusting_project(project_dir.path())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
@@ -790,6 +792,9 @@ fn restore_021_reattach_seats_the_tab_where_the_daemon_registered_its_orchestrat
     );
 
     let daemon = common::spawn_daemon_serve(None, "0");
+    // PRD #1885: the restored project is approved in the store of the daemon
+    // these decks attach to, which is the one that answers the trust check.
+    daemon.approve_project_trust(project_dir.path());
     let launch = |session: &Path| {
         TuiDeck::builder()
             .with_pty_size(160, 45)
@@ -1043,6 +1048,7 @@ fn restore_013_custom_orchestration_tab_title_is_preserved_on_restore() {
     );
 
     let deck = TuiDeck::builder()
+        .trusting_project(project_dir.path())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
             session_file.to_str().expect("session path is UTF-8"),
@@ -1364,6 +1370,9 @@ fn restore_016_reattach_restores_active_tab_and_focused_pane() {
 
     let mut first = launch_deck_against(&daemon, &session_file);
     first.wait_for_string("No active agents");
+    // PRD #1885: the fixture's project is approved in the store of the daemon
+    // both decks attach to, which is the one that answers the trust check.
+    daemon.approve_project_trust(first.workdir());
 
     // Open the orchestration. The mode-chip
     // row is `[No mode] [Orch: reattach-orch] [schedule]`, so ONE Right selects
@@ -1541,6 +1550,7 @@ fn restore_019_cold_start_honours_the_remembered_tab_but_not_a_rebuilt_pane_id()
     std::fs::write(&session_file, staged).expect("append the [focus] table");
 
     let deck = TuiDeck::builder()
+        .trusting_project(project_dir.path())
         .with_pty_size(160, 45)
         .with_env(
             "DOT_AGENT_DECK_SESSION",

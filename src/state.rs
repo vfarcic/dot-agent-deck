@@ -5237,6 +5237,27 @@ impl ProjectConfigs {
         check.refusal()
     }
 
+    /// PRD #1885: [`Self::trust_refusal`] for a `delegate` sent from
+    /// `caller_pane`, logged at warn naming that pane, so the daemon log says
+    /// which orchestrator's delegate was refused.
+    pub(crate) fn delegate_trust_refusal(
+        &self,
+        caller_pane: &str,
+        dir: &str,
+        name: &str,
+    ) -> Option<String> {
+        let check = self.trust_check(dir, name)?;
+        let refusal = check.refusal()?;
+        warn!(
+            pane_id = %escape_id_for_log(caller_pane),
+            orchestration = %escape_id_for_log(name),
+            verdict = check.verdict.word(),
+            "delegate: refused because the orchestration is not approved as its config now \
+             reads; nothing was delivered: {refusal}"
+        );
+        Some(refusal)
+    }
+
     /// Read `dirs` on the blocking pool. This frees the runtime thread, not a
     /// state guard the caller holds — a request handler reads through
     /// [`read_guard_with_project_configs`], which holds none.
@@ -5842,12 +5863,8 @@ async fn dispatch_one_owned(
     let role_config_indexed = match (cwd.as_deref(), orchestration.as_ref()) {
         (Some(c), Some(identity)) => {
             let configs = ProjectConfigs::load(vec![c.to_owned()]).await;
-            let found =
-                lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role);
-            if found.as_ref().is_some_and(|(_, role)| role.clear) {
-                trust_refusal = configs.trust_refusal("delegate", c, identity.name());
-            }
-            found
+            trust_refusal = configs.trust_refusal("delegate", c, identity.name());
+            lookup_orchestration_role_indexed(&configs, c, identity.name(), &target_role)
         }
         _ => None,
     };
@@ -5961,7 +5978,7 @@ async fn dispatch_one_owned(
             orchestrator,
             "task refused",
             format!(
-                "The task for the worker in role {} was NOT delivered and the role was not \
+                "The task for the worker in role {} was NOT delivered and nothing was \
                  restarted: {refusal}",
                 quote_untrusted_role(&target_role)
             ),
@@ -11191,17 +11208,26 @@ impl AppState {
         // applies PRD #126 M1 audit finding 3's duplicate-role de-duplication.
         let targets = self.delegate_targets(&signal.pane_id, &signal.to);
 
-        // PRD #1885: a delegate to a `clear = true` role starts that role's
-        // command again, unattended, so it runs only from an approved
-        // orchestration. Checked for every target before anything is armed or
-        // dispatched, so a refusal delivers nothing and the orchestrator's
-        // `delegate` fails with the reason and the command that approves it.
+        // PRD #1885: every delegate hands its worker the role's CURRENT
+        // `prompt_template`, re-read from the config now, and a delegate to a
+        // `clear = true` role also starts that role's command again — project
+        // text reaching an agent, unattended. So a delegate runs only from an
+        // orchestration whose config is approved as it now reads. Checked for
+        // every target's config before anything is armed or dispatched, so a
+        // refusal delivers nothing and the orchestrator's `delegate` fails with
+        // the reason and the command that approves it.
         if let Some(identity) = orchestration.as_ref() {
-            for (target_role, pane_id) in &targets {
-                let cwd = self.pane_cwd_map.get(pane_id).map(String::as_str);
-                if delegate_respawns_worker(configs, cwd, Some(identity), target_role)
-                    && let Some(cwd) = cwd
-                    && let Some(refusal) = configs.trust_refusal("delegate", cwd, identity.name())
+            let mut checked: Vec<&str> = Vec::new();
+            for (_, pane_id) in &targets {
+                let Some(cwd) = self.pane_cwd_map.get(pane_id).map(String::as_str) else {
+                    continue;
+                };
+                if checked.contains(&cwd) {
+                    continue;
+                }
+                checked.push(cwd);
+                if let Some(refusal) =
+                    configs.delegate_trust_refusal(&signal.pane_id, cwd, identity.name())
                 {
                     return DelegateResponse {
                         error: Some(refusal),

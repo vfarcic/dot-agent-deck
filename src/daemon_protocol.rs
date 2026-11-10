@@ -1700,6 +1700,21 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // sender withholds until the daemon advertises `CAP_DECK_OUTCOMES`.
     // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
     "1666-task-scoped-completion-and-recovery",
+    // PRD #1885, at 12 without moving it -- the #1233/#555 shape. A daemon
+    // now refuses to run an orchestration whose project config (each role's
+    // command, prompt text and description, as resolved) is not approved as it
+    // now reads: `PrepareOrchestration` with `PROJECT_ERR_NOT_APPROVED`, the
+    // prepared start's re-read, `delegate` (every delegate, since it hands the
+    // worker the role's current prompt text), `pane restart`, `pane spawn`,
+    // `dispatch`, and a scheduled fire, Run now or issue dispatch. Every one of
+    // those requests, and its refusal channel, is unchanged on the wire, and
+    // the requests that read and grant an approval are capability-gated
+    // (`CAP_PROJECT_TRUST`). What changed is which requests are refused, which
+    // a version number cannot express: an older client against a newer daemon
+    // meets refusals it cannot resolve in-app, and the refusal names the
+    // `dot-agent-deck trust approve` command that does.
+    // `changelog.d/1885.breaking.md` is its fragment.
+    "1885-unapproved-project-config-refused",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

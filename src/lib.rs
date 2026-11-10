@@ -233,6 +233,7 @@ mod test_paths;
 mod test_pty_wait;
 // PRD #1885: `dot-agent-deck trust list | approve | revoke`.
 pub mod trust_cli;
+pub mod trust_prompt;
 pub mod turn_reply;
 pub mod ui;
 // Issue #670: the one implementation of the control-character / Unicode-bidi

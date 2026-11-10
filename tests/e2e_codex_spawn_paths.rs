@@ -253,6 +253,9 @@ fn spawn_009_declared_orchestration_launcher_wraps_and_badges_codex() {
          clear = false\n",
     )
     .expect("write declared orchestration config");
+    // PRD #1885: approved as written, so the form opens it with no trust
+    // prompt; this test is about the launcher, not the gate.
+    deck.approve_project_trust(deck.workdir());
 
     open_form(&deck);
     deck.send_keys(b"\x1b[C");
