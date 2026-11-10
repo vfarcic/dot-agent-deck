@@ -739,6 +739,10 @@ fn committed(outcome: CommitOutcome, mode: &ClaimMode) -> Option<Completion> {
             report_id: Some(report_id),
             destination: Some(destination),
             differs: false,
+            update: match mode {
+                ClaimMode::TerminalUpdate { update, .. } => Some(*update),
+                _ => None,
+            },
             code: None,
             message: None,
         })),
@@ -773,20 +777,23 @@ async fn save(
     };
     let _ = registry.fault_point(FAULT_BEFORE_WRITE);
     // The retained file.
-    let (task_id, unit_id) = match &claimed.mode {
-        ClaimMode::Task { task_id } => (Some(task_id.clone()), None),
-        ClaimMode::Terminal { unit_id, .. } => (None, Some(unit_id.clone())),
-        ClaimMode::Uncorrelated => (None, None),
+    // `unit_id` is the unit a first terminal report completes; an update
+    // (issue #2260) names its unit in the file, and completes nothing.
+    let (task_id, unit_id, file_unit) = match &claimed.mode {
+        ClaimMode::Task { task_id } => (Some(task_id.clone()), None, None),
+        ClaimMode::Terminal { unit_id, .. } => (None, Some(unit_id.clone()), Some(unit_id.clone())),
+        ClaimMode::TerminalUpdate { unit_id, .. } => (None, None, Some(unit_id.clone())),
+        ClaimMode::Uncorrelated => (None, None, None),
     };
     let envelope = crate::retained_store::Envelope {
         report_id: ctx.spec.report_id.clone(),
-        kind: if unit_id.is_some() {
+        kind: if file_unit.is_some() {
             crate::retained_store::ArtifactKind::DispatchFinished
         } else {
             crate::retained_store::ArtifactKind::WorkerReport
         },
         task_id: task_id.clone(),
-        unit_id: unit_id.clone(),
+        unit_id: file_unit,
         deck_id: registry.inbox().deck().to_string(),
         run_id: store.run_id().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -893,6 +900,11 @@ async fn save(
         ClaimMode::Terminal { .. } => crate::state::ReportPost::Terminal {
             unit_name: claimed.unit_name.clone().unwrap_or_default(),
             unit_cwd: ctx.cwd.clone(),
+        },
+        ClaimMode::TerminalUpdate { update, .. } => crate::state::ReportPost::TerminalUpdate {
+            unit_name: claimed.unit_name.clone().unwrap_or_default(),
+            unit_cwd: ctx.cwd.clone(),
+            update: *update,
         },
     };
     let content = crate::state::compose_report_post(

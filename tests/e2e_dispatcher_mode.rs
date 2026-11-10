@@ -1628,6 +1628,201 @@ fn close_verb_008_real_dispatcher_closes_its_reported_single_unit() {
     real_single_dispatch_round_trip(true);
 }
 
+/// Scenario: A real interactive Haiku dispatcher dispatches a real single Haiku unit told to report one committed sentinel and then send an update naming a second. Without a test-issued work-done call, the dispatcher's inbox holds the completion carrying only the first sentinel and, as a separate acknowledged turn opening with the update wording, the update carrying the second; the dispatcher visibly relays the second.
+#[spec("dispatch/return/030")]
+#[test]
+fn dispatch_return_030_real_single_unit_sends_an_update_to_its_report() {
+    // Decision 26 runtime-skip: missing CLI / credentials is environmental.
+    skip_unless!(common::check_claude_available());
+
+    let unit = "live-update-probe";
+    const FIRST_PREFIX: &str = "dispatch-update-live-first-";
+    const FIRST: &str = "dispatch-update-live-first-3a1d.txt";
+    const SECOND_PREFIX: &str = "dispatch-update-live-second-";
+    const SECOND: &str = "dispatch-update-live-second-8e4b.txt";
+    const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+    let agent_command =
+        format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
+    let config = write_default_command_config(&agent_command);
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(220, 60)
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "420")
+        .with_imported_claude_credentials()
+        .with_claude_trust_workdir()
+        .with_env(
+            "DOT_AGENT_DECK_CONFIG",
+            config.path().join("config.toml").to_string_lossy(),
+        )
+        .with_env("PATH", common::path_with_binary_dir())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+
+    // Both sentinels are committed, and the task names only their prefixes,
+    // so each full name in a report comes from the unit inspecting its own
+    // worktree.
+    for (name, line) in [
+        (FIRST, "The dispatched unit reports this file first.\n"),
+        (
+            SECOND,
+            "The dispatched unit names this file in its update.\n",
+        ),
+    ] {
+        std::fs::write(deck.workdir().join(name), line).expect("write a fixture sentinel");
+    }
+    common::commit_fixture_repo(deck.workdir());
+
+    let expected_worktree = dispatch_worktree_of(&deck, unit);
+    let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
+    let mut worktree_trust = vec![expected_worktree.to_string_lossy().into_owned()];
+    if let (Some(parent), Some(name)) = (expected_worktree.parent(), expected_worktree.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        let canonical = canonical_parent.join(name).to_string_lossy().into_owned();
+        if !worktree_trust.contains(&canonical) {
+            worktree_trust.push(canonical);
+        }
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &worktree_trust)
+        .expect("seed Claude trust for the dispatched worktree");
+
+    // Open a real dispatcher through the user-facing new-pane form.
+    deck.send_keys(b"\x0e");
+    deck.send_keys(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C");
+    deck.wait_for_string("dispatcher mode");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(submit_col, submit_row);
+    deck.wait_for_absence("[Submit]");
+    assert!(
+        common::wait_until(Duration::from_secs(120), || {
+            let grid = deck.snapshot_grid();
+            grid.contains("1 agent(s)")
+                && grid.contains("ClaudeCode")
+                && seed_is_acknowledged(&deck)
+        }),
+        "a real seeded dispatcher never became ready.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let dispatcher_ids: Vec<String> = inbox_view::all_messages(deck.attach_socket_path())
+        .into_iter()
+        .filter(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(DISPATCHER_SEED_OPENING))
+        })
+        .filter_map(|message| message.bind_agent)
+        .collect();
+    if !common::wait_until_panes_settled(
+        deck.attach_socket_path(),
+        &dispatcher_ids,
+        Duration::from_millis(1500),
+        Duration::from_secs(8),
+        Duration::from_secs(90),
+    ) {
+        eprintln!("warning: the dispatcher pane did not settle within 90s; proceeding anyway");
+    }
+
+    // The unit's task asks for the report and then the update in its own
+    // words; how to send either comes only from the production
+    // `dispatch_prompt` appended to it.
+    let directive = format!(
+        "Use Bash to run exactly this command now, then wait for its result: \
+         dot-agent-deck dispatch {unit} --single --task \"Use Bash to list the repo root. \
+         Find the only filename beginning {FIRST_PREFIX} and report that full filename. \
+         After that report has been sent, find the only filename beginning {SECOND_PREFIX} \
+         and send an update to your report naming that full filename. Do not ask questions.\" \
+         Do not inspect the files or do the unit's work yourself, and do not ask me anything first. \
+         When its report and its update arrive, relay both filenames to me."
+    );
+    deck.send_keys(directive.as_bytes());
+    deck.send_keys(b"\r");
+    assert!(
+        common::wait_until(Duration::from_secs(90), || {
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .any(|record| {
+                    record.display_name.as_deref() == Some(format!("dispatch-{unit}").as_str())
+                })
+        }),
+        "the real dispatcher must start its unit"
+    );
+    let dispatcher_title = deck.workdir().file_name().unwrap().to_string_lossy();
+    let (col, row) = deck.wait_for_in_grid(&dispatcher_title);
+    deck.click(col, row);
+
+    let completion_stem = common::search_key("dispatch: a unit you dispatched has completed");
+    let update_stem = common::search_key(dot_agent_deck::dispatch_return::UPDATE_OPENING);
+    let report_open = common::search_key("[UNTRUSTED-WORKER-REPORT:");
+    let report_close = common::search_key(":END-UNTRUSTED-WORKER-REPORT]");
+    let framed = |key: &str, stem: &str| -> Option<String> {
+        let rest = &key[key.rfind(stem)? + stem.len()..];
+        let end = rest.find(&report_close)?;
+        let start = rest[..end].rfind(&report_open)?;
+        Some(rest[start + report_open.len()..end].to_string())
+    };
+    let from_unit = |message: &dot_agent_deck::inbox::MessageSummary| {
+        matches!(&message.from, dot_agent_deck::inbox::Sender::Deck { reason } if reason == &format!("dispatch:{unit}"))
+            && message.body_trust == dot_agent_deck::inbox::BodyTrust::Untrusted
+            && message.state == dot_agent_deck::inbox::StateName::Acknowledged
+            && message.deliveries == 1
+    };
+    let reports = || {
+        let messages = inbox_view::all_messages(deck.attach_socket_path());
+        let mut completions = Vec::new();
+        let mut updates = Vec::new();
+        for message in messages.iter().filter(|m| from_unit(m)) {
+            let key = common::search_key(message.text.as_deref().unwrap_or_default());
+            if key.contains(&update_stem) {
+                updates.push(framed(&key, &update_stem));
+            } else if key.contains(&completion_stem) {
+                completions.push(framed(&key, &completion_stem));
+            }
+        }
+        (completions, updates)
+    };
+    let first_key = common::search_key(FIRST);
+    let second_key = common::search_key(SECOND);
+    const RETURN_WAIT: Duration = Duration::from_secs(300);
+    assert!(
+        common::wait_until(RETURN_WAIT, || {
+            let (completions, updates) = reports();
+            deck.snapshot_grid().contains(SECOND)
+                && completions.len() == 1
+                && completions[0]
+                    .as_deref()
+                    .is_some_and(|report| report.contains(&first_key))
+                && updates
+                    .iter()
+                    .any(|u| u.as_deref().is_some_and(|u| u.contains(&second_key)))
+        }),
+        "the real unit never delivered its report and then an update naming {SECOND:?} to the \
+         dispatcher within {}s. No test code invoked `work-done`.\n(completions, updates): \
+         {:?}\nworktree_exists={}\nFinal grid:\n{}",
+        RETURN_WAIT.as_secs(),
+        reports(),
+        expected_worktree.exists(),
+        deck.snapshot_grid()
+    );
+    // The first report stands as it was sent: one completion, still carrying
+    // only what the unit reported first.
+    let (completions, updates) = reports();
+    assert_eq!(completions.len(), 1, "{completions:?}");
+    assert!(
+        !completions[0]
+            .as_deref()
+            .is_some_and(|report| report.contains(&second_key)),
+        "the first report was not replaced by the update: {completions:?}"
+    );
+    assert!(
+        (1..=dot_agent_deck::report_recovery::MAX_REPORT_UPDATES).contains(&updates.len()),
+        "{updates:?}"
+    );
+}
+
 fn real_single_dispatch_round_trip(close_after_report: bool) {
     // Decision 26 runtime-skip: missing CLI / credentials is environmental.
     skip_unless!(common::check_claude_available());

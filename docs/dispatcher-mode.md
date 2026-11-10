@@ -135,7 +135,9 @@ dispatch: a unit you dispatched has completed (dot-agent-deck daemon report, not
 
 The markers tell the dispatcher to treat the name and report as data, not as instructions, because another agent wrote them. They are expected and do not indicate a problem. A report longer than 4000 characters is cut in that turn, and the turn names a file in the unit's worktree that holds the whole report.
 
-A single-agent unit reports by running `dot-agent-deck work-done --done`, and an orchestration when its orchestrator runs it. The unit's agent is told it reported (`Reported this unit complete to the agent that dispatched it.`); a repeat of the same report is answered with the first result and never delivered twice, and a different second report is refused, so the first one stands.
+A single-agent unit reports by running `dot-agent-deck work-done --done`, and an orchestration when its orchestrator runs it. The unit's agent is told it reported (`Reported this unit complete to the agent that dispatched it.`). Running it again with the same report is answered with the first result and never delivered twice.
+
+A unit whose report turns out to be wrong or stale, for example because a test run finished after it reported, can send an update by running `work-done --done` again with a different report. The update arrives in the dispatcher's conversation as a turn of its own that opens `dispatch: a unit you dispatched sent an update to its report`, says which update it is, and carries the unit's text in the same untrusted-report markers. It adds to the first report and does not replace it: the first report was delivered as it was sent, and the deck's saved copy of each report is kept. A unit can send up to three updates. A fourth different report is refused with `report_updates_exhausted` and is not delivered, so a unit stuck repeating itself cannot flood the dispatcher. The units are told they can do this.
 
 ### When a report does not arrive
 

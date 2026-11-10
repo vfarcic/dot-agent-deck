@@ -381,7 +381,10 @@ async fn return_026_g_only_the_successor_reads_a_closed_replacements_unit() {
         };
         drop(unit.registry().begin_pane_close(unit.pane()));
         assert_only_the_successor_reads_the_unit(&unit, &facts).await;
-        let answer = unit.report_from(unit.pane(), &b, facts, "done").await;
+        // The successor repeats the unit's report, so it reads that report's
+        // answer; a different body would be an update (`dispatch/return/019`).
+        let body = if completed { "PREDECESSOR-026" } else { "done" };
+        let answer = unit.report_from(unit.pane(), &b, facts, body).await;
         match &accepted_id {
             Some(id) => {
                 let answer = reply(answer);
@@ -592,24 +595,119 @@ async fn return_016_a_failed_terminal_save_after_the_units_exit_ends_the_unit() 
     );
 }
 
-/// Scenario: A unit reports, then sends a different terminal report. The repeat is answered `differs`, exit 1, nothing is delivered, and the first report stands.
+/// Scenario: A unit reports, then sends a different terminal report. The second is delivered to the caller as a separate turn labelled as update 1 to the unit's report, wrapped in the untrusted-report markers, while the first report stays delivered and recorded as it was and the saved-results store keeps both. Repeating either report is answered with that report's own result and delivers nothing.
 #[spec("dispatch/return/019")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn return_019_a_differing_terminal_repeat_is_not_delivered() {
+async fn return_019_a_differing_terminal_repeat_is_delivered_as_an_update() {
     let unit = unit("r019", false).await;
-    accepted(unit.report("first").await);
-    let differs = reply(unit.report("second").await);
-    assert_eq!(differs.disposition, WorkDoneDisposition::AlreadyAccepted);
-    assert!(differs.differs);
-    let answer = crate::work_done_text::cli_answer(&differs, None, true);
-    assert!(!answer.success);
+    let delivered = |needle: &str| {
+        unit.registry()
+            .inbox()
+            .rendered(&unit.caller_pane)
+            .into_iter()
+            .filter(|delivery| delivery.text.contains(needle))
+            .map(|delivery| delivery.text)
+            .collect::<Vec<_>>()
+    };
+    let first = accepted(unit.report("R019-FIRST-REPORT").await);
+    assert_eq!(first.update, None);
+    let files = super::report_tests::store_files(&unit.deck.store);
+    assert_eq!(files.len(), 1);
+
+    let update = accepted(unit.report("R019-SECOND-REPORT").await);
+    assert_eq!(update.update, Some(1), "{update:?}");
+    assert_ne!(update.report_id, first.report_id);
+    assert_eq!(update.destination, Some(Destination::Inbox));
+    let answer = crate::work_done_text::cli_answer(&update, None, true);
+    assert!(answer.success, "{answer:?}");
+    assert!(
+        answer
+            .stdout
+            .as_deref()
+            .is_some_and(|line| line.starts_with("Sent update 1 to this unit's report")),
+        "{answer:?}"
+    );
+
+    // Two turns: the first report, untouched, and the labelled update.
     assert_eq!(unit.completed(), 1);
+    assert_eq!(unit.count("dispatch report updated"), 1);
+    let firsts = delivered("R019-FIRST-REPORT");
+    assert_eq!(firsts.len(), 1, "{firsts:?}");
+    assert!(firsts[0].contains("dispatch: a unit you dispatched has completed"));
+    let updates = delivered("R019-SECOND-REPORT");
+    assert_eq!(updates.len(), 1, "{updates:?}");
+    let text = &updates[0];
+    assert!(
+        text.contains(crate::dispatch_return::UPDATE_OPENING)
+            && !text.contains("dispatch: a unit you dispatched has completed"),
+        "{text}"
+    );
+    assert!(text.contains("update 1 of at most 3"), "{text}");
+    assert!(
+        text.contains("earlier report still stands") && text.contains("does not replace it"),
+        "{text}"
+    );
+    assert!(
+        text.find("[UNTRUSTED-WORKER-REPORT:")
+            .zip(text.find(":END-UNTRUSTED-WORKER-REPORT]"))
+            .is_some_and(|(open, close)| text[open..close].contains("R019-SECOND-REPORT")),
+        "{text}"
+    );
+    assert!(!text.contains("R019-FIRST-REPORT"), "{text}");
+    match unit_entry(&unit.deck, &unit.unit_id()) {
+        Some(UnitEntry::Completed {
+            report_id,
+            updates,
+            updating,
+            ..
+        }) => {
+            assert_eq!(report_id, first.report_id, "the first report stands");
+            assert_eq!(updates.len(), 1);
+            assert_eq!(Some(updates[0].1.clone()), update.report_id);
+            assert_eq!(updating, None);
+        }
+        other => panic!("expected a completed unit, got {other:?}"),
+    }
+    let files_after = super::report_tests::store_files(&unit.deck.store);
+    assert_eq!(
+        files_after.len(),
+        2,
+        "the store keeps both: {files_after:?}"
+    );
+    assert!(files.iter().all(|f| files_after.contains(f)));
+
+    // Identical repeats of either report deliver nothing.
+    let again = reply(unit.report("R019-SECOND-REPORT").await);
+    assert_eq!(
+        (again.disposition, again.report_id.clone(), again.differs),
+        (
+            WorkDoneDisposition::AlreadyAccepted,
+            update.report_id.clone(),
+            false
+        )
+    );
+    let again = reply(unit.report("R019-FIRST-REPORT").await);
+    assert_eq!(
+        (again.disposition, again.report_id.clone(), again.differs),
+        (
+            WorkDoneDisposition::AlreadyAccepted,
+            first.report_id.clone(),
+            false
+        )
+    );
+    assert_eq!(unit.completed(), 1);
+    assert_eq!(unit.count("dispatch report updated"), 1);
+    assert_eq!(delivered("R019-SECOND-REPORT").len(), 1);
+    assert_eq!(
+        super::report_tests::store_files(&unit.deck.store),
+        files_after
+    );
 }
 
-/// Scenario: An older dot-agent-deck's `work-done --done`, through the legacy verb's adapter: the unit's first report is acknowledged and delivered. The same body again is acknowledged and changes nothing. A different body is refused, saying the first report stands and this one was not delivered, and it changes nothing: the caller still holds only the first report, and no file is saved.
+/// Scenario: An older dot-agent-deck's `work-done --done`, through the legacy verb's adapter: the unit's first report is acknowledged and delivered. The same body again is acknowledged and changes nothing. A different body is acknowledged and delivered as an update to the report, while the first report stays delivered once.
 #[spec("dispatch/return/019")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn return_019_the_legacy_verb_refuses_a_differing_repeat() {
+async fn return_019_the_legacy_verb_delivers_a_differing_repeat_as_an_update() {
     let unit = unit("r019l", false).await;
     let legacy = |body: &str| {
         let provenance = Provenance::Attested {
@@ -649,24 +747,62 @@ async fn return_019_the_legacy_verb_refuses_a_differing_repeat() {
 
     let same = legacy("LEGACY-019-FIRST").await;
     assert!(same.accepted, "an identical repeat succeeds: {same:?}");
-    let differs = legacy("LEGACY-019-SECOND").await;
+    assert_eq!(inbox_of(&unit.deck, &unit.caller_pane), caller);
+    let update = legacy("LEGACY-019-SECOND").await;
     assert!(
-        !differs.accepted,
-        "a differing repeat is refused: {differs:?}"
+        update.accepted,
+        "a differing repeat is an update: {update:?}"
     );
-    assert_eq!(differs.reason.as_deref(), Some(code::REPORT_DIFFERS));
+    assert_eq!(delivered("LEGACY-019-SECOND"), 1);
+    assert_eq!(delivered("LEGACY-019-FIRST"), 1);
+    assert_eq!(unit.completed(), 1);
+    assert_eq!(unit.count("dispatch report updated"), 1);
+    assert_eq!(
+        super::report_tests::store_files(&unit.deck.store).len(),
+        files.len() + 1
+    );
+}
+
+/// Scenario: A unit reports, then sends three different updates, each delivered as its own numbered update. A fourth different report is refused `report_updates_exhausted`, exit 1, and delivers and saves nothing; an identical repeat of an earlier update is still answered with that update's result.
+#[spec("dispatch/return/029")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_029_a_units_report_updates_are_bounded() {
+    let unit = unit("r029", false).await;
+    accepted(unit.report("R029-REPORT-0").await);
+    let max = crate::report_recovery::MAX_REPORT_UPDATES;
+    let mut ids = Vec::new();
+    for n in 1..=max {
+        let update = accepted(unit.report(&format!("R029-REPORT-{n}")).await);
+        assert_eq!(update.update, Some(n as u32), "{update:?}");
+        ids.push(update.report_id);
+    }
+    assert_eq!(unit.count("dispatch report updated"), max);
+    let files = super::report_tests::store_files(&unit.deck.store);
+    let caller = inbox_of(&unit.deck, &unit.caller_pane);
+
+    let over = refused_with(
+        unit.report("R029-REPORT-OVER").await,
+        code::REPORT_UPDATES_EXHAUSTED,
+    );
+    let answer = crate::work_done_text::cli_answer(&over, None, true);
+    assert!(!answer.success);
     assert!(
-        differs
-            .error
+        answer
+            .stderr
             .as_deref()
-            .is_some_and(|e| e.contains("NOT delivered") && e.contains("first one stands")),
-        "{differs:?}"
+            .is_some_and(|e| e.contains("NOT delivered") && e.contains(&format!("{max} updates"))),
+        "{answer:?}"
     );
     assert_eq!(inbox_of(&unit.deck, &unit.caller_pane), caller);
-    assert_eq!(delivered("LEGACY-019-SECOND"), 0);
-    assert_eq!(delivered("LEGACY-019-FIRST"), 1);
     assert_eq!(super::report_tests::store_files(&unit.deck.store), files);
+
+    let again = reply(unit.report("R029-REPORT-2").await);
+    assert_eq!(
+        (again.disposition, again.report_id),
+        (WorkDoneDisposition::AlreadyAccepted, ids[1].clone())
+    );
     assert_eq!(unit.completed(), 1);
+    assert_eq!(unit.count("dispatch report updated"), max);
 }
 
 /// Scenario: A terminal report is paused after its role-map snapshot and before it takes the routes; the unit's agent exits, and in a second run the unit is closed. Released, it is refused `task_closed` with the ended wording; exactly one `dispatch ended` is posted; no claim, no saved report and no mark are left.
@@ -742,7 +878,7 @@ async fn return_021_a_claim_before_termination_still_reaches_the_caller() {
     }
 }
 
-/// Scenario: A single unit and an orchestration unit each report terminal and are accepted. An identical repeat is answered with the first report id, exit 0; a differing one `differs`, exit 1; after the unit is closed the repeat is still answered through the index; a generation that names no unit is refused `incompatible_mode`. Nothing new is posted, saved or marked.
+/// Scenario: A single unit and an orchestration unit each report terminal and are accepted. An identical repeat is answered with the first report id, exit 0, and posts nothing; a differing one is delivered as update 1; after the unit is closed the repeat is still answered through the index; a generation that names no unit is refused `incompatible_mode`. The first report is posted once.
 #[spec("dispatch/return/022")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn return_022_terminal_retries_after_the_route_was_consumed() {
@@ -759,8 +895,9 @@ async fn return_022_terminal_retries_after_the_route_was_consumed() {
                 false
             )
         );
-        let differs = reply(unit.report("other").await);
-        assert!(differs.differs);
+        let update = accepted(unit.report("other").await);
+        assert_eq!(update.update, Some(1));
+        assert_eq!(unit.count("dispatch report updated"), 1);
         unit.close();
         let after_close = reply(
             unit.report_from(unit.pane(), unit.agent(), unit.facts(unit.agent()), "done")

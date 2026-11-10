@@ -119,6 +119,7 @@ fn answered(
         report_id,
         destination: Some(destination),
         differs,
+        update: None,
         code: None,
         message: None,
     }
@@ -212,6 +213,110 @@ fn install(
         unit_name,
         instance: None,
     }
+}
+
+/// Issue #2260: a terminal report from a unit that already reported. A
+/// repeat of the first report or of an update is answered with that report
+/// and delivers nothing; a repeat while an update is being saved waits for
+/// it; a different report is admitted as the next update while fewer than
+/// [`MAX_REPORT_UPDATES`] were taken, and refused after that. The first
+/// report is never replaced: an update is a post of its own.
+///
+/// [`MAX_REPORT_UPDATES`]: crate::report_recovery::MAX_REPORT_UPDATES
+fn admit_update(
+    st: &mut HubState,
+    reports: &mut ReportState,
+    store: &crate::retained_store::RetainedStore,
+    spec: &ClaimSpec,
+    unit: &str,
+    message_id: &str,
+) -> Admission {
+    let Some(UnitEntry::Completed {
+        report_id,
+        digest,
+        destination,
+        caller,
+        unit_name,
+        updates,
+        updating,
+        ..
+    }) = reports.units.get(unit)
+    else {
+        return Admission::Answer(refused(code::UNKNOWN_TASK, text::forgotten_unit()));
+    };
+    if *digest == spec.digest {
+        return Admission::Answer(answered(
+            WorkDoneDisposition::AlreadyAccepted,
+            None,
+            report_id.clone(),
+            *destination,
+            false,
+        ));
+    }
+    if let Some((_, update_id)) = updates.iter().find(|(d, _)| *d == spec.digest) {
+        return Admission::Answer(answered(
+            WorkDoneDisposition::AlreadyAccepted,
+            None,
+            Some(update_id.clone()),
+            *destination,
+            false,
+        ));
+    }
+    if let Some(claim_id) = *updating {
+        return wait_on(reports, claim_id).unwrap_or_else(|| {
+            Admission::Answer(refused(
+                code::REPORT_PENDING,
+                text::report_pending(Pending::Unit),
+            ))
+        });
+    }
+    if updates.len() >= crate::report_recovery::MAX_REPORT_UPDATES {
+        return Admission::Answer(refused(
+            code::REPORT_UPDATES_EXHAUSTED,
+            text::unit_updates_exhausted(crate::report_recovery::MAX_REPORT_UPDATES),
+        ));
+    }
+    if reports
+        .claims
+        .of_generation(&spec.worker_pane, &spec.worker_agent)
+        .is_some()
+    {
+        return Admission::Answer(refused(
+            code::REPORT_PENDING,
+            text::report_pending(Pending::Generation),
+        ));
+    }
+    let update = updates.len() as u32 + 1;
+    let recipient = caller.clone();
+    let recovery_only = *destination != Destination::Inbox || recipient.is_none();
+    let unit_name = unit_name.clone();
+    let reservation = match reserve_room(st, store, spec.file_bytes) {
+        Ok(reservation) => reservation,
+        Err(reply) => return Admission::Answer(reply),
+    };
+    let claimed = install(
+        reports,
+        spec,
+        ClaimMode::TerminalUpdate {
+            unit_id: unit.to_string(),
+            update,
+        },
+        recipient,
+        None,
+        (None, None),
+        unit_name,
+        message_id,
+        reservation,
+    );
+    // The first report went to recovery: its caller was gone then, and an
+    // update does not reach a successor in that pane either.
+    if recovery_only && let Some(claim) = reports.claims.get_mut(claimed.claim_id) {
+        claim.recipient_gone = true;
+    }
+    if let Some(UnitEntry::Completed { updating, .. }) = reports.units.get_mut(unit) {
+        *updating = Some(claimed.claim_id);
+    }
+    Admission::Claimed(claimed)
 }
 
 /// The watch of claim `claim_id`, for a duplicate to wait on.
@@ -475,19 +580,8 @@ impl InboxHub {
             });
             if let Some(unit) = answering.as_deref() {
                 match reports.units.get(unit) {
-                    Some(UnitEntry::Completed {
-                        report_id,
-                        digest,
-                        destination,
-                        ..
-                    }) => {
-                        return Admission::Answer(answered(
-                            WorkDoneDisposition::AlreadyAccepted,
-                            None,
-                            report_id.clone(),
-                            *destination,
-                            *digest != spec.digest,
-                        ));
+                    Some(UnitEntry::Completed { .. }) => {
+                        return admit_update(st, reports, &store, spec, unit, &message_id);
                     }
                     Some(UnitEntry::Ended { .. }) => {
                         return Admission::Answer(refused(code::TASK_CLOSED, text::unit_ended()));
@@ -719,6 +813,26 @@ impl InboxHub {
                 )),
                 _ => None,
             },
+            ClaimMode::TerminalUpdate { unit_id, .. } => match reports.units.get(unit_id) {
+                Some(UnitEntry::Completed {
+                    updates,
+                    destination,
+                    ..
+                }) if updates.iter().any(|(_, id)| id == report_id) => Some(answered(
+                    WorkDoneDisposition::Accepted,
+                    None,
+                    Some(report_id.to_string()),
+                    if in_inbox || reports.accepted.contains_key(message_id) {
+                        Destination::Inbox
+                    } else if reports.outcomes.has_report(report_id) {
+                        Destination::Recovery
+                    } else {
+                        *destination
+                    },
+                    false,
+                )),
+                _ => None,
+            },
             ClaimMode::Uncorrelated => {
                 if in_inbox || reports.accepted.contains_key(message_id) {
                     Some(answered(
@@ -824,6 +938,22 @@ impl InboxHub {
                     None,
                 ),
                 ClaimMode::Terminal { unit_id, .. } => (
+                    ReportProvenance::Terminal {
+                        unit_id: unit_id.clone(),
+                        report_id: report_id.clone(),
+                        producer: producer.clone(),
+                    },
+                    OutcomePhase::DispatchFinished,
+                    None,
+                    Some(OutcomeUnit {
+                        unit_id: unit_id.clone(),
+                        name: crate::report_recovery::wire_text(
+                            claim.unit_name.as_deref().unwrap_or_default(),
+                            crate::report_recovery::MAX_LABEL_CHARS,
+                        ),
+                    }),
+                ),
+                ClaimMode::TerminalUpdate { unit_id, .. } => (
                     ReportProvenance::Terminal {
                         unit_id: unit_id.clone(),
                         report_id: report_id.clone(),
@@ -955,10 +1085,27 @@ impl InboxHub {
                             digest: claim.digest,
                             destination,
                             unit_mark: claim.unit_mark.unwrap_or(UnitMark::Marked),
+                            caller: claim.recipient.clone().filter(|_| !claim.recipient_gone),
+                            unit_name: claim.unit_name.clone(),
+                            updates: Vec::new(),
+                            updating: None,
                         },
                     );
                     if let Some(returns) = returns {
                         let _ = returns.take_for_unit(unit_pane, unit_id);
+                    }
+                }
+                ClaimMode::TerminalUpdate { unit_id, .. } => {
+                    // The first report and its destination stay as they
+                    // were; the update is recorded beside them.
+                    if let Some(UnitEntry::Completed {
+                        updates, updating, ..
+                    }) = reports.units.get_mut(unit_id)
+                    {
+                        updates.push((claim.digest, report_id.clone()));
+                        if *updating == Some(claim_id) {
+                            *updating = None;
+                        }
                     }
                 }
                 ClaimMode::Uncorrelated => {}
@@ -1061,6 +1208,16 @@ impl InboxHub {
                         reports.units.remove(unit_id);
                     }
                 },
+                // The unit's first report stands; only the update's mark
+                // goes, so a retry is admitted fresh.
+                ClaimMode::TerminalUpdate { unit_id, .. } => {
+                    if let Some(UnitEntry::Completed { updating, .. }) =
+                        reports.units.get_mut(unit_id)
+                        && *updating == Some(claim_id)
+                    {
+                        *updating = None;
+                    }
+                }
                 ClaimMode::Uncorrelated => {}
             }
             let _ = claim.settled.send(ClaimState::Failed);

@@ -1684,6 +1684,17 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // sender withholds until the daemon advertises `CAP_DECK_OUTCOMES`.
     // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
     "1666-task-scoped-completion-and-recovery",
+    // Issue #2260, without moving `PROTOCOL_VERSION`. A dispatched unit's
+    // terminal `work-done` whose body differs from the report it already
+    // sent was answered `already_accepted` with `differs` (or, on the legacy
+    // `work_done` verb, refused `report_differs`) and delivered nothing. It is
+    // now accepted and delivered to the dispatcher as a numbered update beside
+    // the first report, up to `MAX_REPORT_UPDATES`, and refused
+    // `report_updates_exhausted` after that. The reply gains the additive
+    // optional `update` field; what moved is that the same request is now
+    // delivered where an older daemon refused it.
+    // `changelog.d/2260.breaking.md` is its fragment.
+    "2260-work-done-report-updates",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.

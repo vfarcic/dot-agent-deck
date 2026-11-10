@@ -475,10 +475,28 @@ pub enum UnitEntry {
         digest: [u8; 32],
         destination: Destination,
         unit_mark: UnitMark,
+        /// Issue #2260: where an update to the report goes, the caller the
+        /// first report was committed to (`None`: it went to recovery, and
+        /// so does an update).
+        caller: Option<Recipient>,
+        /// The dispatched unit's name, for an update's post.
+        unit_name: Option<String>,
+        /// The updates delivered after the first report, oldest first: each
+        /// one's digest and report id. At most [`MAX_REPORT_UPDATES`].
+        updates: Vec<([u8; 32], String)>,
+        /// The claim saving an update now, which a repeat waits on.
+        updating: Option<u64>,
     },
     /// It ended without a report.
     Ended { how: EndedHow },
 }
+
+/// Issue #2260: how many updates a dispatched unit may send after its first
+/// report. A unit corrects a report it knows is stale or wrong, which in
+/// practice takes one or two (a test run that finished after the report, then
+/// the PR's state); three leaves room for that, while a unit that loops on
+/// `work-done` puts at most four turns into its dispatcher's conversation.
+pub const MAX_REPORT_UPDATES: usize = 3;
 
 /// The environment variable that lowers the per-instance tombstone bound (a
 /// test knob); the daemon-wide bound is sixteen times it.
@@ -548,6 +566,12 @@ impl UnitTable {
         self.units.remove(unit_id)
     }
 
+    /// Unit `unit_id`'s entry, to change in place without moving it in the
+    /// eviction order.
+    pub fn get_mut(&mut self, unit_id: &str) -> Option<&mut UnitEntry> {
+        self.units.get_mut(unit_id)
+    }
+
     fn touch(&mut self, unit_id: &str) {
         if !self.order.iter().any(|u| u == unit_id) {
             self.order.push_back(unit_id.to_string());
@@ -572,8 +596,8 @@ impl UnitTable {
         self.order.is_empty()
     }
 
-    /// Evict the oldest units past the cap, skipping a `Claimed` one and any
-    /// `protected` answers true for (given the unit and its generations).
+    /// Evict the oldest units past the cap, skipping a `Claimed` one, one
+    /// whose report update is being saved, and any `protected` answers true for (given the unit and its generations).
     /// Answers the units evicted.
     pub fn evict(&mut self, protected: impl Fn(&str, &[(String, String)]) -> bool) -> Vec<String> {
         let mut evicted = Vec::new();
@@ -583,7 +607,16 @@ impl UnitTable {
                 break;
             };
             let generations = self.generations_of(&unit);
-            let claimed = matches!(self.units.get(&unit), Some(UnitEntry::Claimed { .. }));
+            let claimed = matches!(
+                self.units.get(&unit),
+                Some(
+                    UnitEntry::Claimed { .. }
+                        | UnitEntry::Completed {
+                            updating: Some(_),
+                            ..
+                        }
+                )
+            );
             if claimed || protected(&unit, &generations) {
                 kept.push_back(unit);
                 continue;
@@ -937,6 +970,9 @@ pub enum ClaimMode {
     Task { task_id: String },
     /// Dispatched unit `unit_id`, whose terminal is on `unit_pane`.
     Terminal { unit_id: String, unit_pane: String },
+    /// Issue #2260: update number `update` (from 1) to dispatched unit
+    /// `unit_id`'s report, which it sent after that report was taken.
+    TerminalUpdate { unit_id: String, update: u32 },
     /// A note that completes no task.
     Uncorrelated,
 }
