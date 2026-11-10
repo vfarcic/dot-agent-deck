@@ -333,6 +333,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the no-prompt open of an approved, unchanged orchestration (every other orchestration test opens one under the harness pre-approval).
 - **Platform coverage:** mac+linux.
 
+##### config-trust/prompt/003 — The trust prompt's layout: state, role marks, removed roles, the restore footer and scrolling under a fixed footer.
+- **Layer:** L1 (`trust_prompt::render_to_buffer` + ratatui `TestBackend` + `insta`, `tests/render_trust_prompt.rs`), views built by `TrustCheck::evaluate(..).view()` against an in-memory `ApprovalStore`.
+- **Agent:** none.
+- **Asserts:** a never-approved orchestration shows `Review project commands`, the project, `not approved before`, every role's command, description and prompt with no mark, and the footer `a approve and start · Esc cancel · ↑↓ scroll`; a changed one shows `changed since you approved it`, the edited role marked `changed`, the added one `new`, the untouched one unmarked and `Removed since you approved it: <role>`; the restore variant's footer is `a approve and restore`; a long prompt in a short terminal keeps the footer on screen and shows `(more below)`, `(more above and below)` and `(more above)` at the top, middle and end. Five snapshots pin the layout.
+- **Does not assert:** keys, approving or the spawned binary (`config-trust/prompt/001`/`002`, the `ui.rs` `prompt_004`–`006` unit tests); escaping of hostile config text (`trust_prompt` unit tests); the desktop dialog.
+- **Platform coverage:** mac+linux+windows.
+
 #### config-trust/restore
 
 ##### config-trust/restore/001 — A restored orchestration whose command changed asks before restoring.
