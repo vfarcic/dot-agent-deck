@@ -336,7 +336,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 ##### config-trust/prompt/003 — The trust prompt's layout: state, role marks, removed roles, the restore footer and scrolling under a fixed footer.
 - **Layer:** L1 (`trust_prompt::render_to_buffer` + ratatui `TestBackend` + `insta`, `tests/render_trust_prompt.rs`), views built by `TrustCheck::evaluate(..).view()` against an in-memory `ApprovalStore`.
 - **Agent:** none.
-- **Asserts:** a never-approved orchestration shows `Review project commands`, the project, `not approved before`, every role's command, description and prompt with no mark, and the footer `a approve and start · Esc cancel · ↑↓ scroll`; a changed one shows `changed since you approved it`, the edited role marked `changed`, the added one `new`, the untouched one unmarked and `Removed since you approved it: <role>`; the restore variant's footer is `a approve and restore`; a long prompt in a short terminal keeps the footer on screen and shows `(more below)`, `(more above and below)` and `(more above)` at the top, middle and end. Five snapshots pin the layout.
+- **Asserts:** a never-approved orchestration shows `Review project commands`, the project, `not approved before`, every role's command, description and prompt with no mark, and the footer `a approve and start · Esc cancel · ↑↓ scroll`; a changed one shows `changed since you approved it`, the edited role marked `changed`, the added one `new`, the untouched one unmarked and `Removed since you approved it: <role>`; the restore variant's footer is `a approve and restore`; a long prompt in a short terminal keeps the footer on screen and shows `(more below)`, `(more above and below)` and `(more above)` at the top, middle and end; a first role whose prompt runs to 70,000 lines either leaves a later role's command reachable at the end or offers no `a approve`. Five snapshots pin the layout.
 - **Does not assert:** keys, approving or the spawned binary (`config-trust/prompt/001`/`002`, the `ui.rs` `prompt_004`–`006` unit tests); escaping of hostile config text (`trust_prompt` unit tests); the desktop dialog.
 - **Platform coverage:** mac+linux+windows.
 
@@ -354,6 +354,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** stand-ins (`sleep 600`).
 - **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing.
 - **Does not assert:** that the orchestration can be reopened afterwards; several restored orchestrations.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/003 — A saved orchestration that can no longer be trust-checked does not fall through to a plain-pane restore.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, three tests): saved session holding a never-approved orchestration whose saved orchestrator command writes a sentinel file, followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION` with an empty approval store.
+- **Agent:** stand-ins (`sh -c 'touch <sentinel>; exec sleep 600'`, `sleep 600`).
+- **Asserts:** after (a) a worker role is removed from the config, (b) the orchestration is renamed, or (c) the config file is deleted, launching the TUI never writes the sentinel, restores no `orchestrator` pane and no pane in the project, starts no role, and still restores the plain pane (a trust prompt, if one appears, is cancelled first).
+- **Does not assert:** what the warning says; role reorder or role rename drift.
 - **Platform coverage:** mac+linux.
 
 #### config-trust/respawn
@@ -379,6 +386,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** spawning a role whose text is unchanged.
 - **Platform coverage:** mac+linux.
 
+##### config-trust/respawn/004 — A delegate to a non-clear role refuses after only its prompt changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** with an approved orchestration open, changing only a non-clear `reviewer` role's `prompt_template` makes `delegate --to reviewer` exit non-zero with the refusal text (`changed since you approved it`, the approve command), and the task never reaches the reviewer's inbox.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
 #### config-trust/schedule
 
 ##### config-trust/schedule/001 — A scheduled fire into a never-approved orchestration is refused and reported.
@@ -395,6 +409,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** the daemon log line.
 - **Platform coverage:** mac+linux.
 
+##### config-trust/schedule/003 — A forged `.git` file does not borrow another checkout's approval.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`sh ./agent.sh`, `cat`).
+- **Asserts:** with repository A's `team` approved, a directory B holding byte-identical TOML, a different `agent.sh` and a `.git` file copied from A's legitimate linked worktree is refused on run-now: B's marker file is never written, `schedule list` reports the refusal with the approve command naming B, and nothing spawns in B; a run-now in A's real linked worktree still opens the orchestration.
+- **Does not assert:** the wording of the refusal reason; other forged geometries (a `.git` directory, a symlinked `.git`).
+- **Platform coverage:** mac+linux.
+
 #### config-trust/dispatch
 
 ##### config-trust/dispatch/001 — `dispatch --orchestration` refuses until approved, then runs in a worktree that shares the approval.
@@ -402,6 +423,24 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** stand-ins.
 - **Asserts:** from a never-approved project the refusal reaches the caller's inbox (where `dispatch` posts its outcome), no worktree is created and nothing spawns; after `trust approve` of the main checkout a second dispatch succeeds and the roles run in the unit's linked worktree.
 - **Does not assert:** `dispatch --single` or `--command` (not gated).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/rearm
+
+##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.
+- **Layer:** L2 headless `daemon serve` + `RunNow` with a PTY-attached TUI warm-reattaching to it, lane 1 (`tests/e2e_config_trust.rs`); synthetic `Compacting` and `/clear` `SessionStart` hook events under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** after a schedule opens an approved orchestration and only its start role's `prompt_template` is edited to carry a sentinel (`trust list` reads `changed`), a TUI attaching to the warm daemon and then a compaction and a `/clear` on the start role publish no `.dot-agent-deck/orchestrator-context*` file and post no start-role inbox message containing the sentinel.
+- **Does not assert:** how the user is told (a prompt or a refusal); the re-arm of an unchanged orchestration (`orchestration/remit/*`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/escape
+
+##### config-trust/escape/001 — Refusals carry no raw terminal control characters from project-chosen names.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), with `DOT_AGENT_DECK_LOG` pointed into the test's tempdir and real agent-verb CLIs from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** an orchestration named with an ESC clear-screen sequence and a right-to-left override is refused on run-now with no raw ESC or U+202E in the daemon's stderr and no raw ESC, BEL or bidi control in its log; after approving, opening it, changing a command and adding a role with an OSC-8/bidi name, the refused `delegate` and `pane restart` print no raw ESC, BEL or bidi control.
+- **Does not assert:** the escaped spelling; `schedule list` (already escaped) or the TUI schedule manager.
 - **Platform coverage:** mac+linux.
 
 #### config-trust/live

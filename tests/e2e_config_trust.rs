@@ -10,7 +10,11 @@
 //!   prompt on the New Agent form and on session restore, through a PTY.
 //! - `config-trust/respawn/*`, `config-trust/schedule/001` and
 //!   `config-trust/dispatch/001`: the unattended paths refuse, report the
-//!   refusal to whoever asked, and start nothing.
+//!   refusal to whoever asked, and start nothing; `config-trust/schedule/003`
+//!   pins that a forged `.git` file borrows no approval.
+//! - `config-trust/rearm/001` and `config-trust/escape/001`: a warm reattach
+//!   re-arms no unapproved instructions, and refusals print no raw terminal
+//!   controls from project-chosen names.
 //!
 //! Every role command is a token-free stand-in (`env TRUST_ROLE=<role> cat`,
 //! `sleep 600`). `config-trust/schedule/002` lives in `e2e_issue_dispatch.rs`
@@ -626,6 +630,18 @@ fn toml_str(s: &str) -> String {
 /// Stage a `session.toml` holding one orchestration pane, in the
 /// `OrchestrationSnapshot` key names `session/restore/008` stages.
 fn stage_orchestration_session(session_file: &Path, project: &Path, roles: &[&str]) {
+    stage_orchestration_session_running(session_file, project, roles, "sleep 600");
+}
+
+/// [`stage_orchestration_session`] with the saved orchestrator pane's
+/// `command` set to `command` — what a plain-pane restore of it would run.
+fn stage_orchestration_session_running(
+    session_file: &Path,
+    project: &Path,
+    roles: &[&str],
+    command: &str,
+) {
+    let command = toml_str(command);
     let dir = toml_str(&project.to_string_lossy());
     let roles = roles
         .iter()
@@ -636,7 +652,7 @@ fn stage_orchestration_session(session_file: &Path, project: &Path, roles: &[&st
         "[[panes]]\n\
          dir = \"{dir}\"\n\
          name = \"orchestrator\"\n\
-         command = \"sleep 600\"\n\n\
+         command = \"{command}\"\n\n\
          [panes.orchestration]\n\
          version = 1\n\
          roles = [{roles}]\n\
@@ -866,6 +882,161 @@ fn restore_002_cancelling_the_restore_prompt_leaves_the_orchestration_unrestored
     );
 }
 
+/// How the project config has drifted from a saved orchestration snapshot
+/// before the TUI restores it (`config-trust/restore/003`).
+enum RestoreDrift {
+    /// A worker role was removed from the orchestration.
+    WorkerRemoved,
+    /// The orchestration was renamed.
+    Renamed,
+    /// The project's `.dot-agent-deck.toml` was deleted.
+    ConfigDeleted,
+}
+
+/// Stage a saved session holding a never-approved orchestration whose saved
+/// orchestrator command writes a sentinel file, followed by a plain pane; then
+/// drift the project config by `drift` and launch the TUI on an empty daemon.
+/// Asserts the saved command never runs, nothing of the orchestration is
+/// restored as a plain pane, and the plain pane still restores.
+fn assert_drifted_restore_runs_nothing(drift: RestoreDrift) {
+    const PLAIN: &str = "r-plain";
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("restore-project");
+    let plain_dir = scratch.path().join("plain-dir");
+    let state = scratch.path().join("state");
+    for dir in [&project, &plain_dir] {
+        std::fs::create_dir_all(dir).expect("create sandbox dir");
+    }
+    let sentinel = scratch.path().join("restore-drift-sentinel");
+    let sentinel_command = format!(
+        "sh -c 'touch {}; exec sleep 600'",
+        sentinel.to_string_lossy()
+    );
+    let role = |name: &str, command: &str, start: bool| {
+        format!(
+            "\n[[orchestrations.roles]]\nname = \"{name}\"\ncommand = \"{}\"\n{}",
+            toml_str(command),
+            if start { "start = true\n" } else { "" }
+        )
+    };
+    let config = |orchestration: &str, with_reviewer: bool| {
+        let mut toml = format!("[[orchestrations]]\nname = \"{orchestration}\"\n");
+        toml.push_str(&role("orchestrator", &sentinel_command, true));
+        toml.push_str(&role("coder", "sleep 600", false));
+        if with_reviewer {
+            toml.push_str(&role("reviewer", "sleep 600", false));
+        }
+        toml
+    };
+    let config_path = project.join(".dot-agent-deck.toml");
+    match drift {
+        RestoreDrift::WorkerRemoved => std::fs::write(&config_path, config("restore-orch", false)),
+        RestoreDrift::Renamed => std::fs::write(&config_path, config("renamed-orch", true)),
+        RestoreDrift::ConfigDeleted => Ok(()),
+    }
+    .expect("write the drifted config");
+
+    let session_file = scratch.path().join("session.toml");
+    stage_orchestration_session_running(
+        &session_file,
+        &project,
+        &["orchestrator", "coder", "reviewer"],
+        &sentinel_command,
+    );
+    let mut session = std::fs::read_to_string(&session_file).expect("read staged session");
+    session.push_str(&format!(
+        "\n[[panes]]\ndir = \"{}\"\nname = \"{PLAIN}\"\ncommand = \"sleep 600\"\n",
+        toml_str(&plain_dir.to_string_lossy())
+    ));
+    std::fs::write(&session_file, session).expect("stage the plain pane");
+
+    let deck = TuiDeck::builder()
+        .with_pty_size(140, 50)
+        .with_env("DOT_AGENT_DECK_SESSION", session_file.to_string_lossy())
+        .with_env("DOT_AGENT_DECK_STATE_DIR", state.to_string_lossy())
+        .launch_with_fixture("plain-project");
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    // A trust prompt is an acceptable answer to a snapshot that cannot be
+    // checked; cancel it so the rest of the session restores either way.
+    let plain_restored = common::wait_until(common::load_scaled(Duration::from_secs(20)), || {
+        if deck.snapshot_grid().contains(PROMPT_TITLE) {
+            deck.send_keys(b"\x1b");
+        }
+        common::agent_records_on(&attach)
+            .iter()
+            .any(|r| r.display_name.as_deref() == Some(PLAIN))
+    });
+    // Give a saved command that did start time to write its sentinel.
+    let sentinel_written = common::wait_until(Duration::from_secs(3), || sentinel.exists());
+    let agents = common::agent_records_on(&attach)
+        .iter()
+        .map(|r| (r.display_name.clone(), r.cwd.clone()))
+        .collect::<Vec<_>>();
+    assert!(
+        !sentinel_written,
+        "the saved orchestrator command of an orchestration that cannot be trust-checked ran \
+         (sentinel {} written) — a drifted, unapproved snapshot must not fall through to a \
+         plain-pane restore.\nAgents: {agents:?}\nGrid:\n{}",
+        sentinel.display(),
+        deck.snapshot_grid()
+    );
+    let project_canonical = canonical(&project);
+    assert!(
+        !common::agent_records_on(&attach).iter().any(|r| {
+            r.display_name.as_deref() == Some("orchestrator")
+                || r.cwd.as_deref().is_some_and(|cwd| {
+                    std::fs::canonicalize(cwd)
+                        .is_ok_and(|c| c.to_string_lossy() == project_canonical)
+                })
+        }),
+        "nothing of the orchestration may be restored as a plain pane.\nAgents: {agents:?}"
+    );
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(1)),
+        "no orchestration role starts: {:?}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        plain_restored,
+        "the rest of the session (`{PLAIN}`) must still restore.\nAgents: {agents:?}\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Stage a saved session holding a never-approved orchestration (its
+/// saved orchestrator command writes a sentinel file) and a plain pane, then
+/// remove a worker role from the project config. Launching the TUI must not run
+/// the saved command or restore it as a plain pane, and the plain pane restores.
+#[spec("config-trust/restore/003")]
+#[test]
+fn restore_003_a_removed_worker_does_not_fall_through_to_a_plain_restore() {
+    assert_drifted_restore_runs_nothing(RestoreDrift::WorkerRemoved);
+}
+
+/// Scenario: Stage the same saved session, then rename the orchestration in the
+/// project config. Launching the TUI must not run the saved orchestrator
+/// command (no sentinel file) or restore it as a plain pane, and the plain pane
+/// restores.
+#[spec("config-trust/restore/003")]
+#[test]
+fn restore_003_a_renamed_orchestration_does_not_fall_through_to_a_plain_restore() {
+    assert_drifted_restore_runs_nothing(RestoreDrift::Renamed);
+}
+
+/// Scenario: Stage the same saved session, then delete the project's
+/// `.dot-agent-deck.toml`. Launching the TUI must not run the saved
+/// orchestrator command (no sentinel file) or restore it as a plain pane, and
+/// the plain pane restores.
+#[spec("config-trust/restore/003")]
+#[test]
+fn restore_003_a_deleted_config_does_not_fall_through_to_a_plain_restore() {
+    assert_drifted_restore_runs_nothing(RestoreDrift::ConfigDeleted);
+}
+
 // ---------------------------------------------------------------------------
 // config-trust/respawn/*: agent verbs refuse after a config change
 // ---------------------------------------------------------------------------
@@ -992,6 +1163,75 @@ fn respawn_003_pane_spawn_refuses_after_a_change() {
         !common::wait_until(Duration::from_secs(2), || role_record(attach, "reviewer")
             .is_some()),
         "a refused spawn starts no reviewer"
+    );
+}
+
+/// The `config-trust` orchestration plus a non-clear `reviewer` role whose
+/// `prompt_template` is `reviewer_prompt`.
+fn write_trust_config_with_reviewer_prompt(dir: &Path, reviewer_prompt: &str) {
+    write_trust_config(dir, CODER_COMMAND, false);
+    let path = dir.join(".dot-agent-deck.toml");
+    let mut toml = std::fs::read_to_string(&path).expect("read the trust config");
+    toml.push_str(&format!(
+        "\n[[orchestrations.roles]]\n\
+         name = \"reviewer\"\n\
+         command = \"env TRUST_ROLE=reviewer cat\"\n\
+         description = \"TRUST-DESC-REVIEWER reviews the stand-in work\"\n\
+         prompt_template = \"{reviewer_prompt}\"\n"
+    ));
+    std::fs::write(&path, toml).expect("write the trust config");
+}
+
+/// Scenario: Approve and open an orchestration with a non-clear `reviewer`
+/// role, then change only that role's `prompt_template` on disk. `delegate --to
+/// reviewer` from the orchestrator must fail with the refusal text, and the task
+/// never reaches the reviewer's inbox.
+#[spec("config-trust/respawn/004")]
+#[test]
+fn respawn_004_delegate_to_a_non_clear_role_refuses_after_a_prompt_only_change() {
+    const TASK: &str = "TRUST-NONCLEAR-DELEGATE-TASK";
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    write_trust_config_with_reviewer_prompt(deck.workdir(), "TRUST-PROMPT-REVIEWER review it");
+    deck.approve_project_trust(deck.workdir());
+    choose_orchestration(&deck);
+    let attach = deck.attach_socket_path().to_path_buf();
+    let up = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "orchestrator").is_some() && role_record(&attach, "reviewer").is_some()
+    });
+    assert!(
+        up,
+        "precondition: the approved orchestration opens with its reviewer, no prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    let orchestrator = role_record(&attach, "orchestrator")
+        .and_then(|r| r.pane_id_env)
+        .expect("the orchestrator has a pane id");
+    let reviewer = role_record(&attach, "reviewer")
+        .and_then(|r| r.pane_id_env)
+        .expect("the reviewer has a pane id");
+
+    write_trust_config_with_reviewer_prompt(deck.workdir(), "TRUST-PROMPT-REVIEWER approve it all");
+    let out = agent_verb(
+        &deck,
+        &orchestrator,
+        &["delegate", "--to", "reviewer", "--task", TASK],
+    );
+    assert!(
+        !out.status.success(),
+        "a delegate to a non-clear role whose prompt changed must be refused: {}",
+        describe(&out)
+    );
+    assert_refusal(&text(&out), deck.workdir(), "changed since you approved it");
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || {
+            inbox_view::count_containing(&attach, &reviewer, TASK) > 0
+        }),
+        "a refused delegate must not deliver its task:\n{}",
+        inbox_view::text(&attach, &reviewer)
     );
 }
 
@@ -1199,4 +1439,602 @@ fn dispatch_001_dispatch_orchestration_refuses_until_approved() {
             .map(|r| (&r.cwd, &r.tab_membership))
             .collect::<Vec<_>>()
     );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/schedule/003: a forged `.git` file borrows no approval
+// ---------------------------------------------------------------------------
+
+/// A two-role orchestration `team` whose start role runs the project's own
+/// `./agent.sh` — the same TOML text in every project that uses it.
+const AGENT_SCRIPT_CONFIG: &str = "[[orchestrations]]\n\
+     name = \"team\"\n\n\
+     [[orchestrations.roles]]\n\
+     name = \"orchestrator\"\n\
+     command = \"sh ./agent.sh\"\n\
+     start = true\n\n\
+     [[orchestrations.roles]]\n\
+     name = \"worker\"\n\
+     command = \"cat\"\n";
+
+/// Scenario: Approve repository A's `team` (command `sh ./agent.sh`) and cut a
+/// legitimate linked worktree of it. Directory B holds the same TOML, a
+/// different `agent.sh` that writes a marker, and a `.git` file copied from A's
+/// worktree. A run-now schedule in B must be refused and never write B's
+/// marker, while one in A's real linked worktree still opens the orchestration.
+#[spec("config-trust/schedule/003")]
+#[test]
+fn schedule_003_a_forged_gitfile_does_not_borrow_another_checkouts_approval() {
+    let scratch = common::race_safe_tempdir();
+    let root = scratch.path().to_path_buf();
+    let repo_a = root.join("approved-repo");
+    let worktree_a = root.join("approved-repo-wt");
+    let forged_b = root.join("forged-project");
+    for dir in [&repo_a, &forged_b] {
+        std::fs::create_dir_all(dir).expect("create sandbox dir");
+    }
+    std::fs::write(repo_a.join(".dot-agent-deck.toml"), AGENT_SCRIPT_CONFIG).expect("A config");
+    std::fs::write(repo_a.join("agent.sh"), "exec cat\n").expect("A agent.sh");
+    for args in [
+        &["-c", "init.defaultBranch=main", "init", "-q"][..],
+        &["add", "-A"],
+        &["commit", "-q", "-m", "init"],
+    ] {
+        let status = common::fixture_git(&repo_a, &root)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git {args:?} failed in repository A");
+    }
+    let added = common::fixture_git(&repo_a, &root)
+        .args(["worktree", "add", "-q", "-b", "wt"])
+        .arg(&worktree_a)
+        .status()
+        .expect("git worktree add");
+    assert!(added.success(), "git worktree add failed");
+
+    // B: byte-identical TOML, a different script, A's worktree's `.git` file.
+    std::fs::write(forged_b.join(".dot-agent-deck.toml"), AGENT_SCRIPT_CONFIG).expect("B config");
+    std::fs::write(
+        forged_b.join("agent.sh"),
+        "echo forged > hostile-marker\nexec cat\n",
+    )
+    .expect("B agent.sh");
+    std::fs::copy(worktree_a.join(".git"), forged_b.join(".git")).expect("copy the .git file");
+    let marker = forged_b.join("hostile-marker");
+
+    let schedule = |name: &str, dir: &Path| {
+        format!(
+            "[[scheduled_tasks]]\n\
+             name = \"{name}\"\n\
+             cron = \"0 0 1 1 *\"\n\
+             working_dir = \"{}\"\n\
+             command = \"cat\"\n\
+             prompt = \"TRUST-FORGED-PROMPT\"\n\
+             enabled = true\n",
+            toml_str(&dir.to_string_lossy())
+        )
+    };
+    let toml = format!(
+        "{}\n{}",
+        schedule("forged-sched", &forged_b),
+        schedule("legit-sched", &worktree_a)
+    );
+    let daemon = common::spawn_daemon_serve_untrusted(Some(&toml), "0", &[]);
+    daemon.approve_project_trust(&repo_a);
+
+    daemon.run_now("forged-sched").expect("run-now in B");
+    let forged_canonical = canonical(&forged_b);
+    let schedule_list = || text(&daemon.run_schedule_cli(&["list"]));
+    let settled = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        marker.exists() || {
+            let listed = schedule_list();
+            listed.contains("dot-agent-deck trust approve") && listed.contains(&forged_canonical)
+        }
+    });
+    let in_b = |r: &AgentRecord| {
+        r.cwd.as_deref().is_some_and(|cwd| {
+            std::fs::canonicalize(cwd).is_ok_and(|c| c.to_string_lossy() == forged_canonical)
+        })
+    };
+    assert!(
+        !marker.exists() && !common::wait_until(Duration::from_secs(2), || marker.exists()),
+        "B was never approved, but its run-now ran B's own agent.sh (marker {} written): a \
+         `.git` file copied from A's linked worktree borrowed A's approval.\nAgents in B: {:?}\n\
+         schedule list:\n{}",
+        marker.display(),
+        daemon
+            .agent_records()
+            .iter()
+            .filter(|r| in_b(r))
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        schedule_list()
+    );
+    assert!(
+        settled,
+        "B's refused fire must be reported in `schedule list`, with the approve command naming \
+         B:\n{}",
+        schedule_list()
+    );
+    assert!(
+        !daemon.agent_records().iter().any(in_b),
+        "a refused fire in B spawns nothing there: {:?}",
+        daemon.agent_records()
+    );
+
+    // Control: A's legitimate linked worktree still shares A's approval.
+    let worktree_canonical = canonical(&worktree_a);
+    daemon
+        .run_now("legit-sched")
+        .expect("run-now in A's worktree");
+    assert!(
+        daemon
+            .wait_for_agent_where(
+                |r| matches!(
+                    &r.tab_membership,
+                    Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+                ) && r.cwd.as_deref().is_some_and(|cwd| {
+                    std::fs::canonicalize(cwd)
+                        .is_ok_and(|c| c.to_string_lossy() == worktree_canonical)
+                }),
+                common::load_scaled(Duration::from_secs(15)),
+            )
+            .is_some(),
+        "A's real linked worktree must still share A's approval and open the orchestration.\n\
+         schedule list:\n{}",
+        schedule_list()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/rearm/001: a warm reattach re-arms only approved instructions
+// ---------------------------------------------------------------------------
+
+/// The start role's instructions after the unapproved edit.
+const REARM_SENTINEL: &str = "UNAPPROVED_REARM_SENTINEL_9c41";
+
+fn write_rearm_config(project: &Path, start_prompt: &str) {
+    let toml = format!(
+        "[[orchestrations]]\n\
+         name = \"rearm-orch\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"cat\"\n\
+         start = true\n\
+         description = \"REARM-DESC coordinates the stand-ins\"\n\
+         prompt_template = \"{start_prompt}\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"worker\"\n\
+         command = \"cat\"\n"
+    );
+    std::fs::write(project.join(".dot-agent-deck.toml"), toml).expect("write the re-arm config");
+}
+
+/// Every orchestrator context file the deck published under `project`, with
+/// its content.
+fn published_context_files(project: &Path) -> Vec<(PathBuf, String)> {
+    let Ok(entries) = std::fs::read_dir(project.join(".dot-agent-deck")) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("orchestrator-context"))
+        })
+        .filter_map(|p| {
+            let content = String::from_utf8_lossy(&std::fs::read(&p).ok()?).into_owned();
+            Some((p, content))
+        })
+        .collect()
+}
+
+/// Where the sentinel has been published, if anywhere: a context file under
+/// `project` or a message in the start role's inbox.
+fn sentinel_published(project: &Path, attach: &Path, start_pane: &str) -> Option<String> {
+    if let Some((path, _)) = published_context_files(project)
+        .into_iter()
+        .find(|(_, content)| content.contains(REARM_SENTINEL))
+    {
+        return Some(format!("context file {}", path.display()));
+    }
+    (inbox_view::count_containing(attach, start_pane, REARM_SENTINEL) > 0).then(|| {
+        format!(
+            "the start role's inbox:\n{}",
+            inbox_view::text(attach, start_pane)
+        )
+    })
+}
+
+/// Inject one synthetic hook event for `pane_id` / `agent_id` over `hook_socket`.
+fn inject_event(
+    hook_socket: &Path,
+    pane_id: &str,
+    agent_id: &str,
+    event_type: dot_agent_deck::event::EventType,
+    agent_type: dot_agent_deck::event::AgentType,
+    tool_name: Option<&str>,
+    metadata: std::collections::HashMap<String, String>,
+) {
+    let event = dot_agent_deck::event::AgentEvent {
+        session_id: format!("{agent_id}-rearm-session"),
+        agent_type,
+        event_type,
+        tool_name: tool_name.map(str::to_string),
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id: Some(pane_id.to_string()),
+        agent_id: Some(agent_id.to_string()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    };
+    let line = serde_json::to_string(&event).expect("serialize the synthetic event");
+    common::write_hook_line(hook_socket, &line).expect("inject the synthetic event");
+}
+
+/// Wait until the daemon's live status for `pane_id` satisfies `pred`.
+fn wait_for_live(
+    attach: &Path,
+    pane_id: &str,
+    pred: impl Fn(&dot_agent_deck::state::SessionSnapshot) -> bool,
+) -> bool {
+    common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
+        common::agent_records_on(attach).into_iter().any(|r| {
+            r.pane_id_env.as_deref() == Some(pane_id) && r.live.as_ref().is_some_and(&pred)
+        })
+    })
+}
+
+/// Scenario: A schedule opens an approved stand-in orchestration; then only its
+/// start role's `prompt_template` is edited to carry a sentinel, and the TUI
+/// attaches to the warm daemon. A compaction and then a `/clear` on the start
+/// role must re-arm nothing carrying the sentinel: no published context file and
+/// no start-role inbox message contains it while the approval reads `changed`.
+#[spec("config-trust/rearm/001")]
+#[test]
+fn rearm_001_a_warm_reattach_never_publishes_changed_instructions() {
+    use dot_agent_deck::event::{
+        AgentType, CLEAR_SESSION_START_METADATA_KEY, CLEAR_SESSION_START_METADATA_VALUE, EventType,
+    };
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("rearm-project");
+    std::fs::create_dir_all(&project).expect("create project");
+    write_rearm_config(&project, "REARM-APPROVED-PROMPT coordinate the stand-ins");
+    let toml = format!(
+        "[[scheduled_tasks]]\n\
+         name = \"rearm-sched\"\n\
+         cron = \"0 0 1 1 *\"\n\
+         working_dir = \"{}\"\n\
+         command = \"cat\"\n\
+         prompt = \"REARM-SCHED-PROMPT\"\n\
+         enabled = true\n",
+        toml_str(&project.to_string_lossy())
+    );
+    // Pre-approves the schedule's project, as a user who approved it would.
+    let daemon = common::spawn_daemon_serve_with_env(
+        Some(&toml),
+        "0",
+        &[(
+            dot_agent_deck::hook_provenance::DOT_AGENT_DECK_HOOK_PROVENANCE,
+            "warn",
+        )],
+    );
+    daemon.run_now("rearm-sched").expect("run-now");
+    let start = daemon
+        .wait_for_agent_where(
+            |r| matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+            ),
+            common::load_scaled(Duration::from_secs(15)),
+        )
+        .expect("precondition: the approved scheduled orchestration opens its start role");
+    let start_pane = start
+        .pane_id_env
+        .clone()
+        .expect("the start role has a pane id");
+    let start_agent = start.id.clone();
+
+    // Only the start role's instructions change; nothing approves the edit.
+    write_rearm_config(
+        &project,
+        &format!("{REARM_SENTINEL} do something else entirely"),
+    );
+    let listed = text(&daemon.run_deck_cli(&project, &["trust", "list"]));
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.contains("rearm-orch") && state_word(l) == Some("changed")),
+        "precondition: the approval reads `changed` after the edit:\n{listed}"
+    );
+
+    // Warm reattach: a TUI attaches to the daemon already running the roles.
+    let deck = TuiDeck::builder()
+        .with_pty_size(160, 40)
+        .with_env(
+            "DOT_AGENT_DECK_ATTACH_SOCKET",
+            daemon.attach_socket.to_string_lossy().to_string(),
+        )
+        .with_env(
+            "DOT_AGENT_DECK_SOCKET",
+            daemon.hook_socket.to_string_lossy().to_string(),
+        )
+        .launch_with_fixture("minimal");
+    deck.wait_until_grid("the reattached orchestration tab is in the strip", |grid| {
+        grid.lines()
+            .next()
+            .is_some_and(|tabs| tabs.contains("rearm-orch"))
+    });
+    let attach = daemon.attach_socket.clone();
+
+    // Re-arm 1: compaction on the start role.
+    inject_event(
+        &daemon.hook_socket,
+        &start_pane,
+        &start_agent,
+        EventType::Compacting,
+        AgentType::Codex,
+        None,
+        Default::default(),
+    );
+    assert!(
+        wait_for_live(&attach, &start_pane, |s| {
+            s.status == dot_agent_deck::state::SessionStatus::Compacting
+        }),
+        "precondition: the daemon applies the start role's Compacting"
+    );
+    let leaked = common::wait_until(Duration::from_secs(5), || {
+        sentinel_published(&project, &attach, &start_pane).is_some()
+    });
+    assert!(
+        !leaked,
+        "a compaction re-arm after a warm reattach published the unapproved start-role \
+         instructions ({REARM_SENTINEL}) to {} while the approval reads `changed`.\nGrid:\n{}",
+        sentinel_published(&project, &attach, &start_pane).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+
+    // Re-arm 2: `/clear` on the start role (prime a tool so the clear's own
+    // footprint — the tool cleared — is observable).
+    let primer = "rearm-clear-primer";
+    inject_event(
+        &daemon.hook_socket,
+        &start_pane,
+        &start_agent,
+        EventType::ToolStart,
+        AgentType::ClaudeCode,
+        Some(primer),
+        Default::default(),
+    );
+    assert!(
+        wait_for_live(&attach, &start_pane, |s| {
+            s.active_tool.as_ref().is_some_and(|t| t.name == primer)
+        }),
+        "precondition: the daemon applies the primer tool"
+    );
+    inject_event(
+        &daemon.hook_socket,
+        &start_pane,
+        &start_agent,
+        EventType::SessionStart,
+        AgentType::ClaudeCode,
+        None,
+        [(
+            CLEAR_SESSION_START_METADATA_KEY.to_string(),
+            CLEAR_SESSION_START_METADATA_VALUE.to_string(),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    assert!(
+        wait_for_live(&attach, &start_pane, |s| s.active_tool.is_none()),
+        "precondition: the daemon applies the start role's /clear SessionStart"
+    );
+    let leaked = common::wait_until(Duration::from_secs(5), || {
+        sentinel_published(&project, &attach, &start_pane).is_some()
+    });
+    assert!(
+        !leaked,
+        "a /clear re-arm after a warm reattach published the unapproved start-role \
+         instructions ({REARM_SENTINEL}) to {} while the approval reads `changed`.\nGrid:\n{}",
+        sentinel_published(&project, &attach, &start_pane).unwrap_or_default(),
+        deck.snapshot_grid()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// config-trust/escape/001: refusal text carries no raw terminal controls
+// ---------------------------------------------------------------------------
+
+/// An orchestration name a hostile project could choose: an ESC sequence that
+/// clears the screen and a right-to-left override, written with TOML escapes.
+const HOSTILE_ORCH_TOML: &str = "esc\\u001b[2JTRUST-AUDIT\\u202eflip";
+/// A role name with an OSC-8 hyperlink opener and a right-to-left override.
+const HOSTILE_ROLE_TOML: &str = "rev\\u001b]8;;http://x\\u0007\\u202eiew";
+
+/// A project whose one orchestration carries the hostile name. Spawn
+/// validation refuses such a name, so it is only ever refused, never opened.
+fn write_hostile_orchestration_config(dir: &Path) {
+    let toml = format!(
+        "[[orchestrations]]\n\
+         name = \"{HOSTILE_ORCH_TOML}\"\n\n\
+         [[orchestrations.roles]]\n\
+         name = \"orchestrator\"\n\
+         command = \"env TRUST_ROLE=orchestrator cat\"\n\
+         start = true\n"
+    );
+    std::fs::write(dir.join(".dot-agent-deck.toml"), toml).expect("write the hostile config");
+}
+
+/// The `config-trust` orchestration with `coder` running `coder_command`, plus
+/// a role carrying the hostile name.
+fn write_trust_config_with_hostile_role(dir: &Path, coder_command: &str) {
+    write_trust_config(dir, coder_command, false);
+    let path = dir.join(".dot-agent-deck.toml");
+    let mut toml = std::fs::read_to_string(&path).expect("read the trust config");
+    toml.push_str(&format!(
+        "\n[[orchestrations.roles]]\n\
+         name = \"{HOSTILE_ROLE_TOML}\"\n\
+         command = \"cat\"\n"
+    ));
+    std::fs::write(&path, toml).expect("write the trust config");
+}
+
+/// The raw terminal controls a refusal must never carry: ESC, BEL and the
+/// bidi overrides/isolates.
+fn raw_controls(text: &str) -> Vec<String> {
+    text.chars()
+        .filter(|c| {
+            matches!(
+                c,
+                '\u{1b}' | '\u{7}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
+        })
+        .map(|c| format!("U+{:04X}", c as u32))
+        .collect()
+}
+
+/// Run `dot-agent-deck <args…>` against `daemon` as the agent in `caller_pane`.
+fn daemon_agent_verb(
+    daemon: &common::DaemonProc,
+    cwd: &Path,
+    caller_pane: &str,
+    args: &[&str],
+) -> Output {
+    std::process::Command::new(common::contained_deck_binary())
+        .args(args)
+        .env("DOT_AGENT_DECK_SOCKET", &daemon.hook_socket)
+        .env("DOT_AGENT_DECK_ATTACH_SOCKET", &daemon.attach_socket)
+        .env("DOT_AGENT_DECK_PANE_ID", caller_pane)
+        .env("HOME", &daemon.home)
+        .current_dir(cwd)
+        .output()
+        .expect("run the agent verb")
+}
+
+/// Scenario: A project names its orchestration with an ESC clear-screen
+/// sequence and a bidi override; a run-now refusal must leave no raw ESC or
+/// bidi character in the daemon's stderr or log. A second, approved and open
+/// orchestration then gains a role with a hostile name, and the refused
+/// `delegate` and `pane restart` print no raw ESC, BEL or bidi character.
+#[spec("config-trust/escape/001")]
+#[test]
+fn escape_001_refusals_carry_no_raw_terminal_controls() {
+    let scratch = common::race_safe_tempdir();
+    let hostile = scratch.path().join("hostile-project");
+    let roles = scratch.path().join("roles-project");
+    for dir in [&hostile, &roles] {
+        std::fs::create_dir_all(dir).expect("create project");
+    }
+    write_hostile_orchestration_config(&hostile);
+    write_trust_config(&roles, CODER_COMMAND, false);
+    let log = scratch.path().join("daemon.log");
+    let schedule = |name: &str, dir: &Path| {
+        format!(
+            "[[scheduled_tasks]]\n\
+             name = \"{name}\"\n\
+             cron = \"0 0 1 1 *\"\n\
+             working_dir = \"{}\"\n\
+             command = \"cat\"\n\
+             prompt = \"TRUST-HOSTILE-PROMPT\"\n\
+             enabled = true\n",
+            toml_str(&dir.to_string_lossy())
+        )
+    };
+    let toml = format!(
+        "{}\n{}",
+        schedule("hostile-sched", &hostile),
+        schedule("roles-sched", &roles)
+    );
+    let log_arg = log.to_string_lossy().into_owned();
+    let daemon = common::spawn_daemon_serve_untrusted(
+        Some(&toml),
+        "0",
+        &[
+            ("DOT_AGENT_DECK_LOG", log_arg.as_str()),
+            (
+                dot_agent_deck::hook_provenance::DOT_AGENT_DECK_HOOK_PROVENANCE,
+                "warn",
+            ),
+        ],
+    );
+
+    // 1. The scheduled fire is refused; its diagnostics stay inert text.
+    daemon.run_now("hostile-sched").expect("run-now");
+    assert!(
+        daemon.wait_for_stderr_contains("refused", common::load_scaled(Duration::from_secs(15))),
+        "precondition: the daemon reports the refused fire on stderr"
+    );
+    assert!(
+        daemon.stderr_contains("TRUST-AUDIT"),
+        "precondition: the refusal on stderr names the orchestration"
+    );
+    let log_text = String::from_utf8_lossy(&std::fs::read(&log).unwrap_or_default()).into_owned();
+    for (sink, found) in [
+        (
+            "daemon stderr",
+            ["\u{1b}", "\u{202e}"]
+                .iter()
+                .filter(|c| daemon.stderr_contains(c))
+                .map(|c| format!("U+{:04X}", c.chars().next().unwrap_or_default() as u32))
+                .collect::<Vec<_>>(),
+        ),
+        ("daemon log", raw_controls(&log_text)),
+    ] {
+        assert!(
+            found.is_empty(),
+            "a refused fire wrote raw terminal controls {found:?} from the project's \
+             orchestration name to the {sink}; they must be escaped"
+        );
+    }
+
+    // 2. Agent verbs: approve and open a benign orchestration (spawn validation
+    // refuses a hostile orchestration name), then add a hostile-named role.
+    daemon.approve_project_trust(&roles);
+    daemon
+        .run_now("roles-sched")
+        .expect("run-now after approval");
+    let orchestrator = daemon
+        .wait_for_agent_where(
+            |r| matches!(
+                &r.tab_membership,
+                Some(TabMembership::Orchestration { role_name, .. }) if role_name == "orchestrator"
+            ),
+            common::load_scaled(Duration::from_secs(15)),
+        )
+        .and_then(|r| r.pane_id_env)
+        .expect("precondition: the approved orchestration opens its start role");
+    write_trust_config_with_hostile_role(&roles, CODER_COMMAND_EDITED);
+
+    for args in [
+        &["delegate", "--to", "coder", "--task", "TRUST-HOSTILE-TASK"][..],
+        &["pane", "restart", "coder", "--force"],
+    ] {
+        let out = daemon_agent_verb(&daemon, &roles, &orchestrator, args);
+        let printed = text(&out);
+        assert!(
+            !out.status.success()
+                && printed.contains("changed since you approved it")
+                && printed.contains("http://x"),
+            "precondition: `{}` is refused after the change, naming the added role: {}",
+            args.join(" "),
+            describe(&out).escape_debug()
+        );
+        let found = raw_controls(&printed);
+        assert!(
+            found.is_empty(),
+            "the refused `{}` printed raw terminal controls {found:?} from the project's \
+             role names; they must be escaped.\n{}",
+            args.join(" "),
+            printed.escape_debug()
+        );
+    }
 }

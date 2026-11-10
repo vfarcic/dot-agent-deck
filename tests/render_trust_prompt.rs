@@ -221,3 +221,23 @@ fn prompt_003_long_prompt_scrolls_under_fixed_footer() {
     insta::assert_snapshot!("prompt_003_long_scrolled_middle", middle);
     insta::assert_snapshot!("prompt_003_long_scrolled_end", end);
 }
+
+/// Scenario: Draw a never-approved orchestration whose first role's prompt runs to 70,000 short lines (more rows than a terminal widget can scroll), followed by a second role with a distinctive command, scrolled as far down as the prompt goes. Either that second role's command is on screen there, or the prompt does not offer `a approve` at all: approval is never offered for a command the user cannot scroll to.
+#[spec("config-trust/prompt/003")]
+#[test]
+fn prompt_003_a_prompt_beyond_65535_rows_cannot_hide_a_later_role() {
+    const LATER_COMMAND: &str = "LATER-ROLE-COMMAND-7f3a --run-this";
+    let huge_prompt = vec!["x"; 70_000].join("\n");
+    let team = orchestration(vec![
+        role("orchestrator", "claude", &huge_prompt),
+        role("coder", LATER_COMMAND, "Write the code."),
+    ]);
+    let end = text(&view(None, &team), PromptAction::Start, u16::MAX, 100, 40);
+    let offers_approval = end.contains("a approve");
+    assert!(
+        end.contains(LATER_COMMAND) || !offers_approval,
+        "scrolled to the end, the prompt still offers approval but the later role's command \
+         {LATER_COMMAND:?} is unreachable — `a` would approve a command the user cannot see.\n\
+         Last page:\n{end}"
+    );
+}
