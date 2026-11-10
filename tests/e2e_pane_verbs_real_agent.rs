@@ -231,6 +231,9 @@ fn real_agent_001_restart_brings_back_a_working_claude() {
         orchestration_toml(&[("coder", &claude_command())]),
     )
     .expect("write the orchestration config");
+    // PRD #1885: approved as written, so the form opens it and the gated verbs
+    // run; this test is about the agent, not the gate.
+    deck.approve_project_trust(deck.workdir());
 
     open_orchestration(&deck);
     deck.wait_for_string("coder");
@@ -305,6 +308,9 @@ fn real_agent_002_spawn_adds_a_working_claude_to_the_open_tab() {
     let config = deck.workdir().join(".dot-agent-deck.toml");
     std::fs::write(&config, orchestration_toml(&[("coder", "cat")]))
         .expect("write the orchestration config");
+    // PRD #1885: approved as written, so the form opens it and the gated verbs
+    // run; this test is about the agent, not the gate.
+    deck.approve_project_trust(deck.workdir());
 
     open_orchestration(&deck);
     deck.wait_for_string("coder");
@@ -324,6 +330,8 @@ fn real_agent_002_spawn_adds_a_working_claude_to_the_open_tab() {
         orchestration_toml(&[("coder", "cat"), ("reviewer", &claude_command())]),
     )
     .expect("add reviewer to the running orchestration's config");
+    // PRD #1885: this edit is setup, not the subject — approve it as the user would.
+    deck.approve_project_trust(deck.workdir());
     let output = std::process::Command::new(common::contained_deck_binary())
         .args(["pane", "spawn", "reviewer"])
         .env("DOT_AGENT_DECK_PANE_ID", orchestrator_pane_id(&deck))
