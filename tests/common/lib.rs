@@ -9178,13 +9178,25 @@ pub(crate) fn minimal_opencode_config() -> String {
 /// The `auth.json` written carries no refresh token (issue #1731,
 /// [`opencode_scratch_auth`]); every value of the host file is registered for
 /// redaction before it is written. A login the copy leaves out is refused only
-/// when it is the test model's provider and no env key authorises that model.
+/// when it is the test model's provider, no other auth file's copy kept a login
+/// for that provider, and no env key authorises that model.
 pub(crate) fn import_opencode_credentials_from(
     source_home: &Path,
     test_home: &Path,
 ) -> std::io::Result<Vec<String>> {
     let mut imported_auth = false;
     let mut recording_redactions = Vec::new();
+    // Issue #1731: the test model's provider, whether some file's copy kept a
+    // login for it, and why one was left out. Judged after every file is
+    // staged, so a stale login in one file cannot refuse a run that a lasting
+    // login in another authorises.
+    let needed = opencode_test_model()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut needed_copied = false;
+    let mut needed_left_out: Option<String> = None;
     let credentials = [
         (
             source_home
@@ -9238,17 +9250,11 @@ pub(crate) fn import_opencode_credentials_from(
         let auth: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
         let (scratch, dropped) = opencode_scratch_auth(auth.clone(), std::time::SystemTime::now());
-        let needed = opencode_test_model()
-            .split('/')
-            .next()
-            .unwrap_or_default()
-            .to_string();
-        if let Some((_, why)) = dropped.iter().find(|(provider, _)| *provider == needed)
-            && !opencode_env_key_authorises()
-        {
-            return Err(std::io::Error::other(format!(
-                "OpenCode login for provider {needed:?} in {redacted}: {why}"
-            )));
+        if scratch.get(&needed).is_some() {
+            needed_copied = true;
+        }
+        if let Some((_, why)) = dropped.iter().find(|(provider, _)| *provider == needed) {
+            needed_left_out.get_or_insert_with(|| format!("{redacted}: {why}"));
         }
         let written = if scratch == auth {
             bytes
@@ -9274,6 +9280,14 @@ pub(crate) fn import_opencode_credentials_from(
              `opencode auth login`"
                 .to_string(),
         ));
+    }
+    if let Some(why) = needed_left_out
+        && !needed_copied
+        && !opencode_env_key_authorises()
+    {
+        return Err(std::io::Error::other(format!(
+            "OpenCode login for provider {needed:?} in {why}"
+        )));
     }
     write_minimal_opencode_config(test_home)?;
 

@@ -6531,23 +6531,26 @@ fn all_strings(value: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// Run `import` with `HOME` pointed at `host_home` and both API keys cleared,
-/// restoring `HOME` before returning so a failed assertion afterwards does not
-/// leave the process reading the fixture.
+/// restoring all three before returning, so a failed assertion afterwards does
+/// not leave the process reading the fixture, and a later test in the same
+/// process still sees the keys it started with.
 fn import_from_fabricated_host<T>(host_home: &Path, import: impl FnOnce() -> T) -> T {
+    let names = ["HOME", ANTHROPIC_API_KEY_ENV, "OPENAI_API_KEY"];
+    let saved: Vec<_> = names.iter().map(std::env::var_os).collect();
     // SAFETY: see "Environment writes" in this file's header.
     unsafe {
         std::env::remove_var(ANTHROPIC_API_KEY_ENV);
         std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("HOME", host_home);
     }
-    let restore_home = std::env::var_os("HOME");
-    // SAFETY: as above.
-    unsafe { std::env::set_var("HOME", host_home) };
     let result = import();
-    // SAFETY: as above.
-    unsafe {
-        match &restore_home {
-            Some(value) => std::env::set_var("HOME", value),
-            None => std::env::remove_var("HOME"),
+    for (name, value) in names.iter().zip(&saved) {
+        // SAFETY: as above.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
         }
     }
     result
@@ -6865,6 +6868,12 @@ fn a_jwt_expiry_is_read_from_its_payload_and_nothing_else() {
         jwt_expiry_secs(FABRICATED_CODEX_ACCESS_TOKEN),
         Some(4_102_444_800)
     );
+    // `{"exp":4102444800,"sub":"FAKE-pad"}`, base64url WITH its `=` padding.
+    assert_eq!(
+        jwt_expiry_secs("eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDAsInN1YiI6IkZBS0UtcGFkIn0=.sig"),
+        Some(4_102_444_800),
+        "a padded payload"
+    );
     assert_eq!(
         jwt_expiry_secs(FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR),
         Some(SCRATCH_NOW_SECS + 3600)
@@ -7021,4 +7030,59 @@ fn a_scratch_opencode_auth_keeps_lasting_logins_without_refresh_tokens() {
         assert!(why.contains("opencode auth login"), "{provider}: {why}");
         assert!(!why.contains("TOKEN"), "{provider}: quotes a secret: {why}");
     }
+}
+
+/// Scenario: Stage a fabricated OpenCode host whose test-model provider has a
+/// lasting OAuth login in one auth file and an expiring one in another, with no
+/// API key in the environment: the import succeeds. With only the expiring
+/// login it is refused, naming the provider and the remedy (Greptile, PR #2271).
+#[test]
+fn a_stale_opencode_login_in_one_file_does_not_refuse_a_lasting_one_in_another() {
+    let provider = opencode_test_model().split('/').next().unwrap().to_string();
+    let in_ms = |secs: u64| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + secs * 1000
+    };
+    let login = |expires: u64| {
+        serde_json::json!({ provider.clone(): {
+            "type": "oauth", "access": "ACCESS-TOKEN-FAKE-0001",
+            "refresh": FABRICATED_OPENAI_REFRESH_TOKEN, "expires": expires,
+        }})
+        .to_string()
+    };
+    let stage = |files: &[(&str, String)]| {
+        let source = race_safe_tempdir();
+        for (path, body) in files {
+            let at = source.path().join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, body).unwrap();
+        }
+        let target = race_safe_tempdir();
+        let result = import_from_fabricated_host(source.path(), || {
+            import_opencode_credentials_from(source.path(), target.path())
+        });
+        (result, target)
+    };
+
+    let (both, target) = stage(&[
+        (".local/share/opencode/auth.json", login(in_ms(5 * 3600))),
+        (".opencode/auth.json", login(in_ms(600))),
+    ]);
+    both.expect("the lasting login in ~/.local/share authorises the run");
+    let kept =
+        std::fs::read_to_string(target.path().join(".local/share/opencode/auth.json")).unwrap();
+    assert!(!kept.contains(FABRICATED_OPENAI_REFRESH_TOKEN), "{kept}");
+
+    let (stale, _target) = stage(&[(".opencode/auth.json", login(in_ms(600)))]);
+    let err = stale
+        .expect_err("only a login that will not last is left")
+        .to_string();
+    assert!(
+        err.contains(&provider) && err.contains("opencode auth login"),
+        "{err}"
+    );
+    assert!(!err.contains("TOKEN"), "quotes a secret: {err}");
 }
