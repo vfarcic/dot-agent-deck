@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", unix))]
 
 //! Real hook CLI version discovery, with version-only agent stand-ins.
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::cell::RefCell;
 use std::io::{BufRead as _, Write as _};

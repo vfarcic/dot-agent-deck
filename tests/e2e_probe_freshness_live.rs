@@ -39,7 +39,7 @@
 //! `DAD_PROBE_FRESHNESS_OUT` names a file the summary is appended to as one
 //! JSON line; the summary is printed either way.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/installed_agent.rs"]
 mod installed;
 

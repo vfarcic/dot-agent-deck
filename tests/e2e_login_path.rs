@@ -28,7 +28,7 @@
 //! pre-fix regression where nothing captured the login-shell PATH, so the bare
 //! command was not found and the marker never appeared.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;

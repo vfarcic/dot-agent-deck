@@ -2,7 +2,7 @@
 
 //! Offline OTLP contract checks for child identity, late agent detection and shared CI.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::{AgentRecord, TabMembership};

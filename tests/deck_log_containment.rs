@@ -13,7 +13,7 @@
 //! tests drive exactly that: the real `wrap` subcommand, whose Codex install
 //! is refused and logged because `CODEX_HOME` is outside the owned root.
 //!
-//! Fast tier, and does NOT link `tests/common/mod.rs`: like
+//! Fast tier, and does NOT link `tests/common/lib.rs`: like
 //! `tests/codex_hooks_safety.rs`, it spawns cargo's build of the binary with a
 //! cleared environment and needs nothing else from the harness.
 #[path = "../src/test_temp.rs"]

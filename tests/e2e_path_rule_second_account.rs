@@ -27,7 +27,7 @@
 //! image to start (RWX's tasks run on an Ubuntu 24.04 base, which is not
 //! that), so a PASS in CI is that skip.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::ffi::CString;
 use std::fs;

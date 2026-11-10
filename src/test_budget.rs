@@ -1,7 +1,7 @@
 //! Load-scaled wait ceilings for the lib target's own `#[cfg(test)]` tests —
 //! issue #709's helper, on this side of the wall.
 //!
-//! `tests/common/mod.rs` carries `load_scaled` and `load_factor`, but **the lib
+//! `tests/common/lib.rs` carries `load_scaled` and `load_factor`, but **the lib
 //! target does not link that file** — the same wall [`crate::test_isolation`]
 //! documents, and for the same reason it cannot share a constant with the
 //! harness. So a unit test in `src/` reaching
@@ -33,7 +33,7 @@ use std::time::Duration;
 use crate::host_metrics::machine_load_per_cpu;
 
 /// The largest factor [`load_scaled`] will multiply a base by. Mirrors
-/// `tests/common/mod.rs`'s `MAX_LOAD_FACTOR`; see there for why it is a clamp
+/// `tests/common/lib.rs`'s `MAX_LOAD_FACTOR`; see there for why it is a clamp
 /// rather than "whatever the load average says".
 const MAX_LOAD_FACTOR: f64 = 6.0;
 

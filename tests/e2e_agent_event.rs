@@ -34,7 +34,7 @@
 //! the `daemon serve` path. So spawning/handling a Pi pane installs no hook and
 //! mutates no `settings.json`. This test is the regression guard that pins it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

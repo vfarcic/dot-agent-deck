@@ -22,7 +22,7 @@ use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{render_button_bar_to_buffer, render_button_bar_with_bindings_to_buffer};
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 use common::{joined_rows, nonblank_rows};
 
 /// Collapse the rendered single-row buffer into one string of cell

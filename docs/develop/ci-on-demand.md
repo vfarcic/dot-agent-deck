@@ -13,7 +13,7 @@ So pick the sweep by what you are missing, not by habit:
 | your situation | the sweep | GitHub job-minutes |
 | --- | --- | --- |
 | `rwx` is installed and `rwx whoami` succeeds | `rwx run .rwx/ci.yml` for the Linux half (below) | none |
-| and the change needs macOS, which your gates did not run on | also `gh workflow run ci.yml --ref <branch> -f linux_jobs=false` | `build-macos` and `changes` only |
+| and the change needs macOS, which your gates did not run on | also `gh workflow run ci.yml --ref <branch> -f linux_jobs=false` | `changes` and `build-macos` with the two jobs it aggregates only |
 | no `rwx` CLI, your gates ran `cargo test-fast` on macOS (below) | `gh workflow run ci.yml --ref <branch> -f build_macos=false` | the Linux jobs |
 | no `rwx` CLI, your gates did not run on macOS | `gh workflow run ci.yml --ref <branch>`, the whole matrix | everything, as before #2090 |
 
@@ -39,7 +39,7 @@ What it does not run: `cross-version` (RWX cannot, see [rwx.md](rwx.md); the pul
 
 `ci.yml`'s `workflow_dispatch` takes two boolean inputs, both defaulting to `true`, so a dispatch with no `-f` runs what it ran before #2090:
 
-- `build_macos=false` skips `build-macos`, the only macOS job.
+- `build_macos=false` skips `build-macos` and the two jobs it aggregates, `build-macos-clippy` and the two partitions of `build-macos-tests` (issue #2098), the only macOS jobs.
 - `linux_jobs=false` skips every Linux job but `changes`, `cross-version` included, by setting the `changes` job's `linux_backend` output to `rwx`, the value under which those jobs already skip for an RWX-owned pull request. What runs is `changes` and, unless you also pass `build_macos=false`, `build-macos`.
 
 ## The commands
@@ -68,7 +68,7 @@ That block is not a sketch: it was run end to end against this repository on 202
 
 ## What a dispatch actually runs
 
-With both inputs at their defaults, every job in `ci.yml` but one: `changes`, `desktop-web`, `desktop-browser`, `desktop-driver`, `fmt`, `clippy`, `build-release`, `test`, `release-lib`, `build`, `e2e-build`, the five `e2e` shards, `e2e-deterministic`, `cross-version`, `windows-cross-check`, `build-windows` (which reports `skipped`: it is `if: false` until Windows ships), `build-macos`, `security`, `nix` and `devbox`. The exception, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
+With both inputs at their defaults, every job in `ci.yml` but one: `changes`, `desktop-web`, `desktop-browser`, `desktop-driver`, `fmt`, `clippy`, `build-release`, `test`, `release-lib`, `build`, `e2e-build`, the five `e2e` shards, `e2e-deterministic`, `cross-version`, `windows-cross-check`, `build-windows` (which reports `skipped`: it is `if: false` until Windows ships), `build-macos-clippy`, the two `build-macos-tests` partitions, `build-macos` (their aggregate), `security`, `nix` and `devbox`. The exception, `notify-main-red`, is gated on `github.event_name == 'push' && github.ref == 'refs/heads/main'` and is silent here by design.
 
 That list is read off a real dispatch rather than off the file: run [`35025264144`](https://github.com/vfarcic/dot-agent-deck/actions/runs/35025264144), a `workflow_dispatch` on this repository on 2026-09-15, ran exactly the eleven that existed then and reported `notify-main-red` as `skipped`, finishing green in 8.8 minutes; issue #953 added `desktop-driver`, and run [`36231844544`](https://github.com/vfarcic/dot-agent-deck/actions/runs/36231844544), a dispatch of that issue's branch on 2026-09-26, ran the twelve that existed then and skipped `notify-main-red`, green in 14.1 minutes; issue #1507 added `cross-version`, and run [`37141989587`](https://github.com/vfarcic/dot-agent-deck/actions/runs/37141989587), a dispatch of that issue's branch on 2026-10-03, listed the thirteen that existed then while `notify-main-red` was still unresolved. The split of `build` into `fmt`, `clippy`, `build-release` and `test`, and of `e2e-deterministic` into `e2e-build` and five `e2e` shards, both kept as aggregators under their old names, came after that and has not been read off a dispatch here. Note the shape of that last part before reading a job list yourself — a completed run reports **fourteen** jobs, the fourteenth `skipped`, while a run still in progress lists only the thirteen, because a skipped job appears only once its condition has resolved. So filter rather than counting:
 

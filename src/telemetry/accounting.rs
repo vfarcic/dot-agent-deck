@@ -5891,7 +5891,7 @@ mod tests {
             "glm-4.6",
             "big-pickle",
             // What the four agents report for the models this repository's
-            // real-agent tests run on (`tests/common/mod.rs`): Claude Code's
+            // real-agent tests run on (`tests/common/lib.rs`): Claude Code's
             // and OpenCode's Claude models, Codex's ChatGPT default and its
             // API-key default, Pi's default (`openai-codex/gpt-5.6-luna`, of
             // which Pi reports the model), OpenCode's override for a

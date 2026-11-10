@@ -6,7 +6,7 @@ use dot_agent_deck::event::{AgentType, AgentType::Codex};
 #[cfg(unix)]
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 /// Budget for a PATH recorder shim to append its launch line. The shims are one
 /// `printf` away from `exec cat`, so the happy path lands in milliseconds — this

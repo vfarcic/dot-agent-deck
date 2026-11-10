@@ -49,7 +49,7 @@
 //! `cargo test-fast` never compiles it; flaky-tolerant (real LLM) per CLAUDE.md rule 4 —
 //! run once, not looped.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
