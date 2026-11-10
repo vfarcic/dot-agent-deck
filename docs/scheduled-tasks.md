@@ -223,7 +223,9 @@ Each claim comment states the `claim_ttl_hours` of the schedule that wrote it, a
 
 ### Clean up
 
-Dispatched tabs stay open until you close them. **Closing an issue's tab removes its worktree with `git worktree remove --force`, which discards uncommitted changes in it.** Commit or push anything you want to keep first. The branch and the clone stay, and the issue becomes eligible again on the next run unless it has an open pull request.
+Dispatched tabs stay open until you close them. **Closing an issue's tab with Close removes its worktree with `git worktree remove --force`, which discards uncommitted changes in it.** Commit or push anything you want to keep first, or keep the worktree (below). The branch and the clone stay, and the issue becomes eligible again on the next run unless it has an open pull request.
+
+To stop an issue's agents but keep its worktree, for example to start an agent in it again later, choose **Close, keep worktree** in the TUI's close confirmation (`Ctrl+W`, or the tab's `[×]`), or **Close agent, keep worktree** or **Close all N roles, keep worktree** in the desktop app's close confirmation. The worktree then stays on disk whatever its state. While it exists the issue stays claimed: a run that considers the issue skips it, as it does any issue whose worktree exists. `dot-agent-deck worktree reclaim` keeps a worktree whose pull request has not merged, so when you want the schedule to take the issue again, remove the worktree yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, adding `--force` to discard uncommitted changes in it.
 
 After the daemon restarts, closing such a tab no longer removes the worktree. Remove it yourself with `git -C <clone> worktree remove .worktrees/issue-<n>`, or that issue stays skipped.
 

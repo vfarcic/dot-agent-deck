@@ -801,7 +801,7 @@ Also check the day-of-week field: numeric days count from `1` = Sunday, so `1-5`
 
 ### Closing a dispatched issue tab lost my changes
 
-Closing the tab of an issue-dispatch run removes the worktree the run created, with `git worktree remove --force`, so uncommitted changes in it are discarded. Commit (and push) the work you want to keep before closing the tab. See [Schedules › Clean up](scheduled-tasks.md#clean-up).
+Closing the tab of an issue-dispatch run with **Close** removes the worktree the run created, with `git worktree remove --force`, so uncommitted changes in it are discarded. Commit (and push) the work you want to keep before closing the tab, or close it with the keep choice (**Close, keep worktree** in the TUI, **Close agent, keep worktree** or **Close all N roles, keep worktree** in the desktop app), which leaves the worktree on disk. See [Schedules › Clean up](scheduled-tasks.md#clean-up).
 
 ## Remotes
 

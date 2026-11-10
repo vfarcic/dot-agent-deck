@@ -2,7 +2,7 @@
 
 `dot-agent-deck close` stops agents from the command line: a unit a [dispatcher](dispatcher-mode.md) started, one agent, or a whole [orchestration](orchestration.md). It does what closing a card or a tab does in the TUI or the desktop app, and it works from a shell or from a dispatcher agent, so a dispatcher can tidy up the units it started when you ask it to.
 
-Closing a dispatched unit also removes its worktree when that worktree has no uncommitted changes, unless you ask to keep it (see [Keep a worktree on purpose](#keep-a-worktree-on-purpose)). The unit's branch is always kept.
+By default, closing a dispatched unit also removes its worktree when that worktree has no uncommitted changes, unless you ask to keep it (see [Keep a worktree on purpose](#keep-a-worktree-on-purpose)). The unit's branch is always kept.
 
 ## Close from a shell
 
@@ -138,7 +138,7 @@ dot-agent-deck close fix-auth-bug --keep-worktree --dry-run
 
 `--keep-worktree` works with every way of choosing what to close: unit names, `--unit-id`, `--pane`, `--orchestration-of` and `--all --yes`. With `--dry-run` it shows `would be kept on request` instead of closing anything. The `worktrees:` section reports the directory as `kept on request` and reminds you how to find it again. If you close just one role of a running orchestration with `--keep-worktree` (`--pane <PANE_ID> --force`, since `close` otherwise refuses to leave the rest of the team without it), the worktree the roles share stays on disk even after you close the other roles without `--keep-worktree`. The TUI and the desktop app offer the same choice in their close confirmations (see [Closing in the TUI and the desktop app](#closing-in-the-tui-and-the-desktop-app)).
 
-A worktree kept this way is yours: closing a later agent you start in the same directory does not remove it. When you are done with it, `dot-agent-deck worktree list` shows it and `dot-agent-deck worktree reclaim` removes it under the same rules as any other leftover worktree ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)); run both from the repository the worktree belongs to.
+A worktree kept this way is yours: closing a later agent you start in the same directory does not remove it. When you are done with it, `dot-agent-deck worktree list` shows it and `dot-agent-deck worktree reclaim` removes it under the same rules as any other leftover worktree, which keep a worktree whose pull request has not merged ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)); run both from the repository the worktree belongs to. To remove it before that, run `git worktree remove <directory>` there, adding `--force` to discard uncommitted changes in it.
 
 If the daemon you are running was started by an older version of the deck, it cannot keep a worktree on close. `close --keep-worktree` then refuses with `cannot keep a worktree on close; nothing was closed` and exits `2`, so nothing is closed and nothing is removed. Restart the daemon onto this version with `dot-agent-deck daemon restart` and run the command again. The TUI and the desktop app do not offer the choice against such a daemon.
 
