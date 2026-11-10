@@ -1173,15 +1173,17 @@ const SCRIPT_SHELLS: &[&str] = &[
 ///   environment (`-i`, `-`), a directory change (`-C`, `--chdir`) or a split
 ///   string (`-S`), and then the command `env` runs, read the same way;
 /// - `codex …`: its own `-C`/`--cd`;
-/// - a shell from [`SCRIPT_SHELLS`] with a `-c` script — the shape a pane runs
-///   a command such as `CODEX_HOME=… codex` or `cd … && codex` in (issue
-///   #1685): any word of the script that names `CODEX_HOME`, a `cd`, `pushd`,
-///   `popd` or `chdir`, a `-C`/`--cd`/`--chdir` option, or an `env` that moves
-///   Codex as above.
+/// - a shell from [`SCRIPT_SHELLS`] that runs a script given on its command
+///   line (`-c`, fish's `-C`, `--command` and `--init-command`) — the shape a
+///   pane runs a command such as `CODEX_HOME=… codex` or `cd … && codex` in
+///   (issue #1685): any word of any argument that names `CODEX_HOME`, a `cd`,
+///   `pushd`, `popd` or `chdir`, a `-C`/`--cd`/`--chdir` option, or an `env`
+///   that moves Codex as above.
 ///
-/// Errs towards `true`, which costs a pane its delivery retry and nothing
-/// else: the script is split on whitespace and shell punctuation, not parsed,
-/// so a quoted `cd` or a `make -C …` before Codex counts. A launcher script
+/// Errs towards `true`, which only makes the deck read the pane's status from
+/// Codex's output as well as from its hooks: arguments are split on whitespace
+/// and shell punctuation, not parsed, so a quoted `cd`, a `make -C …` before
+/// Codex or a positional argument after the script counts. A launcher script
 /// (`./run-codex.sh`, `devbox run codex-big`) is opaque here and reads `false`;
 /// one that sets `CODEX_HOME` or changes directory inside itself is the
 /// residual the user docs name.
@@ -1193,9 +1195,7 @@ fn command_may_move_codex(program: &str, args: &[String]) -> bool {
     match name {
         "env" => env_may_move_codex(args),
         "codex" => args.iter().any(|arg| is_directory_option(arg)),
-        shell if SCRIPT_SHELLS.contains(&shell) => {
-            shell_script(args).is_some_and(script_may_move_codex)
-        }
+        shell if SCRIPT_SHELLS.contains(&shell) => shell_may_move_codex(args),
         _ => false,
     }
 }
@@ -1216,7 +1216,8 @@ fn env_may_move_codex(args: &[String]) -> bool {
     while let Some(arg) = rest.next() {
         let arg = arg.as_str();
         if arg == "--" {
-            break;
+            // The end of `env`'s options, not of its assignments.
+            return env_operands_move_codex(rest.as_slice());
         }
         if arg == "-" || arg == "--ignore-environment" || arg == "--split-string" {
             return true;
@@ -1260,50 +1261,62 @@ fn env_may_move_codex(args: &[String]) -> bool {
             }
             continue;
         }
-        if crate::event::is_env_assignment(arg) {
-            if arg.starts_with("CODEX_HOME=") {
-                return true;
-            }
-            continue;
-        }
-        // The first word that is neither an option nor an assignment is the
-        // command `env` runs.
-        let command: Vec<String> = rest.cloned().collect();
-        return command_may_move_codex(arg, &command);
+        // The first word that is not an option starts the operands: the
+        // assignments, then the command `env` runs.
+        let at = args.len() - rest.as_slice().len() - 1;
+        return env_operands_move_codex(&args[at..]);
     }
-    let command: Vec<String> = rest.cloned().collect();
-    command
+    false
+}
+
+/// [`env_may_move_codex`] for `env`'s operands: `NAME=value` assignments, then
+/// the command it runs, read by [`command_may_move_codex`].
+fn env_operands_move_codex(operands: &[String]) -> bool {
+    let assignments = operands
+        .iter()
+        .take_while(|operand| crate::event::is_env_assignment(operand))
+        .count();
+    if operands[..assignments]
+        .iter()
+        .any(|assignment| assignment.starts_with("CODEX_HOME="))
+    {
+        return true;
+    }
+    operands[assignments..]
         .split_first()
         .is_some_and(|(program, args)| command_may_move_codex(program, args))
 }
 
-/// The script of a shell invoked with `-c` (alone or in a cluster such as
-/// `-lc`), or `None` when the shell runs a file or reads standard input.
-fn shell_script(args: &[String]) -> Option<&str> {
-    let mut has_c = false;
-    let mut rest = args.iter();
-    while let Some(arg) = rest.next() {
-        let arg = arg.as_str();
-        if arg == "--" {
-            break;
-        }
-        if arg == "-o" || arg == "+o" || arg == "-O" || arg == "+O" {
-            rest.next();
-            continue;
-        }
-        if arg.starts_with("--") {
-            continue;
-        }
-        match arg.strip_prefix('-').or_else(|| arg.strip_prefix('+')) {
-            Some(cluster) if !cluster.is_empty() => has_c |= cluster.contains('c'),
-            _ => return has_c.then_some(arg),
-        }
-    }
-    if has_c {
-        rest.next().map(String::as_str)
-    } else {
-        None
-    }
+/// [`command_may_move_codex`] for a shell's arguments: when the shell runs a
+/// script given on its command line (`-c` alone or in a cluster such as `-lc`,
+/// fish's `-C`, `--command`, `--init-command`), every argument that is not an
+/// option is read as a script, which covers the script, an option's value and
+/// the positional arguments after it alike. A shell that runs a file or reads
+/// standard input is opaque here.
+fn shell_may_move_codex(args: &[String]) -> bool {
+    const SCRIPT_OPTIONS: [&str; 2] = ["--command", "--init-command"];
+    let inline = args.iter().any(|arg| {
+        SCRIPT_OPTIONS.iter().any(|option| {
+            arg.strip_prefix(option)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('='))
+        }) || (!arg.starts_with("--")
+            && arg
+                .strip_prefix('-')
+                .or_else(|| arg.strip_prefix('+'))
+                .is_some_and(|cluster| cluster.contains(['c', 'C'])))
+    });
+    inline
+        && args.iter().any(|arg| {
+            let script = SCRIPT_OPTIONS
+                .iter()
+                .find_map(|option| arg.strip_prefix(option)?.strip_prefix('='));
+            match script {
+                Some(script) => script_may_move_codex(script),
+                None => {
+                    !arg.starts_with('-') && !arg.starts_with('+') && script_may_move_codex(arg)
+                }
+            }
+        })
 }
 
 /// [`command_may_move_codex`] for a shell's `-c` script.
@@ -4001,6 +4014,23 @@ mod tests {
             &["env", "-u", "FOO", "sh", "-c", "cd /x && codex"],
             &["codex", "-C", "/x"],
             &["/opt/bin/codex", "--cd=/x"],
+            // Review on PR #2241: assignments still count after `env --`, and
+            // fish takes its script through long options and `-C` too.
+            &["env", "--", "CODEX_HOME=/x", "codex"],
+            &[
+                "env",
+                "-u",
+                "FOO",
+                "--",
+                "FOO=1",
+                "sh",
+                "-c",
+                "cd /x && codex",
+            ],
+            &["fish", "--command=cd /x; codex"],
+            &["fish", "--command", "cd /x; codex"],
+            &["fish", "--init-command=set -x CODEX_HOME /x", "-c", "codex"],
+            &["fish", "-C", "cd /x", "-c", "codex"],
         ] {
             let (program, args) = argv(moves);
             assert!(command_may_move_codex(&program, &args), "{moves:?}");
@@ -4017,6 +4047,9 @@ mod tests {
             &["bash", "-c", "FOO=1 codex --model x"],
             &["env", "FOO=1", "codex"],
             &["env", "-u", "FOO", "codex"],
+            &["env", "--", "FOO=1", "codex"],
+            &["fish", "--command=codex"],
+            &["bash", "-l", "launcher.sh"],
             &["env"],
             // A launcher script or a shell running a file is opaque here.
             &["./run-codex.sh"],
