@@ -1,6 +1,6 @@
 # Idle Workers & Notifications
 
-When a worker in an [orchestration](orchestration.md) gets stuck (it stops responding, sits at a prompt, runs out of provider credits, or exits without finishing its task), the deck sends a report to the orchestrator. What the orchestrator does next, such as chasing the worker, handing the task to another role, or telling you, depends on the instructions you give it.
+When a worker in an [orchestration](orchestration.md) gets stuck (it stops responding, sits at a prompt, stops on an error, runs out of provider credits, or exits without finishing its task), the deck sends a report to the orchestrator. What the orchestrator does next, such as chasing the worker, handing the task to another role, or telling you, depends on the instructions you give it.
 
 Reports are sent only inside an orchestration: an orchestration tab in the TUI, an **ORCHESTRATION** group on the desktop app's Dashboard, or an orchestration started by a dispatcher or a schedule. A standalone agent and a single-agent schedule get none. Apart from one notification for a question an agent has left waiting ([When a question waits](session-management.md#when-a-question-waits)), the deck does not message you itself; to be notified on your phone, see [Get notified when a run needs you](#get-notified-when-a-run-needs-you).
 
@@ -17,10 +17,11 @@ Each report waits in the orchestrator's inbox and reaches its conversation throu
 | `Task m-… to the worker in role … was cancelled by the user after the deck had handed it over` | You pressed **Cancel** on a task that may already have reached the worker, which may be working on it. | none |
 | `Correction: task m-… to the worker in role …` | A task the orchestrator was told had not arrived, was uncertain, undeliverable or cancelled reached the worker after all. If the task was already given to someone else, it may now be done twice. | none |
 | `A delegated worker is waiting for input` | A worker that has not finished its task has been waiting for input for 30 seconds. | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` |
+| `A delegated worker stopped on an error` | A worker that has not finished its task ended its turn on an error, such as a provider rate limit or outage, and has not started working again within 30 seconds. Its card shows **Error** (desktop **error**). Sent for Claude Code, Codex and OpenCode workers. | `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` |
 | `⚠ delegated worker exited without work-done` | The worker's agent exited before it reported. The report names the tasks it had not reported. | none |
 | `⚠ delegated worker never came up` | A `clear = true` worker restarted for a new task exited before it took the task, so the task was not delivered. | none |
 | `⚠ delegated worker respawn failed` | A `clear = true` worker could not be restarted at all, usually because the role's `command` fails, so the task was not delivered. | none |
-| `⚠ delegated worker blocked by a provider usage limit` | A worker that has not finished its task shows **Blocked**: its provider's usage limit or credits ran out. | none |
+| `⚠ delegated worker blocked by a provider usage limit` | A worker that has not finished its task shows **Blocked**: its provider's usage limit or credits ran out. | Sent only while [`worker_response_timeout_minutes`](#change-how-long-a-worker-may-take) is not `0`. |
 
 What each report means for the orchestrator's next step:
 
@@ -29,6 +30,7 @@ What each report means for the orchestrator's next step:
 - **Undeliverable:** the deck will not deliver the task again. Before delegating it again, giving it to another role or telling you, the report asks the orchestrator to check the worker's pane, because a task the deck handed over before giving up can still have reached it; a `work-done` for it is to be trusted over this report. Otherwise the task can be done twice. [Delivery in the TUI and desktop app](orchestration.md#delivery-in-the-tui-and-desktop-app) explains **Retry** and **Cancel**.
 - **Waiting for input** includes the last lines of the worker's pane, so the orchestrator can see what needs an answer.
 - **Waiting for input** depends on the agent. For Claude Code it means a permission prompt; a Claude Code worker that asks a question in plain text simply ends its turn, so only the timeout report covers it. [Session Management](session-management.md) lists what each status means per agent.
+- **Stopped on an error:** the worker does not go on with the task by itself, and still counts as busy with it. The report includes the last lines of the worker's pane, where the error usually is. To have the same worker try again, the orchestrator delegates the task to that role again with `--supersede`; otherwise it gives the task to another role or tells you. A worker whose provider refused it for a usage limit or credits gets the **Blocked** report instead. Pi and Devin report no failed turn to the deck, so their workers get neither report; the timeout report covers them ([Which agents report which status](session-management.md#which-agents-report-which-status)).
 - **Exited:** the worker still counts as busy with its task. Run `dot-agent-deck pane restart <role>`, or delegate with `--supersede`, before giving that role new work ([One task per worker at a time](orchestration.md#one-task-per-worker-at-a-time)). A `work-done` that arrives just after this report is to be trusted over it.
 - **Never came up** and **respawn failed:** re-delegating to the same role runs the same `command` and fails the same way until the role's configuration is fixed, so the orchestrator should tell you or give the task to another role. See [A delegated worker never came up](orchestration.md#a-delegated-worker-never-came-up).
 - **Blocked:** a usage limit can clear on its own. The report asks the orchestrator to check the worker's card first: if it still shows Blocked, give the task to another role or tell you; if the worker is working again, keep waiting.
@@ -86,13 +88,13 @@ Comments and blank lines before it are fine. **Check:** the first non-comment, n
 
 ## Tune or turn off the other reports
 
-The waiting report has one environment setting. They are read by the daemon, so set them on the command that starts the daemon and restart a daemon that is already running; see [Setting the delivery variables](orchestration.md#setting-the-delivery-variables).
+The waiting report and the stopped-on-an-error report share one environment setting. They are read by the daemon, so set them on the command that starts the daemon and restart a daemon that is already running; see [Setting the delivery variables](orchestration.md#setting-the-delivery-variables).
 
 | Variable | Default | Values |
 |---|---|---|
-| `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` | `30000` | Milliseconds a worker must stay waiting before it is reported, at most `600000` (larger values are capped). `0` turns the waiting report off. |
+| `DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS` | `30000` | Milliseconds a worker must stay waiting, or stopped on an error, before it is reported, at most `600000` (larger values are capped). `0` turns both reports off. |
 
-The waiting report is sent at most once per wait, and at most once per worker every four debounce windows (two minutes by default); a worker still waiting when that interval ends is reported then. A prompt you answer yourself within the debounce window produces no report.
+Each of the two reports is sent at most once per wait or failure, and at most once per worker every four debounce windows (two minutes by default); a worker still waiting when that interval ends is reported then. A prompt you answer yourself, or a worker that starts working again, within the debounce window produces no report.
 
 ```bash
 DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS=0 dot-agent-deck
