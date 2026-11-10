@@ -8,7 +8,7 @@ use dot_agent_deck::issue_dispatch_run::KeptWorktree;
 use dot_agent_deck::keybindings::KeybindingConfig;
 use dot_agent_deck::ui::{
     Action, CloseConfirmState, CloseScope, close_confirmation_for_action, global_action,
-    render_close_confirm_to_buffer,
+    handle_close_confirm_key, render_close_confirm_to_buffer,
 };
 use spec::spec;
 
@@ -24,7 +24,7 @@ fn buffer_to_text(buffer: &ratatui::buffer::Buffer) -> String {
     out
 }
 
-/// Scenario: Resolve command-mode Ctrl+W for a selected target, feed its CloseSelected action into the close-confirmation transition, and render both pane- and tab-scoped modal states. Each scope must state its real blast radius while keeping the non-destructive Cancel option selected by default.
+/// Scenario: Resolve command-mode Ctrl+W for a selected target, feed its CloseSelected action into the close-confirmation transition, and render both pane- and tab-scoped modal states. Each scope must state its real blast radius while keeping the non-destructive Cancel option selected by default, and with no dispatched worktree to keep it offers only Cancel and Close, by drawing and by keyboard alike.
 #[spec("prompt/close-confirm/001")]
 #[test]
 fn close_confirm_001_ctrl_w_opens_with_cancel_selected() {
@@ -59,6 +59,34 @@ fn close_confirm_001_ctrl_w_opens_with_cancel_selected() {
     );
     assert!(!tab_text.contains("Close selected agent?"), "{tab_text}");
     assert!(tab_text.contains("> Cancel"), "{tab_text}");
+
+    // Issue #1958: a close the daemon cannot keep a worktree for — nothing
+    // dispatched in the selection, or a daemon too old to advertise the keep —
+    // offers exactly the two choices it always did, in either scope.
+    for (scope, rendered) in [("pane", &text), ("tab", &tab_text)] {
+        assert!(
+            !rendered.contains("keep worktree"),
+            "the {scope}-scoped dialog offered a keep-worktree choice with no \
+             dispatched worktree to keep\n{rendered}"
+        );
+    }
+    // …and the keyboard agrees with the drawing: Down twice from Cancel stops
+    // on Close, so Enter there is the ordinary close.
+    let mut keyed = prompt.clone();
+    let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
+    let _ = handle_close_confirm_key(&mut keyed, down);
+    let _ = handle_close_confirm_key(&mut keyed, down);
+    assert_eq!(
+        keyed.selected, 1,
+        "without a keep choice there is no third option to move to"
+    );
+    assert!(matches!(
+        handle_close_confirm_key(
+            &mut keyed,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
+        ),
+        Action::ConfirmCloseSelected
+    ));
 }
 
 /// Scenario: Arm the close confirmation for a close that would leave a dispatched worktree on disk, and render it in both probe outcomes — a confirmed-dirty tree and one whose status probe never answered. Each must name the path and say the work is kept before the Cancel/Close options, and a close that leaves nothing behind must render exactly as it did before the warning existed.
