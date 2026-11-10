@@ -510,6 +510,8 @@ pub async fn run_issue_dispatch(
     // registered for delegate routing — see
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
+    // PRD #1889: the fire's work, the parent of each issue's.
+    fire_work: Option<&crate::work_journal::WorkId>,
 ) {
     // S5 — every derived path (clone, worktree, the spawn's orchestration_cwd)
     // must be absolute: a relative workspace root would double-nest the worktree
@@ -585,6 +587,7 @@ pub async fn run_issue_dispatch(
                 event_tx,
                 state,
                 &mut claim_run,
+                fire_work,
             )
             .await
             {
@@ -913,6 +916,7 @@ async fn dispatch_one_issue(
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
     claim_run: &mut ClaimRun,
+    fire_work: Option<&crate::work_journal::WorkId>,
 ) -> Result<IssueOutcome, String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
@@ -1055,7 +1059,25 @@ async fn dispatch_one_issue(
     // nothing waits on the agent, so the scheduler's run-active window is freed
     // as soon as the dispatch WORK is done. The worktree-on-disk idempotency
     // signal still serializes overlapping fires safely.
+    // PRD #1889: the issue's work, a child of the fire's. A single-agent
+    // dispatch's panes are its attempts; an orchestration-shaped one's panes
+    // are attempts of the orchestration's work, which is a child of this one.
+    let issue_work = {
+        let work = registry.work();
+        work.open(
+            crate::work_journal::Launch::IssueDispatch,
+            fire_work,
+            crate::work_journal::Refs {
+                issue: Some(issue),
+                repo: work.plain(&cfg.repo),
+                branch: work.plain(&paths.branch),
+                ..crate::work_journal::Refs::default()
+            },
+            Some(&paths.worktree_dir),
+        )
+    };
     let req = SpawnRequest {
+        work_id: issue_work,
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),

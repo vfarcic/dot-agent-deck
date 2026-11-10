@@ -1809,6 +1809,7 @@ async fn dispatch_orchestration(
     .expect("write the dispatched orchestration's config");
     dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
+            work_id: None,
             task_name: format!("dispatch-{name}"),
             working_dir: dir.to_string_lossy().into_owned(),
             command: None,

@@ -734,6 +734,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             warn!(%error, "could not load or create the deck id; using one for this run only");
             crate::inbox::DeckId::generate()
         });
+        let journal_deck = deck.clone();
         let hub = Arc::new(crate::inbox_hub::InboxHub::from_env(deck));
         // PR #1735 fifth review (B-05): the saved bodies of long messages are
         // listed for this run, and those earlier runs left are taken over.
@@ -767,6 +768,22 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             std::sync::Arc::clone(&hub),
             retained,
         ));
+        // PRD #1889: this run's work journal, before anything can spawn: the
+        // previous runs' open attempts are marked interrupted now, while no
+        // agent is live, and compaction runs off the startup path and hourly.
+        // A journal that cannot open is logged and records nothing; the daemon
+        // runs on.
+        let journal = crate::work_journal::WorkJournal::open(
+            &retained_dir,
+            crate::daemon_protocol::daemon_instance_id(),
+            &journal_deck,
+        );
+        // Recovery runs now when the journal's maintenance lock is free, and
+        // in the background as soon as it is when another daemon holds it;
+        // compaction waits for it either way.
+        let _ = journal.start_recovery();
+        drop(crate::work_tracking::spawn_compaction(journal.clone()));
+        pty_registry.work().install(journal);
         pty_registry.install_inbox(hub);
     }
     let inbox_ticker = pty_registry.inbox().spawn_ticker();
@@ -1278,6 +1295,24 @@ pub(crate) fn schedule_callback_factory(
     }
 }
 
+/// PRD #1889: open the work of one fire of schedule `task`, aimed at `dir`.
+fn open_fire_work(
+    registry: &AgentPtyRegistry,
+    task: &str,
+    dir: &str,
+) -> Option<crate::work_journal::WorkId> {
+    let work = registry.work();
+    work.open(
+        crate::work_journal::Launch::ScheduleFire,
+        None,
+        crate::work_journal::Refs {
+            schedule: work.plain(task),
+            ..crate::work_journal::Refs::default()
+        },
+        Some(Path::new(dir)),
+    )
+}
+
 /// One task's firing callback: rebuild the [`crate::spawn::SpawnRequest`] from
 /// the task's configured values and fire it via
 /// [`crate::spawn::spawn_or_reuse`] (PRD #127 M2.2) — which reuses the task's
@@ -1333,6 +1368,9 @@ fn make_schedule_callback(
                     let dc = dc.trim().to_string();
                     if dc.is_empty() { None } else { Some(dc) }
                 });
+                // PRD #1889: this fire's work; each issue it dispatches is a
+                // child of it.
+                let fire_work = open_fire_work(&registry, &task_name, &working_dir);
                 crate::issue_dispatch_run::run_issue_dispatch(
                     &task_name,
                     &working_dir,
@@ -1344,13 +1382,20 @@ fn make_schedule_callback(
                     &notifier,
                     Some(&event_tx),
                     Some(&state),
+                    fire_work.as_ref(),
                 )
                 .await;
+                if let Some(work) = &fire_work {
+                    registry
+                        .work()
+                        .close(work, crate::work_journal::CloseHow::FireDone);
+                }
             })
         });
     }
 
     let req = crate::spawn::SpawnRequest {
+        work_id: None,
         task_name: task.name.clone(),
         working_dir: task.working_dir.clone(),
         command: task.command.clone(),
@@ -1444,6 +1489,9 @@ fn make_schedule_callback(
                     }
                 }
             }
+            // PRD #1889: one work per fire; a pane it spawns is an attempt of
+            // it, and closing that pane ends the fire (`fire_settled`, below).
+            req.work_id = open_fire_work(&registry, &req.task_name, &req.working_dir);
             let debounce = crate::spawn::reuse_debounce();
             loop {
                 match crate::spawn::spawn_or_reuse(
@@ -1484,6 +1532,12 @@ fn make_schedule_callback(
                         break;
                     }
                 }
+            }
+            // PRD #1889: a fire whose pane still serves it closes with that
+            // pane; one that re-posted into an existing pane, opened an
+            // orchestration or spawned nothing closes now.
+            if let Some(work) = &req.work_id {
+                registry.work().fire_settled(work);
             }
         })
     })
@@ -7227,7 +7281,20 @@ async fn run_hook_loop_with_limits(
                                             .to_string();
                                         if dc.is_empty() { None } else { Some(dc) }
                                     };
+                                    // PRD #1889: the dispatcher's work, as its
+                                    // token attested it (else as its record
+                                    // pins it): the dispatch's parent.
+                                    let caller_work = match &provenance {
+                                        crate::hook_provenance::Provenance::Attested {
+                                            facts,
+                                            ..
+                                        } => facts.work.clone(),
+                                        _ => pty_registry
+                                            .attest_facts(&caller_agent_id)
+                                            .and_then(|facts| facts.work),
+                                    };
                                     let ctx = DispatchContext {
+                                        caller_work,
                                         working_dir: PathBuf::from(&cwd),
                                         registry: pty_registry.clone(),
                                         event_tx: event_tx.clone(),

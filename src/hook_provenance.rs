@@ -302,6 +302,10 @@ pub struct AttestFacts {
     /// starts at 1, so a daemon's first 2^64 draws are all distinct and it
     /// names that one replacement; only a wraparound past them repeats one.
     pub replacement_of: Option<u64>,
+    /// PRD #1889: the work this generation serves (its
+    /// `DOT_AGENT_DECK_WORK_ID`), pinned at its reservation, so a respawn keeps
+    /// it and a `dispatch` it makes names it as the dispatched work's parent.
+    pub work: Option<crate::work_journal::WorkId>,
 }
 
 /// What the daemon's registry has to answer for [`classify`] to decide.

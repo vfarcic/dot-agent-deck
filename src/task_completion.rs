@@ -708,6 +708,7 @@ async fn recover(
                 let _ = registry.inbox().note_claim_marked(claim_id, mark);
             }
             let (outcome, after) = registry.commit_claim(claim_id, unit_id.is_some());
+            journal_report(registry, &outcome, mode, None, None);
             (committed(outcome, mode), after)
         }
         Some(ClaimPhase::Applying) => {
@@ -720,6 +721,49 @@ async fn recover(
             (None, None)
         }
     }
+}
+
+/// PRD #1889: a committed report in the work journal, written once the commit
+/// has returned, so with no hub lock held. A task's report is recorded against
+/// the task's work, a unit's against the unit's, and a note against the work of
+/// the generation that wrote it (`producer_agent`, when known).
+fn journal_report(
+    registry: &AgentPtyRegistry,
+    outcome: &CommitOutcome,
+    mode: &ClaimMode,
+    producer_agent: Option<&str>,
+    recipient_agent: Option<&str>,
+) {
+    let CommitOutcome::Committed {
+        destination,
+        report_id,
+        ..
+    } = outcome
+    else {
+        return;
+    };
+    let destination = match destination {
+        crate::report_recovery::Destination::Inbox => crate::work_journal::Destination::Inbox,
+        crate::report_recovery::Destination::Recovery => crate::work_journal::Destination::Recovery,
+        crate::report_recovery::Destination::None
+        | crate::report_recovery::Destination::Unknown => return,
+    };
+    let about = match mode {
+        ClaimMode::Task { task_id } => crate::work_tracking::ReportAbout::Task(task_id),
+        ClaimMode::Terminal { unit_id, .. } => crate::work_tracking::ReportAbout::Unit(unit_id),
+        ClaimMode::Uncorrelated => match producer_agent {
+            Some(producer_agent) => crate::work_tracking::ReportAbout::Note {
+                producer_agent,
+                recipient_agent,
+            },
+            None => return,
+        },
+    };
+    registry.work().reported(&crate::work_tracking::Reported {
+        report_id,
+        about,
+        destination,
+    });
 }
 
 /// The answer a commit gives, or `None` when it is unknown.
@@ -929,6 +973,16 @@ async fn save(
     let _ = registry.fault_point(FAULT_MARKED);
     let (outcome, after) = registry.commit_claim(claim_id, unit_id.is_some());
     let _ = registry.fault_point(FAULT_COMMIT_RETURNED);
+    journal_report(
+        &registry,
+        &outcome,
+        &claimed.mode,
+        Some(&ctx.worker_agent),
+        claimed
+            .recipient
+            .as_ref()
+            .and_then(|recipient| recipient.agent_id.as_deref()),
+    );
     let completion = committed(outcome, &claimed.mode).unwrap_or(Completion::Unconfirmed);
     let _ = handed.send(completion);
     // Only after the handover: the wakes and the owed notices.
