@@ -24,7 +24,7 @@ The review is titled **Review project commands** and shows:
 - **Deck:** in the desktop app, the deck the orchestration would start on. The approval is recorded on that deck and the orchestration starts there. If you switch to another deck while the review is open, the review closes and nothing is approved or started.
 - **Removed since you approved it:** the roles your approval had that the file no longer defines.
 
-Read the commands and prompts as what they are: commands that will run as you, and instructions your agents will follow. Characters that could hide or disguise text, such as terminal control sequences, are shown as escapes (for example `\u{1b}`) rather than obeyed, in both clients and on the command line.
+Read the commands and prompts as what they are: commands that will run as you, and instructions your agents will follow. Characters that could hide or disguise text, such as terminal control sequences, are shown as escapes (for example `\u{1b}`) rather than obeyed, in both clients, on the command line and in the refusal messages described below.
 
 ## Answer it
 
@@ -77,6 +77,18 @@ Where you see it:
 
 Run the command it names from a terminal outside the deck, check the text it prints, and approve. The next fire, or the orchestrator's next try, then runs.
 
+### An orchestrator's instructions after compaction or `/clear`
+
+In the TUI, when the orchestrator's conversation is compacted, or you clear it with `/clear`, the deck sends the orchestrator its instructions again (its prompt, the workers and how to delegate). It sends them only when the orchestration is approved as its file now reads. If the file changed since you approved it, or the orchestration was never approved, nothing is sent and the TUI's status line says why, for example:
+
+```text
+Orchestration 'team': its instructions were not sent to its coordinator again, because its config changed since you approved it. Review and approve it from a terminal outside the deck with: dot-agent-deck trust approve /home/you/code/demo --orchestration team
+```
+
+The orchestrator keeps running, but without its instructions in its conversation. Approve the change with the command in the message, or revert the file; the next compaction or `/clear` then sends them. If you approve a change that only edits the roles' text, that text is what the orchestrator gets. If the change adds, removes, renames or reorders roles, or moves `start`, the status line says `its roles changed since it was opened. Open it again to use the new roles.`: open the orchestration again from the New Agent form.
+
+The desktop app does not send the orchestrator's instructions again after compaction or `/clear`, so this does not apply there.
+
 ## Manage approvals from the command line
 
 Run these from a terminal **outside** the deck, on the machine the daemon runs on.
@@ -94,6 +106,8 @@ Run these from a terminal **outside** the deck, on the machine the daemon runs o
 ## Restoring a saved workspace
 
 When the TUI starts and recreates orchestration tabs from your saved workspace because their agents are gone ([Session Management → Resuming Sessions](session-management.md#resuming-sessions)), it shows the review for each saved orchestration that is not approved as its file now reads, one after the other, with the footer `a approve and restore · Esc cancel · ↑↓ scroll`. The rest of the workspace is restored first. Approving restores that tab; cancelling leaves it out. An orchestration that is approved and unchanged comes back without asking.
+
+A saved orchestration the TUI can no longer find in its project, because the file is gone, the orchestration was renamed or its roles changed, is not restored at all, and nothing from it starts. When you quit the TUI, it prints a warning naming it, such as `Warning: …; orchestration 'team' was not restored`. Open the orchestration again from the New Agent form; it asks for approval if it needs it.
 
 ## After upgrading
 
@@ -129,6 +143,8 @@ The review is about the commands and instructions in a project's `.dot-agent-dec
 | The review comes back every time you open one orchestration from a worktree | The orchestration has no `name`, so each worktree is its own project. | Add `name = "<name>"` to the `[[orchestrations]]` table, then approve it once. |
 | A schedule's status is `refused`, or `schedule list` says `last fire refused` | The orchestration was never approved, or its file changed. | Run the command in the message from a terminal outside the deck, then `schedule run-now`. |
 | An orchestrator says `delegate` or `pane restart` was refused as not approved | The orchestration's file changed after you started it. | Review the change, then approve with the command in the message, or revert the file. |
+| The TUI's status line says an orchestration's `instructions were not sent to its coordinator again` | The orchestration's file changed after you opened it, and the change is not approved. | Approve with the command in the message, or revert the file. If it says the roles changed, open the orchestration again. |
+| A saved orchestration tab did not come back, and the TUI printed `was not restored` when you quit | Its project's file no longer defines it as saved. | Open it again from the New Agent form. |
 | `trust approve` says `run it from a terminal outside the deck` | You ran it in a deck pane. | Run it in a terminal of your own, or approve from the review in a client. |
 | `trust approve` says `there is no terminal to ask on` | It was run without a terminal (from a script). | Read the printed text, then run it again with `--yes`. |
 | The TUI says `The deck daemon is older than this TUI and cannot show the review prompt` | The daemon is from an older release. | Approve with the command in the message, or upgrade and restart the daemon ([Troubleshooting → Recycling the daemon](troubleshooting.md#recycling-the-daemon)). |
