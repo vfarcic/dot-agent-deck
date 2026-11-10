@@ -29728,6 +29728,15 @@ mod spawn_tests {
             "the writer was held past its deadline: {:?}",
             started.elapsed()
         );
+        // The bound times the ring; this is the property the test is named for.
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok(),
+            "the ring released the writer"
+        );
         assert!(matches!(editor.cell(), Latch::Suspended(..)));
         reached
             .recv_timeout(Duration::from_secs(1))

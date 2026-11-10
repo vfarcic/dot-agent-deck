@@ -73,9 +73,9 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 
 ##### telemetry/otlp/002 — Configured export describes the run and its status intervals.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** synthetic shell and cat with synthesized status hooks.
-- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver.
-- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry.
+- **Agent:** synthetic shell and cat with synthesized status hooks; and a clear=true orchestration worker that is a Pi stand-in shell reporting through the real in-pane `agent-event` CLI, as the bundled extension does (issue #2078).
+- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver. In the Pi case a delegate respawns the worker, so its replacement's run sees no `SessionStart` at all (Pi sends none, and a respawn surfaces no placeholder); that run must still export thinking, working and idle `agent.status` spans beside its one bash `agent.operation` (the control).
+- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry; the real `pi` runtime (`telemetry/otlp/019`).
 - **Platform coverage:** mac+linux.
 
 ##### telemetry/otlp/003 — The spawned agent and exported run share the same run id.
@@ -193,7 +193,7 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 ##### telemetry/otlp/019 — Real interactive Pi Haiku exports metadata with the deck identity.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
 - **Agent:** real Pi on Anthropic claude-haiku-4-5, using the automatically bundled extension.
-- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run and prompt/file/output sentinels are absent from every captured body.
+- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run, the deck exports a busy and an idle `agent.status` span for the Pi run (issue #2078) and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** provider fallback or exact token/cost values.
 - **Platform coverage:** mac+linux with Anthropic credentials.
 
