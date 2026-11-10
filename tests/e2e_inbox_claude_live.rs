@@ -26,6 +26,9 @@ struct Claude {
 /// The Claude Code command every test here runs.
 const CLAUDE: &str = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read Write";
 
+// Off Linux the installed-pane tests are compiled out, which leaves the
+// helpers only they call unused there; Linux still lints them.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Claude {
     fn new() -> Self {
         Self::launch(&common::capability_export_command(&format!(
@@ -138,7 +141,8 @@ impl Claude {
     /// PRD #1666 part 3 (Q35-28): interactive Haiku in a pane the deck
     /// installs its editor helper into (`support/claude_installed.rs`), so
     /// the production tick checks a touched input box. Run only where
-    /// [`installed::checkable`] holds.
+    /// [`installed::checkable`] holds. Linux only, as the helper is.
+    #[cfg(target_os = "linux")]
     fn installed() -> Self {
         let installed = installed::Installed::new(&[]);
         installed.assert_installed();
