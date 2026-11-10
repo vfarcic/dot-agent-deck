@@ -15,8 +15,11 @@
 //! spawn-time probe recorded for that same file (the watch never runs a
 //! binary it finds), and a direct child running `opencode serve --stdio` is
 //! the private server `--standalone` starts. A `#!/bin/sh` script named
-//! `opencode` is not detected (its executable is the shell), and OpenCode
-//! itself is not installed where lane 1 runs, so each test builds a native
+//! `opencode` is not detected (its executable is the shell). The real OpenCode
+//! binaries lane 1 has pinned since issue #2051 (`tests/e2e_opencode_real_binary.rs`)
+//! report only their own version, not `1.18.28`, and a real 2.x left off
+//! `--standalone` joins the machine's one shared background service (a fixed
+//! port, shared by every test and the developer's own OpenCode), so each test builds a native
 //! stand-in with `cc` that answers `--version` with a chosen version and,
 //! given `--standalone`, starts that private server child. No model,
 //! credential or real OpenCode is involved, so CI runs these for real rather

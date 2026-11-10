@@ -269,12 +269,23 @@ tasks:
       cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' \
         | while read -r pkg; do cargo clean -q -p "$pkg"; done
 
+  # Issue #2051: the pinned real OpenCode 1.x and 2.x that
+  # tests/e2e_opencode_real_binary.rs starts in a deck pane with NO model,
+  # provider or credential (that file's header says how each is checked, which
+  # is what keeps it in lane 1 under CLAUDE.md rule 5), installed with `npm ci`
+  # against scripts/opencode-pins/'s lockfiles into this task's $HOME, which
+  # the `e2e` partitions use. ci.yml's `e2e` job installs the same.
+  - key: opencode
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, node]
+    run: scripts/install-pinned-opencode.sh
+
   # Five runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
   # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
   # the speed-up comes from partitioning rather than from bigger machines.
   - key: e2e
     if: ${{ tasks.backend.values.rust == 'true' }}
-    use: e2e-build
+    use: [e2e-build, opencode]
     parallel:
       values:
         - shard: "1"
@@ -286,6 +297,9 @@ tasks:
       disk: 150gb
     env:
       SHARD: ${{ parallel.shard }}
+      # Issue #2051: a missing pinned OpenCode fails its tests instead of
+      # skipping them (see the `opencode` task).
+      DAD_E2E_REQUIRE_PINNED_OPENCODE: "1"
     run: |
       # `scripts/e2e-shard.sh` holds what each shard selects, for ci.yml too:
       # the `tests/e2e_*.rs` binaries and the `e2e_only…` modules, not the
