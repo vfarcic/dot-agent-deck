@@ -157,11 +157,11 @@ Drag across text in any pane to select it, in command mode or while typing in a 
 
 The highlight goes away on your next click, when you type into that pane, when you switch tabs, when the pane closes, or when the pane's output moves the text it covers. If you open the help overlay or a dialog while you are still dragging, the selection is dropped and nothing is copied.
 
-The status line says where the text went: `Copied to clipboard`, or `Sent to terminal clipboard (OSC 52)` when the deck could only hand it to your terminal, for example over ssh. If paste comes up empty after the second message, see [Troubleshooting → Copy and paste](troubleshooting.md#copy-and-paste).
+The status line says where the text went: `Copied to clipboard` when it is on the clipboard, or a message starting `Sent to terminal clipboard (OSC 52)` when the deck asked your terminal to put it there, which is normal over ssh. A message that ends `clipboard write still pending`, or reads `Clipboard write not confirmed yet`, means the clipboard had not answered yet when the message appeared and the text may still land, so paste to check. [Troubleshooting → Copy and paste](troubleshooting.md#copy-and-paste) lists every message and what to do when paste comes up empty.
 
 ### Copy mode
 
-Copy mode selects and copies text with the keyboard, including text that has scrolled off the top of the pane. Use it when your mouse does not reach the deck, for example in a terminal or a multiplexer that does not pass mouse clicks on. It copies the same way a drag does, so the status line reports the same two messages.
+Copy mode selects and copies text with the keyboard, including text that has scrolled off the top of the pane. Use it when your mouse does not reach the deck, for example in a terminal or a multiplexer that does not pass mouse clicks on. It copies the same way a drag does, so the status line reports the same messages.
 
 Press `v` in command mode to open copy mode on the focused pane. The chip at the left of the bottom bar reads ` COPY `, a cursor appears in the pane, and the pane stops moving: output that arrives while copy mode is open shows up once you leave it. Nothing you type in copy mode reaches the agent.
 

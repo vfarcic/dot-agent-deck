@@ -99,18 +99,29 @@ pub fn deliver(backend: &mut dyn ClipboardBackend, text: &str) -> Option<CopyOut
 
 /// Status line after a confirmed native write.
 pub const COPIED_MESSAGE: &str = "Copied to clipboard";
-/// Status line when only the OSC 52 sequence is known to have gone out.
+/// Status line when the native write was unavailable or refused and the OSC 52
+/// sequence went out.
 pub const OSC52_ONLY_MESSAGE: &str =
     "Sent to terminal clipboard (OSC 52); if paste is empty, see Troubleshooting";
-/// Status line when neither route sent anything.
+/// Status line when the OSC 52 sequence went out and the native write had not
+/// answered yet: it may still land, so it is neither claimed nor called failed.
+pub const OSC52_PENDING_MESSAGE: &str =
+    "Sent to terminal clipboard (OSC 52); clipboard write still pending";
+/// Status line when the native write was unavailable or refused and no OSC 52
+/// sequence went out.
 pub const NOT_COPIED_MESSAGE: &str = "Not copied: no clipboard was reachable";
+/// Status line when no OSC 52 sequence went out and the native write had not
+/// answered yet: it may still land, so it is not called a failure.
+pub const NOT_CONFIRMED_MESSAGE: &str = "Clipboard write not confirmed yet";
 
 /// The status line for a copy, derived only from what [`deliver`] reports.
 ///
-/// It claims a copy only when the native write confirmed one. When only the
-/// OSC 52 sequence went out, it says so and points at the troubleshooting
-/// page, because whether that lands depends on the user's terminal. `None`
-/// (nothing to copy) yields no message at all.
+/// It claims a copy only when the native write confirmed one. When the OSC 52
+/// sequence went out, it says so; with the native write unavailable or refused
+/// it points at the troubleshooting page, because whether that lands depends on
+/// the user's terminal. A native write that had not answered yet may still
+/// land, so it is reported as pending, never as a copy and never as a
+/// failure. `None` (nothing to copy) yields no message at all.
 pub fn status_message(outcome: Option<CopyOutcome>) -> Option<&'static str> {
     let outcome = outcome?;
     Some(match outcome {
@@ -118,6 +129,14 @@ pub fn status_message(outcome: Option<CopyOutcome>) -> Option<&'static str> {
             native: NativeWrite::Written,
             ..
         } => COPIED_MESSAGE,
+        CopyOutcome {
+            native: NativeWrite::NotConfirmed,
+            osc52_sent: true,
+        } => OSC52_PENDING_MESSAGE,
+        CopyOutcome {
+            native: NativeWrite::NotConfirmed,
+            osc52_sent: false,
+        } => NOT_CONFIRMED_MESSAGE,
         CopyOutcome {
             osc52_sent: true, ..
         } => OSC52_ONLY_MESSAGE,
@@ -541,15 +560,11 @@ mod tests {
         assert_eq!(status_message(outcome), Some(COPIED_MESSAGE));
     }
 
-    /// Scenario: A selection is copied where no native clipboard exists, the headless or ssh case, or where the native write failed or did not answer in time. Only the OSC 52 sequence went out, so the status line says it was sent to the terminal and points at Troubleshooting instead of claiming a copy.
+    /// Scenario: A selection is copied where no native clipboard exists, the headless or ssh case, or where the native write failed. Only the OSC 52 sequence went out, so the status line says it was sent to the terminal and points at Troubleshooting instead of claiming a copy.
     #[spec("clipboard/deliver/001")]
     #[test]
     fn deliver_001_osc52_only_says_sent_to_the_terminal() {
-        for native in [
-            NativeWrite::Unavailable,
-            NativeWrite::Failed,
-            NativeWrite::NotConfirmed,
-        ] {
+        for native in [NativeWrite::Unavailable, NativeWrite::Failed] {
             let mut backend = FakeBackend::new(native, true);
             let message = status_message(deliver(&mut backend, "hello"));
             assert_eq!(message, Some(OSC52_ONLY_MESSAGE), "native {native:?}");
@@ -559,13 +574,41 @@ mod tests {
         }
     }
 
-    /// Scenario: A copy finds neither a native clipboard nor a terminal to write OSC 52 to. The status line says nothing was copied rather than claiming a copy.
+    /// Scenario: A selection is copied while the native clipboard write is still running when the status line is chosen, and the OSC 52 sequence went out. The status line says it was sent to the terminal and that the clipboard write is still pending, neither claiming the copy nor saying it failed, because the native write may still land.
+    #[spec("clipboard/deliver/001")]
+    #[test]
+    fn deliver_001_an_unconfirmed_native_write_with_osc52_says_pending() {
+        let mut backend = FakeBackend::new(NativeWrite::NotConfirmed, true);
+        let message = status_message(deliver(&mut backend, "hello"));
+        assert_eq!(message, Some(OSC52_PENDING_MESSAGE));
+        let message = message.unwrap();
+        assert!(message.contains("Sent to terminal clipboard"), "{message}");
+        assert!(message.contains("pending"), "{message}");
+        assert!(!message.contains("Copied"), "{message}");
+        assert!(!message.contains("Not copied"), "{message}");
+    }
+
+    /// Scenario: A copy finds neither a native clipboard that accepted it nor a terminal to write OSC 52 to. The status line says nothing was copied rather than claiming a copy.
     #[spec("clipboard/deliver/001")]
     #[test]
     fn deliver_001_nothing_sent_claims_no_copy() {
-        let mut backend = FakeBackend::new(NativeWrite::Unavailable, false);
+        for native in [NativeWrite::Unavailable, NativeWrite::Failed] {
+            let mut backend = FakeBackend::new(native, false);
+            let message = status_message(deliver(&mut backend, "hello"));
+            assert_eq!(message, Some(NOT_COPIED_MESSAGE), "native {native:?}");
+        }
+    }
+
+    /// Scenario: A copy finds no terminal to write OSC 52 to while the native clipboard write is still running. The status line says the clipboard write is not confirmed yet, not that nothing was copied, because the native write may still land.
+    #[spec("clipboard/deliver/001")]
+    #[test]
+    fn deliver_001_an_unconfirmed_native_write_alone_is_not_called_a_failure() {
+        let mut backend = FakeBackend::new(NativeWrite::NotConfirmed, false);
         let message = status_message(deliver(&mut backend, "hello"));
-        assert_eq!(message, Some(NOT_COPIED_MESSAGE));
+        assert_eq!(message, Some(NOT_CONFIRMED_MESSAGE));
+        let message = message.unwrap();
+        assert!(!message.contains("Copied"), "{message}");
+        assert!(!message.contains("Not copied"), "{message}");
     }
 
     /// Scenario: An empty selection is released. Nothing is written by either route and no status message appears.

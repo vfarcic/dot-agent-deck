@@ -185,12 +185,13 @@ fn preserve_modal_click_miss_is_consumed() {
     // PRD #385: a copy no longer always says "Copied to clipboard" — under the
     // harness, with the native clipboard off, it says it went out over OSC 52
     // — so the check is on the copy itself: no OSC 52 sequence reached the
-    // terminal, and no copy status of either wording is on screen.
+    // terminal, and no copy status of any wording is on screen.
     let grid = deck.snapshot_grid();
     for status in [
         "Copied to clipboard",
         "Sent to terminal clipboard",
         "Not copied",
+        "Clipboard write not confirmed",
     ] {
         assert!(
             !grid.contains(status),
