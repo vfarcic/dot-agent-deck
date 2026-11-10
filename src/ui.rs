@@ -1898,6 +1898,11 @@ struct UiState {
     /// prompt ([`open_next_trust_restore`]). Nothing of one is spawned until it
     /// is approved.
     pending_trust_restores: std::collections::VecDeque<PendingTrustRestore>,
+    /// PRD #1885: saved orchestrations whose restore prompt was cancelled.
+    /// Like [`Self::pending_trust_restores`] and the one an open prompt holds,
+    /// each stays in the saved session unchanged ([`keep_held_trust_restores`]),
+    /// so the next start asks about it again.
+    declined_trust_restores: Vec<config::SavedPane>,
     /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
@@ -2562,6 +2567,7 @@ impl UiState {
             restart_notice: None,
             trust_prompt: None,
             pending_trust_restores: std::collections::VecDeque::new(),
+            declined_trust_restores: Vec::new(),
             restart_notice_area: None,
             confirm_choices_drawn: None,
             confirm_drawing: None,
@@ -7189,7 +7195,8 @@ fn open_trust_prompt(
 }
 
 /// PRD #1885: close the trust prompt without approving: nothing is spawned and
-/// nothing is stored. A restore it was shown for stays unrestored.
+/// nothing is stored. A restore it was shown for stays unrestored, and stays in
+/// the saved session so the next start asks again.
 fn cancel_trust_prompt(ui: &mut UiState) {
     ui.mode = UiMode::Normal;
     let Some(prompt) = ui.trust_prompt.take() else {
@@ -7200,7 +7207,8 @@ fn cancel_trust_prompt(ui: &mut UiState) {
         TrustPromptPurpose::Open { .. } => {
             format!("Orchestration '{name}' not started: its commands were not approved.")
         }
-        TrustPromptPurpose::Restore(_) => {
+        TrustPromptPurpose::Restore(pending) => {
+            ui.declined_trust_restores.push(pending.saved_pane);
             format!("Orchestration '{name}' not restored: its commands were not approved.")
         }
     };
@@ -12237,6 +12245,41 @@ fn dispatch_action(
     Flow::Continue
 }
 
+/// PRD #1885: add to `session` every saved orchestration the startup restore
+/// held back for approval — still waiting for its prompt, open in it, or
+/// declined — exactly as it was saved, so a save made before it is approved
+/// does not drop it and the next start asks about it again. One whose
+/// orchestration (the same project and config name) is open in a live tab, and
+/// so is already saved from that tab, is left out rather than restored twice.
+fn keep_held_trust_restores(ui: &UiState, session: &mut config::SavedSession) {
+    let open = ui
+        .trust_prompt
+        .as_ref()
+        .and_then(|prompt| match &prompt.purpose {
+            TrustPromptPurpose::Restore(pending) => Some(&pending.saved_pane),
+            TrustPromptPurpose::Open { .. } => None,
+        });
+    let held: Vec<config::SavedPane> = ui
+        .pending_trust_restores
+        .iter()
+        .map(|pending| &pending.saved_pane)
+        .chain(open)
+        .chain(&ui.declined_trust_restores)
+        .filter(|held| {
+            let Some(orch) = held.orchestration.as_ref() else {
+                return true;
+            };
+            !session.panes.iter().any(|live| {
+                live.orchestration.as_ref().is_some_and(|o| {
+                    o.project_path == orch.project_path && o.config_name == orch.config_name
+                })
+            })
+        })
+        .cloned()
+        .collect();
+    session.panes.extend(held);
+}
+
 /// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
 /// says a write is due (a state change is pending and the throttle interval has
 /// elapsed since the last write). Called once per main-loop iteration, so the
@@ -12259,6 +12302,7 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
     // pane-derived snapshot builder cannot know. `track_session_focus` keeps
     // `ui.session_focus` current and is what marked this write dirty.
     session.focus = ui.session_focus.clone();
+    keep_held_trust_restores(ui, &mut session);
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
@@ -15844,6 +15888,7 @@ pub fn run_tui(
         // move behind.
         track_session_focus(&mut ui, &tab_manager);
         session.focus = ui.session_focus.clone();
+        keep_held_trust_restores(&ui, &mut session);
         if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
@@ -42190,6 +42235,69 @@ mod tests {
             "approving opens every role"
         );
         assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: three saved orchestrations are held back by the startup
+    /// restore. One is cancelled with Esc, one is open in the trust prompt and
+    /// one still waits; a session save keeps all three exactly as saved, except
+    /// one whose orchestration a live tab already saves (Greptile P1 on PR
+    /// #2256).
+    #[test]
+    fn a_session_save_keeps_every_restore_awaiting_approval() {
+        let held = |project: &str, name: &str| {
+            let config = make_orchestration(name);
+            let view = crate::project_trust::TrustCheck::evaluate(
+                &crate::project_trust::ApprovalStore::default(),
+                std::path::PathBuf::from(project),
+                std::path::Path::new(project),
+                &config,
+            )
+            .view();
+            PendingTrustRestore {
+                saved_pane: config::SavedPane {
+                    dir: project.to_string(),
+                    name: name.to_string(),
+                    command: String::new(),
+                    mode: None,
+                    orchestration: Some(config::OrchestrationSnapshot {
+                        version: 1,
+                        roles: vec!["orchestrator".to_string()],
+                        start_role_index: 0,
+                        orchestrator_prompt: String::new(),
+                        config_name: name.to_string(),
+                        project_path: project.to_string(),
+                        started_role_indices: Vec::new(),
+                        display_title: None,
+                    }),
+                },
+                view,
+            }
+        };
+        let mut ui = default_ui();
+        let declined = held("/p/declined", "declined");
+        let open = held("/p/open", "open");
+        ui.pending_trust_restores
+            .push_back(held("/p/waiting", "waiting"));
+        ui.pending_trust_restores.push_back(held("/p/live", "live"));
+        open_trust_prompt(
+            &mut ui,
+            declined.view.clone(),
+            TrustPromptPurpose::Restore(declined),
+        );
+        cancel_trust_prompt(&mut ui);
+        open_trust_prompt(
+            &mut ui,
+            open.view.clone(),
+            TrustPromptPurpose::Restore(open),
+        );
+
+        let mut session = config::SavedSession {
+            panes: vec![held("/p/live", "live").saved_pane],
+            ..Default::default()
+        };
+        keep_held_trust_restores(&ui, &mut session);
+        let names: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["live", "waiting", "open", "declined"]);
     }
 
     /// Scenario: Choose an approved orchestration whose config is unchanged:

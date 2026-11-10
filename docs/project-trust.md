@@ -58,7 +58,7 @@ An approval covers one orchestration of one project, and the exact text you were
 
 The project is the directory holding `.dot-agent-deck.toml`. In a git repository, a linked worktree counts as the main checkout: the same directory in any worktree of the repository is one project. A linked worktree, such as the one each [dispatched unit](dispatcher-mode.md) works in, therefore uses the main checkout's approval: a unit started from an approved orchestration starts without asking, as long as the worktree's file says the same thing.
 
-**Give your orchestrations a `name`.** An orchestration without one takes the directory's name, which is different in every worktree, so each worktree asks for its own approval and none of them shares the main checkout's.
+An orchestration without a `name` is remembered under the name of the project's main checkout, so its worktrees share that approval too. The review and every refusal show that name, and it is the name to give `trust approve` and `trust revoke` with `--orchestration`.
 
 Approvals are kept per user, on the machine the daemon runs on, in `project-trust/approvals.json` in the deck's state directory (`~/.local/state/dot-agent-deck/` unless `XDG_STATE_HOME` or `DOT_AGENT_DECK_STATE_DIR` moves it; see [Configuration → Environment variables](configuration.md#paths-and-endpoints)). For a [remote](remote-environments.md) daemon, that is the remote host.
 
@@ -84,6 +84,14 @@ Where you see it:
 - **The daemon log**, at warning level ([Troubleshooting → Logs](troubleshooting.md#logs-and-diagnostics)).
 
 Run the command it names from a terminal outside the deck, check the text it prints, and approve. The next fire, or the orchestrator's next try, then runs.
+
+A scheduled issue dispatch reuses the issue's existing branch, `agent/issue-<n>`, when an earlier dispatch left one in the schedule's clone. If that branch's `.dot-agent-deck.toml` differs from the approved one on the default branch, the issue is refused without an approve command, because approving the branch's version would replace the default branch's approval:
+
+```text
+orchestration 'team' on the existing issue branch agent/issue-7 in /home/you/work/issues changed since you approved it (roles: coder (changed)): that branch's .dot-agent-deck.toml differs from the approved one, so nothing was started. Approving the branch's version would replace the default branch's approval, so bring the branch's .dot-agent-deck.toml back in line with the default branch, or, if its work is abandoned, delete the branch with: git -C /home/you/work/issues branch -D agent/issue-7 — the next fire then dispatches the issue fresh. Issues on the default branch keep dispatching.
+```
+
+Other issues, on the default branch, keep dispatching meanwhile.
 
 ### An orchestrator's instructions after compaction or `/clear`
 
@@ -114,6 +122,8 @@ Run these from a terminal **outside** the deck, on the machine the daemon runs o
 ## Restoring a saved workspace
 
 When the TUI starts and recreates orchestration tabs from your saved workspace because their agents are gone ([Session Management → Resuming Sessions](session-management.md#resuming-sessions)), it shows the review for each saved orchestration that is not approved as its file now reads, one after the other, with the footer `a approve and restore · Esc cancel · ↑↓ scroll`. The rest of the workspace is restored first. Approving restores that tab; cancelling leaves it out. An orchestration that is approved and unchanged comes back without asking.
+
+An orchestration you cancel, or have not answered yet when you quit, stays in your saved workspace and is offered again the next time the TUI restores it. To drop it for good, clear the saved workspace with `dot-agent-deck snapshot clear` ([Session Management → Starting Fresh](session-management.md#starting-fresh)).
 
 A saved orchestration the TUI can no longer find in its project, because the file is gone, the orchestration was renamed or its roles changed, is not restored at all, and nothing from it starts. When you quit the TUI, it prints a warning naming it, such as `Warning: …; orchestration 'team' was not restored`. Open the orchestration again from the New Agent form; it asks for approval if it needs it.
 
@@ -148,7 +158,9 @@ The review is about the commands and instructions in a project's `.dot-agent-dec
 
 | What you see | Why | What to do |
 |---|---|---|
-| The review comes back every time you open one orchestration from a worktree | The orchestration has no `name`, so each worktree is its own project. | Add `name = "<name>"` to the `[[orchestrations]]` table, then approve it once. |
+| The review comes back every time you open one orchestration from a worktree | The worktree's file says something other than what you approved in the main checkout. | Review the difference, then approve it, or bring the file in line with the main checkout. |
+| An issue dispatch is refused because `the existing issue branch agent/issue-<n>` differs from the approved one | An earlier dispatch left that branch, and its `.dot-agent-deck.toml` changed. | Bring that branch's file back in line with the default branch, or delete the branch with the `git` command in the message; the next fire dispatches the issue again. |
+| A cancelled restore is offered again every time the TUI starts | An orchestration you did not approve stays in your saved workspace. | Approve it, or run `dot-agent-deck snapshot clear` to drop the saved workspace. |
 | A schedule's status is `refused`, or `schedule list` says `last fire refused` | The orchestration was never approved, or its file changed. | Run the command in the message from a terminal outside the deck, then `schedule run-now`. |
 | An orchestrator says `delegate` or `pane restart` was refused as not approved | The orchestration's file changed after you started it. | Review the change, then approve with the command in the message, or revert the file. |
 | The TUI's status line says an orchestration's `instructions were not sent to its coordinator again` | The orchestration's file changed after you opened it, and the change is not approved. | Approve with the command in the message, or revert the file. If it says the roles changed, open the orchestration again. |

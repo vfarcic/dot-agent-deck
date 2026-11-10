@@ -33,6 +33,11 @@
 //! subdirectories of one repository stay two projects. Otherwise the canonical
 //! config directory.
 //!
+//! An orchestration block with no `name` is kept under the project's basename
+//! ([`approval_name`]), not the basename of the directory it was read in, so a
+//! linked worktree's unnamed orchestration is the approval its main checkout
+//! was given.
+//!
 //! # Where approvals live (decision 3)
 //!
 //! `<state_dir>/project-trust/approvals.json`, the directory created
@@ -322,6 +327,34 @@ pub fn project_identity(config_dir: &Path) -> io::Result<PathBuf> {
     }
 }
 
+/// The name the approval of the orchestration called `loaded_name` — as the
+/// config in `config_dir` was loaded — is kept under, for `project`, the
+/// [`project_identity`] of `config_dir`.
+///
+/// A block with no `name` is loaded under `config_dir`'s basename
+/// ([`crate::project_config::resolve_orchestration_name`]), which differs
+/// between a main checkout and each of its linked worktrees. For approval it
+/// takes the project's basename instead, so every checkout of one project keys
+/// it alike. `project` is the verified identity, never an unverified git
+/// answer, so a directory that is not really a linked worktree keeps its own
+/// basename.
+///
+/// The loaded config no longer says whether a block was unnamed, so a name
+/// equal to `config_dir`'s basename is read as one. Outside a linked
+/// worktree's top level that changes nothing, because the project's basename is
+/// that same name. Inside one, a block explicitly named after the worktree's
+/// directory is also kept under the project's basename: its approval is still
+/// of its own exact text.
+pub fn approval_name(project: &Path, config_dir: &Path, loaded_name: &str) -> String {
+    let derived_in =
+        |dir: &Path| crate::project_config::resolve_orchestration_name("", dir) == loaded_name;
+    if derived_in(config_dir) || std::fs::canonicalize(config_dir).is_ok_and(|c| derived_in(&c)) {
+        crate::project_config::resolve_orchestration_name("", project)
+    } else {
+        loaded_name.to_string()
+    }
+}
+
 /// The best spelling of `dir` for a store key when it may no longer exist
 /// (revoking an approval whose project is gone): its identity when it
 /// resolves, otherwise the path made absolute as written.
@@ -552,11 +585,12 @@ impl TrustCheck {
         orchestration: &OrchestrationConfig,
     ) -> Self {
         let roles = role_texts(orchestration);
-        let verdict = store.evaluate(&project, &orchestration.name, &roles);
+        let name = approval_name(&project, config_dir, &orchestration.name);
+        let verdict = store.evaluate(&project, &name, &roles);
         TrustCheck {
             project,
             config_dir: config_dir.to_path_buf(),
-            orchestration: orchestration.name.clone(),
+            orchestration: name,
             roles,
             verdict,
         }
@@ -596,8 +630,23 @@ pub fn refusal_text(
     orchestration: &str,
     verdict: &TrustVerdict,
 ) -> String {
-    let state = match verdict {
-        TrustVerdict::Approved => return String::new(),
+    let Some(state) = verdict_phrase(verdict) else {
+        return String::new();
+    };
+    crate::untrusted_text::escape_control_and_bidi(&format!(
+        "orchestration '{orchestration}' of project {} {state}, so nothing from it was \
+         started. Review and approve it from a terminal outside the deck with: {}",
+        project.display(),
+        approve_command(config_dir, orchestration)
+    ))
+}
+
+/// What a refusal says of `verdict` — `was never approved`, or `changed since
+/// you approved it (roles: …)` naming each changed role — or `None` when it
+/// is approved. Not escaped: the caller escapes the sentence it builds.
+pub fn verdict_phrase(verdict: &TrustVerdict) -> Option<String> {
+    Some(match verdict {
+        TrustVerdict::Approved => return None,
         TrustVerdict::NeverApproved => "was never approved".to_string(),
         TrustVerdict::Changed { roles, removed } => {
             let mut named: Vec<String> = roles
@@ -614,13 +663,7 @@ pub fn refusal_text(
                 )
             }
         }
-    };
-    crate::untrusted_text::escape_control_and_bidi(&format!(
-        "orchestration '{orchestration}' of project {} {state}, so nothing from it was \
-         started. Review and approve it from a terminal outside the deck with: {}",
-        project.display(),
-        approve_command(config_dir, orchestration)
-    ))
+    })
 }
 
 /// `dot-agent-deck trust approve <dir> --orchestration <name>`, each argument
@@ -863,10 +906,19 @@ pub fn inspect_config(
     orchestration: &str,
 ) -> Result<TrustCheck, TrustError> {
     let project = project_identity(config_dir).map_err(TrustError::Store)?;
+    // The name the approval is kept under (what a refusal and a review show)
+    // first, then the name the config was loaded under (what a client that
+    // read the config itself sends).
     let orch = config
         .orchestrations
         .iter()
-        .find(|o| o.name == orchestration)
+        .find(|o| approval_name(&project, config_dir, &o.name) == orchestration)
+        .or_else(|| {
+            config
+                .orchestrations
+                .iter()
+                .find(|o| o.name == orchestration)
+        })
         .ok_or_else(|| TrustError::NoOrchestration {
             config_dir: config_dir.to_path_buf(),
             name: orchestration.to_string(),
@@ -1384,6 +1436,62 @@ prompt_template = "Be brief."
         assert_eq!(
             verdict(&store, &forged, "team"),
             TrustVerdict::NeverApproved
+        );
+    }
+
+    /// Qodo's finding on PR #2256: an orchestration with no `name` is loaded
+    /// under the directory's basename, which differs in a linked worktree, so
+    /// its approval is keyed on the project's basename instead. The approval
+    /// name and the loaded name both find it, and a forged `.git` file keys
+    /// the copy's unnamed block on its own basename.
+    #[test]
+    fn an_unnamed_orchestration_is_keyed_on_the_project_in_a_linked_worktree() {
+        let unnamed = TEAM.replace("name = \"team\"\n", "");
+        let scratch = crate::test_temp::tempdir().unwrap();
+        let store = TrustStore::at(scratch.path().join("state"));
+        let repo = scratch.path().join("repo");
+        write_config(&repo, &unnamed);
+        git(&repo, scratch.path(), &["init", "--quiet"]);
+        crate::worktree_owner::pin_fixture_eol(&repo, scratch.path());
+        git(&repo, scratch.path(), &["add", "."]);
+        git(&repo, scratch.path(), &["commit", "--quiet", "-m", "init"]);
+        let linked = scratch.path().join("repo-unit");
+        git(
+            &repo,
+            scratch.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "unit",
+                &linked.to_string_lossy(),
+            ],
+        );
+
+        approve_now(&store, &repo, "repo");
+        let by_loaded_name = inspect(&store, &linked, "repo-unit").unwrap();
+        assert_eq!(by_loaded_name.orchestration, "repo");
+        assert_eq!(by_loaded_name.verdict, TrustVerdict::Approved);
+        assert_eq!(verdict(&store, &linked, "repo"), TrustVerdict::Approved);
+
+        let forged = scratch.path().join("forged");
+        write_config(&forged, &unnamed);
+        std::fs::copy(linked.join(".git"), forged.join(".git")).unwrap();
+        let check = inspect(&store, &forged, "forged").unwrap();
+        assert_eq!(check.orchestration, "forged");
+        assert_eq!(check.verdict, TrustVerdict::NeverApproved);
+    }
+
+    #[test]
+    fn approval_name_keeps_a_name_that_is_not_the_directorys() {
+        assert_eq!(
+            approval_name(Path::new("/p/main"), Path::new("/p/wt"), "team"),
+            "team"
+        );
+        assert_eq!(
+            approval_name(Path::new("/p/main"), Path::new("/p/wt"), "wt"),
+            "main"
         );
     }
 

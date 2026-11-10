@@ -1062,7 +1062,14 @@ async fn dispatch_one_issue(
     // A refusal removes the worktree this attempt just created (the branch and
     // its commits stay), so the issue is dispatched again once it is approved
     // rather than skipped as claimed on every later fire.
-    if let Err(refusal) = refuse_unapproved_worktree(&paths.worktree_dir, task_name, notifier).await
+    if let Err(refusal) = refuse_unapproved_worktree(
+        &paths.worktree_dir,
+        clone_dir,
+        &paths.branch,
+        task_name,
+        notifier,
+    )
+    .await
     {
         return Err(release_refused_worktree(
             &paths.worktree_dir,
@@ -1188,8 +1195,21 @@ async fn release_refused_worktree(
 /// orchestration `worktree_dir`'s config would open is not approved as it now
 /// reads. A directory with no config, or one that opens no orchestration,
 /// passes: what starts there is the task's own command.
+///
+/// The worktree is removed after a refusal, so the refusal never names it. The
+/// run checked the clone's (default branch's) config before creating it, so a
+/// refusal here normally means the issue's `branch` — an existing one, attached
+/// as it stands — configures something other than the approved text. Approving
+/// that text would replace the default branch's approval (one is kept per
+/// project and orchestration) and refuse every later fire, so the refusal
+/// offers no approve command: it names the branch and how to resolve it
+/// ([`branch_differs_refusal`]). When the clone's own config is no longer
+/// approved either (revoked or changed meanwhile), the clone's refusal is
+/// recorded instead, and its approve command names the clone.
 async fn refuse_unapproved_worktree(
     worktree_dir: &Path,
+    clone_dir: &Path,
+    branch: &str,
     task_name: &str,
     notifier: &dyn Notifier,
 ) -> Result<(), String> {
@@ -1200,9 +1220,72 @@ async fn refuse_unapproved_worktree(
     else {
         return Ok(());
     };
-    crate::spawn::refuse_unless_approved(worktree_dir, chosen.config, task_name, notifier)
+    let check = {
+        let (dir, orch) = (worktree_dir.to_path_buf(), chosen.config.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::project_trust::check_blocking(
+                &crate::project_trust::TrustStore::default_location(),
+                &dir,
+                &orch,
+            )
+        })
         .await
-        .map_err(|e| e.to_string())
+    };
+    let refusal = match check {
+        Ok(check) if check.verdict.is_approved() => return Ok(()),
+        Ok(check) => {
+            let clone_config = crate::spawn::load_config_for_dir(clone_dir);
+            let clone_refusal = match clone_config
+                .as_ref()
+                .and_then(|c| crate::project_config::default_orchestration(c, clone_dir))
+            {
+                Some(clone_chosen) => {
+                    crate::spawn::approval_refusal(clone_dir, clone_chosen.config, task_name).await
+                }
+                None => None,
+            };
+            clone_refusal.unwrap_or_else(|| branch_differs_refusal(&check, clone_dir, branch))
+        }
+        Err(e) => crate::untrusted_text::escape_control_and_bidi(&format!(
+            "orchestration '{}' was not started: its approval could not be checked ({e})",
+            chosen.name
+        )),
+    };
+    tracing::warn!(task = task_name, "issue-dispatch: {refusal}");
+    notifier.notify(NotifyEvent::NotApproved {
+        task: task_name.to_string(),
+        message: refusal.clone(),
+    });
+    Err(refusal)
+}
+
+/// PRD #1885: the refusal for an issue whose `branch` in `clone_dir` carries
+/// orchestration text other than the approved text `check` was measured
+/// against. Names the branch and the clone, says nothing was started, and
+/// offers the two ways out — align the branch's config with the default
+/// branch, or delete the branch — instead of an approve command. Escaped for
+/// display, as [`crate::project_trust::refusal_text`] is.
+fn branch_differs_refusal(
+    check: &crate::project_trust::TrustCheck,
+    clone_dir: &Path,
+    branch: &str,
+) -> String {
+    let state = crate::project_trust::verdict_phrase(&check.verdict)
+        .unwrap_or_else(|| "differs from the approved text".to_string());
+    let config = crate::project_config::CONFIG_FILE_NAME;
+    crate::untrusted_text::escape_control_and_bidi(&format!(
+        "orchestration '{orchestration}' on the existing issue branch {branch} in {clone} \
+         {state}: that branch's {config} differs from the approved one, so nothing was \
+         started. Approving the branch's version would replace the default branch's \
+         approval, so bring the branch's {config} back in line with the default branch, or, \
+         if its work is abandoned, delete the branch with: git -C {quoted_clone} branch -D \
+         {quoted_branch} — the next fire then dispatches the issue fresh. Issues on the \
+         default branch keep dispatching.",
+        orchestration = check.orchestration,
+        clone = clone_dir.display(),
+        quoted_clone = crate::platform::paths::shell_quote_if_needed(&clone_dir.to_string_lossy()),
+        quoted_branch = crate::platform::paths::shell_quote_if_needed(branch),
+    ))
 }
 
 /// PRD #421 M3.2 — the claimant whose record on `issue` is live, read from
@@ -4380,6 +4463,38 @@ mod tests {
             "the next attempt reclaims it under the lock"
         );
         assert!(!wt.exists());
+    }
+
+    /// Scenario: an issue's existing branch changes the approved role's
+    /// command. The refusal names the branch and the clone, says nothing
+    /// started and offers aligning or deleting the branch, and prints no
+    /// `trust approve` command (Greptile P1 / Qodo finding 6 on PR #2256).
+    #[test]
+    fn a_differing_issue_branch_is_refused_without_an_approve_command() {
+        let check = crate::project_trust::TrustCheck {
+            project: PathBuf::from("/ws/task"),
+            config_dir: PathBuf::from("/ws/task/.worktrees/issue-7"),
+            orchestration: "team".to_string(),
+            roles: Vec::new(),
+            verdict: crate::project_trust::TrustVerdict::Changed {
+                roles: vec![(
+                    "coder".to_string(),
+                    crate::project_trust::RoleChange::Changed,
+                )],
+                removed: Vec::new(),
+            },
+        };
+        let text = branch_differs_refusal(&check, Path::new("/ws/my task"), "agent/issue-7");
+        assert!(
+            text.contains("orchestration 'team' on the existing issue branch agent/issue-7")
+                && text.contains("changed since you approved it (roles: coder (changed))")
+                && text.contains("nothing was started")
+                && text.contains("git -C '/ws/my task' branch -D agent/issue-7")
+                && text.contains("Issues on the default branch keep dispatching"),
+            "{text}"
+        );
+        assert!(!text.contains("trust approve"), "{text}");
+        assert!(!text.contains(".worktrees"), "{text}");
     }
 
     /// Scenario: an issue's new worktree configures an orchestration that is
