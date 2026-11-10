@@ -1163,12 +1163,16 @@ pub async fn handle_dispatch(
         }
     };
     // PRD #1889: a dispatch that registered no unit writes its work as it is;
-    // one that started nothing leaves no work behind.
+    // a failed one leaves no work behind when it started nothing, and keeps
+    // and closes it when something it started was already written (a role
+    // of its orchestration that came up before a later one failed).
     if let Some(work) = &work_id {
         if spawned.is_ok() {
-            ctx.registry.work().flush_open(work);
+            ctx.registry.work().launch_succeeded(work);
         } else {
-            ctx.registry.work().forget(work);
+            ctx.registry
+                .work()
+                .launch_failed(work, Some(crate::work_journal::CloseHow::UnitEnded));
         }
     }
     match spawned {

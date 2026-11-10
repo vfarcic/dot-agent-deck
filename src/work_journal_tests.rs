@@ -2049,3 +2049,176 @@ fn a_symlinked_home_is_redacted_in_either_spelling() {
     assert!(!text.contains(real.to_str().unwrap()), "{text}");
     assert!(!text.contains(link.to_str().unwrap()), "{text}");
 }
+
+/// Qodo finding 5 on PR #2248: a rotation whose directory sync fails does
+/// not switch to the new segment. The run keeps writing its current segment
+/// (every line still reads back), no unsynced empty segment is left behind,
+/// and once the sync succeeds the next rotation goes ahead.
+#[test]
+fn a_rotation_whose_directory_sync_fails_keeps_writing_the_current_segment() {
+    let state = state();
+    let faults = Arc::new(AtomicU64::new(3));
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "me",
+        &deck(),
+        options_with(|o| {
+            o.segment_max_bytes = 512;
+            o.hooks.rotate_sync_fault = Some(Arc::clone(&faults));
+        }),
+    )
+    .unwrap();
+    let dir = journal_dir(state.path());
+    let segments = || -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.starts_with("run-me") && n.ends_with(".jsonl"))
+            .collect();
+        names.sort();
+        names
+    };
+    let linked = |n: u64| Event::Linked {
+        work: work(n),
+        refs: Box::new(Refs::default()),
+    };
+    // Past the segment size: each line that would rotate meets a failing
+    // sync, while three failures last.
+    let mut written = 0;
+    while faults.load(Ordering::SeqCst) > 0 {
+        journal.try_record(linked(written)).unwrap();
+        written += 1;
+        assert!(written < 100, "the rotation never reached its sync");
+    }
+    assert_eq!(segments(), vec!["run-me.jsonl".to_string()]);
+    assert!(fs::metadata(dir.join("run-me.jsonl")).unwrap().len() > 512);
+    // The sync works again: the next line rotates.
+    journal.try_record(linked(written)).unwrap();
+    written += 1;
+    assert_eq!(
+        segments(),
+        vec!["run-me.1.jsonl".to_string(), "run-me.jsonl".to_string()]
+    );
+    let read: HashSet<WorkId> = read_journal(state.path())
+        .unwrap()
+        .lines
+        .iter()
+        .map(|l| l.event.work().clone())
+        .collect();
+    assert_eq!(read, (0..written).map(work).collect::<HashSet<_>>());
+}
+
+/// Greptile P1 on PR #2248: a live daemon's exited-but-open pane keeps its
+/// work id and can be restarted into it, so retention keeps that work — its
+/// `opened` included — even once rotation has sealed its lines and they are
+/// past the age limit. A delegation of the live run, which gets no new
+/// attempt, and a pane work the run closed still go; and once the run is
+/// gone, its unclosed pane work expires too.
+#[test]
+fn retention_keeps_an_open_restartable_pane_work_of_a_live_run() {
+    let state = state();
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "me",
+        &deck(),
+        options_with(|o| o.segment_max_bytes = 1024),
+    )
+    .unwrap();
+    // work(1): a pane whose agent exited, the pane still open.
+    journal.try_record(opened(work(1), None)).unwrap();
+    journal.try_record(started(work(1), "me", 1)).unwrap();
+    journal.try_record(ended(work(1), "me", 1)).unwrap();
+    // work(2): a pane the run closed.
+    journal.try_record(opened(work(2), None)).unwrap();
+    journal.try_record(started(work(2), "me", 2)).unwrap();
+    journal.try_record(ended(work(2), "me", 2)).unwrap();
+    journal.try_record(closed(work(2))).unwrap();
+    // work(3): a delegation whose worker generation ended, never reported.
+    journal
+        .try_record(Event::Opened {
+            work: work(3),
+            launch: Launch::Delegation,
+            parent: None,
+            refs: Box::new(Refs::default()),
+            workspace: None,
+        })
+        .unwrap();
+    journal.try_record(started(work(3), "me", 3)).unwrap();
+    journal.try_record(ended(work(3), "me", 3)).unwrap();
+    // Enough of another work to seal those lines into older segments.
+    for _ in 0..12 {
+        journal
+            .try_record(Event::Linked {
+                work: work(9),
+                refs: Box::new(Refs::default()),
+            })
+            .unwrap();
+    }
+    let works = |state: &Path| -> HashSet<WorkId> {
+        read_journal(state)
+            .unwrap()
+            .lines
+            .iter()
+            .map(|l| l.event.work().clone())
+            .collect()
+    };
+    let later = now_ms() + 40 * DAY_MS;
+    let report = journal.compact_with(later, Retention::default()).unwrap();
+    assert_eq!(report.dropped_works, 2, "{report:?}");
+    assert_eq!(works(state.path()), HashSet::from([work(1), work(9)]));
+    let kinds: Vec<&str> = read_journal(state.path())
+        .unwrap()
+        .lines
+        .iter()
+        .filter(|l| l.event.work() == &work(1))
+        .map(|l| l.event.kind())
+        .collect();
+    assert_eq!(kinds, ["opened", "attempt_started", "attempt_ended"]);
+
+    // The run goes away: its unclosed pane work is finished, and expires.
+    drop(journal);
+    let next = open(state.path(), "next");
+    next.compact_with(later, Retention::default()).unwrap();
+    assert!(!works(state.path()).contains(&work(1)));
+}
+
+/// Qodo finding 7 on PR #2248: the daemon's startup recovery runs entirely
+/// off the caller's thread. With every recovery attempt held at a gate, the
+/// start returns at once (it would never return if it ran the first attempt
+/// itself), compaction waits for the recovery it owes, and once the gate
+/// opens recovery completes and compaction runs.
+#[test]
+fn startup_recovery_in_the_background_never_holds_up_its_caller() {
+    let state = state();
+    plant(
+        state.path(),
+        "run-dead.jsonl",
+        &[encoded(&line("dead", 1, 1, started(work(1), "dead", 1)))],
+        "",
+    );
+    let gate = WriterGate::closed();
+    let journal = WorkJournal::try_open_with(
+        state.path(),
+        "new",
+        &deck(),
+        options_with(|o| o.hooks.recovery_gate = Some(Arc::clone(&gate))),
+    )
+    .unwrap();
+    journal.start_recovery_in_background();
+    // Returned with the first attempt still held.
+    assert!(!journal.recovery_done());
+    let report = journal.compact_with(NOW_MS, Retention::default()).unwrap();
+    assert!(report.skipped_recovery_pending, "{report:?}");
+    until("the background attempt reaches its gate", || {
+        gate.reached.load(Ordering::SeqCst) > 0
+    });
+    gate.open();
+    assert!(journal.wait_recovered(Duration::from_secs(60)));
+    assert!(journal.recovery_done());
+    assert_eq!(
+        interrupted_attempts(&segment_lines(state.path(), "new")).len(),
+        1
+    );
+    let report = journal.compact_with(NOW_MS, Retention::default()).unwrap();
+    assert!(!report.skipped_recovery_pending, "{report:?}");
+}

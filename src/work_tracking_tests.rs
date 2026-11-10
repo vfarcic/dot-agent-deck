@@ -792,15 +792,18 @@ fn superseded_abandoned_and_torn_down_delegations_are_retired() {
     let sizes = tracker.book_sizes();
     assert_eq!(sizes.tasks, 0);
     assert!(sizes.retired <= MAX_RETIRED_TASKS);
+    assert!(sizes.settled <= MAX_SETTLED_TASKS);
     assert_eq!(
         BookSizes {
             retired: 0,
+            settled: 0,
             orchestrations: 0,
             panes: 0,
             ..sizes
         },
         BookSizes {
             retired: 0,
+            settled: 0,
             orchestrations: 0,
             attempts: 0,
             panes: 0,
@@ -1174,4 +1177,237 @@ async fn a_blocked_writer_never_holds_up_the_registry() {
     assert_eq!(registry.live_pane_agents().len(), 5);
     registry.shutdown_all();
     gate.open();
+}
+
+/// Greptile P2 on PR #2248: a stop that closes a freshly published pane
+/// before the spawn has returned must still close the pane's work. The spawn
+/// is held just after publication, the pane is closed there (what a
+/// concurrent `StopAgent` does once it can find the generation), and the
+/// pane's work must read closed — not opened with nothing left to close it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pane_closed_while_its_spawn_returns_closes_its_work() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let (reached, release) =
+        registry.pause_at_sync_for_test(crate::agent_pty::PAUSE_SPAWN_AFTER_PUBLISH);
+    let spawner = Arc::clone(&registry);
+    let spawn = tokio::task::spawn_blocking(move || {
+        spawner.spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "wj-race".to_string())],
+            ..SpawnOptions::default()
+        })
+    });
+    reached
+        .recv_timeout(Duration::from_secs(20))
+        .expect("the spawn reached its post-publication window");
+    // A stop's close step, run while the spawn has not returned yet.
+    registry.work().pane_closed("wj-race");
+    release.send(()).unwrap();
+    let agent = spawn.await.unwrap().expect("spawn");
+    let work = registry
+        .attest_facts(&agent)
+        .and_then(|facts| facts.work)
+        .expect("the work is pinned on the generation");
+    let read = lines(registry.work(), state.path());
+    let kinds = kinds_of(&read, &work);
+    assert!(
+        kinds.contains(&"closed"),
+        "a pane closed during its spawn left its work open: {kinds:?}"
+    );
+    assert_eq!(kinds[..2], ["opened", "attempt_started"]);
+    registry.shutdown_all();
+}
+
+/// Qodo finding 3 on PR #2248: a report of a superseded task that has been
+/// evicted from the retired ring (many newer tasks went to the same pane
+/// since) is still written on that task's work and closes it, and the
+/// task-to-work association stays bounded.
+#[test]
+fn a_late_report_of_a_task_evicted_from_the_retired_ring_still_finds_its_work() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = delegation_fixture(state.path());
+    for n in 0..(MAX_RETIRED_TASKS + 100) {
+        tracker.delegated(Some("orch-1"), &format!("m-{n}"), "coder", "o-2", "2");
+    }
+    let sizes = tracker.book_sizes();
+    assert!(sizes.retired <= MAX_RETIRED_TASKS);
+    assert!(sizes.settled > 0, "nothing was evicted from the ring");
+    tracker.reported(&Reported {
+        report_id: "r-5",
+        about: ReportAbout::Task("m-5"),
+        destination: Destination::Inbox,
+    });
+    let read = lines(&tracker, state.path());
+    let work = task_work(&read, "m-5").expect("m-5's opened is written");
+    assert_eq!(
+        kinds_of(&read, &work),
+        ["opened", "attempt_started", "reported", "closed"]
+    );
+    assert_eq!(tracker.book_sizes().settled, sizes.settled - 1);
+
+    // The association is bounded: the oldest settled tasks go first.
+    for n in 0..(MAX_SETTLED_TASKS + 10) {
+        tracker.delegated(Some("orch-1"), &format!("n-{n}"), "coder", "o-2", "2");
+    }
+    assert!(tracker.book_sizes().settled <= MAX_SETTLED_TASKS);
+}
+
+/// Greptile P2 on PR #2248: a dispatched orchestration whose first role came
+/// up (writing the orchestration's `opened` with the dispatch as parent) and
+/// whose later role failed. The rollback closes the orchestration, and the
+/// failed dispatch keeps its own `opened` — so the child's parent can be
+/// found — and closes. A dispatch that started nothing still leaves nothing.
+#[test]
+fn a_failed_dispatch_whose_orchestration_started_keeps_and_closes_its_work() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let work = tracker
+        .dispatch_minted(None, "agent/dispatch-team", Path::new("/tmp/team"))
+        .unwrap();
+    let orch = tracker
+        .resolve_spawn(
+            Some(&work),
+            Some("o-1"),
+            Some(&orchestration("orch-d", "orchestrator")),
+            None,
+        )
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&orch, "1", Some("o-1"), Some("orchestrator"));
+    // The second role fails: the rollback stops the first and the
+    // orchestration ends, before any unit was registered.
+    tracker.attempt_ended("1", worker_end());
+    tracker.orchestration_ended("orch-d");
+    tracker.launch_failed(&work, Some(CloseHow::UnitEnded));
+    let read = lines(&tracker, state.path());
+    assert_eq!(kinds_of(&read, &work), ["opened", "closed"]);
+    let parent = read.iter().find_map(|l| match &l.event {
+        Event::Opened {
+            work: w, parent, ..
+        } if w == &orch => Some(parent.clone()),
+        _ => None,
+    });
+    assert_eq!(parent, Some(Some(work.clone())));
+    assert!(read.iter().any(|l| matches!(
+        &l.event,
+        Event::Closed { work: w, how: CloseHow::UnitEnded } if w == &work
+    )));
+    assert_eq!(tracker.book_sizes().launches, 0);
+    assert_eq!(tracker.book_sizes().pending_units, 0);
+
+    // Nothing started: nothing written.
+    let quiet = tracker
+        .dispatch_minted(None, "agent/dispatch-quiet", Path::new("/tmp/quiet"))
+        .unwrap();
+    tracker.launch_failed(&quiet, Some(CloseHow::UnitEnded));
+    assert!(kinds_of(&lines(&tracker, state.path()), &quiet).is_empty());
+}
+
+fn issue_launch(tracker: &WorkTracker, fire: Option<&WorkId>) -> WorkId {
+    tracker
+        .hold_launch(
+            Launch::IssueDispatch,
+            fire,
+            Refs {
+                issue: Some(7),
+                ..Refs::default()
+            },
+            Path::new("/home/someone/code/x-issue-7"),
+        )
+        .unwrap()
+}
+
+/// Qodo finding 6 on PR #2248: a scheduled issue dispatch's work is held
+/// until its spawn settles. A spawn that fails having started nothing leaves
+/// no work; a single-agent one closes with its pane (`pane_closed`); an
+/// orchestration-shaped one closes when its orchestration ends
+/// (`orchestration_ended`); and the book returns to where it was.
+#[test]
+fn a_scheduled_issue_dispatch_closes_with_what_it_started_or_leaves_nothing() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let fire = tracker.open(Launch::ScheduleFire, None, Refs::default(), None);
+    let baseline = tracker.book_sizes();
+
+    // The spawn fails before anything starts.
+    let failed = issue_launch(&tracker, fire.as_ref());
+    tracker.launch_failed(&failed, None);
+    assert!(kinds_of(&lines(&tracker, state.path()), &failed).is_empty());
+    assert_eq!(tracker.book_sizes(), baseline);
+
+    // A single agent: its pane is an attempt of the issue's work.
+    let single = issue_launch(&tracker, fire.as_ref());
+    let served = tracker
+        .resolve_spawn(Some(&single), Some("i-1"), None, None)
+        .kept()
+        .unwrap();
+    assert_eq!(served, single);
+    tracker.attempt_started(&single, "1", Some("i-1"), None);
+    tracker.flush_open(&single);
+    tracker.issue_launched(&single);
+    assert_eq!(
+        kinds_of(&lines(&tracker, state.path()), &single),
+        ["opened", "attempt_started"],
+        "open while its pane is"
+    );
+    tracker.attempt_ended("1", worker_end());
+    tracker.pane_closed("i-1");
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        kinds_of(&read, &single),
+        ["opened", "attempt_started", "attempt_ended", "closed"]
+    );
+    assert!(read.iter().any(|l| matches!(
+        &l.event,
+        Event::Closed { work, how: CloseHow::PaneClosed } if work == &single
+    )));
+
+    // An orchestration: its work is the issue's child, and the issue's work
+    // closes when it ends.
+    let team = issue_launch(&tracker, fire.as_ref());
+    let orch = tracker
+        .resolve_spawn(
+            Some(&team),
+            Some("io-1"),
+            Some(&orchestration("orch-issue", "orchestrator")),
+            None,
+        )
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&orch, "2", Some("io-1"), Some("orchestrator"));
+    tracker.flush_open(&team);
+    tracker.issue_launched(&team);
+    assert_eq!(kinds_of(&lines(&tracker, state.path()), &team), ["opened"]);
+    tracker.attempt_ended("2", worker_end());
+    tracker.orchestration_ended("orch-issue");
+    let read = lines(&tracker, state.path());
+    assert_eq!(kinds_of(&read, &team), ["opened", "closed"]);
+    assert!(read.iter().any(|l| matches!(
+        &l.event,
+        Event::Closed { work, how: CloseHow::OrchestrationEnded } if work == &team
+    )));
+    let sizes = tracker.book_sizes();
+    assert_eq!((sizes.launches, sizes.close_with_child), (0, 0));
+
+    // An orchestration-shaped spawn whose later role failed: the issue's
+    // work keeps its `opened` and closes with the orchestration it started.
+    let broken = issue_launch(&tracker, fire.as_ref());
+    let orch = tracker
+        .resolve_spawn(
+            Some(&broken),
+            Some("ib-1"),
+            Some(&orchestration("orch-broken", "orchestrator")),
+            None,
+        )
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&orch, "3", Some("ib-1"), Some("orchestrator"));
+    tracker.attempt_ended("3", worker_end());
+    tracker.orchestration_ended("orch-broken");
+    tracker.launch_failed(&broken, None);
+    let read = lines(&tracker, state.path());
+    assert_eq!(kinds_of(&read, &broken), ["opened", "closed"]);
+    assert_eq!(tracker.book_sizes().launches, 0);
 }

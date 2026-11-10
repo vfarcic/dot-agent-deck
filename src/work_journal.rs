@@ -1523,6 +1523,8 @@ struct Writer {
     broken: bool,
     #[cfg(test)]
     gate: Option<Arc<WriterGate>>,
+    #[cfg(test)]
+    rotate_sync_fault: Option<Arc<AtomicU64>>,
     /// Released when the writer ends, after everything is written.
     _lock: File,
     /// Dropped last, so the handle's last drop can wait for the lock's release.
@@ -1614,14 +1616,31 @@ impl Writer {
     }
 
     /// Seal the current segment and start the next. On failure the current
-    /// one keeps taking lines.
+    /// one keeps taking lines: that includes a failed directory sync after
+    /// the new segment was created, since lines synced into a file whose
+    /// directory entry is not durable can vanish with it in a crash. The new,
+    /// empty file is removed then, so it neither blocks the next attempt nor
+    /// reads as the run's highest segment.
     fn rotate(&mut self) {
         let next = self.segment + 1;
         let name = segment_name_n(&self.run, next);
         match self.dir.create_new_owner_only(&name) {
             Ok(file) => {
-                if let Err(error) = self.dir.sync() {
-                    debug!(%error, "work journal: the directory sync after a rotation failed");
+                if let Err(error) = self.sync_for_rotation() {
+                    warn!(
+                        segment = %name,
+                        %error,
+                        "work journal: the directory sync after a rotation failed; the current segment keeps growing"
+                    );
+                    drop(file);
+                    if let Err(error) = self.dir.remove_file(&name) {
+                        warn!(
+                            segment = %name,
+                            %error,
+                            "work journal: the unsynced new segment could not be removed"
+                        );
+                    }
+                    return;
                 }
                 self.file = file;
                 self.segment = next;
@@ -1635,6 +1654,21 @@ impl Writer {
                 "work journal: could not start a new segment; the current one keeps growing"
             ),
         }
+    }
+}
+
+impl Writer {
+    /// The directory sync that makes a new segment's entry durable.
+    fn sync_for_rotation(&self) -> io::Result<()> {
+        #[cfg(test)]
+        if let Some(faults) = &self.rotate_sync_fault
+            && faults
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok()
+        {
+            return Err(io::Error::other("injected rotation sync failure"));
+        }
+        self.dir.sync()
     }
 }
 
@@ -1684,6 +1718,12 @@ pub(crate) struct TestHooks {
     /// While set, compaction's probe for a free chunk name fails with this
     /// error kind.
     pub(crate) chunk_probe_fault: Option<io::ErrorKind>,
+    /// While above zero, each rotation's directory sync fails and takes one
+    /// off.
+    pub(crate) rotate_sync_fault: Option<Arc<AtomicU64>>,
+    /// Holds each recovery attempt, with the lock not yet taken, until it is
+    /// opened.
+    pub(crate) recovery_gate: Option<Arc<WriterGate>>,
 }
 
 #[cfg(test)]
@@ -1695,6 +1735,8 @@ impl std::fmt::Debug for TestHooks {
             .field("listing_omits", &self.listing_omits.is_some())
             .field("fail_recovery", &self.fail_recovery)
             .field("chunk_probe_fault", &self.chunk_probe_fault)
+            .field("rotate_sync_fault", &self.rotate_sync_fault)
+            .field("recovery_gate", &self.recovery_gate.is_some())
             .finish()
     }
 }
@@ -1926,6 +1968,8 @@ impl WorkJournal {
             broken: false,
             #[cfg(test)]
             gate: options.hooks.gate.clone(),
+            #[cfg(test)]
+            rotate_sync_fault: options.hooks.rotate_sync_fault.clone(),
             _lock: lock,
             _done: done,
         };
@@ -2295,6 +2339,23 @@ impl WorkJournal {
         }
     }
 
+    /// The daemon's startup recovery, off the caller's thread: as
+    /// [`Self::start_recovery`], except that its first attempt also runs on
+    /// the background thread, so a startup on an async path does not wait for
+    /// a scan of the journal (only when that thread cannot be started does
+    /// the first attempt run in place). Compaction still waits for it: the phase is
+    /// pending from this call until that first attempt has run.
+    pub fn start_recovery_in_background(&self) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.set_phase(RecoveryPhase::Pending);
+        if !self.spawn_recovery_thread(Duration::ZERO, false) {
+            // No thread: recovery runs here rather than not at all.
+            let _ = self.start_recovery();
+        }
+    }
+
     /// One attempt at the startup recovery the phase still owes: `None` when
     /// it owes none (done, or never asked for). Moves the phase.
     fn recovery_step(&self) -> Option<RecoveryReport> {
@@ -2308,6 +2369,10 @@ impl WorkJournal {
             RecoveryPhase::Done | RecoveryPhase::NotRequested
         ) {
             return None;
+        }
+        #[cfg(test)]
+        if let Some(gate) = &self.shared.hooks.recovery_gate {
+            gate.pass();
         }
         let report = self.recover();
         if report.completed() {
@@ -2324,11 +2389,22 @@ impl WorkJournal {
     /// complete. The thread holds the journal weakly, so it ends when the
     /// journal is dropped.
     fn spawn_recovery_retries(&self, busy: bool) {
+        if !self.spawn_recovery_thread(self.shared.recovery_retry, !busy) {
+            warn!(
+                "work journal: cannot retry recovery in the background; it is retried after compaction"
+            );
+        }
+    }
+
+    /// The recovery thread: waits `first`, then takes recovery steps until
+    /// one completes, with [`Self::spawn_recovery_retries`]'s waits. False
+    /// when the thread could not be started.
+    fn spawn_recovery_thread(&self, first: Duration, backoff: bool) -> bool {
         let shared = Arc::downgrade(&self.shared);
         let base = self.shared.recovery_retry;
         let max = self.shared.recovery_backoff_max.max(base);
-        let mut wait = base;
-        let mut backoff = !busy;
+        let mut wait = first;
+        let mut backoff = backoff;
         let spawned = std::thread::Builder::new()
             .name("work-journal-recovery".to_string())
             .spawn(move || {
@@ -2357,11 +2433,12 @@ impl WorkJournal {
                     }
                 }
             });
-        if let Err(error) = spawned {
-            warn!(
-                %error,
-                "work journal: cannot retry recovery in the background; it is retried after compaction"
-            );
+        match spawned {
+            Ok(_) => true,
+            Err(error) => {
+                warn!(%error, "work journal: cannot start the recovery thread");
+                false
+            }
         }
     }
 
@@ -2594,7 +2671,7 @@ impl WorkJournal {
 
         // Pass 1: the index.
         let budget = self.shared.budgets.compaction;
-        let mut index = Index::new(budget.entries);
+        let mut index = Index::new(budget.entries, &live);
         let mut candidates: Vec<Candidate> = Vec::new();
         for file in &listing.files {
             let opened = match open_file(dir, &file.name) {
@@ -2869,12 +2946,22 @@ struct WorkFacts {
     pinned: bool,
     /// The candidate files holding its lines, each once.
     files: Vec<u32>,
+    /// It was `closed`.
+    closed: bool,
+    /// Its `opened` names it a delegation, which never gets a new attempt.
+    delegation: bool,
+    /// A live run started an attempt of it: that run may still serve it (an
+    /// exited pane keeps its work until it closes, and a restart of it is a
+    /// new attempt of the same work).
+    live_attempt: bool,
 }
 
 /// Compaction's first pass: what the journal says about every work, bounded
 /// by `limit` entries, holding no line.
-struct Index {
+struct Index<'a> {
     works: Vec<WorkFacts>,
+    /// The runs whose lock is held.
+    live: &'a HashSet<String>,
     by_id: HashMap<WorkId, u32>,
     attempts: HashMap<AttemptId, u32>,
     /// Attempt -> the work whose `attempt_ended` line ended it.
@@ -2885,10 +2972,11 @@ struct Index {
     full: bool,
 }
 
-impl Index {
-    fn new(limit: usize) -> Self {
+impl<'a> Index<'a> {
+    fn new(limit: usize, live: &'a HashSet<String>) -> Self {
         Index {
             works: Vec::new(),
+            live,
             by_id: HashMap::new(),
             attempts: HashMap::new(),
             ender: Vec::new(),
@@ -2923,6 +3011,9 @@ impl Index {
             started: Vec::new(),
             pinned: false,
             files: Vec::new(),
+            closed: false,
+            delegation: false,
+            live_attempt: false,
         });
         self.by_id.insert(id.clone(), w);
         Some(w)
@@ -2961,17 +3052,22 @@ impl Index {
             }
         }
         match &line.event {
-            Event::Opened {
-                parent: Some(parent),
-                ..
-            } => {
-                if self.works[w as usize].parent.is_none()
+            Event::Opened { parent, launch, .. } => {
+                if *launch == Launch::Delegation {
+                    self.works[w as usize].delegation = true;
+                }
+                if let Some(parent) = parent
+                    && self.works[w as usize].parent.is_none()
                     && let Some(p) = self.work(parent)
                 {
                     self.works[w as usize].parent = Some(p);
                 }
             }
+            Event::Closed { .. } => self.works[w as usize].closed = true,
             Event::AttemptStarted { attempt, .. } => {
+                if self.live.contains(&line.run) {
+                    self.works[w as usize].live_attempt = true;
+                }
                 if let Some(a) = self.attempt(attempt)
                     && !self.works[w as usize].started.contains(&a)
                     && self.room(1)
@@ -2995,7 +3091,11 @@ impl Index {
     /// ended — whether or not they were `closed`: a pane work whose daemon
     /// went away is never closed, but recovery ends its attempt, and it must
     /// not be kept forever) older than the age limit or beyond the count
-    /// limit, less those a kept work needs ([`Self::protect`]).
+    /// limit, less those a kept work needs ([`Self::protect`]). A work a
+    /// live run started an attempt of and has not closed is not finished,
+    /// unless it is a delegation: the run may still serve it (an exited
+    /// pane can be restarted into its work), and it becomes finished once
+    /// that run closes it or is gone.
     fn eligible(&self, now_ms: u64, retention: Retention) -> Vec<u32> {
         let max_age_ms = u64::try_from(retention.max_age.as_millis()).unwrap_or(u64::MAX);
         let cutoff = now_ms.saturating_sub(max_age_ms);
@@ -3006,6 +3106,7 @@ impl Index {
                 !f.pinned
                     && !f.files.is_empty()
                     && f.started.iter().all(|a| self.ender[*a as usize].is_some())
+                    && (f.closed || f.delegation || !f.live_attempt)
             })
             .collect();
         // Newest first, to rank them.

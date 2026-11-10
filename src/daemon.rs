@@ -768,20 +768,23 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
             std::sync::Arc::clone(&hub),
             retained,
         ));
-        // PRD #1889: this run's work journal, before anything can spawn: the
-        // previous runs' open attempts are marked interrupted now, while no
-        // agent is live, and compaction runs off the startup path and hourly.
-        // A journal that cannot open is logged and records nothing; the daemon
-        // runs on.
+        // PRD #1889: this run's work journal, before anything can spawn. The
+        // previous runs' open attempts are marked interrupted by recovery,
+        // and compaction runs off the startup path and hourly. A journal that
+        // cannot open is logged and records nothing; the daemon runs on.
         let journal = crate::work_journal::WorkJournal::open(
             &retained_dir,
             crate::daemon_protocol::daemon_instance_id(),
             &journal_deck,
         );
-        // Recovery runs now when the journal's maintenance lock is free, and
-        // in the background as soon as it is when another daemon holds it;
-        // compaction waits for it either way.
-        let _ = journal.start_recovery();
+        // Recovery reads every earlier run's files, so it runs on its own
+        // thread, not on this async startup path (in place only when that
+        // thread cannot be started): at once when the
+        // journal's maintenance lock is free, and as soon as it is when
+        // another daemon holds it. It touches only dead runs' attempts, so
+        // agents this run starts meanwhile are not its business; compaction
+        // waits for it either way.
+        journal.start_recovery_in_background();
         drop(crate::work_tracking::spawn_compaction(journal.clone()));
         pty_registry.work().install(journal);
         pty_registry.install_inbox(hub);

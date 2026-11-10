@@ -2132,3 +2132,50 @@ async fn work_done_050_a_report_out_of_hand_overs_survives_a_close_and_a_late_ac
         "the row outlives the close"
     );
 }
+
+/// Qodo finding 2 on PR #2248 (PRD #1889): a note whose save task stops after
+/// staging is committed by the supervisor's settlement, and the work journal
+/// records that commit as `reported` on the producing generation's work, as
+/// the save task itself would have.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_the_supervisor_commits_is_reported_in_the_work_journal() {
+    use crate::work_journal::{Event, JournalOptions, WorkJournal, read_journal};
+    let deck = deck();
+    let journal_state = deck.root.path().join("journal-state");
+    std::fs::create_dir(&journal_state).unwrap();
+    deck.registry.work().install(
+        WorkJournal::try_open_with(
+            &journal_state,
+            "run1",
+            &crate::deck_identity::DeckId::generate(),
+            JournalOptions::default(),
+        )
+        .unwrap(),
+    );
+    let team = team_on(deck, "wjnote");
+    let producer_work = team
+        .registry()
+        .work()
+        .work_of_attempt(&team.worker)
+        .expect("the worker's attempt serves a work");
+    team.registry().inject_fault_for_test(
+        crate::task_completion::FAULT_STAGED,
+        TestFault::Panic("injected-wjnote"),
+    );
+    let note = reply(team.report(WorkDoneMode::Uncorrelated, "a note").await);
+    assert_eq!(note.disposition, WorkDoneDisposition::Uncorrelated);
+    let report_id = note.report_id.expect("the note was committed");
+    team.registry().work().journal().unwrap().flush();
+    let read = read_journal(&journal_state).unwrap();
+    let reported = read.lines.iter().find_map(|l| match &l.event {
+        Event::Reported {
+            work,
+            report_id: id,
+            to,
+            ..
+        } if *id == report_id => Some((work.clone(), to.clone())),
+        _ => None,
+    });
+    let (work, _to) = reported.expect("the recovered note is reported in the journal");
+    assert_eq!(work, producer_work);
+}

@@ -1062,9 +1062,11 @@ async fn dispatch_one_issue(
     // PRD #1889: the issue's work, a child of the fire's. A single-agent
     // dispatch's panes are its attempts; an orchestration-shaped one's panes
     // are attempts of the orchestration's work, which is a child of this one.
+    // Its `opened` is held until the spawn settles: a spawn that starts
+    // nothing leaves no work behind.
     let issue_work = {
         let work = registry.work();
-        work.open(
+        work.hold_launch(
             crate::work_journal::Launch::IssueDispatch,
             fire_work,
             crate::work_journal::Refs {
@@ -1073,11 +1075,11 @@ async fn dispatch_one_issue(
                 branch: work.plain(&paths.branch),
                 ..crate::work_journal::Refs::default()
             },
-            Some(&paths.worktree_dir),
+            &paths.worktree_dir,
         )
     };
     let req = SpawnRequest {
-        work_id: issue_work,
+        work_id: issue_work.clone(),
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
@@ -1093,7 +1095,17 @@ async fn dispatch_one_issue(
         // PRD #1666 S5: labelled as the session's starting prompt.
         seed_reason: Some("seed".to_string()),
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
+    let spawned = spawn(req, registry, notifier, event_tx, true, state).await;
+    // PRD #1889: a spawned issue's work closes with its pane or its
+    // orchestration; a failed one is forgotten, or closed when something it
+    // started was already written.
+    if let Some(work) = &issue_work {
+        match &spawned {
+            Ok(_) => registry.work().issue_launched(work),
+            Err(_) => registry.work().launch_failed(work, None),
+        }
+    }
+    if let Err(e) = spawned {
         return settle_failed_issue_spawn(
             e,
             worktrees,

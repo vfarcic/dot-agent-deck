@@ -4675,8 +4675,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// Issue #1981 M6: the open runs not yet named list their generations,
-    /// and a run named after its dispatched unit carries that name exactly.
     /// PRD #1889: a run's `agent.run` span carries the work its attempt
     /// serves as `deck.work.id`, and a run with none carries no attribute.
     #[test]
@@ -4695,6 +4693,8 @@ pub(crate) mod tests {
         assert_eq!(attr(run_span_on(&spans, "p2"), AttrKey::WorkId), None);
     }
 
+    /// Issue #1981 M6: the open runs not yet named list their generations,
+    /// and a run named after its dispatched unit carries that name exactly.
     #[test]
     fn a_dispatched_run_carries_its_units_name() {
         let mut tracker = RunTracker::new();

@@ -590,7 +590,16 @@ async fn supervise(
     let mode = claimed.mode.clone();
     let report_id = ctx.spec.report_id.clone();
     let message_id = claimed.message_id.clone();
-    let recipient_pane = claimed.recipient.as_ref().map(|to| to.pane_id.clone());
+    // Who wrote the report and who it went to: the supervisor's settlement
+    // records a note it commits against these, as the save task would have.
+    let parties = Parties {
+        recipient_pane: claimed.recipient.as_ref().map(|to| to.pane_id.clone()),
+        producer_agent: ctx.worker_agent.clone(),
+        recipient_agent: claimed
+            .recipient
+            .as_ref()
+            .and_then(|to| to.agent_id.clone()),
+    };
     let unit_id = match &claimed.mode {
         ClaimMode::Terminal { unit_id, .. } => Some(unit_id.clone()),
         _ => None,
@@ -623,7 +632,7 @@ async fn supervise(
             &mode,
             &report_id,
             &message_id,
-            recipient_pane.as_deref(),
+            &parties,
             unit_id.as_deref(),
         )
         .await;
@@ -648,6 +657,16 @@ async fn supervise(
     from_supervisor.await.unwrap_or(Completion::Unconfirmed)
 }
 
+/// A report's producer and recipient, captured before the save task takes
+/// its context, for the supervisor's settlement.
+struct Parties {
+    recipient_pane: Option<String>,
+    /// The generation that wrote the report.
+    producer_agent: String,
+    /// The recipient's generation, when the report is bound to one.
+    recipient_agent: Option<String>,
+}
+
 /// The supervisor's settlement of a save task that ended without a result
 /// (D12 rule 11): its answer, and what the settlement owes once that answer
 /// is handed over. A `None` answer answers nothing: the connection reads
@@ -658,9 +677,10 @@ async fn recover(
     mode: &ClaimMode,
     report_id: &str,
     message_id: &str,
-    recipient_pane: Option<&str>,
+    parties: &Parties,
     unit_id: Option<&str>,
 ) -> (Option<Completion>, Option<AfterSection>) {
+    let recipient_pane = parties.recipient_pane.as_deref();
     let file = format!("r-{report_id}.md");
     let phase = match registry.inbox().claim_phase(claim_id) {
         Ok(phase) => phase,
@@ -708,7 +728,13 @@ async fn recover(
                 let _ = registry.inbox().note_claim_marked(claim_id, mark);
             }
             let (outcome, after) = registry.commit_claim(claim_id, unit_id.is_some());
-            journal_report(registry, &outcome, mode, None, None);
+            journal_report(
+                registry,
+                &outcome,
+                mode,
+                Some(&parties.producer_agent),
+                parties.recipient_agent.as_deref(),
+            );
             (committed(outcome, mode), after)
         }
         Some(ClaimPhase::Applying) => {

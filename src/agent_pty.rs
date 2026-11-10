@@ -8650,6 +8650,11 @@ pub(crate) const FAULT_RESPAWN_BEFORE_PUBLISH_SECTION: &str = "respawn-before-pu
 /// published and before it returns ((f2')'s seam).
 pub(crate) const FAULT_SPAWN_AFTER_INSERT: &str = "spawn-after-insert";
 
+/// PRD #1889: a spawn's pause point after its record is published and the
+/// registry lock released ([`AgentPtyRegistry::pause_at_sync_for_test`]), the
+/// window in which a concurrent stop can close the new generation's pane.
+pub(crate) const PAUSE_SPAWN_AFTER_PUBLISH: &str = "spawn-after-publish";
+
 /// PRD #1666 part 3, round 5: a spawn's fault point after its fork and before
 /// its record is published, with its reservation armed (`/057` (c)).
 pub(crate) const FAULT_SPAWN_BEFORE_PUBLISH: &str = "spawn-before-publish";
@@ -15126,6 +15131,18 @@ impl AgentPtyRegistry {
         // PRD #1741: under the lock that published the agent, so its reader's
         // EOF, which checks registration under it, is ordered after this.
         crate::telemetry::commit_spawn(telemetry_run);
+        // PRD #1889: the generation is published, so its attempt starts (and
+        // the work it serves opens, when this spawn minted it) — under the
+        // lock that publishes it, so a stop, which can only find the
+        // generation once it is published, closes the pane's work after its
+        // start is booked rather than before (a close that ran first would
+        // find nothing to close, and the late start would leave the work
+        // open). `attempt_started` takes only the work book's leaf mutex and
+        // queues its events: no file I/O under this lock.
+        if let Some(work) = &work {
+            self.work
+                .attempt_started(work, &id, journal_pane.as_deref(), journal_role.as_deref());
+        }
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.
@@ -15134,12 +15151,9 @@ impl AgentPtyRegistry {
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
-        // PRD #1889: the generation is published, so its attempt starts (and
-        // the work it serves opens, when this spawn minted it).
-        if let Some(work) = &work {
-            self.work
-                .attempt_started(work, &id, journal_pane.as_deref(), journal_role.as_deref());
-        }
+        // PRD #1889 test seam: the window, after publication, in which a
+        // concurrent stop can close the pane.
+        self.pause_point_sync(PAUSE_SPAWN_AFTER_PUBLISH);
         // PRD #1666 part 3 (Q35-14b): an installed generation's observer,
         // started with the registry lock released.
         #[cfg(target_os = "linux")]

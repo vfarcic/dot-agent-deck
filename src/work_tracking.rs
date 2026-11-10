@@ -26,7 +26,9 @@
 //! [`WorkJournal::record`] only queues the event for the journal's writer
 //! thread, and the filesystem reads a workspace needs are made before the
 //! mutex is taken. The book's mutex is a leaf; call these with no registry,
-//! hub or other ranked lock held.
+//! hub or other ranked lock held — except [`WorkTracker::attempt_started`],
+//! which the spawn calls under the registry lock that publishes the
+//! generation, so a stop of it is ordered after its start.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::Path;
@@ -50,6 +52,12 @@ const MAX_EARLY_ENDS: usize = 64;
 /// [`WorkTracker::delegate_refused`]) is still to come and takes it, so those
 /// are bounded by the posts in flight, not by this cap.
 const MAX_RETIRED_TASKS: usize = 64;
+
+/// Settled tasks evicted from the retired ring, remembered as task id -> its
+/// work and its orchestration's work only, so a report of a superseded or
+/// abandoned task that arrives after many newer ones still finds its work.
+/// Bounded: the oldest goes first.
+const MAX_SETTLED_TASKS: usize = 4096;
 
 /// How a generation's end reads in the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,6 +118,25 @@ struct Delegation {
     held: Vec<Event>,
 }
 
+/// What the book knows of a launch whose spawn has not settled.
+#[derive(Default)]
+struct HeldLaunch {
+    /// Something of it is in the journal: its `opened`, an attempt of its
+    /// own (a single agent's pane), or a child whose `opened` names it (the
+    /// orchestration it started).
+    written: bool,
+    /// It was closed (its unit ended during the spawn).
+    closed: bool,
+    /// How it closes when its spawn fails after something was written: with
+    /// its own pane, or with the orchestration it started.
+    close_as: Option<CloseHow>,
+    /// The orchestration's work it started, once that was opened.
+    child: Option<WorkId>,
+    /// Its `opened` waits for a unit id (a dispatch): it is not written by
+    /// the first thing published under it, but once the unit is registered.
+    awaits_unit: bool,
+}
+
 struct UnitWork {
     work: WorkId,
     caller: Option<WorkId>,
@@ -135,10 +162,21 @@ struct Book {
     early_ends: HashMap<String, AttemptEnd>,
     /// A dispatch's `opened`, held until its unit is registered.
     pending_units: HashMap<WorkId, Event>,
+    /// Launches (a dispatch, a scheduled issue dispatch) whose spawn has not
+    /// settled yet ([`WorkTracker::hold_launch`]).
+    launches: HashMap<WorkId, HeldLaunch>,
+    /// An orchestration's work -> the launch work that closes when it ends
+    /// (a scheduled issue dispatch whose unit is an orchestration).
+    close_with_child: HashMap<WorkId, WorkId>,
     /// Delegated task id -> its work.
     tasks: HashMap<String, Delegation>,
     /// Tasks retired without a report, newest last (see [`MAX_RETIRED_TASKS`]).
     retired: VecDeque<(String, Delegation)>,
+    /// Settled tasks evicted from `retired`: task id -> (its work, its
+    /// orchestration's work), see [`MAX_SETTLED_TASKS`]; `settled_order` is
+    /// their ids, oldest first.
+    settled: HashMap<String, (WorkId, Option<WorkId>)>,
+    settled_order: VecDeque<String>,
     /// Spawns in flight (a [`SpawnWork`] not yet dropped) per work whose
     /// `opened` is still pending, so a failed spawn forgets a minted work only
     /// when no other spawn of it is still on its way.
@@ -171,8 +209,35 @@ impl Book {
             else {
                 break;
             };
-            self.retired.remove(at);
+            if let Some((id, task)) = self.retired.remove(at) {
+                self.settle(id, task.work, task.orchestration);
+            }
         }
+    }
+
+    /// Remember settled task `id`'s work past the retired ring.
+    fn settle(&mut self, id: String, work: WorkId, orchestration: Option<WorkId>) {
+        if self
+            .settled
+            .insert(id.clone(), (work, orchestration))
+            .is_none()
+        {
+            self.settled_order.push_back(id);
+        }
+        while self.settled_order.len() > MAX_SETTLED_TASKS {
+            if let Some(oldest) = self.settled_order.pop_front() {
+                self.settled.remove(&oldest);
+            }
+        }
+    }
+
+    /// Take settled task `task_id`'s work and its orchestration's.
+    fn take_settled(&mut self, task_id: &str) -> Option<(WorkId, Option<WorkId>)> {
+        let found = self.settled.remove(task_id)?;
+        if let Some(at) = self.settled_order.iter().position(|id| id == task_id) {
+            self.settled_order.remove(at);
+        }
+        Some(found)
     }
 
     /// Task `task_id`, live or retired.
@@ -207,8 +272,11 @@ pub(crate) struct BookSizes {
     pub panes: usize,
     pub early_ends: usize,
     pub pending_units: usize,
+    pub launches: usize,
+    pub close_with_child: usize,
     pub tasks: usize,
     pub retired: usize,
+    pub settled: usize,
     pub units: usize,
     pub spawning: usize,
 }
@@ -477,8 +545,11 @@ impl WorkTracker {
             panes: book.panes.len(),
             early_ends: book.early_ends.len(),
             pending_units: book.pending_units.len(),
+            launches: book.launches.len(),
+            close_with_child: book.close_with_child.len(),
             tasks: book.tasks.len(),
             retired: book.retired.len(),
+            settled: book.settled.len(),
             units: book.units.len(),
             spawning: book.spawning.len(),
         }
@@ -520,9 +591,36 @@ impl WorkTracker {
         };
         // Under the book's lock, so the end of this attempt (taken under the
         // same lock) is written after its start.
-        let mut book = self.book();
+        let mut guard = self.book();
+        let book = &mut *guard;
         if let Some(opened) = book.pending_open.remove(work) {
+            if let Event::Opened {
+                parent: Some(parent),
+                ..
+            } = &opened
+                && let Some(launch) = book.launches.get_mut(parent)
+            {
+                launch.written = true;
+                launch.close_as.get_or_insert(CloseHow::OrchestrationEnded);
+                launch.child = Some(work.clone());
+                // The parent's `opened` before the child's that names it,
+                // unless it waits for its unit id.
+                if !launch.awaits_unit
+                    && let Some(parent_opened) = book.pending_units.remove(parent)
+                {
+                    journal.record(parent_opened);
+                }
+            }
             journal.record(opened);
+        }
+        if let Some(launch) = book.launches.get_mut(work) {
+            launch.written = true;
+            launch.close_as.get_or_insert(CloseHow::PaneClosed);
+            if !launch.awaits_unit
+                && let Some(opened) = book.pending_units.remove(work)
+            {
+                journal.record(opened);
+            }
         }
         if let Some(pane) = pane {
             book.panes.insert(pane.to_string(), work.clone());
@@ -617,6 +715,9 @@ impl WorkTracker {
     /// Write `closed` for `work`.
     pub fn close(&self, work: &WorkId, how: CloseHow) {
         if let Some(journal) = self.journal() {
+            if let Some(launch) = self.book().launches.get_mut(work) {
+                launch.closed = true;
+            }
             journal.record(Event::Closed {
                 work: work.clone(),
                 how,
@@ -716,7 +817,10 @@ impl WorkTracker {
     /// Task `task_id`'s delegate was refused: forget its work, live or
     /// already retired. Nothing of it was written.
     pub fn delegate_refused(&self, task_id: &str) {
-        self.book().take_task(task_id);
+        let mut book = self.book();
+        if book.take_task(task_id).is_none() {
+            book.take_settled(task_id);
+        }
     }
 
     /// A delegate was posted, in one step: [`Self::delegate_pending`] then
@@ -759,23 +863,31 @@ impl WorkTracker {
                 // Under the book's lock, so a `delegate_posted` racing this
                 // report cannot write the held events after the report.
                 let mut book = self.book();
-                let Some(task) = book.take_task(task_id) else {
-                    return;
+                let (work, orchestration) = match book.take_task(task_id) {
+                    Some(task) => {
+                        for event in task.held {
+                            journal.record(event);
+                        }
+                        (task.work, task.orchestration)
+                    }
+                    // Settled long enough ago to have left the retired ring:
+                    // its events were written when its post went in.
+                    None => match book.take_settled(task_id) {
+                        Some(found) => found,
+                        None => return,
+                    },
                 };
-                for event in task.held {
-                    journal.record(event);
-                }
                 drop(book);
                 journal.record(Event::Reported {
-                    work: task.work.clone(),
+                    work: work.clone(),
                     report_id,
                     task_id: journal.plain(task_id),
                     unit_id: None,
                     destination,
-                    to: task.orchestration,
+                    to: orchestration,
                 });
                 journal.record(Event::Closed {
-                    work: task.work,
+                    work,
                     how: CloseHow::TaskDone,
                 });
             }
@@ -835,25 +947,11 @@ impl WorkTracker {
         branch: &str,
         workspace: &Path,
     ) -> Option<WorkId> {
-        let journal = self.journal()?;
-        let work = journal.mint_work_id()?;
         let refs = Refs {
-            branch: journal.plain(branch),
+            branch: self.plain(branch),
             ..Refs::default()
         };
-        // Resolved before the book's lock: it reads the filesystem.
-        let workspace = journal.workspace(workspace);
-        self.book().pending_units.insert(
-            work.clone(),
-            Event::Opened {
-                work: work.clone(),
-                launch: Launch::Dispatch,
-                parent: parent.cloned(),
-                refs: Box::new(refs),
-                workspace,
-            },
-        );
-        Some(work)
+        self.hold_launch(Launch::Dispatch, parent, refs, workspace)
     }
 
     /// The unit dispatched as `work` was registered as `unit_id`: its
@@ -899,6 +997,9 @@ impl WorkTracker {
             .or_else(|| book.pending_units.remove(work))
         {
             journal.record(opened);
+            if let Some(launch) = book.launches.get_mut(work) {
+                launch.written = true;
+            }
         }
     }
 
@@ -908,6 +1009,114 @@ impl WorkTracker {
         book.pending_open.remove(work);
         book.pending_units.remove(work);
         book.pane_works.remove(work);
+    }
+
+    /// Mint a launch's work — a `dispatch`, or a scheduled issue dispatch —
+    /// whose spawn is about to run, a child of `parent`. Its `opened` is held
+    /// until the spawn settles: written by the spawn once something of it is
+    /// published (or by [`Self::unit_registered`] and [`Self::flush_open`]
+    /// once a dispatch's unit id is known), by [`Self::launch_succeeded`] or
+    /// [`Self::issue_launched`] when the spawn returns, and forgotten by
+    /// [`Self::launch_failed`] when nothing of it was written.
+    pub fn hold_launch(
+        &self,
+        launch: Launch,
+        parent: Option<&WorkId>,
+        refs: Refs,
+        workspace: &Path,
+    ) -> Option<WorkId> {
+        let journal = self.journal()?;
+        let work = journal.mint_work_id()?;
+        // Resolved before the book's lock: it reads the filesystem.
+        let workspace = journal.workspace(workspace);
+        let mut book = self.book();
+        book.pending_units.insert(
+            work.clone(),
+            Event::Opened {
+                work: work.clone(),
+                launch,
+                parent: parent.cloned(),
+                refs: Box::new(refs),
+                workspace,
+            },
+        );
+        book.launches.insert(
+            work.clone(),
+            HeldLaunch {
+                awaits_unit: launch == Launch::Dispatch,
+                ..HeldLaunch::default()
+            },
+        );
+        Some(work)
+    }
+
+    /// Launch `work`'s spawn succeeded: its `opened` is written if it is
+    /// still held. Its end is its own (a dispatched unit's end).
+    pub fn launch_succeeded(&self, work: &WorkId) {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        let mut book = self.book();
+        Self::flush_locked(journal, &mut book, work);
+        book.launches.remove(work);
+    }
+
+    /// Scheduled issue dispatch `work`'s spawn succeeded: its `opened` is
+    /// written if it is still held, and it closes with what it started — a
+    /// single agent's pane (`pane_closed`, when that pane closes) or its
+    /// orchestration (`orchestration_ended`, when that orchestration ends);
+    /// when neither is still running, it closes now.
+    pub fn issue_launched(&self, work: &WorkId) {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        let mut book = self.book();
+        Self::flush_locked(journal, &mut book, work);
+        let launch = book.launches.remove(work).unwrap_or_default();
+        if book.panes.values().any(|served| served == work) {
+            book.pane_works.insert(work.clone(), CloseHow::PaneClosed);
+            return;
+        }
+        if let Some(child) = launch.child
+            && book.orchestrations.values().any(|o| *o == child)
+        {
+            book.close_with_child.insert(child, work.clone());
+            return;
+        }
+        if launch.closed {
+            return;
+        }
+        let how = launch.close_as.unwrap_or(CloseHow::PaneClosed);
+        drop(book);
+        self.close(work, how);
+    }
+
+    /// Launch `work`'s spawn failed. When nothing of it was written, it is
+    /// forgotten, as a launch that did not happen. When something was — an
+    /// attempt of its own, or the orchestration it started, whose `opened`
+    /// names it as parent, before a later step failed — its `opened` is
+    /// written, so the orchestration's parent can be found, and
+    /// it closes `how` (or as what it started ended, with `how` `None`),
+    /// unless it already closed.
+    pub fn launch_failed(&self, work: &WorkId, how: Option<CloseHow>) {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        let mut book = self.book();
+        let launch = book.launches.remove(work).unwrap_or_default();
+        if !launch.written {
+            drop(book);
+            self.forget(work);
+            return;
+        }
+        Self::flush_locked(journal, &mut book, work);
+        book.pane_works.remove(work);
+        if launch.closed {
+            return;
+        }
+        let how = how.or(launch.close_as).unwrap_or(CloseHow::PaneClosed);
+        drop(book);
+        self.close(work, how);
     }
 
     /// Orchestration instance `instance` lost its last role pane: its work
@@ -923,9 +1132,17 @@ impl WorkTracker {
         };
         // Opened only once an attempt of it was published; one that never
         // was leaves nothing to close.
+        let parent = book.close_with_child.remove(&work);
         if book.pending_open.remove(&work).is_none() {
             journal.record(Event::Closed {
                 work,
+                how: CloseHow::OrchestrationEnded,
+            });
+        }
+        // A scheduled issue dispatch whose unit was this orchestration.
+        if let Some(parent) = parent {
+            journal.record(Event::Closed {
+                work: parent,
                 how: CloseHow::OrchestrationEnded,
             });
         }
