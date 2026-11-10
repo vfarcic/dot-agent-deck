@@ -17944,6 +17944,11 @@ impl AgentPtyRegistry {
             );
             return released;
         }
+        // Issue #2099: the tasks this report is about, read before it is
+        // posted, so a task delegated meanwhile is not ended by it.
+        let stopped_tasks = self
+            .inbox()
+            .tasks_awaiting_report(worker_pane_id, worker_agent_id);
         // PRD #1666 S5: a daemon notice in the orchestrator generation's inbox.
         match crate::inbox_hub::post_notice_to_live(
             self,
@@ -17962,9 +17967,7 @@ impl AgentPtyRegistry {
                 // likely not complete, which ends the task's hand-off.
                 crate::telemetry::observe_worker_stopped(
                     self.telemetry(),
-                    &self
-                        .inbox()
-                        .open_tasks_of_generation(worker_pane_id, worker_agent_id),
+                    &stopped_tasks,
                     crate::telemetry::handoff::Stopped::Blocked,
                 );
             }

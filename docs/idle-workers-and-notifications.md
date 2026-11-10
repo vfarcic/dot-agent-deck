@@ -21,7 +21,7 @@ Each report waits in the orchestrator's inbox and reaches its conversation throu
 | `⚠ delegated worker exited without work-done` | The worker's agent exited before it reported. The report names the tasks it had not reported. | none |
 | `⚠ delegated worker never came up` | A `clear = true` worker restarted for a new task exited before it took the task, so the task was not delivered. | none |
 | `⚠ delegated worker respawn failed` | A `clear = true` worker could not be restarted at all, usually because the role's `command` fails, so the task was not delivered. | none |
-| `⚠ delegated worker blocked by a provider usage limit` | A worker that has not finished its task shows **Blocked**: its provider's usage limit or credits ran out. | none |
+| `⚠ delegated worker blocked by a provider usage limit` | A worker that has not finished its task shows **Blocked**: its provider's usage limit or credits ran out. | Sent only while [`worker_response_timeout_minutes`](#change-how-long-a-worker-may-take) is not `0`. |
 
 What each report means for the orchestrator's next step:
 

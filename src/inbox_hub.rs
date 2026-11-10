@@ -1609,11 +1609,16 @@ impl InboxHub {
             .unwrap_or_default()
     }
 
-    /// Issue #2099: the delegated tasks still open for generation
-    /// `(pane_id, agent_id)`, by id; empty when the report state is torn.
-    pub fn open_tasks_of_generation(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+    /// Issue #2099: the delegated tasks generation `(pane_id, agent_id)` still
+    /// owes a report for, by id — not one a report is being saved for; empty
+    /// when the report state is torn.
+    pub fn tasks_awaiting_report(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
         self.lock()
-            .guarded_read(|reports| reports.tasks.open_of_generation(pane_id, agent_id))
+            .guarded_read(|reports| {
+                reports
+                    .tasks
+                    .awaiting_report_of_generation(pane_id, agent_id)
+            })
             .unwrap_or_default()
     }
 

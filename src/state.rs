@@ -4699,6 +4699,12 @@ impl AppState {
         // still at its prompt (#1365 item 3), and for a turn that then ended
         // on an error: the wait it reported is over, the failure is news.
         let reopen_settled = matches!(kind, StopKind::WaitingOnDelegation | StopKind::Failed);
+        // A failure replaces a wait still pending for the same agent: that
+        // watch would report a wait, and the failure is what the orchestrator
+        // has to hear (PR #2239 review). Its cooldown is kept.
+        if kind == StopKind::Failed {
+            registry.cancel_waiting_notice(pane_id, live_agent_id);
+        }
         let Some(armed) = registry.arm_waiting_notice(
             pane_id,
             live_agent_id,
@@ -4938,6 +4944,15 @@ fn arm_waiting_notice_watch(
             registry.settle_waiting_notice(&worker_pane_id, seq, false);
             return;
         }
+        // Issue #2099: the tasks this report is about, read before it is
+        // posted, so a task delegated meanwhile is not ended by it.
+        let stopped_tasks = if failed {
+            registry
+                .inbox()
+                .tasks_awaiting_report(&worker_pane_id, &worker_agent_id)
+        } else {
+            Vec::new()
+        };
         let posted = crate::inbox_hub::post_notice_to_live(
             &registry,
             crate::inbox::Recipient::bound(&orchestrator_pane_id, &expected_agent_id),
@@ -4954,9 +4969,7 @@ fn arm_waiting_notice_watch(
         if failed && posted.is_ok() {
             crate::telemetry::observe_worker_stopped(
                 registry.telemetry(),
-                &registry
-                    .inbox()
-                    .open_tasks_of_generation(&worker_pane_id, &worker_agent_id),
+                &stopped_tasks,
                 crate::telemetry::handoff::Stopped::Failed,
             );
         }

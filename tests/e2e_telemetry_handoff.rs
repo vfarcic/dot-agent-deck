@@ -341,11 +341,19 @@ fn telemetry_otlp_047_failed_worker_ends_its_handoff_promptly() {
     let id = delegate(&deck, &orch, &worker);
     cli(&deck, &worker, &["inbox", "fetch", "--json"]);
     inbox::state(&deck, &worker, &id, "acknowledged");
-    // The worker's turn ends on a provider error that is not a quota block —
-    // a transient 429 Claude Code classifies `error` — and it sits at its
-    // prompt owing the task.
+    // The worker reports a wait, then, inside the debounce, its turn ends on
+    // a provider error that is not a quota block — a transient 429 Claude
+    // Code classifies `error` — and it sits at its prompt owing the task. The
+    // failure replaces the pending wait (PR #2239 review).
+    inbox::status(&deck, &worker, "waiting_for_input", "claude_code");
     inbox::status(&deck, &worker, "error", "claude_code");
-    route::notice(&deck, &orch, "delegated worker stopped on an error");
+    let notice = route::notice(&deck, &orch, "delegated worker stopped on an error");
+    assert!(
+        !notice
+            .to_string()
+            .contains("delegated worker is waiting for input"),
+        "the failure, not the earlier wait, is reported: {notice}"
+    );
     let handoff = one_handoff(&receiver, &id);
     assert!(
         receiver.run(&orch.id).is_none() && receiver.run(&worker.id).is_none(),
