@@ -431,13 +431,15 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 
 | Outcome | Exit status | Printed on stderr |
 |---|---|---|
-| Accepted for every named role | 0 | nothing; check the inbox badge for delivery. |
-| Accepted for some roles, not others | 0 | `Warning: …` naming the roles that were missed and why. Re-send only to those roles; repeating the whole command gives the accepted roles the task twice. |
+| Accepted for every named role | 0 | `Delegated …`, naming the pane each role's worker runs in and the task id the deck gave the task; check the inbox badge for delivery. |
+| Accepted for some roles, not others | 0 | `Warning: …` naming the roles that were missed and why, followed by the `Delegated …` line for the roles that were accepted. Re-send only to the missed roles; repeating the whole command gives the accepted roles the task twice. |
 | Accepted for no role | non-zero | `Error: delegate from pane … reached no worker for role(s): …`, or `… was NOT sent: every worker it reached still owes a work-done …` |
 | Refused: the caller is not the orchestrator | non-zero | `Error: delegate from pane … failed: pane … is the \`<role>\` role, not this orchestration's orchestrator, so it may not delegate.` |
 | Daemon not reachable | non-zero | `Error: could not reach the dot-agent-deck daemon socket, …` |
 
 A role "reaches no worker" when it is not in the file, when it is the orchestrator itself, when its pane was closed, or when it was renamed or added after the orchestration started.
+
+`delegate` always gives the task to a worker in the orchestrator's own orchestration, even when other orchestrations running on the deck have roles with the same names. The `Delegated …` line is how to check: its pane is the one `dot-agent-deck roles` lists in its PANE column, beside the worker's orchestration, and its task id is the one the worker's report names when it arrives as `<role> completed task <id>`. A deck older than this `dot-agent-deck` names no pane, and the command then prints nothing for a task accepted for every role.
 
 `work-done` answers once the deck has kept the report:
 

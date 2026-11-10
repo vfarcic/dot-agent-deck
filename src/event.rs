@@ -2789,6 +2789,33 @@ pub struct DelegateResponse {
     /// `dot-agent-deck inbox list`. Additive on the hook socket.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub message_ids: Vec<String>,
+    /// Issue #545: the worker pane each dispatched role resolved to, one entry
+    /// per pane in fan-out order, so `delegate` can tell the orchestrator which
+    /// worker received the task. Without it a delegate that reached the wrong
+    /// worker was as silent as one that reached the right one, and the
+    /// orchestrator found out only if the eventual report looked wrong.
+    ///
+    /// Additive on the hook socket like every field of this reply (that socket
+    /// is not versioned by [`crate::daemon_protocol::PROTOCOL_VERSION`]): an
+    /// older daemon never writes it, so the CLI prints no pane for it, and an
+    /// older CLI ignores the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_panes: Vec<DeliveredPane>,
+}
+
+/// Issue #545: one worker pane a delegate was dispatched to. See
+/// [`DelegateResponse::delivered_panes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredPane {
+    /// The `--to` role the pane is registered for.
+    pub role: String,
+    /// The pane's `DOT_AGENT_DECK_PANE_ID` — the id `daemon status` prints in
+    /// its PANE column and a worker's report names.
+    pub pane_id: String,
+    /// The inbox id of the task message posted to this pane, the same id
+    /// [`DelegateResponse::message_ids`] carries for it.
+    #[serde(default)]
+    pub message_id: String,
 }
 
 /// Issue #714: one delegate target whose worker appears blocked by a provider
@@ -2842,6 +2869,7 @@ impl Default for DelegateResponse {
             superseded: Vec::new(),
             blocked: Vec::new(),
             message_ids: Vec::new(),
+            delivered_panes: Vec::new(),
         }
     }
 }

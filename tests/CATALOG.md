@@ -4507,6 +4507,14 @@ without depending on the config struct API.
 - **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
 - **Platform coverage:** mac+linux (unix-only PTYs).
 
+##### orchestration/delegate/053 — With two tabs of one orchestration running in the same daemon and folder, each with a worker named `coder`, each orchestrator's real `delegate --to coder` names the pane and task id of its OWN coder, and the task reaches only that coder (issue #545).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`; the real binary's isolated daemon, both tabs started through the real `StartAgent` with distinct per-tab `orchestration_id`s and run titles, and the REAL `dot-agent-deck delegate` CLI run as each orchestrator's pane with its capability token).
+- **Agent:** none: the routing fixture's scripted stand-in (`tests/support/inbox_route.rs`), which runs the real `inbox fetch` on its doorbell. The question is what the deck routes and prints, not what an agent does with the task.
+- **Asserts:** for tab A then tab B: `delegate` exits 0; the task is posted to that tab's own coder and the other tab's coder holds no message with its id; stderr names the own coder's pane and task id inside the fenced `[UNTRUSTED-PANE-ID: … :END-UNTRUSTED-PANE-ID] as task <id>` form and never names the other coder's pane; the own coder fetches that task framed as from the orchestrator.
+- **Why it exists:** issue #545 reported a delegate from one of several concurrent orchestrations reaching another's worker, unnoticed because a successful `delegate` printed nothing. The routing half held on `main` at `364a3c54` (the inbox assertions passed); the output half was red there (`stderr=""`). The routing half stays as a guard against the reported mis-route.
+- **Does not assert:** a real agent reading the line (lane 2's `orchestration/route/001` drives real orchestrators through the same CLI); the cause of the cross-routing the issue observed, which this test could not reproduce; the `Delegated` wording beyond the fenced pane and task (`delegate_verdict` unit tests in `src/main.rs`); an older daemon, which names no pane (unit-tested there too).
+- **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in).
+
 #### orchestration/work-done
 
 ##### orchestration/work-done/001 — A `work-done` from a worker with NO outstanding delegation is reported to the orchestrator as unsolicited, and does not overwrite the last commissioned report (issue #448).
