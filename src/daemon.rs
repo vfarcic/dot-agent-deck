@@ -7886,7 +7886,10 @@ async fn run_hook_loop_with_limits(
                                 )
                             ) && presented
                                 .as_deref()
-                                .is_some_and(|token| pty_registry.hook_token_was_retired(token));
+                                .is_some_and(|token| {
+                                    pty_registry
+                                        .hook_token_was_retired(token, event.pane_id.as_deref())
+                                });
                             drop(presented);
                             match crate::hook_provenance::admits(
                                 &provenance,
@@ -14953,7 +14956,7 @@ mod hook_ingestion_tests {
         assert_agent_event_refused("thinking", "malformed", "enforce").await;
     }
 
-    /// Scenario: The deck closes a worker, and the dying worker's own SessionEnd arrives afterwards carrying its now-retired token, then a sender presents a well-formed token the daemon never minted. Both are refused and change no card; the retired one is logged at debug as expected teardown, the never-minted one still as a warning (issue #2104).
+    /// Scenario: The deck closes a worker, and the dying worker's own SessionEnd arrives afterwards carrying its now-retired token; then the same retired token is replayed claiming the orchestrator's pane, and a well-formed token the daemon never minted is presented. All are refused and change no card; only the worker's own teardown report is logged at debug, the other two still as warnings (issue #2104).
     #[tokio::test]
     async fn hook_provenance_agent_event_retired_token_is_refused_quietly() {
         use std::sync::Mutex;
@@ -14994,14 +14997,29 @@ mod hook_ingestion_tests {
             fx.registry.owner_of_hook_token(&retired).is_none(),
             "a closed generation's token resolves to nobody"
         );
-        assert!(fx.registry.hook_token_was_retired(&retired));
+        assert!(
+            fx.registry
+                .hook_token_was_retired(&retired, Some(PROV_WORKER_PANE))
+        );
         let never_minted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        assert!(!fx.registry.hook_token_was_retired(never_minted));
+        assert!(
+            !fx.registry
+                .hook_token_was_retired(never_minted, Some(PROV_ORCH_PANE))
+        );
 
         let before = format!("{:?}", fx.state.read().await.sessions);
         fx.agent_event(
             PROV_WORKER_PANE,
             "dying-worker",
+            "session_end",
+            Some(&retired),
+        )
+        .await;
+        // The same retired token claiming a pane its generation never held
+        // is not that generation's teardown (Qodo on PR #2257).
+        fx.agent_event(
+            PROV_ORCH_PANE,
+            "replayed-card",
             "session_end",
             Some(&retired),
         )
@@ -15018,7 +15036,7 @@ mod hook_ingestion_tests {
         fx.stop().await;
         assert!(
             before == after && broadcast.is_none(),
-            "both refused: changed={} broadcast={broadcast:?}",
+            "all refused: changed={} broadcast={broadcast:?}",
             before != after
         );
 
@@ -15034,12 +15052,17 @@ mod hook_ingestion_tests {
         assert!(dying.contains("DEBUG"), "{dying}");
         assert!(dying.contains("reason=\"unknown_token\""), "{dying}");
         assert!(dying.contains("SessionEnd"), "{dying}");
-        let forged = refusals
+        // The replayed retired token and the never-minted one, both on a pane
+        // neither generation held: each still a warning.
+        let elsewhere: Vec<&&str> = refusals
             .iter()
-            .find(|line| line.contains(PROV_ORCH_PANE))
-            .unwrap_or_else(|| panic!("the never-minted token's refusal is logged: {log}"));
-        assert!(forged.contains("WARN"), "{forged}");
-        assert!(forged.contains("reason=\"unknown_token\""), "{forged}");
+            .filter(|line| line.contains(PROV_ORCH_PANE))
+            .collect();
+        assert_eq!(elsewhere.len(), 2, "{log}");
+        for line in elsewhere {
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains("reason=\"unknown_token\""), "{line}");
+        }
         assert!(!log.contains(&retired), "the token is never logged");
     }
 

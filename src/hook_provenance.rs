@@ -272,6 +272,11 @@ pub struct TokenOwner {
 /// A token in here resolves to nothing in [`HookTokenDirectory`]: membership
 /// grants no admission, and [`classify`] never reads it.
 ///
+/// Each entry binds the token to the pane its generation held, and a refusal
+/// counts as that generation's last report only when it claims that same
+/// pane (Qodo on PR #2257): a retired token presented for any other pane is
+/// not teardown and still warns.
+///
 /// Holds a SHA-256 digest of each token rather than the token, so a retired
 /// capability is not kept in memory for longer than its record was. Bounded
 /// at [`Self::CAPACITY`], oldest first out; a token evicted from it is merely
@@ -279,7 +284,8 @@ pub struct TokenOwner {
 #[derive(Debug, Default)]
 pub(crate) struct RetiredHookTokens {
     order: std::collections::VecDeque<[u8; 32]>,
-    digests: std::collections::HashSet<[u8; 32]>,
+    /// Digest → the pane the retired generation held (`None`: paneless).
+    digests: std::collections::HashMap<[u8; 32], Option<String>>,
 }
 
 impl RetiredHookTokens {
@@ -287,8 +293,8 @@ impl RetiredHookTokens {
     /// arrives within a second of its teardown (issue #2104 measured 102 of
     /// 116 within one), so this only has to outlast the teardowns of one busy
     /// burst. Each entry is a 32-byte digest held in both `order` and
-    /// `digests`, so a full set is 64 KiB of digests plus the two
-    /// collections' own overhead.
+    /// `digests`, plus its pane id, so a full set is 64 KiB of digests plus
+    /// the pane ids and the two collections' own overhead.
     pub(crate) const CAPACITY: usize = 1024;
 
     fn digest(token: &str) -> [u8; 32] {
@@ -296,10 +302,14 @@ impl RetiredHookTokens {
         Sha256::digest(token.as_bytes()).into()
     }
 
-    /// Remember that `token`'s generation was taken down.
-    pub(crate) fn record(&mut self, token: &str) {
+    /// Remember that `token`'s generation, which held `pane`, was taken down.
+    pub(crate) fn record(&mut self, token: &str, pane: Option<&str>) {
         let digest = Self::digest(token);
-        if !self.digests.insert(digest) {
+        if self
+            .digests
+            .insert(digest, pane.map(str::to_string))
+            .is_some()
+        {
             return;
         }
         self.order.push_back(digest);
@@ -310,9 +320,12 @@ impl RetiredHookTokens {
         }
     }
 
-    /// Whether `token` belongs to a generation this daemon took down.
-    pub(crate) fn contains(&self, token: &str) -> bool {
-        self.digests.contains(&Self::digest(token))
+    /// Whether `token` belongs to a generation this daemon took down while
+    /// it held `claimed_pane` — `None` matching only a paneless generation.
+    pub(crate) fn contains(&self, token: &str, claimed_pane: Option<&str>) -> bool {
+        self.digests
+            .get(&Self::digest(token))
+            .is_some_and(|pane| pane.as_deref() == claimed_pane)
     }
 }
 
@@ -1190,27 +1203,38 @@ mod tests {
         let mut retired = RetiredHookTokens::default();
         let gone = mint();
         let live = mint();
-        assert!(!retired.contains(&gone));
-        retired.record(&gone);
-        assert!(retired.contains(&gone));
-        assert!(!retired.contains(&live));
+        assert!(!retired.contains(&gone, Some("p")));
+        retired.record(&gone, Some("p"));
+        assert!(retired.contains(&gone, Some("p")));
+        assert!(!retired.contains(&gone, Some("other")), "another pane");
+        assert!(!retired.contains(&gone, None), "no pane");
+        assert!(!retired.contains(&live, Some("p")));
+        let paneless = mint();
+        retired.record(&paneless, None);
+        assert!(retired.contains(&paneless, None));
+        assert!(!retired.contains(&paneless, Some("p")));
+        retired.record(&paneless, None);
+        assert_eq!(retired.order.len(), 2);
         // Recording the same token twice keeps one entry.
-        retired.record(&gone);
-        assert_eq!(retired.order.len(), 1);
+        retired.record(&gone, Some("p"));
+        assert_eq!(retired.order.len(), 2);
     }
 
     #[test]
     fn retired_hook_tokens_are_bounded_oldest_first() {
         let mut retired = RetiredHookTokens::default();
         let first = mint();
-        retired.record(&first);
+        retired.record(&first, Some("p"));
         let rest: Vec<String> = (0..RetiredHookTokens::CAPACITY).map(|_| mint()).collect();
         for token in &rest {
-            retired.record(token);
+            retired.record(token, Some("p"));
         }
         assert_eq!(retired.order.len(), RetiredHookTokens::CAPACITY);
         assert_eq!(retired.digests.len(), RetiredHookTokens::CAPACITY);
-        assert!(!retired.contains(&first), "the oldest entry is evicted");
-        assert!(rest.iter().all(|t| retired.contains(t)));
+        assert!(
+            !retired.contains(&first, Some("p")),
+            "the oldest entry is evicted"
+        );
+        assert!(rest.iter().all(|t| retired.contains(t, Some("p"))));
     }
 }

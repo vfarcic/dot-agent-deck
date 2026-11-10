@@ -15562,7 +15562,9 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
-            inner.retired_hook_tokens.record(&agent.hook_token);
+            inner
+                .retired_hook_tokens
+                .record(&agent.hook_token, agent.pane_id_env.as_deref());
             agent.removal.closed();
             // Issue #2028 (review): in the removing hold, so a reader that no
             // longer finds the record finds what it knew of its child.
@@ -15934,7 +15936,9 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
-            inner.retired_hook_tokens.record(&removed.hook_token);
+            inner
+                .retired_hook_tokens
+                .record(&removed.hook_token, removed.pane_id_env.as_deref());
             let removed_record = Self::cleanup_record(&agent_id, &removed);
             // PRD #1666 part 3, round 5-wake: under the lock hold that lifts the
             // record out; the ticket settles it.
@@ -19505,15 +19509,20 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #2104: whether `token` belongs to a generation this registry took
-    /// down — closed, respawned away or drained at shutdown.
+    /// down — closed, respawned away or drained at shutdown — while it held
+    /// `claimed_pane` (`None`: a paneless generation). A retired token claiming
+    /// any other pane answers `false`.
     ///
     /// For the hook loop's LOG LEVEL only: a dying agent's last report carries
     /// its retired token and is refused as `unknown_token`, which is expected
     /// and logged at `debug`. It is not evidence the sender may act — a token
     /// answered `true` here still resolves to nothing in
     /// [`Self::owner_of_hook_token`].
-    pub fn hook_token_was_retired(&self, token: &str) -> bool {
-        self.inner.lock().retired_hook_tokens.contains(token)
+    pub fn hook_token_was_retired(&self, token: &str, claimed_pane: Option<&str>) -> bool {
+        self.inner
+            .lock()
+            .retired_hook_tokens
+            .contains(token, claimed_pane)
     }
 
     /// Test probe for one record's hook capability token.
@@ -20695,7 +20704,7 @@ impl AgentPtyRegistry {
                 .agents
                 .drain()
                 .map(|(_, agent)| {
-                    retired.record(&agent.hook_token);
+                    retired.record(&agent.hook_token, agent.pane_id_env.as_deref());
                     agent.removal.closed();
                     agent.into()
                 })
@@ -22134,19 +22143,29 @@ mod spawn_tests {
             })
             .expect("spawn the pane");
         let first_token = registry.hook_token_of(&first).expect("first token");
-        assert!(!registry.hook_token_was_retired(&first_token));
+        assert!(!registry.hook_token_was_retired(&first_token, Some("pane-2104")));
 
         let second = registry
             .respawn_agent_for_pane("pane-2104", "cat")
             .await
             .expect("respawn the pane");
         let second_token = registry.hook_token_of(&second).expect("second token");
-        assert!(registry.hook_token_was_retired(&first_token), "respawn");
+        assert!(
+            registry.hook_token_was_retired(&first_token, Some("pane-2104")),
+            "respawn"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&first_token, Some("another-pane")),
+            "a retired token claiming another pane is not its teardown"
+        );
         assert!(registry.owner_of_hook_token(&first_token).is_none());
-        assert!(!registry.hook_token_was_retired(&second_token));
+        assert!(!registry.hook_token_was_retired(&second_token, Some("pane-2104")));
 
         registry.close_agent(&second).expect("close the pane");
-        assert!(registry.hook_token_was_retired(&second_token), "close");
+        assert!(
+            registry.hook_token_was_retired(&second_token, Some("pane-2104")),
+            "close"
+        );
         assert!(registry.owner_of_hook_token(&second_token).is_none());
 
         let third = registry
@@ -22157,7 +22176,10 @@ mod spawn_tests {
             .expect("spawn a paneless agent");
         let third_token = registry.hook_token_of(&third).expect("third token");
         registry.shutdown_all();
-        assert!(registry.hook_token_was_retired(&third_token), "shutdown");
+        assert!(
+            registry.hook_token_was_retired(&third_token, None),
+            "shutdown"
+        );
     }
 
     /// Qodo, PR #1603: a respawn under a DIFFERENT command keeps the old badge
