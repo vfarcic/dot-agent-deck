@@ -663,7 +663,8 @@ async fn return_019_a_differing_terminal_repeat_is_delivered_as_an_update() {
         }) => {
             assert_eq!(report_id, first.report_id, "the first report stands");
             assert_eq!(updates.len(), 1);
-            assert_eq!(Some(updates[0].1.clone()), update.report_id);
+            assert_eq!(Some(updates[0].report_id.clone()), update.report_id);
+            assert_eq!(updates[0].destination, Destination::Inbox);
             assert_eq!(updating, None);
         }
         other => panic!("expected a completed unit, got {other:?}"),
@@ -803,6 +804,171 @@ async fn return_029_a_units_report_updates_are_bounded() {
     );
     assert_eq!(unit.completed(), 1);
     assert_eq!(unit.count("dispatch report updated"), max);
+}
+
+/// Scenario: A unit reports, then sends an update that is paused after its save. While it is paused, an identical repeat of the update and a different third report both arrive and wait instead of racing it. Released, the update is delivered once as update 1, the identical repeat is answered with update 1's own result and delivers nothing, and the different report becomes update 2.
+#[spec("dispatch/return/031")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_031_reports_arriving_while_an_update_is_saved_wait_for_it() {
+    let unit = Arc::new(unit("r031", false).await);
+    let first = accepted(unit.report("R031-FIRST").await);
+    let (update, release) =
+        paused_report(&unit, crate::task_completion::PAUSE_SAVED, "R031-UPDATE-1").await;
+    assert!(
+        matches!(
+            unit_entry(&unit.deck, &unit.unit_id()),
+            Some(UnitEntry::Completed {
+                updating: Some(_),
+                ..
+            })
+        ),
+        "the update is recorded as in flight"
+    );
+    let send = |body: &'static str| {
+        let unit = Arc::clone(&unit);
+        tokio::spawn(async move { unit.report(body).await })
+    };
+    let repeat = send("R031-UPDATE-1");
+    let other = send("R031-UPDATE-2");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !repeat.is_finished() && !other.is_finished(),
+        "both wait for the update in flight"
+    );
+    assert_eq!(unit.count("dispatch report updated"), 0);
+    release.send(()).unwrap();
+
+    let update = accepted(update.await.unwrap());
+    assert_eq!(update.update, Some(1));
+    let repeat = reply(repeat.await.unwrap());
+    assert_eq!(
+        (
+            repeat.disposition,
+            repeat.report_id.clone(),
+            repeat.update,
+            repeat.differs
+        ),
+        (
+            WorkDoneDisposition::AlreadyAccepted,
+            update.report_id.clone(),
+            Some(1),
+            false
+        )
+    );
+    let other = accepted(other.await.unwrap());
+    assert_eq!(other.update, Some(2));
+    assert_eq!(unit.completed(), 1);
+    assert_eq!(unit.count("dispatch report updated"), 2);
+    match unit_entry(&unit.deck, &unit.unit_id()) {
+        Some(UnitEntry::Completed {
+            report_id,
+            updates,
+            updating,
+            ..
+        }) => {
+            assert_eq!(report_id, first.report_id, "the first report stands");
+            assert_eq!(updates.len(), 2);
+            assert_eq!(updating, None);
+        }
+        other => panic!("expected a completed unit, got {other:?}"),
+    }
+}
+
+/// Scenario: A unit reports, then sends an update whose save fails. The update is refused `report_save_failed`, posts nothing and leaves no file; the unit's first report and its entry are unchanged and no update is in flight; the same update sent again is then accepted as update 1.
+#[spec("dispatch/return/032")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_032_a_failed_update_save_changes_nothing_and_a_retry_is_accepted() {
+    let unit = unit("r032", false).await;
+    let first = accepted(unit.report("R032-FIRST").await);
+    let entry = unit_entry(&unit.deck, &unit.unit_id());
+    let files = super::report_tests::store_files(&unit.deck.store);
+    let caller = inbox_of(&unit.deck, &unit.caller_pane);
+    unit.registry()
+        .inject_fault_for_test(crate::task_completion::FAULT_FAIL_SAVE, TestFault::Fail);
+    refused_with(unit.report("R032-UPDATE").await, code::REPORT_SAVE_FAILED);
+    assert_eq!(unit_entry(&unit.deck, &unit.unit_id()), entry);
+    assert_eq!(super::report_tests::store_files(&unit.deck.store), files);
+    assert_eq!(inbox_of(&unit.deck, &unit.caller_pane), caller);
+
+    let retry = accepted(unit.report("R032-UPDATE").await);
+    assert_eq!(retry.update, Some(1));
+    assert_eq!(unit.count("dispatch report updated"), 1);
+    match unit_entry(&unit.deck, &unit.unit_id()) {
+        Some(UnitEntry::Completed {
+            report_id, updates, ..
+        }) => {
+            assert_eq!(report_id, first.report_id);
+            assert_eq!(updates.len(), 1);
+        }
+        other => panic!("expected a completed unit, got {other:?}"),
+    }
+}
+
+/// Scenario: A unit's first report reaches its live dispatcher; then an update is paused after its save and the dispatcher's agent exits. Released, the update is accepted and kept for recovery, and the CLI says it was update 1 and was saved. The first report still reads as delivered, and an identical repeat of the update is answered with the update's own destination (recovery) and number, not the first report's.
+#[spec("dispatch/return/033")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn return_033_an_update_after_the_dispatcher_exited_is_kept_for_recovery() {
+    let unit = Arc::new(unit("r033", false).await);
+    let first = accepted(unit.report("R033-FIRST").await);
+    assert_eq!(first.destination, Some(Destination::Inbox));
+    let caller_agent = unit
+        .registry()
+        .pane_current_agent_id(&unit.caller_pane)
+        .expect("a live dispatcher");
+    let (update, release) =
+        paused_report(&unit, crate::task_completion::PAUSE_SAVED, "R033-UPDATE").await;
+    kill_child(unit.registry(), &caller_agent);
+    eventually("the dispatcher's agent is gone", || {
+        unit.registry()
+            .pane_current_agent_id(&unit.caller_pane)
+            .as_deref()
+            != Some(caller_agent.as_str())
+    })
+    .await;
+    release.send(()).unwrap();
+
+    let update = accepted(update.await.unwrap());
+    assert_eq!(
+        (update.update, update.destination),
+        (Some(1), Some(Destination::Recovery))
+    );
+    let line = crate::work_done_text::cli_answer(&update, None, true);
+    assert!(
+        line.stdout
+            .as_deref()
+            .is_some_and(|l| l.starts_with("Sent update 1 to this unit's report.")
+                && l.contains("saved the report to a file")),
+        "{line:?}"
+    );
+    match unit_entry(&unit.deck, &unit.unit_id()) {
+        Some(UnitEntry::Completed {
+            report_id,
+            destination,
+            updates,
+            ..
+        }) => {
+            assert_eq!(report_id, first.report_id);
+            assert_eq!(destination, Destination::Inbox, "the first report's own");
+            assert_eq!(updates.len(), 1);
+            assert_eq!(updates[0].destination, Destination::Recovery);
+        }
+        other => panic!("expected a completed unit, got {other:?}"),
+    }
+    let repeat = reply(unit.report("R033-UPDATE").await);
+    assert_eq!(
+        (
+            repeat.disposition,
+            repeat.report_id.clone(),
+            repeat.destination,
+            repeat.update
+        ),
+        (
+            WorkDoneDisposition::AlreadyAccepted,
+            update.report_id.clone(),
+            Some(Destination::Recovery),
+            Some(1)
+        )
+    );
 }
 
 /// Scenario: A terminal report is paused after its role-map snapshot and before it takes the routes; the unit's agent exits, and in a second run the unit is closed. Released, it is refused `task_closed` with the ended wording; exactly one `dispatch ended` is posted; no claim, no saved report and no mark are left.

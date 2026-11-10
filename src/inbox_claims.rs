@@ -253,14 +253,22 @@ fn admit_update(
             false,
         ));
     }
-    if let Some((_, update_id)) = updates.iter().find(|(d, _)| *d == spec.digest) {
-        return Admission::Answer(answered(
+    if let Some((n, taken)) = updates
+        .iter()
+        .enumerate()
+        .find(|(_, taken)| taken.digest == spec.digest)
+    {
+        // The update's own result: its report id, where IT went, and its
+        // number, never the first report's.
+        let mut reply = answered(
             WorkDoneDisposition::AlreadyAccepted,
             None,
-            Some(update_id.clone()),
-            *destination,
+            Some(taken.report_id.clone()),
+            taken.destination,
             false,
-        ));
+        );
+        reply.update = Some(n as u32 + 1);
+        return Admission::Answer(reply);
     }
     if let Some(claim_id) = *updating {
         return wait_on(reports, claim_id).unwrap_or_else(|| {
@@ -813,24 +821,23 @@ impl InboxHub {
                 )),
                 _ => None,
             },
-            ClaimMode::TerminalUpdate { unit_id, .. } => match reports.units.get(unit_id) {
-                Some(UnitEntry::Completed {
-                    updates,
-                    destination,
-                    ..
-                }) if updates.iter().any(|(_, id)| id == report_id) => Some(answered(
-                    WorkDoneDisposition::Accepted,
-                    None,
-                    Some(report_id.to_string()),
-                    if in_inbox || reports.accepted.contains_key(message_id) {
-                        Destination::Inbox
-                    } else if reports.outcomes.has_report(report_id) {
-                        Destination::Recovery
-                    } else {
-                        *destination
-                    },
-                    false,
-                )),
+            ClaimMode::TerminalUpdate { unit_id, update } => match reports.units.get(unit_id) {
+                Some(UnitEntry::Completed { updates, .. }) => updates
+                    .iter()
+                    .find(|taken| taken.report_id == report_id)
+                    .map(|taken| {
+                        // Recovered after the commit: the update's number
+                        // goes back with it, so the CLI says it was an update.
+                        let mut reply = answered(
+                            WorkDoneDisposition::Accepted,
+                            None,
+                            Some(report_id.to_string()),
+                            taken.destination,
+                            false,
+                        );
+                        reply.update = Some(*update);
+                        reply
+                    }),
                 _ => None,
             },
             ClaimMode::Uncorrelated => {
@@ -1102,7 +1109,11 @@ impl InboxHub {
                         updates, updating, ..
                     }) = reports.units.get_mut(unit_id)
                     {
-                        updates.push((claim.digest, report_id.clone()));
+                        updates.push(crate::report_recovery::ReportUpdate {
+                            digest: claim.digest,
+                            report_id: report_id.clone(),
+                            destination,
+                        });
                         if *updating == Some(claim_id) {
                             *updating = None;
                         }

@@ -481,14 +481,25 @@ pub enum UnitEntry {
         caller: Option<Recipient>,
         /// The dispatched unit's name, for an update's post.
         unit_name: Option<String>,
-        /// The updates delivered after the first report, oldest first: each
-        /// one's digest and report id. At most [`MAX_REPORT_UPDATES`].
-        updates: Vec<([u8; 32], String)>,
+        /// The updates taken after the first report, oldest first; update
+        /// `n` is at index `n - 1`. At most [`MAX_REPORT_UPDATES`].
+        updates: Vec<ReportUpdate>,
         /// The claim saving an update now, which a repeat waits on.
         updating: Option<u64>,
     },
     /// It ended without a report.
     Ended { how: EndedHow },
+}
+
+/// Issue #2260: one update a unit sent to its report, as it was committed:
+/// what a repeat of it is answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportUpdate {
+    pub digest: [u8; 32],
+    pub report_id: String,
+    /// Where this update went, which is not always where the first report
+    /// went: the dispatcher may have exited in between.
+    pub destination: Destination,
 }
 
 /// Issue #2260: how many updates a dispatched unit may send after its first

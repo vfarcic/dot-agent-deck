@@ -5724,6 +5724,30 @@ without depending on the config struct API.
 - **Does not assert:** a real agent; the desktop app.
 - **Platform coverage:** mac+linux.
 
+##### dispatch/return/031 — Reports that arrive while an update is being saved wait for it, then settle in order.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** with an update paused after its save, the unit entry records it in flight, and an identical repeat and a different report both wait rather than finish; released, the update is update 1, the repeat answers `already_accepted` with update 1's id and number and posts nothing, the different report becomes update 2, and the first report is unchanged.
+- **Why it exists:** issue #2260 (PR #2275 review): the in-flight state is what keeps a repeat from posting twice or racing the update it repeats.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/032 — A failed update save changes nothing, and a retry is accepted.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** an update whose save fails is refused `report_save_failed`; the unit entry, the saved files and the dispatcher's inbox are unchanged and no update is left in flight; the same update sent again is accepted as update 1.
+- **Why it exists:** issue #2260 (PR #2275 review): a failed update must neither touch the first report nor leave the unit unable to send an update.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/033 — An update sent after the dispatcher exited is kept for recovery, and its repeat says so.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** with the first report delivered to a live dispatcher, an update paused after its save while the dispatcher's agent exits is accepted with destination `recovery` and update 1, and the CLI line says it was update 1 and was saved; the first report's entry still reads `inbox`; an identical repeat of the update answers with the update's own destination and number.
+- **Why it exists:** issue #2260 (PR #2275 review): a repeat of an update used to answer with the first report's destination and no number.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
 ##### dispatch/return/030 — A real dispatched single unit, told its report is out of date, sends an update, and the dispatcher receives it as a separate turn beside the first report.
 - **Layer:** L2 PTY-attached, lane 2 (`TuiDeck` on `minimal`, `tests/e2e_dispatcher_mode.rs`) driving the real new-pane dispatcher flow and two real interactive Claude Code panes through the branch binary; the dispatcher runs `dot-agent-deck dispatch --single` itself, and no test process runs `dispatch` or `work-done`.
 - **Agent:** REAL interactive Claude Code Haiku (`claude-haiku-4-5-20251001`) for the dispatcher and the unit, with `--allowedTools Bash Read Write`. Credentialed lane 2: run with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`, never in CI.
