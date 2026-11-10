@@ -944,8 +944,9 @@ fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
     let session_dir = common::race_safe_tempdir();
     let session_file = session_dir.path().join("session.toml");
     // `dir` (saved_pane.dir) = saved_dir; `project_path` = planted_dir — the
-    // divergence. The saved role set matches the planted config so today's
-    // name+order drift guard passes and the planted config would auto-run.
+    // divergence. The saved role set matches the planted config, so the
+    // name+order role check alone would accept it; the path-divergence check is
+    // what has to refuse the restore before the planted config is ever loaded.
     let sentinel = session_dir.path().join("restore_012_saved_command_ran");
     stage_orchestration_snapshot(
         &session_file,
@@ -969,8 +970,8 @@ fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
         .launch_with_fixture("minimal");
 
     // The divergent-path config must NOT be executed: poll for its uniquely-named
-    // `phantom-reviewer` role to (wrongly) appear. `true` means the bug
-    // reproduced — RED today, since restore auto-runs the planted config.
+    // `phantom-reviewer` role to (wrongly) appear. `true` would mean restore
+    // auto-ran the planted config — the regression this test guards against.
     let auto_ran = common::wait_until(Duration::from_secs(10), || {
         deck.snapshot_grid().contains("phantom-reviewer")
     });
@@ -1043,9 +1044,8 @@ fn restore_013_custom_orchestration_tab_title_is_preserved_on_restore() {
         deck.snapshot_grid()
     );
 
-    // The rebuilt tab must carry the user's saved title in the tab bar. RED
-    // today: the title is the canonical `tdd-cycle` because `display_title` is
-    // not yet part of the snapshot schema (RED-pending-schema).
+    // The rebuilt tab must carry the user's saved title in the tab bar, read
+    // from the snapshot's `display_title`, not the canonical `tdd-cycle` name.
     let titled = common::wait_until(Duration::from_secs(5), || {
         deck.snapshot_grid().contains("MYDECKTITLE")
     });
