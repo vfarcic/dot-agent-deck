@@ -750,6 +750,53 @@ pub fn approve_if_unchanged_with(
         .map_err(TrustError::Store)?
 }
 
+/// What approving several orchestrations as one batch did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BatchApproveOutcome {
+    /// Every one was recorded; each text matched its digest.
+    Approved,
+    /// These orchestrations no longer hash to the digest the approver was
+    /// shown, so nothing in the batch was recorded.
+    Stale(Vec<String>),
+}
+
+/// Approve every `(config_dir, orchestration, expected_digest)` in `batch` as
+/// one change: all of them are re-read and compared under the store's lock,
+/// and either every one is recorded in a single store write or, when any of
+/// them changed or cannot be read, none is. One answer that approved several
+/// orchestrations therefore never leaves some of them approved.
+pub fn approve_batch_if_unchanged(
+    store: &TrustStore,
+    batch: &[(&Path, &str, &str)],
+) -> Result<BatchApproveOutcome, TrustError> {
+    store
+        .update(|approvals| {
+            let mut fresh = Vec::with_capacity(batch.len());
+            let mut stale = Vec::new();
+            for &(config_dir, orchestration, expected_digest) in batch {
+                let check = match read_config(config_dir).and_then(|config| {
+                    inspect_config(approvals, config_dir, &config, orchestration)
+                }) {
+                    Ok(check) => check,
+                    Err(e) => return (Err(e), false),
+                };
+                if check.digest() != expected_digest {
+                    stale.push(orchestration.to_string());
+                }
+                fresh.push(check);
+            }
+            if !stale.is_empty() {
+                return (Ok(BatchApproveOutcome::Stale(stale)), false);
+            }
+            let now = chrono::Utc::now();
+            for check in fresh {
+                approvals.approve(&check.project, &check.orchestration, check.roles, now);
+            }
+            (Ok(BatchApproveOutcome::Approved), true)
+        })
+        .map_err(TrustError::Store)?
+}
+
 /// Why [`inspect`] or an approval could not answer.
 #[derive(Debug)]
 pub enum TrustError {

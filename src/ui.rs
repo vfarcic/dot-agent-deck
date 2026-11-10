@@ -707,6 +707,39 @@ fn schedule_refusals() -> crate::schedule_outcome::Outcomes {
     crate::schedule_outcome::OutcomeStore::default_location().load()
 }
 
+/// PRD #1885: how often the open Schedules manager re-reads the refusal
+/// records, so a fire refused after the manager opened shows up without
+/// reopening it.
+const SCHEDULE_REFUSALS_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Read the refusal records into the manager now.
+fn reload_schedule_refusals(ui: &mut UiState) {
+    ui.scheduled_refusals = schedule_refusals();
+    ui.scheduled_refusals_read_at = Some(std::time::Instant::now());
+}
+
+/// PRD #1885: while the Schedules manager is open, re-read the refusal records
+/// through `load` once [`SCHEDULE_REFUSALS_REFRESH`] has passed since the last
+/// read. Called every main-loop iteration; outside the manager it reads
+/// nothing.
+fn refresh_schedule_refusals_if_due(
+    ui: &mut UiState,
+    now: std::time::Instant,
+    load: impl FnOnce() -> crate::schedule_outcome::Outcomes,
+) {
+    if ui.mode != UiMode::ScheduledTasks {
+        return;
+    }
+    if ui
+        .scheduled_refusals_read_at
+        .is_some_and(|read| now.saturating_duration_since(read) < SCHEDULE_REFUSALS_REFRESH)
+    {
+        return;
+    }
+    ui.scheduled_refusals = load();
+    ui.scheduled_refusals_read_at = Some(now);
+}
+
 /// The manager's STATUS cell. PRD #1885: `refused` when the task's last fire
 /// was refused as not approved, so a schedule that stopped working says so.
 fn schedule_status_label_with(enabled: bool, is_live: bool, refused: bool) -> &'static str {
@@ -2247,6 +2280,11 @@ struct UiState {
     /// orchestration is not approved, snapshotted with
     /// [`Self::scheduled_live_names`].
     scheduled_refusals: crate::schedule_outcome::Outcomes,
+    /// PRD #1885: when [`Self::scheduled_refusals`] was last read from disk, so
+    /// the open manager re-reads it on [`SCHEDULE_REFUSALS_REFRESH`]'s cadence
+    /// and picks up a refusal recorded after it opened (a fire runs after its
+    /// `RunNow` returns).
+    scheduled_refusals_read_at: Option<std::time::Instant>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -2594,6 +2632,7 @@ impl UiState {
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
             scheduled_refusals: Default::default(),
+            scheduled_refusals_read_at: None,
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
@@ -11974,7 +12013,7 @@ fn dispatch_action(
             ui.scheduled_selected = 0;
             ui.scheduled_delete_confirm = false;
             ui.scheduled_live_names = live_schedule_names();
-            ui.scheduled_refusals = schedule_refusals();
+            reload_schedule_refusals(ui);
             ui.mode = UiMode::ScheduledTasks;
         }
         // PRD #127 finding #4: `[Add]` button parity for the `a` key. PRD #170
@@ -12110,7 +12149,7 @@ fn dispatch_action(
             // PRD #127 N2: dialog stays open after run-now; refresh live-status snapshot.
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_live_names = live_schedule_names();
-                ui.scheduled_refusals = schedule_refusals();
+                reload_schedule_refusals(ui);
             }
         }
         Action::ScheduleDelete(name) => {
@@ -12143,7 +12182,7 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
-                ui.scheduled_refusals = schedule_refusals();
+                reload_schedule_refusals(ui);
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
                 }
@@ -12190,7 +12229,7 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
-                ui.scheduled_refusals = schedule_refusals();
+                reload_schedule_refusals(ui);
             }
         }
         Action::Continue => {}
@@ -14211,6 +14250,8 @@ pub fn run_tui(
         {
             ui.status_message = None;
         }
+
+        refresh_schedule_refusals_if_due(&mut ui, std::time::Instant::now(), schedule_refusals);
 
         // Issue #949 — notice a moved position (active tab / focused pane) and
         // mark the snapshot dirty, so the flush below has something to write.
@@ -39764,6 +39805,46 @@ mod tests {
             shape: None,
             issue_dispatch: None,
         }
+    }
+
+    /// PRD #1885 (Greptile P2 / Qodo finding 3 on PR #2256): the open manager
+    /// picks up a refusal recorded after it opened — a fire runs after its
+    /// `RunNow` returns — on its refresh cadence, and reads nothing before that
+    /// cadence is due or while it is closed.
+    #[test]
+    fn the_open_schedule_manager_picks_up_a_refusal_recorded_after_it_opened() {
+        let refused = || {
+            let mut outcomes = crate::schedule_outcome::Outcomes::new();
+            outcomes.insert(
+                "nightly".to_string(),
+                crate::schedule_outcome::Refusal {
+                    at: "2026-11-10T09:00:00Z".to_string(),
+                    message: "orchestration 'team' was never approved".to_string(),
+                },
+            );
+            outcomes
+        };
+        let opened = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.scheduled_tasks = vec![make_scheduled_task("nightly", true)];
+        ui.mode = UiMode::ScheduledTasks;
+        ui.scheduled_refusals_read_at = Some(opened);
+
+        refresh_schedule_refusals_if_due(&mut ui, opened, || panic!("not due yet"));
+        assert!(ui.scheduled_refusals.is_empty());
+
+        let later = opened + SCHEDULE_REFUSALS_REFRESH;
+        refresh_schedule_refusals_if_due(&mut ui, later, refused);
+        assert!(
+            ui.scheduled_refusals.contains_key("nightly"),
+            "the refusal recorded after the manager opened is shown"
+        );
+        assert_eq!(ui.scheduled_refusals_read_at, Some(later));
+
+        ui.mode = UiMode::Normal;
+        refresh_schedule_refusals_if_due(&mut ui, later + SCHEDULE_REFUSALS_REFRESH * 10, || {
+            panic!("a closed manager reads nothing")
+        });
     }
 
     /// PRD #1885: a schedule whose last fire was refused as not approved reads

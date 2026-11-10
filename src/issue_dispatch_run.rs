@@ -828,9 +828,9 @@ async fn reclaim_abandoned_spawn_paced(
 
     let Some(_repo_lock) = acquire_worktree_lock(clone_dir).await else {
         return Reclaim::Failed(format!(
-            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
-             and the repository's worktree lock that guards removing it could not be taken; \
-             the next attempt retries",
+            "the issue's worktree {} was left by a spawn that never started, and the \
+             repository's worktree lock that guards removing it could not be taken; the next \
+             attempt retries",
             worktree_dir.display()
         ));
     };
@@ -854,13 +854,13 @@ async fn reclaim_abandoned_spawn_paced(
         None => {
             tracing::info!(
                 worktree = %worktree_dir.display(),
-                "issue-dispatch: removed a worktree left by a spawn refused during a restart"
+                "issue-dispatch: removed a worktree left by a spawn that never started"
             );
             Reclaim::Removed
         }
         Some(_) => Reclaim::Failed(format!(
-            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
-             and removing it failed again; the next attempt retries",
+            "the issue's worktree {} was left by a spawn that never started, and removing it \
+             failed again; the next attempt retries",
             worktree_dir.display()
         )),
     }
@@ -958,7 +958,8 @@ async fn dispatch_one_issue(
     // IssueDispatchFailed notification.
     //
     // Except for a leftover this task abandoned for this issue when its spawn
-    // was refused during a restart and the removal failed: that is retried
+    // was refused (during a restart, or because its orchestration is not
+    // approved, PRD #1885) and the removal failed: that is retried
     // here first, and only a worktree that is still there afterwards claims
     // the issue (PRD #1487 final audit F2).
     // `Path::exists` is a blocking `stat`: `tokio::fs::metadata` is the same
@@ -1063,9 +1064,13 @@ async fn dispatch_one_issue(
     // rather than skipped as claimed on every later fire.
     if let Err(refusal) = refuse_unapproved_worktree(&paths.worktree_dir, task_name, notifier).await
     {
-        let _repo_lock = acquire_worktree_lock(clone_dir).await;
-        remove_worktree(&paths.worktree_dir, clone_dir, RemovalPolicy::Force).await;
-        return Err(refusal);
+        return Err(release_refused_worktree(
+            &paths.worktree_dir,
+            clone_dir,
+            Creator::issue_dispatch(task_name, issue),
+            refusal,
+        )
+        .await);
     }
     warm_project_environment(&paths.worktree_dir).await;
 
@@ -1121,6 +1126,62 @@ async fn dispatch_one_issue(
 
     // M1.3 — the caller claims the issue and then surfaces the success.
     Ok(IssueOutcome::Dispatched { claims_unchecked })
+}
+
+/// PRD #1885: remove the worktree an approval refusal left unused, answering
+/// the issue's failure message: `refusal` itself, extended when the worktree
+/// stays on disk.
+///
+/// A worktree left behind would read as the issue being claimed on every later
+/// fire, so — as [`settle_failed_issue_spawn`] does for a restart refusal — it
+/// is marked as abandoned by `creator` before the removal, under the
+/// per-repository worktree lock. A removal that succeeds deletes the mark with
+/// the worktree; one that fails, or a lock that cannot be taken, leaves the
+/// mark, so the next attempt retries the removal ([`reclaim_abandoned_spawn`]),
+/// and the refusal names the leftover.
+async fn release_refused_worktree(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    creator: Creator,
+    refusal: String,
+) -> String {
+    let repo_lock = acquire_worktree_lock(clone_dir).await;
+    let marked = {
+        let dir = worktree_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree_owner::mark_abandoned_spawn(&dir, &creator)
+        })
+        .await
+        .unwrap_or_else(|join| Err(join.to_string()))
+    };
+    let why_kept = if repo_lock.is_none() {
+        "the repository's worktree lock could not be taken"
+    } else if remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force)
+        .await
+        .is_none()
+    {
+        return refusal;
+    } else {
+        "removing it failed"
+    };
+    let next = match marked {
+        Ok(_) => "the next attempt retries the removal".to_string(),
+        Err(why) => format!(
+            "it could not be marked for a retry ({why}), so remove it by hand to release the issue"
+        ),
+    };
+    let kept = format!(
+        "the issue's new worktree {} stays on disk because {why_kept}; {next}",
+        worktree_dir.display()
+    );
+    tracing::warn!(
+        worktree = %crate::config_validation::escape_field_for_log(
+            &worktree_dir.to_string_lossy(),
+            crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+        ),
+        "issue-dispatch: {kept}"
+    );
+    format!("{refusal}; {kept}")
 }
 
 /// PRD #1885: refuse — recording the refusal through `notifier` — when the
@@ -4319,6 +4380,69 @@ mod tests {
             "the next attempt reclaims it under the lock"
         );
         assert!(!wt.exists());
+    }
+
+    /// Scenario: an issue's new worktree configures an orchestration that is
+    /// not approved, so the dispatch is refused, and removing that worktree
+    /// again fails (it is locked). The refusal says the worktree stays on disk
+    /// and names it, and the leftover is marked so the next attempt retries
+    /// the removal instead of reading it as the issue being claimed (PRD #1885,
+    /// Qodo finding 7 on PR #2256).
+    #[tokio::test]
+    async fn a_trust_refusal_whose_worktree_cannot_be_removed_says_so_and_is_retried() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        // A locked worktree refuses a single `--force`.
+        git(&["worktree", "lock", &wt.to_string_lossy()]);
+
+        let message =
+            release_refused_worktree(&wt, &repo, creator(), "not approved".to_string()).await;
+        assert!(wt.exists(), "the removal really did fail");
+        assert!(
+            message.starts_with("not approved")
+                && message.contains(&wt.display().to_string())
+                && message.contains("retries"),
+            "the refusal names the leftover and says it will be retried: {message}"
+        );
+        assert!(
+            crate::worktree_owner::is_abandoned_spawn_of(&wt, &creator()),
+            "the leftover is marked as abandoned by this task for this issue"
+        );
+
+        git(&["worktree", "unlock", &wt.to_string_lossy()]);
+        let reg = new_worktree_registry();
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::Removed,
+            "the next attempt reclaims it"
+        );
+        assert!(!wt.exists());
+
+        // A removal that succeeds leaves the refusal as it was.
+        let wt2 = tmp.path().join("repo-issue-8");
+        git(&["worktree", "add", "-q", "-b", "wt2", &wt2.to_string_lossy()]);
+        assert_eq!(
+            release_refused_worktree(
+                &wt2,
+                &repo,
+                Creator::issue_dispatch("nightly", 8),
+                "not approved".to_string()
+            )
+            .await,
+            "not approved"
+        );
+        assert!(!wt2.exists());
     }
 
     /// Scenario: the same restart refusal, but `git worktree remove --force`
