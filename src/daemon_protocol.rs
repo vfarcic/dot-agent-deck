@@ -7352,10 +7352,12 @@ async fn handle_connection(
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
             // Issue #1958 (F1): a keep is latched HERE, before anything is
             // stopped and whatever else still runs in the tree, by taking the
-            // registry entry. Every removal goes through that entry, so no later
-            // cleanup — this stop's, a sibling role's earlier ordinary stop's,
-            // or a close of an agent started in the same directory afterwards —
-            // finds one to remove. Left to the cleanup after the stop, the keep
+            // registry entry. The deck's cleanups of a dispatched tree — a
+            // stop's, a close's and a failed dispatch's rollback — remove only a
+            // tree whose entry they took, so no later one — this stop's, a
+            // sibling role's earlier ordinary stop's, a close of an agent started
+            // in the same directory afterwards, or the rollback of a dispatch
+            // this stop ended while it was starting — removes it. Left to the cleanup after the stop, the keep
             // was lost to whichever of those got there first.
             //
             // If the stop then fails, the agent keeps running in a tree the

@@ -1625,10 +1625,12 @@ async fn close_one(
 
     // Issue #1958 (F1): the keep is latched here — admitted, re-validated and
     // disclosed, and before anything is stopped — by taking the worktree's
-    // registry entry, whatever else still runs in the tree. Every removal goes
-    // through that entry, so no other cleanup (an earlier ordinary stop's
-    // detached one, or a later close of another agent in the same directory)
-    // finds one to remove. If the stops below then fail, the tree stays on disk
+    // registry entry, whatever else still runs in the tree. The deck's cleanups
+    // of a dispatched tree — a stop's, a close's and a failed dispatch's
+    // rollback — remove only a tree whose entry they took, so none of them (an
+    // earlier ordinary stop's detached one, a later close of another agent in
+    // the same directory, or the rollback of a dispatch this close ended while
+    // it was starting) removes this one. If the stops below then fail, the tree stays on disk
     // with no record: no close removes it, and `dot-agent-deck worktree reclaim`
     // is how the user finds it. The entry is not put back — that would hand the
     // tree to the next ordinary close.

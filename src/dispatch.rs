@@ -1228,6 +1228,13 @@ pub async fn handle_dispatch(
                     wt = paths.worktree_dir.display(),
                     branch = paths.branch,
                 ),
+                RollbackOutcome::NotOwned => format!(
+                    " (the worktree {wt} was LEFT IN PLACE with its branch {branch}: the close \
+                     that ended this dispatch kept it. Remove both when you are done with them; \
+                     until then this dispatch name stays taken.)",
+                    wt = paths.worktree_dir.display(),
+                    branch = paths.branch,
+                ),
             };
 
             DispatchResult {
@@ -1250,6 +1257,12 @@ enum RollbackOutcome {
     /// `live` agents are still rooted in the tree, so it was left in place along
     /// with its branch and its worktree-registry entry.
     Retained { live: usize },
+    /// Issue #1958: the tree is still on disk but its registry entry is gone —
+    /// the close that ended this dispatch while it was starting took it, to
+    /// keep the tree on request or to clean it up itself, and reported what it
+    /// did. That close owns the tree's fate, so the worktree and its branch were
+    /// left in place.
+    NotOwned,
 }
 
 /// Undo a dispatch whose spawn failed — but never at the cost of deleting a
@@ -1287,6 +1300,12 @@ enum RollbackOutcome {
 /// and it finds the tree by that entry, so removing it here would strand the
 /// directory forever. Retaining the branch follows for free — `git branch -D`
 /// refuses a branch that is checked out in a live worktree anyway.
+///
+/// Issue #1958: with nothing rooted in the tree, the rollback deletes only what
+/// it took ownership of through the worktree-registry entry. A close that ended
+/// the dispatch while it was starting may have taken that entry first — to keep
+/// the tree on request, or to remove it under its policy — and has already
+/// reported what it did; on `NotOwned` the tree and its branch are left to it.
 async fn rollback_dispatched_worktree(
     registry: &Arc<AgentPtyRegistry>,
     worktrees: &WorktreeRegistry,
@@ -1309,11 +1328,34 @@ async fn rollback_dispatched_worktree(
         return RollbackOutcome::Retained { live };
     }
 
+    // Issue #1958: take cleanup ownership through the registry entry BEFORE
+    // deleting anything. A close that ended this dispatch while it was starting
+    // may already have taken the entry: a keep latches it before stopping
+    // anything, and an ordinary close takes it to remove the tree (keeping it
+    // when it holds uncommitted work). Either way that close owns the tree's
+    // fate and has already reported it, so a tree still on disk with no entry is
+    // left alone — the tree AND its branch, which is checked out there. A tree
+    // that is gone was removed by that close, and only the branch is left to
+    // free the dispatch name, as before.
+    let owned = crate::issue_dispatch_run::take_worktree(worktrees, worktree_dir);
+    if owned.is_none() && tokio::fs::metadata(worktree_dir).await.is_ok() {
+        tracing::info!(
+            worktree = %worktree_dir.display(),
+            branch = %branch,
+            "dispatch rollback: the close that ended this dispatch owns its worktree \
+             (kept on request, or kept by its own cleanup); leaving the worktree and its \
+             branch in place"
+        );
+        return RollbackOutcome::NotOwned;
+    }
+
     // `Force` is correct now that the guard above has established nothing is
     // rooted here: this worktree was created seconds ago for an agent that is not
     // running, so there is no user work to protect — and it MUST actually go, or
     // the leftover dir and branch wedge this name for every later dispatch.
-    remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await;
+    if owned.is_some() {
+        remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force).await;
+    }
     // Also delete the branch: `git worktree remove` never deletes it, but on this
     // rollback path no agent is running so there is no committed work to protect —
     // leaving the branch would wedge this name for every later dispatch.
@@ -1328,11 +1370,6 @@ async fn rollback_dispatched_worktree(
             "spawn rollback: failed to delete branch — name may be wedged for future dispatches"
         );
     }
-
-    worktrees
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .remove(worktree_dir);
 
     RollbackOutcome::Reclaimed {
         branch_cleanup_failed,
@@ -3391,6 +3428,305 @@ mod tests {
         assert!(!worktrees.lock().unwrap().contains_key(&worktree_dir));
         assert!(registry.agent_records().is_empty());
         assert_eq!(registry.dispatched_units().live().count(), 0);
+    }
+
+    /// What [`close_a_dispatch_before_publication`] left behind.
+    #[cfg(unix)]
+    struct ClosedBeforePublication {
+        tmp: tempfile::TempDir,
+        repo: PathBuf,
+        worktree_dir: PathBuf,
+        branch: String,
+        verdict: Option<crate::daemon_protocol::WorktreeVerdictKind>,
+        kept_on_request_broadcasts: usize,
+        rollback: RollbackOutcome,
+    }
+
+    /// Issue #1958 round 3: start a dispatched unit — an orchestration when
+    /// `orchestration`, else a single agent — in a real worktree whose ignored
+    /// `.dot-agent-deck/` holds a sentinel, pause it just before its
+    /// publication, close it (keeping the worktree when `keep`) and let the
+    /// close finish, then resume it and run the rollback `handle_dispatch` runs
+    /// for the `CLOSED_WHILE_STARTING` it answers.
+    #[cfg(unix)]
+    async fn close_a_dispatch_before_publication(
+        slug: &str,
+        orchestration: bool,
+        keep: bool,
+    ) -> ClosedBeforePublication {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+        use crate::spawn::{RoleSpawn, SpawnTarget};
+        struct SilentNotifier;
+        impl crate::scheduler::Notifier for SilentNotifier {
+            fn notify(&self, _event: crate::scheduler::NotifyEvent) {}
+        }
+
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        init_repo_in(tmp.path(), &repo);
+        // `.dot-agent-deck/` is ignored the way a real checkout ignores it, so
+        // the sentinel is the kind of file only a forced removal deletes.
+        std::fs::write(repo.join(".git/info/exclude"), ".dot-agent-deck/\n").unwrap();
+        let worktree_dir = repo.parent().unwrap().join(format!("repo-dispatch-{slug}"));
+        let branch = format!("agent/dispatch-{slug}");
+        create_worktree(
+            &repo,
+            &worktree_dir,
+            &branch,
+            false,
+            Creator::dispatch(slug),
+        )
+        .await
+        .unwrap();
+        std::fs::create_dir_all(worktree_dir.join(".dot-agent-deck")).unwrap();
+        std::fs::write(worktree_dir.join(".dot-agent-deck/sentinel"), "report").unwrap();
+
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let (event_tx, _keep) = tokio::sync::broadcast::channel(1024);
+        let worktrees = new_worktree_registry();
+        record_worktree(&worktrees, &worktree_dir, &repo, RemovalPolicy::KeepIfDirty);
+        struct Guard(Arc<AgentPtyRegistry>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.shutdown_all();
+            }
+        }
+        let _guard = Guard(registry.clone());
+
+        let (dispatch_reached, dispatch_release) =
+            registry.pause_at_for_test("dispatch-publication");
+        let spawned = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let event_tx = event_tx.clone();
+            let role = |idx: usize, name: &str| RoleSpawn {
+                agent_type: None,
+                role_index: idx,
+                role_name: name.to_string(),
+                command: "sleep 30".to_string(),
+                is_start_role: idx == 0,
+            };
+            let resolved_target = if orchestration {
+                SpawnTarget::Orchestration {
+                    name: slug.to_string(),
+                    roles: vec![role(0, "orchestrator"), role(1, "worker")],
+                    config: Box::new(OrchestrationConfig {
+                        default: false,
+                        name: slug.to_string(),
+                        roles: vec![OrchestrationRoleConfig {
+                            agent: None,
+                            name: "orchestrator".to_string(),
+                            command: "sleep 30".to_string(),
+                            start: true,
+                            description: None,
+                            prompt_template: None,
+                            clear: false,
+                        }],
+                    }),
+                }
+            } else {
+                SpawnTarget::SingleAgent {
+                    command: Some("sleep 30".to_string()),
+                    inherited: None,
+                }
+            };
+            let req = SpawnRequest {
+                task_name: format!("dispatch-{slug}"),
+                working_dir: worktree_dir.to_string_lossy().into_owned(),
+                command: (!orchestration).then(|| "sleep 30".to_string()),
+                prompt: "unused".to_string(),
+                resolved_target: Some(resolved_target),
+                compose_orchestrator_context: None,
+                seed_reason: None,
+            };
+            let origin = crate::dispatched_units::UnitOrigin {
+                name: slug.to_string(),
+                worktree: worktree_dir.clone(),
+                branch: branch.clone(),
+                clone_dir: repo.clone(),
+                dispatcher: crate::dispatched_units::Dispatcher {
+                    pane_id: "disp".to_string(),
+                    agent_id: "nobody".to_string(),
+                },
+            };
+            let caller = crate::dispatch_return::DispatchCaller {
+                pane_id: "disp".to_string(),
+                agent_id: "nobody".to_string(),
+                unit_name: slug.to_string(),
+            };
+            tokio::spawn(async move {
+                crate::spawn::spawn_dispatched_unit(
+                    req,
+                    &registry,
+                    &SilentNotifier,
+                    Some(&event_tx),
+                    true,
+                    Some(&state),
+                    origin,
+                    caller,
+                )
+                .await
+                .map(|handle| handle.unit_id)
+            })
+        };
+        dispatch_reached
+            .await
+            .expect("the dispatch reaches its publication");
+        let records = registry.agent_records();
+        let selector = if orchestration {
+            let orchestrator = records
+                .iter()
+                .find(|r| {
+                    matches!(
+                        &r.tab_membership,
+                        Some(crate::agent_pty::TabMembership::Orchestration {
+                            is_start_role: true,
+                            ..
+                        })
+                    )
+                })
+                .and_then(|r| r.pane_id_env.clone())
+                .expect("the orchestrator was started");
+            crate::daemon_protocol::CloseSelector::OrchestrationOf {
+                pane_id: orchestrator,
+            }
+        } else {
+            let [agent] = records.as_slice() else {
+                panic!("one agent was started: {records:?}");
+            };
+            crate::daemon_protocol::CloseSelector::Pane {
+                pane_id: agent.pane_id_env.clone().expect("the agent has a pane"),
+            }
+        };
+
+        let mut events = event_tx.subscribe();
+        let report = crate::close_agents::handle_close_agents(
+            selector, None, false, false, keep, &registry, &state, &event_tx, &worktrees,
+        )
+        .await;
+        let [target] = report.targets.as_slice() else {
+            panic!("one close target: {report:?}");
+        };
+        assert_eq!(
+            target.outcome,
+            crate::daemon_protocol::CloseOutcome::Closed,
+            "{target:?}"
+        );
+        let verdict = target.worktree_verdict.as_ref().map(|v| v.verdict);
+        let mut kept_on_request_broadcasts = 0;
+        while let Ok(msg) = events.try_recv() {
+            if let crate::event::BroadcastMsg::WorktreeKept(kept) = msg
+                && kept.on_request
+            {
+                kept_on_request_broadcasts += 1;
+            }
+        }
+
+        let _ = dispatch_release.send(());
+        let result = spawned.await.unwrap();
+        assert!(
+            matches!(&result, Err(crate::spawn::SpawnError::Agent(m))
+                if m == crate::spawn::CLOSED_WHILE_STARTING),
+            "{result:?}"
+        );
+        let rollback =
+            rollback_dispatched_worktree(&registry, &worktrees, &worktree_dir, &repo, &branch)
+                .await;
+        ClosedBeforePublication {
+            tmp,
+            repo,
+            worktree_dir,
+            branch,
+            verdict,
+            kept_on_request_broadcasts,
+            rollback,
+        }
+    }
+
+    /// Assert the worktree, its ignored sentinel and its branch all survived.
+    #[cfg(unix)]
+    fn assert_kept_with_branch(closed: &ClosedBeforePublication) {
+        assert_eq!(
+            closed.verdict,
+            Some(crate::daemon_protocol::WorktreeVerdictKind::KeptOnRequest),
+            "the close reports the keep"
+        );
+        assert_eq!(
+            closed.kept_on_request_broadcasts, 1,
+            "the keep is broadcast once"
+        );
+        assert!(
+            closed.worktree_dir.exists(),
+            "the rollback must not delete a worktree the close kept on request ({:?})",
+            closed.rollback
+        );
+        assert!(
+            closed
+                .worktree_dir
+                .join(".dot-agent-deck/sentinel")
+                .exists(),
+            "the kept tree's ignored files survive"
+        );
+        assert!(
+            branch_exists(closed.tmp.path(), &closed.repo, &closed.branch),
+            "the rollback must not delete the branch of a kept worktree"
+        );
+        assert_eq!(closed.rollback, RollbackOutcome::NotOwned);
+    }
+
+    /// Scenario: issue #1958 round 3 — a dispatched orchestration has started
+    /// its roles in a fresh worktree and pauses before publishing them. The
+    /// user closes the orchestration choosing to keep the worktree; the close
+    /// reports the worktree kept on request, once. The dispatch then resumes,
+    /// answers that it was closed while starting, and rolls back: the worktree,
+    /// an ignored `.dot-agent-deck/` file in it and its branch all survive.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_dispatch_rollback_keeps_an_orchestration_worktree_the_close_kept() {
+        let closed = close_a_dispatch_before_publication("keep-orch", true, true).await;
+        assert_kept_with_branch(&closed);
+    }
+
+    /// Scenario: issue #1958 round 3 — the same for a single dispatched agent:
+    /// closed with keep before its card is published, the dispatch's rollback
+    /// leaves the worktree, its ignored sentinel and its branch in place.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_dispatch_rollback_keeps_a_single_agent_worktree_the_close_kept() {
+        let closed = close_a_dispatch_before_publication("keep-single", false, true).await;
+        assert_kept_with_branch(&closed);
+    }
+
+    /// Scenario: issue #1958 round 3 control — the same orchestration closed
+    /// before publication WITHOUT keep: the close removes the clean worktree,
+    /// and the dispatch's rollback still deletes its branch, so the dispatch
+    /// name is free again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_dispatch_closed_without_keep_still_reclaims_its_worktree_and_branch() {
+        for (slug, orchestration) in [("nokeep-orch", true), ("nokeep-single", false)] {
+            let closed = close_a_dispatch_before_publication(slug, orchestration, false).await;
+            assert_eq!(
+                closed.verdict,
+                Some(crate::daemon_protocol::WorktreeVerdictKind::Removed),
+                "{slug}: an ordinary close removes the clean tree"
+            );
+            assert_eq!(closed.kept_on_request_broadcasts, 0, "{slug}");
+            assert_eq!(
+                closed.rollback,
+                RollbackOutcome::Reclaimed {
+                    branch_cleanup_failed: false
+                },
+                "{slug}"
+            );
+            assert!(!closed.worktree_dir.exists(), "{slug}");
+            assert!(
+                !branch_exists(closed.tmp.path(), &closed.repo, &closed.branch),
+                "{slug}: the rollback frees the dispatch name"
+            );
+        }
     }
 
     /// A shape the repo cannot satisfy must be refused BEFORE any git work, so a

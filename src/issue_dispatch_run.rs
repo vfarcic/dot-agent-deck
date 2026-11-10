@@ -169,9 +169,11 @@ pub fn worktree_of_record(record: &AgentRecord) -> Option<PathBuf> {
 /// Two kinds of caller take it. An ORDINARY cleanup takes it to remove the
 /// tree, and only once nothing it can see still runs there:
 /// [`cleanup_after_stop`] after [`worktree_still_in_use`] finds no live agent
-/// rooted in it, and `close_agents::cleanup_worktree` after it holds the
+/// rooted in it, `close_agents::cleanup_worktree` after it holds the
 /// directory against new spawns — so for a multi-role orchestration the entry
-/// survives every earlier ordinary sibling close. An EXPLICIT keep
+/// survives every earlier ordinary sibling close — and a failed dispatch's
+/// rollback (`dispatch::rollback_dispatched_worktree`), which leaves a tree
+/// still on disk whose entry it could not take. An EXPLICIT keep
 /// ([`keep_on_request`]) takes it before stopping anything, whatever siblings
 /// still run in the tree, so that no ordinary cleanup finds it afterwards.
 pub fn take_worktree(worktrees: &WorktreeRegistry, worktree_dir: &Path) -> Option<WorktreeEntry> {
