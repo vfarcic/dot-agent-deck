@@ -6176,7 +6176,7 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens; since PRD #1666 the replay is read from the role's inbox, not the recorder).
 - **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`.
-- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); a snapshot whose config no longer resolves, which is left unrestored (`session/restore/009`); a project whose orchestration is not approved (`config-trust/restore/*`) — this test pre-approves it through the harness's `trusting_project`; the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/009 — An orchestration snapshot whose config no longer resolves is left unrestored, with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift; PRD #1885 removed the plain-pane fallback).
@@ -6202,16 +6202,16 @@ without depending on the config struct API.
 
 ##### session/restore/012 — A snapshot whose `project_path` diverges from the saved pane `dir` does not auto-run the config planted at `project_path` (PRD #89 review-fix F1).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (roles run `sleep 600`; no LLM).
+- **Agent:** none (the planted config's roles run `sleep 600`; the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
 - **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — and, since PRD #1885, the saved pane is not restored as a plain `orchestrator` card either, and its saved command's sentinel file is never written; the teardown warning names `tdd-cycle` as `was not restored`, which proves the restore ran and refused. Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
-- **Does not assert:** which fix shape the coder chooses (drift fallback vs. re-resolving from `saved_pane.dir`) — only that the divergent config is not executed; path canonicalization edge cases (symlinks, `..`).
+- **Does not assert:** whether the refusal comes from re-resolving against `saved_pane.dir` or from cross-checking it against `project_path` — only that neither the divergent config nor the saved command runs; the exact warning wording; path canonicalization edge cases (symlinks, `..`).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4, RED-pending-schema).
+##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. RED-pending-schema: `OrchestrationSnapshot` has no `display_title` field yet (the staged key parses but is dropped on load, since the struct sets no `deny_unknown_fields`) and restore passes `None` to `open_orchestration_tab`, so the tab comes back titled `tdd-cycle`; goes GREEN once the coder adds the field + capture + restore threading.
-- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
+- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. It was written RED, before `OrchestrationSnapshot` carried a `display_title` field, when the staged key was dropped on load and the tab came back titled `tdd-cycle`.
+- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the field in isolation (`src/config.rs` unit tests); an unapproved project (this test pre-approves it through the harness's `trusting_project`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/014 — A restored pane whose command identifies a supported agent immediately shows that agent as Idle.
@@ -7630,7 +7630,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009`).
 - **Agent:** none.
 - **Asserts:** two legs on the same fixture tab shape (`[orchestrator, coder]`). Leg 1 — with the current config reading `[orchestrator, coder, reviewer]`, growing with `reviewer` still lands it last (returned index 2, vectors `[orchestrator, coder, reviewer]`, `start_role_index` unmoved): the case that was accidentally correct before placement existed must stay correct. Leg 2 — with a current config that does not mention `reviewer` at all, the growth still succeeds and appends (returned index 2), so placement degrades to the pre-#1096 behaviour rather than panicking or picking an arbitrary slot.
-- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement and still falls back to a plain pane.
+- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement, and since PRD #1885 the snapshot is left unrestored with a warning rather than restored as a plain pane (`config-trust/restore/003`).
 - **Platform coverage:** mac+linux (unix-only).
 
 ##### pane/spawn/016 — A role inserted BEFORE the start role carries `start_role_index` along with it (issue #1096).

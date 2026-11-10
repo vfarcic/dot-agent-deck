@@ -625,10 +625,10 @@ fn restore_010_zero_role_reresolved_orchestration_is_left_unrestored_without_pan
 /// the inbox of the role at the SAVED index (`coder`, index 1), NOT to the
 /// config-default start role (`orchestrator`, index 0) — and `daemon status`
 /// must mark that same saved role, and only it, as the orchestrator, so the
-/// pane holding the prompt is the pane allowed to delegate. RED today: the restore
-/// branch recomputes the start from the live config
-/// (`roles.iter().position(|r| r.start)`) and never reads `snap.start_role_index`,
-/// so the prompt is delivered to `orchestrator` and `coder` never receives it.
+/// pane holding the prompt is the pane allowed to delegate. It was written RED,
+/// when the restore branch recomputed the start from the live config
+/// (`roles.iter().position(|r| r.start)`) and never read `snap.start_role_index`,
+/// so the prompt went to `orchestrator` and `coder` never received it.
 #[spec("session/restore/011")]
 #[test]
 fn restore_011_saved_start_role_index_is_honored_over_config_default() {
@@ -995,11 +995,9 @@ fn restore_012_divergent_project_path_does_not_auto_run_planted_config() {
 /// (`MYDECKTITLE`) distinct from the canonical config name. Launch against a
 /// fresh (empty) daemon with NO flag. The rebuilt orchestration tab must show the
 /// user's saved title in the tab bar — not the canonical `tdd-cycle` config/cwd
-/// name. RED today (RED-pending-schema): `OrchestrationSnapshot` has no
-/// `display_title` field and restore passes `None` to `open_orchestration_tab`,
-/// so the staged key is dropped on load and the tab comes back titled
-/// `tdd-cycle`. Goes GREEN once the coder adds the field, captures it, and
-/// threads it through restore.
+/// name. It was written RED, before `OrchestrationSnapshot` carried a
+/// `display_title` field, when the staged key was dropped on load and the tab
+/// came back titled `tdd-cycle`.
 #[spec("session/restore/013")]
 #[test]
 fn restore_013_custom_orchestration_tab_title_is_preserved_on_restore() {
