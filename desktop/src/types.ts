@@ -1334,7 +1334,7 @@ export type DeckAction =
    * `displayTitle` is the run's name — absent when the form's Name is empty, so
    * the run takes the orchestration's name, as `start_orchestration`'s does.
    */
-  | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks

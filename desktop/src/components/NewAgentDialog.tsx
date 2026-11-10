@@ -3,7 +3,7 @@ import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } 
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
 import { ProjectTrustDialog } from "./ProjectTrustDialog";
-import { isNotApproved, REVIEW_FIRST, useProjectTrustReview } from "../lib/projectTrust";
+import { isNotApproved, REVIEW_FIRST, useProjectTrustReview, type ProjectTrustView } from "../lib/projectTrust";
 import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
@@ -569,7 +569,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
   /** PRD #1885 — the review of an orchestration's commands and prompts before it starts. */
   const trust = useProjectTrustReview(runtime);
   const approveTrust = trust.approve;
-  const approveReviewed = useCallback(() => { void approveTrust(); }, [approveTrust]);
+  const approveReviewed = useCallback((token: string) => { void approveTrust(token); }, [approveTrust]);
 
   /**
    * Every way out of the dialog — the header's close button, Esc, a backdrop
@@ -1518,7 +1518,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
      * user approves that text.
      */
     const launch = { deck, path: orchestrations.path, configRevision: orchestrations.configRevision, name };
-    const checked = await trust.check({ deckId: deck.deckId, path: launch.path, orchestration: orchestration.name }, () => launchOrchestration(orchestration, launch, true));
+    const checked = await trust.check({ deckId: deck.deckId, path: launch.path, orchestration: orchestration.name }, (approved) => launchOrchestration(orchestration, approvedLaunch(launch, approved), true), { deckName: deck.name });
     if (checked.kind === "approved") {
       await launchOrchestration(orchestration, launch, false);
       return;
@@ -1530,6 +1530,19 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     }
     setPhase("idle");
   };
+
+  /**
+   * PRD #1885 review — the launch after the user approved the text the review
+   * showed: with the config revision of THAT text, which the deck read when it
+   * answered the approval, rather than the one the orchestrations were listed
+   * at. After a `trust-text-changed` refresh those differ, and the listed one
+   * would be refused as stale although the user approved the current text. A
+   * config that moves again after the approval is still refused by the deck's
+   * revision check.
+   */
+  const approvedLaunch = <T extends { configRevision?: string }>(launch: T, approved: ProjectTrustView): T => (
+    approved.configRevision === undefined ? launch : { ...launch, configRevision: approved.configRevision }
+  );
 
   /**
    * The launch itself, once the deck has said the orchestration is approved.
@@ -1569,7 +1582,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
       // PRD #1885: the deck refused it as not approved — its config changed
       // after the check. Show the text it has now; nothing was started.
       if (!afterReview && mounted.current && isNotApproved(messageOf(cause))) {
-        const checked = await trust.check({ deckId: chosen.deckId, path: launch.path, orchestration: orchestration.name }, () => launchOrchestration(orchestration, launch, true));
+        const checked = await trust.check({ deckId: chosen.deckId, path: launch.path, orchestration: orchestration.name }, (approved) => launchOrchestration(orchestration, approvedLaunch(launch, approved), true), { deckName: chosen.name });
         if (checked.kind === "review") {
           runtime.clearError();
           setPhase("idle");

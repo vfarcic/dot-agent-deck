@@ -1837,7 +1837,7 @@ export type DesktopRunActionDto =
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
-  | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
 
@@ -3934,7 +3934,7 @@ class FixtureDeckBridge implements DeckBridge {
       project: target.path,
       orchestration: target.orchestration,
       state: "approved",
-      roles: roles.map((role) => ({ name: role.name, command: FIXTURE_ROLE_COMMANDS[role.name] ?? "" })),
+      roles: roles.map((role) => ({ name: role.name, command: FIXTURE_ROLE_COMMANDS[role.name] ?? "", start: role.start, clear: true })),
       removedRoles: [],
       digest: "fixture-digest",
     };

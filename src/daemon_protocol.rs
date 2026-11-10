@@ -8227,17 +8227,7 @@ async fn handle_connection(
                 Ok(()) => project_trust_reply(
                     crate::project_resolve::run_bounded(move || {
                         let dir = trust_config_dir(&path)?;
-                        let config = read_trust_config(&dir)?;
-                        let approvals = crate::project_trust::TrustStore::default_location()
-                            .load()
-                            .map_err(crate::project_trust::TrustError::Store)?;
-                        crate::project_trust::inspect_config(
-                            &approvals,
-                            &dir,
-                            &config,
-                            &orchestration,
-                        )
-                        .map(|check| check.view())
+                        trust_view_now(&dir, &orchestration)
                     })
                     .await,
                 ),
@@ -8268,17 +8258,7 @@ async fn handle_connection(
                                     orchestration = %orchestration,
                                     "a client approved the orchestration's commands and prompts"
                                 );
-                                let approvals = store
-                                    .load()
-                                    .map_err(crate::project_trust::TrustError::Store)?;
-                                let config = read_trust_config(&dir)?;
-                                crate::project_trust::inspect_config(
-                                    &approvals,
-                                    &dir,
-                                    &config,
-                                    &orchestration,
-                                )
-                                .map(|check| check.view())
+                                trust_view_now(&dir, &orchestration)
                             }
                             crate::project_trust::ApproveOutcome::Stale => {
                                 Err(crate::project_trust::TrustError::Config(format!(
@@ -8718,6 +8698,33 @@ fn read_trust_config(
             "{PROJECT_ERR_UNRESOLVED}: that project's config could not be read"
         ))
     })
+}
+
+/// PRD #1885: the trust view of `orchestration` in the config in `dir`, read
+/// now, carrying the [`crate::project_resolve::config_revision`] of the same
+/// bytes the roles were read from. A client that approves this text launches
+/// with that revision, so an approval of text the user was re-shown after it
+/// changed does not start against the revision listed before the change (and
+/// get refused as stale), while a config that moves again after this read is
+/// still refused by the launch's own revision check.
+fn trust_view_now(
+    dir: &std::path::Path,
+    orchestration: &str,
+) -> Result<crate::project_trust::ProjectTrustView, crate::project_trust::TrustError> {
+    let (config, revision) = crate::project_resolve::read_project_config_with_revision(dir)
+        .map_err(|e| {
+            warn!(project = %dir.display(), reason = %e, "project trust: the config did not read");
+            crate::project_trust::TrustError::Config(format!(
+                "{PROJECT_ERR_UNRESOLVED}: that project's config could not be read"
+            ))
+        })?;
+    let approvals = crate::project_trust::TrustStore::default_location()
+        .load()
+        .map_err(crate::project_trust::TrustError::Store)?;
+    let mut view =
+        crate::project_trust::inspect_config(&approvals, dir, &config, orchestration)?.view();
+    view.config_revision = Some(revision);
+    Ok(view)
 }
 
 /// PRD #1885: the reply to a trust request.
@@ -10283,6 +10290,44 @@ mod fence_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #1885 review (reviewer 4). Scenario: a client asks for the trust
+    /// view of an orchestration, then the project's config changes and it asks
+    /// again, as the review does after `trust-text-changed`. Each view carries
+    /// the config revision of the bytes it was read from — the one
+    /// `resolve-project` reports for the same bytes — so a launch after
+    /// approving the re-shown text sends the revision of that text instead of
+    /// the one listed before the change.
+    #[test]
+    fn trust_view_now_carries_the_revision_of_the_bytes_it_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::project_resolve::canonicalize_project_dir(tmp.path()).unwrap();
+        let team = |command: &str| {
+            format!(
+                "[[orchestrations]]\nname = \"team\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{command}\"\nstart = true\n"
+            )
+        };
+        std::fs::write(
+            dir.join(crate::project_config::CONFIG_FILE_NAME),
+            team("cat"),
+        )
+        .unwrap();
+        let first = trust_view_now(&dir, "team").unwrap();
+        let listed = crate::project_resolve::resolve_project(&dir).unwrap();
+        assert!(first.config_revision.is_some(), "{first:?}");
+        assert_eq!(first.config_revision, listed.config_revision);
+
+        std::fs::write(
+            dir.join(crate::project_config::CONFIG_FILE_NAME),
+            team("sh ./agent.sh"),
+        )
+        .unwrap();
+        let second = trust_view_now(&dir, "team").unwrap();
+        let relisted = crate::project_resolve::resolve_project(&dir).unwrap();
+        assert_ne!(second.config_revision, first.config_revision);
+        assert_eq!(second.config_revision, relisted.config_revision);
+        assert_eq!(second.roles[0].text.command, "sh ./agent.sh");
+    }
     use spec::spec;
 
     /// Audit F2: the attach `post-message` verb refuses a body over the inbox's

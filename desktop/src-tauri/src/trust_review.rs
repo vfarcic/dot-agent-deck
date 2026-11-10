@@ -80,6 +80,12 @@ pub struct DesktopProjectTrustView {
     pub removed_roles: Vec<String>,
     /// The digest of exactly this text, which the approval carries back.
     pub digest: String,
+    /// The config revision of the bytes this text was read from. A launch
+    /// after approving this text sends it, so an approval of text re-shown
+    /// after a change starts against that text's revision rather than the
+    /// one listed before the change. Absent from a deck that does not send it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
 }
 
 /// One role as the dialog shows it.
@@ -94,6 +100,12 @@ pub struct DesktopTrustRole {
     pub command: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// The role's `start` flag: the orchestration starts with this role. Part
+    /// of what is approved, so it is shown.
+    pub start: bool,
+    /// The role's `clear` flag: its agent is restarted before each task. Part
+    /// of what is approved, so it is shown.
+    pub clear: bool,
     /// One escaped string per line; absent when the role has none.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<Vec<String>>,
@@ -133,6 +145,8 @@ macro_rules! review_from_view {
                     change: role.change.map(|change| change.word().to_string()),
                     command: escape_control_and_bidi(&role.text.command),
                     agent: role.text.agent.as_deref().map(escape_control_and_bidi),
+                    start: role.text.start,
+                    clear: role.text.clear,
                     description: role.text.description.as_deref().map(escaped_lines),
                     prompt: role.text.prompt_template.as_deref().map(escaped_lines),
                 })
@@ -143,6 +157,7 @@ macro_rules! review_from_view {
                 .map(|name| escape_control_and_bidi(name))
                 .collect(),
             digest: view.digest.clone(),
+            config_revision: view.config_revision.clone(),
         }
     }};
 }
@@ -297,12 +312,95 @@ mod tests {
                 "changed",
                 dot_agent_deck::trust_prompt::CHANGED_SINCE_APPROVAL,
             ),
+            ("start label", dot_agent_deck::trust_prompt::START_LABEL),
+            ("start = true", dot_agent_deck::trust_prompt::START_TRUE),
+            ("start = false", dot_agent_deck::trust_prompt::START_FALSE),
+            ("clear label", dot_agent_deck::trust_prompt::CLEAR_LABEL),
+            ("clear = true", dot_agent_deck::trust_prompt::CLEAR_TRUE),
+            ("clear = false", dot_agent_deck::trust_prompt::CLEAR_FALSE),
         ] {
             assert!(
                 words.contains(&format!("\"{word}\"")),
                 "projectTrust.ts must carry the TUI's {what} word {word:?}"
             );
         }
+    }
+
+    /// Stand-ins with the crate view's field names, which the macro reads by
+    /// name (the crate type's module is outside what the desktop imports).
+    #[derive(Clone, Copy)]
+    struct FakeChange;
+    impl FakeChange {
+        fn word(&self) -> &'static str {
+            "changed"
+        }
+    }
+    struct FakeText {
+        name: String,
+        command: String,
+        agent: Option<String>,
+        start: bool,
+        clear: bool,
+        description: Option<String>,
+        prompt_template: Option<String>,
+    }
+    struct FakeRole {
+        text: FakeText,
+        change: Option<FakeChange>,
+    }
+    struct FakeView {
+        project: String,
+        config_dir: String,
+        orchestration: String,
+        state: String,
+        roles: Vec<FakeRole>,
+        removed_roles: Vec<String>,
+        digest: String,
+        config_revision: Option<String>,
+    }
+
+    /// PRD #1885 review (reviewer 3, reviewer 4). Scenario: the deck answers a
+    /// review whose only change is a role's `clear` flag, with the config
+    /// revision it read. The dialog's DTO carries both flags of every role and
+    /// that revision, so the dialog can show a flag-only change and the launch
+    /// can use the revision of the text approved.
+    #[test]
+    fn the_review_carries_start_clear_and_the_config_revision() {
+        let role = |name: &str, start: bool, clear: bool, change: Option<FakeChange>| FakeRole {
+            text: FakeText {
+                name: name.into(),
+                command: "cat".into(),
+                agent: None,
+                start,
+                clear,
+                description: None,
+                prompt_template: None,
+            },
+            change,
+        };
+        let view = FakeView {
+            project: "/srv/demo".into(),
+            config_dir: "/srv/demo".into(),
+            orchestration: "team".into(),
+            state: "changed".into(),
+            roles: vec![
+                role("orchestrator", true, true, None),
+                role("coder", false, false, Some(FakeChange)),
+            ],
+            removed_roles: Vec::new(),
+            digest: "ab".into(),
+            config_revision: Some("fnv1a128-01".into()),
+        };
+        let shown = review_from_view!(&view);
+        assert_eq!(shown.config_revision.as_deref(), Some("fnv1a128-01"));
+        assert!(shown.roles[0].start && shown.roles[0].clear);
+        assert!(!shown.roles[1].start && !shown.roles[1].clear);
+        assert_eq!(shown.roles[1].change.as_deref(), Some("changed"));
+        let json = serde_json::to_value(DesktopProjectTrust::Review(shown)).unwrap();
+        assert_eq!(json["configRevision"], "fnv1a128-01");
+        assert_eq!(json["roles"][1]["start"], false);
+        assert_eq!(json["roles"][1]["clear"], false);
+        assert_eq!(json["roles"][0]["start"], true);
     }
 
     /// Escaped one line at a time, as the TUI draws them: an ESC and a bidi

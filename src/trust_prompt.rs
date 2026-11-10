@@ -40,6 +40,28 @@ pub const NOT_APPROVED_BEFORE: &str = "not approved before";
 /// What it says of one whose approved text changed.
 pub const CHANGED_SINCE_APPROVAL: &str = "changed since you approved it";
 
+/// The label of a role's `start` flag. The prompt shows the flag on every role
+/// in both clients (`desktop/src/lib/projectTrust.ts` carries the same words),
+/// so moving the orchestration's start role, or nothing but a flag, is visible.
+pub const START_LABEL: &str = "start";
+
+/// The value shown for `start = true`: the orchestration starts with this role.
+pub const START_TRUE: &str = "true — the orchestration starts with this role";
+
+/// The value shown for `start = false`.
+pub const START_FALSE: &str = "false";
+
+/// The label of a role's `clear` flag.
+pub const CLEAR_LABEL: &str = "clear";
+
+/// The value shown for `clear = true`: the role's agent is restarted before
+/// each task it is given.
+pub const CLEAR_TRUE: &str = "true — restarted before each task";
+
+/// The value shown for `clear = false`: the role's agent keeps running between
+/// tasks.
+pub const CLEAR_FALSE: &str = "false — keeps running between tasks";
+
 /// The status line when the daemon approved the orchestration but the TUI's
 /// own read of the config no longer matches what was approved: the file moved
 /// again while it was being opened, so nothing was started.
@@ -473,6 +495,7 @@ mod tests {
                 .collect(),
             removed_roles: Vec::new(),
             digest: "d".to_string(),
+            config_revision: None,
         }
     }
 

@@ -840,6 +840,13 @@ pub struct ProjectTrustView {
     pub removed_roles: Vec<String>,
     /// [`digest`] of the text in `roles`, for `project`/`orchestration`.
     pub digest: String,
+    /// The [`crate::project_resolve::config_revision`] of the config bytes
+    /// this view was read from, so a client that approves the text shown can
+    /// launch with the revision of that same read rather than one it listed
+    /// earlier. `None` from [`TrustCheck::view`], which has no bytes; the
+    /// daemon's trust replies fill it in. Additive and optional on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_revision: Option<String>,
 }
 
 /// One role in a [`ProjectTrustView`]: its recorded text and how it compares.
@@ -874,6 +881,7 @@ impl TrustCheck {
                 _ => Vec::new(),
             },
             digest: self.digest(),
+            config_revision: None,
         }
     }
 }

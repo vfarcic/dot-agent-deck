@@ -231,7 +231,7 @@ Typing into the agent does not work while the page is open over its pane: close 
 
 ## Approving project commands
 
-While **Review project commands** is open ([Approving Project Commands](../project-trust.md)), say **"approve and start"**, or any request that says *approve*, such as "approve the commands" or "I approve", to press **Approve and start**: it approves exactly the text on screen and starts the orchestration. A start that does not say *approve*, such as "start it" or "go ahead", does not approve anything. Say **"cancel"**, **"never mind"** or **"close"** to cancel the review, which starts nothing. With no review open, the app says there is nothing to approve.
+While **Review project commands** is open ([Approving Project Commands](../project-trust.md)), say **"approve and start"**, or any request that says *approve*, such as "approve the commands" or "I approve", to press **Approve and start**: it approves exactly the text on screen and starts the orchestration. A start that does not say *approve*, such as "start it" or "go ahead", does not approve anything. Say **"cancel"**, **"never mind"** or **"close"** to cancel the review, which starts nothing. With no review open, the app says there is nothing to approve. An approval applies only to the review that was on screen when you spoke: if it was cancelled, replaced by another, or re-shown with changed text before your words were understood, nothing is approved and the app asks you to look again.
 
 ## Checking a daemon's machine
 

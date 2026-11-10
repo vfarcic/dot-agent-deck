@@ -6191,6 +6191,7 @@ mod tests {
     #[cfg(unix)]
     fn runs_launch(cwd: &std::path::Path) -> crate::ActivateOrchestrationRequest {
         crate::ActivateOrchestrationRequest {
+            deck_id: None,
             name: "review".into(),
             display_title: None,
             cwd: cwd.to_string_lossy().into_owned(),
@@ -6227,6 +6228,58 @@ mod tests {
             );
         }
         assert_eq!(state.daemon.handshake_count(), 0, "no deck was contacted");
+    }
+
+    /// PRD #1885 review (auditor 4, reviewer 5). Scenario: the local deck is a
+    /// real daemon and is the selected deck, and a Runs launch names the deck
+    /// its project-commands review was approved on — one this app no longer
+    /// observes. The launch is refused with the unobserved-deck sentence and
+    /// contacts no deck: a launch that names its deck never falls back to the
+    /// selection. As a control, the same launch naming no deck reaches the
+    /// selected deck, which is what makes "no handshake" mean something.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runs_launch_naming_its_deck_never_falls_back_to_the_selected_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("1885-runs-named-deck");
+        let (settings, _remote) = all_decks_with_one_remote_row("build-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let mut only_local = settings.clone();
+        only_local
+            .endpoints
+            .as_mut()
+            .expect("built with an [endpoints] section")
+            .selection = crate::settings::Selection::Local;
+        crate::dto::apply_settings_selection(&only_local);
+        let state = crate::terminal::DesktopState::default();
+
+        let mut named = runs_launch(&local.dir);
+        named.deck_id = Some("deck-00000000000000ff".into());
+        let refused = crate::activate_orchestration_action(&state, named).await;
+        let handshakes_named = state.daemon.handshake_count();
+        let control = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
+        let handshakes_control = state.daemon.handshake_count();
+        local.shutdown();
+
+        let Err(refused) = refused else {
+            panic!("a launch naming a deck this app does not observe is refused");
+        };
+        assert!(
+            refused
+                .message()
+                .contains("that daemon is not one this app is observing"),
+            "{}",
+            refused.message()
+        );
+        assert_eq!(
+            handshakes_named, 0,
+            "no deck was contacted for the named one"
+        );
+        assert!(
+            handshakes_control > 0,
+            "the control launch, naming no deck, reached the selected deck: {:?}",
+            control.err().map(|e| e.message().to_string())
+        );
     }
 
     /// Scenario (#1083): the local deck is a real daemon running one agent,

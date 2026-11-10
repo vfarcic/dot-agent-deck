@@ -20,7 +20,8 @@ The review is titled **Review project commands** and shows:
 - **Project:** the project's directory. For a linked git worktree this is the matching directory of the repository's main checkout, and a **Config in:** line names the worktree directory whose `.dot-agent-deck.toml` is being read.
 - **Orchestration:** its name.
 - **State:** `not approved before`, or `changed since you approved it`.
-- For each role: its name, then `command`, `agent` (when the role sets one), `description` and `prompt` (the role's `prompt_template`), in full. A role whose text changed since your approval is marked `changed`, and one your approval did not have is marked `new`.
+- For each role: its name, then `command`, `agent` (when the role sets one), `start` (`true` on the role the orchestration starts with), `clear` (`true` when the role's agent is restarted before each task, `false` when it keeps running between tasks), `description` and `prompt` (the role's `prompt_template`), in full. A role whose text changed since your approval is marked `changed`, and one your approval did not have is marked `new`.
+- **Deck:** in the desktop app, the deck the orchestration would start on. The approval is recorded on that deck and the orchestration starts there. If you switch to another deck while the review is open, the review closes and nothing is approved or started.
 - **Removed since you approved it:** the roles your approval had that the file no longer defines.
 
 Read the commands and prompts as what they are: commands that will run as you, and instructions your agents will follow. Characters that could hide or disguise text, such as terminal control sequences, are shown as escapes (for example `\u{1b}`) rather than obeyed, in both clients and on the command line.
@@ -40,6 +41,8 @@ Read the commands and prompts as what they are: commands that will run as you, a
 **Desktop app:** the **Review project commands** dialog shows the same text. Press **Approve and start** to approve it and start the orchestration, or **Cancel** (or `Esc`) to start and remember nothing. `Enter` does not approve here either. With [voice control](desktop/voice.md#approving-project-commands) on, say "approve and start" (any request that says *approve*, such as "approve the commands"); "cancel" or "close" cancels.
 
 If the file changes while the review is open, approving does not approve the new text: the review shows the new text instead, and you answer again.
+
+In the desktop app, after you press **Approve and start** the dialog says the approval has been sent. **Cancel** still works then: nothing starts, but the deck may already have recorded the approval. Run `dot-agent-deck trust revoke` on the deck's host if you did not mean to approve it. A spoken "approve" applies only to the review that was on screen when you said it: if that review closed or its text changed before the words were understood, nothing is approved, and you are asked to look again.
 
 ## What is remembered
 
@@ -113,6 +116,7 @@ An older TUI or desktop app against a daemon from this release cannot show the r
 The review is about the commands and instructions in a project's `.dot-agent-deck.toml`. It does not stop everything a project can make your machine run:
 
 - **Programs running as you can approve.** The approvals file and the `trust` command are reachable by any program running under your user account, agents included. The deck refuses `trust approve` inside its own panes, but a program that clears the deck's environment, or writes the file itself, is not stopped. Treat an agent with shell access as able to approve.
+- **Where approvals are kept follows the daemon's environment.** The daemon reads its approvals from the state directory that `DOT_AGENT_DECK_STATE_DIR` or `XDG_STATE_HOME` points at when it starts. A daemon started from a shell that loaded a project's environment, for example a `devbox shell` whose init hook loads the project's `.env`, can therefore be pointed at an approvals file the project chose. Start the daemon from a shell of your own, not from inside a project's environment.
 - **What the approved commands run next.** The review shows a role's `command`, such as `devbox run agent-coder`. What that runs is decided by other files in the project, such as `devbox.json`, scripts and build files, and the deck does not review those. A dispatched unit's worktree setup (its `devbox` environment) is prepared only after the orchestration's approval is checked, but `devbox.json` itself is not reviewed.
 - **Commands you start yourself.** A single agent from the New Agent form runs the command you typed; `dot-agent-deck dispatch --command` runs the command it is given; a schedule's own `command` comes from your schedules file. None of these comes from a project file, so none is reviewed.
 - **The desktop app's own agent profiles.** Commands you set in the app's experimental agent profiles are your own settings and are not reviewed; the project prompts an orchestration started from the deck screen hands its agents are.

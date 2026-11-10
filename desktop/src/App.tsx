@@ -92,7 +92,7 @@ import { deckScreenSnapshot } from "./lib/deckScreen";
 import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
-import { approveShownReview, isNotApproved, useProjectTrustReview } from "./lib/projectTrust";
+import { approveShownReview, isNotApproved, REVIEW_DECK_CHANGED, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
@@ -1088,7 +1088,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const readPager = useCallback((): VoicePager | undefined => (
     dialogLayerUp() ? pagerLayers.current.dialog : pagerLayers.current.screen
   ), [dialogLayerUp]);
-  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
+  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto, declaredTrustReview?: string) => {
     const previous = view;
     /*
       One target for every entry, built from the outcome's own resolved params —
@@ -1193,8 +1193,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       closeOverlays: railContext.closeOverlays,
       /* PRD #1885 — the review dialog's Approve and start, wherever it is open:
          over the New agent dialog or over the Runs screen. With none open it
-         answers that there is nothing to approve. */
-      approveProjectCommands: approveShownReview,
+         answers that there is nothing to approve. Bound to the review that
+         was on screen when the words were DECLARED (its token): one cancelled
+         and replaced, or re-shown with new text, while the words were being
+         worked out is not approved (PRD #1885 review, auditor 3). */
+      approveProjectCommands: () => approveShownReview(declaredTrustReview),
       /* Only while Settings is open and nothing is drawn over it, so `close`
          reads its presence as "Settings is on top" (#1197, PR #1680 review). */
       ...(overlaysOpen.settings && !overlayAbove(document.querySelector(SETTINGS_PANEL)) ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
@@ -1825,7 +1828,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   /* PRD #1885 — the Runs screen's review of a project's commands before Activate. */
   const trustReview = useProjectTrustReview(runtime);
   const approveTrustReview = trustReview.approve;
-  const approveReviewed = useCallback(() => { void approveTrustReview(); }, [approveTrustReview]);
+  const approveReviewed = useCallback((token: string) => { void approveTrustReview(token); }, [approveTrustReview]);
   const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
      or closes, exactly as the overview reports its own: the voice panel's gate
@@ -2349,7 +2352,26 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     });
   };
 
+  /*
+   * PRD #1885 review (auditor 4, reviewer 5) — a Runs review is bound to the
+   * deck it was asked of. Its query, its approval and the activation all name
+   * that deck (below), and when the selected deck changes while it is open
+   * the review closes: the user is no longer looking at the deck they would be
+   * approving on. Identical project paths and config text on two decks do not
+   * carry consent from one deck's approvals to the other's.
+   */
+  const shownTrustReview = trustReview.shown;
+  const cancelTrustReview = trustReview.cancel;
+  useEffect(() => {
+    if (shownTrustReview === undefined || shownTrustReview.target.deckId === orchestrationDeckId) return;
+    cancelTrustReview();
+    setNotice(REVIEW_DECK_CHANGED);
+  }, [shownTrustReview, orchestrationDeckId, cancelTrustReview]);
+
   const requestLaunch = (config: OrchestrationLaunchConfig) => {
+    /* The deck this launch is for: the one selected when Activate is pressed. */
+    const deckId = orchestrationDeckId;
+    const launchDeckName = deckName(snapshot.connection);
     const generatedCount = config.roles.length - config.customCommandCount;
     const commandCopy = config.customCommandCount > 0
       ? `${generatedCount} commands are generated from their current profile fields; ${config.customCommandCount} explicit custom command override${config.customCommandCount === 1 ? " bypasses" : "s bypass"} those fields. Custom commands may carry arbitrary permissions and are not covered by structured permission claims.`
@@ -2369,16 +2391,27 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
          * PRD #1885 — ask the deck first. An approved, unchanged orchestration
          * activates exactly as before; otherwise the review dialog shows what
          * it would run, and nothing starts until the user approves that text.
-         * The Runs screen's launch goes to the selected deck, so the review
-         * names no deck either.
+         * The review, its approval and the activation name the deck selected
+         * when Activate was pressed, and the dialog says which deck that is.
          */
-        const trustTarget = { path: config.cwd, orchestration: config.name };
-        const checked = await trustReview.check(trustTarget, () => activateLaunch(config, true));
-        if (checked.kind === "approved") await activateLaunch(config, false);
+        const trustTarget = { ...(deckId === undefined ? {} : { deckId }), path: config.cwd, orchestration: config.name };
+        const checked = await trustReview.check(trustTarget, (approved) => activateLaunch(approvedConfig(config, approved), true, deckId), { deckName: launchDeckName });
+        if (checked.kind === "approved") await activateLaunch(config, false, deckId);
         else if (checked.kind === "refused") setNotice(checked.reason);
       },
     });
   };
+
+  /**
+   * PRD #1885 review — after the user approved the text the review showed,
+   * activate with the config revision of THAT text (the deck's read when it
+   * answered the approval), not the one the project was resolved at: after a
+   * `trust-text-changed` refresh the two differ and the old one is refused as
+   * stale. A config that moves again afterwards is still refused.
+   */
+  const approvedConfig = (config: OrchestrationLaunchConfig, approved: ProjectTrustView): OrchestrationLaunchConfig => (
+    approved.configRevision === undefined ? config : { ...config, configRevision: approved.configRevision }
+  );
 
   /**
    * The Runs screen's activation itself, once the deck has said the
@@ -2387,7 +2420,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
    * config changed again in between) is said rather than reviewed a second
    * time, so the two can never loop.
    */
-  const activateLaunch = async (config: OrchestrationLaunchConfig, afterReview: boolean) => {
+  const activateLaunch = async (config: OrchestrationLaunchConfig, afterReview: boolean, deckId: string | undefined) => {
     // `displayTitle` is NOT a display twin: it rides along as the run's
     // title (issue #1044), absent when the Name was left empty. The
     // sheet's collision check ran when Activate was pressed; it runs again
@@ -2402,7 +2435,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       // dialog and the notice, and the daemon gets the identities alone
       // (PRD #819 audit fix).
       const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
-      await runtime.runAction({ type: "activate_orchestration", ...launch });
+      await runtime.runAction({ type: "activate_orchestration", ...launch, ...(deckId === undefined ? {} : { deckId }) });
       setOverlay("orchestration", false);
       await runtime.reconnect();
       setNotice(`${config.displayName} activated with ${config.roles.length} configured roles.`);
@@ -2484,7 +2517,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
        * after the check above. Review the text it now has; nothing started.
        */
       if (!afterReview && isNotApproved(message)) {
-        const checked = await trustReview.check({ path: config.cwd, orchestration: config.name }, () => activateLaunch(config, true));
+        const checked = await trustReview.check({ ...(deckId === undefined ? {} : { deckId }), path: config.cwd, orchestration: config.name }, (approved) => activateLaunch(approvedConfig(config, approved), true, deckId), { deckName: deckName(snapshot.connection) });
         if (checked.kind === "review") {
           runtime.clearError();
           return;
