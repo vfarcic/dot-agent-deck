@@ -65,7 +65,11 @@ answer() {
   fi
 }
 case "$*" in
-  "pr view "*) answer pr ;;
+  "pr view "*)
+    # The second read of the head answers pr_later when a test provides one.
+    if [ -f "$REVIEW_STUB/pr.seen" ] && [ -f "$REVIEW_STUB/pr_later.json" ]; then answer pr_later
+    else touch "$REVIEW_STUB/pr.seen"; answer pr
+    fi ;;
   "api repos/{owner}/{repo}/issues/"*"/comments --paginate") answer comments ;;
   "api graphql --paginate "*) answer threads ;;
   *) echo "gh stand-in: unhandled invocation: $*" >&2; exit 1 ;;
@@ -610,4 +614,21 @@ fn review_findings_011_answering_a_longer_title_does_not_answer_a_shorter_one_in
         text.contains(&format!("ANSWERED=Qodo 2 comment: {short}\n")),
         "{text}"
     );
+}
+
+#[test]
+fn review_findings_012_a_head_that_moves_during_the_reads_is_an_error() {
+    if !tools_present() {
+        return;
+    }
+    let sb = Sandbox::new();
+    sb.answer(
+        "pr_later",
+        &json!({"headRefOid": "b".repeat(40), "url": "https://github.com/o/r/pull/42"}),
+    );
+    let out = sb.run();
+    let text = stdout(&out);
+    assert_eq!(out.status.code(), Some(2), "{text}");
+    assert!(text.contains("during the reads; run again"), "{text}");
+    assert!(!text.contains("FINDINGS="), "{text}");
 }

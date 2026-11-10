@@ -53,7 +53,8 @@
 # title in your reply; numbers change between Qodo's reviews, titles do not.
 #
 # Exit status is 0 whenever FINDINGS= was printed, and 2 with ERROR= on bad
-# usage, a malformed reviewers.json, or a GitHub read that failed.
+# usage, a malformed reviewers.json, a GitHub read that failed, or a head
+# that moved while the script was reading.
 #
 # REVIEWERS_FILE overrides the registry path; it exists for the tests in
 # xtask/linkage-check/src/review_findings.rs.
@@ -102,6 +103,16 @@ gh api graphql --paginate \
   -f o="$owner" -f r="$repo" -F n="$pr" >"$tmp/threads.raw" 2>/dev/null &&
   jq -s '[.[].data.repository.pullRequest.reviewThreads.nodes[]]' "$tmp/threads.raw" >"$tmp/threads.json" 2>/dev/null ||
   die "cannot read pull request #$pr's review threads"
+
+# A push during the reads above leaves them describing a head the PR no longer
+# has, so read the head again and refuse a verdict when it moved. Everything
+# after this point works on the files already read.
+gh pr view "$pr" --json headRefOid >"$tmp/pr.after.json" 2>/dev/null ||
+  die "cannot read pull request #$pr to confirm its head"
+now=$(jq -re '.headRefOid' "$tmp/pr.after.json" 2>/dev/null) ||
+  die "cannot read pull request #$pr to confirm its head"
+[ "$now" = "$head" ] ||
+  die "pull request #$pr moved from $head to $now during the reads; run again"
 
 login_of() { jq -r --arg n "$1" '.reviewers[] | select(.name == $n) | .login' "$registry" | head -1; }
 
