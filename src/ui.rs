@@ -6242,6 +6242,38 @@ fn clear_selection_on_press(ui: &mut UiState, mouse: &crossterm::event::MouseEve
     }
 }
 
+/// PRD #385: end a pane gesture that has not been released, and drop the
+/// selection it was making. A selection a release already copied is kept.
+///
+/// Called while a blocking overlay, a modal or copy mode is the input surface
+/// ([`cancel_pane_gesture_under_overlay`]) and when the terminal loses focus:
+/// the surface the drag started on no longer owns the pointer, so its release
+/// must not copy.
+fn cancel_pane_gesture(ui: &mut UiState) {
+    if !ui.pane_drag {
+        return;
+    }
+    ui.pane_drag = false;
+    if ui
+        .selection
+        .as_ref()
+        .is_some_and(|sel| sel.copied.is_none())
+    {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385: [`cancel_pane_gesture`] when the UI is in a mode whose overlay
+/// takes the mouse ([`overlay_blocks_mouse`]): Help, a dialog, the directory
+/// picker, the new-pane form, copy mode and the other modals. Checked for each
+/// mouse event before the pane's gesture route, and before each frame draws,
+/// so it holds whichever path opened the overlay.
+fn cancel_pane_gesture_under_overlay(ui: &mut UiState) {
+    if overlay_blocks_mouse(&ui.mode) {
+        cancel_pane_gesture(ui);
+    }
+}
+
 /// PRD #385: whether `mouse` is the drag or release of a left-button gesture
 /// that started with a press in a pane. Such a gesture is the pane's to finish
 /// wherever the pointer is: a release over a card, a button or a tab header
@@ -15135,6 +15167,12 @@ pub fn run_tui(
                 break; // re-render; layout-driven resize handles PTY sizing
             }
 
+            // PRD #385: a pane drag held while the terminal loses focus is
+            // over; a release reported later must not copy.
+            if matches!(ev, Event::FocusLost) {
+                cancel_pane_gesture(&mut ui);
+            }
+
             // PRD #20 R20-007: input rejection with VISIBLE feedback. A focused
             // pane can go non-live (a wrapped Codex session that declared
             // history-only, or a view-only target) WHILE the user is in
@@ -15204,6 +15242,11 @@ pub fn run_tui(
                 // PRD #385 M3: a press clears a kept selection before anything
                 // else handles it.
                 clear_selection_on_press(&mut ui, &mouse);
+                // PRD #385: an overlay opened since the press (a key in the
+                // same burst can open one before any frame) owns the pointer
+                // now, so the pane's gesture ends here and its release falls
+                // to the overlay's handling below.
+                cancel_pane_gesture_under_overlay(&mut ui);
                 // PRD #385: the drag and release of a gesture that started in a
                 // pane are the pane's, before any card, button or tab under the
                 // pointer sees them: the release copies wherever it lands.
@@ -17468,6 +17511,9 @@ fn render_frame(
         };
         reconcile_copy_mode(ui, embedded, drawn);
     }
+    // PRD #385: an overlay opened mid-drag takes the gesture and its
+    // unfinished highlight, before this frame draws either.
+    cancel_pane_gesture_under_overlay(ui);
     let now = std::time::Instant::now();
     observe_command_mode_edge(ui, now);
     let banner_visibility = ui.command_banner.visibility(now);

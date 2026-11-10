@@ -211,3 +211,91 @@ fn select_005_a_drag_released_over_chrome_still_copies_the_pane_text() {
         g.contains("[New Agent n/Ctrl+N]") && !g.contains("Select Directory")
     });
 }
+
+/// The OSC 52 set-clipboard prefix, which every copy the deck writes starts with.
+const OSC52_PREFIX: &str = "\x1b]52;c;";
+
+/// How long a test waits for a copy that must not come.
+const NO_COPY_WAIT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Scenario: One shell pane shows a sentinel and the deck is in command mode. The user presses on the sentinel and drags across it, and with the button still held presses `?`; once the Help overlay is drawn, the release lands over it. Nothing is copied (no OSC 52, no copy status), and after Help closes a click on the New Agent button opens the directory picker as usual. A drag held while the terminal loses focus copies nothing on its release either.
+#[spec("mouse/select/011")]
+#[test]
+fn select_011_an_overlay_or_focus_loss_mid_drag_cancels_the_pane_selection() {
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 40)
+        .with_continue_session("seloverlay", "bash --noprofile --norc")
+        .launch_with_fixture("form");
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+    let sentinel = "SELOVL-42-heldover";
+    deck.send_bytes(b"printf 'SELOVL-%d-heldover\\n' $((6*7))\r");
+    deck.wait_for_string(sentinel);
+    deck.send_bytes(b"\x04"); // Ctrl+D → command mode
+    deck.wait_for_string("[New Agent n/Ctrl+N]");
+
+    // Press on the sentinel and drag across it, the button still held.
+    let (col, row) = deck.wait_for_in_grid(sentinel);
+    let last = col + sentinel.len() as u16 - 1;
+    deck.send_bytes(
+        format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M",
+            col + 1,
+            row + 1,
+            last + 1,
+            row + 1
+        )
+        .as_bytes(),
+    );
+    // `?` opens Help while the drag is held; the release lands over it.
+    deck.send_bytes(b"?");
+    deck.wait_for_string("Press ? or Esc to close");
+    let (help_col, help_row) = deck.wait_for_in_grid("Panes auto-saved continuously.");
+    deck.send_bytes(format!("\x1b[<0;{};{}m", help_col + 3, help_row + 1).as_bytes());
+    assert!(
+        !deck.wait_for_stream_string_within(OSC52_PREFIX, NO_COPY_WAIT),
+        "a release over the Help overlay copied the pane selection the overlay interrupted"
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Sent to terminal clipboard") && !grid.contains("Copied to clipboard"),
+        "no copy status may show for a cancelled selection:\n{grid}"
+    );
+    assert!(
+        grid.contains("Press ? or Esc to close"),
+        "the release over Help leaves Help open:\n{grid}"
+    );
+
+    // Help closes, and the next click on chrome works as usual.
+    deck.send_bytes(b"\x1b"); // Esc → close Help
+    deck.wait_until_grid("Help closed", |g| !g.contains("Press ? or Esc to close"));
+    let (button_col, button_row) = deck.wait_for_in_grid("[New Agent n/Ctrl+N]");
+    deck.click(button_col + 1, button_row);
+    deck.wait_for_string("Select Directory");
+    deck.send_bytes(b"q"); // close the picker
+    deck.wait_until_grid("the picker closed", |g| !g.contains("Select Directory"));
+
+    // A drag held while the terminal loses focus copies nothing on release.
+    let (col, row) = deck.wait_for_in_grid(sentinel);
+    let last = col + sentinel.len() as u16 - 1;
+    deck.send_bytes(
+        format!(
+            "\x1b[<0;{};{}M\x1b[<32;{};{}M\x1b[O\x1b[<0;{};{}m",
+            col + 1,
+            row + 1,
+            last + 1,
+            row + 1,
+            last + 1,
+            row + 1
+        )
+        .as_bytes(),
+    );
+    assert!(
+        !deck.wait_for_stream_string_within(OSC52_PREFIX, NO_COPY_WAIT),
+        "a release after the terminal lost focus copied the pane selection"
+    );
+    let grid = deck.snapshot_grid();
+    assert!(
+        !grid.contains("Sent to terminal clipboard") && !grid.contains("Copied to clipboard"),
+        "no copy status may show after a focus loss mid-drag:\n{grid}"
+    );
+}

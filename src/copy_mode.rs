@@ -138,13 +138,16 @@ impl CopyMode {
     }
 
     /// The pane now draws `shown` (rows, cols) of the screen, as a resize can
-    /// change it: the cursor and the selection's anchor are brought onto drawn
-    /// cells, and the view onto the cursor.
+    /// change it: the selection keeps only its cells that are still drawn, and
+    /// is dropped when none are; the cursor is brought onto a drawn cell, and
+    /// the view onto the cursor.
     pub fn set_shown(&mut self, shown: (u16, u16)) {
         let (shown_rows, shown_cols) = Self::clamp_shown(shown, self.rows, self.cols);
         if (shown_rows, shown_cols) == (self.shown_rows, self.shown_cols) {
             return;
         }
+        let selection = self.selection();
+        let cursor_first = self.anchor.is_some_and(|anchor| self.cursor < anchor);
         self.shown_rows = shown_rows;
         self.shown_cols = shown_cols;
         let last = Pos {
@@ -152,11 +155,39 @@ impl CopyMode {
             col: shown_cols - 1,
         };
         self.cursor = self.glyph_start(Self::clamp_pos(self.cursor, last));
-        self.anchor = self
-            .anchor
-            .map(|pos| self.glyph_start(Self::clamp_pos(pos, last)));
+        self.anchor = None;
+        if let Some((start, end)) = selection.and_then(|sel| Self::drawn_part(sel, last)) {
+            let (start, end) = (self.glyph_start(start), self.glyph_start(end));
+            // The cursor stays the end of the selection it was.
+            let (anchor, cursor) = if cursor_first {
+                (end, start)
+            } else {
+                (start, end)
+            };
+            self.anchor = Some(anchor);
+            self.cursor = cursor;
+        }
         self.keep_cursor_in_view();
         self.scroll_frozen_to(self.view);
+    }
+
+    /// The part of the stream selection `start..=end` that falls on drawn
+    /// cells, whose last is `last`, or `None` when no cell of it is drawn. A
+    /// first line that starts past the drawn columns gives way to the next
+    /// line's first cell; an end past them is cut to the last drawn column.
+    fn drawn_part((mut start, end): (Pos, Pos), last: Pos) -> Option<(Pos, Pos)> {
+        if start.col > last.col {
+            start = Pos {
+                line: start.line + 1,
+                col: 0,
+            };
+        }
+        let end = if end.line > last.line {
+            last
+        } else {
+            Self::clamp_pos(end, last)
+        };
+        (start <= end && start.line <= last.line).then_some((start, end))
     }
 
     pub fn pane_id(&self) -> &str {

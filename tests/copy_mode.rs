@@ -542,7 +542,9 @@ fn copymode_keys_003_an_oversized_screen_and_a_shrink_while_selected() {
     let mut seam = CopyModeSeam::new(40, 14, &lines);
     seam.render();
     chars(&mut seam, "v");
-    chars(&mut seam, "k");
+    // On rows the smaller pane still draws: a selection the shrink leaves
+    // entirely undrawn is dropped (`copymode/keys/010`).
+    press(&mut seam, KeyCode::Char('k'), 7);
     press(&mut seam, KeyCode::Char('h'), 40);
     chars(&mut seam, "llvj");
     press(&mut seam, KeyCode::Char('l'), 40);
@@ -568,7 +570,7 @@ fn copymode_keys_003_an_oversized_screen_and_a_shrink_while_selected() {
         "the yank copies what the frame highlights:\n{}",
         frame_with_marks(&buf)
     );
-    assert_eq!(shown, "w05-abcdefghijklmnop");
+    assert_eq!(shown, "w04-abcdefghijklmnop\nrow05-abcdefghijklmnop");
 }
 
 /// Scenario: The pane shows `你AB`, a two-column glyph and two letters, and the row is drawn with no gap after the glyph. In copy mode, moving right from the glyph lands on `A` and then `B`; selections forward and backward over the glyph highlight it and copy it whole; a cursor that starts, or moves up, onto the glyph's right half is put on the glyph. Each time the copied text is exactly the highlighted text.
@@ -750,4 +752,107 @@ fn copymode_keys_008_nothing_typed_in_copy_mode_reaches_the_pane() {
     assert_eq!(seam.mode(), "QuitConfirm");
     assert!(seam.forwarded().is_empty(), "Ctrl+C is not forwarded");
     assert!(seam.copies().is_empty());
+}
+
+fn long_rows(count: usize) -> Vec<u8> {
+    (0..count)
+        .map(|n| format!("row{n:02}-abcdefghijklmnopqrstuvwxyz"))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+        .into_bytes()
+}
+
+/// Scenario: In copy mode the user selects columns 20 to 25 of one line, the terminal is narrowed so the pane draws only 10 columns, and `y` is pressed right after the one frame drawn at the new size. That frame highlights nothing, so the yank copies nothing and copy mode stays open, and a selection made afterwards copies what it highlights. A selection whose first line starts right of the new edge keeps only its drawn part, and a height shrink that moves copy mode's view yanks exactly what the first smaller frame highlights.
+#[spec("copymode/keys/010")]
+#[test]
+fn copymode_keys_010_a_resize_never_lets_a_yank_copy_what_the_frame_did_not_highlight() {
+    // A selection entirely right of the new edge.
+    let mut seam = CopyModeSeam::new(40, 14, &long_rows(12));
+    seam.render();
+    chars(&mut seam, "vk");
+    press(&mut seam, KeyCode::Char('h'), 40);
+    press(&mut seam, KeyCode::Char('l'), 20);
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::Char('l'), 5);
+    assert_eq!(marked_text(&seam.render()), "opqrst");
+    seam.resize(12, 14);
+    let buf = seam.render();
+    let shown = marked_text(&buf);
+    let selected = cells(&buf, is_selected);
+    chars(&mut seam, "y");
+    assert!(
+        selected.is_empty(),
+        "no part of the selection is drawn, so nothing is highlighted:\n{}",
+        frame_with_marks(&buf)
+    );
+    assert!(
+        seam.copies().is_empty(),
+        "the yank copies what the frame highlighted, which is nothing (the frame marked {shown:?})"
+    );
+    assert_eq!(seam.status(), None);
+    let buf = seam.render();
+    assert!(bar(&buf).starts_with(" COPY"), "{}", bar(&buf));
+    let rect = seam.pane_rect();
+    let cursor = cells(&buf, is_cursor);
+    assert!(
+        cursor.len() == 1 && cursor[0].0 > rect.x && cursor[0].0 < rect.x + rect.width - 1,
+        "the cursor is on a drawn cell, got {cursor:?}:\n{}",
+        frame_with_marks(&buf)
+    );
+    chars(&mut seam, "vhh");
+    let shown = marked_text(&seam.render());
+    chars(&mut seam, "y");
+    assert_eq!(seam.copies(), [shown.as_str()]);
+    assert_eq!(shown, "bcd");
+
+    // A selection whose first line starts right of the new edge.
+    let mut seam = CopyModeSeam::new(40, 14, &long_rows(12));
+    seam.render();
+    chars(&mut seam, "vkk");
+    press(&mut seam, KeyCode::Char('h'), 40);
+    press(&mut seam, KeyCode::Char('l'), 20);
+    chars(&mut seam, "vj");
+    press(&mut seam, KeyCode::Char('h'), 40);
+    press(&mut seam, KeyCode::Char('l'), 3);
+    seam.render();
+    seam.resize(12, 14);
+    let buf = seam.render();
+    let shown = marked_text(&buf);
+    chars(&mut seam, "y");
+    assert_eq!(
+        seam.copies().last().map(String::as_str),
+        Some(shown.as_str()),
+        "the yank copies what the frame highlights:\n{}",
+        frame_with_marks(&buf)
+    );
+    assert_eq!(shown, "row1", "{}", frame_with_marks(&buf));
+
+    // A height shrink that moves copy mode's view.
+    let mut seam = CopyModeSeam::new(40, 14, &long_rows(30));
+    seam.render();
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::PageUp, 1);
+    press(&mut seam, KeyCode::Char('h'), 40);
+    chars(&mut seam, "v");
+    press(&mut seam, KeyCode::Char('l'), 5);
+    let before = seam.render();
+    let rect = seam.pane_rect();
+    assert_eq!(marked_text(&before), "row19-");
+    assert_eq!(
+        cells(&before, is_selected).first().map(|&(_, y)| y),
+        Some(rect.y + rect.height - 2),
+        "the selection is on the view's last row:\n{}",
+        frame_with_marks(&before)
+    );
+    seam.resize(40, 8);
+    let buf = seam.render();
+    let shown = marked_text(&buf);
+    chars(&mut seam, "y");
+    assert_eq!(
+        seam.copies().last().map(String::as_str),
+        Some(shown.as_str()),
+        "the yank copies what the frame highlights:\n{}",
+        frame_with_marks(&buf)
+    );
+    assert_eq!(shown, "row19-", "{}", frame_with_marks(&buf));
 }
