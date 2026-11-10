@@ -151,8 +151,19 @@ def redraw():
     cols = os.get_terminal_size(0).columns
     rule = ('─' * cols).encode()
     out = b'\x1b[2J\x1b[H\x1b[2;12HClaude Code v' + version.encode() + b'\r'
-    for i, message in enumerate(transcript[-5:]):
-        out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % (4 + i * 2)).encode() + message + b'\x1b[0m'
+    row = 4
+    for message in transcript[-5:]:
+        # Issue #1730: a submitted line longer than the row (the doorbell
+        # line naming the deck's absolute path) continues on rows painted
+        # the same colour, wrapped at word boundaries as Claude Code does.
+        lines = wrapped(message, cols - 2)
+        if len(lines) == 1:
+            out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % row).encode() + message + b'\x1b[0m'
+        else:
+            out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % row).encode() + lines[0].encode() + b'\x1b[0m'
+            for i, line in enumerate(lines[1:], 1):
+                out += ('\x1b[%d;1H\x1b[48;5;237m  ' % (row + i)).encode() + line.encode() + b'\x1b[0m'
+        row += len(lines) + 1
     out += b'\x1b[25;1H' + rule + '\x1b[26;1H❯ '.encode()
     lines = wrapped(composer, cols - 2)
     if len(lines) > 1:

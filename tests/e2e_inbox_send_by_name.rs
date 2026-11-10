@@ -317,7 +317,11 @@ fn orchestration_address_006_name_and_pane_reach_one_of_two_standalone_agents() 
         .unwrap_or_else(|| panic!("no reply command in the delivered message\n{message}"));
     assert!(reply.contains("--name=caller"), "{reply}");
     let words = shell_words(reply.replace("'<your reply>'", "REPLY_2053_e5").as_str());
-    assert_eq!(words[0], "dot-agent-deck");
+    // Issue #1730: the reply command names the deck the daemon runs from.
+    assert_eq!(
+        std::path::Path::new(&words[0]),
+        common::contained_deck_binary()
+    );
     let args: Vec<&str> = words[1..].iter().map(String::as_str).collect();
     let output = fixture.cli(Some(&dispatcher), &args);
     exit("reply by name", &output, 0);
