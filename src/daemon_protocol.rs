@@ -4770,7 +4770,9 @@ pub struct ComposerCapDrops {
 }
 
 /// How long `observer-hold` waits for a pass already running to finish
-/// before answering that it hasn't (Q105b.2).
+/// before answering that it hasn't (Q105b.2). Linux only, as its one user
+/// `e2e_composer_observer_control` is: under `e2e` on macOS it was dead code
+/// and failed CLAUDE.md rule 2's clippy there.
 #[cfg(all(feature = "e2e", target_os = "linux"))]
 const OBSERVER_HOLD_BOUND: Duration = Duration::from_secs(30);
 

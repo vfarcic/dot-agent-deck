@@ -223,3 +223,58 @@ pub fn resolve_build_id(
         None => format!("{version}-unknown"),
     }
 }
+
+/// Does this build need git at all — to compose the build id and to watch the
+/// git files that move it (issue #2072)?
+///
+/// Not when a valid `DAD_BUILD_ID` is injected *and* the version came from a
+/// valid `DAD_VERSION` injection: [`resolve_build_id`] then ignores the sha and
+/// the dirty flag, the version ignores the tags, and `cargo:rerun-if-env-changed`
+/// on both variables is what invalidates the build. Watching git files then
+/// buys nothing and costs a rebuild of the root crate whenever something
+/// rewrites them without moving the build id, which is what every `rwx sandbox
+/// exec` does to `HEAD`. When either value still comes from git, the watches
+/// stay: a checkout can move the reachable tag as well as the sha.
+pub fn build_needs_git(version_source: VersionSource, injected_build_id: Option<&str>) -> bool {
+    version_source != VersionSource::Injected
+        || injected_build_id.and_then(normalize_build_id).is_none()
+}
+
+/// The git-internal files (names for `git rev-parse --git-path`) whose change
+/// can move the composed build id, in emission order (PRD #103 M1.0, issue
+/// #2072).
+///
+/// `HEAD` catches a branch switch or a detached-HEAD move; the branch's ref
+/// file (`head_ref`, from `git symbolic-ref`) catches a commit on that branch;
+/// `packed-refs` catches a ref that lives only there; `logs/HEAD`, the
+/// worktree's HEAD reflog, is appended on every commit, checkout and reset, so
+/// it still catches a commit on a branch whose loose ref file did not exist
+/// when the build last ran; `index` catches a staged dirty/clean flip.
+///
+/// `build.rs` emits only the ones that exist: cargo treats a missing
+/// `rerun-if-changed` path as changed on *every* build, so a clone without
+/// `packed-refs` (the RWX sandbox's) rebuilt the root crate on every command.
+/// A missing branch ref file is the one exception: `build.rs` watches the
+/// nearest existing directory of [`ref_ancestor_dirs`], so its creation by a
+/// commit or a reset is caught even without a reflog.
+pub fn git_watch_names(head_ref: Option<&str>) -> Vec<String> {
+    let mut names: Vec<String> = ["HEAD", "logs/HEAD", "index", "packed-refs"]
+        .into_iter()
+        .map(String::from)
+        .collect();
+    names.extend(head_ref.map(String::from));
+    names
+}
+
+/// The directories a missing loose ref file `ref_path` (`refs/heads/a/b`)
+/// would be created in, nearest first, down to and including its namespace
+/// (`refs/heads`), never above it: `build.rs` watches the first that exists
+/// (issue #2072), and a directory above the namespace would be `refs/` or the
+/// git dir itself, whose scan reaches every ref or every object.
+pub fn ref_ancestor_dirs(ref_path: &str) -> Vec<String> {
+    let parts: Vec<&str> = ref_path.split('/').filter(|p| !p.is_empty()).collect();
+    (2..parts.len())
+        .rev()
+        .map(|n| parts[..n].join("/"))
+        .collect()
+}

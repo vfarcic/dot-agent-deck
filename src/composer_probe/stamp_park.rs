@@ -16,7 +16,9 @@
 use std::sync::{Arc, Mutex, PoisonError};
 
 /// Where a feeder parks.
-// Off Linux only the `Output*` points remain, which trips the shared-prefix lint.
+///
+/// Off Linux only the `Output*` points exist, which trips clippy's
+/// `enum_variant_names` there; the names stay as they are on Linux.
 #[cfg_attr(not(target_os = "linux"), allow(clippy::enum_variant_names))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StampPoint {

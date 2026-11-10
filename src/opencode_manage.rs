@@ -5563,8 +5563,16 @@ pub(crate) mod tests {
             let b = seed_deck(&fixture.path().join("local").join("dot-agent-deck"));
             write_plugin(&root, &a).unwrap();
 
-            let pins = with_takeover(takeover, || {
-                auto_install_to(std::slice::from_ref(&root), &b)
+            // The probe of A answers what its stub prints without running it:
+            // the decision is under test, not the probe's timing on a loaded
+            // machine (issue #2183).
+            let answer = pinned.map(str::to_string).ok_or_else(|| {
+                "its `--version` output is not a dot-agent-deck version".to_string()
+            });
+            let pins = crate::hook_binary::with_probe_answers([(a.clone().into(), answer)], || {
+                with_takeover(takeover, || {
+                    auto_install_to(std::slice::from_ref(&root), &b)
+                })
             });
 
             let expected = if replaced { &b } else { &a };
@@ -6788,14 +6796,27 @@ const api = {
             &driver,
             format!(
                 r#"{FAKE_TUI_API_JS}
+// Wait on what the plugin does, not on the clock (issue #2183): how long it
+// takes to reach the dialog wait, and to deliver after it, depends on the
+// recorder it runs first and so on the machine's load.
+let dialogReads = 0;
+api.ui.dialog = {{ get open() {{ if (dialog) dialogReads += 1; return dialog; }} }};
+const until = async (done, what) => {{
+  for (const end = Date.now() + 10000; Date.now() < end; ) {{
+    if (done()) return;
+    await sleep(20);
+  }}
+  throw new Error("timed out waiting for " + what);
+}};
 dialog = true;
 route = {{ name: "session", params: {{ sessionID: "child" }} }};
 const {{ default: mod }} = await import("{}");
 await mod.tui(api);
-await sleep(700);
+// Polled twice: the delivery is waiting for the dialog, past its first read.
+await until(() => dialogReads >= 2, "the delivery to wait on the dialog");
 route = {{ name: "session", params: {{ sessionID: "rootB" }} }};
 dialog = false;
-await sleep(700);
+await until(() => prompts.length > 0, "the delivery to start the message");
 disposeCb?.();
 console.log(JSON.stringify({{ prompts, navigations }}));
 process.exit(0);
@@ -8356,10 +8377,19 @@ check(called, [1], "never reaches OpenCode");
                     r#"process.argv = [process.argv[0], "opencode", ...{argv}];
 const {{ default: {{ server: plugin }} }} = await import("{}");
 const hooks = await plugin({{ directory: "/work" }});
-// PRD #1666 §4: the substitution needs this context's receiver registered.
-await new Promise((r) => setTimeout(r, 500));
-const output = {{ parts: [{{ type: "text", text: {line_json} }}] }};
-await hooks["chat.message"]({{ messageID: "u1" }}, output);
+// PRD #1666 §4: the substitution needs this context's receiver registered,
+// which takes as long as the recorder takes to start (issue #2183). A call
+// before then returns the line untouched and changes nothing, so ask again
+// until it is substituted: within 10s where it should be, and over the 500ms
+// window this check always gave where it should not be.
+const until = Date.now() + ({intercepts} ? 10000 : 500);
+let output;
+do {{
+  output = {{ parts: [{{ type: "text", text: {line_json} }}] }};
+  await hooks["chat.message"]({{ messageID: "u1" }}, output);
+  if (output.parts[0].text !== {line_json}) break;
+  await new Promise((r) => setTimeout(r, 20));
+}} while (Date.now() < until);
 console.log(JSON.stringify(output.parts[0].text));
 process.exit(0);
 "#,
@@ -8379,7 +8409,12 @@ process.exit(0);
                 serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
             let calls = std::fs::read_to_string(&calls).unwrap_or_default();
             let fetched = calls.lines().any(|call| call.starts_with("inbox fetch"));
-            assert_eq!(fetched, intercepts, "{argv}: fetch calls");
+            assert_eq!(
+                fetched,
+                intercepts,
+                "{argv}: fetch calls: {calls:?}; stderr: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             if intercepts {
                 assert!(
                     calls.contains("--adapter-integration 2 --rx 3"),
@@ -8864,6 +8899,17 @@ check(inboxIdsIn("[dot-agent-deck message " + A + " from x]\nhead"), [A], "an un
     #[cfg(unix)]
     fn opencode_named_shell(dir: &Path) -> PathBuf {
         let shell = dir.join("opencode");
+        // macOS SIGKILLs a copy of a platform binary such as `/bin/sh`
+        // (measured on Darwin 25: exit 137, no output), and the plugin reads
+        // a parent's name there from its `ps` arguments, which name the path
+        // it was started by, so a symlink serves. Linux resolves
+        // `/proc/<pid>/exe` through a symlink, so it keeps the copy.
+        #[cfg(target_os = "macos")]
+        if !shell.exists() {
+            std::os::unix::fs::symlink("/bin/sh", &shell)
+                .unwrap_or_else(|e| panic!("link /bin/sh to {}: {e}", shell.display()));
+        }
+        #[cfg(not(target_os = "macos"))]
         if !shell.exists() {
             let status = std::process::Command::new("cp")
                 .arg("/bin/sh")
@@ -9668,6 +9714,7 @@ if (asked("hang") !== 2) throw new Error("hang not asked again: " + calls);
     fn opencode_plugin_ancestry_lookup_stays_bounded_when_the_client_ignores_abort() {
         let Some(payloads) = run_plugin_driver(
             r#"
+import { createRequire, syncBuiltinESMExports } from "module";
 const calls = [];
 const client = { session: { get: ({ path, signal }) => {
   const call = { id: path.id, signal };
@@ -9684,11 +9731,36 @@ const settle = () => new Promise((resolve) => setTimeout(resolve, 20));
 const expectCalls = (n, why) => {
   if (calls.length !== n) throw new Error(why + ": " + calls.length + " requests: " + calls.map((c) => c.id));
 };
+// The idle report must not wait for a lookup: it is sent within 1000 ms of
+// its own work. That work includes a synchronous run of the recorder through
+// `execFileSync`, whose time is the machine's (load, and on macOS the first
+// launch of a fresh file), not the plugin's (issue #2183). So the plugin's
+// `execFileSync` is timed, and that time is left out of the bound. A report
+// that waited on a lookup that never settles would never return; the
+// watchdog turns that into a failure.
+const childProcess = createRequire(import.meta.url)("child_process");
+const realExecFileSync = childProcess.execFileSync;
+let inChildren = 0;
+childProcess.execFileSync = (...args) => {
+  const began = Date.now();
+  try {
+    return realExecFileSync(...args);
+  } finally {
+    inChildren += Date.now() - began;
+  }
+};
+syncBuiltinESMExports();
 const idle = async (s) => {
+  const watchdog = setTimeout(() => {
+    console.error("the idle report for " + s + " never returned");
+    process.exit(13);
+  }, 20000);
   const started = Date.now();
+  const childrenBefore = inChildren;
   await send("session.status", { sessionID: s, status: { type: "idle" } });
-  const took = Date.now() - started;
-  if (took > 1000) throw new Error("the idle report for " + s + " waited " + took + " ms");
+  clearTimeout(watchdog);
+  const own = Date.now() - started - (inChildren - childrenBefore);
+  if (own > 1000) throw new Error("the idle report for " + s + " waited " + own + " ms");
 };
 const turn = async (s, m, text) => {
   await assistant(s, m);
