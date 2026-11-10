@@ -1678,6 +1678,22 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** a real agent, the desktop.
 - **Platform coverage:** mac+linux.
 
+##### status/waiting/008 — A real interactive Haiku Claude's own background Bash command reads Waiting after Stop, and Idle once it exits on its own (issue #1757). [reel]
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
+- **Asserts:** a directive prompt launches one run_in_background Bash command (`ping -c 60 … && touch <unique sentinel>`) and the turn ends; after its native Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not Claude Code starts a turn to report the finished command. The events after the exit are printed, which records what a completion-wake turn sends first.
+- **Does not assert:** a command killed from outside (`status/background/007`), a command carried over from an earlier turn (`status/waiting/007`), desktop.
+- **Observed (Claude Code 2.1.322, Haiku 4.5, 2026-11-10):** Claude Code starts a turn to report the finished command. The first event it sends after the exit is a `Thinking` whose prompt is the `<task-notification>` it injects; the daemon's `ShellIdle` with an empty aggregate follows about 0.2 s later, and the turn ends with `Idle` about 2 s after that. The card reads Idle once the command's session is gone and again after that turn.
+- **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
+
+##### status/waiting/009 — A real interactive OpenCode's own background shell command reads Waiting after its turn ends, and Idle once it exits on its own (issue #1757). [reel]
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive OpenCode 2.x (the shell tool's `background` option exists only from 2) on the harness's cheap test model, spawned through Ctrl+N; skips on OpenCode 1.x.
+- **Asserts:** a directive prompt launches one background shell command (`ping -c 60 … && touch <unique sentinel>` in the fixture directory) and the turn ends; after OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not OpenCode starts a turn to report the finished command.
+- **Does not assert:** OpenCode 1.x, desktop.
+- **Known failure (OpenCode 2.2.5, 2026-11-10):** the card reads Waiting but with `Background: 2 commands` for the one command started. `opencode --standalone` runs its server, `opencode serve --stdio --port 0`, in a POSIX session of its own below the pane; OpenCode has no measured shell-tool shape, so the structural test counts that server as a background command, and because it is first sampled in the pane's first turn it counts as awaited too. The test prints every detached session below it at the Waiting check, which is how this was found.
+- **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
+
 ##### status/waiting/010 — The bell does not ring on the step to Waiting, and rings on its later step to Idle (issue #1757).
 - **Layer:** L1 unit (`src/ui.rs`, fast tier).
 - **Agent:** none; session fixtures fed to the TUI's bell transition check.
