@@ -600,8 +600,12 @@ fn orchestration_address_001_folder_delivers_untrusted_only_to_orchestrator() {
     let sender = framed
         .find(&format!("sender folder: {}", folder(&caller).display()))
         .expect("sender folder inside untrusted frame");
+    // Issue #1730: the reply command names the deck the daemon runs from.
     let reply = framed
-        .find("reply with: dot-agent-deck inbox send --folder ")
+        .find(&format!(
+            "reply with: {} inbox send --folder ",
+            common::contained_deck_binary().display()
+        ))
         .expect("reply command inside untrusted frame");
     let message = framed.find(sentinel).expect("sentinel inside frame");
     assert!(

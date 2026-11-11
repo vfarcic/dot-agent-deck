@@ -122,21 +122,66 @@ def bash_tool():
     os.replace(temporary, result_path)
 
 
+def wrapped(composer, width):
+    """The composer's text as the rows the agent draws it in: one row while it
+    fits, else wrapped at word boundaries into rows of `width`, as the real
+    agent wraps a long line (a word wider than a row is split). Joined at
+    single spaces, the rows give the text back; text holding a control
+    character is drawn as it is, on one row."""
+    text = composer.decode('utf-8', 'replace')
+    if len(text) <= width or any(ord(c) < 32 for c in text):
+        return [text]
+    rows, row = [], None
+    for word in text.split(' '):
+        if row is None:
+            row = word
+        elif len(row) + 1 + len(word) <= width:
+            row += ' ' + word
+        else:
+            rows.append(row)
+            row = word
+        while len(row) > width:
+            rows.append(row[:width])
+            row = row[width:]
+    rows.append(row)
+    return rows
+
+
 def redraw():
     cols = os.get_terminal_size(0).columns
     rule = ('─' * cols).encode()
     out = b'\x1b[2J\x1b[H\x1b[2;12HClaude Code v' + version.encode() + b'\r'
-    for i, message in enumerate(transcript[-5:]):
-        out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % (4 + i * 2)).encode() + message + b'\x1b[0m'
+    row = 4
+    for message in transcript[-5:]:
+        # Issue #1730: a submitted line longer than the row (the doorbell
+        # line naming the deck's absolute path) continues on rows painted
+        # the same colour, wrapped at word boundaries as Claude Code does.
+        lines = wrapped(message, cols - 2)
+        if len(lines) == 1:
+            out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % row).encode() + message + b'\x1b[0m'
+        else:
+            out += ('\x1b[%d;1H\x1b[48;5;237m❯ ' % row).encode() + lines[0].encode() + b'\x1b[0m'
+            for i, line in enumerate(lines[1:], 1):
+                out += ('\x1b[%d;1H\x1b[48;5;237m  ' % (row + i)).encode() + line.encode() + b'\x1b[0m'
+        row += len(lines) + 1
     out += b'\x1b[25;1H' + rule + '\x1b[26;1H❯ '.encode()
-    if composer:
+    lines = wrapped(composer, cols - 2)
+    if len(lines) > 1:
+        # Issue #1730: a line longer than the row (the doorbell line naming
+        # the deck's absolute path) continues at the composer's indent.
+        out += lines[0].encode()
+        for i, line in enumerate(lines[1:], 1):
+            out += ('\x1b[%d;1H  ' % (26 + i)).encode() + line.encode()
+    elif composer:
         out += bytes(composer)
     else:
         out += b'\x1b[2mTry "fix the bug"\x1b[22m'
-    out += b'\x1b[27;1H' + rule + b'\x1b[28;3H? for shortcuts'
+    below = len(lines) - 1
+    out += ('\x1b[%d;1H' % (27 + below)).encode() + rule
+    out += ('\x1b[%d;3H? for shortcuts' % (28 + below)).encode()
     if external_edit and external_edit.error:
-        out += b'\x1b[29;1H' + external_edit.error
-    out += ('\x1b[26;%dH' % (3 + len(composer.decode('utf-8', 'replace')))).encode()
+        out += ('\x1b[%d;1H' % (29 + below)).encode() + external_edit.error
+    out += ('\x1b[%d;%dH' % (26 + below, 3 + len(lines[-1]))).encode()
     os.write(1, out)
 
 

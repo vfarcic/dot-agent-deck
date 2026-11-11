@@ -839,16 +839,39 @@ pub fn fetch_not_handed(daemon: &impl Endpoint, pane: &Pane) -> Value {
     reply
 }
 
-/// The doorbell line naming `id`, without its ring token.
+/// What the doorbell line says between the message id and the command word.
+pub const WAITING: &str = " waiting, run: ";
+
+/// What the doorbell line's command says after the command word.
+pub const FETCH: &str = " inbox fetch";
+
+/// The doorbell line naming `id`, without its ring token, as a deck whose
+/// daemon runs the harness's contained binary types it (issue #1730: the
+/// line names the daemon's own binary, not a bare `dot-agent-deck`).
 pub fn fixed_line(id: &str) -> String {
-    format!("{PREFIX}{id} waiting, run: dot-agent-deck inbox fetch")
+    let bin = common::contained_deck_binary()
+        .to_str()
+        .expect("the harness's deck path is UTF-8");
+    format!("{PREFIX}{id}{WAITING}{bin}{FETCH}")
+}
+
+/// The command word a doorbell line `line` tells the agent to run `inbox
+/// fetch` with: the text between [`WAITING`] and the trailing [`FETCH`].
+pub fn command_word(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(WAITING)?;
+    rest.strip_suffix(FETCH).filter(|word| !word.is_empty())
 }
 
 /// Whether `line` is the doorbell's token-led line naming `id`: `(`, six
-/// lowercase letters, `)`, then [`fixed_line`] (PRD #1666 part 3, round
-/// 5-wake).
+/// lowercase letters, `)`, then [`fixed_line`]'s shape with any command word
+/// (PRD #1666 part 3, round 5-wake; issue #1730).
 pub fn is_ring_line(line: &str, id: &str) -> bool {
-    token_led(line).is_some_and(|rest| rest == fixed_line(id))
+    token_led(line).is_some_and(|rest| {
+        rest.strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_prefix(id))
+            .is_some_and(|rest| rest.starts_with(WAITING))
+            && command_word(rest).is_some()
+    })
 }
 
 /// The doorbell line `line` carries after its ring token, if it has one.

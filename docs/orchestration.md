@@ -596,8 +596,10 @@ In both clients, replacing an earlier task with a new delegation or restarting t
 Native inbox delivery does not type a task into your input box. When native wake is unavailable, the deck types a one-line doorbell into Claude Code or Codex, only when the agent is idle, its input box is on screen and empty, and nothing has been typed into it since the deck last knew it was empty:
 
 ```text
-(bmrtzx) dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox fetch
+(bmrtzx) dot-agent-deck: message m-… waiting, run: /home/you/.local/bin/dot-agent-deck inbox fetch
 ```
+
+The command names the `dot-agent-deck` the deck daemon runs from, by its full path, so the agent runs that copy even when another, perhaps older, `dot-agent-deck` comes first on the agent's own `PATH`. The commands the deck gives agents elsewhere name it the same way: the `work-done` and `delegate` commands in tasks and in an orchestrator's instructions, and the reply command in a message from an agent outside the team. To have agents use a different copy, start the deck from that copy, restarting its daemon ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)). `DOT_AGENT_DECK_BIN` changes the binary agents' hooks, the OpenCode plugin and the Pi extension run, not the commands the deck writes for the agent ([Environment variables](configuration.md#paths-and-endpoints)).
 
 The six letters in brackets are drawn afresh each time the deck types the line. They let the deck tell its own line from anything else on the screen, so it can check that the line reached the input box intact and that the agent took it. The deck does not type the doorbell into other agents ([Which agents wake for messages](#which-agents-wake-for-messages)).
 
