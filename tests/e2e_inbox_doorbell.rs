@@ -11,7 +11,7 @@ use serde_json::json;
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must receive exactly one doorbell line, led by its ring token, and one submission, while the task body remains only in the inbox; an empty inbox never rings.
+/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must receive exactly one doorbell line, led by its ring token, and one submission, while the task body remains only in the inbox; an empty inbox never rings. Then run the line's command word through `/bin/sh` with an older stand-in `dot-agent-deck` first on `PATH`: it must run the deck the daemon runs and never the stand-in.
 #[spec("inbox/doorbell/001")]
 #[test]
 fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
