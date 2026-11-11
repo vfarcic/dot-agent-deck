@@ -465,11 +465,28 @@ fn codex_numbered(grid: &Grid, row: u16) -> bool {
     digits > 0 && text[digits..].starts_with('.')
 }
 
+/// Append Codex's next wrapped row to the text read so far. Codex wraps a
+/// long line at a space, which the row break replaces, or right after a
+/// hyphen, which keeps its place with no space after it: measured on live
+/// Codex 0.164.0, which drew the deck's line naming
+/// `…/dad-tests-3260328-xsMumn/…` as `…/dad-tests-3260328-` over
+/// `xsMumn/…` (`inbox/codex/009`, 2026-11-10, issue #1730). So a row that
+/// ends in `-` joins the next with nothing between them, and any other row
+/// with one space. The reading is the deck's own line exactly when the rows
+/// came from wrapping it; a draft whose own text has a hyphen before a space
+/// at the wrap point reads without that space, as text the deck did not type.
+pub fn codex_join_wrapped(text: &mut String, next: &str) {
+    if !text.ends_with('-') {
+        text.push(' ');
+    }
+    text.push_str(next);
+}
+
 /// The composer: the lowest row whose first cell is a bold `›` that is
 /// neither dim (a submitted message in the transcript, whose glyph Codex
 /// draws dim) nor inverse (a dialog's highlighted choice), with its text from column 2 and the rows
-/// below it at the same indent until a blank row, joined at single spaces
-/// (Codex wraps the line at word boundaries).
+/// below it at the same indent until a blank row, joined as Codex wrapped
+/// them ([`codex_join_wrapped`]).
 fn codex_composer(grid: &Grid) -> Option<Composer> {
     let prompt_row = (0..grid.rows).rev().find(|&r| {
         codex_glyph(grid, r).is_some_and(|c| c.bold && !c.dim && !c.inverse)
@@ -485,8 +502,7 @@ fn codex_composer(grid: &Grid) -> Option<Composer> {
         }
         // A row below the composer that is not its continuation: the model
         // line and the footer sit after a blank row.
-        text.push(' ');
-        text.push_str(next.trim_start());
+        codex_join_wrapped(&mut text, next.trim_start());
         last_row = row;
         row += 1;
     }
@@ -578,8 +594,7 @@ fn codex_transcript_user_line(grid: &Grid, line: &str) -> bool {
             if next.trim().is_empty() || !next.starts_with("  ") {
                 break;
             }
-            text.push(' ');
-            text.push_str(next.trim());
+            codex_join_wrapped(&mut text, next.trim());
             row += 1;
         }
         text == line

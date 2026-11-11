@@ -63,6 +63,7 @@ Tool mailbox contract (one publisher, one composer per base; no crash recovery):
   error "exec_failed" with exit null. Acknowledge errors the same way.
 """
 import json
+import re
 import os
 import select
 import subprocess
@@ -196,26 +197,29 @@ def at(row, col):
 
 
 def wrapped(composer, width):
-    """The composer's text as the rows the agent draws it in: one row while it
-    fits, else wrapped at word boundaries into rows of `width`, as the real
-    agent wraps a long line (a word wider than a row is split). Joined at
-    single spaces, the rows give the text back; text holding a control
-    character is drawn as it is, on one row."""
+    """The composer's text as the rows Codex draws it in: one row while it
+    fits, else wrapped into rows of `width` at a space, which the row break
+    replaces, or right after a hyphen, which stays at the end of its row
+    (measured on live Codex 0.164.0, inbox/codex/009, issue #1730); a piece
+    wider than a row is split. Text holding a control character is drawn as
+    it is, on one row."""
     text = composer.decode('utf-8', 'replace')
     if len(text) <= width or any(ord(c) < 32 for c in text):
         return [text]
     rows, row = [], None
     for word in text.split(' '):
-        if row is None:
-            row = word
-        elif len(row) + 1 + len(word) <= width:
-            row += ' ' + word
-        else:
-            rows.append(row)
-            row = word
-        while len(row) > width:
-            rows.append(row[:width])
-            row = row[width:]
+        for i, part in enumerate(re.findall(r'[^-]*-|[^-]+', word) or ['']):
+            sep = ' ' if i == 0 else ''
+            if row is None:
+                row = part
+            elif len(row) + len(sep) + len(part) <= width:
+                row += sep + part
+            else:
+                rows.append(row)
+                row = part
+            while len(row) > width:
+                rows.append(row[:width])
+                row = row[width:]
     rows.append(row)
     return rows
 

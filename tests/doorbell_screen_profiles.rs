@@ -457,7 +457,7 @@ fn holds(profile: &ScreenProfile, grid: &Grid, line: &str) -> Option<ComposerTex
     profile.holds(grid, line)
 }
 
-/// Scenario: Read the recorded Codex 0.164.0 and 0.160.0 composer sessions at the empty composer, after the deck's line was written, after its Enter, after the deletes, and for a prefix of the line still arriving. The profile sees the empty ready composer with its placeholder, the exact line with the cursor after it, the submitted line as a transcript user message and not as composer text, the prefix as a prefix, and the placeholder back after the deletes.
+/// Scenario: Read the recorded Codex 0.164.0 and 0.160.0 composer sessions at the empty composer, after the deck's line was written, after its Enter, after the deletes, and for a prefix of the line still arriving; then draw a line naming the deck's absolute path wrapped over three rows as live Codex wraps it, once at a space and once right after a hyphen. The profile sees the empty ready composer with its placeholder, the exact line with the cursor after it, the submitted line as a transcript user message and not as composer text, the prefix as a prefix, the placeholder back after the deletes, and the wrapped line as exactly the deck's line.
 #[spec("inbox/doorbell/036")]
 #[test]
 fn doorbell_036_codex_composer_over_real_frames() {
@@ -514,6 +514,42 @@ fn doorbell_036_codex_composer_over_real_frames() {
         assert_eq!(
             holds(p, &Grid::parse(&bytes, trace.rows, trace.cols), line),
             Some(ComposerText::Other)
+        );
+        // Issue #1730: a line naming the deck's absolute path, wrapped over
+        // three rows as live Codex 0.164.0 drew it (inbox/codex/009,
+        // 2026-11-10): at a space, then right after a hyphen, with no space
+        // there, each continuation at the composer's indent.
+        let rows = [
+            "(gavzpw) dot-agent-deck: message m-bcdgo54g-46917b8c190e9bb9 waiting, run:",
+            "/var/tmp/dad-e2e-1000/dad-tests-3260328-",
+            "xsMumn/deck-under-test/dot-agent-deck inbox fetch",
+        ];
+        let long = format!("{} {}{}", rows[0], rows[1], rows[2]);
+        let mut bytes = trace.bytes[..empty_end].to_vec();
+        bytes.extend_from_slice(
+            format!(
+                "\x1b[{};3H\x1b[0m{}\x1b[K\x1b[{};1H  {}\x1b[K\x1b[{};1H  {}\x1b[K\x1b[{};1H\x1b[K\x1b[{};{}H",
+                row + 1,
+                rows[0],
+                row + 2,
+                rows[1],
+                row + 3,
+                rows[2],
+                row + 4,
+                row + 3,
+                3 + rows[2].chars().count(),
+            )
+            .as_bytes(),
+        );
+        let wrapped = Grid::parse(&bytes, trace.rows, trace.cols);
+        assert_eq!(
+            holds(p, &wrapped, &long),
+            Some(ComposerText::Exact),
+            "{stem}: a line wrapped after a hyphen is the line"
+        );
+        assert_eq!(
+            strict_withdrawal(p, &wrapped, &long),
+            Ok(long.chars().count())
         );
     }
 }
