@@ -7876,6 +7876,24 @@ async fn run_hook_loop_with_limits(
                                 presented.as_deref(),
                                 &*pty_registry,
                             );
+                            // Issue #2104: whether a refusal is a dying
+                            // generation's last report, decided while the token
+                            // is still in hand. Read for the log level only.
+                            let retired_token = matches!(
+                                provenance,
+                                crate::hook_provenance::Provenance::Refused(
+                                    crate::hook_provenance::Refusal::UnknownToken
+                                )
+                            ) && presented
+                                .as_deref()
+                                .is_some_and(|token| {
+                                    pty_registry
+                                        .hook_token_was_retired(
+                                            token,
+                                            event.pane_id.as_deref(),
+                                            event.agent_id.as_deref(),
+                                        )
+                                });
                             drop(presented);
                             match crate::hook_provenance::admits(
                                 &provenance,
@@ -7887,6 +7905,27 @@ async fn run_hook_loop_with_limits(
                                     // never the token. No reply line — a raw
                                     // event is fire-and-forget, and a hook's
                                     // output is what its agent reads.
+                                    //
+                                    // Issue #2104: a dying generation's own last
+                                    // report — its token retired at close or
+                                    // respawn — is expected, so it is logged at
+                                    // debug; every other refusal stays a warning.
+                                    // The `warn!` below is pinned verbatim by
+                                    // `xtask/cross-version`'s `KNOWN_EFFECTS`.
+                                    if retired_token {
+                                        debug!(
+                                            verb = "agent_event",
+                                            event_type = ?event.event_type,
+                                            claimed_pane = %escape_id_for_log(
+                                                event.pane_id.as_deref().unwrap_or("<none>")
+                                            ),
+                                            reason = refusal.code(),
+                                            "hook socket: refused a status event from an \
+                                             agent this deck already closed or replaced (its \
+                                             token was retired at teardown); expected"
+                                        );
+                                        continue;
+                                    }
                                     warn!(
                                         verb = "agent_event",
                                         event_type = ?event.event_type,
@@ -13834,6 +13873,141 @@ mod hook_ingestion_tests {
         }
     }
 
+    /// Issue #2276: an `opencode mini` pane on OpenCode 2, under the daemon a
+    /// deck TUI started from a macOS terminal. Under `mini` the server plugin
+    /// arms the stream from the private server, so the receiver it names is
+    /// that server and not the pane's own process, and placing it relative to
+    /// the agent walks up from the agent past the daemon, the TUI and the
+    /// terminal's shell to the root-owned `/usr/bin/login`. Where that
+    /// process's parent cannot be read (macOS `PROC_PIDTBSDINFO`, issue
+    /// #2237), the pane's one-shot verbs and a receiver naming the pane's own
+    /// process are still admitted: they read nothing above the agent. Read
+    /// past it, or with the daemon parented by launchd, the server's receiver
+    /// resolves to the client.
+    #[test]
+    fn opencode_2_minis_server_receiver_is_placed_through_the_daemons_ancestry() {
+        // 1 launchd ── 2 /usr/bin/login (root) ── 3 zsh ── 4 deck TUI ── 5 daemon
+        //   ── 10 opencode mini (the pane's agent root: the launcher exec'd it)
+        //        ├── 11 opencode serve --stdio ── 12 CLI (`inbox wait --stream`)
+        //        │                              └── 13 bash (a tool) ── 14 CLI (`inbox fetch`)
+        //        └── 15 CLI (a receiver naming the pane's own process)
+        fn table(pid: u32, login_parent: Option<u32>, daemon_parent: u32) -> Option<u32> {
+            match pid {
+                2 => login_parent,
+                3 => Some(2),
+                4 => Some(3),
+                5 => Some(daemon_parent),
+                10 => Some(5),
+                11 | 15 => Some(10),
+                12 | 13 => Some(11),
+                14 => Some(13),
+                _ => None,
+            }
+        }
+        // `login`'s parent unread, as macOS `PROC_PIDTBSDINFO` answers (#2237).
+        fn unread_login(pid: u32) -> Option<u32> {
+            table(pid, None, 4)
+        }
+        // `login`'s parent read, as Linux answers, and macOS once #2237 is fixed.
+        fn read_login(pid: u32) -> Option<u32> {
+            table(pid, Some(1), 4)
+        }
+        // The TUI detached, or a service or the desktop app started the daemon.
+        fn launchd_daemon(pid: u32) -> Option<u32> {
+            table(pid, None, 1)
+        }
+        fn lookups(
+            parent_of: fn(u32) -> Option<u32>,
+            descends: fn(u32, u32) -> Option<bool>,
+        ) -> ProcessLookups {
+            ProcessLookups {
+                descends,
+                parent_of,
+                executable_of: |pid| {
+                    let exe = match pid {
+                        2 => "/usr/bin/login",
+                        3 => "/bin/zsh",
+                        13 => "/bin/bash",
+                        10 | 11 => "/opt/homebrew/bin/opencode",
+                        4 | 5 | 12 | 14 | 15 => "/opt/homebrew/bin/dot-agent-deck",
+                        _ => return None,
+                    };
+                    Some(std::path::PathBuf::from(exe))
+                },
+                started: |_| Some(1),
+                arguments_of: |pid| {
+                    let argv: &[&str] = match pid {
+                        10 => &["opencode", "mini", "--standalone", "--session", "ses-team"],
+                        11 => &["opencode", "serve", "--stdio", "--port", "0"],
+                        _ => return None,
+                    };
+                    Some(argv.iter().map(|a| a.to_string()).collect())
+                },
+                stdio_is_sockets: |pid| pid == 11,
+            }
+        }
+        let admit = |lookups: &ProcessLookups, peer: u32, claimed: Option<u32>| {
+            let used_as = if claimed.is_some() {
+                ComponentUse::Receiver
+            } else {
+                ComponentUse::Cli
+            };
+            admit_inbox_component_with(
+                Some(AcceptedPeer {
+                    pid: peer,
+                    started: Some(1),
+                    same_user: Some(true),
+                }),
+                claimed,
+                Some(10),
+                used_as,
+                Evidence::Required,
+                lookups,
+            )
+        };
+
+        let unread = lookups(unread_login, |pid, root| {
+            crate::platform::proc::descends_from_with(pid, root, unread_login)
+        });
+        assert_eq!(
+            crate::platform::proc::ancestry_with(10, 11, unread_login),
+            crate::platform::proc::Ancestry::Unreadable,
+            "the walk from the agent toward its server climbs to login"
+        );
+        // Deliberately not pinned: `admit(&unread, 12, Some(11))`, the server
+        // plugin's `inbox wait` under an unread login. It is refused
+        // `Unidentified` today, which is #2276, and a fix may make it admit:
+        // the server descends from the agent, so it cannot be above it.
+        assert_eq!(
+            admit(&unread, 14, None),
+            Ok(None),
+            "the pane's one-shot `inbox fetch` is admitted"
+        );
+        assert_eq!(
+            admit(&unread, 15, Some(10)),
+            Ok(Some(10)),
+            "a receiver naming the pane's own process reads nothing above it"
+        );
+
+        let read = lookups(read_login, |pid, root| {
+            crate::platform::proc::descends_from_with(pid, root, read_login)
+        });
+        assert_eq!(
+            admit(&read, 12, Some(11)),
+            Ok(Some(10)),
+            "read past login, the server's receiver resolves to the client"
+        );
+
+        let detached = lookups(launchd_daemon, |pid, root| {
+            crate::platform::proc::descends_from_with(pid, root, launchd_daemon)
+        });
+        assert_eq!(
+            admit(&detached, 12, Some(11)),
+            Ok(Some(10)),
+            "under a daemon launchd parents, login is never read"
+        );
+    }
+
     /// The real process table: this test process reads its own start time, the
     /// same each time, on a platform that has one.
     #[test]
@@ -14308,11 +14482,28 @@ mod hook_ingestion_tests {
         /// returns, so absence assertions need no arbitrary sleep. Raw events
         /// remain fire-and-forget and must produce no response bytes.
         async fn agent_event(&self, pane: &str, session: &str, kind: &str, token: Option<&str>) {
+            let agent = if pane == PROV_ORCH_PANE {
+                self.orchestrator_agent.as_str()
+            } else {
+                "foreign-agent"
+            };
+            self.agent_event_as(pane, agent, session, kind, token).await;
+        }
+
+        /// [`Self::agent_event`], naming `agent` as the sender's agent id.
+        async fn agent_event_as(
+            &self,
+            pane: &str,
+            agent: &str,
+            session: &str,
+            kind: &str,
+            token: Option<&str>,
+        ) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut payload = serde_json::json!({
                 "session_id": session,
                 "pane_id": pane,
-                "agent_id": if pane == PROV_ORCH_PANE { self.orchestrator_agent.as_str() } else { "foreign-agent" },
+                "agent_id": agent,
                 "agent_type": "pi",
                 "event_type": kind,
                 "timestamp": chrono::Utc::now(),
@@ -14920,6 +15111,132 @@ mod hook_ingestion_tests {
     #[tokio::test]
     async fn hook_provenance_agent_event_refuses_malformed_token() {
         assert_agent_event_refused("thinking", "malformed", "enforce").await;
+    }
+
+    /// Scenario: The deck closes a worker, and the dying worker's own SessionEnd arrives afterwards carrying its now-retired token; then the same retired token is replayed naming another agent on the worker's pane, and claiming the orchestrator's pane, and a well-formed token the daemon never minted is presented. All are refused and change no card; only the worker's own teardown report is logged at debug, the others still as warnings (issue #2104).
+    #[tokio::test]
+    async fn hook_provenance_agent_event_retired_token_is_refused_quietly() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        let _lock = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        let _policy = HookProvenanceEnv::set("enforce");
+        let mut fx = ProvenanceFixture::start().await;
+        let retired = fx.worker_token.clone();
+        let worker = fx.worker_agent.clone();
+        fx.registry
+            .close_agent(&fx.worker_agent)
+            .expect("close the worker");
+        assert!(
+            fx.registry.owner_of_hook_token(&retired).is_none(),
+            "a closed generation's token resolves to nobody"
+        );
+        assert!(fx.registry.hook_token_was_retired(
+            &retired,
+            Some(PROV_WORKER_PANE),
+            Some(&worker)
+        ));
+        let never_minted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert!(
+            !fx.registry
+                .hook_token_was_retired(never_minted, Some(PROV_ORCH_PANE), None)
+        );
+
+        let before = format!("{:?}", fx.state.read().await.sessions);
+        fx.agent_event_as(
+            PROV_WORKER_PANE,
+            &worker,
+            "dying-worker",
+            "session_end",
+            Some(&retired),
+        )
+        .await;
+        // The same retired token on its own pane but naming another agent is
+        // not that generation's teardown either (Qodo on PR #2257).
+        fx.agent_event(PROV_WORKER_PANE, "other-agent", "thinking", Some(&retired))
+            .await;
+        // The same retired token claiming a pane its generation never held
+        // is not that generation's teardown (Qodo on PR #2257).
+        fx.agent_event(
+            PROV_ORCH_PANE,
+            "replayed-card",
+            "session_end",
+            Some(&retired),
+        )
+        .await;
+        fx.agent_event(
+            PROV_ORCH_PANE,
+            "forged-card",
+            "thinking",
+            Some(never_minted),
+        )
+        .await;
+        let after = format!("{:?}", fx.state.read().await.sessions);
+        let broadcast = fx.events.try_recv().ok();
+        fx.stop().await;
+        assert!(
+            before == after && broadcast.is_none(),
+            "all refused: changed={} broadcast={broadcast:?}",
+            before != after
+        );
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("hook socket: refused a status event"))
+            .collect();
+        let on_worker: Vec<&&str> = refusals
+            .iter()
+            .filter(|line| line.contains(PROV_WORKER_PANE))
+            .collect();
+        assert_eq!(on_worker.len(), 2, "{log}");
+        let dying = on_worker
+            .iter()
+            .find(|line| line.contains("SessionEnd"))
+            .unwrap_or_else(|| panic!("the retired token's refusal is logged: {log}"));
+        assert!(dying.contains("DEBUG"), "{dying}");
+        assert!(dying.contains("reason=\"unknown_token\""), "{dying}");
+        let other_agent = on_worker
+            .iter()
+            .find(|line| line.contains("Thinking"))
+            .unwrap_or_else(|| panic!("the other agent's refusal is logged: {log}"));
+        assert!(other_agent.contains("WARN"), "{other_agent}");
+        // The replayed retired token and the never-minted one, both on a pane
+        // neither generation held: each still a warning.
+        let elsewhere: Vec<&&str> = refusals
+            .iter()
+            .filter(|line| line.contains(PROV_ORCH_PANE))
+            .collect();
+        assert_eq!(elsewhere.len(), 2, "{log}");
+        for line in elsewhere {
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains("reason=\"unknown_token\""), "{line}");
+        }
+        assert!(!log.contains(&retired), "the token is never logged");
     }
 
     /// Scenario: Enable the older-CLI warn policy and send a token-less status for a spawned pane. It must update the card and reach attach clients.

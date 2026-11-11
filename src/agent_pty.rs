@@ -9978,6 +9978,13 @@ struct RegistryInner {
     /// [`SpawnReservation`] on both its release paths — so a token is
     /// resolvable from exactly one of the two maps at every instant.
     pending_hook_tokens: HashMap<String, String>,
+    /// Issue #2104: digests of the tokens of generations whose records were
+    /// lifted out of `agents` — by a close, a respawn or the shutdown drain —
+    /// read by [`AgentPtyRegistry::hook_token_was_retired`] so the hook loop
+    /// logs a dying agent's refused last report quietly. Never consulted by
+    /// [`AgentPtyRegistry::owner_of_hook_token`]: a retired token still
+    /// resolves to nothing. Bounded; see [`crate::hook_provenance::RetiredHookTokens`].
+    retired_hook_tokens: crate::hook_provenance::RetiredHookTokens,
     /// Issue #1612: the working directories of every spawn in
     /// [`Self::pending_spawns`] — its `cwd` and, for an orchestration role, its
     /// orchestration cwd — keyed by the same pre-allocated agent id, inserted
@@ -10591,6 +10598,7 @@ impl AgentPtyRegistry {
                 pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 pending_hook_tokens: HashMap::new(),
+                retired_hook_tokens: Default::default(),
                 pending_spawn_dirs: HashMap::new(),
                 pending_busy: HashSet::new(),
                 pending_turned: HashMap::new(),
@@ -15591,6 +15599,9 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+            inner
+                .retired_hook_tokens
+                .record(&agent.hook_token, agent.pane_id_env.as_deref(), id);
             agent.removal.closed();
             // Issue #2028 (review): in the removing hold, so a reader that no
             // longer finds the record finds what it knew of its child.
@@ -15962,6 +15973,11 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
+            inner.retired_hook_tokens.record(
+                &removed.hook_token,
+                removed.pane_id_env.as_deref(),
+                &agent_id,
+            );
             let removed_record = Self::cleanup_record(&agent_id, &removed);
             // PRD #1666 part 3, round 5-wake: under the lock hold that lifts the
             // record out; the ticket settles it.
@@ -19545,6 +19561,30 @@ impl AgentPtyRegistry {
             })
     }
 
+    /// Issue #2104: whether `token` belongs to a generation this registry took
+    /// down — closed, respawned away or drained at shutdown — and the claim is
+    /// that generation's own: `claimed_pane` is the pane it held (`None`: a
+    /// paneless generation) and `claimed_agent`, when given, is its id; a
+    /// paneless claim must give it. A retired token claiming any other pane
+    /// or agent answers `false`.
+    ///
+    /// For the hook loop's LOG LEVEL only: a dying agent's last report carries
+    /// its retired token and is refused as `unknown_token`, which is expected
+    /// and logged at `debug`. It is not evidence the sender may act — a token
+    /// answered `true` here still resolves to nothing in
+    /// [`Self::owner_of_hook_token`].
+    pub fn hook_token_was_retired(
+        &self,
+        token: &str,
+        claimed_pane: Option<&str>,
+        claimed_agent: Option<&str>,
+    ) -> bool {
+        self.inner
+            .lock()
+            .retired_hook_tokens
+            .contains(token, claimed_pane, claimed_agent)
+    }
+
     /// Test probe for one record's hook capability token.
     ///
     /// `#[cfg(test)]` on purpose, and that gate is load-bearing rather than
@@ -20718,10 +20758,13 @@ impl AgentPtyRegistry {
                 std::thread::sleep(FORCE_REAP_POLL_INTERVAL);
                 continue;
             }
-            let mut children: Vec<ShutdownChild> = inner
+            let fields = &mut *inner;
+            let retired = &mut fields.retired_hook_tokens;
+            let mut children: Vec<ShutdownChild> = fields
                 .agents
                 .drain()
-                .map(|(_, agent)| {
+                .map(|(id, agent)| {
+                    retired.record(&agent.hook_token, agent.pane_id_env.as_deref(), &id);
                     agent.removal.closed();
                     agent.into()
                 })
@@ -22143,6 +22186,72 @@ mod spawn_tests {
         assert_eq!(registry.configured_launch_of(&shell), None);
         assert_eq!(registry.configured_launch_of("no-such-agent"), None);
         registry.shutdown_all();
+    }
+
+    /// Issue #2104: every path that takes a generation down — a respawn, a
+    /// close, the shutdown drain — remembers its token as retired, and a
+    /// retired token still resolves to nobody.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_paths_retire_the_outgoing_hook_token() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let first = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-2104".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane");
+        let first_token = registry.hook_token_of(&first).expect("first token");
+        assert!(!registry.hook_token_was_retired(&first_token, Some("pane-2104"), Some(&first)));
+
+        let second = registry
+            .respawn_agent_for_pane("pane-2104", "cat")
+            .await
+            .expect("respawn the pane");
+        let second_token = registry.hook_token_of(&second).expect("second token");
+        assert!(
+            registry.hook_token_was_retired(&first_token, Some("pane-2104"), Some(&first)),
+            "respawn"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&first_token, Some("another-pane"), Some(&first)),
+            "a retired token claiming another pane is not its teardown"
+        );
+        assert!(registry.owner_of_hook_token(&first_token).is_none());
+        assert!(!registry.hook_token_was_retired(&second_token, Some("pane-2104"), Some(&second)));
+
+        registry.close_agent(&second).expect("close the pane");
+        assert!(
+            registry.hook_token_was_retired(&second_token, Some("pane-2104"), Some(&second)),
+            "close"
+        );
+        assert!(registry.owner_of_hook_token(&second_token).is_none());
+
+        let third = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a paneless agent");
+        let third_token = registry.hook_token_of(&third).expect("third token");
+        registry.shutdown_all();
+        assert!(
+            registry.hook_token_was_retired(&third_token, None, Some(&third)),
+            "shutdown"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&third_token, None, Some(&first)),
+            "a retired paneless token naming another agent is not its teardown"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&third_token, None, None),
+            "a paneless claim that names no agent is not its teardown"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&first_token, Some("pane-2104"), Some(&second)),
+            "a retired token naming its successor is not its teardown"
+        );
     }
 
     /// Qodo, PR #1603: a respawn under a DIFFERENT command keeps the old badge
