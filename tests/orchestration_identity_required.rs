@@ -19,7 +19,7 @@ use dot_agent_deck::daemon_client::{ClientError, DaemonClient, StartAgentOptions
 use dot_agent_deck::daemon_protocol::START_ERR_ORCHESTRATION_ID_REQUIRED;
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 async fn start_role(
     client: &DaemonClient,

@@ -23,7 +23,7 @@ use dot_agent_deck::daemon_client::{ClientError, DaemonClient, StartAgentOptions
 use dot_agent_deck::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE;
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCHESTRATION: &str = "review";
 

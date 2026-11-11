@@ -2,7 +2,7 @@
 
 //! Fast subprocess coverage for Codex's Claude-compatible native hook payloads.
 
-// Issue #322. Fast-tier, does NOT link `tests/common/mod.rs`; the ~40-line
+// Issue #322. Fast-tier, does NOT link `tests/common/lib.rs`; the ~40-line
 // crate-internal resolver is `#[path]`-included instead, at two extra test
 // executions rather than the harness's ~530. Every scratch dir here binds a
 // `hook.sock`, which is exactly the shape that kept `tests/daemon_protocol.rs`

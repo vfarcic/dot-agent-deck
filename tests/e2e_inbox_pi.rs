@@ -5,7 +5,7 @@
 //! receiver, with no model, and plays Pi's event contract so the deck's
 //! not-started window can be watched from the card and the picker.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

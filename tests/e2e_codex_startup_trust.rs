@@ -18,7 +18,7 @@
 //! starts the whole deck in a PTY against the silent stand-in, for the
 //! dashboard's first draw.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};

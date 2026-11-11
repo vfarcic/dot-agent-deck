@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", unix))]
 //! Generated OpenCode plugins against a fake API, real inbox CLI and daemon.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]

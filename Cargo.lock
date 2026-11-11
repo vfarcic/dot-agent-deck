@@ -1349,6 +1349,7 @@ dependencies = [
  "crossterm",
  "ctor",
  "dirs",
+ "dot-agent-deck-test-harness",
  "futures-util",
  "getrandom 0.4.3",
  "insta",
@@ -1413,6 +1414,24 @@ dependencies = [
  "windows-core",
  "windows-sys 0.61.2",
  "zbus 6.2.1",
+]
+
+[[package]]
+name = "dot-agent-deck-test-harness"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "ctor",
+ "dot-agent-deck",
+ "libc",
+ "portable-pty",
+ "ratatui",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "vt100",
+ "windows-sys 0.61.2",
+ "xtask-docs",
 ]
 
 [[package]]

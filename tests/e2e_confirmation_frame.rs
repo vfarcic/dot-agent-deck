@@ -3,7 +3,7 @@
 //! PTY-attached coverage for input that reaches a confirmation dialog before
 //! the dialog's first frame.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

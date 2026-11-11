@@ -121,8 +121,14 @@
       #     crossterm with the patched copy in `vendor/crossterm`, which the
       #     binary compiles.
       #
-      # `tests/` is left out on purpose: `doCheck = false`, so nothing compiles
-      # it.
+      #   * `tests/common/` (issue #2083), the test-harness crate, for the same
+      #     reason as `xtask/`: it is a workspace member and a path
+      #     dev-dependency of the root package, so cargo cannot resolve the
+      #     workspace without its manifest and lib target, though
+      #     `-p dot-agent-deck` never compiles it.
+      #
+      # The rest of `tests/` is left out on purpose: `doCheck = false`, so
+      # nothing compiles it.
       src = lib.fileset.toSource {
         root = ./.;
         fileset = lib.fileset.unions [
@@ -136,6 +142,7 @@
           ./pi-extension/src
           ./examples
           ./xtask
+          ./tests/common
           ./desktop/src-tauri
           ./vendor
           (lib.fileset.difference

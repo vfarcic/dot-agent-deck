@@ -20,10 +20,16 @@
 //! quiescence-based waits, and failure recordings.
 //!
 //! The Unix-only harness items carry a per-item `#[cfg(unix)]` gate (see the
-//! file header) so this single module can be shared by every L2 test under the
-//! `e2e` feature while the cross-platform helpers still compile on Windows. The
-//! harness uses production deps only (`portable-pty`, `vt100`, `tempfile`,
-//! `libc`, `serde_json`), all already in `Cargo.toml`.
+//! file header) so this single crate can be shared by every L2 test under the
+//! `e2e` feature while the cross-platform helpers still compile on Windows.
+//!
+//! **A crate, not a module** (issue #2083). Every test binary used to write
+//! `mod common;`, which compiled this file and its submodules once per binary
+//! and made `cargo fmt` format them once per binary. It is now the
+//! `dot-agent-deck-test-harness` crate (`tests/common/Cargo.toml`), a
+//! dev-dependency of the root package compiled once per build. A test file
+//! links it with [`link!`], which also names it `common` there, so harness
+//! paths in the tests read as they did.
 
 #![allow(dead_code)]
 
@@ -37,7 +43,7 @@ pub mod synthetic_agent;
 /// window and appended to every panic the harness's hook renders, so a failure
 /// caused by a starved machine labels itself instead of looking identical to a
 /// regression. The module header has the signals and what they do not prove.
-pub(crate) mod load_context;
+pub mod load_context;
 
 /// Issue #1516: the refusal an in-process environment write in a test makes
 /// while a Tokio runtime is alive. The module header has the rule.
@@ -1072,7 +1078,7 @@ impl TuiDeck {
         // The binary this deck runs as: the contained link (PRD #1666), unless
         // the test opted out with `launching_the_cargo_artifact`.
         let deck_binary: PathBuf = if builder.launch_cargo_artifact {
-            PathBuf::from(env!("CARGO_BIN_EXE_dot-agent-deck"))
+            PathBuf::from(deck_binary_path())
         } else {
             contained_deck_binary().to_path_buf()
         };
@@ -1246,9 +1252,10 @@ impl TuiDeck {
 
         // Cargo sets `CARGO_BIN_EXE_<bin-name>` at integration-test
         // build time to the path of the freshly-built binary under
-        // test. The `env!()` evaluates at compile time so the harness
-        // always launches whatever the current test build produced
-        // (debug vs. release matches the test's profile).
+        // test, and `link!` registers it from the test binary (issue
+        // #2083), so the harness always launches whatever the current
+        // test build produced (debug vs. release matches the test's
+        // profile).
         //
         // Run through `contained_deck_binary` rather than from that path
         // directly, unless the test opted out: see that function.
@@ -3289,7 +3296,7 @@ fn eprint_log_tail(name: &str, redacted: &[u8], where_the_rest_is: &str) {
 /// to stderr without panicking — CI's linkage-check rule 7 is the
 /// load-bearing enforcement.
 fn regenerate_paired_doc(test_name: &str) {
-    let workspace_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let workspace_root = checkout_root().to_path_buf();
     let config = xtask_docs::DocsConfig::from_workspace(&workspace_root);
     let generated = match xtask_docs::generate_all(&config) {
         Ok(g) => g,
@@ -3511,7 +3518,7 @@ impl TuiDeck {
         outcome: RecordingOutcome,
         redactions: &[String],
     ) -> std::io::Result<()> {
-        let (commit, dirty) = recording_build_commit(env!("DAD_BUILD_ID"));
+        let (commit, dirty) = recording_build_commit(test_crate_build_id());
         let recorded_at_unix = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -3522,7 +3529,7 @@ impl TuiDeck {
             "outcome": outcome.as_str(),
             "commit": commit.unwrap_or(""),
             "dirty": dirty,
-            "build_id": env!("DAD_BUILD_ID"),
+            "build_id": test_crate_build_id(),
             "run_id": std::env::var("NEXTEST_RUN_ID").unwrap_or_else(|_| "unknown".to_string()),
             "redaction_version": RECORDING_REDACTION_VERSION,
             "recorded_at_unix": recorded_at_unix,
@@ -4486,7 +4493,7 @@ pub(crate) fn redact_known_credentials_bytes(data: &[u8], credentials: &[String]
     redacted
 }
 
-pub(crate) fn redact_known_credentials_text(text: &str, credentials: &[String]) -> String {
+pub fn redact_known_credentials_text(text: &str, credentials: &[String]) -> String {
     String::from_utf8_lossy(&redact_known_credentials_bytes(
         text.as_bytes(),
         credentials,
@@ -5186,7 +5193,7 @@ pub fn wait_for_file_contains(path: &Path, needle: &str) {
 /// and exercised by the unit tests below — extracted so the polling
 /// logic stays trivial and the matching invariant is testable
 /// without spawning a PTY.
-pub(crate) fn match_needles_in_order(haystack: &[u8], needles: &[&str]) -> usize {
+pub fn match_needles_in_order(haystack: &[u8], needles: &[&str]) -> usize {
     let text = String::from_utf8_lossy(haystack);
     let mut cursor = 0usize;
     let mut matched = 0usize;
@@ -5435,7 +5442,7 @@ fn contained_deck() -> &'static ContainedDeck {
             .unwrap_or_else(|e| panic!("create {}: {e}", path_dir.display()));
         let name = format!("dot-agent-deck{}", std::env::consts::EXE_SUFFIX);
         let binary = dir.join(&name);
-        let built = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"));
+        let built = Path::new(deck_binary_path());
         if std::fs::hard_link(built, &binary).is_err() {
             std::fs::copy(built, &binary).unwrap_or_else(|e| {
                 panic!(
@@ -5460,7 +5467,7 @@ fn contained_deck() -> &'static ContainedDeck {
                  real agents run by this suite are shown paths inside it. Point \
                  DAD_E2E_TMPDIR outside the checkout.",
                 dir.display(),
-                env!("CARGO_MANIFEST_DIR"),
+                checkout_root().display(),
             );
         }
         #[cfg(target_os = "macos")]
@@ -5503,7 +5510,7 @@ fn pay_first_launch(binary: &Path) {
 /// Whether `path` is the developer's checkout or below it, lexically or through
 /// its canonical spelling.
 fn is_inside_checkout(path: &Path) -> bool {
-    let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let checkout = checkout_root();
     path.starts_with(checkout)
         || std::fs::canonicalize(checkout).is_ok_and(|canonical| path.starts_with(canonical))
 }
@@ -5553,7 +5560,7 @@ fn is_inside_checkout(path: &Path) -> bool {
 /// created or retargeted after this ran is not seen.
 #[allow(dead_code)]
 pub fn contain_path(path: &str) -> String {
-    let cargo_dir = Path::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
+    let cargo_dir = Path::new(deck_binary_path())
         .parent()
         .expect("the binary under test has a parent directory");
     let cargo_canonical = std::fs::canonicalize(cargo_dir).ok();
@@ -5685,8 +5692,7 @@ pub fn path_with_binary_dir() -> String {
 }
 
 fn locate_fixture(name: &str) -> PathBuf {
-    // CARGO_MANIFEST_DIR is the repo root for integration tests.
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = checkout_root().to_path_buf();
     let p = root.join("tests").join("fixtures").join(name);
     assert!(p.is_dir(), "fixture directory missing: {p:?}");
     p
@@ -5723,7 +5729,8 @@ fn copy_dir_recursively(src: &Path, dst: &Path) -> std::io::Result<()> {
 /// Absolute workspace path: the deck itself runs in a temporary fixture.
 /// Current artifacts live under `<test>/`, older runs under `<test>/runs/`.
 fn workspace_recordings_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    checkout_root()
+        .to_path_buf()
         .join(".dot-agent-deck")
         .join("recordings")
 }
@@ -5947,12 +5954,12 @@ pub(crate) fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// the check and the scenario then failed deep inside a PTY wait with a
 /// confusing timeout. The extra checks below are all **cheap and offline** —
 /// no probe request, unlike [`check_codex_available`], because the equivalent
-/// `claude -p` round trip costs real tokens on every e2e run. Expiry is
-/// treated the way Claude Code itself treats it: an expired access token is
-/// fine while a live refresh token can still renew it, so only the case where
-/// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
-/// holds that half as a pure function so `tests/real_agent_preflight.rs` can
-/// assert every accepted and rejected credential shape.
+/// `claude -p` round trip costs real tokens on every e2e run. Since issue
+/// #1731 a test HOME gets an access-only copy of the login, so the access token
+/// alone decides, and it must last [`SCRATCH_LOGIN_RUN_MARGIN`] — see
+/// [`claude_oauth_usable`], which holds that half as a pure function so
+/// `tests/real_agent_preflight.rs` can assert every accepted and rejected
+/// credential shape.
 ///
 /// PRD #386: the credential set is no longer necessarily a FILE. Claude Code
 /// 2.x on macOS keeps it in the login Keychain as the generic-password item
@@ -6083,7 +6090,7 @@ pub const ANTHROPIC_API_KEY_ENV: &str = "ANTHROPIC_API_KEY";
 /// This is a secret. It is returned only to be threaded into a child process's
 /// environment and to be registered for recording redaction; it is never
 /// printed, never formatted into an error and never written to an artifact.
-pub(crate) fn anthropic_api_key() -> Option<String> {
+pub fn anthropic_api_key() -> Option<String> {
     std::env::var(ANTHROPIC_API_KEY_ENV)
         .ok()
         .filter(|key| !key.trim().is_empty())
@@ -6110,7 +6117,7 @@ pub(crate) const INHERIT_PASS: [&str; 2] = ["PATH", ANTHROPIC_API_KEY_ENV];
 /// The agent credential variables [`TuiDeckBuilder::without_agent_credentials`]
 /// keeps out of a deck's environment: the one [`INHERIT_PASS`] carries across
 /// `env_clear`, and the OpenAI key a `with_env` could add back.
-pub(crate) const AGENT_CREDENTIAL_ENV: [&str; 2] = [ANTHROPIC_API_KEY_ENV, OPENAI_API_KEY_ENV];
+pub const AGENT_CREDENTIAL_ENV: [&str; 2] = [ANTHROPIC_API_KEY_ENV, OPENAI_API_KEY_ENV];
 
 /// The ambient OpenAI API key, or `None` when unset, empty or whitespace-only.
 /// Same trim rule and same secret discipline as [`anthropic_api_key`]: returned
@@ -6287,11 +6294,22 @@ fn now_epoch_ms() -> i64 {
 /// buffer can; it is local, dropped when this returns, and never read except
 /// through `claude_oauth_usable`.
 fn claude_credential_document_usable(raw: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(raw)
-        .ok()
-        .as_ref()
-        .and_then(|parsed| parsed.get("claudeAiOauth"))
-        .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok())
+    claude_credential_document_check(raw).is_ok()
+}
+
+/// [`claude_credential_document_usable`] with the reason, for the import's
+/// refusal. The message quotes no value from the document.
+fn claude_credential_document_check(raw: &[u8]) -> Result<(), String> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(raw).map_err(|_| {
+        "Claude Code credentials at ~/.claude/.credentials.json are not valid JSON — \
+         log in again with `claude login`"
+            .to_string()
+    })?;
+    let oauth = parsed.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    claude_oauth_usable(oauth, now_epoch_ms())
 }
 
 /// Service name Claude Code 2.x files its OAuth credential set under in the
@@ -6440,44 +6458,86 @@ fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
 /// was already spent — precisely the "credentials look fine, then the real agent
 /// fails deep inside a PTY wait" case this check exists to catch.
 ///
-/// Two deliberate decisions are preserved. An expired access token with a LIVE
-/// refresh token still passes, because Claude Code itself refreshes on that
-/// shape. And there is **no probe request**: revoked credentials and network
+/// **Issue #1731: the ACCESS token alone decides, and it must last the run.**
+/// A test HOME gets an access-only copy of the login ([`claude_scratch_login`]),
+/// so a refresh token no longer makes an expired or expiring access token
+/// usable: the copy has nothing to refresh with. The set is usable when its
+/// `accessToken` is non-empty and its `expiresAt` is at least
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now_ms`; an absent `expiresAt` is
+/// refused, because the harness cannot then tell whether the token lasts. This
+/// replaced PRD #126's acceptance of an expired access token beside a live
+/// refresh token, which was right for Claude Code on the host and is wrong for
+/// a copy that must never refresh.
+///
+/// There is still **no probe request**: revoked credentials and network
 /// failures remain an accepted false-positive class, since a live round trip
 /// would spend real tokens on every e2e run.
 pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(), String> {
+    const REMEDY: &str = "log in again with `claude login` (or `/login` inside `claude`) \
+                          to refresh the host login; the test copy carries no refresh token, \
+                          so it cannot refresh on its own";
     let non_empty = |key: &str| {
         oauth
             .get(key)
             .and_then(|v| v.as_str())
             .is_some_and(|v| !v.is_empty())
     };
-    if !non_empty("accessToken") && !non_empty("refreshToken") {
-        return Err(
-            "Claude Code credentials at ~/.claude/.credentials.json carry no access or refresh \
-             token — log in with `claude login`"
-                .into(),
-        );
+    if !non_empty("accessToken") {
+        if !non_empty("refreshToken") {
+            return Err(
+                "Claude Code credentials at ~/.claude/.credentials.json carry no access or \
+                 refresh token — log in with `claude login`"
+                    .into(),
+            );
+        }
+        return Err(format!(
+            "Claude Code credentials at ~/.claude/.credentials.json carry no access token, \
+             only a refresh token; {REMEDY}"
+        ));
     }
-    // Both timestamps are epoch MILLISECONDS. An absent field is treated as
-    // "no expiry information", never as expired.
-    let live = |key: &str| {
-        oauth
-            .get(key)
-            .and_then(|v| v.as_i64())
-            .is_none_or(|at| at > now_ms)
+    // Epoch MILLISECONDS.
+    let Some(expires_at) = oauth.get("expiresAt").and_then(serde_json::Value::as_i64) else {
+        return Err(format!(
+            "Claude Code credentials at ~/.claude/.credentials.json have no `expiresAt`, so \
+             the harness cannot tell whether the access token lasts the run; {REMEDY}"
+        ));
     };
-    // A token is usable only if it is BOTH present and unexpired; an expiry
-    // alone says nothing about a token that does not exist.
-    let usable = |token_key: &str, expiry_key: &str| non_empty(token_key) && live(expiry_key);
-    if !usable("accessToken", "expiresAt") && !usable("refreshToken", "refreshTokenExpiresAt") {
-        return Err(
-            "Claude Code credentials at ~/.claude/.credentials.json are expired and cannot be \
-             refreshed — log in again with `claude login`"
-                .into(),
-        );
+    scratch_login_lasts_the_run(
+        u128::try_from(expires_at).unwrap_or(0),
+        u128::try_from(now_ms).unwrap_or(0),
+        "the Claude Code login at ~/.claude/.credentials.json",
+        REMEDY,
+    )
+}
+
+/// The copy of a host Claude Code credentials `document` that a test HOME gets
+/// (issue #1731): `{"claudeAiOauth": …}` with every refresh-token key removed,
+/// and nothing else. `mcpOAuth` — MCP servers' OAuth logins, each with its own
+/// refresh token — is left out entirely, so a host MCP server that the test
+/// HOME's configuration still names starts unauthenticated there.
+/// Refused, with the remedy, by the [`claude_oauth_usable`] rule.
+///
+/// **Why no refresh token**, the reason [`pi_scratch_login`] gives: a refresh
+/// in the copy writes the new tokens only into the scratch HOME, which is
+/// deleted at teardown, and a provider that rotates refresh tokens leaves the
+/// host login holding a spent one. Measured on 2026-11-10 that Claude Code
+/// 2.1.322 authenticates from the access-only copy (`claude -p` on Haiku in a
+/// scratch HOME holding only this document) and writes no refresh token into
+/// it.
+pub(crate) fn claude_scratch_login(
+    document: &serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    let oauth = document.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    claude_oauth_usable(oauth, i64::try_from(epoch_ms(now)).unwrap_or(i64::MAX))?;
+    let mut oauth = oauth.clone();
+    if let Some(fields) = oauth.as_object_mut() {
+        fields.retain(|key, _| !is_refresh_token_key(key));
     }
-    Ok(())
+    Ok(serde_json::json!({ "claudeAiOauth": oauth }))
 }
 
 /// PRD #77 Decision 26 runtime-skip helper for OpenCode. Mirrors
@@ -6954,15 +7014,92 @@ fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
         .filter(serde_json::Value::is_object)
 }
 
-/// How long a Pi OAuth access token must still be valid when a scratch copy is
-/// made of it ([`pi_scratch_login`]): the copy carries no refresh token, so a
-/// test that outlives the token fails rather than refreshing. One hour covers a
-/// lane-2 Pi test with its preflight many times over.
-const PI_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+/// How long an OAuth access token must still be valid when a scratch copy is
+/// made of it — Pi's ([`pi_scratch_login`]), Claude's ([`claude_scratch_login`]),
+/// Codex's ([`codex_scratch_login`]) and OpenCode's ([`opencode_scratch_auth`]).
+/// Each copy carries no refresh token (PRD #1666, issue #1731), so a test that
+/// outlives the token fails rather than refreshing. One hour covers a lane-2
+/// test with its preflight many times over: the copy is made when that one test
+/// starts, not when the run does.
+pub(crate) const SCRATCH_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+
+/// Whether an OAuth document key names a refresh token. Matched on the key, not
+/// the value, the way [`pi_scratch_login`] matches; `last_refresh` (Codex's
+/// timestamp of its last refresh, not a token) is the one exception.
+fn is_refresh_token_key(key: &str) -> bool {
+    key != "last_refresh" && key.to_ascii_lowercase().contains("refresh")
+}
+
+/// The `exp` claim (seconds since the epoch) of a JWT, read without verifying
+/// it: the harness only needs to know whether the token lasts the run, and the
+/// agent that receives it does the verifying. `None` for anything that is not a
+/// three-part token with a base64url JSON payload carrying a numeric `exp`.
+pub(crate) fn jwt_expiry_secs(token: &str) -> Option<u64> {
+    let mut parts = token.split('.');
+    let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(payload.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in payload.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
+/// Milliseconds since the epoch at `now`, `0` on a pre-epoch clock.
+fn epoch_ms(now: std::time::SystemTime) -> u128 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0)
+}
+
+/// `Err` naming how long is left when `expires_ms` is less than
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now_ms`. `what` names the login, and
+/// `remedy` how to refresh it on the host; the message quotes no secret.
+fn scratch_login_lasts_the_run(
+    expires_ms: u128,
+    now_ms: u128,
+    what: &str,
+    remedy: &str,
+) -> Result<(), String> {
+    let left_ms = expires_ms.saturating_sub(now_ms);
+    if left_ms < SCRATCH_LOGIN_RUN_MARGIN.as_millis() {
+        let when = if left_ms == 0 {
+            "has expired".to_string()
+        } else {
+            format!("expires in {} min", left_ms / 60_000)
+        };
+        return Err(format!(
+            "{what}'s access token {when}, less than the {} min a test run needs; {remedy}",
+            SCRATCH_LOGIN_RUN_MARGIN.as_secs() / 60
+        ));
+    }
+    Ok(())
+}
 
 /// The copy of the host's stored Pi login `entry` that a scratch agent
 /// directory gets: every refresh token taken out, and refused unless its access
-/// token is still valid for [`PI_LOGIN_RUN_MARGIN`] after `now`.
+/// token is still valid for [`SCRATCH_LOGIN_RUN_MARGIN`] after `now`.
 ///
 /// **Why no refresh token.** A refresh run in the scratch copy writes the new
 /// tokens only there, and they go when the directory does. On a provider that
@@ -7005,12 +7142,12 @@ pub(crate) fn pi_scratch_login(
         .map(|since| since.as_millis())
         .unwrap_or(0);
     let left_ms = u128::from(expires).saturating_sub(now_ms);
-    if left_ms < PI_LOGIN_RUN_MARGIN.as_millis() {
+    if left_ms < SCRATCH_LOGIN_RUN_MARGIN.as_millis() {
         return Err(format!(
             "the stored Pi login's access token expires in {} min, less than the {} min a \
              test run needs; {remedy}",
             left_ms / 60_000,
-            PI_LOGIN_RUN_MARGIN.as_secs() / 60
+            SCRATCH_LOGIN_RUN_MARGIN.as_secs() / 60
         ));
     }
     for key in refresh_keys {
@@ -7144,7 +7281,7 @@ pub fn check_pi_available() -> Result<(), String> {
             "Pi is installed and has a credential for provider {:?}, but it refused model \
              {model}, so this real-agent test cannot run. Set {PI_TEST_MODEL_ENV} to a \
              `<provider>/<model>` these credentials accept, or update PI_TEST_MODEL_DEFAULT \
-             ({PI_TEST_MODEL_DEFAULT:?}) in tests/common/mod.rs if the id was retired.",
+             ({PI_TEST_MODEL_DEFAULT:?}) in tests/common/lib.rs if the id was retired.",
             model.provider
         );
     }
@@ -7225,7 +7362,7 @@ pub fn check_pi_available() -> Result<(), String> {
 /// which is the same third-auth-path measurement #502/#785 recorded on
 /// [`check_opencode_available`]. Both lane-2 OpenCode tests were then run
 /// against this default with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` and passed.
-pub(crate) const OPENCODE_TEST_MODEL_DEFAULT: &str = "anthropic/claude-haiku-4-5-20251001";
+pub const OPENCODE_TEST_MODEL_DEFAULT: &str = "anthropic/claude-haiku-4-5-20251001";
 
 /// Env var that overrides [`opencode_test_model`] on a host whose OpenCode
 /// credentials cannot reach the default — e.g. one holding a
@@ -7606,14 +7743,13 @@ pub fn check_codex_available() -> Result<(), String> {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
 
-    // Both commands below read the home that `codex_test_model` and
-    // `import_codex_credentials` read, `~/.codex`, rather than an ambient
-    // `CODEX_HOME` the launched test never sees (the harness clears the
+    // Both commands below read the login that `codex_test_model` and
+    // `import_codex_credentials` read, `~/.codex/auth.json`, rather than an
+    // ambient `CODEX_HOME` the launched test never sees (the harness clears the
     // environment). Otherwise a host whose `CODEX_HOME` holds the other auth
     // mode would be probed with the wrong login and, since #656, fail on a
     // model refusal that the test itself would not meet.
-    let codex_home = host_home().join(".codex");
-    let auth_path = codex_home.join("auth.json");
+    let auth_path = host_home().join(".codex").join("auth.json");
     let auth_is_regular = std::fs::symlink_metadata(&auth_path)
         .map(|meta| meta.file_type().is_file())
         .unwrap_or(false);
@@ -7622,6 +7758,15 @@ pub fn check_codex_available() -> Result<(), String> {
             "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`".into(),
         );
     }
+    // Issue #1731: the probe runs in a scratch `CODEX_HOME` holding the same
+    // access-only copy a test gets ([`seed_codex_scratch_auth`]), not in the
+    // host's `~/.codex`. So it measures the login the test will run with, a
+    // login that would not last the run is a skip here rather than a panic at
+    // launch, and no probe — one per gated test, run concurrently — can
+    // refresh the developer's own login.
+    let probe_home = race_safe_tempdir();
+    let codex_home = probe_home.path().join(".codex");
+    seed_codex_scratch_auth(&codex_home).map_err(|e| e.to_string())?;
 
     let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
     let deadline = Instant::now() + ceiling;
@@ -7685,7 +7830,7 @@ pub fn check_codex_available() -> Result<(), String> {
         panic!(
             "Codex is installed and logged in (auth_mode {:?}), but it refused model {:?}, so \
              this real-agent test cannot run. Set {} to a model these credentials accept, or \
-             update the default for this auth mode in tests/common/mod.rs if OpenAI retired \
+             update the default for this auth mode in tests/common/lib.rs if OpenAI retired \
              it. Measured choices: ChatGPT login {:?}, API key {:?}",
             codex_auth_mode().unwrap_or_else(|| "unknown".to_string()),
             codex_test_model(),
@@ -7944,7 +8089,7 @@ pub fn _skip_if_err(result: Result<(), String>) -> bool {
 #[macro_export]
 macro_rules! skip_unless {
     ($expr:expr) => {
-        if $crate::common::_skip_if_err($expr) {
+        if $crate::_skip_if_err($expr) {
             return;
         }
     };
@@ -7965,6 +8110,13 @@ fn host_home() -> PathBuf {
 /// in place would invoke the developer's real hook commands inside
 /// the test). M3.1 auditor S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
+///
+/// **The credentials file is an access-only copy (issue #1731)**: the
+/// `claudeAiOauth` login without its refresh token, and no `mcpOAuth`
+/// ([`claude_scratch_login`]). A login whose access token would not last
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] is refused with the remedy rather than copied.
+/// Every value of the source document, refresh tokens included, is registered
+/// for redaction before anything is written.
 ///
 /// # Returns the credential values the recording must redact (issue #502/#785)
 ///
@@ -8008,7 +8160,7 @@ fn host_home() -> PathBuf {
 /// [`api_key_recording_redactions`] whenever a key is present. Its identity
 /// fields are registered separately and by NAME, where they are written — see
 /// [`claude_identity_redactions`] (PR #805 audit P2).
-pub(crate) fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
+pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
     // The ambient API key this import defers to is rendered through the
     // approval prompt's 20-character suffix, and the documents copied below are
     // registered at the point they are read. Installing here registers every
@@ -8070,9 +8222,17 @@ pub(crate) fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec
         Ok(bytes) => match claude_keychain_credentials_export() {
             Some(keychain) => Some(keychain),
             None if key_authorises => None,
-            // Unchanged: copy what we have and let it fail loudly rather than
-            // silently importing nothing.
-            None => Some(bytes),
+            // Issue #1731: this used to copy what we had and let it fail
+            // loudly. An unusable document cannot be turned into an access-only
+            // copy that lasts the run, so the import refuses with the reason —
+            // which `check_claude_available` has already given as a skip on
+            // every path that calls it first.
+            None => {
+                let reason = claude_credential_document_check(&bytes)
+                    .err()
+                    .unwrap_or_default();
+                return Err(std::io::Error::other(reason));
+            }
         },
         // A symlinked or unreadable source lands here too, and falls through to
         // the same alternatives the absent-file case does — the same posture the
@@ -8091,16 +8251,27 @@ pub(crate) fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec
     let seeded_oauth = creds_bytes.is_some();
     let _ = CLAUDE_OAUTH_SEEDED.set(seeded_oauth);
     if let Some(bytes) = creds_bytes {
-        // Registered from the bytes actually WRITTEN, not from a second read of
-        // the host — the Keychain fallback and the API-key branch mean the
-        // document that lands in the test HOME is not always the file this
-        // function started from.
-        redactions.extend(claude_recording_redactions(
+        // Registered from the SOURCE document the copy is made from, not from a
+        // second read of the host — the Keychain fallback and the API-key branch
+        // mean that is not always the file this function started from — and
+        // registered BEFORE anything is written: every value in it, the refresh
+        // tokens and `mcpOAuth` the copy leaves out included (issue #1731).
+        let host_values = claude_recording_redactions(
             &bytes,
             "~/.claude/.credentials.json",
             CredentialScope::AuthDocument,
-        )?);
-        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &bytes)?;
+        )?;
+        register_diagnostic_redactions(host_values.clone());
+        redactions.extend(host_values);
+        // Issue #1731: the test HOME gets an access-only copy
+        // ([`claude_scratch_login`]), never the host's refresh token. `bytes`
+        // parsed above, so the parse here cannot fail.
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let scratch = claude_scratch_login(&document, std::time::SystemTime::now())
+            .map_err(std::io::Error::other)?;
+        let scratch_bytes = serde_json::to_vec_pretty(&scratch).map_err(std::io::Error::other)?;
+        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &scratch_bytes)?;
     }
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
@@ -8295,7 +8466,7 @@ pub(crate) fn import_claude_plugins_enabled() -> bool {
 ///
 /// A response the host already recorded for a key that is not the ambient one
 /// is left untouched in every branch.
-pub(crate) fn seed_claude_project_trust(
+pub fn seed_claude_project_trust(
     test_home: &Path,
     trust_paths: &[String],
 ) -> std::io::Result<Vec<String>> {
@@ -9036,12 +9207,29 @@ pub(crate) fn minimal_opencode_config() -> String {
 /// may execute them, and the PTY stream is persisted as a recording artifact.
 /// Every source ancestor plus the auth leaf is checked without following
 /// symlinks; destination credentials are atomically created with mode 0o600.
+///
+/// The `auth.json` written carries no refresh token (issue #1731,
+/// [`opencode_scratch_auth`]); every value of the host file is registered for
+/// redaction before it is written. A login the copy leaves out is refused only
+/// when it is the test model's provider, no other auth file's copy kept a login
+/// for that provider, and no env key authorises that model.
 pub(crate) fn import_opencode_credentials_from(
     source_home: &Path,
     test_home: &Path,
 ) -> std::io::Result<Vec<String>> {
     let mut imported_auth = false;
     let mut recording_redactions = Vec::new();
+    // Issue #1731: the test model's provider, whether some file's copy kept a
+    // login for it, and why one was left out. Judged after every file is
+    // staged, so a stale login in one file cannot refuse a run that a lasting
+    // login in another authorises.
+    let needed = opencode_test_model()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut needed_copied = false;
+    let mut needed_left_out: Option<String> = None;
     let credentials = [
         (
             source_home
@@ -9086,9 +9274,28 @@ pub(crate) fn import_opencode_credentials_from(
             &format!("OpenCode credentials not found at {redacted}"),
             redacted,
         )?;
+        // Issue #1731: every value of the HOST document, refresh tokens
+        // included, is registered before anything is written or refused.
+        let host_values = opencode_recording_redactions(&bytes, redacted)?;
+        register_diagnostic_redactions(host_values.clone());
+        recording_redactions.extend(host_values);
+        // `opencode_recording_redactions` refused anything that does not parse.
+        let auth: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let (scratch, dropped) = opencode_scratch_auth(auth.clone(), std::time::SystemTime::now());
+        if scratch.get(&needed).is_some() {
+            needed_copied = true;
+        }
+        if let Some((_, why)) = dropped.iter().find(|(provider, _)| *provider == needed) {
+            needed_left_out.get_or_insert_with(|| format!("{redacted}: {why}"));
+        }
+        let written = if scratch == auth {
+            bytes
+        } else {
+            serde_json::to_vec(&scratch).map_err(std::io::Error::other)?
+        };
         std::fs::create_dir_all(dst.parent().expect("OpenCode auth path has a parent"))?;
-        write_credential_file_atomic_0o600(&dst, &bytes)?;
-        recording_redactions.extend(opencode_recording_redactions(&bytes, redacted)?);
+        write_credential_file_atomic_0o600(&dst, &written)?;
         imported_auth = true;
     }
 
@@ -9107,11 +9314,82 @@ pub(crate) fn import_opencode_credentials_from(
                 .to_string(),
         ));
     }
+    if let Some(why) = needed_left_out
+        && !needed_copied
+        && !opencode_env_key_authorises()
+    {
+        return Err(std::io::Error::other(format!(
+            "OpenCode login for provider {needed:?} in {why}"
+        )));
+    }
     write_minimal_opencode_config(test_home)?;
 
     normalise_redactions(&mut recording_redactions);
     register_diagnostic_redactions(recording_redactions.clone());
     Ok(recording_redactions)
+}
+
+/// The copy of a host OpenCode `auth.json` that a test HOME gets (issue #1731),
+/// with the providers left out of it and why. Per provider entry, the
+/// [`pi_scratch_login`] rule: an entry with no refresh-token key (an API key)
+/// is kept as it is; an OAuth entry whose numeric `expires` (epoch
+/// milliseconds) is at least [`SCRATCH_LOGIN_RUN_MARGIN`] after `now` is kept
+/// with every refresh-token key blanked to `""`; any other OAuth entry is
+/// LEFT OUT rather than copied. Left out, not refused: a host with an expired
+/// login for a provider the test model does not use must still run, so the
+/// importer refuses only when the test model's own provider was left out.
+///
+/// **Blanked rather than removed** because OpenCode's stored-login schema
+/// requires the field, the shape Codex was measured to need
+/// ([`codex_scratch_login`]). That OpenCode then authenticates from the
+/// access-only entry is NOT measured: this host's only OpenCode OAuth login
+/// had expired when this was written, and the default test model is
+/// `anthropic/…` from `ANTHROPIC_API_KEY`, which no stored login affects.
+pub(crate) fn opencode_scratch_auth(
+    mut auth: serde_json::Value,
+    now: std::time::SystemTime,
+) -> (serde_json::Value, Vec<(String, String)>) {
+    const REMEDY: &str = "run `opencode auth login` to refresh the host login; the test \
+                          copy carries no refresh token, so it cannot refresh on its own";
+    let mut dropped = Vec::new();
+    let Some(providers) = auth.as_object_mut() else {
+        return (auth, dropped);
+    };
+    providers.retain(|provider, entry| {
+        let Some(fields) = entry.as_object_mut() else {
+            return true;
+        };
+        if !fields.keys().any(|key| is_refresh_token_key(key)) {
+            return true;
+        }
+        let verdict = match fields.get("expires").and_then(serde_json::Value::as_u64) {
+            None => Err(format!(
+                "it has a refresh token but no `expires` time, so the harness cannot tell \
+                 whether its access token lasts the run; {REMEDY}"
+            )),
+            Some(expires) => scratch_login_lasts_the_run(
+                u128::from(expires),
+                epoch_ms(now),
+                "the stored login",
+                REMEDY,
+            ),
+        };
+        match verdict {
+            Ok(()) => {
+                for (key, value) in fields.iter_mut() {
+                    if is_refresh_token_key(key) {
+                        *value = serde_json::Value::String(String::new());
+                    }
+                }
+                true
+            }
+            Err(why) => {
+                dropped.push((provider.clone(), why));
+                false
+            }
+        }
+    });
+    (auth, dropped)
 }
 
 /// The isolated OpenCode config every seeded HOME gets: the test model and
@@ -9168,18 +9446,12 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// also not a state a working host reaches — `check_codex_available` ends in a
 /// live model probe against this very file, so a host that got here has one
 /// codex itself just authenticated from.
+///
+/// **The `auth.json` written is access-only (issue #1731)** — see
+/// [`seed_codex_scratch_auth`].
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
-    let src = host_home().join(".codex").join("auth.json");
-    let bytes = read_credential_file_no_symlink(
-        &src,
-        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
-        "~/.codex/auth.json",
-    )?;
-    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
-    register_diagnostic_redactions(redactions.clone());
     let dst = test_home.join(".codex");
-    std::fs::create_dir_all(&dst)?;
-    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)?;
+    let redactions = seed_codex_scratch_auth(&dst)?;
 
     let project = test_home.parent().ok_or_else(|| {
         std::io::Error::other("isolated Codex HOME has no fixture working directory")
@@ -9212,6 +9484,94 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>
     // be on, neither of which a test wants to inherit.
     let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
     Ok(redactions)
+}
+
+/// Write an access-only copy of the host's `~/.codex/auth.json` into
+/// `codex_dir` (a scratch `CODEX_HOME`), mode 0600, and return the values a
+/// recording must redact: every value of the HOST document, refresh token
+/// included, registered for diagnostic redaction before anything is written or
+/// refused. [`import_codex_credentials`] and [`check_codex_available`]'s probe
+/// both seed through here, so the probe measures the login a test gets.
+///
+/// An API-key login (no `tokens`) is copied byte for byte; a ChatGPT login goes
+/// through [`codex_scratch_login`].
+pub(crate) fn seed_codex_scratch_auth(codex_dir: &Path) -> std::io::Result<Vec<String>> {
+    let src = host_home().join(".codex").join("auth.json");
+    let bytes = read_credential_file_no_symlink(
+        &src,
+        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
+        "~/.codex/auth.json",
+    )?;
+    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
+    register_diagnostic_redactions(redactions.clone());
+    // `codex_recording_redactions` refused anything that does not parse.
+    let auth: serde_json::Value = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    let scratch = codex_scratch_login(auth.clone(), std::time::SystemTime::now())
+        .map_err(std::io::Error::other)?;
+    let written = if scratch == auth {
+        bytes
+    } else {
+        serde_json::to_vec(&scratch).map_err(std::io::Error::other)?
+    };
+    std::fs::create_dir_all(codex_dir)?;
+    write_credential_file_atomic_0o600(&codex_dir.join("auth.json"), &written)?;
+    Ok(redactions)
+}
+
+/// The copy of a host Codex `auth.json` that a scratch `CODEX_HOME` gets (issue
+/// #1731): every refresh-token member of `tokens` blanked to `""`, and refused
+/// unless the `access_token`'s JWT `exp` is at least
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now`. A document with no `tokens` object
+/// (an API-key login) has nothing to refresh and comes back unchanged.
+///
+/// **Blanked, not removed, and measured** (codex-cli 0.164.0, 2026-11-10, a
+/// scratch `CODEX_HOME` holding a copy of a live ChatGPT login): with the
+/// member removed, `codex login status` fails on `missing field
+/// \`refresh_token\`` and `codex exec` answers 401; with it `""`, both succeed
+/// and a one-turn `codex exec` answers — including with `last_refresh` nine
+/// days old, so a stale `last_refresh` does not make Codex try a refresh it
+/// cannot make. The id token is left as it is: Codex accepted one already
+/// expired.
+///
+/// **Why no refresh token**, the reason [`pi_scratch_login`] gives: a refresh
+/// in the copy writes the rotated tokens only into the scratch home, which is
+/// deleted at teardown, leaving the host login holding a refresh token OpenAI
+/// has already spent — which Codex reports as "refresh token was already
+/// used". The refusal names no value from the document.
+pub(crate) fn codex_scratch_login(
+    mut auth: serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    const REMEDY: &str = "run `codex login` to refresh the host login; the test copy \
+                          carries no refresh token, so it cannot refresh on its own";
+    let Some(tokens) = auth
+        .get_mut("tokens")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(auth);
+    };
+    let Some(expires_secs) = tokens
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .and_then(jwt_expiry_secs)
+    else {
+        return Err(format!(
+            "the Codex login at ~/.codex/auth.json has no access token with a readable \
+             expiry, so the harness cannot tell whether it lasts the run; {REMEDY}"
+        ));
+    };
+    scratch_login_lasts_the_run(
+        u128::from(expires_secs) * 1000,
+        epoch_ms(now),
+        "the Codex login at ~/.codex/auth.json",
+        REMEDY,
+    )?;
+    for (key, value) in tokens.iter_mut() {
+        if is_refresh_token_key(key) {
+            *value = serde_json::Value::String(String::new());
+        }
+    }
+    Ok(auth)
 }
 
 /// The credential values inside a Codex `auth.json` that a recording must
@@ -9438,6 +9798,7 @@ const DECK_ENDPOINT_VARS: [&str; 5] = [
 /// Tests that need an endpoint set it explicitly per-child (`Command::env`), so
 /// the ambient value being absent changes nothing for them.
 fn detach_from_any_live_deck() {
+    assert_linked_before_main();
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         let leaked: Vec<&str> = CLEARED_BEFORE_MAIN.get().cloned().unwrap_or_default();
@@ -9480,43 +9841,71 @@ fn unreachable_runtime_dir() -> PathBuf {
 }
 
 /// The identity variables [`detach_before_main`] found set, so the note in
-/// [`detach_from_any_live_deck`] can still name them.
+/// [`detach_from_any_live_deck`] can still name them. `Some` once it has run.
 static CLEARED_BEFORE_MAIN: OnceLock<Vec<&'static str>> = OnceLock::new();
 
-ctor::declarative::ctor! {
-    /// Issue #1473: detach every test process that links this harness from any
-    /// live deck before `main` — scrub [`DECK_ENDPOINT_VARS`] and redirect
-    /// `XDG_RUNTIME_DIR` (see [`detach_from_any_live_deck`]).
-    ///
-    /// Prints nothing: stderr is not promised to be usable before `main`.
-    #[ctor(unsafe)]
-    fn detach_before_main() {
-        let leaked: Vec<&'static str> = DECK_ENDPOINT_VARS
-            .into_iter()
-            .filter(|v| std::env::var_os(v).is_some())
-            .collect();
-        // SAFETY: a constructor runs before `main`, so before libtest or any
-        // code in this binary has started a thread, and nothing can observe
-        // the environment mid-write (see `child_lifetime_bound`'s constructor
-        // for what was measured). This is the only place the harness writes these
-        // variables: `detach_from_any_live_deck` checks them and writes
-        // nothing (issue #678).
-        unsafe {
-            for var in DECK_ENDPOINT_VARS {
-                std::env::remove_var(var);
-            }
-            #[cfg(unix)]
-            std::env::set_var("XDG_RUNTIME_DIR", unreachable_runtime_dir());
+/// Whether this process ran [`detach_before_main`] before `main`, which it does
+/// exactly when the test binary invoked [`link!`] (issue #2083).
+pub fn linked_before_main() -> bool {
+    CLEARED_BEFORE_MAIN.get().is_some()
+}
+
+/// Panic unless [`link!`]'s constructor ran in this process.
+///
+/// Without it this process still carries any live deck's endpoints and no
+/// wrapped-child lifetime cap, and every child it spawns inherits both — the
+/// two leaks issues #1473 and #668 closed. Nothing else in the process would
+/// notice, so the harness's entry points check.
+fn assert_linked_before_main() {
+    assert!(
+        linked_before_main(),
+        "the test harness's pre-main set-up did not run in this test binary: put \
+         `dot_agent_deck_test_harness::link!();` at the root of the test file instead of \
+         naming the harness crate directly. Without it this process keeps any live deck's \
+         endpoints and pins no lifetime cap for the agents it spawns (issues #1473, #668, \
+         #2083)"
+    );
+}
+
+/// Issue #1473: detach every test process that links this harness from any
+/// live deck before `main` — scrub [`DECK_ENDPOINT_VARS`] and redirect
+/// `XDG_RUNTIME_DIR` (see [`detach_from_any_live_deck`]).
+///
+/// Called from the constructor [`link!`] defines in each test binary, and from
+/// nowhere else. Prints nothing: stderr is not promised to be usable before
+/// `main`.
+///
+/// # Safety
+///
+/// Call it only from a pre-main constructor, before any thread exists: it
+/// writes the process environment.
+#[doc(hidden)]
+pub unsafe fn detach_before_main() {
+    let leaked: Vec<&'static str> = DECK_ENDPOINT_VARS
+        .into_iter()
+        .filter(|v| std::env::var_os(v).is_some())
+        .collect();
+    // SAFETY: a constructor runs before `main`, so before libtest or any
+    // code in this binary has started a thread, and nothing can observe
+    // the environment mid-write (see `child_lifetime_bound`'s constructor
+    // for what was measured). This is the only place the harness writes these
+    // variables: `detach_from_any_live_deck` checks them and writes
+    // nothing (issue #678).
+    unsafe {
+        for var in DECK_ENDPOINT_VARS {
+            std::env::remove_var(var);
         }
-        let _ = CLEARED_BEFORE_MAIN.set(leaked);
+        #[cfg(unix)]
+        std::env::set_var("XDG_RUNTIME_DIR", unreachable_runtime_dir());
     }
+    let _ = CLEARED_BEFORE_MAIN.set(leaked);
 }
 
 /// Issue #668: the wrapped-agent lifetime bound, in a file small enough for the
 /// test binaries that deliberately do NOT link this harness to
-/// `#[path]`-include on their own. Declaring it here brings in its pre-main
-/// constructor (issue #678), which pins the cap for every test binary that
-/// links this harness; `init_test_env` below calls the same
+/// `#[path]`-include on their own. For a binary that links this harness, the
+/// constructor [`link!`] defines calls [`child_lifetime_bound::pin_before_main`]
+/// (issue #678), which pins the cap; `init_test_env` below calls
 /// [`child_lifetime_bound::arm`] to check it ran, so there is one
 /// implementation and one SAFETY argument rather than one per spawn-owning
 /// crate.
@@ -9524,9 +9913,174 @@ ctor::declarative::ctor! {
 /// `pub` so `tests/agent_lifetime_bound.rs` can unit-test
 /// [`child_lifetime_bound::clamped`] in ONE crate. The alternative — a
 /// `#[cfg(test)] mod tests` in the file itself — would run those pure-function
-/// cases once per including crate, i.e. ~88 times, which is the multiplication
+/// cases once per including crate, which is the multiplication
 /// `src/test_temp.rs`'s header already reasons about avoiding.
-pub(crate) mod child_lifetime_bound;
+pub mod child_lifetime_bound;
+
+/// Link this harness into a test binary. Write it once, at the root of every
+/// `tests/*.rs` file that uses the harness, in place of the `mod common;` it
+/// replaced (issue #2083):
+///
+/// ```ignore
+/// dot_agent_deck_test_harness::link!();
+/// ```
+///
+/// A test binary that also runs as a fixture child (a copy of itself
+/// standing in for an agent, chosen by an environment variable before
+/// libtest starts) names that entry point, and the constructor calls it once
+/// the harness is set up — the entry uses harness helpers, and reads its own
+/// initial environment back from `/proc/self/environ` for what the detach
+/// removed:
+///
+/// ```ignore
+/// dot_agent_deck_test_harness::link!(then = live::native_entry);
+/// ```
+///
+/// A separate constructor would not do: the order two constructors run in is
+/// not something either can rely on, and these binaries failed on Linux when
+/// the entry ran first.
+///
+/// It does three things. It names this crate `common` at the test crate's
+/// root, so `common::…` and `crate::common::…` paths read as they did when the
+/// harness was a module. It imports [`skip_unless!`] there, where test bodies
+/// call it unqualified. And it defines, **inside the test binary**, the
+/// pre-main constructor that runs [`detach_before_main`] (issue #1473) and
+/// [`child_lifetime_bound::pin_before_main`] (issue #678), and hands this
+/// crate the compile-time values only the test crate can see
+/// ([`register_test_crate`]).
+///
+/// **The constructor has to live in the test binary, not here.** A constructor
+/// is a function the linker keeps because of the section it sits in, but only
+/// once it has pulled in the object file holding it — and from a library
+/// archive the linker pulls in an object only when the binary references a
+/// symbol defined in it. A constructor left in this crate would therefore run
+/// in a binary that happened to call something in the same codegen unit and in
+/// no other, and which binaries those are depends on how rustc partitions the
+/// crate. The test binary's own objects are always linked, so a constructor
+/// defined there always runs. [`init_test_env`] and the temp-root set-up fail
+/// loudly if it did not, so a file that names this crate without the macro
+/// fails its first harness call rather than spawning agents unbounded.
+#[macro_export]
+macro_rules! link {
+    () => {
+        $crate::link!(then = $crate::__no_fixture_entry);
+    };
+    (then = $entry:path) => {
+        #[allow(unused_imports)]
+        use $crate as common;
+        #[allow(unused_imports)]
+        use $crate::skip_unless;
+
+        $crate::__ctor::declarative::ctor! {
+            /// The harness's pre-main set-up for this test binary (issue
+            /// #2083): see `dot_agent_deck_test_harness::link!`.
+            #[ctor(unsafe)]
+            fn __dot_agent_deck_test_harness_before_main() {
+                // SAFETY: this is a pre-main constructor, so no other thread
+                // exists yet — the condition both functions document.
+                unsafe {
+                    $crate::detach_before_main();
+                    $crate::child_lifetime_bound::pin_before_main();
+                }
+                $crate::register_test_crate(
+                    env!("CARGO_BIN_EXE_dot-agent-deck"),
+                    env!("DAD_BUILD_ID"),
+                );
+                // A binary that also runs as a fixture child picks that role
+                // here, with the harness already set up; the normal test
+                // process returns from it.
+                $entry();
+            }
+        }
+    };
+}
+
+/// [`link!`]'s default fixture entry: this binary is never a fixture child.
+#[doc(hidden)]
+pub fn __no_fixture_entry() {}
+
+// The harness's own unit-test binary is this crate, so it cannot invoke
+// `link!` on itself; it gets the same constructor directly, which is always
+// linked for the same reason: the binary's own objects always are.
+#[cfg(test)]
+ctor::declarative::ctor! {
+    #[ctor(unsafe)]
+    fn harness_unit_tests_before_main() {
+        // SAFETY: a pre-main constructor, so no other thread exists yet.
+        unsafe {
+            detach_before_main();
+            child_lifetime_bound::pin_before_main();
+        }
+        // Cargo builds no `dot-agent-deck` binary for this crate's own tests
+        // (a dependency's binaries are not built) and sets no
+        // `CARGO_BIN_EXE_*` for them, so there is no deck to register. These
+        // tests never launch one; the ones that reach this path link or copy
+        // it into the harness root and reason about where it lives. So
+        // register this test binary itself: a file that always exists, even
+        // in a fresh target directory where nothing else was built.
+        let deck = std::env::current_exe()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        register_test_crate(Box::leak(deck.into_boxed_str()), "harness-unit-tests");
+    }
+}
+
+/// The `ctor` crate, for [`link!`]'s expansion, so a test crate needs no
+/// `ctor` dependency of its own to link the harness.
+#[doc(hidden)]
+pub use ctor as __ctor;
+
+/// The paths and values a test binary knows at compile time and this crate
+/// does not, registered by [`link!`]'s constructor (issue #2083).
+///
+/// Cargo sets `CARGO_BIN_EXE_dot-agent-deck` only when compiling the root
+/// package's integration tests, and the root's `build.rs` sets `DAD_BUILD_ID`
+/// only for the root package's own targets, so neither is visible while this
+/// crate compiles. `link!` expands inside the test crate, where both are, and
+/// hands them over before `main`.
+struct TestCrate {
+    deck_binary: &'static str,
+    build_id: &'static str,
+}
+
+static TEST_CRATE: OnceLock<TestCrate> = OnceLock::new();
+
+/// Called by [`link!`]'s constructor; not for direct use.
+#[doc(hidden)]
+pub fn register_test_crate(deck_binary: &'static str, build_id: &'static str) {
+    let _ = TEST_CRATE.set(TestCrate {
+        deck_binary,
+        build_id,
+    });
+}
+
+fn registered_test_crate() -> &'static TestCrate {
+    TEST_CRATE.get().expect(
+        "no test binary registered with the harness: this process did not run \
+         `dot_agent_deck_test_harness::link!()`'s constructor, so the path of the binary \
+         under test is unknown (issue #2083)",
+    )
+}
+
+/// The `dot-agent-deck` binary cargo built for this test run — what
+/// `env!("CARGO_BIN_EXE_dot-agent-deck")` reads in the test binary.
+pub fn deck_binary_path() -> &'static str {
+    registered_test_crate().deck_binary
+}
+
+/// The test binary's compile-time `DAD_BUILD_ID`.
+fn test_crate_build_id() -> &'static str {
+    registered_test_crate().build_id
+}
+
+/// The repository checkout this harness was compiled from. This crate's own
+/// manifest is at `tests/common/Cargo.toml`, two levels below it.
+pub fn checkout_root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .expect("the harness crate sits two levels below the checkout root")
+}
 
 /// Idempotent setup hook for legacy daemon-spawning tests. Creates the
 /// per-process lock dir on first call; subsequent calls are no-ops.
@@ -9839,7 +10393,7 @@ pub(crate) fn choose_temp_base(
 /// This process's effective UID — the identity every harness-created directory
 /// must be owned by.
 #[cfg(unix)]
-pub(crate) fn effective_uid() -> u32 {
+pub fn effective_uid() -> u32 {
     // SAFETY: `geteuid` takes no arguments, always succeeds, and cannot fail or
     // touch memory this process owns.
     unsafe { libc::geteuid() }
@@ -10925,7 +11479,7 @@ pub(crate) fn temp_space_problem(path: &Path) -> Option<String> {
 /// is armed without this; a child started with `env_clear` is not, which is why
 /// every such environment here carries it.
 #[allow(dead_code)]
-pub(crate) fn config_containment_env() -> [(&'static str, String); 2] {
+pub fn config_containment_env() -> [(&'static str, String); 2] {
     let roots = std::env::join_paths(
         std::iter::once(harness_temp_root().to_path_buf())
             .chain(dot_agent_deck::config_write_guard::default_test_roots()),
@@ -10983,9 +11537,13 @@ fn pin_harness_umask() {
     }
 }
 
-pub(crate) fn harness_temp_root() -> &'static Path {
+pub fn harness_temp_root() -> &'static Path {
     HARNESS_TEMP_ROOT
         .get_or_init(|| {
+            // Issue #2083: the choke point nearly every harness test passes
+            // through, so a binary that names this crate without `link!` fails
+            // here, before it can spawn anything.
+            assert_linked_before_main();
             // Issue #701: this is the choke point every harness temp dir passes
             // through, including headless tests that never obtain a grid, so it
             // is where the panic hook — and with it the load baseline — gets
@@ -12228,7 +12786,7 @@ pub fn retry_pane_restart_until_success(
     role: &str,
     timeout: Duration,
 ) -> std::process::Output {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin = deck_binary_path();
     let deadline = Instant::now() + timeout;
     loop {
         let output = std::process::Command::new(bin)
@@ -12940,7 +13498,7 @@ pub fn write_late_announcing_profiled_agent(
         "\"$DOT_AGENT_DECK_PANE_ID\"",
         98,
     );
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin = deck_binary_path();
     let script = write_profiled_agent(dir);
     let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
     let shell = write_late_announcing_script(
@@ -13056,7 +13614,7 @@ const LATE_ANNOUNCE_PASTE_JSON: &str = r#"json_prompt=$(printf '%s\n' "$raw_prom
 /// own identifier and needs nothing.
 #[cfg(unix)]
 fn late_announce_hook(json: &str, args: &str, code: u16) -> String {
-    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let bin = deck_binary_path();
     let quoted_bin = format!("'{}'", bin.replace('\'', r"'\''"));
     format!(
         "printf '{json}' {args} | {quoted_bin} hook --agent claude-code >/dev/null 2>&1 \
@@ -13263,7 +13821,7 @@ pub fn misplaced_note(expected: &Path) -> String {
     if let Some(dir) = contained_deck_binary().parent().and_then(Path::parent) {
         extra.push(dir.to_path_buf());
     }
-    extra.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")));
+    extra.push(checkout_root().to_path_buf());
     misplaced_note_among(expected, &extra)
 }
 
@@ -13883,17 +14441,13 @@ impl BroadcastEventLog {
     }
 }
 
-// Issue #806: the harness's own unit tests used to sit here, in a
-// `#[cfg(test)] mod harness_unit_tests`. They now live in
-// `tests/common/harness_unit_tests.rs`, which exactly one binary compiles —
-// `tests/harness_unit.rs`. `cfg(test)` is true in EVERY integration-test
-// target, so a `#[cfg(test)]` module in this file was never "the tests for
-// this file": it was a module that every binary writing `mod common;`
-// compiled and nextest then ran, once each. Measured on `45528bc`, the commit
-// before the move: 108 distinct tests, 65 lane-1 binaries, 7020 lane-1
-// executions — 75.4% of everything `cargo test-e2e` selects. Add a new
-// harness unit test to that file, not to this one; the note at its head has
-// the reasoning and the rule for what belongs there.
+// The harness's own unit tests (issues #806, #2083). Since the harness became
+// its own crate, `cfg(test)` here is true only in this crate's unit-test
+// binary, so they compile and run once per tier — `cargo test-fast` runs them
+// through `--workspace`. The note at the head of the file has the rule for
+// what belongs there.
+#[cfg(test)]
+mod harness_unit_tests;
 
 /// Raw input to one agent the way a client that is NOT the TUI writes it — the
 /// desktop's terminal bridge (`desktop/src-tauri/src/terminal.rs` `write`):

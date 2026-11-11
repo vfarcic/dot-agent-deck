@@ -7,7 +7,7 @@
 //! public wire names and response projection independently of the typed client
 //! helpers that use them.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};

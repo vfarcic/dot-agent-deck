@@ -30,7 +30,7 @@ This file is **project-local and owned by this repository** — it was forked ou
 
 `gh pr create`, with a body that says what changed and why, how it was verified (name the tests), and `Closes #<n>` — or `Refs #<n>` for a PR that ships only part of a PRD, which leaves the PRD open (the orchestrator template's step 5 in `.dot-agent-deck.toml` has the rule).
 
-Then `gh pr edit <n> --add-reviewer <the other maintainer>` — but **request review last**, after CI and the automated review have settled and you have pushed the fixes. `dismiss_stale_reviews_on_push` voids an approval when you push new commits (a `gh pr update-branch` merge was measured not to), so asking early buys a guaranteed second round trip.
+Then `gh pr edit <n> --add-reviewer <the other maintainer>` — but **request review last**, after CI and the automated review have settled, you have pushed the fixes, and every finding is answered (step 4's two checks). `dismiss_stale_reviews_on_push` voids an approval when you push new commits (a `gh pr update-branch` merge was measured not to), so asking early buys a guaranteed second round trip.
 
 ## 3. Settle CI and the automated review
 
@@ -52,11 +52,25 @@ It waits for every app listed in `reviewers.json` beside it to finish reviewing 
 gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate
 ```
 
-Keep `--paginate` — replies count toward the page, so a busy PR silently truncates the findings you are about to certify as read. The summary comment and the review object carry none of them, and a `COMMENTED` review with a passing check can still carry real defects.
+Keep `--paginate` — replies count toward the page, so a busy PR silently truncates the findings you are about to certify as read. The review object carries none of them, and a `COMMENTED` review with a passing check can still carry real defects.
+
+**The inline threads are not every finding.** Qodo's "Code Review by Qodo" issue comment lists its findings at the head as numbered items, and its **informational** tier exists only there (`inline_comments_severity_threshold = 2`), with no thread to answer in; Greptile's summary comment lists its findings too. Those items are findings like any other: the agent reviewer reads them, and a bot finding with no reply and no fix was the commonest reason for its `REQUEST_CHANGES` (issue #2081: 22 of 40 verdicts read were an unanswered bot finding, at least 13 of them a Qodo summary item, while unresolved threads at merge were zero). So list them with:
+
+```sh
+.claude/skills/pr-create/unanswered-findings.sh <n>
+```
+
+It reads Qodo's comment for the head and Greptile's summary, prints `ANSWERED=` or `UNANSWERED=<app> <n> <severity>: <title>` per finding, and ends with `UNANSWERED_COUNT=` and `FINDINGS=answered|unanswered`. It only reads; it posts and resolves nothing. `NO_REVIEW=<app>` means there was no review of the head to read (run `wait-reviews.sh` first, and report the review you did not get); `UNPARSED=<app>` means `reviewers.json` lists an app the script has no reader for, so read that app's findings by hand.
+
+A finding counts as **answered** when one of these holds, and nothing else counts:
+
+- **fixed** — Qodo itself marks the item resolved (struck through, `✓ Resolved`, naming the resolving commit). A fix commit you pushed is not enough on its own: Qodo re-reviews it, and until it marks the item, reply.
+- **thread** — the item's review thread is resolved, or has a reply from a person (not a bot account). Greptile's summary links its thread; Qodo's medium and above have one.
+- **comment** — a PR comment from a person quotes the item's **title** (or its Qodo finding id, the UUID in its "View" link). Quote the title, not the number: Qodo renumbers its items on every review, titles stay.
 
 ## 4. Answer and resolve every finding
 
-For each one: fix it, or reply saying why not. Then **resolve the thread.**
+For each one: fix it, or reply saying why not. A finding with a thread is answered in its thread; **a summary item without one — Qodo's informational tier — is answered in one PR comment** (`gh pr comment <n> --body-file <file>`) that quotes each item's title and says what you did about it. Then **resolve the thread.**
 
 Resolving is not bookkeeping — it is half the job, and skipping it blocks the merge twice over:
 
@@ -83,11 +97,13 @@ Re-run the query after resolving and confirm it returns nothing. "I resolved the
 
 Resolve only what you actually addressed. Leave a thread open when you are waiting on the commenter, or when they asked something they still need answered there — a thread closed over unaddressed feedback is worse than one left open.
 
-Push fixes **before** requesting review (step 2). Greptile does not re-review — `greptile.json` sets `triggerOnUpdates: false` — but Qodo re-reviews on **every push** (`.pr_agent.toml`), a merge-only one included. So **after your last push, run `wait-reviews.sh <n>` again** and repeat this step for anything new it raised; a finding raised on your final push and left unanswered is still an unresolved thread blocking the merge. The script judges the new head, so a Qodo review of an earlier push does not count. Its **medium and above** findings arrive at the same endpoint as Greptile's and are answered and resolved the same way; its **informational** tier exists only in its "Code Review by Qodo" issue comment (`inline_comments_severity_threshold = 2`), so read that comment as well as the inline endpoint.
+Push fixes **before** requesting review (step 2). Greptile does not re-review — `greptile.json` sets `triggerOnUpdates: false` — but Qodo re-reviews on **every push** (`.pr_agent.toml`), a merge-only one included. So **after your last push, run `wait-reviews.sh <n>` again** and repeat this step for anything new it raised; a finding raised on your final push and left unanswered is still an unresolved thread blocking the merge. The script judges the new head, so a Qodo review of an earlier push does not count. Its **medium and above** findings arrive at the same endpoint as Greptile's and are answered and resolved the same way; its **informational** tier exists only in its "Code Review by Qodo" issue comment, and is answered by a PR comment as above.
+
+**Before requesting review, both checks come back empty, run after the final `wait-reviews.sh`:** `unanswered-findings.sh <n>` ends with `FINDINGS=answered` (`UNANSWERED_COUNT=0`), and the unresolved-thread query above returns nothing. Taken before Qodo's review of your last push lands, either check certifies a head nobody has reviewed yet. On a large PR Qodo trims its comment ("Comment size exceeded", `docs/develop/governance.md`), so the script sees only the items the comment still carries; say so in your report when that happens.
 
 ## 5. Hand off
 
-Report and stop: PR URL, check status, each finding and what you did about it, each red you met and whether it was fixed or quarantined, and whether an automated review was obtained at all.
+Report and stop: PR URL, check status, each finding and what you did about it (with `unanswered-findings.sh`'s final `UNANSWERED_COUNT=` and the unresolved-thread count, both taken after the last `wait-reviews.sh`), each red you met and whether it was fixed or quarantined, and whether an automated review was obtained at all.
 
 **Do not arm auto-merge** (CLAUDE.md rule 8). GitHub would merge the PR the moment the approval lands, with nobody present to run `/merge-pr`'s overlap check first ("The overlap check before a merge", `.claude/skills/merge-pr/SKILL.md`) or to watch `main`'s CI run for the merge commit and fix a red. When your task says to take the PR to merged, do it through `/merge-pr` once it is approved; otherwise stop at the PR.
 

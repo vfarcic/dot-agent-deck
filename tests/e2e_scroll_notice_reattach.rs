@@ -8,7 +8,7 @@
 //! daemon, a first deck that sees the agent start, and a second deck that only
 //! ever sees the replay.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::Path;
 use std::time::Duration;

@@ -4,7 +4,7 @@
 //! No real agent is started; attaches go through the real attach socket and
 //! health through the real export pipeline.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]

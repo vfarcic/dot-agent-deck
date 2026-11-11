@@ -3,7 +3,7 @@
 //! Issue #1835 with a real agent: a Bash command that fails in an interactive
 //! Claude Code ends with `PostToolUseFailure`, and the deck must hear it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 mod telemetry_operation_receiver;
 
 use common::TuiDeck;

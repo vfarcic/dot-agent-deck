@@ -16,7 +16,7 @@
 //! the deck's controlling terminal, so what the deck writes for the user's
 //! terminal lands in its byte history, where the request is read back.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

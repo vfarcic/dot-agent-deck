@@ -3,7 +3,7 @@
 //! Codex inbox contract through the real wrapper, hook CLI and daemon.
 //! Screen fixtures transcribe the 0.160.0 spike, with scratch paths substituted.
 //! No Codex CLI, model or credential is used.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

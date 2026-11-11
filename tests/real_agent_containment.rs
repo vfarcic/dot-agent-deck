@@ -14,7 +14,7 @@
 //! `orchestration/dispatch/008` checks the link and the `PATH` rewrite
 //! themselves. `orchestration/dispatch/006` and `/009` check the launches.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 
