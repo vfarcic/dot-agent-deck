@@ -7046,6 +7046,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the upper bound itself (`SPAWN_HOOKS_LIST_TIMEOUT`, 30 s), which a test would have to wait out; that the startup and CLI paths keep the 5 s bound; real Codex timing, which `question/live/004` exercises.
 - **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
 
+##### codex/trust/010 — A Codex command that sets its own `CODEX_HOME` or changes directory declares that no submitted-prompt report will come (issue #1703).
+- **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a real hook socket collecting every emitted event.
+- **Agent:** the `codex/trust/005` launcher script, with the healthy `codex` app-server stand-in on the wrapper's `PATH` (the deck's prompt hook listed and switched on, so trust is recorded), wrapped four ways: `/bin/sh -c '<launcher>'` (control), `/bin/sh -c 'CODEX_HOME=<other> <launcher>'`, `/bin/sh -c 'cd <other> && <launcher>'` and `env CODEX_HOME=<other> <launcher>`.
+- **Asserts:** the precondition that trust was recorded in the wrapper's home in every run; then that no event of the control run carries `wrapper_prompt_reports_unavailable`, and that EVERY event of the other three does. RED before issue #1703's fix, when the three re-homing runs declared nothing because the wrapper's own trust outcome was all the marker read.
+- **Does not assert:** a launcher script that sets `CODEX_HOME` or changes directory inside itself, which the wrapper cannot see and which stays a documented residual; real Codex loading another home, which needs a credential.
+- **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
+
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
