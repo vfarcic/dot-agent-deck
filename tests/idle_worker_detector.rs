@@ -583,7 +583,13 @@ impl IdleHarness {
     ) -> (tokio::time::Instant, tokio::time::Instant) {
         let started = tokio::time::Instant::now();
         let response = tokio::task::spawn_blocking(move || {
-            common::attach_request_on(&socket, &AttachRequest::StopAgent { id: agent_id })
+            common::attach_request_on(
+                &socket,
+                &AttachRequest::StopAgent {
+                    id: agent_id,
+                    keep_worktree: false,
+                },
+            )
         })
         .await
         .expect("StopAgent blocking task")

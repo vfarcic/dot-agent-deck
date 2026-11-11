@@ -90,11 +90,21 @@ export default defineConfig({
   // narrowing to one test is never what the author meant.
   forbidOnly: !!process.env.CI,
   retries: 0,
-  // One worker in CI to start. Layout is not timing-dependent, but browser
-  // startup on a 4-vCPU runner contends with itself, and this job has no honest
-  // runs yet — the same reason `e2e-deterministic` was added advisory. Raising
-  // it is a deliberate act once the job has a run history to argue from.
-  workers: process.env.CI ? 1 : undefined,
+  // Four workers in CI: one per CPU of both CI runners (GitHub's
+  // `ubuntu-latest` and the RWX task in `.rwx/ci.yml`, 4 vCPU each). Pinned
+  // rather than left to Playwright's default, which is half the cores. The job
+  // ran on one worker until it had a run history (issue #2079: 0 failures in
+  // 320 RWX PR runs). Measured on 2026-11-10 on `ubuntu-latest`, four runs per
+  // count, Playwright's own suite time for 442 tests: 1 worker 9.4–11.1 min,
+  // 2 workers 6.7–8.3, 3 workers 6.3–8.3, 4 workers 5.7–7.0, with no failure
+  // in any of the 16 runs. The specs share nothing a second worker could race
+  // on: each test gets its own browser context, the fixture state lives in the
+  // page, and the one server is a read-only `vite preview` of the built
+  // bundle. Specs that import `test` from `e2e/support/load-budget.ts` get an
+  // outer test budget that grows with the load average; locator assertions
+  // keep their normal timeout, and specs using Playwright's own `test` get no
+  // such adjustment. Retries stay off.
+  workers: process.env.CI ? 4 : undefined,
   // The JUnit report is what both CI backends keep as the run's test results
   // (issue #1981 M10), on green runs as well as red ones.
   reporter: process.env.CI

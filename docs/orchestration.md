@@ -399,6 +399,10 @@ With the flag on, keystrokes aimed at a worker pane in the TUI are dropped until
 
 While the TUI is **locked**, it moves focus within the active orchestration tab: to a role pane as soon as that role starts waiting for input (the lowest-numbered one first when several are waiting), and back to the orchestrator once none is waiting. It does not switch tabs to follow a waiting pane elsewhere; that tab's label colour shows it instead. While **unlocked**, focus stays where you put it.
 
+### Prompt suggestions are off in workers
+
+Claude Code suggests your next prompt after each turn, and each suggestion costs a model request. A worker takes its tasks from the orchestrator rather than from you, so the deck starts Claude Code workers with suggestions off. You can still type into a worker; you just get no suggestion there. The orchestrator keeps them, as you configured Claude Code. See [Configuration](configuration.md#set-by-the-deck).
+
 ### Closing an orchestration
 
 **TUI:** `Ctrl+w` on the orchestration tab, after a confirmation. **Desktop:** the group's **Close** button, after a confirmation that lists the roles (**Close all N roles**). Either stops every role's agent.

@@ -282,6 +282,11 @@ enum Commands {
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Keep the worktree of each unit this closes, even when it has no
+        /// uncommitted changes. `dot-agent-deck worktree reclaim` finds it
+        /// later.
+        #[arg(long = "keep-worktree")]
+        keep_worktree: bool,
     },
     /// List the live agents with their folder, orchestration and role, and
     /// which one is each orchestration's orchestrator — the agent to message
@@ -2283,6 +2288,7 @@ fn main() -> ExitCode {
             dry_run,
             force,
             json,
+            keep_worktree,
         }) => {
             let args = dot_agent_deck::close_cli::CloseArgs {
                 units,
@@ -2294,6 +2300,7 @@ fn main() -> ExitCode {
                 dry_run,
                 force,
                 json,
+                keep_worktree,
             };
             run_close_cli(args)
         }
@@ -3176,7 +3183,7 @@ async fn run_tui_session() -> ExitCode {
     // alternate screen, so any malformed-config / conflict / unknown-action
     // warnings land on stderr in the normal terminal (and, under a PTY, in
     // the byte stream that precedes the alt-screen switch) where they are
-    // actually visible. `run_tui` (via `ratatui::init`) is what flips into
+    // actually visible. `run_tui` (via `wide_glyph_backend::init`) is what flips into
     // the alt-screen, so loading here keeps the warnings ahead of it.
     let keybindings = dot_agent_deck::keybindings::KeybindingConfig::load();
 

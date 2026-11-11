@@ -553,6 +553,7 @@ fn close_verb_007_team_still_resolves_after_orchestrator_stops() {
         test.deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: members[0].id.clone(),
+            keep_worktree: false,
         },
     )
     .expect("existing StopAgent reply");
@@ -703,5 +704,275 @@ fn close_verb_011_unit_id_closes_only_the_selected_unit() {
     test.assert_present(&other);
     assert!(!test.worktrees[0].exists(), "{json}");
     assert!(test.worktrees[1].exists(), "{json}");
+    test.assert_present(&[caller]);
+}
+
+/// Issue #1958: the rows of the close dialog's three choices — the selected
+/// `Cancel`, the ordinary `Close` option row (a `Close` row with a ` — `
+/// description that is not the keep choice) and `Close, keep worktree` — when
+/// all three are drawn top to bottom in that order.
+fn close_choice_rows(grid: &str) -> Option<(usize, usize, usize)> {
+    let lines: Vec<&str> = grid.lines().collect();
+    let row = |pred: &dyn Fn(&str) -> bool| lines.iter().position(|l| pred(l));
+    let cancel = row(&|l| l.contains("> Cancel"))?;
+    let close =
+        row(&|l| l.contains("Close") && l.contains('\u{2014}') && !l.contains("keep worktree"))?;
+    let keep = row(&|l| l.contains("Close, keep worktree"))?;
+    (cancel < close && close < keep).then_some((cancel, close, keep))
+}
+
+/// `git status --porcelain` of a dispatched worktree, trimmed.
+fn porcelain(dir: &Path) -> String {
+    let out = common::fixture_git(dir, dir)
+        .args(["status", "--porcelain"])
+        .output()
+        .expect("git available");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Issue #1958: put a file in the worktree's git-ignored `.dot-agent-deck/`,
+/// the deck's own coordination directory, and prove the tree is still CLEAN —
+/// so a close that keeps it is keeping it on request, not because it is dirty.
+fn plant_ignored_sentinel(worktree: &Path, name: &str) -> PathBuf {
+    // A real project ignores the directory (its `.gitignore`, or the clone-local
+    // `info/exclude` rule the deck adds when it publishes orchestration context).
+    // The `minimal` fixture has neither until a team is dispatched, so add the
+    // clone-local rule here, as the deck would. `--git-path` resolves to the
+    // shared exclude file that the linked worktree reads.
+    let out = common::fixture_git(worktree, worktree)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .expect("git available");
+    let exclude = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let exclude = if exclude.is_absolute() {
+        exclude
+    } else {
+        worktree.join(exclude)
+    };
+    let mut rules = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !rules.lines().any(|l| l.trim() == "/.dot-agent-deck/") {
+        rules.push_str("\n/.dot-agent-deck/\n");
+        std::fs::create_dir_all(exclude.parent().expect("exclude has a parent"))
+            .expect("create the info dir");
+        std::fs::write(&exclude, rules).expect("ignore .dot-agent-deck/");
+    }
+    let dir = worktree.join(".dot-agent-deck");
+    std::fs::create_dir_all(&dir).expect("create the worktree's .dot-agent-deck");
+    let sentinel = dir.join(name);
+    std::fs::write(&sentinel, "kept on request").expect("write the ignored sentinel");
+    assert_eq!(
+        porcelain(worktree),
+        "",
+        "premise: the dispatched worktree must be clean (its .dot-agent-deck/ \
+         ignored) so that keeping it can only be the user's request"
+    );
+    sentinel
+}
+
+fn assert_kept_with_sentinel(worktree: &Path, sentinel: &Path, context: &str) {
+    assert!(
+        worktree.is_dir(),
+        "a worktree closed with keep was removed: {}\n{context}",
+        worktree.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(sentinel).unwrap_or_default(),
+        "kept on request",
+        "the kept worktree lost its .dot-agent-deck/ contents\n{context}"
+    );
+}
+
+/// Scenario: A clean single unit is dispatched and its card selected in the
+/// attached TUI. Ctrl+W offers Cancel, Close and `Close, keep worktree`;
+/// Down, Down, Enter closes the agent but leaves the worktree and its ignored
+/// `.dot-agent-deck/` on disk, and the status line says it was kept on request
+/// and where.
+#[spec("prompt/close-confirm/012")]
+#[test]
+fn close_confirm_012_ctrl_w_keep_worktree_keeps_a_clean_dispatched_tree() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let members = test.dispatch(&caller, "kept-tui", false);
+    let worktree = test.worktrees[0].clone();
+    let sentinel = plant_ignored_sentinel(&worktree, "keep-sentinel-1958.txt");
+    let card = members[0]
+        .display_name
+        .clone()
+        .expect("the dispatched unit's card name");
+
+    // Close the caller card first so the dispatched card is the selected one.
+    test.deck.send_keys(b"\x04");
+    test.deck.wait_for_string("COMMAND");
+    test.deck.send_keys(b"\x17");
+    test.deck.wait_for_string("Close selected agent?");
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\r");
+    test.assert_gone(std::slice::from_ref(&caller));
+    test.deck
+        .wait_until_grid("the dispatched card is the selected one", |grid| {
+            grid.lines()
+                .any(|l| l.contains('\u{25b8}') && l.contains(card.as_str()))
+        });
+
+    test.deck.send_keys(b"\x17");
+    test.deck.wait_for_string("Close selected agent?");
+    test.deck.wait_until_grid(
+        "the dialog offers Cancel, Close and `Close, keep worktree`, in that order",
+        |grid| close_choice_rows(grid).is_some(),
+    );
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\r");
+
+    let path = worktree.to_string_lossy().into_owned();
+    test.deck.wait_until_grid(
+        "the status line says the worktree was kept on request, with its path",
+        |grid| grid.contains("Worktree kept on request:") && grid.contains(path.as_str()),
+    );
+    test.assert_gone(&members);
+    assert_kept_with_sentinel(&worktree, &sentinel, &test.deck.snapshot_grid());
+}
+
+/// Scenario: A clean two-role unit is dispatched and its tab opened in the
+/// attached TUI. Ctrl+W on the tab offers Cancel, Close and `Close, keep
+/// worktree`; Down, Down, Enter stops both roles and removes the tab but leaves
+/// the shared worktree and its ignored `.dot-agent-deck/` on disk, and the
+/// status line says it was kept on request and where.
+#[spec("prompt/close-confirm/013")]
+#[test]
+fn close_confirm_013_ctrl_w_tab_keep_worktree_keeps_a_teams_shared_tree() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let members = test.dispatch(&caller, "kept-tab", true);
+    let worktree = test.worktrees[0].clone();
+    let sentinel = plant_ignored_sentinel(&worktree, "keep-sentinel-tab.txt");
+    let label = match &members[0].tab_membership {
+        Some(TabMembership::Orchestration { name, .. }) => name.clone(),
+        _ => panic!("dispatched team has no tab membership"),
+    };
+    test.deck.wait_until_grid("the unit's tab appears", |grid| {
+        grid.lines().take(5).any(|l| l.contains(&label))
+    });
+
+    test.deck.send_keys(b"\x04");
+    test.deck.wait_for_string("COMMAND");
+    test.deck.send_keys(b"\x1b[C");
+    // The tab shows its two roles of the three sessions (the caller's is the
+    // third).
+    test.deck.wait_for_string("2/3 agent(s)");
+    test.deck.send_keys(b"\x17");
+    test.deck
+        .wait_for_string("Close this tab and all its agents?");
+    test.deck.wait_until_grid(
+        "the tab dialog offers Cancel, Close and `Close, keep worktree`, in that order",
+        |grid| close_choice_rows(grid).is_some(),
+    );
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\r");
+
+    let path = worktree.to_string_lossy().into_owned();
+    test.deck.wait_until_grid(
+        "the status line says the shared worktree was kept on request, with its path",
+        |grid| grid.contains("Worktree kept on request:") && grid.contains(path.as_str()),
+    );
+    test.assert_gone(&members);
+    test.deck.wait_until_grid("the unit's tab is gone", |grid| {
+        !grid.lines().take(5).any(|l| l.contains(&label))
+    });
+    assert_kept_with_sentinel(&worktree, &sentinel, &test.deck.snapshot_grid());
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A completed clean single unit is closed by name with
+/// `--keep-worktree`, then a second one with `--keep-worktree --json`. Both
+/// agents go, both worktrees and their ignored `.dot-agent-deck/` stay, the
+/// human report says `kept on request` with the path and how to reclaim it,
+/// and the JSON verdict is `kept-on-request`.
+#[spec("dispatch/close-verb/012")]
+#[test]
+fn close_verb_012_keep_worktree_keeps_a_clean_units_tree() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let human = test.dispatch(&caller, "kept-human", false);
+    let json_unit = test.dispatch(&caller, "kept-json", false);
+    test.report_done(&human[0]);
+    test.report_done(&json_unit[0]);
+    let human_tree = test.worktrees[0].clone();
+    let json_tree = test.worktrees[1].clone();
+    let human_sentinel = plant_ignored_sentinel(&human_tree, "keep-sentinel-human.txt");
+    let json_sentinel = plant_ignored_sentinel(&json_tree, "keep-sentinel-json.txt");
+
+    let output = test.close(Some(&caller), &["kept-human", "--keep-worktree"]);
+    assert_exit("close --keep-worktree", &output, 0);
+    let text = output_text(&output);
+    assert!(
+        text.contains(&format!("{}: kept on request", human_tree.display())),
+        "the human report must say the worktree was kept on request, with its path\n{text}"
+    );
+    assert!(
+        text.contains("dot-agent-deck worktree reclaim"),
+        "the report must say how to find the kept worktree later\n{text}"
+    );
+    test.assert_gone(&human);
+    assert_kept_with_sentinel(&human_tree, &human_sentinel, &text);
+
+    let output = test.close(Some(&caller), &["kept-json", "--keep-worktree", "--json"]);
+    assert_exit("close --keep-worktree --json", &output, 0);
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("keep-worktree close JSON");
+    let verdicts = json["worktrees"].as_array().expect("worktree verdicts");
+    assert_eq!(verdicts.len(), 1, "one worktree verdict: {json}");
+    assert_eq!(verdicts[0]["verdict"], "kept-on-request", "{json}");
+    assert_eq!(
+        verdicts[0]["path"],
+        json_tree.to_string_lossy().as_ref(),
+        "{json}"
+    );
+    test.assert_gone(&json_unit);
+    assert_kept_with_sentinel(&json_tree, &json_sentinel, &json.to_string());
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A completed clean two-role unit is closed with
+/// `close --orchestration-of <pane> --keep-worktree --json`. Both roles go,
+/// the worktree they shared and its ignored `.dot-agent-deck/` stay, and the
+/// JSON reports it `kept-on-request`.
+#[spec("dispatch/close-verb/013")]
+#[test]
+fn close_verb_013_orchestration_of_keep_worktree_keeps_the_shared_tree() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let members = test.dispatch(&caller, "kept-team", true);
+    test.report_done(&members[0]);
+    let worktree = test.worktrees[0].clone();
+    let sentinel = plant_ignored_sentinel(&worktree, "keep-sentinel-team.txt");
+
+    let output = test.close(
+        Some(&caller),
+        &[
+            "--orchestration-of",
+            members[1].pane_id_env.as_deref().expect("worker pane id"),
+            "--keep-worktree",
+            "--json",
+        ],
+    );
+    assert_exit("close --orchestration-of --keep-worktree", &output, 0);
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("orchestration keep close JSON");
+    let verdicts = json["worktrees"].as_array().expect("worktree verdicts");
+    assert_eq!(
+        verdicts.len(),
+        1,
+        "the shared worktree is reported once: {json}"
+    );
+    assert_eq!(verdicts[0]["verdict"], "kept-on-request", "{json}");
+    assert_eq!(
+        verdicts[0]["path"],
+        worktree.to_string_lossy().as_ref(),
+        "{json}"
+    );
+    test.assert_gone(&members);
+    assert_kept_with_sentinel(&worktree, &sentinel, &json.to_string());
     test.assert_present(&[caller]);
 }

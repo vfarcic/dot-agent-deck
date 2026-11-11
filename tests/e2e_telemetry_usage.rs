@@ -237,7 +237,10 @@ fn launch(receiver: &Receiver) -> TuiDeck {
         .unwrap();
     let reply = common::attach_request_on(
         deck.attach_socket_path(),
-        &AttachRequest::StopAgent { id: boot.id },
+        &AttachRequest::StopAgent {
+            id: boot.id,
+            keep_worktree: false,
+        },
     )
     .unwrap();
     assert!(reply.ok);
