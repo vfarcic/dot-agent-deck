@@ -48,6 +48,8 @@ pub fn command(dir: &Path) -> String {
     std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, time, re
 tty.setraw(0, termios.TCSANOW)
 base = os.path.join(os.getcwd(), '.route-' + os.environ['DOT_AGENT_DECK_AGENT_ID'])
+# PRD #1889: the work id the deck gave this generation, empty when none.
+with open(base + '.work', 'w') as f: f.write(os.environ.get('DOT_AGENT_DECK_WORK_ID', ''))
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 ring = re.compile(r'^\([a-z]{6}\) dot-agent-deck: message ')

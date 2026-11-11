@@ -80,10 +80,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry; the real `pi` runtime (`telemetry/otlp/019`).
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/003 — The spawned agent and exported run share the same run id.
+##### telemetry/otlp/003 — The spawned agent and exported run share the same run id and work id.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell recording its environment.
-- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged.
+- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged; the agent receives a `DOT_AGENT_DECK_WORK_ID` (PRD #1889), its OTEL_RESOURCE_ATTRIBUTES carries `deck.work.id` equal to it, and the exported `agent.run` span carries the same `deck.work.id`.
 - **Does not assert:** a real agent exporting its own telemetry (005).
 - **Platform coverage:** mac+linux.
 
@@ -269,6 +269,79 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** offline Pi/OpenCode stand-ins with export disabled and a plain command with export enabled.
 - **Asserts:** when the daemon inherits DOT_AGENT_DECK_USAGE_FILE, a spawn without an allocated channel receives an absent or empty value and its attempted reply append leaves the parent's file unchanged.
 - **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
+- **Platform coverage:** mac+linux.
+
+### Work journal (PRD #1889)
+
+The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
+
+#### journal/launch
+
+##### journal/launch/001 — A manual pane opens a work, its agent is told the work id, and closing it closes the work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in recording `DOT_AGENT_DECK_WORK_ID`.
+- **Asserts:** an `opened` line with the v1 envelope, `launch=pane`, `refs.pane`, no parent and `workspace` = the pane's cwd (home-relative as `~/…`); an `attempt_started` on that work naming the pane and agent with `attempt` = `<run>/<agent id>`; the agent's `DOT_AGENT_DECK_WORK_ID` equals the work id; closing the pane through the daemon (`StopAgent`) writes that attempt's `attempt_ended` and `closed how=pane_closed` on the pane's work.
+- **Does not assert:** saved-session restore or desktop `StartPreparedAgent` launches; compaction; which `how` the closed attempt's end carries.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/002 — A dispatch is a child work of its dispatcher's pane work, and its unit's report or silent end is recorded.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --single` CLI from a stand-in pane in a one-commit repository.
+- **Agent:** synthetic routing stand-in, as dispatcher and as the unit.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work, with `refs.branch` = `agent/dispatch-<slug>`, a `u-…` `refs.unit_id` and `workspace` = the unit's worktree; the unit agent's `attempt_started` is on the dispatch work and its `DOT_AGENT_DECK_WORK_ID` names it; the unit's `work-done --done` writes `reported` on the dispatch work with that `unit_id`, a `report_id`, `destination=inbox` and `to` = the dispatcher's work; a second unit from the same dispatcher, closed through the daemon before it reports, gets `closed how=unit_ended` and no `reported`; no task or report text reaches the journal.
+- **Does not assert:** an orchestration-shaped dispatch (journal/launch/006); a unit that ends by its agent exiting rather than by a close; whether a unit that did report also gets a `closed`.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/003 — An orchestration, a delegation and its report are recorded, and a clear respawn keeps the role's work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-ins as a two-role orchestration whose worker has `clear = true`.
+- **Asserts:** `opened launch=orchestration` with `refs.orchestration_id`, `refs.orchestration` and `workspace` = `~` (the orchestration's cwd is the home directory); both role panes' attempts are on that work with their `role`, and both agents' `DOT_AGENT_DECK_WORK_ID` name it; a delegate opens a `launch=delegation` child with `refs.task_id` and `refs.role`; the clear respawn ends the old generation `how=replaced` and adds a new `attempt_started` for the same pane and role on the orchestration work, and the respawned generation's `DOT_AGENT_DECK_WORK_ID` is still the orchestration's work id (not the delegation's); the delegation gets an attempt on the bound generation; `work-done --task-id` writes `reported` on the delegation with `task_id`, `destination=inbox`, a `report_id` and `to` = the orchestration work, then `closed how=task_done`; no task or report text reaches the journal.
+- **Does not assert:** `pane restart`; an orchestration started by a dispatch (journal/launch/006).
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/004 — A plain scheduled fire opens a work per fire.
+- **Layer:** L2 headless `daemon serve` driven by `RunNow`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in as the schedule's command.
+- **Asserts:** `opened launch=schedule_fire` with `refs.schedule`; the fired pane's `attempt_started` is on that work and its `DOT_AGENT_DECK_WORK_ID` names it.
+- **Does not assert:** a fire that re-posts into a reused pane; an orchestration-shaped fire.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/005 — A scheduled issue dispatch opens one child work per issue, and its interrupted attempts still lead to the issue after a restart.
+- **Layer:** L2 headless `daemon serve` driven by `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`), behind the offline stub `gh` of `scheduler/dispatch/*`; then a SIGTERM to that daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** none (the fixture orchestration role runs `cat`).
+- **Asserts:** `opened launch=schedule_fire` with `refs.schedule`, and as its child an `opened launch=issue_dispatch` with `refs.issue`, `refs.repo`, `refs.branch` = `agent/issue-<n>` and `workspace` = the issue's worktree; the dispatched pane's attempt is on the issue's work or on a work whose parent it is; after the restart every attempt that was live at the SIGTERM has `attempt_ended how=interrupted`, and walking up its work's `parent` chain reaches that issue's `launch=issue_dispatch` work with `refs.issue`, `refs.repo` and `refs.branch`.
+- **Does not assert:** the issue pane's `DOT_AGENT_DECK_WORK_ID` (`cat` records nothing); skipped issues; the interruption's cause; a SIGKILL'd daemon (journal/restart/002 covers recovery after one).
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/006 — An orchestration started by a dispatch is a child work of that dispatch.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --orchestration=journal-team` CLI from a stand-in pane in a one-commit repository whose `.dot-agent-deck.toml` defines a one-role orchestration.
+- **Agent:** synthetic routing stand-in, as dispatcher and as the orchestrator role.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work and whose `workspace` is the unit's worktree; an `opened launch=orchestration` named `journal-team`, with a `refs.orchestration_id`, whose `parent` is that dispatch work; the orchestrator role's `attempt_started` is on the orchestration work with `role=orchestrator`, and its `DOT_AGENT_DECK_WORK_ID` names the orchestration work.
+- **Does not assert:** a multi-role dispatched team; the orchestration unit's terminal report.
+- **Platform coverage:** mac+linux.
+
+#### journal/restart
+
+##### journal/restart/001 — After a SIGTERM, a new daemon on the same state directory finds every launch and every live attempt interrupted.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`); the signal goes to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
+- **Asserts:** the new daemon creates its own `run-<id>.jsonl` (even with nothing to write) holding only its own run's lines; the pane's and the dispatch's `opened` lines (parent, refs, workspace) read back after the restart; both attempts have `attempt_ended how=interrupted` with cause `daemon_shutdown` or `daemon_gone`; the dead segment is byte for byte as left, or folded away into a `compacted-*.jsonl` that carries every one of its lines byte for byte.
+- **Does not assert:** which of the two causes is written (the shutdown write is best effort).
+- **Platform coverage:** mac+linux.
+
+##### journal/restart/002 — After a SIGKILL and a torn tail, recovery writes the interruptions without rewriting the dead segment.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
+- **Asserts:** with a half line (no newline) appended to the dead segment, the new daemon starts and serves; both open attempts get `attempt_ended how=interrupted cause=daemon_gone` in the new run's segment; the dead segment is byte for byte what was left, or folded away into a `compacted-*.jsonl` that carries every complete line of it byte for byte (the torn tail may be dropped).
+- **Does not assert:** compaction's retention rules.
+- **Platform coverage:** mac+linux.
+
+#### journal/compat
+
+##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`), on a state directory planted before it starts.
+- **Agent:** none.
+- **Asserts:** a dead segment with no held lock holding a v1 `opened` and `attempt_started`, a `"v":2` line and a v1 line of unknown `kind` (both shaped to end that attempt) does not stop the daemon starting; it writes `attempt_ended how=interrupted cause=daemon_gone` for the planted attempt; the v2 and unknown-kind lines remain byte for byte in the journal and the dead segment is not rewritten (or is folded into a `compacted-*.jsonl` carrying all its lines byte for byte).
+- **Does not assert:** a reader ignoring unknown fields on a known kind.
 - **Platform coverage:** mac+linux.
 
 ### Session pull requests
@@ -3120,6 +3193,42 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Asserts:** each agent starts with the files `hooks/install/025`/`026` define, which are the same for both versions; the server module (`~/.config/opencode/plugin/dot-agent-deck.js`) and the 2.x TUI half keep the same bytes, inode and mtime from the first 1.x spawn through the 2.x spawn and back to 1.x, because OpenCode 2 reloads its plugins whenever the module file changes; `--standalone` is on the 2.x agent's argv once and on neither 1.x agent's.
 - **Does not assert:** the 1.x TUI half and `tui.json` across the switch (unit-tested in `opencode_alternating_generations_rewrite_nothing`); that a real OpenCode 2 reloads on a rewrite; an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent; a daemon of another template revision (`an_older_deck_never_downgrades_a_newer_template`).
 - **Platform coverage:** mac+linux.
+
+#### hooks/opencode-real
+
+Issue #2051: the deck's OpenCode plugin under the real, pinned OpenCode binaries, in CI's lane 1 on both backends, with no model. The file header has the no-model guarantee in full and the measurements behind what each check reads.
+
+##### hooks/opencode-real/001 — A real OpenCode 1.x loads both halves of the deck's plugin, and a session it creates reaches the card (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 1.x (1.19.5 when written) (`scripts/opencode-pins/v1`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(1)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** the pane draws OpenCode's own `No provider selected`; the deck adds no `--standalone`; the plugin's server half (`inbox wait --doorbell-only`) and TUI half (`inbox wait` without it) run their watchers inside OpenCode, and `inbox_list` reports the pane armed by `opencode_plugin`; the card has no status until `POST /session` on OpenCode's loopback server (`--port`) creates a session, whose `SessionStart` arrives with that `ses_` id, owned by the pane's agent and pane, after which the card reads Idle in `daemon status --json` and on the dashboard; OpenCode reports no failed plugin.
+- **Does not assert:** a failed-plugin report from 1.x (1.19.5 reported a deliberately broken plugin nowhere, in its log or on screen, so the watchers are the evidence); a turn, a tool or a prompt (there is no model); delivery of a deck message (1.x's TUI half opens its "connect a provider" dialog instead).
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/002 — A real OpenCode 2.x gets `--standalone`, and its plugin runs with the pane's environment (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 2.x (2.2.5 when written) (`scripts/opencode-pins/v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** the deck starts it with `--standalone` exactly once; its private server (`serve --stdio`) carries the pane's `DOT_AGENT_DECK_PANE_ID` and `DOT_AGENT_DECK_AGENT_ID`, the server half's watcher runs under that server and the TUI half's under the client, and `inbox_list` reports the pane armed by `opencode_plugin`; a deck message posted to the pane starts a `ses_` session whose `SessionStart` and `Error` (the turn fails for want of a model) are owned by the pane's agent and pane, and the card goes from no status to Error in `daemon status --json` and on the dashboard; no `failed to load plugin` in OpenCode's log and no `Plugin failed` on screen.
+- **Does not assert:** the message being answered or acknowledged; OpenCode's shared background service (a real 2.x off `--standalone` would join the machine's one service on a fixed port; the stand-in `inbox/opencode/061` covers it); `mini`.
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/003 — A real OpenCode 2.x reports a broken plugin beside the deck's, so the failed-plugin check can fail (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 2.x (`scripts/opencode-pins/v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** with a plugin that throws as it loads in the config root's `plugin/` beside the deck's, the deck's plugin still loads (watchers, armed) and OpenCode reports a failed plugin both in its log (`failed to load plugin`) and on screen (`Plugin failed`), every such log line naming the broken file and none naming a deck file.
+- **Does not assert:** 1.x (which reports such a plugin nowhere, measured on 1.19.5).
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/004 — Switching one config root between real OpenCode 2.x, 1.x and 2.x again keeps the deck's plugin loading (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent. Three panes in turn, each stopped before the next starts.
+- **Agent:** the pinned REAL OpenCode 1.x and 2.x (`scripts/opencode-pins/v1` and `v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(1)` / `(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** each start loads the deck's plugin (watchers, armed) with no failed plugin reported; the first 2.x start leaves a deck entry in `cli.json` (the deck's 1.x TUI entry, which 2.x copies from `tui.json`; a precondition, so a 2.x that stops copying it fails rather than leaving the repair untested), after the 1.x start's install `cli.json` holds no deck entry, and the second 2.x start finds none; the deck's server module keeps its bytes, inode and mtime from the first start to the last.
+- **Does not assert:** one data root across the switch: each pane gets its own `XDG_DATA_HOME`, because after OpenCode 2.x has run, 1.19.5 refuses to start on the database 2.x migrated (`Database is not empty and has no session table`, measured), whatever the deck does; a switch while an agent runs.
+- **Platform coverage:** linux.
+- **Cost:** none.
 
 #### hooks/stale
 
@@ -6943,6 +7052,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Agent:** the `codex/trust/002` stand-in with a 6 s sleep after it reads `initialize`, which puts its `hooks/list` reply past the 5 s bound the daemon's startup install and `hooks install` use.
 - **Asserts:** the wrapper exits 0, the stand-in Codex is launched, and `[hooks.state]` in the pinned home's `config.toml` holds exactly the deck's listed key. RED before the fix: no `config.toml` was written, which against real Codex 0.160.0 is the "1 hook needs review before it can run" dialog `question/live/004` stopped on twice on a starved box.
 - **Does not assert:** the upper bound itself (`SPAWN_HOOKS_LIST_TIMEOUT`, 30 s), which a test would have to wait out; that the startup and CLI paths keep the 5 s bound; real Codex timing, which `question/live/004` exercises.
+- **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
+
+##### codex/trust/010 — A Codex command that sets its own `CODEX_HOME` or changes directory declares that no submitted-prompt report will come (issue #1703).
+- **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a real hook socket collecting every emitted event.
+- **Agent:** the `codex/trust/005` launcher script, with the healthy `codex` app-server stand-in on the wrapper's `PATH` (the deck's prompt hook listed and switched on, so trust is recorded), wrapped four ways: `/bin/sh -c '<launcher>'` (control), `/bin/sh -c 'CODEX_HOME=<other> <launcher>'`, `/bin/sh -c 'cd <other> && <launcher>'` and `env CODEX_HOME=<other> <launcher>`.
+- **Asserts:** the precondition that trust was recorded in the wrapper's home in every run; then that no event of the control run carries `wrapper_prompt_reports_unavailable`, and that EVERY event of the other three does. RED before issue #1703's fix, when the three re-homing runs declared nothing because the wrapper's own trust outcome was all the marker read.
+- **Does not assert:** a launcher script that sets `CODEX_HOME` or changes directory inside itself, which the wrapper cannot see and which stays a documented residual; real Codex loading another home, which needs a credential.
 - **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
 
 #### codex/spawn

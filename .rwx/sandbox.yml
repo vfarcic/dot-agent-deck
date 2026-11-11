@@ -87,6 +87,13 @@ tasks:
       cargo install cargo-mutants --locked --version "$CARGO_MUTANTS_VERSION" --root "$HOME/.cargo"
       "$HOME/.cargo/bin/cargo-mutants" mutants --version
 
+  # Issue #2051: the pinned real OpenCode 1.x and 2.x the lane-1
+  # tests/e2e_opencode_real_binary.rs runs, as `.rwx/ci.yml`'s `opencode` task
+  # installs them, so those tests run here rather than skip.
+  - key: opencode
+    use: [code, node]
+    run: scripts/install-pinned-opencode.sh
+
   - key: go-task
     run: |
       curl -LsSf https://github.com/go-task/task/releases/download/v3.53.1/task_linux_amd64.tar.gz \
@@ -94,7 +101,7 @@ tasks:
       task --version
 
   - key: sandbox
-    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node]
+    use: [system-packages, code, rust, nextest, cargo-mutants, go-task, node, opencode]
     runner:
       cpus: 16
       memory: 64gb

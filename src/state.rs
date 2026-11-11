@@ -6321,6 +6321,21 @@ async fn dispatch_one_owned(
             .pane_orchestration(&pane_id)
             .and_then(|orchestration| orchestration.instance_id),
     };
+    // PRD #1889: the task's work, a child of its orchestration's, registered
+    // under the task id (the message id minted above, which the post keeps)
+    // BEFORE the post, so a `work-done` that races the post finds it. Its
+    // `opened` and its attempt on the bound worker generation are written once
+    // the post goes in, or dropped if it is refused. No hub lock is held here.
+    let journal_task = content.id.as_ref().map(ToString::to_string);
+    if let Some(task_id) = journal_task.as_deref() {
+        registry.work().delegate_pending(
+            ledger.instance.as_deref(),
+            task_id,
+            &target_role,
+            &pane_id,
+            &worker_agent_id,
+        );
+    }
     // The liveness check above is separated from the post by the awaits in
     // between, so the post checks again, under the inbox's lock: a worker that
     // died and was swept meanwhile would otherwise hold the task forever.
@@ -6344,6 +6359,7 @@ async fn dispatch_one_owned(
             id,
             ended,
             superseded,
+            superseded_tasks,
         }) => {
             tracing::info!(
                 role = %target_role,
@@ -6365,6 +6381,13 @@ async fn dispatch_one_owned(
                     role: &target_role,
                 },
             );
+            // PRD #1889: the task's held `opened` and `attempt_started`, now
+            // that the post went in, and exactly the tasks it superseded
+            // retired. Outside the inbox's lock, which the post above has
+            // released.
+            registry
+                .work()
+                .delegate_posted(id.as_str(), &superseded_tasks);
             // PRD #1666 part 3, round 5 (plan D8): the tasks this one
             // superseded are closed in the ledger; their own arms and records
             // go too, exactly, and nothing of the new task's.
@@ -6392,11 +6415,19 @@ async fn dispatch_one_owned(
         }
         // Each retires the idle-worker record; `pointer_queue` ends the hold
         // on drop, a no-op by then.
-        Err(crate::inbox_hub::PostRefusal::Stale(_)) => {
-            no_live_worker(orchestrator, reservation);
-        }
-        Err(crate::inbox_hub::PostRefusal::Refused(error)) => {
-            refuse(orchestrator, Some(reservation), &error);
+        Err(refusal) => {
+            // PRD #1889: nothing of the refused task's work was written.
+            if let Some(task_id) = journal_task.as_deref() {
+                registry.work().delegate_refused(task_id);
+            }
+            match refusal {
+                crate::inbox_hub::PostRefusal::Stale(_) => {
+                    no_live_worker(orchestrator, reservation);
+                }
+                crate::inbox_hub::PostRefusal::Refused(error) => {
+                    refuse(orchestrator, Some(reservation), &error);
+                }
+            }
         }
     }
 }
