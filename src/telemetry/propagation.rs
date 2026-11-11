@@ -63,6 +63,8 @@ pub struct RunIdentity<'a> {
     pub pane_id: &'a str,
     pub agent: &'a AgentType,
     pub orchestration: Option<&'a OrchestrationInfo>,
+    /// PRD #1889: `deck.work.id`, when the spawn path gave the run one.
+    pub work_id: Option<&'a str>,
 }
 
 /// The variables to add to or override in an agent's environment.
@@ -98,6 +100,9 @@ pub fn agent_env(
                 deck_pairs.push((key.as_str().into(), value.into()));
             }
         }
+    }
+    if let Some(work) = identity.work_id.filter(|w| !w.is_empty()) {
+        deck_pairs.push((AttrKey::WorkId.as_str().into(), work.into()));
     }
     if let Some(host) = host.filter(|h| !h.is_empty()) {
         deck_pairs.push((AttrKey::HostName.as_str().into(), host.into()));
@@ -167,11 +172,38 @@ mod tests {
             pane_id: "pane-7",
             agent,
             orchestration: orch,
+            work_id: None,
         }
     }
 
     fn get<'a>(out: &'a [(String, String)], key: &str) -> Option<&'a str> {
         out.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    /// PRD #1889: the work id lands in the agent's `OTEL_RESOURCE_ATTRIBUTES`
+    /// as `deck.work.id`, beside the run id, and is absent without one.
+    #[test]
+    fn agent_env_carries_the_work_id() {
+        let base = env(&[(OTEL_EXPORTER_OTLP_ENDPOINT, "http://c:4318")]);
+        let agent = AgentType::ClaudeCode;
+        let mut id = identity(&agent, None);
+        id.work_id = Some("w-deck-0123456789abcdef");
+        let out = agent_env(Some(&config(&[])), &base, &id, None);
+        let attrs = get(&out, OTEL_RESOURCE_ATTRIBUTES).expect("resource attributes");
+        assert!(
+            attrs
+                .split(',')
+                .any(|pair| pair == "deck.work.id=w-deck-0123456789abcdef"),
+            "{attrs}"
+        );
+        assert!(
+            attrs.split(',').any(|pair| pair == "deck.run.id=run-1"),
+            "{attrs}"
+        );
+
+        let out = agent_env(Some(&config(&[])), &base, &identity(&agent, None), None);
+        let attrs = get(&out, OTEL_RESOURCE_ATTRIBUTES).expect("resource attributes");
+        assert!(!attrs.contains("deck.work.id"), "{attrs}");
     }
 
     #[test]

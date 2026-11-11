@@ -80,10 +80,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry; the real `pi` runtime (`telemetry/otlp/019`).
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/003 — The spawned agent and exported run share the same run id.
+##### telemetry/otlp/003 — The spawned agent and exported run share the same run id and work id.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell recording its environment.
-- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged.
+- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged; the agent receives a `DOT_AGENT_DECK_WORK_ID` (PRD #1889), its OTEL_RESOURCE_ATTRIBUTES carries `deck.work.id` equal to it, and the exported `agent.run` span carries the same `deck.work.id`.
 - **Does not assert:** a real agent exporting its own telemetry (005).
 - **Platform coverage:** mac+linux.
 
@@ -269,6 +269,79 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** offline Pi/OpenCode stand-ins with export disabled and a plain command with export enabled.
 - **Asserts:** when the daemon inherits DOT_AGENT_DECK_USAGE_FILE, a spawn without an allocated channel receives an absent or empty value and its attempted reply append leaves the parent's file unchanged.
 - **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
+- **Platform coverage:** mac+linux.
+
+### Work journal (PRD #1889)
+
+The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
+
+#### journal/launch
+
+##### journal/launch/001 — A manual pane opens a work, its agent is told the work id, and closing it closes the work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in recording `DOT_AGENT_DECK_WORK_ID`.
+- **Asserts:** an `opened` line with the v1 envelope, `launch=pane`, `refs.pane`, no parent and `workspace` = the pane's cwd (home-relative as `~/…`); an `attempt_started` on that work naming the pane and agent with `attempt` = `<run>/<agent id>`; the agent's `DOT_AGENT_DECK_WORK_ID` equals the work id; closing the pane through the daemon (`StopAgent`) writes that attempt's `attempt_ended` and `closed how=pane_closed` on the pane's work.
+- **Does not assert:** saved-session restore or desktop `StartPreparedAgent` launches; compaction; which `how` the closed attempt's end carries.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/002 — A dispatch is a child work of its dispatcher's pane work, and its unit's report or silent end is recorded.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --single` CLI from a stand-in pane in a one-commit repository.
+- **Agent:** synthetic routing stand-in, as dispatcher and as the unit.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work, with `refs.branch` = `agent/dispatch-<slug>`, a `u-…` `refs.unit_id` and `workspace` = the unit's worktree; the unit agent's `attempt_started` is on the dispatch work and its `DOT_AGENT_DECK_WORK_ID` names it; the unit's `work-done --done` writes `reported` on the dispatch work with that `unit_id`, a `report_id`, `destination=inbox` and `to` = the dispatcher's work; a second unit from the same dispatcher, closed through the daemon before it reports, gets `closed how=unit_ended` and no `reported`; no task or report text reaches the journal.
+- **Does not assert:** an orchestration-shaped dispatch (journal/launch/006); a unit that ends by its agent exiting rather than by a close; whether a unit that did report also gets a `closed`.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/003 — An orchestration, a delegation and its report are recorded, and a clear respawn keeps the role's work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-ins as a two-role orchestration whose worker has `clear = true`.
+- **Asserts:** `opened launch=orchestration` with `refs.orchestration_id`, `refs.orchestration` and `workspace` = `~` (the orchestration's cwd is the home directory); both role panes' attempts are on that work with their `role`, and both agents' `DOT_AGENT_DECK_WORK_ID` name it; a delegate opens a `launch=delegation` child with `refs.task_id` and `refs.role`; the clear respawn ends the old generation `how=replaced` and adds a new `attempt_started` for the same pane and role on the orchestration work, and the respawned generation's `DOT_AGENT_DECK_WORK_ID` is still the orchestration's work id (not the delegation's); the delegation gets an attempt on the bound generation; `work-done --task-id` writes `reported` on the delegation with `task_id`, `destination=inbox`, a `report_id` and `to` = the orchestration work, then `closed how=task_done`; no task or report text reaches the journal.
+- **Does not assert:** `pane restart`; an orchestration started by a dispatch (journal/launch/006).
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/004 — A plain scheduled fire opens a work per fire.
+- **Layer:** L2 headless `daemon serve` driven by `RunNow`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in as the schedule's command.
+- **Asserts:** `opened launch=schedule_fire` with `refs.schedule`; the fired pane's `attempt_started` is on that work and its `DOT_AGENT_DECK_WORK_ID` names it.
+- **Does not assert:** a fire that re-posts into a reused pane; an orchestration-shaped fire.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/005 — A scheduled issue dispatch opens one child work per issue, and its interrupted attempts still lead to the issue after a restart.
+- **Layer:** L2 headless `daemon serve` driven by `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`), behind the offline stub `gh` of `scheduler/dispatch/*`; then a SIGTERM to that daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** none (the fixture orchestration role runs `cat`).
+- **Asserts:** `opened launch=schedule_fire` with `refs.schedule`, and as its child an `opened launch=issue_dispatch` with `refs.issue`, `refs.repo`, `refs.branch` = `agent/issue-<n>` and `workspace` = the issue's worktree; the dispatched pane's attempt is on the issue's work or on a work whose parent it is; after the restart every attempt that was live at the SIGTERM has `attempt_ended how=interrupted`, and walking up its work's `parent` chain reaches that issue's `launch=issue_dispatch` work with `refs.issue`, `refs.repo` and `refs.branch`.
+- **Does not assert:** the issue pane's `DOT_AGENT_DECK_WORK_ID` (`cat` records nothing); skipped issues; the interruption's cause; a SIGKILL'd daemon (journal/restart/002 covers recovery after one).
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/006 — An orchestration started by a dispatch is a child work of that dispatch.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --orchestration=journal-team` CLI from a stand-in pane in a one-commit repository whose `.dot-agent-deck.toml` defines a one-role orchestration.
+- **Agent:** synthetic routing stand-in, as dispatcher and as the orchestrator role.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work and whose `workspace` is the unit's worktree; an `opened launch=orchestration` named `journal-team`, with a `refs.orchestration_id`, whose `parent` is that dispatch work; the orchestrator role's `attempt_started` is on the orchestration work with `role=orchestrator`, and its `DOT_AGENT_DECK_WORK_ID` names the orchestration work.
+- **Does not assert:** a multi-role dispatched team; the orchestration unit's terminal report.
+- **Platform coverage:** mac+linux.
+
+#### journal/restart
+
+##### journal/restart/001 — After a SIGTERM, a new daemon on the same state directory finds every launch and every live attempt interrupted.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`); the signal goes to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
+- **Asserts:** the new daemon creates its own `run-<id>.jsonl` (even with nothing to write) holding only its own run's lines; the pane's and the dispatch's `opened` lines (parent, refs, workspace) read back after the restart; both attempts have `attempt_ended how=interrupted` with cause `daemon_shutdown` or `daemon_gone`; the dead segment is byte for byte as left, or folded away into a `compacted-*.jsonl` that carries every one of its lines byte for byte.
+- **Does not assert:** which of the two causes is written (the shutdown write is best effort).
+- **Platform coverage:** mac+linux.
+
+##### journal/restart/002 — After a SIGKILL and a torn tail, recovery writes the interruptions without rewriting the dead segment.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
+- **Asserts:** with a half line (no newline) appended to the dead segment, the new daemon starts and serves; both open attempts get `attempt_ended how=interrupted cause=daemon_gone` in the new run's segment; the dead segment is byte for byte what was left, or folded away into a `compacted-*.jsonl` that carries every complete line of it byte for byte (the torn tail may be dropped).
+- **Does not assert:** compaction's retention rules.
+- **Platform coverage:** mac+linux.
+
+#### journal/compat
+
+##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`), on a state directory planted before it starts.
+- **Agent:** none.
+- **Asserts:** a dead segment with no held lock holding a v1 `opened` and `attempt_started`, a `"v":2` line and a v1 line of unknown `kind` (both shaped to end that attempt) does not stop the daemon starting; it writes `attempt_ended how=interrupted cause=daemon_gone` for the planted attempt; the v2 and unknown-kind lines remain byte for byte in the journal and the dead segment is not rewritten (or is folded into a `compacted-*.jsonl` carrying all its lines byte for byte).
+- **Does not assert:** a reader ignoring unknown fields on a known kind.
 - **Platform coverage:** mac+linux.
 
 ### Session pull requests

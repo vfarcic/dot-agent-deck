@@ -981,6 +981,14 @@ pub struct SpawnOptions<'a> {
     /// Every production spawn site with an orchestration membership passes
     /// one; `None` there answers a terminal report `report_pending`.
     pub origin: Option<crate::hook_provenance::InstanceOrigin>,
+    /// PRD #1889: the work this spawn serves, set by the daemon's own launch
+    /// paths and never taken from the wire: a respawn's pinned work, a
+    /// dispatched unit's, a scheduled fire's. For a role pane of an
+    /// orchestration it is instead the PARENT of the instance's work when the
+    /// spawn is the first the daemon sees of that instance. `None` makes the
+    /// spawn a pane of its own, with a fresh pane work. Handed to the child as
+    /// [`crate::work_journal::ENV_WORK_ID`] and pinned on its record.
+    pub work_id: Option<crate::work_journal::WorkId>,
 }
 
 impl Default for SpawnOptions<'_> {
@@ -995,6 +1003,7 @@ impl Default for SpawnOptions<'_> {
             tab_membership: None,
             agent_type: None,
             origin: None,
+            work_id: None,
         }
     }
 }
@@ -1798,6 +1807,9 @@ fn spawn_with_dir(
     // unfiltered inherit would tag every spawned agent with the
     // parent deck's id and the hook script would misroute events.
     cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
+    // PRD #1889: and for the work id. A daemon launched from another deck's
+    // pane would otherwise hand that pane's work to an agent it gave none.
+    cmd.env_remove(crate::work_journal::ENV_WORK_ID);
     // Issue #1077: same scrub-then-overlay rule for the hook capability token,
     // and the failure mode of NOT scrubbing it is the sharpest on this list. A
     // daemon launched from inside another deck's pane inherits that pane's
@@ -3275,6 +3287,15 @@ fn pump_reader(
         );
         termination
     });
+    // PRD #1889: the attempt this generation was ends, as the deck observed
+    // it. Best effort at a shutdown: this thread is detached, and the next
+    // run's startup recovery ends whatever it did not reach.
+    if let (Some(registry), Some(termination)) = (registry.upgrade(), termination.as_ref()) {
+        registry.work().attempt_ended(
+            &agent_id,
+            crate::work_tracking::AttemptEnd::of(termination, registry.is_shutting_down()),
+        );
+    }
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
     // longer reach it. Deliberate closes included: the entry is gone by now, but
     // its messages are not.
@@ -8442,6 +8463,8 @@ pub struct AgentPtyRegistry {
     turn_replies: crate::turn_reply::TurnReplyHub,
     /// PRD #1666: see [`AgentPtyRegistry::inbox`].
     inbox: std::sync::OnceLock<Arc<crate::inbox_hub::InboxHub>>,
+    /// PRD #1889: see [`AgentPtyRegistry::work`].
+    work: crate::work_tracking::WorkTracker,
     /// PRD #1487 audit A2 test seam: when set, the next spawn reports that its
     /// child is forked and waits, before it takes the publishing lock — see
     /// [`Self::pause_next_publish_for_test`].
@@ -8626,6 +8649,11 @@ pub(crate) const FAULT_RESPAWN_BEFORE_PUBLISH_SECTION: &str = "respawn-before-pu
 /// PRD #1666 part 3, round 5: a spawn's fault point after its record is
 /// published and before it returns ((f2')'s seam).
 pub(crate) const FAULT_SPAWN_AFTER_INSERT: &str = "spawn-after-insert";
+
+/// PRD #1889: a spawn's pause point after its record is published and the
+/// registry lock released ([`AgentPtyRegistry::pause_at_sync_for_test`]), the
+/// window in which a concurrent stop can close the new generation's pane.
+pub(crate) const PAUSE_SPAWN_AFTER_PUBLISH: &str = "spawn-after-publish";
 
 /// PRD #1666 part 3, round 5: a spawn's fault point after its fork and before
 /// its record is published, with its reservation armed (`/057` (c)).
@@ -10666,6 +10694,7 @@ impl AgentPtyRegistry {
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
             turn_replies: crate::turn_reply::TurnReplyHub::default(),
             inbox: std::sync::OnceLock::new(),
+            work: crate::work_tracking::WorkTracker::default(),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
             #[cfg(test)]
@@ -10918,6 +10947,23 @@ impl AgentPtyRegistry {
             }
             hub
         })
+    }
+
+    /// PRD #1889: the work journal's bookkeeping — which work each spawn,
+    /// end, report and close belongs to. Records nothing until the daemon
+    /// installs its run's journal ([`crate::work_tracking::WorkTracker::install`]).
+    pub fn work(&self) -> &crate::work_tracking::WorkTracker {
+        &self.work
+    }
+
+    /// TEST: the environment generation `agent_id` was spawned with.
+    #[cfg(test)]
+    pub(crate) fn spawn_env_of_for_test(&self, agent_id: &str) -> Option<Vec<(String, String)>> {
+        self.inner
+            .lock()
+            .agents
+            .get(agent_id)
+            .map(|a| a.spawn_env.clone())
     }
 
     /// PRD #1666: install the daemon's inbox, built on its persisted deck id.
@@ -14367,6 +14413,26 @@ impl AgentPtyRegistry {
             }),
             _ => None,
         };
+        // PRD #1889: the work this generation serves, decided before the fork
+        // so the child is handed it, and pinned on its reservation so a
+        // respawn keeps it. Taken with no registry lock held. The guard lives
+        // to the end of this spawn: a spawn refused or failed before its
+        // attempt is published forgets the work it minted.
+        let work_guard = self.work.resolve_spawn(
+            opts.work_id.as_ref(),
+            pane_id_env.as_deref(),
+            tab_membership.as_ref(),
+            cwd_stored.as_deref(),
+        );
+        let work = work_guard.work().cloned();
+        opts.work_id.clone_from(&work);
+        let journal_pane = pane_id_env.clone();
+        let journal_role = match tab_membership.as_ref() {
+            Some(TabMembership::Orchestration { role_name, .. }) if !role_name.is_empty() => {
+                Some(role_name.clone())
+            }
+            _ => None,
+        };
         let (preallocated_id, reservation) = self.reserve_spawn(
             &pane_id_env,
             &hook_token_for_record,
@@ -14376,10 +14442,21 @@ impl AgentPtyRegistry {
             admission.is_admitted_respawn(),
             seat,
             admission.replacement(),
+            work.clone(),
         )?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
             .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
+        // PRD #1889: strip, then set, as for the agent id: a respawn replays
+        // its predecessor's environment, which must not carry a stale work.
+        opts.env
+            .retain(|(k, _)| k != crate::work_journal::ENV_WORK_ID);
+        if let Some(work) = &work {
+            opts.env.push((
+                crate::work_journal::ENV_WORK_ID.to_string(),
+                work.to_string(),
+            ));
+        }
 
         // Issue #1077: hand the child the hook capability token minted above,
         // in the same breath as its agent id and for the same reason — the child's
@@ -15099,6 +15176,18 @@ impl AgentPtyRegistry {
         // PRD #1741: under the lock that published the agent, so its reader's
         // EOF, which checks registration under it, is ordered after this.
         crate::telemetry::commit_spawn(telemetry_run);
+        // PRD #1889: the generation is published, so its attempt starts (and
+        // the work it serves opens, when this spawn minted it) — under the
+        // lock that publishes it, so a stop, which can only find the
+        // generation once it is published, closes the pane's work after its
+        // start is booked rather than before (a close that ran first would
+        // find nothing to close, and the late start would leave the work
+        // open). `attempt_started` takes only the work book's leaf mutex and
+        // queues its events: no file I/O under this lock.
+        if let Some(work) = &work {
+            self.work
+                .attempt_started(work, &id, journal_pane.as_deref(), journal_role.as_deref());
+        }
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.
@@ -15107,6 +15196,9 @@ impl AgentPtyRegistry {
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
+        // PRD #1889 test seam: the window, after publication, in which a
+        // concurrent stop can close the pane.
+        self.pause_point_sync(PAUSE_SPAWN_AFTER_PUBLISH);
         // PRD #1666 part 3 (Q35-14b): an installed generation's observer,
         // started with the registry lock released.
         #[cfg(target_os = "linux")]
@@ -16298,6 +16390,9 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type: respawn_agent_type,
             origin: previous_facts.seat.as_ref().and_then(|seat| seat.origin),
+            // PRD #1889: the pane's work, pinned on its predecessor: a new
+            // attempt of the same work.
+            work_id: previous_facts.work.clone(),
         };
         // PRD #1666 part 3, round 5 (plan D7): from here to the end of the
         // replacement's `publish` there is no `.await`, so the window runs as
@@ -16837,6 +16932,9 @@ impl AgentPtyRegistry {
             tab_membership: identity.tab_membership.clone(),
             agent_type,
             origin,
+            // PRD #1889: a re-created pane keeps the work its last generation
+            // served, so it is a new attempt of the same work.
+            work_id: self.work.work_of_pane(pane_id_env),
         })
     }
 
@@ -19369,6 +19467,7 @@ impl AgentPtyRegistry {
         admitted_respawn: bool,
         seat: Option<crate::hook_provenance::Seat>,
         replacement: Option<&ReplacementTicket>,
+        work: Option<crate::work_journal::WorkId>,
     ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
         let mut inner = self.inner.lock();
         // PRD #1589 D4: no pane joins an instance a `close` is taking down or
@@ -19451,6 +19550,7 @@ impl AgentPtyRegistry {
                 seat,
                 unit: None,
                 replacement_of: replacement.map(|ticket| ticket.id),
+                work,
             },
         );
         // PRD #1666 part 3, round 5 (plan D7): a replacement's successor is
@@ -19626,6 +19726,7 @@ impl AgentPtyRegistry {
                 false,
                 None,
                 None,
+                None,
             )
             .expect("reserve a spawn");
         // Disarm the guard so the reservation outlives this call.
@@ -19651,6 +19752,7 @@ impl AgentPtyRegistry {
             vec![cwd.to_path_buf()],
             None,
             false,
+            None,
             None,
             None,
         )?;
@@ -20238,6 +20340,29 @@ impl AgentPtyRegistry {
         units.note_exited(&id);
     }
 
+    /// Whether a record of orchestration instance `instance` is still held,
+    /// published or not yet confirmed.
+    pub fn instance_has_records(&self, instance: &str) -> bool {
+        let inner = self.inner.lock();
+        inner.agents.values().any(|a| {
+            matches!(
+                &a.tab_membership,
+                Some(TabMembership::Orchestration {
+                    orchestration_id: Some(id),
+                    ..
+                }) if id == instance
+            )
+        }) || inner.unconfirmed_agents.values().any(|a| {
+            matches!(
+                &a.record.tab_membership,
+                Some(TabMembership::Orchestration {
+                    orchestration_id: Some(id),
+                    ..
+                }) if id == instance
+            )
+        })
+    }
+
     /// PRD #1589 D5: a member of a unit was deliberately stopped and its record
     /// removed. A single unit ends with its agent; an orchestration unit ends
     /// only once no pane of its instance remains — no record in this registry,
@@ -20258,26 +20383,9 @@ impl AgentPtyRegistry {
             }) => Some(id.clone()),
             _ => None,
         };
-        let instance_has_records = instance.as_deref().is_some_and(|instance| {
-            let inner = self.inner.lock();
-            inner.agents.values().any(|a| {
-                matches!(
-                    &a.tab_membership,
-                    Some(TabMembership::Orchestration {
-                        orchestration_id: Some(id),
-                        ..
-                    }) if id == instance
-                )
-            }) || inner.unconfirmed_agents.values().any(|a| {
-                matches!(
-                    &a.record.tab_membership,
-                    Some(TabMembership::Orchestration {
-                        orchestration_id: Some(id),
-                        ..
-                    }) if id == instance
-                )
-            })
-        });
+        let instance_has_records = instance
+            .as_deref()
+            .is_some_and(|instance| self.instance_has_records(instance));
         // Read and released before the registry lock is taken again below:
         // the ledger is never held while taking it.
         let (id, orchestration) = {
@@ -20863,6 +20971,10 @@ impl AgentPtyRegistry {
         // Issue #581: the kill pass and the reap pass are SEPARATE, and
         // [`Self::force_kill_and_reap_all`] documents why.
         Self::force_kill_and_reap_all(agents);
+
+        // PRD #1889: what the work journal's writer still holds, within a
+        // short bound, so a graceful stop leaves the journal current.
+        self.work.drain(crate::work_journal::SHUTDOWN_DRAIN);
 
         self.change_notify.notify_one();
     }
