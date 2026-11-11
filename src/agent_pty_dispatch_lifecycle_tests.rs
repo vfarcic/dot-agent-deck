@@ -127,6 +127,7 @@ pub(super) async fn dispatch_single(
 ) -> SpawnHandle {
     let dir = deck.root.path().join(name);
     let req = SpawnRequest {
+        work_id: None,
         task_name: format!("dispatch-{name}"),
         working_dir: dir.to_string_lossy().into_owned(),
         command: None,
@@ -169,6 +170,7 @@ pub(super) async fn dispatch_orchestration(
         is_start_role: idx == 0,
     };
     let req = SpawnRequest {
+        work_id: None,
         task_name: format!("dispatch-{name}"),
         working_dir: dir.to_string_lossy().into_owned(),
         command: None,
@@ -907,6 +909,7 @@ fn dispatch_single_task(
     let registry = Arc::clone(&deck.registry);
     let dir = deck.root.path().join(name);
     let req = SpawnRequest {
+        work_id: None,
         task_name: format!("dispatch-{name}"),
         working_dir: dir.to_string_lossy().into_owned(),
         command: None,

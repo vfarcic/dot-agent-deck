@@ -602,8 +602,9 @@ pub fn force_kill_pid(pid: u32) -> std::io::Result<()> {
 
 /// PRD #1666 hardening M2: the parent of process `pid`, or `None` when the
 /// process is gone or this platform cannot say. Linux reads
-/// `/proc/<pid>/stat`; macOS asks `proc_pidinfo(PROC_PIDTBSDINFO)`. Other Unix
-/// platforms answer `None`, and the caller falls back to not checking.
+/// `/proc/<pid>/stat`; macOS asks `proc_pidinfo(PROC_PIDT_SHORTBSDINFO)`.
+/// Other Unix platforms answer `None`, and the caller falls back to not
+/// checking.
 #[cfg(target_os = "linux")]
 pub fn parent_pid_of(pid: u32) -> Option<u32> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -612,25 +613,31 @@ pub fn parent_pid_of(pid: u32) -> Option<u32> {
     after.split_whitespace().nth(1)?.parse().ok()
 }
 
-/// See the Linux variant.
+/// See the Linux variant. macOS asks for the short BSD info
+/// (`PROC_PIDT_SHORTBSDINFO`), not the full one (`PROC_PIDTBSDINFO`): the
+/// full one is refused with `EPERM` for a process another user owns, the
+/// short one is not (measured on macOS 26, as `ps` reads every process's
+/// parent), so a walk climbs past the root-owned `/usr/bin/login` a terminal
+/// starts its shell through, as it climbs past a root process on Linux
+/// (issue #2237). A process that has exited still answers `None` (`ESRCH`).
 #[cfg(target_os = "macos")]
 pub fn parent_pid_of(pid: u32) -> Option<u32> {
     let pid = libc::c_int::try_from(pid).ok()?;
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is a zeroed, stack-allocated `proc_bsdinfo` that outlives
-    // the call, and `size` is exactly its size, so the kernel writes at most
-    // that many bytes into it.
+    let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdshortinfo>() as libc::c_int;
+    // SAFETY: `info` is a zeroed, stack-allocated `proc_bsdshortinfo` that
+    // outlives the call, and `size` is exactly its size, so the kernel writes
+    // at most that many bytes into it.
     let written = unsafe {
         libc::proc_pidinfo(
             pid,
-            libc::PROC_PIDTBSDINFO,
+            libc::PROC_PIDT_SHORTBSDINFO,
             0,
             &mut info as *mut _ as *mut libc::c_void,
             size,
         )
     };
-    (written == size).then_some(info.pbi_ppid)
+    (written == size).then_some(info.pbsi_ppid)
 }
 
 /// See the Linux variant.
@@ -661,8 +668,8 @@ pub fn process_start_of(pid: u32) -> Option<u64> {
     let pid = libc::c_int::try_from(pid).ok()?;
     let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
     let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: as in `parent_pid_of`: a zeroed stack `proc_bsdinfo` of exactly
-    // `size` bytes that outlives the call.
+    // SAFETY: a zeroed stack `proc_bsdinfo` of exactly `size` bytes that
+    // outlives the call.
     let written = unsafe {
         libc::proc_pidinfo(
             pid,
@@ -913,5 +920,100 @@ mod tests {
             "an empty list never reaches `ps` — the sampler returns early — but the \
              formatting must not invent a stray separator"
         );
+    }
+
+    /// Issue #2237: the parent walk reads a process another user owns. On
+    /// macOS a shell a terminal starts runs under the root-owned
+    /// `/usr/bin/login`, and a walk that stopped there could not place a
+    /// receiver relative to the agent, so the inbox refused it as
+    /// unidentified. Pid 1 (`launchd` on macOS, `init` or a container's first
+    /// process on Linux) belongs to root, and its parent reads as 0. Run as
+    /// root, the test reads a process its own user owns, so it pins the
+    /// property only when run as an ordinary user.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_pid_of_reads_a_process_another_user_owns() {
+        assert_eq!(parent_pid_of(1), Some(0));
+        // A pid no process holds still answers `None`: an exited process is
+        // not read as a parent.
+        assert_eq!(parent_pid_of(u32::MAX >> 1), None);
+    }
+
+    /// Issue #2237 review: switching macOS to the short flavor leaves how an
+    /// exited process reads unchanged. A child that has exited but is not yet
+    /// reaped (a zombie) and one that has been reaped read the same through
+    /// `parent_pid_of` as through the full flavor it used before, on macOS;
+    /// on Linux the zombie reads its parent and the reaped child reads `None`.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn parent_pid_of_reads_an_exited_process_as_before() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn `true`");
+        let pid = child.id();
+        // Wait for it to exit without reaping it (`WNOWAIT`), so it stays a
+        // zombie until `child.wait()` below.
+        loop {
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            // SAFETY: `info` is a zeroed `siginfo_t` that outlives the call,
+            // and `pid` is this process's own unreaped child.
+            let rc = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    libc::id_t::from(pid),
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT,
+                )
+            };
+            if rc == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::Interrupted,
+                "waitid: {error}"
+            );
+        }
+        let zombie = parent_pid_of(pid);
+        #[cfg(target_os = "linux")]
+        assert_eq!(zombie, Some(std::process::id()));
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            zombie,
+            full_bsdinfo_parent(pid),
+            "a zombie reads differently through the short flavor"
+        );
+        child.wait().expect("reap `true`");
+        assert_eq!(parent_pid_of(pid), None);
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(full_bsdinfo_parent(pid), None);
+            // A live process this user owns reads the same through both.
+            let me = std::process::id();
+            assert_eq!(parent_pid_of(me), full_bsdinfo_parent(me));
+            assert!(parent_pid_of(me).is_some());
+        }
+    }
+
+    /// `parent_pid_of` as it read before issue #2237, through the full flavor
+    /// (`PROC_PIDTBSDINFO`), for comparison.
+    #[cfg(target_os = "macos")]
+    fn full_bsdinfo_parent(pid: u32) -> Option<u32> {
+        let pid = libc::c_int::try_from(pid).ok()?;
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: a zeroed stack `proc_bsdinfo` of exactly `size` bytes that
+        // outlives the call.
+        let written = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                size,
+            )
+        };
+        (written == size).then_some(info.pbi_ppid)
     }
 }

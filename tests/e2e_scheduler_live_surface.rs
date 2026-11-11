@@ -508,6 +508,8 @@ fn live_005_two_schedules_firing_one_repo_get_tabs_with_distinct_labels() {
         // neither is ellipsized into looking like the other.
         .with_pty_size(220, 50)
         .with_env("DOT_AGENT_DECK_SCHEDULES", sched_path.to_string_lossy())
+        // PRD #1885: the scheduled project is approved, as a user's is once.
+        .trusting_project(&work)
         .launch_with_fixture("minimal");
     deck.wait_for_string("No active agents");
 

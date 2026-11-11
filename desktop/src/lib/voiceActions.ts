@@ -464,6 +464,25 @@ export type VoiceActionContext = {
    */
   startNewAgent: (target: VoiceDispatchTarget) => string | undefined;
   /**
+   * PRD #1885 — approve the project commands the `Review project commands`
+   * dialog shows, and start the orchestration it was opened for: its Approve
+   * and start button. It approves exactly the text on screen (the dialog
+   * carries its digest), so it can approve nothing the user is not looking at.
+   * Answers `undefined` when it approved, or the sentence saying why not (no
+   * review is open, or an approval is already under way).
+   *
+   * **Served by the SHELL**, from the one review the app can show at a time
+   * (`approveShownReview` in `lib/projectTrust.ts`): the dialog opens over the
+   * New agent dialog on the overview and over the Runs screen on the deck.
+   */
+  approveProjectCommands: () => string | undefined;
+  /**
+   * PRD #1885 — the review dialog's Cancel: close it, starting and storing
+   * nothing. Voice reaches it through `close` ("cancel"), as the topmost
+   * overlay, and not through a row of its own.
+   */
+  cancelProjectCommands: () => void;
+  /**
    * PRD #802 D5 — the two voice members that lead to a STOP, and the one rule
    * they share: **each can only OPEN a confirmation.** Neither runs a deck
    * action; the confirmation's own button does, pressed by the user. So a
@@ -1202,6 +1221,30 @@ export const VOICE_ACTIONS = {
     },
   },
 
+  /* PRD #1885 — the `Review project commands` dialog. Approving starts the
+     orchestration with exactly the commands and prompts on screen, as the
+     dialog's own button does; it is a start the user is looking at, which is
+     why voice may press it (docs/develop/voice-first-design.md section 5). */
+  approveProjectCommands: {
+    label: "Approve the project commands the review shows and start the orchestration",
+    voice: true,
+    needs: ["approveProjectCommands"],
+    /* `reportRefused` is read through `?.`, for `openPullRequest`'s reason: the
+       button is disabled whenever it would be refused, so its click serves no
+       voice surface. */
+    run: (context: Pick<VoiceActionContext, "approveProjectCommands"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.approveProjectCommands();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  cancelProjectCommands: {
+    label: "Close the project commands review without starting anything",
+    no_voice: "the review dialog's Cancel and its `Escape`; the dialog is on the overlay stack, so voice's `close` (\"cancel\", \"never mind\") closes it as the thing on top, through `closeTopmost` — a row of its own would be a second reading of words `close` already answers. It is voice-reachable through that entry",
+    needs: ["cancelProjectCommands"],
+    run: (context: Pick<VoiceActionContext, "cancelProjectCommands">) => context.cancelProjectCommands(),
+  },
+
   /* PRD #802 D5 — the two rows that STOP something. Each entry calls a member
      that can only OPEN a confirmation (see the members' own comment on
      `VoiceActionContext`), so voice never reaches `runAction` for a stop: the
@@ -1551,9 +1594,12 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * {@link VoiceActionContext.closeSettings} — closing the topmost overlay with
  * no member of its own, read from the fence's stack, which spans both screens
  * ({@link VoiceActionContext.closeOverlay}), and switching deck (PRD #1195),
- * whose selector sits on both screens and writes the shell's settings.
+ * whose selector sits on both screens and writes the shell's settings. PRD
+ * #1885's review dialog is the shell's too: it opens over the New agent dialog
+ * on the overview and over the Runs screen on the deck. Its Cancel is reached
+ * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

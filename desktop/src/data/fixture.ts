@@ -1,6 +1,7 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
+import type { ProjectTrustRole } from "../lib/projectTrust";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
@@ -615,6 +616,36 @@ export function fixtureProjectOrchestrations(home: string, path: string): Daemon
 }
 
 /**
+ * PRD #1885 — the `project-trust` docs scene (`?fixture=1&state=docs&trust=changed`):
+ * `demo-project` defines `team` instead of `demo-loop`, and its review reads
+ * `changed since you approved it`. The TUI capture
+ * (`docs_screenshot_project_trust` in `tests/e2e_docs_screenshots.rs`) writes
+ * the same roles into its project and approves the earlier text, so the two
+ * images show one state: `orchestrator` unchanged, `coder` changed, `tester`
+ * new and `reviewer` removed. Change the two together.
+ */
+export const DOCS_TRUST_ORCHESTRATION: DaemonOrchestration = {
+  name: "team",
+  displayName: "team",
+  default: true,
+  roles: [
+    { name: "orchestrator", displayName: "orchestrator", start: true },
+    { name: "coder", displayName: "coder", start: false },
+    { name: "tester", displayName: "tester", start: false },
+  ],
+};
+
+/** The review the `project-trust` scene's deck answers for `team`, in the TUI capture's words. */
+export const DOCS_TRUST_ROLES: ProjectTrustRole[] = [
+  { name: "orchestrator", command: "claude", start: true, clear: false, prompt: ["Break the task into steps and delegate each one."] },
+  { name: "coder", change: "changed", command: "claude --model opus", start: false, clear: true, prompt: ["Implement the task you are given and run the tests."] },
+  { name: "tester", change: "new", command: "codex", start: false, clear: true, prompt: ["Write a failing test for the task, then report it."] },
+];
+
+/** The role the `project-trust` scene's approval had and its config no longer defines. */
+export const DOCS_TRUST_REMOVED_ROLES: readonly string[] = ["reviewer"];
+
+/**
  * The commands `demo-loop`'s roles are configured with on a fixture deck — the
  * deck's own config, which never crosses the wire. The fixture deck starts each
  * role with its command the way a live deck does for a launch from the New
@@ -946,7 +977,7 @@ function docsFleet(): DeckSnapshot[] {
     runId: "run_docs_service",
     repo: "service-api",
     worktree: "/home/dev/service-api",
-    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
     hostMetrics: fixtureHostMetrics("remote"),
     agents: [
       crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
@@ -1126,7 +1157,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -1146,7 +1177,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     */
     fleetDeck(
       FIXTURE_UNREACHABLE_DAEMON_ID,
-      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No daemon is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No daemon is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
       staleAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -1194,7 +1225,7 @@ function upgradeIncompatibleDeck(): DeckSnapshot {
       runningAgentCount: 0,
       message: "This daemon is older than this app, and a change between the two versions means it may be read wrongly.",
       deckKind: "remote",
-      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      localOnlyReason: "Replace daemon acts on a process on this machine.",
       upgradeOffer: FIXTURE_OLDER,
     },
     [],
@@ -1221,7 +1252,7 @@ function upgradeFleet(): DeckSnapshot[] {
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -1261,7 +1292,7 @@ function hookNoticeFleet(): DeckSnapshot[] {
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),

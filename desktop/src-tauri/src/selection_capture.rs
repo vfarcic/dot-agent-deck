@@ -104,14 +104,12 @@ mod tests {
     ///
     /// Every allowance below is the first kind, and each is named:
     ///
-    /// - `lib.rs` × 2 `selected_endpoint()`: `retarget_selection` reading what
+    /// - `lib.rs` × 1 `selected_endpoint()`: `retarget_selection` reading what
     ///   was selected *before* this save (synchronous — no await between it and
-    ///   the write it feeds), and the `StopDaemon` arm, which captures into a
-    ///   local once and reuses it across its awaits — the shape `DeckScope`
-    ///   generalises, already written this way and left alone rather than
-    ///   churned. (The `RestartDaemon` arm was the third until PRD #1487 moved
-    ///   Replace daemon onto `desktop_upgrade_daemon`, which takes a deck id and
-    ///   resolves a `DeckScope`.)
+    ///   the write it feeds). (The `RestartDaemon` arm was a third until PRD
+    ///   #1487 moved Replace daemon onto `desktop_upgrade_daemon`, and the
+    ///   `StopDaemon` arm a second until issue #1073 gave it a deck id that it
+    ///   resolves into a `DeckScope`.)
     /// - `lib.rs` × 1 `observed_decks()`: `ensure_snapshot_watchers`, which
     ///   reads the set once and iterates it synchronously.
     /// - `endpoint_test.rs` × 1 `deck_is_observed(`: `release_if_not_observed`,
@@ -119,7 +117,7 @@ mod tests {
     ///   holding a transport *now*, and its doc comment says so. This is the
     ///   one site where a fresh read is the requirement rather than the bug.
     const BUDGET: [(&str, [usize; 4]); 4] = [
-        ("lib.rs", [2, 0, 1, 0]),
+        ("lib.rs", [1, 0, 1, 0]),
         ("daemon_bridge.rs", [0, 0, 0, 0]),
         ("terminal.rs", [0, 0, 0, 0]),
         ("endpoint_test.rs", [0, 0, 0, 1]),

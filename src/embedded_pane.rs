@@ -870,6 +870,10 @@ impl LastCommandReader {
 
 /// PRD #1258 M3 — what one host-metrics request ended with, as the host
 /// overlay reads it from [`HostMetricsReader::take`].
+/// PRD #1885: the bound on one trust-state or approval request. The daemon
+/// reads one project config through its bounded reader for either.
+const TRUST_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
 pub type HostMetricsAnswer = Result<crate::daemon_client::HostMetricsReport, String>;
 
 /// PRD #1258 M3 — fetches the attached daemon's host sample for the TUI's host
@@ -1279,6 +1283,29 @@ impl EmbeddedPaneController {
     /// PRD #1666 part 2 (G-fix6): this controller's client, bound to the daemon
     /// process every request about `card`'s pane goes to
     /// ([`held_incarnation`]).
+    /// PRD #1885: run one trust request on the daemon answering now, bounded
+    /// by [`TRUST_REQUEST_TIMEOUT`]. Blocks the calling (UI) thread, as a pane
+    /// start does: the prompt it feeds opens only once the answer is in.
+    fn trust_request(
+        &self,
+        request: impl std::future::Future<
+            Output = Result<GatedQuery<crate::project_trust::ProjectTrustView>, ClientError>,
+        >,
+    ) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, String> {
+        match self
+            .runtime
+            .block_on(async move { tokio::time::timeout(TRUST_REQUEST_TIMEOUT, request).await })
+        {
+            Ok(Ok(answer)) => Ok(answer),
+            Ok(Err(ClientError::Server(message))) => Err(message),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!(
+                "the deck did not answer within {}s",
+                TRUST_REQUEST_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
     fn held_client(&self, card: &BoundPane) -> DaemonClient {
         bound_to_held(
             &self.client,
@@ -5349,6 +5376,39 @@ impl PaneController for EmbeddedPaneController {
                 POST_MESSAGE_TIMEOUT.as_millis()
             ))),
         }
+    }
+
+    fn project_trust_state(
+        &self,
+        dir: &str,
+        orchestration: &str,
+    ) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, String> {
+        let client = self.client.clone();
+        let (dir, orchestration) = (dir.to_string(), orchestration.to_string());
+        self.trust_request(async move {
+            let client = client.bound_to_current().await?;
+            client.project_trust_state(&dir, &orchestration).await
+        })
+    }
+
+    fn approve_project_trust(
+        &self,
+        dir: &str,
+        orchestration: &str,
+        digest: &str,
+    ) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, String> {
+        let client = self.client.clone();
+        let (dir, orchestration, digest) = (
+            dir.to_string(),
+            orchestration.to_string(),
+            digest.to_string(),
+        );
+        self.trust_request(async move {
+            let client = client.bound_to_current().await?;
+            client
+                .approve_project_trust(&dir, &orchestration, &digest)
+                .await
+        })
     }
 
     fn report_orchestrator_context(&self, pane_id: &str, context_path: &std::path::Path) {

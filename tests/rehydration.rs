@@ -37,6 +37,17 @@
 // `docs/develop/e2e-temp-dirs.md`.
 #[path = "../src/test_temp.rs"]
 mod test_temp;
+
+/// PRD #1885: approve every orchestration of the config in `dir`, through the
+/// real store API, in a store private to this test process — a spawn that reads
+/// its orchestration from the directory runs only an approved one.
+fn approve(dir: &std::path::Path) {
+    use dot_agent_deck::project_trust::{TrustStore, approve_all};
+    static STORE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let store = STORE.get_or_init(|| test_temp::tempdir().expect("mint the trust store dir"));
+    let _ = TrustStore::use_state_dir_for_this_process(store.path().to_path_buf());
+    approve_all(&TrustStore::default_location(), dir).expect("approve the fixture config");
+}
 // Issue #668: same shape, same reason — the wrapped-child lifetime bound this
 // file's registry spawns and in-process daemon need, in a file small enough to
 // include on its own instead of pulling in the harness. `common::init_test_env`
@@ -1807,8 +1818,10 @@ async fn dispatch_orchestration(
         dispatch_orchestration_config(name),
     )
     .expect("write the dispatched orchestration's config");
+    approve(dir);
     dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
+            work_id: None,
             task_name: format!("dispatch-{name}"),
             working_dir: dir.to_string_lossy().into_owned(),
             command: None,

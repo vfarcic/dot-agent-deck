@@ -162,6 +162,8 @@ fn write_orchestration(deck: &TuiDeck, workers: &[(&str, &str, &str)]) {
     }
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), config)
         .expect("write quota orchestration config");
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
 }
 
 fn delegate(deck: &TuiDeck, role: &str, task: &str) -> Output {

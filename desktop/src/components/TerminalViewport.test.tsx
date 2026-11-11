@@ -444,7 +444,7 @@ describe("TerminalViewport agent pane geometry", () => {
     const [, tileCols, tileRows] = resizeTerminal.mock.calls.at(-1)!;
     resizeTerminal.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     triggerResize("planner");
     expect(resizeTerminal).toHaveBeenCalledTimes(1);
     const [, overlayCols, overlayRows] = resizeTerminal.mock.calls[0];

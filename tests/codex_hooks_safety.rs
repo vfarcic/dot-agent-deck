@@ -1571,6 +1571,26 @@ fn run_wrapped_program_collecting_events(
     hook_response: &str,
     path: &str,
 ) -> (Output, Vec<dot_agent_deck::event::AgentEvent>) {
+    run_wrapped_command_collecting_events(
+        &[program.as_os_str()],
+        codex_home,
+        fixture_dir,
+        deck_home,
+        hook_response,
+        path,
+    )
+}
+
+/// [`run_wrapped_program_collecting_events`] for a whole wrapped command — a
+/// program and its arguments — rather than a lone program.
+fn run_wrapped_command_collecting_events(
+    command: &[&std::ffi::OsStr],
+    codex_home: &std::path::Path,
+    fixture_dir: &std::path::Path,
+    deck_home: &std::path::Path,
+    hook_response: &str,
+    path: &str,
+) -> (Output, Vec<dot_agent_deck::event::AgentEvent>) {
     use std::io::Read as _;
 
     let socket = fixture_dir.join("hook.sock");
@@ -1578,7 +1598,7 @@ fn run_wrapped_program_collecting_events(
         std::os::unix::net::UnixListener::bind(&socket).expect("bind wrapper event socket");
     let output = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["wrap", "--agent", "codex", "--"])
-        .arg(program)
+        .args(command)
         .env("PATH", path)
         .env("HOME", deck_home)
         .env("CODEX_HOME", codex_home)
@@ -1722,6 +1742,117 @@ fn codex_trust_005_untrusted_hooks_are_declared_on_every_wrapper_event() {
                  — the fork-time start included, since it is the first thing the deck learns \
                  the pane is Codex from — or the deck reads the pane as able to confirm a \
                  delivery and types a delivered prompt in again (issue #559); events={events:?}"
+            );
+        }
+    }
+}
+
+/// Scenario: Run the real wrapper in a deck-managed pane, with a `codex` app-server stand-in on its PATH that lists the deck's prompt hook switched on, around Codex launch commands that set their own `CODEX_HOME` or change directory before the launcher runs: `CODEX_HOME=… launcher` and `cd … && launcher` under `/bin/sh -c` (the shape a deck pane launches them in), and `env CODEX_HOME=… launcher`. Trust is recorded for the home and directory the wrapper knows, but Codex may load another, so every event each run emits must declare that no submitted-prompt report will come. A control runs the launcher under `/bin/sh -c` with nothing that re-homes it and must declare nothing.
+#[spec("codex/trust/010")]
+#[test]
+fn codex_trust_010_a_command_that_rehomes_codex_declares_prompt_reports_unavailable() {
+    use dot_agent_deck::event::WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Case {
+        /// `/bin/sh -c "<launcher>"`: a shell, but nothing that moves Codex.
+        ShellOnly,
+        /// `/bin/sh -c "CODEX_HOME=<elsewhere> <launcher>"` (issue #1685's
+        /// assignment shape).
+        ShellAssignment,
+        /// `/bin/sh -c "cd <elsewhere> && <launcher>"` (issue #1685's compound).
+        ShellCd,
+        /// `env CODEX_HOME=<elsewhere> <launcher>`, a plain argv.
+        EnvAssignment,
+    }
+
+    for case in [
+        Case::ShellOnly,
+        Case::ShellAssignment,
+        Case::ShellCd,
+        Case::EnvAssignment,
+    ] {
+        let fixture = test_temp::tempdir().expect("create wrapper fixture");
+        let home = test_temp::tempdir().expect("create Codex home");
+        let elsewhere = test_temp::tempdir().expect("create the home or directory Codex moves to");
+        let deck_home = test_temp::tempdir().expect("create isolated deck HOME");
+        let deck_command = expected_hook_command(
+            seed_durable_binary(deck_home.path())
+                .to_str()
+                .expect("durable path is UTF-8"),
+        );
+        write_fake_codex(fixture.path());
+        let launcher = fixture.path().join("launcher.sh");
+        write_fake_program(&launcher);
+        let response = hook_list_response(vec![
+            own_home_entry(&deck_command, 0, "sha256:deck"),
+            prompt_hook_entry(&deck_command, true),
+        ]);
+        let launcher_str = launcher.to_str().expect("launcher path is UTF-8");
+        let elsewhere_str = elsewhere.path().to_str().expect("elsewhere is UTF-8");
+        let command: Vec<String> = match case {
+            Case::ShellOnly => vec!["/bin/sh".into(), "-c".into(), launcher_str.into()],
+            Case::ShellAssignment => vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("CODEX_HOME={elsewhere_str} {launcher_str}"),
+            ],
+            Case::ShellCd => vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("cd {elsewhere_str} && {launcher_str}"),
+            ],
+            Case::EnvAssignment => vec![
+                "env".into(),
+                format!("CODEX_HOME={elsewhere_str}"),
+                launcher_str.into(),
+            ],
+        };
+        let command: Vec<&std::ffi::OsStr> = command.iter().map(std::ffi::OsStr::new).collect();
+
+        let (output, events) = run_wrapped_command_collecting_events(
+            &command,
+            home.path(),
+            fixture.path(),
+            deck_home.path(),
+            &response,
+            &fixture_path(fixture.path()),
+        );
+
+        assert!(
+            output.status.success(),
+            "wrapper failed ({case:?}): {output:?}"
+        );
+        assert!(
+            home.path().join("config.toml").exists(),
+            "precondition ({case:?}): the trust step recorded trust for the prompt hook in the \
+             wrapper's own home, so only the command can decide the outcome; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            events.len() >= 2,
+            "expected at least the fork-time start and the exit-time event; events={events:?}"
+        );
+        let declaring: Vec<bool> = events
+            .iter()
+            .map(|event| {
+                event
+                    .metadata
+                    .contains_key(WRAPPER_PROMPT_REPORTS_UNAVAILABLE_METADATA_KEY)
+            })
+            .collect();
+        if case == Case::ShellOnly {
+            assert!(
+                declaring.iter().all(|declared| !declared),
+                "a shell that leaves Codex's home and directory alone must declare nothing, or \
+                 every pane launched through a shell loses its retry; events={events:?}"
+            );
+        } else {
+            assert!(
+                declaring.iter().all(|declared| *declared),
+                "{case:?}: the command can start Codex in a home or directory the wrapper did \
+                 not install and trust its hooks for, so every event must say no submitted-prompt \
+                 report can be counted on (issue #1703); events={events:?}"
             );
         }
     }

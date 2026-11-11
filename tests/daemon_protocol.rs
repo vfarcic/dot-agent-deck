@@ -1381,7 +1381,20 @@ fn mint_project(toml: &str) -> (TempDir, PathBuf) {
     let dir = test_temp::tempdir().expect("mint the project sandbox");
     std::fs::write(dir.path().join(".dot-agent-deck.toml"), toml).expect("seed the project config");
     let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize the project sandbox");
+    approve(&canonical);
     (dir, canonical)
+}
+
+/// PRD #1885: approve every orchestration of the config in `dir`, through the
+/// real store API, in a store private to this test process — preparing and a
+/// prepared start run only an approved orchestration, and these tests are about
+/// the verbs. Best effort: a config that does not parse has nothing to approve.
+fn approve(dir: &std::path::Path) {
+    use dot_agent_deck::project_trust::{TrustStore, approve_all};
+    static STORE: std::sync::OnceLock<TempDir> = std::sync::OnceLock::new();
+    let store = STORE.get_or_init(|| test_temp::tempdir().expect("mint the trust store dir"));
+    let _ = TrustStore::use_state_dir_for_this_process(store.path().to_path_buf());
+    let _ = approve_all(&TrustStore::default_location(), dir);
 }
 
 const LAUNCHABLE_PROJECT: &str = r#"
@@ -1450,6 +1463,10 @@ async fn prepare_workflow_refuses_a_stale_config_revision_before_publishing() {
         LAUNCHABLE_PROJECT.replace("Implements the requested change", "Something else entirely"),
     )
     .expect("rewrite the project config");
+    // PRD #1885: the new text is approved, as a user would approve it, so the
+    // refusal below is about the stale revision (checked first) and the launch
+    // with no expectation is about the revision field, not the gate.
+    approve(&project);
 
     let resp = issue_json_request(
         &server,

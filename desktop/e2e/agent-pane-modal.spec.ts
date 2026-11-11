@@ -100,7 +100,7 @@ test.describe("the agent pane is a real modal", () => {
     await selector.focus();
     expect(await page.evaluate(() => document.activeElement?.getAttribute("data-testid"))).toBe("deck-selector-toggle");
 
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
 

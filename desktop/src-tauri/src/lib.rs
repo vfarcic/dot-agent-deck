@@ -46,6 +46,7 @@ mod selection_saves;
 mod self_upgrade;
 mod settings;
 mod terminal;
+mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
 // crate's shared upgrade procedure.
 mod upgrade;
@@ -73,7 +74,7 @@ use dot_agent_deck::daemon_client::{
     ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, Incarnation,
     LastCommandKeeper, StartAgentOptions,
 };
-use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
+use dot_agent_deck::daemon_stop::{StopError, StopOutcome, WireStopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, PreparedOrchestration, ProjectRole};
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
@@ -86,7 +87,7 @@ use crate::dto::{
     DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
     DesktopResolvedProject, DesktopSnapshot, OrchestrationRoleInput, TerminalAttachResult,
     desktop_agent_registry, ensure_desktop_orchestration_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
+    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
     validate_dimensions, validate_orchestration_shape, validate_pasted_project_path,
     validate_start_fields,
 };
@@ -5016,6 +5017,132 @@ async fn worktree_close_preview_on(
     .flatten()
 }
 
+/// Issue #1073 — stop the daemon of the deck `deck_id` names, which on the
+/// overview need not be the selected one.
+///
+/// The deck is resolved once, as [`stop_agent_action`] resolves it, and the
+/// path is chosen per deck:
+///
+/// - **The wire verb** (`AttachRequest::StopDaemon`, issue #1049) whenever the
+///   deck advertises it. The daemon runs the #770 refusal itself and stops
+///   itself, so nothing here reads a pid or sends a signal — which is why it
+///   is the only path that reaches a remote deck.
+/// - **The pid stop** ([`run_daemon_stop`]) for a local deck that predates the
+///   verb or does not answer the handshake, and for a forced stop of a local
+///   deck: escalating past a graceful stop needs a signal, which a caller on the
+///   wire does not have.
+/// - **A refusal** for a remote deck without the verb. The pid path takes a
+///   `LocalEndpoint`, and over a forwarded socket its peer-credential lookup
+///   would name the local `ssh` client (PRD #741 M2), so there is nothing safe
+///   to send.
+///
+/// A refused stop returns before anything is torn down, so the deck's link and
+/// terminals survive it, as they did when this arm stopped only the local deck.
+pub(crate) async fn stop_daemon_action(
+    state: &DesktopState,
+    deck_id: &str,
+    force: bool,
+) -> Result<(crate::dto::DeckScope, String), String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let endpoint = scope.endpoint().clone();
+    let local = endpoint.as_local();
+    let wire = match (force, local) {
+        (true, Some(_)) => None,
+        _ => match state.daemon.trusted(&endpoint).await {
+            Ok(daemon) => {
+                let supported = daemon
+                    .client
+                    .capabilities()
+                    .await
+                    .is_ok_and(|capabilities| {
+                        capabilities.supports(dot_agent_deck::daemon_protocol::CAP_STOP_DAEMON)
+                    });
+                supported.then_some(daemon)
+            }
+            // A local deck that does not answer is the pid path's to report —
+            // "no daemon was running" is its idempotent answer.
+            Err(_) if local.is_some() => None,
+            Err(error) => return Err(error),
+        },
+    };
+    let message = match (wire, local) {
+        (Some(daemon), _) => wire_stop_message(daemon.client.stop_daemon(force).await)?,
+        (None, Some(local)) => pid_stop_message(run_daemon_stop(local, force).await)?,
+        (None, None) => {
+            return Err(crate::daemon_bridge::stop_daemon_reason(&endpoint, false)
+                .unwrap_or_else(|| "This daemon cannot be stopped from this app.".into()));
+        }
+    };
+    // PRD #741 M4(a): the daemon this link was established against is going
+    // away, so the handshake held for it describes a process that is ending.
+    state.daemon.invalidate(&endpoint).await;
+    // PRD #1105: this deck's sessions only — every other deck's terminals
+    // belong to daemons this action never touched.
+    terminal::detach_deck(state, &endpoint).await;
+    Ok((scope, message))
+}
+
+/// The pid stop's outcome in the words the desktop shows.
+fn pid_stop_message(outcome: Result<StopOutcome, StopError>) -> Result<String, String> {
+    match outcome {
+        Ok(StopOutcome::NoDaemonRunning) => Ok("No daemon was running.".into()),
+        Ok(StopOutcome::Stopped { pid }) => Ok(format!("Daemon stopped gracefully (pid {pid}).")),
+        Ok(StopOutcome::ForceKilled { pid }) => Ok(format!("Daemon force-killed (pid {pid}).")),
+        Err(error) => Err(stop_refusal_message(&error)),
+    }
+}
+
+/// The wire stop's outcome in the words the desktop shows (issue #1073).
+///
+/// `AcceptedNotConfirmed` is reported as what it is: the daemon said yes and
+/// began stopping, and had not gone when the confirmation budget ran out.
+/// Calling it stopped is the PRD #741 cautionary case — a stop path that
+/// reported success for a daemon it had not seen go.
+pub(crate) fn wire_stop_message(
+    outcome: Result<WireStopOutcome, StopError>,
+) -> Result<String, String> {
+    match outcome {
+        Ok(WireStopOutcome::NoDaemonRunning) => Ok("No daemon was running.".into()),
+        Ok(WireStopOutcome::Stopped) => Ok("Daemon stopped gracefully.".into()),
+        Ok(WireStopOutcome::AcceptedNotConfirmed) => Ok(
+            "The daemon accepted the stop and is still shutting down; its agents are being closed."
+                .into(),
+        ),
+        Err(error) => Err(stop_refusal_message(&error)),
+    }
+}
+
+/// A refused stop in the app's words, from either path.
+///
+/// The daemon's own refusal ends in "pass --force", which is the CLI's way out
+/// and not one this app offers, so the two guards are worded here; every other
+/// error is the daemon's or the transport's own sentence.
+fn stop_refusal_message(error: &StopError) -> String {
+    use dot_agent_deck::daemon_protocol::StopRefusalReason;
+    let agents = |count: usize| {
+        format!(
+            "The daemon was not stopped: {count} agent{} still running on it. Close {} first, then stop the daemon.",
+            if count == 1 { " is" } else { "s are" },
+            if count == 1 { "it" } else { "them" },
+        )
+    };
+    let roles = |count: usize| {
+        format!(
+            "The daemon was not stopped: it runs orchestration roles ({count}) that would be left unable to delegate. Close the orchestration first, then stop the daemon."
+        )
+    };
+    match error {
+        StopError::LiveAgents { ids } => agents(ids.len()),
+        StopError::LiveOrchestrations { roles: held } => roles(held.len()),
+        StopError::Refused(refusal) => match refusal.reason {
+            StopRefusalReason::LiveOrchestrations => roles(refusal.roles.len()),
+            StopRefusalReason::LiveAgents => agents(refusal.agent_ids.len()),
+            StopRefusalReason::Unknown => safe_message(refusal.summary.clone()),
+        },
+        other => safe_message(other.to_string()),
+    }
+}
+
 /// Stop one agent on the selected deck, and tear down **that deck's** terminal
 /// session for it.
 ///
@@ -5421,6 +5548,9 @@ struct StartedOrchestration {
 /// [`DesktopAction::ActivateOrchestration`]'s fields, unpacked for
 /// [`activate_orchestration_action`].
 struct ActivateOrchestrationRequest {
+    /// The deck the launch was started on (PRD #1885 review); `None` takes the
+    /// selected deck, refused under All Decks.
+    deck_id: Option<String>,
     name: String,
     /// The run's name (issue #1044), absent when the form's Name is empty.
     display_title: Option<String>,
@@ -5450,6 +5580,7 @@ async fn activate_orchestration_action(
     request: ActivateOrchestrationRequest,
 ) -> Result<OrchestrationLaunchResult, DesktopActionError> {
     let ActivateOrchestrationRequest {
+        deck_id,
         name,
         display_title,
         cwd,
@@ -5477,7 +5608,19 @@ async fn activate_orchestration_action(
     // The supported non-Pi coordinator still uses the readiness-gated,
     // identity-bound retry path in `launch_orchestration`; Pi is rejected
     // inside the preparation, before anything is spawned.
-    let daemon = trusted_daemon(&state.daemon).await?;
+    //
+    // PRD #1885 review: a launch that names its deck goes to that deck, the
+    // one its project-commands review was asked of and approved on, never to
+    // whatever is selected when it arrives. The id is resolved against the
+    // observed decks (`DeckScope::resolve`), so an id this app does not
+    // observe is refused before any deck is contacted.
+    let daemon = match deck_id.as_deref() {
+        Some(deck_id) => {
+            let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+            state.daemon.trusted(scope.endpoint()).await?
+        }
+        None => trusted_daemon(&state.daemon).await?,
+    };
     daemon.require_compatible()?;
     ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
     let launch_client = bind_launch(&daemon.client).await?;
@@ -6338,6 +6481,7 @@ async fn desktop_run_action(
             result_agent_ids = started.agent_ids;
         }
         DesktopAction::ActivateOrchestration {
+            deck_id,
             name,
             display_title,
             cwd,
@@ -6350,6 +6494,7 @@ async fn desktop_run_action(
             let launched = activate_orchestration_action(
                 &state,
                 ActivateOrchestrationRequest {
+                    deck_id,
                     name,
                     display_title,
                     cwd,
@@ -6398,34 +6543,17 @@ async fn desktop_run_action(
             })?;
             result_agent_ids = roles.into_iter().map(|role| role.agent_id).collect();
         }
-        DesktopAction::StopDaemon { force } => {
-            // PRD #741 M2: `run_daemon_stop` takes a `LocalEndpoint`, so this
-            // cannot reach a remote deck even by accident — `require_local`
-            // is the only way to produce one and it refuses, naming the deck
-            // and the reason. (M7 renders this as a disabled button carrying
-            // the same explanation rather than a failed action.)
-            let endpoint = selected_endpoint();
-            let local = endpoint
-                .require_local("Stop daemon")
-                .map_err(|error| safe_message(error.to_string()))?;
-            let outcome = run_daemon_stop(local, force)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            // PRD #741 M4(a): the daemon this link was established against is
-            // being terminated, so the handshake held for it describes a
-            // process that is going away. Drop it here rather than waiting for
-            // the watcher to notice its stream end.
-            state.daemon.invalidate(&endpoint).await;
-            // PRD #1105: this deck's sessions only. Stop is refused for
-            // anything but the local deck, so tearing down every deck's
-            // terminals would close panes on machines this action never
-            // touched.
-            terminal::detach_deck(&state, &endpoint).await;
-            result_message = Some(match outcome {
-                StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
-                StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
-                StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
-            });
+        DesktopAction::StopDaemon { deck_id, force } => {
+            // Issue #1073: the deck the control was pressed on, which on the
+            // overview need not be the selected one.
+            let (scope, message) = stop_daemon_action(&state, &deck_id, force).await?;
+            // The TARGET deck, directly, for the StopAgent arm's reason — the
+            // tail below refreshes only the selected one.
+            if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
+                emit_snapshot(&app, &snapshot);
+            }
+            state.request_refetch(&scope.identity());
+            result_message = Some(message);
         }
         DesktopAction::AllowBuildMismatch { deck_id } => {
             // Session-scoped and nothing else: no daemon call beyond a
@@ -6833,6 +6961,8 @@ pub fn run() {
             desktop_list_projects,
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
+            trust_review::desktop_project_trust_state,
+            trust_review::desktop_approve_project_trust,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_new_agent_options,
@@ -10845,14 +10975,17 @@ command = "configured-planner"
         assert!(outcomes[3].is_none());
     }
 
-    /// Scenario (PRD #1223 U4): the webview sends a `stop_agent` or a
-    /// `stop_orchestration` that names no deck. Both fail to decode, for
-    /// `start_agent`'s reason — a stop must never fall back to the selection.
+    /// Scenario (PRD #1223 U4, issue #1073): the webview sends a `stop_agent`,
+    /// a `stop_orchestration` or a `stop_daemon` that names no deck. All three
+    /// fail to decode, for `start_agent`'s reason — a stop must never fall back
+    /// to the selection.
     #[test]
     fn a_stop_without_a_deck_does_not_decode() {
         for action in [
             serde_json::json!({"type": "stop_agent", "agentId": "7"}),
             serde_json::json!({"type": "stop_orchestration", "roles": [{"agentId": "7", "name": "planner"}]}),
+            serde_json::json!({"type": "stop_daemon"}),
+            serde_json::json!({"type": "stop_daemon", "force": false}),
         ] {
             assert!(
                 serde_json::from_value::<DesktopAction>(action.clone()).is_err(),
@@ -10862,6 +10995,10 @@ command = "configured-planner"
         assert!(matches!(
             serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_agent", "deckId": "deck-000000000000dec1", "agentId": "7"})),
             Ok(DesktopAction::StopAgent { deck_id, agent_id, .. }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
+        ));
+        assert!(matches!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_daemon", "deckId": "deck-000000000000dec1"})),
+            Ok(DesktopAction::StopDaemon { deck_id, force: false }) if deck_id == "deck-000000000000dec1"
         ));
     }
 
