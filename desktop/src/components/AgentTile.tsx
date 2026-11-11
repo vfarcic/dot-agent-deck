@@ -35,6 +35,7 @@ import { terminalInputState, type AgentRecordFreshness, type NoTerminalState } f
 import { blockedReasonText } from "../lib/blockedReason";
 import { attentionReason, inboxActionText, inboxBadge, inboxNotice, inputHeldText, INBOX_WORDS } from "../lib/inboxWords";
 import { displayBackgroundWork, displayUptime } from "../lib/displayText";
+import { agentTitle } from "../lib/agentNames";
 import { OVERVIEW_CLOCK_TICK_MS } from "./AgentOverview";
 import { OutputReader } from "./OutputReader";
 import { PullRequestBadge } from "./PullRequestBadge";
@@ -447,8 +448,14 @@ export function AgentTile({
   // what the daemon said, the word the TUI's card uses (CLAUDE.md rule 22).
   const tileStatusLabel = agent.daemonStatus === "error" ? "error" : statusLabel(agent.status);
   /*
-    Issue #2001 — the line under the title says what the agent IS, each fact
-    once, and only the facts the deck has. The title is the agent's name, so a
+    Issue #1798 — the title names the agent: its name, after its run's title
+    for an orchestration agent. Every accessible name on the tile is built from
+    the same clamped copy, so a screen reader names the tile the way it reads.
+  */
+  const title = agentTitle(agent);
+  /*
+    Issue #2001 — the muted words beside the title say what the agent IS, each
+    fact once, and only the facts the deck has. The title is the agent's name, so a
     part that spells the same word is dropped: an agent started without a name
     is named after its command (`claude`), and a role keeps its role name until
     someone renames it. The role leads for an orchestration role and in the
@@ -493,7 +500,7 @@ export function AgentTile({
       data-presentation={presentation}
       /* Its name, so the tile can be told apart without its contents — with
          the voice number first while one is shown. */
-      aria-label={voiceNumber === undefined ? agent.role : `${voiceNumber}. ${agent.role}`}
+      aria-label={voiceNumber === undefined ? title.shown : `${voiceNumber}. ${title.shown}`}
       data-voice-number={voiceNumber}
       onMouseDown={onSelect}
     >
@@ -501,10 +508,43 @@ export function AgentTile({
         <div className="agent-identity">
           <span className={`agent-state-mark status-${agent.status}${held ? " is-held" : ""}`} aria-hidden="true" />
           <div>
+            {/*
+              Issue #1798 — one line: the agent's name, the muted facts that
+              say what it is, its badges and status, and the rename pencil.
+              Renaming swaps the name and its facts for the field, in place.
+            */}
             <div className="agent-title-line">
               <VoiceNumber number={voiceNumber} hidden />
-              {/* Issue #2001 — the name the agent was given or renamed to. */}
-              <h2 title={agent.displayName}>{agent.displayName}</h2>
+              {renameDraft !== undefined ? (
+                <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>
+                  <input
+                    autoFocus
+                    aria-label={`Rename ${title.shown}`}
+                    value={renameDraft}
+                    onChange={(event) => setRenameDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") { event.preventDefault(); commitRename(); }
+                      if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setRenameDraft(undefined); }
+                    }}
+                  />
+                  <button aria-label={`Save ${title.shown} name`} onClick={commitRename}><Check size={12} /></button>
+                  <button aria-label={`Cancel renaming ${title.shown}`} onClick={() => setRenameDraft(undefined)}><X size={12} /></button>
+                </div>
+              ) : (
+                <>
+                  <h2 title={title.full}>{title.shown}</h2>
+                  {/* Issue #856: the binary the daemon named, dropped entirely
+                      when it named none — each separator goes with the part it
+                      precedes rather than dangling. */}
+                  {identityParts.length > 0 && (
+                    <span className="agent-identity-facts">
+                      {identityParts.map((part, index) => (
+                        <span key={index}>{index > 0 && <span aria-hidden="true"> · </span>}{part}</span>
+                      ))}
+                    </span>
+                  )}
+                </>
+              )}
               {agent.isStartRole && <span className="coordinator-badge" title="Orchestration start role">ORCHESTRATOR</span>}
               {/* Issue #2075 — the TUI card's badge, in the same words. */}
               {question && <span className="question-badge" data-testid={`question-badge-${agent.id}`} title="A question is waiting for an answer">{questionBadgeText(question, now)}</span>}
@@ -529,41 +569,16 @@ export function AgentTile({
               )}
               {/* PRD #1666: the inbox line the TUI's card prints too. */}
               {badge && !held && <span className="agent-inbox-badge" data-testid={`inbox-badge-${agent.id}`}>{badge}</span>}
+              {onRename && renameDraft === undefined && (
+                <button
+                  className="agent-rename-trigger"
+                  aria-label={`Rename ${title.shown}`}
+                  title={`Rename ${title.shown}`}
+                  onMouseDown={(event) => event.stopPropagation()}
+                  onClick={() => setRenameDraft(agent.displayName)}
+                ><Pencil size={11} /></button>
+              )}
             </div>
-            {renameDraft !== undefined ? (
-              <div className="agent-rename" onMouseDown={(event) => event.stopPropagation()}>
-                <input
-                  autoFocus
-                  aria-label={`Rename ${agent.role}`}
-                  value={renameDraft}
-                  onChange={(event) => setRenameDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter") { event.preventDefault(); commitRename(); }
-                    if (event.key === "Escape") { event.preventDefault(); event.stopPropagation(); setRenameDraft(undefined); }
-                  }}
-                />
-                <button aria-label={`Save ${agent.role} name`} onClick={commitRename}><Check size={12} /></button>
-                <button aria-label={`Cancel renaming ${agent.role}`} onClick={() => setRenameDraft(undefined)}><X size={12} /></button>
-              </div>
-            ) : (
-              <p>
-                {/* Issue #856: the binary the daemon named, dropped entirely
-                    when it named none — each separator goes with the part it
-                    precedes rather than dangling. */}
-                {identityParts.map((part, index) => (
-                  <span key={index}>{index > 0 && <span aria-hidden="true"> · </span>}{part}</span>
-                ))}
-                {onRename && (
-                  <button
-                    className="agent-rename-trigger"
-                    aria-label={`Rename ${agent.role}`}
-                    title={`Rename ${agent.displayName}`}
-                    onMouseDown={(event) => event.stopPropagation()}
-                    onClick={() => setRenameDraft(agent.displayName)}
-                  ><Pencil size={11} /></button>
-                )}
-              </p>
-            )}
             {/* Issue #714: say WHY the agent is blocked, beside the status it
                 explains. Not on a held record: that status is a past reading. */}
             {agent.status === "blocked" && !held && (
@@ -622,8 +637,8 @@ export function AgentTile({
           {onOpen && (
             <button
               className="agent-pane-control"
-              aria-label={`Open ${agent.role} agent`}
-              title={`Open ${agent.displayName} in a full-window pane`}
+              aria-label={`Open ${title.shown} agent`}
+              title={`Open ${title.shown} in a full-window pane`}
               onMouseDown={(event) => event.stopPropagation()}
               onClick={onOpen}
             ><Maximize2 size={13} /></button>
@@ -653,7 +668,7 @@ export function AgentTile({
         <p>{agent.task}</p>
       </div>
 
-      <div className="agent-instruments" aria-label={`${agent.role} run metrics`}>
+      <div className="agent-instruments" aria-label={`${title.shown} run metrics`}>
         <div title={uptime && `Spawned by the daemon at: ${uptime.title}`}><span>TIME</span><strong>{uptime?.label ?? agent.duration}</strong></div>
         {fixture ? (
           <>
@@ -674,7 +689,7 @@ export function AgentTile({
         )}
       </div>
 
-      <div className="agent-tabs" role="tablist" aria-label={`${agent.role} details`}>
+      <div className="agent-tabs" role="tablist" aria-label={`${title.shown} details`}>
         {(showDetails ? tabs : tabs.filter(({ id }) => id === "terminal")).map(({ id, label, icon: Icon }) => (
           <button
             key={id}
@@ -754,7 +769,7 @@ export function AgentTile({
                      restarted deck's agent with the same id has a feed and an
                      xterm of its own. */
                   incarnation={agent.incarnation}
-                  label={agent.role}
+                  label={title.shown}
                   transcript={agent.transcript}
                   terminalFeed={terminalFeed}
                   readOnly={input.readOnly}

@@ -946,7 +946,7 @@ function docsFleet(): DeckSnapshot[] {
     runId: "run_docs_service",
     repo: "service-api",
     worktree: "/home/dev/service-api",
-    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+    connection: { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
     hostMetrics: fixtureHostMetrics("remote"),
     agents: [
       crowdedAgent({ id: "1", displayName: "API implementation", role: "Codex", cli: "codex", status: "running", cwd: "/home/dev/service-api", toolCount: 2, upForMinutes: 44, quietForMinutes: 0, activeTool: "Edit", activeToolDetail: "src/routes.rs", lastUserPrompt: "Add the checkout endpoint.", tab: { kind: "dashboard" } }),
@@ -1126,7 +1126,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -1146,7 +1146,7 @@ export function createFixtureFleet(state: FixtureState = "connected"): DeckSnaps
     */
     fleetDeck(
       FIXTURE_UNREACHABLE_DAEMON_ID,
-      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No daemon is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "disconnected", deckId: FIXTURE_UNREACHABLE_DAEMON_ID, socketPath: FIXTURE_UNREACHABLE_DAEMON_ID, message: "No daemon is listening on the configured socket.", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
       staleAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -1194,7 +1194,7 @@ function upgradeIncompatibleDeck(): DeckSnapshot {
       runningAgentCount: 0,
       message: "This daemon is older than this app, and a change between the two versions means it may be read wrongly.",
       deckKind: "remote",
-      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      localOnlyReason: "Replace daemon acts on a process on this machine.",
       upgradeOffer: FIXTURE_OLDER,
     },
     [],
@@ -1221,7 +1221,7 @@ function upgradeFleet(): DeckSnapshot[] {
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine.", upgradeOffer: FIXTURE_OLDER },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),
@@ -1261,7 +1261,7 @@ function hookNoticeFleet(): DeckSnapshot[] {
     ),
     fleetDeck(
       FIXTURE_REMOTE_DAEMON_ID,
-      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Stop daemon acts on a process on this machine." },
+      { status: "connected", deckId: FIXTURE_REMOTE_DAEMON_ID, socketPath: FIXTURE_REMOTE_DAEMON_ID, message: "Daemon responding", deckKind: "remote", localOnlyReason: "Replace daemon acts on a process on this machine." },
       remoteAgents,
       "/home/dev/code/dot-agent-deck",
     ),

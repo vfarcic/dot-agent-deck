@@ -36,7 +36,7 @@ setup("warm WebKit before the first spec", async ({ page }) => {
   await page.goto("/?fixture=1&state=fleet&experimental=1");
   await page.getByTestId("open-deck").click({ timeout: 120_000 });
   await page.locator(".agent-grid").waitFor({ timeout: 120_000 });
-  await page.getByRole("button", { name: "Open Planner agent" }).click({ timeout: 120_000 });
+  await page.getByRole("button", { name: "Open Plan / architecture agent" }).click({ timeout: 120_000 });
   await page.getByTestId("agent-pane-overlay").waitFor({ timeout: 120_000 });
   console.log(`webkit warm-up: ${Date.now() - started}ms from first navigation to an open agent pane`);
 });

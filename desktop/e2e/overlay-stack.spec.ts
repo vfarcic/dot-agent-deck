@@ -92,7 +92,7 @@ test.describe("a sheet chosen from the command menu on a plain deck", () => {
   test("leaves the deck live, and closes with Close or Escape", async ({ page }) => {
     await load(page, "connected");
     await enterDeck(page);
-    const openPlanner = page.getByRole("button", { name: "Open Planner agent" });
+    const openPlanner = page.getByRole("button", { name: "Open Plan / architecture agent" });
 
     await settingsFromCommandMenu(page);
     expect(await inert(openPlanner), "Settings opened over nothing fenced must not fence the deck").toBe(false);
@@ -118,7 +118,7 @@ test.describe("a sheet chosen from the command menu on a plain deck", () => {
     await enterDeck(page);
     await settingsFromCommandMenu(page);
 
-    await page.getByRole("button", { name: "Open Planner agent" }).press("Enter");
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).press("Enter");
     await expect(pane(page)).toBeVisible();
     const back = pane(page).getByRole("button", { name: "Back to dashboard" });
     expect(await inert(pane(page)), "the pane opened last must take input").toBe(false);
@@ -252,7 +252,7 @@ test.describe("an agent's output Reader (issue #1709)", () => {
   test("close closes Settings over the Reader, then the Reader", async ({ page }) => {
     await load(page, "connected", ["close this", "voice off", "close this", "voice off"]);
     await enterDeck(page);
-    const openPlanner = page.getByRole("button", { name: "Open Planner agent" });
+    const openPlanner = page.getByRole("button", { name: "Open Plan / architecture agent" });
     await page.locator('[data-testid^="reader-open-"]').first().click();
     const reader = page.getByRole("dialog", { name: /output reader$/ });
     await expect(reader).toBeVisible();
@@ -322,7 +322,7 @@ test.describe("sheets, the agent pane and the pull request page", () => {
   test("a sheet opened over the page from the command menu is on top, and close closes only it", async ({ page }) => {
     await load(page, "docs-pr", ["close this"]);
     await enterDeck(page);
-    await page.getByRole("button", { name: "Open Codex agent" }).click();
+    await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();
     await expect(pane(page)).toBeVisible();
     await pane(page).getByTestId("pr-badge-2").click();
     const browser = page.getByTestId("pr-browser");
