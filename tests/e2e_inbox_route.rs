@@ -548,6 +548,9 @@ fn route_006_respawn_failure_posts_daemon_notice() {
         "command = 'inbox-route-missing-executable-6a83'",
     );
     std::fs::write(config, contents).unwrap();
+    // PRD #1885: the edit is setup (a command that cannot start), approved as
+    // the user would, so the delegate reaches the respawn this test is about.
+    daemon.approve_project_trust(&daemon.home);
     let mut req = request(&orch, "delegate");
     req["task"] = json!(route::TASK);
     req["to"] = json!(["coder"]);

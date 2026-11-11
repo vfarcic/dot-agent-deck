@@ -486,6 +486,9 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
         // orchestrator + claude worker) side by side — the grid shows the
         // delegation happening live.
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         // Gate ON so the Pi first-class identity renders (features::show_pi_agent).
         .with_env("DOT_AGENT_DECK_EXPERIMENTAL", "1")
         // pi's login, as for `pi_live_001` above.

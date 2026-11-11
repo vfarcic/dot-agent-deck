@@ -17942,6 +17942,9 @@ mod tests {
     /// rather than silently leaving the old words as the only spoken form.
     const NEW_AGENT_DIALOG_TSX: &str = include_str!("../../../src/components/NewAgentDialog.tsx");
     const AGENT_OVERVIEW_TSX: &str = include_str!("../../../src/components/AgentOverview.tsx");
+    const PROJECT_TRUST_TS: &str = include_str!("../../../src/lib/projectTrust.ts");
+    const PROJECT_TRUST_DIALOG_TSX: &str =
+        include_str!("../../../src/components/ProjectTrustDialog.tsx");
     /// The one rail, shown beside the overview as well as the deck (#1197).
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
@@ -17970,7 +17973,24 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 26] = [
+    const CONTROL_LABELS: [ControlLabel; 28] = [
+        // PRD #1885 — the Review project commands dialog, over the New agent
+        // form (and over the Runs screen): Approve and start is its own row,
+        // and Cancel is `close`, which cancels the dialog on top.
+        ControlLabel {
+            source: "APPROVE_AND_START = \"Approve and start\"",
+            file: PROJECT_TRUST_TS,
+            said: "Approve and start",
+            row: "approve_project_commands",
+            over_the_form: true,
+        },
+        ControlLabel {
+            source: "cancelProjectCommands: onCancel })}>Cancel</button>",
+            file: PROJECT_TRUST_DIALOG_TSX,
+            said: "Cancel",
+            row: "close",
+            over_the_form: true,
+        },
         ControlLabel {
             source: "\"Activate orchestration\"",
             file: NEW_AGENT_DIALOG_TSX,

@@ -160,6 +160,9 @@ fn doorbell_056_a_turned_off_claude_doorbell_is_held_visibly_and_a_prompt_recove
         ),
     )
     .unwrap();
+    // PRD #1885: a delegate runs only from an approved orchestration; this
+    // test is about the doorbell, not the gate.
+    deck.approve_project_trust(deck.workdir());
     let membership = |role: &str, index, start| {
         json!({"tab_membership": {
         "kind":"orchestration", "name":"claude-release", "role_name":role,

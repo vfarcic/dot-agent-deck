@@ -161,6 +161,8 @@ fn restart_009_restarted_pane_stays_reachable_in_an_already_attached_tui() {
     let running_config_path = std::path::Path::new(&orchestration_cwd).join(".dot-agent-deck.toml");
     std::fs::write(&running_config_path, LONG_LIVED_CONFIG)
         .expect("swap coder's command to a long-lived one before restarting it");
+    // PRD #1885: this edit is setup, not the subject — approve it as the user would.
+    deck.approve_project_trust(std::path::Path::new(&orchestration_cwd));
 
     // Retry the REAL `pane restart coder` CLI call itself until it succeeds,
     // instead of polling `ListAgents` for a `crashed` marker that
@@ -335,6 +337,8 @@ fn restart_014_a_replaced_generations_late_start_cannot_take_the_card_back() {
         LONG_LIVED_CONFIG,
     )
     .expect("swap coder's command to a long-lived one before restarting it");
+    // PRD #1885: this edit is setup, not the subject — approve it as the user would.
+    deck.approve_project_trust(std::path::Path::new(&cwd));
     retry_pane_restart_until_success(
         deck.hook_socket_path(),
         &orchestrator_pane_id,

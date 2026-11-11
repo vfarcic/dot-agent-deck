@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -19,6 +19,7 @@ import { speechAudioError } from "./speech";
 import { DEFAULT_SPEECH_LANGUAGE, SPEECH_LANGUAGE_TOKENS } from "./speechLanguages";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { pullRequestFromDto } from "./pullRequest";
+import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -1838,7 +1839,7 @@ export type DesktopRunActionDto =
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
-  | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
   | { type: "stop_daemon"; deckId: string; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
 
@@ -2295,6 +2296,19 @@ export interface DeckBridge {
    * one from this flow. Rejects exactly as {@link listDirectories} does.
    */
   newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations>;
+  /**
+   * PRD #1885 — whether `target`'s orchestration is approved on the deck its
+   * launch goes to (`target.deckId`, or the selected deck when absent), and
+   * the escaped text the review dialog shows when it is not; `unsupported`
+   * with the refusal to show for a deck older than the review.
+   */
+  projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust>;
+  /**
+   * PRD #1885 — approve `target`'s orchestration, carrying the `digest` of the
+   * text the dialog showed. Rejects with the deck's `trust-text-changed`
+   * refusal when the config changed since, and approves nothing then.
+   */
+  approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
   /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
@@ -3104,6 +3118,13 @@ class FixtureDeckBridge implements DeckBridge {
    * deck ids. Empty by default.
    */
   private nonUnixDecks: ReadonlySet<string> = new Set();
+  /**
+   * PRD #1885 — `?trust=changed` plays the `project-trust` docs scene: the
+   * fixture project defines `team` ({@link DOCS_TRUST_ORCHESTRATION}), and its
+   * review answers `changed` instead of approved, so starting it opens the
+   * Review project commands dialog. Off by default.
+   */
+  private docsTrustReview = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
@@ -3137,6 +3158,7 @@ class FixtureDeckBridge implements DeckBridge {
     else if (older) this.olderDecks = new Set(older.split(",").map((deckId) => deckId.trim()).filter(Boolean));
     const nonUnix = new URLSearchParams(window.location.search).get("nonunix");
     if (nonUnix) this.nonUnixDecks = new Set(nonUnix.split(",").map((deckId) => deckId.trim()).filter(Boolean));
+    this.docsTrustReview = new URLSearchParams(window.location.search).get("trust") === "changed";
     this.fleet.forEach((deck) => this.markOlderDeck(deck));
   }
 
@@ -3927,12 +3949,49 @@ class FixtureDeckBridge implements DeckBridge {
    * way — and `unsupported` for a deck this preview plays as older or as
    * non-Unix.
    */
+  /**
+   * PRD #1885 — the browser preview has no approval store: every fixture
+   * orchestration answers approved, with its roles as the review would show
+   * them, so a fixture launch starts as it always did. Approving answers the
+   * same.
+   */
+  async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    await Promise.resolve();
+    const home = FIXTURE_HOMES[target.deckId ?? ""] ?? "/home/dev";
+    if (this.docsTrustReview && target.path === `${home}/demo-project` && target.orchestration === DOCS_TRUST_ORCHESTRATION.name) {
+      return {
+        kind: "review",
+        project: target.path,
+        orchestration: target.orchestration,
+        state: "changed",
+        roles: DOCS_TRUST_ROLES.map((role) => ({ ...role })),
+        removedRoles: [...DOCS_TRUST_REMOVED_ROLES],
+        digest: "fixture-digest",
+      };
+    }
+    const roles = fixtureProjectOrchestrations(home, target.path)?.find((candidate) => candidate.name === target.orchestration)?.roles ?? [];
+    return {
+      kind: "review",
+      project: target.path,
+      orchestration: target.orchestration,
+      state: "approved",
+      roles: roles.map((role) => ({ name: role.name, command: FIXTURE_ROLE_COMMANDS[role.name] ?? "", start: role.start, clear: true })),
+      removedRoles: [],
+      digest: "fixture-digest",
+    };
+  }
+
+  async approveProjectTrust(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    return this.projectTrustState(target);
+  }
+
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     await Promise.resolve();
     this.connectedDeck(deckId);
     if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
-    const orchestrations = (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
+    const docsTrust = this.docsTrustReview && path === `${home}/demo-project` ? [DOCS_TRUST_ORCHESTRATION] : undefined;
+    const orchestrations = docsTrust ?? (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };
     return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
@@ -5811,6 +5870,17 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOrchestrations>("desktop_new_agent_orchestrations", { deckId, path });
+  }
+
+  /** PRD #1885. `deckId` is sent only when the target names one; without it the crate takes the selected deck, as the Runs launch does. */
+  async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    const invoke = await this.getInvoke();
+    return invoke<ProjectTrust>("desktop_project_trust_state", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration });
+  }
+
+  async approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust> {
+    const invoke = await this.getInvoke();
+    return invoke<ProjectTrust>("desktop_approve_project_trust", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration, digest });
   }
 
   async dispose(): Promise<void> {

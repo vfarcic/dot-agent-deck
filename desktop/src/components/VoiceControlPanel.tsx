@@ -98,6 +98,7 @@ import { ConfirmDialog } from "./ConfirmDialog";
 import { desktopFeaturesOf, type AgentTarget, type DeckFleet, type DeckRuntimeState } from "../types";
 import { agentKey, boundAgentKey, sameIncarnation } from "../lib/agentKey";
 import { AGENT_GONE_AFTER_RESTART } from "../lib/agentIdentity";
+import { shownReviewToken } from "../lib/projectTrust";
 
 /**
  * How long an Undo stays on offer, in milliseconds.
@@ -183,6 +184,14 @@ export const SCREEN_MOVED_ON = "You moved to another screen while that was being
  * changes count.
  */
 export const DIALOG_MOVED_ON = "The New agent dialog changed while that was being worked out, so nothing ran. Say it again.";
+
+/**
+ * PRD #1885 review (auditor 3) — the project-commands review on screen changed
+ * (closed, replaced by another, or re-shown with new text) while an utterance
+ * was being worked out. Nothing ran: an approval spoken against one review
+ * never approves another.
+ */
+export const REVIEW_MOVED_ON = "The project commands review changed while that was being worked out, so nothing ran. Review what is shown and say it again.";
 
 /**
  * Whether two New agent declarations are the same CONTEXT for grounding — the
@@ -1092,6 +1101,14 @@ type VoiceContext = {
    * become another process is told apart as gone with its deck's restart.
    */
   deckProcesses?: Readonly<Record<string, string | undefined>>;
+  /**
+   * PRD #1885 review (auditor 3): the project-commands review on screen, as
+   * its token (`shownReviewToken`) — its own number and the digest of the
+   * text it shows — or `undefined` with none. An answer is refused when it
+   * moved, and the declared token rides to the dispatch, so a spoken approval
+   * approves the review it was spoken against or nothing.
+   */
+  trustReview?: string;
 };
 
 /**
@@ -1109,7 +1126,7 @@ type Touches = { answer?: true; pane?: AgentAddress; agent?: { deckId: string | 
  * daemon process listing the agent's id: the agent is gone with its deck's
  * restart, and its `why` is the TUI's sentence for it.
  */
-type Lost = { code: "screen" | "dialog" | "mode" | "confirmation" | "pane" | "replaced" | "restarted" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
+type Lost = { code: "screen" | "dialog" | "review" | "mode" | "confirmation" | "pane" | "replaced" | "restarted" | "blocked" | "hidden" | "deck" | "agent" | "gone"; why: string };
 
 /**
  * PRD #1260/#1261 review, rounds 4-5 — THE gate. Every side effect an
@@ -1148,6 +1165,7 @@ function contextLost(was: VoiceContext, now: VoiceContext, touches: Touches): Lo
     if (now.screen !== was.screen) return { code: "screen", why: "you moved to another screen" };
     if (!sameNewAgentDeclaration(was.newAgent, now.newAgent) || now.instance !== was.instance) return { code: "dialog", why: "the New agent dialog changed" };
     if (now.generation !== was.generation) return { code: "mode", why: "typing mode changed" };
+    if (now.trustReview !== was.trustReview) return { code: "review", why: "the project commands review changed" };
   }
   const aim = touches.pane;
   if (aim) {
@@ -1248,6 +1266,7 @@ function bindAgentParams(params: readonly VoiceResolvedParamDto[], declared: Voi
 function answerRefusal(lost: Lost): string {
   if (lost.code === "screen") return SCREEN_MOVED_ON;
   if (lost.code === "dialog") return DIALOG_MOVED_ON;
+  if (lost.code === "review") return REVIEW_MOVED_ON;
   if (lost.code === "mode") return VOICE_MODE_MOVED_ON;
   if (lost.code === "replaced") return VOICE_PANE_REPLACED;
   return voiceNothingRan(lost.why);
@@ -1257,6 +1276,7 @@ function answerRefusal(lost: Lost): string {
 function choiceRefusal(lost: Lost): string {
   if (lost.code === "screen") return VOICE_CHOICE_SCREEN_MOVED_ON;
   if (lost.code === "dialog") return VOICE_CHOICE_DIALOG_MOVED_ON;
+  if (lost.code === "review") return REVIEW_MOVED_ON;
   if (lost.code === "deck") return VOICE_CHOICE_DECK_MOVED_ON;
   if (lost.code === "agent") return VOICE_CHOICE_AGENT_REPLACED;
   if (lost.code === "gone") return VOICE_CHOICE_AGENT_GONE;
@@ -1470,7 +1490,7 @@ interface VoiceControlPanelProps {
    * cases stay distinguishable: one is a report the surface must correct, the
    * other is an ordinary command with no Undo beside it.
    */
-  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => { undo?: () => void } | undefined;
+  onDispatch: (outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto, declaredTrustReview?: string) => { undo?: () => void } | undefined;
   /**
    * What the New agent dialog's directory browser is showing right now, or
    * `undefined` when it is showing nothing (PRD #1223).
@@ -2161,6 +2181,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     deckProcesses: Object.fromEntries((fleetRef.current ?? [])
       .filter(({ connection }) => connection.deckId !== undefined && connection.status === "connected")
       .map(({ connection }) => [connection.deckId as string, connection.incarnation])),
+    trustReview: shownReviewToken(),
   }), []);
   /** Take the numbered list on screen as the one heard, with the context it stands in. */
   const hearNumbers = useCallback(() => {
@@ -2184,7 +2205,7 @@ export function VoiceControlPanel({ runtime, screen, onDispatch, channel, direct
     try {
       /* G-fix7: every agent the outcome names, bound to the process that
          listed it at the declaration (the gate above held it there). */
-      return onDispatch({ ...outcome, params: bindAgentParams(outcome.params, declared) }, declared.directories, declared.newAgent);
+      return onDispatch({ ...outcome, params: bindAgentParams(outcome.params, declared) }, declared.directories, declared.newAgent, declared.trustReview);
     } finally {
       dispatching.current = outer;
       /* PR #1451 round 3, change 4 — what voice just did may have changed the

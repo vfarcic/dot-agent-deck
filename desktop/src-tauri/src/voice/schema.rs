@@ -419,6 +419,7 @@ mod tests {
                 "choose_deck".to_string(),
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
+                "approve_project_commands".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
                 "none".to_string(),
@@ -513,6 +514,7 @@ mod tests {
                 "choose_deck",
                 "start_new_agent",
                 "discard_new_agent",
+                "approve_project_commands",
                 "stop_agent",
                 "close_orchestration",
                 "none"
@@ -724,6 +726,9 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
+                // PRD #1885: callable where its dialog opens; the app answers
+                // that nothing is waiting when no review is open.
+                ("approve_project_commands".to_string(), true),
                 ("stop_agent".to_string(), false),
                 ("close_orchestration".to_string(), false),
             ]
@@ -782,6 +787,7 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
+                ("approve_project_commands".to_string(), true),
                 // The D5 stops: on the overview with the New agent dialog
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
@@ -839,6 +845,7 @@ mod tests {
                 ("choose_deck".to_string(), false),
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
+                ("approve_project_commands".to_string(), false),
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), false),
             ]

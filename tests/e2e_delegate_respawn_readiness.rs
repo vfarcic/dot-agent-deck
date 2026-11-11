@@ -180,6 +180,9 @@ fn run_real_clear_true_delegate(deck: &TuiDeck, worker_command: &str, case: Real
         orchestration_toml(&role_command, case.declared_launcher),
     )
     .expect("write delegate orchestration config");
+    // PRD #1885: approved as written, so the delegate runs; this test is
+    // about the agent, not the gate.
+    deck.approve_project_trust(&work);
     std::fs::write(work.join(DELEGATE_TASK_FILE), delegate_task(&case, &work))
         .expect("write delegated task body");
     write_executable(&work.join(ORCHESTRATOR_SCRIPT), ORCHESTRATOR_BODY);

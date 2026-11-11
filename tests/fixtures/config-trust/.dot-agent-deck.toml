@@ -1,0 +1,23 @@
+# Fixture for the `config-trust/*` tests (PRD #1885): one orchestration whose
+# two roles run token-free stand-ins. Each `command` is `env TRUST_ROLE=<role>
+# cat`, so the text a trust prompt or refusal shows is distinctive while the
+# process is still a long-lived `cat`. The `description` and `prompt_template`
+# carry sentinels the prompt must display. `coder` is `clear = true` so a
+# delegate to it respawns the pane — the unattended path
+# `config-trust/respawn/001` covers.
+[[orchestrations]]
+name = "trust-orch"
+
+[[orchestrations.roles]]
+name = "orchestrator"
+command = "env TRUST_ROLE=orchestrator cat"
+start = true
+description = "TRUST-DESC-ORCH coordinates the stand-ins"
+prompt_template = "TRUST-PROMPT-ORCH coordinate the stand-in team"
+
+[[orchestrations.roles]]
+name = "coder"
+command = "env TRUST_ROLE=coder cat"
+clear = true
+description = "TRUST-DESC-CODER does the stand-in work"
+prompt_template = "TRUST-PROMPT-CODER do the stand-in work"

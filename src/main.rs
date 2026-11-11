@@ -453,6 +453,15 @@ enum Commands {
         #[command(subcommand)]
         cmd: SnapshotCmd,
     },
+    /// Review, approve and revoke the commands and prompts a project's
+    /// orchestrations may run (PRD #1885). The deck runs nothing from an
+    /// orchestration you have not approved, or that changed since you did:
+    /// the clients ask first, and schedules, dispatches and agent verbs refuse
+    /// and name the `approve` command to run.
+    Trust {
+        #[command(subcommand)]
+        action: TrustAction,
+    },
     /// Reclaim git worktrees whose PR is merged, whose tree is clean, and
     /// which the deck can prove it created. Never inspects git ancestry for
     /// merge state — squash-merges never enter `main`'s ancestry, and an
@@ -783,6 +792,37 @@ enum RemoteCmd {
         /// stderr).
         #[arg(long)]
         json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrustAction {
+    /// List every stored approval: project, orchestration, when, and whether
+    /// the config still says what was approved (`current`), says something
+    /// else (`changed`), or is gone (`missing`).
+    List,
+    /// Print the commands and prompts of a project's orchestrations and
+    /// approve them. Asks on a terminal; refuses without one unless `--yes`.
+    /// Refuses inside a pane the deck started.
+    Approve {
+        /// The directory holding `.dot-agent-deck.toml` (default: the current
+        /// directory).
+        dir: Option<std::path::PathBuf>,
+        /// Approve only this orchestration (default: every one in the file).
+        #[arg(long)]
+        orchestration: Option<String>,
+        /// Approve without asking. The text is still printed.
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Remove stored approvals of a project (one orchestration with
+    /// `--orchestration`).
+    Revoke {
+        /// The project directory (default: the current directory).
+        dir: Option<std::path::PathBuf>,
+        /// Revoke only this orchestration.
+        #[arg(long)]
+        orchestration: Option<String>,
     },
 }
 
@@ -1454,7 +1494,12 @@ fn delegate_verdict(
 ) -> DelegateVerdict {
     let blocked_note = blocked_workers_note(resp);
     if let Some(error) = resp.error.as_deref() {
-        let mut message = format!("Error: delegate from pane {pane_id} failed: {error}");
+        // The daemon's error can name roles and paths from a project config:
+        // shown, never obeyed.
+        let mut message = format!(
+            "Error: delegate from pane {pane_id} failed: {}",
+            dot_agent_deck::untrusted_text::escape_control_and_bidi(error)
+        );
         if let Some(note) = blocked_note {
             message.push('\n');
             message.push_str(&note);
@@ -2673,6 +2718,7 @@ fn main() -> ExitCode {
         },
         Some(Commands::Connect { name }) => run_connect(name),
         Some(Commands::Schedule { action }) => run_schedule_cli(action),
+        Some(Commands::Trust { action }) => run_trust_cli(action),
         Some(Commands::Snapshot { cmd }) => match cmd {
             // PRD #89 M4.2 — local fresh-start escape hatch. Reuses the same
             // `SavedSession::clear()` the TUI calls at teardown, so it honors
@@ -3701,6 +3747,54 @@ fn run_remote_upgrade(name: &str, version: String, no_install: bool, json: bool)
     }
 }
 
+/// `dot-agent-deck trust list | approve | revoke` (PRD #1885): the store and
+/// its rules live in [`dot_agent_deck::trust_cli`]; this only binds them to the
+/// process's stdio, terminal and environment.
+fn run_trust_cli(action: TrustAction) -> ExitCode {
+    use dot_agent_deck::project_trust::TrustStore;
+    use dot_agent_deck::trust_cli;
+    use std::io::IsTerminal;
+
+    let store = TrustStore::default_location();
+    let here = || std::path::PathBuf::from(".");
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    let ok = match action {
+        TrustAction::List => trust_cli::list(&store, &mut out, &mut err),
+        TrustAction::Approve {
+            dir,
+            orchestration,
+            yes,
+        } => {
+            let context = trust_cli::ApproveContext {
+                in_deck_pane: trust_cli::in_deck_pane(),
+                interactive: std::io::stdin().is_terminal() && std::io::stdout().is_terminal(),
+            };
+            trust_cli::approve(
+                &store,
+                &dir.unwrap_or_else(here),
+                orchestration.as_deref(),
+                yes,
+                context,
+                &mut std::io::stdin().lock(),
+                &mut out,
+                &mut err,
+            )
+        }
+        TrustAction::Revoke { dir, orchestration } => trust_cli::revoke(
+            &store,
+            &dir.unwrap_or_else(here),
+            orchestration.as_deref(),
+            &mut out,
+            &mut err,
+        ),
+    };
+    if ok {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::FAILURE
+    }
+}
+
 /// `dot-agent-deck daemon probe [--json]` (PRD #1487, hidden plumbing). One
 /// bounded `Hello` against the running daemon at this host's endpoint, through
 /// [`DaemonClient::probe_running`], which never lazy-spawns. "Nothing running"
@@ -4352,7 +4446,14 @@ async fn run_schedule_cli(action: ScheduleAction) -> ExitCode {
             for err in &loaded.errors {
                 eprintln!("warning: skipped malformed entry: {}", err.message);
             }
-            print!("{}", schedule_cli::format_list(&loaded.tasks));
+            // PRD #1885: with each task's last fire when it was refused.
+            print!(
+                "{}",
+                schedule_cli::format_list_with_outcomes(
+                    &loaded.tasks,
+                    &dot_agent_deck::schedule_outcome::OutcomeStore::default_location().load(),
+                )
+            );
             return ExitCode::SUCCESS;
         }
         _ => {}

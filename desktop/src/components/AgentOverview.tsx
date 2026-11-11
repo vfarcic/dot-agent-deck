@@ -1053,9 +1053,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         newAgentOptions: runtime.newAgentOptions,
         // PRD #1223 M6 — optional: a runtime without it offers no orchestration chips.
         ...(runtime.newAgentOrchestrations ? { newAgentOrchestrations: runtime.newAgentOrchestrations } : {}),
+        // PRD #1885 — the review before an orchestration starts. A runtime
+        // without them starts no orchestration: the dialog says why.
+        ...(runtime.projectTrustState ? { projectTrustState: runtime.projectTrustState } : {}),
+        ...(runtime.approveProjectTrust ? { approveProjectTrust: runtime.approveProjectTrust } : {}),
       }
       : undefined
-  ), [runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.runAction]);
+  ), [runtime.approveProjectTrust, runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.projectTrustState, runtime.runAction]);
   /** The open flow and the deck it preselects; `undefined` while it is closed. */
   const [newAgent, setNewAgent] = useState<{ deckId?: string }>();
   /** The open dialog's own close — every route it has, blocked while a start is in flight — published by the dialog (PRD #1223 U5). */

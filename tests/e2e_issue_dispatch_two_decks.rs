@@ -219,6 +219,65 @@ fn spawn_deck(
     (daemon, workspace, starts)
 }
 
+/// PRD #1885: an issue dispatch's project is its clone, which does not exist
+/// before a deck's first fire. That fire clones and is refused as never
+/// approved, before it lists issues, so it reads and writes no claim. Approve
+/// the clone it made, as the user would, then fire until a fire is not skipped
+/// behind the refused run, and wait for `outcome`.
+fn fire_refused_then_approve(
+    daemon: &common::DaemonProc,
+    workspace: &Path,
+    name: &str,
+    outcome: &str,
+) {
+    let refused = format!("[scheduler] task {name:?}: refused:");
+    daemon.run_now(name).unwrap_or_else(|error| {
+        panic!(
+            "RunNow {name} (refused) failed: {}",
+            common::redact_credentials_for_output(&error.to_string())
+        )
+    });
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(90)), || {
+            log(daemon)
+                .lines()
+                .any(|line| line.starts_with(&refused) && line.contains("never approved"))
+        }),
+        "schedule {name}'s first fire must be refused on its never-approved clone; log:\n{}",
+        log(daemon)
+    );
+    daemon.approve_project_trust(
+        &dot_agent_deck::issue_dispatch::derive_issue_paths(workspace, name, ISSUE).clone_dir,
+    );
+    let skipped_line = format!("[scheduler] skipped fire of {name:?}");
+    let skipped = || log(daemon).matches(&skipped_line).count();
+    assert!(
+        common::wait_until(common::load_scaled(Duration::from_secs(30)), || {
+            let before = skipped();
+            let reply = daemon.run_now(name).unwrap_or_else(|error| {
+                panic!(
+                    "RunNow {name} (approved) failed: {}",
+                    common::redact_credentials_for_output(&error.to_string())
+                )
+            });
+            assert!(
+                reply.ok,
+                "RunNow {name} rejected: {}",
+                common::redact_credentials_for_output(&format!("{:?}", reply.error))
+            );
+            // A skipped fire prints its skip promptly; one that started does not.
+            !common::wait_until(Duration::from_secs(2), || skipped() > before)
+        }),
+        "the approved fire of {name} must start once the refused run has finished; log:\n{}",
+        log(daemon)
+    );
+    assert!(
+        daemon.wait_for_stderr_contains(outcome, common::load_scaled(Duration::from_secs(90))),
+        "schedule {name} must report {outcome:?}; daemon log:\n{}",
+        log(daemon)
+    );
+}
+
 fn fire_and_wait(daemon: &common::DaemonProc, name: &str, outcome: &str) {
     let reply = daemon.run_now(name).unwrap_or_else(|error| {
         panic!(
@@ -238,7 +297,7 @@ fn fire_and_wait(daemon: &common::DaemonProc, name: &str, outcome: &str) {
     );
 }
 
-/// Scenario: Fire deck A against permanent live GitHub issue #2, then fire isolated deck B with a different schedule and claim gating enabled.
+/// Scenario: Fire deck A against permanent live GitHub issue #2, then fire isolated deck B with a different schedule and claim gating enabled, approving each deck's clone after its first fire is refused as never approved.
 /// A dispatches a local stand-in and writes its claim; B reports A as the claimant without spawning or writing a B record, and A's next fire skips its existing worktree.
 /// Check the fixture's cron at each minute boundary so scheduled ticks cannot race the manual fires during a daemon's bounded lifetime.
 #[spec("scheduler/dispatch/041")]
@@ -295,7 +354,7 @@ fn dispatch_041_two_decks_gate_on_live_github_claim() {
     let path = stand_in_path(scratch.path());
     let (a, workspace_a, starts_a) = spawn_deck(scratch.path(), SCHEDULE_A, &path, &token);
 
-    fire_and_wait(&a, SCHEDULE_A, "dispatched issue #2");
+    fire_refused_then_approve(&a, &workspace_a, SCHEDULE_A, "dispatched issue #2");
     let agents_a = a.agent_records();
     assert!(
         !agents_a.is_empty(),
@@ -340,7 +399,7 @@ fn dispatch_041_two_decks_gate_on_live_github_claim() {
     assert_ne!(a.home, b.home);
     assert_ne!(a.attach_socket, b.attach_socket);
     assert_ne!(a.hook_socket, b.hook_socket);
-    fire_and_wait(&b, SCHEDULE_B, "claimed by");
+    fire_refused_then_approve(&b, &workspace_b, SCHEDULE_B, "claimed by");
     let b_log = log(&b);
     let claimant = format!(
         "claimed by schedule {:?} on machine {} (GitHub account {})",

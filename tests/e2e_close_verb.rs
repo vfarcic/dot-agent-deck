@@ -97,6 +97,8 @@ os.execvp("cat", ["cat"])
             ),
         )
         .expect("write two-role stand-in orchestration");
+        // PRD #1885: the team this test dispatches is approved, as the user's is.
+        deck.approve_project_trust(deck.workdir());
         common::commit_fixture_repo(deck.workdir());
         Self {
             deck,

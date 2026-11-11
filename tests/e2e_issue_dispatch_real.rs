@@ -169,7 +169,7 @@ fn remote_branch_exists(branch: &str) -> Option<bool> {
     }
 }
 
-/// Scenario: Launch an attached deck with a schedule targeting permanent live GitHub issue #1, then fire it via RunNow to clone the fixture and spawn its interactive Haiku orchestration.
+/// Scenario: Launch an attached deck with a schedule targeting permanent live GitHub issue #1 and fire it via RunNow; the first fire clones the fixture and is refused on the never-approved clone, as `schedule list` shows, so approve the clone with `trust approve` and fire again to spawn its interactive Haiku orchestration.
 /// After the agents register as `orchestrator` and `worker`, require an `issue-work` orchestration tab to appear in the attached TUI without reconnecting.
 /// Switch to that tab to best-effort observe the worker listing the sentinel file, then best-effort probe that no `agent/issue-1` branch was pushed.
 #[spec("scheduler/dispatch/013")]
@@ -242,6 +242,40 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
 
     // Fire the dispatch into the SAME daemon this TUI is attached to.
     run_now(&deck, SCHEDULE_NAME);
+
+    // PRD #1885: an issue dispatch's project is its clone, which does not exist
+    // before this first fire, so the fire clones and is refused as never
+    // approved, and `schedule list` says so. Approve the clone that fire made, as
+    // the user would, and fire again — re-firing while the refused run is still
+    // finishing, since a fire then is skipped and leaves the refusal recorded.
+    let schedule_list = || {
+        let out = deck.run_deck_cli(deck.workdir(), &["schedule", "list"]);
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(120), || schedule_list()
+            .contains("never approved")),
+        "the first fire must be refused on its never-approved clone; `schedule list`:\n{}",
+        schedule_list()
+    );
+    deck.approve_project_trust(
+        &dot_agent_deck::issue_dispatch::derive_issue_paths(&workspace_abs, SCHEDULE_NAME, 1)
+            .clone_dir,
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(60), || {
+            run_now(&deck, SCHEDULE_NAME);
+            common::wait_until(Duration::from_secs(3), || {
+                !schedule_list().contains("never approved")
+            })
+        }),
+        "the fire after approving the clone must start; `schedule list`:\n{}",
+        schedule_list()
+    );
 
     // Precondition (daemon side): the dispatch flow really enumerated, cloned
     // from GitHub, created the worktree, and spawned BOTH of the orchestration's
