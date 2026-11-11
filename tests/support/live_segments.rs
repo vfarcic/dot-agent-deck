@@ -150,6 +150,15 @@ pub enum Hosted {
     /// The same script under another interpreter: a copy of the same
     /// `python3` at another inode.
     OtherInterpreter,
+    /// The genuine script, started by name through a launcher shaped like
+    /// `devbox run codex-big` (issue #2258): the launcher prints its own
+    /// line, puts a directory holding another `python3` (a copy at another
+    /// inode) first on `PATH`, as devbox puts its own `node` there, and runs
+    /// a generated script through `sh -c` that runs a version check
+    /// (`codex --version`) and then `codex` by name with `codex-big`'s own
+    /// `-c` options, none of which sets a key binding. `env python3` then
+    /// finds that other interpreter on the `PATH` the launcher handed it.
+    LauncherPath,
 }
 
 impl Hosted {
@@ -158,6 +167,7 @@ impl Hosted {
             Self::Genuine => "genuine",
             Self::OtherScript => "other-script",
             Self::OtherInterpreter => "other-interpreter",
+            Self::LauncherPath => "launcher-path",
         }
     }
 }
@@ -541,6 +551,37 @@ impl Fixture {
             let copy = package.join("other").join("python3");
             fs::copy(&python, &copy).unwrap();
             fs::set_permissions(&copy, fs::Permissions::from_mode(0o755)).unwrap();
+            if hosted == Some(Hosted::LauncherPath) {
+                // `devbox run codex-big`'s shape: `devbox` prints its line,
+                // puts its own profile first on `PATH` and runs the
+                // generated script through `sh -c`; the script runs this
+                // repo's version check, then `codex` by name. The profile is
+                // `other/`, whose `python3` is another inode than the one the
+                // spawn `PATH` resolves.
+                let launcher = package.join("launcher");
+                fs::create_dir_all(&launcher).unwrap();
+                let check = launcher.join("require-codex-version.sh");
+                executable(
+                    &check,
+                    "#!/bin/sh\ninstalled=$(codex --version 2>/dev/null | awk '{print $NF}') || true\n[ -n \"$installed\" ] || { echo 'Codex is not installed' >&2; exit 1; }\n",
+                );
+                let generated = launcher.join("codex-big.sh");
+                executable(
+                    &generated,
+                    &format!(
+                        "set -e\n{}\ncodex --live-segments-fixture -c model_reasoning_effort=high -c check_for_update_on_startup=false\n",
+                        quote(&check)
+                    ),
+                );
+                executable(
+                    &launcher.join("devbox"),
+                    &format!(
+                        "#!/bin/sh\nprintf 'Info: Running script \"codex-big\" on %s\\r\\n' \"$PWD\"\nPATH={}:\"$PATH\"\nexport PATH\nexec /bin/sh -c {}\n",
+                        quote(&package.join("other")),
+                        quote(Path::new(&quote(&generated)))
+                    ),
+                );
+            }
         }
         let mut f = Self {
             daemon,
@@ -604,7 +645,20 @@ impl Fixture {
             }
             env.push(json!(["CODEX_HOOK_LIST_RESPONSE", pane.hook_list]));
         }
-        let command = if self.hosted.is_some() {
+        let command = if self.hosted == Some(Hosted::LauncherPath) {
+            format!(
+                "{} run codex-big",
+                quote(
+                    &self
+                        .exe
+                        .parent()
+                        .unwrap()
+                        .join("npm")
+                        .join("launcher")
+                        .join("devbox")
+                )
+            )
+        } else if self.hosted.is_some() {
             format!("{} --live-segments-fixture", self.kind)
         } else if self.launcher.is_some() {
             format!(
