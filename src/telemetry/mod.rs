@@ -72,6 +72,7 @@ pub mod propagation;
 pub mod resource;
 pub mod run_context;
 pub mod shim;
+pub mod skill;
 pub mod span;
 pub mod tracker;
 
@@ -456,6 +457,8 @@ pub const SPAN_NAMES: [&str; 7] = [
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
 pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
+/// Issue #2087: the agent loaded a skill ([`skill`]).
+pub const EVENT_SKILL: &str = "deck.skill";
 pub use accounting::EVENT_MODEL_USAGE;
 
 /// The span events the deck emits on `agent.handoff`: the worker took the
@@ -507,6 +510,10 @@ pub enum AttrKey {
     /// Issue #1981: why the deck ended an `agent.operation` itself.
     OperationEnd,
     OperationsCount,
+    /// Issue #2087: a defined skill's name, on a `deck.skill` event.
+    SkillName,
+    /// Issue #2087: how many skills the run loaded.
+    SkillsCount,
     CiFrom,
     CiTo,
     CiResult,
@@ -589,6 +596,8 @@ impl AttrKey {
         AttrKey::OperationWrappedWord,
         AttrKey::OperationEnd,
         AttrKey::OperationsCount,
+        AttrKey::SkillName,
+        AttrKey::SkillsCount,
         AttrKey::CiFrom,
         AttrKey::CiTo,
         AttrKey::CiResult,
@@ -658,6 +667,8 @@ impl AttrKey {
             AttrKey::OperationWrappedWord => "deck.operation.wrapped.word",
             AttrKey::OperationEnd => "deck.operation.end",
             AttrKey::OperationsCount => "deck.operations.count",
+            AttrKey::SkillName => "deck.skill.name",
+            AttrKey::SkillsCount => "deck.skills.count",
             AttrKey::CiFrom => "deck.ci.from",
             AttrKey::CiTo => "deck.ci.to",
             AttrKey::CiResult => "deck.ci.result",

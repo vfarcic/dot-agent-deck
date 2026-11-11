@@ -14974,6 +14974,14 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** a real agent's failed turn (the hook mapping is `status/blocked/011`, `/022`, `/023`, `/026`); the default 30-second debounce; a worker that starts working again inside the debounce (the episode's cancellation is the waiting notice's, `scheduler/idle-worker/021`); a report sent after the handoff ended.
 - **Platform coverage:** mac+linux.
 
+##### telemetry/otlp/048 — A skill call names the skill on the run only when a skill directory defines it (issue #2087).
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_skill.rs`); the real `hook --agent claude-code` CLI and a local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in receives synthetic Claude Code `Skill` `PreToolUse` hooks.
+- **Asserts:** with a skill defined at `<project>/.claude/skills/<name>/SKILL.md`, three `Skill` calls (that skill with free-text `args`, a name no directory holds, and a path-shaped name) export three `deck.skill` events on the run, only the first with `deck.skill.name`, and `deck.skills.count` of 3; no request body holds the arguments, the undefined name or the path. Before the fix the run had no `deck.skill` event.
+- **Does not assert:** a real agent calling its `Skill` tool; OpenCode's `skill` tool and user-level skill directories (unit tests in `src/telemetry/skill.rs` and `src/hook.rs`).
+- **Platform coverage:** mac+linux.
+
 ##### telemetry/otlp/041 — Periodic daemon health exports memory, open runs, hook latency summaries and span drops.
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_daemon_health.rs`); local OTLP/JSON receiver and shortened health interval.

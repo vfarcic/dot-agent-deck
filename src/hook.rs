@@ -1810,6 +1810,23 @@ fn build_event_typed_with_version(
         metadata.insert("bash_command".to_string(), cmd.to_string());
     }
 
+    // Issue #2087: the skill a skill-tool call loads, only when a skill
+    // directory defines it (`crate::telemetry::skill`).
+    if matches!(event_type, EventType::ToolStart)
+        && let Some(name) = crate::telemetry::skill::called_skill(
+            &agent_type,
+            tool_name.as_deref(),
+            tool_input.as_ref(),
+            cwd.as_deref(),
+            &crate::telemetry::skill::user_skill_roots(),
+        )
+    {
+        metadata.insert(
+            crate::telemetry::skill::SKILL_NAME_METADATA_KEY.to_string(),
+            name,
+        );
+    }
+
     // Issue #714: a Claude Code turn that an API error ended. Every `error`
     // kind maps to something — `StopFailure` replaces `Stop`, so an unmapped
     // kind would leave the card `Thinking` — and only a quota or credit refusal
@@ -2220,6 +2237,22 @@ pub(crate) fn build_opencode_event_with_question(
         && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
     {
         metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
+    // Issue #2087: as for Claude Code, OpenCode's `skill` tool.
+    if matches!(event_type, EventType::ToolStart)
+        && let Some(name) = crate::telemetry::skill::called_skill(
+            &AgentType::OpenCode,
+            input.tool_name.as_deref(),
+            input.tool_input.as_ref(),
+            input.cwd.as_deref(),
+            &crate::telemetry::skill::user_skill_roots(),
+        )
+    {
+        metadata.insert(
+            crate::telemetry::skill::SKILL_NAME_METADATA_KEY.to_string(),
+            name,
+        );
     }
 
     // OpenCode publishes the user interrupting a turn as a `session.error`
@@ -5715,6 +5748,78 @@ mod tests {
             event.metadata.get("bash_command").map(String::as_str),
             Some(full_cmd),
         );
+    }
+
+    /// Issue #2087: a Claude Code `Skill` call and an OpenCode `skill` call
+    /// name a skill their project defines, and only that: not the tool's
+    /// arguments, not an undefined name, not on a call's end, not for another
+    /// agent's tool of the same name.
+    #[test]
+    fn a_skill_call_names_only_a_defined_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir
+            .path()
+            .join(".claude/skills")
+            .join("dad-hook-skill-2087");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "x").unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let key = crate::telemetry::skill::SKILL_NAME_METADATA_KEY;
+        let claude = |event: &str, agent: AgentType, name: &str| {
+            build_event_typed(
+                ClaudeCodeHookInput {
+                    session_id: "s1".into(),
+                    hook_event_name: event.into(),
+                    cwd: Some(cwd.clone()),
+                    tool_name: Some("Skill".into()),
+                    tool_input: Some(serde_json::json!({"skill": name, "args": "PRIVATE"})),
+                    ..Default::default()
+                },
+                agent,
+            )
+            .unwrap()
+            .metadata
+            .get(key)
+            .cloned()
+        };
+        assert_eq!(
+            claude("PreToolUse", AgentType::ClaudeCode, "dad-hook-skill-2087").as_deref(),
+            Some("dad-hook-skill-2087")
+        );
+        assert_eq!(
+            claude(
+                "PreToolUse",
+                AgentType::ClaudeCode,
+                "dad-hook-undefined-2087"
+            ),
+            None
+        );
+        assert_eq!(claude("PreToolUse", AgentType::ClaudeCode, "../x"), None);
+        assert_eq!(
+            claude("PostToolUse", AgentType::ClaudeCode, "dad-hook-skill-2087"),
+            None
+        );
+        assert_eq!(
+            claude("PreToolUse", AgentType::Codex, "dad-hook-skill-2087"),
+            None
+        );
+
+        let opencode = |tool: &str| {
+            build_opencode_event(OpenCodeHookInput {
+                session_id: "oc-1".into(),
+                event: "tool.execute.before".into(),
+                tool_name: Some(tool.into()),
+                tool_input: Some(serde_json::json!({"name": "dad-hook-skill-2087"})),
+                cwd: Some(cwd.clone()),
+                ..Default::default()
+            })
+            .unwrap()
+            .metadata
+            .get(key)
+            .cloned()
+        };
+        assert_eq!(opencode("skill").as_deref(), Some("dad-hook-skill-2087"));
+        assert_eq!(opencode("read"), None);
     }
 
     fn claude_payload(event: &str) -> ClaudeCodeHookInput {
