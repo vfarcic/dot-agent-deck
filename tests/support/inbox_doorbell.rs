@@ -121,9 +121,19 @@ pub fn wait_budget() -> Duration {
     })
 }
 
+/// Refresh a socket's timeout. macOS refuses `SO_RCVTIMEO`/`SO_SNDTIMEO` with
+/// EINVAL once the peer has closed the connection, while what it sent is still
+/// buffered to read; the read or write that follows reports the end itself.
+fn refresh_timeout(set: std::io::Result<()>) -> std::io::Result<()> {
+    match set {
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    }
+}
+
 fn read_exact_budgeted(socket: &mut UnixStream, mut bytes: &mut [u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        socket.set_read_timeout(Some(wait_budget()))?;
+        refresh_timeout(socket.set_read_timeout(Some(wait_budget())))?;
         let read = socket.read(bytes)?;
         if read == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
@@ -135,7 +145,7 @@ fn read_exact_budgeted(socket: &mut UnixStream, mut bytes: &mut [u8]) -> std::io
 
 fn write_all_budgeted(socket: &mut UnixStream, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        socket.set_write_timeout(Some(wait_budget()))?;
+        refresh_timeout(socket.set_write_timeout(Some(wait_budget())))?;
         let written = socket.write(bytes)?;
         if written == 0 {
             return Err(std::io::ErrorKind::WriteZero.into());
@@ -779,10 +789,16 @@ fn report_handed(
 /// End a one-shot receiver: closing our half ends it, and the deck closes its
 /// own once it has applied every control written before.
 pub fn close(mut socket: BufReader<UnixStream>) {
-    socket
-        .get_mut()
-        .shutdown(std::net::Shutdown::Write)
-        .unwrap();
+    // A deck with nothing to hand closes its half first; macOS then refuses
+    // the shutdown with ENOTCONN where Linux accepts it, and either way the
+    // connection is over.
+    if let Err(error) = socket.get_mut().shutdown(std::net::Shutdown::Write) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotConnected,
+            "closing a one-shot receiver: {error}"
+        );
+    }
     let mut rest = String::new();
     let _ = socket.read_to_string(&mut rest);
 }

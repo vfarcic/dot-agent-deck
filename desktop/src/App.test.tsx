@@ -1673,15 +1673,16 @@ describe("ControlDeck", () => {
   });
 
   /**
-   * Scenario: the app is talking to a daemon on another machine. Stop, Start and
-   * Replace are gone, and the banner says why.
+   * Scenario: the app is talking to a daemon on another machine. Start and
+   * Replace are gone and the banner says why Replace is; Stop is disabled while
+   * that daemon is not answering. Connected, the same deck's Stop is enabled and
+   * names it (issue #1073), and a daemon too old to be stopped from the app
+   * leaves Stop disabled with that reason.
    *
-   * PRD #741 M7. This is rendering a refusal that already exists:
-   * `Endpoint::require_local` makes the operation unreachable by type, and the
-   * sentence is its own. Over a forwarded socket the consequence of NOT gating
-   * is not a no-op — `run_daemon_stop` resolves its target from the socket's
-   * peer credentials, which name the local `ssh` client, so Stop would tear the
-   * tunnel down and report that a daemon had stopped gracefully.
+   * PRD #741 M7. The Replace refusal already exists: `Endpoint::require_local`
+   * makes the operation unreachable by type, and the sentence is its own. Stop
+   * on a remote deck goes over the wire verb instead of the pid stop, whose
+   * peer-credential lookup would name the local `ssh` client.
    */
   it("disables the daemon lifecycle controls for a remote deck and says why", () => {
     const remote = createFixtureSnapshot("disconnected");
@@ -1689,22 +1690,32 @@ describe("ControlDeck", () => {
     remote.connection = {
       ...remote.connection,
       status: "disconnected",
+      deckId: "deck-00000000000b0x01",
       deckKind: "remote",
       daemonDetected: true,
       runningAgentCount: 0,
       localOnlyReason:
-        "Stop daemon is not available for the remote deck deploy@build-box: it acts on a process on this machine, which is not the machine that daemon runs on",
+        "Replace daemon is not available for the remote daemon deploy@build-box: it acts on a process on this machine, which is not the machine that daemon runs on",
     };
-    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: remote })} />);
+    const view = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: remote })} />);
 
     expect(screen.queryByTestId("start-daemon")).not.toBeInTheDocument();
     expect(screen.queryByTestId("replace-daemon")).not.toBeInTheDocument();
     expect(screen.getByTestId("stop-run")).toBeDisabled();
-    expect(screen.getByTestId("stop-run")).toHaveAttribute(
-      "title",
-      expect.stringContaining("not the machine that daemon runs on"),
-    );
+    expect(screen.getByTestId("stop-run")).toHaveAttribute("title", "Daemon is not connected");
     expect(screen.getByTestId("remote-deck-notice")).toHaveTextContent("acts on a process on this machine");
+    view.unmount();
+
+    const answering = { ...remote, connection: { ...remote.connection, status: "connected" as const, socketPath: "deploy@build-box" } };
+    const second = render(<ControlDeck runtime={runtime({ mode: "live", snapshot: answering })} />);
+    expect(screen.getByTestId("stop-run")).toBeEnabled();
+    expect(screen.getByTestId("stop-run")).toHaveAttribute("title", "Stop the daemon on deploy@build-box");
+    second.unmount();
+
+    const tooOld = "This daemon is too old to be stopped from this app.";
+    render(<ControlDeck runtime={runtime({ mode: "live", snapshot: { ...answering, connection: { ...answering.connection, stopDaemonReason: tooOld } } })} />);
+    expect(screen.getByTestId("stop-run")).toBeDisabled();
+    expect(screen.getByTestId("stop-run")).toHaveAttribute("title", tooOld);
   });
 
   /// Scenario: Confirm starting a disconnected local daemon on this machine, without a second reconnect action.
@@ -1743,8 +1754,8 @@ describe("ControlDeck", () => {
     expect(live.runAction).not.toHaveBeenCalled();
     fireEvent.click(screen.getAllByRole("button", { name: "Stop daemon" }).at(-1)!);
 
-    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "stop_daemon" }));
-    expect(screen.getByText("Local daemon stopped.")).toBeVisible();
+    await waitFor(() => expect(live.runAction).toHaveBeenCalledWith({ type: "stop_daemon", deckId: connectedNoAgents.connection.deckId }));
+    expect(screen.getByText("Daemon stopped.")).toBeVisible();
   });
 
   /** Scenario: Replaces an incompatible zero-agent daemon through an explicit confirmation, on the shared upgrade path. */
@@ -1838,7 +1849,7 @@ describe("ControlDeck", () => {
       deckId: "deck-remote",
       socketPath: "dev@build-box",
       deckKind: "remote",
-      localOnlyReason: "Stop daemon acts on a process on this machine.",
+      localOnlyReason: "Replace daemon acts on a process on this machine.",
       message: "This daemon is older than this app.",
       daemonDetected: true,
       runningAgentCount: 0,
@@ -2104,6 +2115,7 @@ describe("ControlDeck", () => {
     incompatible.agents = [];
     incompatible.connection = {
       status: "error",
+      deckId: "deck-000000000000dec1",
       message: "build mismatch",
       daemonDetected: true,
       runningAgentCount: 2,

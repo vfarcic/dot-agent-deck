@@ -94,8 +94,10 @@ export interface DesktopSnapshotDto {
     deckId: string;
     /** `"local"` or `"remote"` — PRD #741 M7. Always present. */
     deckKind: string;
-    /** Why Stop and Replace are unavailable; present exactly for a remote deck. */
+    /** Why Replace is unavailable; present exactly for a remote deck. */
     localOnlyReason?: string;
+    /** Why Stop daemon cannot act on this deck while it answers (issue #1073). */
+    stopDaemonReason?: string;
     /** Why the app is on the local deck when the stored selection named another. */
     selectionFallback?: string;
     /**
@@ -1838,7 +1840,7 @@ export type DesktopRunActionDto =
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
   | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
-  | { type: "stop_daemon"; force?: boolean }
+  | { type: "stop_daemon"; deckId: string; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
 
 /**
@@ -1868,6 +1870,10 @@ type Unsubscribe = () => void;
 
 interface PendingTerminalAttachment {
   lifecycle: number;
+  /** The deck the attach is for, so a teardown of that deck alone can cancel it (issue #1073). */
+  deckId: string;
+  /** Set when that teardown cancelled this attempt: its late failure is not the pane's error to show. */
+  cancelled?: boolean;
   channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>;
   output: Uint8Array[];
   stateEvents: DesktopTerminalStateDto[];
@@ -3018,6 +3024,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       daemonBuildVersion: dto.connection.daemonBuildVersion,
       deckKind: dto.connection.deckKind === "remote" ? "remote" : "local",
       localOnlyReason: dto.connection.localOnlyReason,
+      ...(dto.connection.stopDaemonReason === undefined ? {} : { stopDaemonReason: dto.connection.stopDaemonReason }),
       selectionFallback: dto.connection.selectionFallback,
       projectActionsReason: dto.connection.projectActionsReason,
       newAgentReason: dto.connection.newAgentReason,
@@ -4543,6 +4550,7 @@ export class TauriDeckBridge implements DeckBridge {
       const onOutput = new Channel<ArrayBuffer>();
       const attempt: PendingTerminalAttachment = {
         lifecycle,
+        deckId: target.deckId,
         channel: onOutput,
         output: [],
         stateEvents: [],
@@ -4663,13 +4671,18 @@ export class TauriDeckBridge implements DeckBridge {
           if (this.pendingAttachments.get(key) === attempt) this.pendingAttachments.delete(key);
           this.attached.delete(key);
           if (this.terminalChannels.get(key) === onOutput) this.terminalChannels.delete(key);
-          this.deliverTerminal(target, {
-            agentId: target.agentId,
-            data: new Uint8Array(),
-            stream: "error",
-            operation: "append",
-            message: terminalAttachFailure(cause),
-          });
+          // An attempt its deck's stop or replacement cancelled fails because
+          // that daemon is going away; the next declaration attaches afresh, so
+          // this failure is not the pane's to show (issue #1073).
+          if (!attempt.cancelled) {
+            this.deliverTerminal(target, {
+              agentId: target.agentId,
+              data: new Uint8Array(),
+              stream: "error",
+              operation: "append",
+              message: terminalAttachFailure(cause),
+            });
+          }
         }
         throw cause;
       } finally {
@@ -5205,16 +5218,13 @@ export class TauriDeckBridge implements DeckBridge {
       } catch (cause) {
         throw actionErrorFrom(cause);
       }
-      if (action.type === "stop_daemon") {
-        this.sessions.clear();
-        this.sessionKeys.clear();
-        this.attached.clear();
-        this.terminalChannels.clear();
-        // Nothing is attached any more, so nothing is warm. `shown` is left
-        // alone on purpose: it mirrors what the UI is displaying, which a
-        // daemon stop does not change, and re-declaring it re-attaches.
-        this.warm.clear();
-        this.lifecycle += 1;
+      if (action.type === "stop_daemon" && result?.ok !== false) {
+        // Issue #1073: the stopped deck's sessions only — the crate detached
+        // exactly those, and every other deck's terminals belong to daemons
+        // this stop never touched. `shown` is left alone on purpose: it mirrors
+        // what the UI is displaying, which a daemon stop does not change, and
+        // re-declaring it re-attaches.
+        this.forgetDeckSessions(action.deckId);
       }
       // The crate already returned `agentId` for every agent-scoped action and
       // this dropped it, which left a started agent's id — the one thing the
@@ -5789,12 +5799,30 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   /**
-   * Forget every terminal session on `deckId` after its daemon was replaced —
-   * the crate already detached them. Other decks' sessions are untouched, and
-   * `shown` is kept for the reason `stop_daemon` keeps it: re-declaring it
-   * re-attaches against the new daemon.
+   * Forget every terminal session on `deckId` after its daemon was replaced or
+   * stopped — the crate already detached them. Other decks' sessions are
+   * untouched, and `shown` is kept on purpose: re-declaring it re-attaches
+   * against whatever daemon answers next.
+   *
+   * An attach still in flight on that deck is cancelled too (issue #1073,
+   * Qodo on PR #2259): dropping its pending entry and channel is what makes
+   * the post-await guard in the attach detach its late result instead of
+   * installing a session for a daemon that is gone. A replay queued behind
+   * such an attach (`attachRequested`, which a warm-set eviction can leave
+   * while the invocation is still outstanding) was declared against the same
+   * daemon and is dropped with it; a later declaration attaches afresh.
    */
   private forgetDeckSessions(deckId: string): void {
+    for (const [key, requested] of Array.from(this.attachRequested.entries())) {
+      if (requested.deckId === deckId) this.attachRequested.delete(key);
+    }
+    for (const [key, pending] of Array.from(this.pendingAttachments.entries())) {
+      if (pending.deckId !== deckId) continue;
+      pending.cancelled = true;
+      this.pendingAttachments.delete(key);
+      this.attached.delete(key);
+      if (this.terminalChannels.get(key) === pending.channel) this.terminalChannels.delete(key);
+    }
     for (const [key, session] of Array.from(this.sessions.entries())) {
       if (session.target.deckId !== deckId) continue;
       this.sessions.delete(key);
