@@ -395,6 +395,20 @@ pub fn observe_delegate_posted(telemetry: Option<Arc<Telemetry>>, posted: &Deleg
     }
 }
 
+/// Issue #2099: the deck told an orchestrator that the worker owing `tasks`
+/// (delegated tasks' inbox message ids) stopped, as `stopped` says, which ends
+/// those tasks' `agent.handoff` spans ([`handoff`]). Nothing happens when
+/// telemetry is off.
+pub fn observe_worker_stopped(
+    telemetry: Option<Arc<Telemetry>>,
+    tasks: &[String],
+    stopped: handoff::Stopped,
+) {
+    if let Some(telemetry) = telemetry {
+        telemetry.observe_worker_stopped(tasks, stopped);
+    }
+}
+
 /// Issue #1981 M8: the daemon streamed a pane to a client, `took` from taking
 /// the request to having written the pane's screen to it, which goes into
 /// the next `daemon.health` span ([`health`]). Nothing happens when

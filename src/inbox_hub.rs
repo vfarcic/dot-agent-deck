@@ -1620,6 +1620,19 @@ impl InboxHub {
             .unwrap_or_default()
     }
 
+    /// Issue #2099: the delegated tasks generation `(pane_id, agent_id)` still
+    /// owes a report for, by id — not one a report is being saved for; empty
+    /// when the report state is torn.
+    pub fn tasks_awaiting_report(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+        self.lock()
+            .guarded_read(|reports| {
+                reports
+                    .tasks
+                    .awaiting_report_of_generation(pane_id, agent_id)
+            })
+            .unwrap_or_default()
+    }
+
     /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
     /// acknowledged, as superseded — a newer delegation, or the pane's agent
     /// restarting, has made it moot. Superseded tasks are not reported. A
@@ -5405,14 +5418,16 @@ fn kind_sender_label(kind: &str, from: &Sender, trust: BodyTrust) -> String {
 /// message was replaced, and a shut inbox is the daemon going away; neither is
 /// the agent's to explain.
 fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
-    use crate::inbox_display::{NOTICE_AGENT_EXITED, NOTICE_MAX_DELIVER};
+    use crate::inbox_display::{NOTICE_MAX_DELIVER, PaneTermination};
     if st.card_notice_sink.is_none() || event.state != StateName::Undeliverable {
         return;
     }
     let detail = match event.undeliverable_reason {
-        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER,
+        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER.into(),
         Some(UndeliverableReason::AgentExited) => event_termination(st, event)
-            .map_or(NOTICE_AGENT_EXITED, |termination| termination.card_notice()),
+            .unwrap_or(&PaneTermination::Unknown)
+            .card_notice()
+            .into(),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5678,7 +5693,7 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         agent_id,
         delivery_id: event.message_id.to_string(),
         session_id: None,
-        detail: crate::inbox_display::NOTICE_DELIVERED_LATE,
+        detail: crate::inbox_display::NOTICE_DELIVERED_LATE.into(),
         cleared: true,
     });
 }

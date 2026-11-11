@@ -15,6 +15,7 @@
  */
 
 import type { AgentSession, AgentTab } from "../types";
+import { DISPLAY_LIMITS, displayIdentity, displayText, displayTitle, rendersBlank } from "./displayText";
 
 /** The title an orchestration's group heading shows: the run's title, else the orchestration's name. */
 export function orchestrationTitle(tab: Pick<Extract<AgentTab, { kind: "orchestration" }>, "displayTitle" | "name">): string {
@@ -33,4 +34,23 @@ export function agentSpokenName(agent: Pick<AgentSession, "displayName" | "tab">
   if (name.length >= maxChars || agent.tab.kind !== "orchestration") return name.slice(0, maxChars).join("");
   const title = Array.from(orchestrationTitle(agent.tab)).slice(0, maxChars - name.length - 1).join("").trimEnd();
   return title === "" ? agent.displayName : `${title} ${agent.displayName}`;
+}
+
+/**
+ * Issue #1798 — what an agent's tile calls it, in its title and in every name
+ * a screen reader hears for the tile and its controls: its name, after its
+ * run's title and ` / ` for an orchestration agent ("prd-1401 / coder"), so a
+ * tile opened full-window still says which run it belongs to. `shown` clamps
+ * each part the way the overview clamps a name, with a visible stand-in for one
+ * that renders blank; `full` is the whole of it, for the tooltip.
+ */
+export function agentTitle(agent: Pick<AgentSession, "id" | "displayName" | "tab">): { shown: string; full: string } {
+  const id = displayText(agent.id, DISPLAY_LIMITS.toolName);
+  const name = displayIdentity(agent.displayName, DISPLAY_LIMITS.name, rendersBlank(id) ? "unnamed agent" : `unnamed agent ${id}`);
+  if (agent.tab.kind !== "orchestration") return { shown: name, full: displayTitle(agent.displayName) };
+  const run = orchestrationTitle(agent.tab);
+  return {
+    shown: `${displayIdentity(run, DISPLAY_LIMITS.name, "unnamed orchestration")} / ${name}`,
+    full: displayTitle(`${run} / ${agent.displayName}`),
+  };
 }

@@ -441,6 +441,142 @@ fn telemetry_otlp_002_exports_run_and_status_intervals() {
     }
 }
 
+/// Scenario: Open a two-role orchestration whose clear=true worker is a Pi stand-in that, like the bundled extension, reports running, a bash tool start and end and finished through the real `agent-event` CLI and never a `SessionStart`; delegate to it to respawn it, then close the replacement. The replacement's exported run must carry thinking, working and idle status intervals beside its one bash operation (issue #2078).
+#[spec("telemetry/otlp/002")]
+#[test]
+fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
+    use dot_agent_deck::agent_pty::TabMembership;
+
+    let receiver = Receiver::start();
+    let deck = TuiDeck::builder()
+        .without_agent_credentials()
+        .impersonating_pane_signals()
+        .with_pty_size(180, 45)
+        .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
+        .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    // A respawn broadcasts no placeholder `SessionStart` for the pane, so the
+    // replacement's run sees nothing but the Pi reports: the configuration
+    // the issue's Pi runs had.
+    let bin = env!("CARGO_BIN_EXE_dot-agent-deck");
+    let command = format!(
+        "/bin/sh -c 'env > pi-respawn.env.tmp; mv pi-respawn.env.tmp pi-respawn.env; \
+         \"{bin}\" agent-event --type running; \
+         \"{bin}\" agent-event --type tool-start --tool-name bash --tool-detail ls; \
+         \"{bin}\" agent-event --type tool-end --tool-name bash; \
+         \"{bin}\" agent-event --type finished; \
+         cp pi-respawn.env pi-reported.env; exec cat'"
+    );
+    std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
+        "[[orchestrations]]\nname = \"telemetry-pi\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
+    )).unwrap();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\x1b[C");
+    deck.send_keys(b"\r");
+    deck.send_keys(b"\r");
+    deck.wait_for_string("coder");
+    let run_id_in = |file: &str| {
+        std::fs::read_to_string(deck.workdir().join(file))
+            .ok()
+            .and_then(|environment| {
+                env_value(&environment, "OTEL_RESOURCE_ATTRIBUTES").and_then(|attributes| {
+                    attributes
+                        .split(',')
+                        .find_map(|pair| pair.strip_prefix("deck.run.id="))
+                        .map(str::to_string)
+                })
+            })
+    };
+    assert!(
+        common::wait_until(Duration::from_secs(15), || run_id_in("pi-reported.env")
+            .is_some()),
+        "the first Pi stand-in never finished reporting"
+    );
+    let first_id = run_id_in("pi-reported.env").unwrap();
+    let record = |role: &str| {
+        common::agent_records_on(deck.attach_socket_path()).into_iter().find(|record| {
+            matches!(&record.tab_membership, Some(TabMembership::Orchestration { role_name, .. }) if role_name == role)
+        })
+    };
+    let first = record("coder").expect("first worker");
+    let orchestrator = record("orchestrator").expect("orchestrator");
+    // Opened before the respawn: nothing is replayed.
+    let events = common::subscribe_events_on(deck.attach_socket_path());
+    let output = std::process::Command::new(bin)
+        .args([
+            "delegate",
+            "--to",
+            "coder",
+            "--task",
+            "respawn the Pi stand-in",
+        ])
+        .env("DOT_AGENT_DECK_SOCKET", deck.hook_socket_path())
+        .env(
+            "DOT_AGENT_DECK_PANE_ID",
+            orchestrator.pane_id_env.as_deref().unwrap(),
+        )
+        .env("HOME", deck.home_dir())
+        .current_dir(deck.workdir())
+        .output()
+        .expect("delegate to the clear=true Pi stand-in");
+    assert!(
+        output.status.success(),
+        "respawn delegate failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        common::wait_until(Duration::from_secs(15), || run_id_in("pi-reported.env")
+            .is_some_and(|id| id != first_id)),
+        "the replacement Pi stand-in never finished reporting"
+    );
+    let second_id = run_id_in("pi-reported.env").unwrap();
+    let replacement = record("coder").expect("replacement worker");
+    // `agent-event` returns once its report is written, not once the daemon
+    // has applied it: close only after the replacement's last report has
+    // been broadcast, which is the stream telemetry reads, in order.
+    events.wait_for(
+        |e| {
+            e.pane_id == first.pane_id_env
+                && e.agent_id.as_deref() == Some(replacement.id.as_str())
+                && e.event_type == dot_agent_deck::event::EventType::Idle
+        },
+        Duration::from_secs(15),
+    );
+    close(&deck, &replacement);
+
+    let pane = replacement.pane_id_env.as_deref().unwrap();
+    assert!(
+        common::wait_until(EXPORT_WAIT, || receiver.spans().iter().any(|span| {
+            span["name"] == "agent.run" && attribute(span, "deck.run.id") == second_id
+        })),
+        "the replacement's run on {pane} was never exported"
+    );
+    let spans = receiver.spans();
+    let of_run = |name: &str| -> Vec<String> {
+        spans
+            .iter()
+            .filter(|span| span["name"] == name && attribute(span, "deck.run.id") == second_id)
+            .map(|span| attribute(span, "deck.status"))
+            .collect()
+    };
+    assert_eq!(
+        of_run("agent.operation").len(),
+        1,
+        "the control: the replacement's bash tool call is one operation"
+    );
+    let statuses = of_run("agent.status");
+    for want in ["thinking", "working", "idle"] {
+        assert!(
+            statuses.iter().any(|s| s == want),
+            "the respawned Pi run exported no {want} status interval: {statuses:?}"
+        );
+    }
+}
+
 /// Scenario: Start a stand-in that records its environment with OTLP configured, then close it. Its propagated run id must equal the exported run's id, the configured endpoint must reach it unchanged, and its `DOT_AGENT_DECK_WORK_ID` must appear as `deck.work.id` both in its resource attributes and on the exported run.
 #[spec("telemetry/otlp/003")]
 #[test]

@@ -214,9 +214,12 @@ Refresh the integration with `dot-agent-deck hooks install` on the machine runni
 
 When the agent's pane ended before it took a message, the line says what the deck saw end it, in both clients, and an orchestrator that had delegated it a task it hadn't taken yet is told the same:
 
-- `the command started in this agent's pane exited`: the command the deck started in the pane, such as `claude` or `devbox run codex-big`, exited; the orchestrator's message gives its exit code. The agent usually ended with it, but an agent that command started in the background can still be running: look at the pane, or for the agent's process, before you start another.
-- `the deck's connection to this agent's pane ended`: the pane's terminal closed while the command the deck started was still running, or before the deck could read how it ended. The agent may still be running, but the deck can no longer reach it: stop it yourself if it is, then restart the agent from the deck.
-- A worker's pane that was closed, or replaced by a new agent started in it, is named that way in the orchestrator's message, and the task stays with the agent that was there: the new agent doesn't get it. When a new agent was being started in the pane but had not started yet, or failed to start, the message only says that the agent's pane ended. Restarting a worker with `dot-agent-deck pane restart` cancels its waiting tasks instead, and the orchestrator that asked for the restart isn't told about them.
+- `the command started in the agent's pane exited (code N)`: the command the deck started in the pane, such as `claude` or `devbox run codex-big`, exited with code N. The agent usually ended with it, but an agent that command started in the background can still be running: look at the pane, or for the agent's process, before you start another.
+- `the deck's connection to the agent's pane ended`: the pane's terminal closed while the command the deck started was still running, or before the deck could read how it ended. The agent may still be running, but the deck can no longer reach it: stop it yourself if it is, then restart the agent from the deck.
+- `the agent's pane was replaced` or `the pane was closed`: the worker's pane was replaced by a new agent started in it, or closed. The message stays with the agent that was there: the new agent doesn't get it.
+- `the agent's pane ended`: a new agent was being started in the pane but had not started yet, or failed to start, so the deck can't say more.
+
+Restarting a worker with `dot-agent-deck pane restart` cancels its waiting tasks instead, and the orchestrator that asked for the restart isn't told about them.
 
 ### A message says delivery uncertain
 
@@ -326,6 +329,7 @@ The deck is holding the agent's messages instead of typing the doorbell line, be
 - **`scanner_budget`:** the pane printed a very large amount of screen-clearing output at a very large size. Make the window smaller and start the agent afresh from the deck.
 - **`release_conflict`:** two different versions appeared on the agent's start-up screen. Start it afresh from the deck.
 - **`input_mode_conflict`:** the pane's agent was restarted inside the same pane by something other than the deck. Restart it from the deck.
+- **No `doorbell off` line for a Codex agent, and its `doorbell hold` line names `CannotType` after `unchecked`:** something was typed into the Codex's input box (your text, a key, or the answer to one of its start-up dialogs), and the deck can't check that Codex's box, so it types nothing more into it until it restarts. That happens to a Codex started through `sh -c`, typed into a shell pane, started through a launcher whose command doesn't name Codex (such as a `devbox run` script) when its role has no `agent = "codex"` line, or running on macOS ([How the deck checks Codex's input box](orchestration.md#how-the-deck-checks-codexs-input-box)). For a launcher such as `devbox run codex-big`, add `agent = "codex"` beside the role's `command` ([Declaring the agent behind a launcher command](orchestration.md#declaring-the-agent-behind-a-launcher-command)) and restart the agent from the deck once it has taken its messages.
 - **`input_mode_unverified`:** the deck can't confirm how the agent's terminal input is set up. One possible cause is that the agent's pane runs an older `dot-agent-deck` than the deck: if you upgraded the deck since the agent started, restart the agent from the deck.
 
 An orchestrator told about the hold keeps the reason it was given when it was told; it isn't told again when the reason changes.
