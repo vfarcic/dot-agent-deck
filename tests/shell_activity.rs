@@ -1218,8 +1218,11 @@ fn status_waiting_025_codex_linux_sandbox_counts_one_command() {
     use std::collections::HashSet;
 
     // Words as measured (the JSON permission profile shortened; it has no
-    // spaces in the measured run either).
-    const OUTER_ARGV: &str = "codex-linux-sandbox --sandbox-policy-cwd /work --command-cwd /work \
+    // spaces in the measured run either): the outer stage's program is the
+    // link Codex runs itself through, the inner's the bare name bubblewrap's
+    // `--argv0` sets.
+    const OUTER_ARGV: &str = "/home/user/.codex/tmp/arg0-linux/codex-arg0jvJDMd/codex-linux-sandbox \
+         --sandbox-policy-cwd /work --command-cwd /work \
          --permission-profile {\"type\":\"managed\",\"network\":\"restricted\"} -- /bin/bash -c \
          sleep 60 && touch done";
     const INNER_ARGV: &str = "codex-linux-sandbox --sandbox-policy-cwd /work --command-cwd /work \
@@ -1365,6 +1368,20 @@ fn status_waiting_025_codex_linux_sandbox_counts_one_command() {
     changed[2].command_line =
         CommandLine::Read("/usr/bin/codex-linux-sandbox-x --sandbox-policy-cwd /w -- a".into());
     assert_eq!(codex(&changed), both, "another program");
+    let mut changed = one_command();
+    changed[2].command_line =
+        CommandLine::Read("/bin/sh -c codex-linux-sandbox --sandbox-policy-cwd /w -- a".into());
+    assert_eq!(codex(&changed), both, "a shell quoting the wrapper");
+    let mut changed = one_command();
+    changed[2].command_line = CommandLine::Read(OUTER_ARGV.replace(
+        "/home/user/.codex/tmp/arg0-linux/codex-arg0jvJDMd/codex-linux-sandbox",
+        "codex-linux-sandbox",
+    ));
+    assert_eq!(
+        codex(&changed),
+        Some(HashSet::from([538581])),
+        "the bare program name, as `codex sandbox` runs it"
+    );
 
     // The outer session is not the wrapper: a user's `setsid` launcher whose
     // child starts a session shaped like the inner wrapper counts both.

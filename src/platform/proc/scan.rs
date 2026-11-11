@@ -415,11 +415,13 @@ pub fn qualifying_command_sessions_with_server(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandWrapper {
     /// Codex's Linux sandbox, as measured on codex-cli 0.164.0 (Linux,
-    /// 2026-11-11: the tree `status/waiting/024` printed, and a re-measure with
+    /// 2026-11-11: the trees `status/waiting/024` printed, and a re-measure with
     /// `codex sandbox -- /bin/bash -c 'sleep 20'`). Codex's exec tool starts
-    /// each command as `codex-linux-sandbox --sandbox-policy-cwd <dir> …
-    /// --permission-profile <json> -- <command>` in a session of its own (its
-    /// pid is that session's id) as a direct child of the agent; its one child
+    /// each command as `<CODEX_HOME>/tmp/arg0-linux/codex-arg0<random>/codex-linux-sandbox
+    /// --sandbox-policy-cwd <dir> … --permission-profile <json> -- <command>`
+    /// (Codex runs itself through that `codex-linux-sandbox` link) in a session
+    /// of its own (its pid is that session's id) as a direct child of the
+    /// agent; its one child
     /// is `bwrap … --new-session … --argv0 codex-linux-sandbox -- …` in the
     /// same session; and bubblewrap's one child is `codex-linux-sandbox …
     /// --apply-seccomp-then-exec -- <command>`, leader of a second session that
@@ -428,9 +430,11 @@ pub enum CommandWrapper {
     CodexLinuxSandbox,
 }
 
-/// Issue #1757: the program word both stages of Codex's Linux sandbox carry
-/// (Codex sets it as argv\[0\], and bubblewrap's `--argv0` sets it on the
-/// inner stage), as measured: the bare name, no path.
+/// Issue #1757: the file name of the program word both stages of Codex's
+/// Linux sandbox carry, as measured: the outer stage's is a path to the link
+/// Codex runs itself through (`<CODEX_HOME>/tmp/arg0-linux/codex-arg0<random>/codex-linux-sandbox`,
+/// `status/waiting/024`; the bare name under `codex sandbox`), and the inner
+/// stage's is the bare name bubblewrap's `--argv0` sets.
 const CODEX_LINUX_SANDBOX_PROGRAM: &str = "codex-linux-sandbox";
 
 /// Issue #1757: the option that marks the inner stage of Codex's Linux
@@ -448,7 +452,7 @@ enum CodexSandboxStage {
 
 /// Issue #1757: read `command_line` (a sampled command line, `ps` joining argv
 /// with spaces) as a stage of Codex's Linux sandbox, by words in fixed
-/// positions, never substrings: the program word exactly
+/// positions, never substrings: the program word's file name exactly
 /// [`CODEX_LINUX_SANDBOX_PROGRAM`], the next word `--sandbox-policy-cwd`, and a
 /// standalone `--` with a command after it. The inner stage is the one whose
 /// last word before that `--` is [`CODEX_APPLY_SECCOMP_THEN_EXEC`]; the outer
@@ -458,7 +462,8 @@ enum CodexSandboxStage {
 /// which leaves its sessions counted (visible) rather than hiding one.
 fn codex_sandbox_stage(command_line: &CommandLine) -> Option<CodexSandboxStage> {
     let words: Vec<&str> = command_line.read()?.split_whitespace().collect();
-    if words.first() != Some(&CODEX_LINUX_SANDBOX_PROGRAM)
+    if words.first().and_then(|program| program.rsplit('/').next())
+        != Some(CODEX_LINUX_SANDBOX_PROGRAM)
         || words.get(1) != Some(&"--sandbox-policy-cwd")
     {
         return None;
