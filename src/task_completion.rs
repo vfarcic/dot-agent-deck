@@ -776,7 +776,11 @@ fn journal_report(
     };
     let about = match mode {
         ClaimMode::Task { task_id } => crate::work_tracking::ReportAbout::Task(task_id),
-        ClaimMode::Terminal { unit_id, .. } => crate::work_tracking::ReportAbout::Unit(unit_id),
+        // Issue #2260: an update is another report about the same unit,
+        // recorded beside the first under its own report id.
+        ClaimMode::Terminal { unit_id, .. } | ClaimMode::TerminalUpdate { unit_id, .. } => {
+            crate::work_tracking::ReportAbout::Unit(unit_id)
+        }
         ClaimMode::Uncorrelated => match producer_agent {
             Some(producer_agent) => crate::work_tracking::ReportAbout::Note {
                 producer_agent,
