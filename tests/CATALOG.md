@@ -7931,7 +7931,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/select/010 — A drag over wide (two-column) glyphs copies exactly what its highlight shows (PRD #385 decision 6).
 - **Layer:** L1 (`PaneSelectionSeam`, `tests/mouse_select.rs`).
 - **Agent:** none.
-- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) drags copy `AB` and `💻A`, and on `🇺🇸AB` they copy `🇸AB` and `AB`, each matching its highlight.
+- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) drags copy `AB` and `💻A`, and on `🇺🇸AB` they copy `🇸AB` and `AB`, each matching its highlight; a drag, forward or backward, that starts on a glyph's second column leaves that glyph out of both the highlight and the copy (`AB`, `AB 漢`, `AB 漢字`, `💻A`), and one that ends on either column of a glyph highlights and copies the whole glyph (`AB 漢`, `💻`).
 - **Does not assert:** double- and triple-click word and paragraph selection over wide glyphs; a glyph cut by the pane's edge.
 - **Platform coverage:** mac+linux+windows.
 

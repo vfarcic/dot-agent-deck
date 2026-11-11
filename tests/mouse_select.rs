@@ -569,6 +569,68 @@ fn select_010_a_drag_over_joined_emoji_and_flags_copies_what_it_highlights() {
     }
 }
 
+/// Scenario: A pane shows `你AB 漢字x` or `👩‍💻AB`, with two-column glyphs among the letters. Drags that start on a glyph's second column, forward and backward, leave that glyph out of both the highlight and the copy, and drags that end on either column of a glyph highlight and copy the whole glyph: what the terminal shows highlighted is exactly what is copied.
+#[spec("mouse/select/010")]
+#[test]
+fn select_010_a_drag_from_or_to_either_half_of_a_wide_glyph_highlights_what_it_copies() {
+    // Columns: 你 0-1, A 2, B 3, space 4, 漢 5-6, 字 7-8, x 9;
+    // and `👩‍` 0-1, `💻` 2-3, A 4, B 5.
+    const CJK: &str = "你AB 漢字x";
+    const ZWJ: &str = "👩\u{200d}💻AB";
+    let cases: [(&str, &str, u16, u16, &str); 9] = [
+        ("forward from a glyph's right half", CJK, 1, 3, "AB"),
+        (
+            "forward from a right half to a right half",
+            CJK,
+            1,
+            6,
+            "AB 漢",
+        ),
+        (
+            "backward from a right half to a right half",
+            CJK,
+            8,
+            1,
+            "AB 漢字",
+        ),
+        ("forward to a glyph's left half", CJK, 2, 5, "AB 漢"),
+        ("backward from a glyph's left half", CJK, 5, 2, "AB 漢"),
+        ("forward from a joined emoji's right half", ZWJ, 1, 4, "💻A"),
+        ("backward to an emoji's right half", ZWJ, 5, 3, "AB"),
+        (
+            "forward from an emoji's right half to the next emoji's left half",
+            ZWJ,
+            1,
+            2,
+            "💻",
+        ),
+        (
+            "backward from an emoji's left half to its right half",
+            ZWJ,
+            2,
+            1,
+            "💻",
+        ),
+    ];
+    for (what, text, from, to, expected) in cases {
+        let mut seam = PaneSelectionSeam::tiled(40, 8, &[("a", text.as_bytes())], "a");
+        seam.render();
+        let (x, y) = first_cell(seam.pane_rect("a"));
+        press(&mut seam, x + from, y);
+        drag(&mut seam, x + to, y);
+        release(&mut seam, x + to, y);
+        let buf = seam.render();
+        let highlight = visible_highlighted_text(&buf);
+        assert_eq!(
+            Some(&highlight),
+            seam.copies().last(),
+            "{what}: the highlight is not the copy\n{}",
+            frame_with_highlight(&buf)
+        );
+        assert_eq!(highlight, expected, "{what}: the highlight");
+    }
+}
+
 /// Two orchestration role panes, `a` focused, drawn by a whole frame of the
 /// orchestration tab.
 fn orchestration_panes() -> PaneSelectionSeam {
