@@ -211,6 +211,26 @@ fn codex_stranded_line_is_bound_to_the_decks_own_line_and_the_edit_cursor() {
             "a lone doorbell row at the bottom of the screen is not the composer: {bare_cursor:?}"
         );
     }
+    // Issue #1730: the line names the deck's absolute path, and Codex wraps a
+    // long line right after a hyphen as well as at a space (live
+    // inbox/codex/009, 2026-11-10), so the two rows join with no space.
+    let path_line = " dot-agent-deck: message m-oj4hazfz-6d18338071ac2788 waiting, run: /var/tmp/dad-e2e-1000/dad-tests-3260328-xsMumn/deck-under-test/dot-agent-deck inbox fetch";
+    let wrapped = rows(
+        &placeholder
+            .replace(
+                "Ask Codex to do anything",
+                " dot-agent-deck: message m-oj4hazfz-6d18338071ac2788 waiting, run: /var/tmp/dad-e2e-1000/dad-tests-3260328-\n  xsMumn/deck-under-test/dot-agent-deck inbox fetch",
+            )
+            .replace("? for shortcuts", ""),
+    );
+    assert!(
+        codex_composer_holds_doorbell_line(&wrapped, cursor_after_composer(&wrapped), path_line),
+        "the deck's line wrapped after a hyphen is its line"
+    );
+    assert!(
+        codex_composer_holds_doorbell_line(&wrapped, cursor_below_composer(&wrapped), path_line),
+        "and with the cursor on the empty row below it"
+    );
 }
 
 /// Codex 0.160.0's last frame in live `load_004` (PRD #1666), transcribed

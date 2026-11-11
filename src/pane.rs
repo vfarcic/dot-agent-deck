@@ -556,6 +556,39 @@ pub trait PaneController: Send + Sync {
     ) -> Result<String, PaneError> {
         Err(PaneError::NotAvailable)
     }
+    /// PRD #1885: the attached daemon's trust state of orchestration
+    /// `orchestration` of the project config in `dir` — whether its commands
+    /// and prompts are approved as they now read, the text to show, and the
+    /// digest an approval carries back. [`GatedQuery::Unsupported`] when the
+    /// daemon does not serve trust requests (an older daemon), which is also
+    /// the default for a controller with no daemon behind it; the caller then
+    /// decides without the daemon (`trust_prompt::decide`), never by assuming
+    /// approval.
+    ///
+    /// [`GatedQuery::Unsupported`]: crate::daemon_client::GatedQuery::Unsupported
+    fn project_trust_state(
+        &self,
+        _dir: &str,
+        _orchestration: &str,
+    ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+    {
+        Ok(crate::daemon_client::GatedQuery::Unsupported)
+    }
+    /// PRD #1885: approve `orchestration` of the project config in `dir` on the
+    /// user's answer to the trust prompt, carrying the `digest` of the text the
+    /// prompt showed. The daemon approves only while the config still hashes to
+    /// it; otherwise the error names
+    /// [`crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED`] and nothing is
+    /// recorded. Answers the new state. The default approves nothing.
+    fn approve_project_trust(
+        &self,
+        _dir: &str,
+        _orchestration: &str,
+        _digest: &str,
+    ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+    {
+        Ok(crate::daemon_client::GatedQuery::Unsupported)
+    }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;
     fn as_any(&self) -> &dyn Any;

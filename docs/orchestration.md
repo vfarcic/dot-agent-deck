@@ -85,6 +85,8 @@ A new tab opens with one pane per role. The role cards are in the left sidebar, 
 3. Under **Mode**, pick the `Orch: team` chip. There is no **Command** field: each role runs its own `command`.
 4. Optionally type a **Name** for the run, then press **Activate orchestration**.
 
+The first time you start an orchestration, and again after its roles' commands, descriptions or prompts change, both clients show **Review project commands** before anything starts: read what each role will run and be told, then press `a` in the TUI or **Approve and start** in the desktop app. Schedules and dispatched units can start it only after you have approved it. See [Approving Project Commands](project-trust.md).
+
 The Dashboard shows an **ORCHESTRATION** group with a numbered row per role and an **ORCHESTRATOR** badge on the orchestrator. Click a row to open that role's terminal. See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
 
 ![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
@@ -414,7 +416,7 @@ The orchestrator can delegate one task to several roles at once (`--to reviewer 
 
 ### Commands
 
-These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane.
+These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane, and are refused, starting nothing, when the orchestration's roles changed in `.dot-agent-deck.toml` since you approved them; the message names the `dot-agent-deck trust approve` command to run from a terminal outside the deck ([Approving Project Commands](project-trust.md#work-that-runs-while-you-are-away)).
 
 | Command | Who runs it | What it does |
 |---|---|---|
@@ -431,13 +433,15 @@ These commands work only from a pane the deck started, which sets `DOT_AGENT_DEC
 
 | Outcome | Exit status | Printed on stderr |
 |---|---|---|
-| Accepted for every named role | 0 | nothing; check the inbox badge for delivery. |
-| Accepted for some roles, not others | 0 | `Warning: …` naming the roles that were missed and why. Re-send only to those roles; repeating the whole command gives the accepted roles the task twice. |
+| Accepted for every named role | 0 | `Delegated …`, naming the pane each role's worker runs in and the task id the deck queued the task under; check the inbox badge, or `dot-agent-deck inbox list --all`, for delivery. |
+| Accepted for some roles, not others | 0 | `Warning: …` naming the roles that were missed and why, followed by the `Delegated …` line for the roles that were accepted. Re-send only to the missed roles; repeating the whole command gives the accepted roles the task twice. |
 | Accepted for no role | non-zero | `Error: delegate from pane … reached no worker for role(s): …`, or `… was NOT sent: every worker it reached still owes a work-done …` |
 | Refused: the caller is not the orchestrator | non-zero | `Error: delegate from pane … failed: pane … is the \`<role>\` role, not this orchestration's orchestrator, so it may not delegate.` |
 | Daemon not reachable | non-zero | `Error: could not reach the dot-agent-deck daemon socket, …` |
 
 A role "reaches no worker" when it is not in the file, when it is the orchestrator itself, when its pane was closed, or when it was renamed or added after the orchestration started.
+
+`delegate` always gives the task to a worker in the orchestrator's own orchestration, even when other orchestrations running on the deck have roles with the same names. The `Delegated …` line is how to check: its pane is the one `dot-agent-deck roles` lists in its PANE column, beside the worker's orchestration, and its task id is the one the worker's report names when it arrives as `<role> completed task <id>`. A deck older than this `dot-agent-deck` names no pane, and the command then prints nothing for a task accepted for every role.
 
 `work-done` answers once the deck has kept the report:
 
@@ -594,8 +598,10 @@ In both clients, replacing an earlier task with a new delegation or restarting t
 Native inbox delivery does not type a task into your input box. When native wake is unavailable, the deck types a one-line doorbell into Claude Code or Codex, only when the agent is idle, its input box is on screen and empty, and nothing has been typed into it since the deck last knew it was empty:
 
 ```text
-(bmrtzx) dot-agent-deck: message m-… waiting, run: dot-agent-deck inbox fetch
+(bmrtzx) dot-agent-deck: message m-… waiting, run: /home/you/.local/bin/dot-agent-deck inbox fetch
 ```
+
+The command names the `dot-agent-deck` the deck daemon runs from, by its full path, so the agent runs that copy even when another, perhaps older, `dot-agent-deck` comes first on the agent's own `PATH`. The commands the deck gives agents elsewhere name it the same way: the `work-done` and `delegate` commands in tasks and in an orchestrator's instructions, and the reply command in a message from an agent outside the team. To have agents use a different copy, start the deck from that copy, restarting its daemon ([Recycling the daemon](troubleshooting.md#recycling-the-daemon)). `DOT_AGENT_DECK_BIN` changes the binary agents' hooks, the OpenCode plugin and the Pi extension run, not the commands the deck writes for the agent ([Environment variables](configuration.md#paths-and-endpoints)).
 
 The six letters in brackets are drawn afresh each time the deck types the line. They let the deck tell its own line from anything else on the screen, so it can check that the line reached the input box intact and that the agent took it. The deck does not type the doorbell into other agents ([Which agents wake for messages](#which-agents-wake-for-messages)).
 
@@ -714,7 +720,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI (the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI and approved as its file now reads ([Approving Project Commands](project-trust.md#an-orchestrators-instructions-after-compaction-or-clear); the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `orchestrator-context.md` | when an orchestration starts | A copy of a recent orchestrator context, kept for compatibility. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |

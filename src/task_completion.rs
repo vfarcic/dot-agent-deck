@@ -590,7 +590,16 @@ async fn supervise(
     let mode = claimed.mode.clone();
     let report_id = ctx.spec.report_id.clone();
     let message_id = claimed.message_id.clone();
-    let recipient_pane = claimed.recipient.as_ref().map(|to| to.pane_id.clone());
+    // Who wrote the report and who it went to: the supervisor's settlement
+    // records a note it commits against these, as the save task would have.
+    let parties = Parties {
+        recipient_pane: claimed.recipient.as_ref().map(|to| to.pane_id.clone()),
+        producer_agent: ctx.worker_agent.clone(),
+        recipient_agent: claimed
+            .recipient
+            .as_ref()
+            .and_then(|to| to.agent_id.clone()),
+    };
     let unit_id = match &claimed.mode {
         ClaimMode::Terminal { unit_id, .. } => Some(unit_id.clone()),
         _ => None,
@@ -623,7 +632,7 @@ async fn supervise(
             &mode,
             &report_id,
             &message_id,
-            recipient_pane.as_deref(),
+            &parties,
             unit_id.as_deref(),
         )
         .await;
@@ -648,6 +657,16 @@ async fn supervise(
     from_supervisor.await.unwrap_or(Completion::Unconfirmed)
 }
 
+/// A report's producer and recipient, captured before the save task takes
+/// its context, for the supervisor's settlement.
+struct Parties {
+    recipient_pane: Option<String>,
+    /// The generation that wrote the report.
+    producer_agent: String,
+    /// The recipient's generation, when the report is bound to one.
+    recipient_agent: Option<String>,
+}
+
 /// The supervisor's settlement of a save task that ended without a result
 /// (D12 rule 11): its answer, and what the settlement owes once that answer
 /// is handed over. A `None` answer answers nothing: the connection reads
@@ -658,9 +677,10 @@ async fn recover(
     mode: &ClaimMode,
     report_id: &str,
     message_id: &str,
-    recipient_pane: Option<&str>,
+    parties: &Parties,
     unit_id: Option<&str>,
 ) -> (Option<Completion>, Option<AfterSection>) {
+    let recipient_pane = parties.recipient_pane.as_deref();
     let file = format!("r-{report_id}.md");
     let phase = match registry.inbox().claim_phase(claim_id) {
         Ok(phase) => phase,
@@ -708,6 +728,13 @@ async fn recover(
                 let _ = registry.inbox().note_claim_marked(claim_id, mark);
             }
             let (outcome, after) = registry.commit_claim(claim_id, unit_id.is_some());
+            journal_report(
+                registry,
+                &outcome,
+                mode,
+                Some(&parties.producer_agent),
+                parties.recipient_agent.as_deref(),
+            );
             (committed(outcome, mode), after)
         }
         Some(ClaimPhase::Applying) => {
@@ -720,6 +747,53 @@ async fn recover(
             (None, None)
         }
     }
+}
+
+/// PRD #1889: a committed report in the work journal, written once the commit
+/// has returned, so with no hub lock held. A task's report is recorded against
+/// the task's work, a unit's against the unit's, and a note against the work of
+/// the generation that wrote it (`producer_agent`, when known).
+fn journal_report(
+    registry: &AgentPtyRegistry,
+    outcome: &CommitOutcome,
+    mode: &ClaimMode,
+    producer_agent: Option<&str>,
+    recipient_agent: Option<&str>,
+) {
+    let CommitOutcome::Committed {
+        destination,
+        report_id,
+        ..
+    } = outcome
+    else {
+        return;
+    };
+    let destination = match destination {
+        crate::report_recovery::Destination::Inbox => crate::work_journal::Destination::Inbox,
+        crate::report_recovery::Destination::Recovery => crate::work_journal::Destination::Recovery,
+        crate::report_recovery::Destination::None
+        | crate::report_recovery::Destination::Unknown => return,
+    };
+    let about = match mode {
+        ClaimMode::Task { task_id } => crate::work_tracking::ReportAbout::Task(task_id),
+        // Issue #2260: an update is another report about the same unit,
+        // recorded beside the first under its own report id.
+        ClaimMode::Terminal { unit_id, .. } | ClaimMode::TerminalUpdate { unit_id, .. } => {
+            crate::work_tracking::ReportAbout::Unit(unit_id)
+        }
+        ClaimMode::Uncorrelated => match producer_agent {
+            Some(producer_agent) => crate::work_tracking::ReportAbout::Note {
+                producer_agent,
+                recipient_agent,
+            },
+            None => return,
+        },
+    };
+    registry.work().reported(&crate::work_tracking::Reported {
+        report_id,
+        about,
+        destination,
+    });
 }
 
 /// The answer a commit gives, or `None` when it is unknown.
@@ -739,6 +813,10 @@ fn committed(outcome: CommitOutcome, mode: &ClaimMode) -> Option<Completion> {
             report_id: Some(report_id),
             destination: Some(destination),
             differs: false,
+            update: match mode {
+                ClaimMode::TerminalUpdate { update, .. } => Some(*update),
+                _ => None,
+            },
             code: None,
             message: None,
         })),
@@ -773,20 +851,23 @@ async fn save(
     };
     let _ = registry.fault_point(FAULT_BEFORE_WRITE);
     // The retained file.
-    let (task_id, unit_id) = match &claimed.mode {
-        ClaimMode::Task { task_id } => (Some(task_id.clone()), None),
-        ClaimMode::Terminal { unit_id, .. } => (None, Some(unit_id.clone())),
-        ClaimMode::Uncorrelated => (None, None),
+    // `unit_id` is the unit a first terminal report completes; an update
+    // (issue #2260) names its unit in the file, and completes nothing.
+    let (task_id, unit_id, file_unit) = match &claimed.mode {
+        ClaimMode::Task { task_id } => (Some(task_id.clone()), None, None),
+        ClaimMode::Terminal { unit_id, .. } => (None, Some(unit_id.clone()), Some(unit_id.clone())),
+        ClaimMode::TerminalUpdate { unit_id, .. } => (None, None, Some(unit_id.clone())),
+        ClaimMode::Uncorrelated => (None, None, None),
     };
     let envelope = crate::retained_store::Envelope {
         report_id: ctx.spec.report_id.clone(),
-        kind: if unit_id.is_some() {
+        kind: if file_unit.is_some() {
             crate::retained_store::ArtifactKind::DispatchFinished
         } else {
             crate::retained_store::ArtifactKind::WorkerReport
         },
         task_id: task_id.clone(),
-        unit_id: unit_id.clone(),
+        unit_id: file_unit,
         deck_id: registry.inbox().deck().to_string(),
         run_id: store.run_id().to_string(),
         created_at: chrono::Utc::now().to_rfc3339(),
@@ -894,6 +975,11 @@ async fn save(
             unit_name: claimed.unit_name.clone().unwrap_or_default(),
             unit_cwd: ctx.cwd.clone(),
         },
+        ClaimMode::TerminalUpdate { update, .. } => crate::state::ReportPost::TerminalUpdate {
+            unit_name: claimed.unit_name.clone().unwrap_or_default(),
+            unit_cwd: ctx.cwd.clone(),
+            update: *update,
+        },
     };
     let content = crate::state::compose_report_post(
         post,
@@ -929,6 +1015,16 @@ async fn save(
     let _ = registry.fault_point(FAULT_MARKED);
     let (outcome, after) = registry.commit_claim(claim_id, unit_id.is_some());
     let _ = registry.fault_point(FAULT_COMMIT_RETURNED);
+    journal_report(
+        &registry,
+        &outcome,
+        &claimed.mode,
+        Some(&ctx.worker_agent),
+        claimed
+            .recipient
+            .as_ref()
+            .and_then(|recipient| recipient.agent_id.as_deref()),
+    );
     let completion = committed(outcome, &claimed.mode).unwrap_or(Completion::Unconfirmed);
     let _ = handed.send(completion);
     // Only after the handover: the wakes and the owed notices.

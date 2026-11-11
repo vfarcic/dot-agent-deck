@@ -37,6 +37,9 @@ fn delegate_009_real_codex_worker_acts_on_clear_true_delegate() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"codex-delegate\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./delegate.sh\"\nstart = true\n\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: approved as written, so the delegate runs; this test is
+    // about the agent, not the gate.
+    deck.approve_project_trust(deck.workdir());
     std::fs::write(deck.workdir().join("delegate-task.md"),format!(
         "Run exactly this shell command: printf '{CONTENT}' > '{}'. Then reply DONE and end your turn.",
         // PRD #1666: the absolute path, not "the current directory".

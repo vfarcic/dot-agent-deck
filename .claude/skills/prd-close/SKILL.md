@@ -192,8 +192,10 @@ EOF
 Run the gates CLAUDE.md rule 2 names before committing, then:
 
 ```bash
-git add prds/
-git status   # only the moved PRD and its in-repo link fixes
+git add prds/                      # the moved PRD
+git add docs/ROADMAP.md            # if F2 edited it
+git add <each file with a link fix> # every in-repo reference to the old path
+git status   # staged: the moved PRD, the roadmap edit and the link fixes; nothing left unstaged
 
 git commit -m "docs(prd-[number]): close PRD #[number] - [brief reason]
 

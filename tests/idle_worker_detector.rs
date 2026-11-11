@@ -268,6 +268,11 @@ impl IdleHarness {
         if let Some(contents) = project_config {
             std::fs::write(cwd.path().join(".dot-agent-deck.toml"), contents)
                 .expect("write project config");
+            // PRD #1885: a `clear = true` delegate runs only an approved
+            // orchestration; these tests are about the worker, not the gate.
+            if contents.contains("[[orchestrations]]") {
+                common::approve_project_fixture(cwd.path());
+            }
         }
         let cwd_str = cwd.path().to_string_lossy().to_string();
         let registry = Arc::new(AgentPtyRegistry::new());

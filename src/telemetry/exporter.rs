@@ -1102,6 +1102,7 @@ impl Telemetry {
                 pane_id: &start.pane_id,
                 agent: &start.agent,
                 orchestration: start.orchestration.as_ref(),
+                work_id: start.work_id.as_deref(),
             },
             self.host.as_deref(),
         );
@@ -2951,6 +2952,7 @@ mod tests {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 

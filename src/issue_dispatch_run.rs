@@ -510,6 +510,8 @@ pub async fn run_issue_dispatch(
     // registered for delegate routing — see
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
+    // PRD #1889: the fire's work, the parent of each issue's.
+    fire_work: Option<&crate::work_journal::WorkId>,
 ) {
     // S5 — every derived path (clone, worktree, the spawn's orchestration_cwd)
     // must be absolute: a relative workspace root would double-nest the worktree
@@ -541,6 +543,25 @@ pub async fn run_issue_dispatch(
             message,
         });
         return;
+    }
+
+    // PRD #1885: an orchestration this clone's config would open runs only when
+    // its text is the approved text — checked HERE, before any issue's worktree
+    // is created and so before its devbox warm-up runs anything the default
+    // branch configured. The clone was just brought up to the default branch,
+    // which is what each issue's new branch is cut from. The spawn checks the
+    // worktree's own read again before starting anything.
+    {
+        let config = crate::spawn::load_config_for_dir(&clone_dir);
+        if let Some(chosen) = config
+            .as_ref()
+            .and_then(|c| crate::project_config::default_orchestration(c, &clone_dir))
+            && crate::spawn::refuse_unless_approved(&clone_dir, chosen.config, task_name, notifier)
+                .await
+                .is_err()
+        {
+            return;
+        }
     }
 
     // Enumerate open issues. The `--limit` in the argv is advisory; cap in code.
@@ -585,6 +606,7 @@ pub async fn run_issue_dispatch(
                 event_tx,
                 state,
                 &mut claim_run,
+                fire_work,
             )
             .await
             {
@@ -809,9 +831,9 @@ async fn reclaim_abandoned_spawn_paced(
 
     let Some(_repo_lock) = acquire_worktree_lock(clone_dir).await else {
         return Reclaim::Failed(format!(
-            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
-             and the repository's worktree lock that guards removing it could not be taken; \
-             the next attempt retries",
+            "the issue's worktree {} was left by a spawn that never started, and the \
+             repository's worktree lock that guards removing it could not be taken; the next \
+             attempt retries",
             worktree_dir.display()
         ));
     };
@@ -835,13 +857,13 @@ async fn reclaim_abandoned_spawn_paced(
         None => {
             tracing::info!(
                 worktree = %worktree_dir.display(),
-                "issue-dispatch: removed a worktree left by a spawn refused during a restart"
+                "issue-dispatch: removed a worktree left by a spawn that never started"
             );
             Reclaim::Removed
         }
         Some(_) => Reclaim::Failed(format!(
-            "the issue's worktree {} was left by a spawn the daemon refused while restarting, \
-             and removing it failed again; the next attempt retries",
+            "the issue's worktree {} was left by a spawn that never started, and removing it \
+             failed again; the next attempt retries",
             worktree_dir.display()
         )),
     }
@@ -913,6 +935,7 @@ async fn dispatch_one_issue(
     // `crate::state::AppState::register_orchestration_role`.
     state: Option<&crate::state::SharedState>,
     claim_run: &mut ClaimRun,
+    fire_work: Option<&crate::work_journal::WorkId>,
 ) -> Result<IssueOutcome, String> {
     let paths = derive_issue_paths(workspace, task_name, issue);
 
@@ -939,7 +962,8 @@ async fn dispatch_one_issue(
     // IssueDispatchFailed notification.
     //
     // Except for a leftover this task abandoned for this issue when its spawn
-    // was refused during a restart and the removal failed: that is retried
+    // was refused (during a restart, or because its orchestration is not
+    // approved, PRD #1885) and the removal failed: that is retried
     // here first, and only a worktree that is still there afterwards claims
     // the issue (PRD #1487 final audit F2).
     // `Path::exists` is a blocking `stat`: `tokio::fs::metadata` is the same
@@ -1010,12 +1034,16 @@ async fn dispatch_one_issue(
     // fire can claim it in the TOCTOU window after the idempotency check above
     // (see `create_worktree`); that benign race is a skip, not a failure —
     // mirroring the `dispatch_decision` worktree-presence skip.
-    match create_worktree(
+    // PRD #1885: created unwarmed, so the trust check below reads the config
+    // this worktree's (possibly reattached) branch carries before its devbox
+    // warm-up runs anything that branch configured.
+    match create_worktree_unwarmed(
         clone_dir,
         &paths.worktree_dir,
         &paths.branch,
         true,
         Creator::issue_dispatch(task_name, issue),
+        None,
     )
     .await?
     {
@@ -1030,6 +1058,32 @@ async fn dispatch_one_issue(
             return Ok(IssueOutcome::Handled);
         }
     }
+
+    // PRD #1885 (decision 7, amended): the run checked the default branch's
+    // config before any worktree existed, but an existing `agent/issue-<n>` is
+    // attached as it stands and may configure something else. So the config the
+    // spawn will read — this worktree's — is checked HERE, before the warm-up.
+    // A refusal removes the worktree this attempt just created (the branch and
+    // its commits stay), so the issue is dispatched again once it is approved
+    // rather than skipped as claimed on every later fire.
+    if let Err(refusal) = refuse_unapproved_worktree(
+        &paths.worktree_dir,
+        clone_dir,
+        &paths.branch,
+        task_name,
+        notifier,
+    )
+    .await
+    {
+        return Err(release_refused_worktree(
+            &paths.worktree_dir,
+            clone_dir,
+            Creator::issue_dispatch(task_name, issue),
+            refusal,
+        )
+        .await);
+    }
+    warm_project_environment(&paths.worktree_dir).await;
 
     // M2.4 — record the worktree for tab-close cleanup NOW, before the spawn.
     // `spawn` registers the agent (visible to a `StopAgent`
@@ -1055,7 +1109,27 @@ async fn dispatch_one_issue(
     // nothing waits on the agent, so the scheduler's run-active window is freed
     // as soon as the dispatch WORK is done. The worktree-on-disk idempotency
     // signal still serializes overlapping fires safely.
+    // PRD #1889: the issue's work, a child of the fire's. A single-agent
+    // dispatch's panes are its attempts; an orchestration-shaped one's panes
+    // are attempts of the orchestration's work, which is a child of this one.
+    // Its `opened` is held until the spawn settles: a spawn that starts
+    // nothing leaves no work behind.
+    let issue_work = {
+        let work = registry.work();
+        work.hold_launch(
+            crate::work_journal::Launch::IssueDispatch,
+            fire_work,
+            crate::work_journal::Refs {
+                issue: Some(issue),
+                repo: work.plain(&cfg.repo),
+                branch: work.plain(&paths.branch),
+                ..crate::work_journal::Refs::default()
+            },
+            &paths.worktree_dir,
+        )
+    };
     let req = SpawnRequest {
+        work_id: issue_work.clone(),
         task_name: task_name.to_string(),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         command: default_command.map(str::to_string),
@@ -1071,7 +1145,17 @@ async fn dispatch_one_issue(
         // PRD #1666 S5: labelled as the session's starting prompt.
         seed_reason: Some("seed".to_string()),
     };
-    if let Err(e) = spawn(req, registry, notifier, event_tx, true, state).await {
+    let spawned = spawn(req, registry, notifier, event_tx, true, state).await;
+    // PRD #1889: a spawned issue's work closes with its pane or its
+    // orchestration; a failed one is forgotten, or closed when something it
+    // started was already written.
+    if let Some(work) = &issue_work {
+        match &spawned {
+            Ok(_) => registry.work().launched_without_unit(work),
+            Err(_) => registry.work().launch_failed(work, None),
+        }
+    }
+    if let Err(e) = spawned {
         return settle_failed_issue_spawn(
             e,
             worktrees,
@@ -1083,6 +1167,159 @@ async fn dispatch_one_issue(
 
     // M1.3 — the caller claims the issue and then surfaces the success.
     Ok(IssueOutcome::Dispatched { claims_unchecked })
+}
+
+/// PRD #1885: remove the worktree an approval refusal left unused, answering
+/// the issue's failure message: `refusal` itself, extended when the worktree
+/// stays on disk.
+///
+/// A worktree left behind would read as the issue being claimed on every later
+/// fire, so — as [`settle_failed_issue_spawn`] does for a restart refusal — it
+/// is marked as abandoned by `creator` before the removal, under the
+/// per-repository worktree lock. A removal that succeeds deletes the mark with
+/// the worktree; one that fails, or a lock that cannot be taken, leaves the
+/// mark, so the next attempt retries the removal ([`reclaim_abandoned_spawn`]),
+/// and the refusal names the leftover.
+async fn release_refused_worktree(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    creator: Creator,
+    refusal: String,
+) -> String {
+    let repo_lock = acquire_worktree_lock(clone_dir).await;
+    let marked = {
+        let dir = worktree_dir.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::worktree_owner::mark_abandoned_spawn(&dir, &creator)
+        })
+        .await
+        .unwrap_or_else(|join| Err(join.to_string()))
+    };
+    let why_kept = if repo_lock.is_none() {
+        "the repository's worktree lock could not be taken"
+    } else if remove_worktree(worktree_dir, clone_dir, RemovalPolicy::Force)
+        .await
+        .is_none()
+    {
+        return refusal;
+    } else {
+        "removing it failed"
+    };
+    let next = match marked {
+        Ok(_) => "the next attempt retries the removal".to_string(),
+        Err(why) => format!(
+            "it could not be marked for a retry ({why}), so remove it by hand to release the issue"
+        ),
+    };
+    let kept = format!(
+        "the issue's new worktree {} stays on disk because {why_kept}; {next}",
+        worktree_dir.display()
+    );
+    tracing::warn!(
+        worktree = %crate::config_validation::escape_field_for_log(
+            &worktree_dir.to_string_lossy(),
+            crate::daemon_stop::MAX_LOGGED_PATH_CHARS,
+        ),
+        "issue-dispatch: {kept}"
+    );
+    format!("{refusal}; {kept}")
+}
+
+/// PRD #1885: refuse — recording the refusal through `notifier` — when the
+/// orchestration `worktree_dir`'s config would open is not approved as it now
+/// reads. A directory with no config, or one that opens no orchestration,
+/// passes: what starts there is the task's own command.
+///
+/// The worktree is removed after a refusal, so the refusal never names it. The
+/// run checked the clone's (default branch's) config before creating it, so a
+/// refusal here normally means the issue's `branch` — an existing one, attached
+/// as it stands — configures something other than the approved text. Approving
+/// that text would replace the default branch's approval (one is kept per
+/// project and orchestration) and refuse every later fire, so the refusal
+/// offers no approve command: it names the branch and how to resolve it
+/// ([`branch_differs_refusal`]). When the clone's own config is no longer
+/// approved either (revoked or changed meanwhile), the clone's refusal is
+/// recorded instead, and its approve command names the clone.
+async fn refuse_unapproved_worktree(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+    branch: &str,
+    task_name: &str,
+    notifier: &dyn Notifier,
+) -> Result<(), String> {
+    let config = crate::spawn::load_config_for_dir(worktree_dir);
+    let Some(chosen) = config
+        .as_ref()
+        .and_then(|c| crate::project_config::default_orchestration(c, worktree_dir))
+    else {
+        return Ok(());
+    };
+    let check = {
+        let (dir, orch) = (worktree_dir.to_path_buf(), chosen.config.clone());
+        tokio::task::spawn_blocking(move || {
+            crate::project_trust::check_blocking(
+                &crate::project_trust::TrustStore::default_location(),
+                &dir,
+                &orch,
+            )
+        })
+        .await
+    };
+    let refusal = match check {
+        Ok(check) if check.verdict.is_approved() => return Ok(()),
+        Ok(check) => {
+            let clone_config = crate::spawn::load_config_for_dir(clone_dir);
+            let clone_refusal = match clone_config
+                .as_ref()
+                .and_then(|c| crate::project_config::default_orchestration(c, clone_dir))
+            {
+                Some(clone_chosen) => {
+                    crate::spawn::approval_refusal(clone_dir, clone_chosen.config, task_name).await
+                }
+                None => None,
+            };
+            clone_refusal.unwrap_or_else(|| branch_differs_refusal(&check, clone_dir, branch))
+        }
+        Err(e) => crate::untrusted_text::escape_control_and_bidi(&format!(
+            "orchestration '{}' was not started: its approval could not be checked ({e})",
+            chosen.name
+        )),
+    };
+    tracing::warn!(task = task_name, "issue-dispatch: {refusal}");
+    notifier.notify(NotifyEvent::NotApproved {
+        task: task_name.to_string(),
+        message: refusal.clone(),
+    });
+    Err(refusal)
+}
+
+/// PRD #1885: the refusal for an issue whose `branch` in `clone_dir` carries
+/// orchestration text other than the approved text `check` was measured
+/// against. Names the branch and the clone, says nothing was started, and
+/// offers the two ways out — align the branch's config with the default
+/// branch, or delete the branch — instead of an approve command. Escaped for
+/// display, as [`crate::project_trust::refusal_text`] is.
+fn branch_differs_refusal(
+    check: &crate::project_trust::TrustCheck,
+    clone_dir: &Path,
+    branch: &str,
+) -> String {
+    let state = crate::project_trust::verdict_phrase(&check.verdict)
+        .unwrap_or_else(|| "differs from the approved text".to_string());
+    let config = crate::project_config::CONFIG_FILE_NAME;
+    crate::untrusted_text::escape_control_and_bidi(&format!(
+        "orchestration '{orchestration}' on the existing issue branch {branch} in {clone} \
+         {state}: that branch's {config} differs from the approved one, so nothing was \
+         started. Approving the branch's version would replace the default branch's \
+         approval, so bring the branch's {config} back in line with the default branch, or, \
+         if its work is abandoned, delete the branch with: git -C {quoted_clone} branch -D \
+         {quoted_branch} — the next fire then dispatches the issue fresh. Issues on the \
+         default branch keep dispatching.",
+        orchestration = check.orchestration,
+        clone = clone_dir.display(),
+        quoted_clone = crate::platform::paths::shell_quote_if_needed(&clone_dir.to_string_lossy()),
+        quoted_branch = crate::platform::paths::shell_quote_if_needed(branch),
+    ))
 }
 
 /// PRD #421 M3.2 — the claimant whose record on `issue` is live, read from
@@ -2335,6 +2572,46 @@ pub async fn create_worktree_from(
     creator: Creator,
     start_point: Option<&str>,
 ) -> Result<WorktreeCreation, String> {
+    let created = create_worktree_unwarmed(
+        clone_dir,
+        worktree_dir,
+        branch,
+        reuse_existing_branch,
+        creator,
+        start_point,
+    )
+    .await?;
+    if created == WorktreeCreation::Created {
+        // Issue #791: materialize this worktree's project environment ONCE,
+        // HERE, before returning — so that by the time any caller spawns a
+        // role into it, there is no cold `.devbox` left to race over. The
+        // outcome is deliberately dropped: EVERY one of them, warmed or not,
+        // still reports `Created`, because a worktree that exists has been
+        // created whatever devbox did afterwards. See
+        // [`warm_project_environment`] for why none of them is an error.
+        warm_project_environment(worktree_dir).await;
+    }
+    Ok(created)
+}
+
+/// [`create_worktree_from`] WITHOUT the issue #791 warm-up: the caller owns
+/// running [`warm_project_environment`] on a `Created` worktree before it spawns
+/// anything into it.
+///
+/// PRD #1885: for issue dispatch, whose `agent/issue-<n>` branch may already
+/// exist and is then attached as it stands, so its `.dot-agent-deck.toml` can
+/// differ from the default branch's that was checked before any worktree
+/// existed. The caller checks the config the spawn will actually read — this
+/// worktree's — between creation and the warm-up, so a refused orchestration
+/// runs nothing its branch configured.
+pub async fn create_worktree_unwarmed(
+    clone_dir: &Path,
+    worktree_dir: &Path,
+    branch: &str,
+    reuse_existing_branch: bool,
+    creator: Creator,
+    start_point: Option<&str>,
+) -> Result<WorktreeCreation, String> {
     if let Some(parent) = worktree_dir.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create worktree parent {}: {e}", parent.display()))?;
@@ -2446,14 +2723,6 @@ pub async fn create_worktree_from(
             // the hazard the lock is for, to protect two materializations that
             // do not touch each other's `.devbox` in the first place.
             drop(repo_lock);
-            // Issue #791: materialize this worktree's project environment ONCE,
-            // HERE, before returning — so that by the time any caller spawns a
-            // role into it, there is no cold `.devbox` left to race over. The
-            // outcome is deliberately dropped: EVERY one of them, warmed or
-            // not, still reports `Created`, because a worktree that exists has
-            // been created whatever devbox did afterwards. See
-            // [`warm_project_environment`] for why none of them is an error.
-            warm_project_environment(worktree_dir).await;
             Ok(WorktreeCreation::Created)
         }
         // Issue #692: an add killed at `SUBPROCESS_TIMEOUT` gets no chance to
@@ -4228,6 +4497,101 @@ mod tests {
             "the next attempt reclaims it under the lock"
         );
         assert!(!wt.exists());
+    }
+
+    /// Scenario: an issue's existing branch changes the approved role's
+    /// command. The refusal names the branch and the clone, says nothing
+    /// started and offers aligning or deleting the branch, and prints no
+    /// `trust approve` command (Greptile P1 / Qodo finding 6 on PR #2256).
+    #[test]
+    fn a_differing_issue_branch_is_refused_without_an_approve_command() {
+        let check = crate::project_trust::TrustCheck {
+            project: PathBuf::from("/ws/task"),
+            config_dir: PathBuf::from("/ws/task/.worktrees/issue-7"),
+            orchestration: "team".to_string(),
+            roles: Vec::new(),
+            verdict: crate::project_trust::TrustVerdict::Changed {
+                roles: vec![(
+                    "coder".to_string(),
+                    crate::project_trust::RoleChange::Changed,
+                )],
+                removed: Vec::new(),
+            },
+        };
+        let text = branch_differs_refusal(&check, Path::new("/ws/my task"), "agent/issue-7");
+        assert!(
+            text.contains("orchestration 'team' on the existing issue branch agent/issue-7")
+                && text.contains("changed since you approved it (roles: coder (changed))")
+                && text.contains("nothing was started")
+                && text.contains("git -C '/ws/my task' branch -D agent/issue-7")
+                && text.contains("Issues on the default branch keep dispatching"),
+            "{text}"
+        );
+        assert!(!text.contains("trust approve"), "{text}");
+        assert!(!text.contains(".worktrees"), "{text}");
+    }
+
+    /// Scenario: an issue's new worktree configures an orchestration that is
+    /// not approved, so the dispatch is refused, and removing that worktree
+    /// again fails (it is locked). The refusal says the worktree stays on disk
+    /// and names it, and the leftover is marked so the next attempt retries
+    /// the removal instead of reading it as the issue being claimed (PRD #1885,
+    /// Qodo finding 7 on PR #2256).
+    #[tokio::test]
+    async fn a_trust_refusal_whose_worktree_cannot_be_removed_says_so_and_is_retried() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let wt = tmp.path().join("repo-issue-7");
+        init_repo_with_worktree(tmp.path(), &repo, &wt);
+        let creator = || Creator::issue_dispatch("nightly", 7);
+        crate::worktree_owner::write_marker(&wt, "wt", &creator()).unwrap();
+        let git = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        // A locked worktree refuses a single `--force`.
+        git(&["worktree", "lock", &wt.to_string_lossy()]);
+
+        let message =
+            release_refused_worktree(&wt, &repo, creator(), "not approved".to_string()).await;
+        assert!(wt.exists(), "the removal really did fail");
+        assert!(
+            message.starts_with("not approved")
+                && message.contains(&wt.display().to_string())
+                && message.contains("retries"),
+            "the refusal names the leftover and says it will be retried: {message}"
+        );
+        assert!(
+            crate::worktree_owner::is_abandoned_spawn_of(&wt, &creator()),
+            "the leftover is marked as abandoned by this task for this issue"
+        );
+
+        git(&["worktree", "unlock", &wt.to_string_lossy()]);
+        let reg = new_worktree_registry();
+        assert_eq!(
+            reclaim_abandoned_spawn(&wt, &repo, creator(), &reg, &AgentPtyRegistry::new()).await,
+            Reclaim::Removed,
+            "the next attempt reclaims it"
+        );
+        assert!(!wt.exists());
+
+        // A removal that succeeds leaves the refusal as it was.
+        let wt2 = tmp.path().join("repo-issue-8");
+        git(&["worktree", "add", "-q", "-b", "wt2", &wt2.to_string_lossy()]);
+        assert_eq!(
+            release_refused_worktree(
+                &wt2,
+                &repo,
+                Creator::issue_dispatch("nightly", 8),
+                "not approved".to_string()
+            )
+            .await,
+            "not approved"
+        );
+        assert!(!wt2.exists());
     }
 
     /// Scenario: the same restart refusal, but `git worktree remove --force`

@@ -1497,6 +1497,9 @@ fn assert_attached_tab_rearms_from_own_context(live_surface: bool) -> RearmedRun
         &project.path().join("orchestrator-remit.sh"),
         ORCHESTRATOR_REMIT_SCRIPT,
     );
+    // PRD #1885: the daemon prepares only an approved orchestration; this
+    // test is about what a prepared start re-arms from, not the gate.
+    daemon.approve_project_trust(project.path());
     let cwd = std::fs::canonicalize(project.path()).expect("canonical project path");
     let cwd_wire = cwd.to_string_lossy().into_owned();
     let prepare = |task: &str| {

@@ -65,6 +65,11 @@ pub enum NotifyEvent {
     /// PRD #127 M2.1: a fire created/resolved its `working_dir` but the agent
     /// spawn itself failed. The fire is abandoned; other tasks keep running.
     SpawnFailed { task: String, message: String },
+    /// PRD #1885: the fire would have started an orchestration whose commands
+    /// and prompts are not approved (never, or not as they now read), so
+    /// nothing was started. `message` names the orchestration, the project and
+    /// the command that approves it.
+    NotApproved { task: String, message: String },
     /// PRD #120 M1.3: an `issue_dispatch` task successfully dispatched one issue
     /// (per-issue worktree created + agent spawned). `claims_unchecked` is why
     /// the claims on the issue could not be read when claim gating is on (PRD
@@ -167,6 +172,13 @@ impl Notifier for StderrNotifier {
             }
             NotifyEvent::SpawnFailed { task, message } => {
                 eprintln!("[scheduler] task {task:?}: spawn failed: {message}");
+            }
+            // PRD #1885: also recorded as the task's last fire, which `schedule
+            // list` and the TUI's schedule manager show.
+            NotifyEvent::NotApproved { task, message } => {
+                eprintln!("[scheduler] task {task:?}: refused: {message}");
+                crate::schedule_outcome::OutcomeStore::default_location()
+                    .record_refusal(&task, &message);
             }
             NotifyEvent::IssueDispatched {
                 task,

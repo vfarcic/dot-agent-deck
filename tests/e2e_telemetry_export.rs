@@ -436,7 +436,7 @@ fn telemetry_otlp_002_exports_run_and_status_intervals() {
             assert_eq!(attribute(resource, "service.name"), "dot-agent-deck");
             assert!(!attribute(resource, "service.version").is_empty());
             assert!(!attribute(resource, "host.name").is_empty());
-            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "3");
+            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "4");
         }
     }
 }
@@ -471,6 +471,8 @@ fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-pi\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -577,7 +579,7 @@ fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
     }
 }
 
-/// Scenario: Start a stand-in that records its environment with OTLP configured, then close it. Its propagated run id must equal the exported run's id, and the configured endpoint must reach it unchanged.
+/// Scenario: Start a stand-in that records its environment with OTLP configured, then close it. Its propagated run id must equal the exported run's id, the configured endpoint must reach it unchanged, and its `DOT_AGENT_DECK_WORK_ID` must appear as `deck.work.id` both in its resource attributes and on the exported run.
 #[spec("telemetry/otlp/003")]
 #[test]
 fn telemetry_otlp_003_agent_and_deck_share_run_id() {
@@ -596,9 +598,26 @@ fn telemetry_otlp_003_agent_and_deck_share_run_id() {
         env_value(&environment, "OTEL_EXPORTER_OTLP_ENDPOINT"),
         Some(receiver.endpoint.as_str())
     );
+    // PRD #1889: the work the run serves, the same id in the agent's own
+    // environment, its resource attributes and the exported run.
+    let work_id = env_value(&environment, "DOT_AGENT_DECK_WORK_ID")
+        .filter(|id| id.starts_with("w-"))
+        .expect("agent must receive DOT_AGENT_DECK_WORK_ID");
+    assert_eq!(
+        attributes
+            .split(',')
+            .find_map(|pair| pair.strip_prefix("deck.work.id=")),
+        Some(work_id),
+        "agent resource must carry deck.work.id equal to DOT_AGENT_DECK_WORK_ID: {attributes}"
+    );
     close(&deck, &agent);
     let run = receiver.run(agent.pane_id_env.as_deref().unwrap());
     assert_eq!(attribute(&run, "deck.run.id"), run_id);
+    assert_eq!(
+        attribute(&run, "deck.work.id"),
+        work_id,
+        "the exported agent.run must carry deck.work.id: {run}"
+    );
 }
 
 /// Scenario: Print private output, type private input, and send private hook fields while a privately titled pane exports with a secret header, then start a successor in a privately named git directory with private file contents, branch, command argument and ordinary environment value. Require an intervention, the authentication header, the telemetry exporter's startup log and the branch as the successor run's `vcs.ref.head.name`, and reject every other private sentinel from exported bodies, and every sentinel from URIs, non-authentication headers and telemetry-module log lines.
@@ -1171,6 +1190,8 @@ fn telemetry_otlp_011_respawn_mints_a_new_run_id() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-respawn\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");

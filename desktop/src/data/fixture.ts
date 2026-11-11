@@ -1,6 +1,7 @@
 import type { VoiceCommandDto, VoiceReadingStateDto, VoiceResolvedParamDto, VoiceResultDto, VoiceScreen, VoiceStatusDto, VoiceTranscriptionDto } from "../lib/bridge";
 import type { AgentProfile, AgentSession, AuthoringKind, AgentStatus, AgentTab, AgentTypeId, DaemonOrchestration, DeckDirectoryEntry, DeckSnapshot, EvidenceItem, HostLevel, HostMetricsReport, NewAgentOption, PromptKeys, WorkflowStage } from "../types";
 import type { PendingQuestionDto, QuestionResultDto } from "../lib/voiceQuestion";
+import type { ProjectTrustRole } from "../lib/projectTrust";
 import type { SelfCopy, SelfUpgradeApi, SelfUpgradeCheck, SelfUpgradePlan, SelfUpgradeResult } from "../lib/selfUpgrade";
 import PROMPT_KEYS_JSON from "./prompt-keys.json";
 import { voicePagesFleet } from "./fixtureCrowded";
@@ -613,6 +614,36 @@ export function fixtureProjectOrchestrations(home: string, path: string): Daemon
     },
   ];
 }
+
+/**
+ * PRD #1885 — the `project-trust` docs scene (`?fixture=1&state=docs&trust=changed`):
+ * `demo-project` defines `team` instead of `demo-loop`, and its review reads
+ * `changed since you approved it`. The TUI capture
+ * (`docs_screenshot_project_trust` in `tests/e2e_docs_screenshots.rs`) writes
+ * the same roles into its project and approves the earlier text, so the two
+ * images show one state: `orchestrator` unchanged, `coder` changed, `tester`
+ * new and `reviewer` removed. Change the two together.
+ */
+export const DOCS_TRUST_ORCHESTRATION: DaemonOrchestration = {
+  name: "team",
+  displayName: "team",
+  default: true,
+  roles: [
+    { name: "orchestrator", displayName: "orchestrator", start: true },
+    { name: "coder", displayName: "coder", start: false },
+    { name: "tester", displayName: "tester", start: false },
+  ],
+};
+
+/** The review the `project-trust` scene's deck answers for `team`, in the TUI capture's words. */
+export const DOCS_TRUST_ROLES: ProjectTrustRole[] = [
+  { name: "orchestrator", command: "claude", start: true, clear: false, prompt: ["Break the task into steps and delegate each one."] },
+  { name: "coder", change: "changed", command: "claude --model opus", start: false, clear: true, prompt: ["Implement the task you are given and run the tests."] },
+  { name: "tester", change: "new", command: "codex", start: false, clear: true, prompt: ["Write a failing test for the task, then report it."] },
+];
+
+/** The role the `project-trust` scene's approval had and its config no longer defines. */
+export const DOCS_TRUST_REMOVED_ROLES: readonly string[] = ["reviewer"];
 
 /**
  * The commands `demo-loop`'s roles are configured with on a fixture deck — the
