@@ -13840,10 +13840,10 @@ mod hook_ingestion_tests {
     /// the agent walks up from the agent past the daemon, the TUI and the
     /// terminal's shell to the root-owned `/usr/bin/login`. Where that
     /// process's parent cannot be read (macOS `PROC_PIDTBSDINFO`, issue
-    /// #2237), every `inbox wait` is unidentified, though the pane's one-shot
-    /// verbs and a receiver naming the pane's own process are admitted: they
-    /// read nothing above the agent. Read past it, or with the daemon
-    /// parented by launchd, the server's receiver resolves to the client.
+    /// #2237), the pane's one-shot verbs and a receiver naming the pane's own
+    /// process are still admitted: they read nothing above the agent. Read
+    /// past it, or with the daemon parented by launchd, the server's receiver
+    /// resolves to the client.
     #[test]
     fn opencode_2_minis_server_receiver_is_placed_through_the_daemons_ancestry() {
         // 1 launchd ── 2 /usr/bin/login (root) ── 3 zsh ── 4 deck TUI ── 5 daemon
@@ -13934,11 +13934,10 @@ mod hook_ingestion_tests {
             crate::platform::proc::Ancestry::Unreadable,
             "the walk from the agent toward its server climbs to login"
         );
-        assert_eq!(
-            admit(&unread, 12, Some(11)),
-            Err(ComponentRefusal::Unidentified),
-            "the server plugin's `inbox wait` is refused, as #2276 reports"
-        );
+        // Deliberately not pinned: `admit(&unread, 12, Some(11))`, the server
+        // plugin's `inbox wait` under an unread login. It is refused
+        // `Unidentified` today, which is #2276, and a fix may make it admit:
+        // the server descends from the agent, so it cannot be above it.
         assert_eq!(
             admit(&unread, 14, None),
             Ok(None),
