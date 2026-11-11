@@ -473,6 +473,9 @@ fn journal_launch_006_a_dispatched_orchestration_is_a_child_of_its_dispatch() {
     )
     .unwrap();
     journal::init_repo(&repo);
+    // PRD #1885: the orchestration written after launch is approved, as the
+    // user's is; an unapproved one is refused before the worktree exists.
+    daemon.approve_project_trust(&repo);
     let caller = route::start(&daemon, "journal-caller", json!({"cwd": repo}));
     let orchestrator = dispatch_as(
         &daemon,

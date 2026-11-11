@@ -462,6 +462,8 @@ pub struct TuiDeckBuilder {
     launch_subdir: Option<PathBuf>,
     launch_cargo_artifact: bool,
     keep_startup_hook_install: bool,
+    skip_trust_preapproval: bool,
+    trusted_projects: Vec<PathBuf>,
 }
 
 impl TuiDeckBuilder {
@@ -547,6 +549,23 @@ impl TuiDeckBuilder {
     /// `XDG_CONFIG_HOME` through [`Self::with_env`] is opted out already.
     pub fn keeping_the_startup_hook_install(mut self) -> Self {
         self.keep_startup_hook_install = true;
+        self
+    }
+
+    /// PRD #1885: opt out of the default pre-approval, so the fixture's
+    /// orchestrations start unapproved, exactly as a user's never-approved
+    /// project does. For the `config-trust/*` tests, whose subject is the gate.
+    pub fn without_trust_preapproval(mut self) -> Self {
+        self.skip_trust_preapproval = true;
+        self
+    }
+
+    /// PRD #1885: also approve the project at `dir` at launch, through the
+    /// same real `trust approve --yes` as the fixture's own pre-approval —
+    /// for a test whose orchestration lives outside the fixture (a session
+    /// restore's project dir).
+    pub fn trusting_project(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.trusted_projects.push(dir.into());
         self
     }
 
@@ -813,6 +832,9 @@ pub struct TuiDeck {
     /// dumped beside `daemon.log`. `None` when a test's `with_env` gave it a
     /// value that selects the host's default log (`1`, an empty string).
     deck_log_path: Option<PathBuf>,
+    /// The environment the deck was launched with, for
+    /// [`TuiDeck::approve_project_trust`] (PRD #1885).
+    launch_env: HashMap<String, String>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -1002,6 +1024,8 @@ impl TuiDeck {
             launch_subdir: None,
             launch_cargo_artifact: false,
             keep_startup_hook_install: false,
+            skip_trust_preapproval: false,
+            trusted_projects: Vec::new(),
         }
     }
 
@@ -1446,6 +1470,16 @@ impl TuiDeck {
         {
             preinstall_deck_hooks(&deck_binary, &launch_dir, &final_env);
         }
+        // PRD #1885: start from the fixture's orchestrations approved, as a
+        // user who has approved their project once does, so a test about
+        // something else never meets the trust prompt. See
+        // `approve_project_trust_with`.
+        if !builder.skip_trust_preapproval && work.join(".dot-agent-deck.toml").is_file() {
+            preapprove_project_trust(&deck_binary, &work, &final_env);
+        }
+        for dir in &builder.trusted_projects {
+            approve_project_trust_with(&deck_binary, dir, &final_env);
+        }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
         let daemon_log_path = final_env
@@ -1479,7 +1513,7 @@ impl TuiDeck {
                 }
             })
             .unwrap_or_else(|| home.clone());
-        for (k, v) in final_env {
+        for (k, v) in &final_env {
             cmd.env(k, v);
         }
 
@@ -1597,6 +1631,7 @@ impl TuiDeck {
             recording_redactions,
             daemon_log_path,
             deck_log_path,
+            launch_env: final_env,
         })
     }
 
@@ -2495,6 +2530,22 @@ impl TuiDeck {
     /// write into it via [`seed_claude_trust_in_home`] before opening the pane.
     pub fn home_dir(&self) -> &Path {
         &self.home
+    }
+
+    /// PRD #1885: approve every orchestration of the project at `dir` through
+    /// the real `dot-agent-deck trust approve <dir> --yes`, in this deck's
+    /// environment (so into its store). For a test that edits a running
+    /// orchestration's config as setup and then needs the edit to count as
+    /// approved. Panics when the approval fails.
+    pub fn approve_project_trust(&self, dir: &Path) {
+        approve_project_trust_with(contained_deck_binary(), dir, &self.launch_env);
+    }
+
+    /// PRD #1885: run `dot-agent-deck <args…>` in this deck's environment from
+    /// `cwd`, without a terminal, and return its output. The `trust` CLI is
+    /// what the `config-trust/*` tests drive through it.
+    pub fn run_deck_cli(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
+        deck_cli_output(contained_deck_binary(), cwd, &self.launch_env, args)
     }
 
     /// Return the parsed grid contents — used by `wait_for_string`
@@ -5375,6 +5426,79 @@ fn preinstall_deck_hooks(binary: &Path, cwd: &Path, env: &HashMap<String, String
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+/// The pane-identity variables `trust approve` refuses under (PRD #1885),
+/// removed from every harness run of the CLI: a test's environment is the
+/// deck's, never a pane's.
+const PANE_IDENTITY_ENV: [&str; 3] = [
+    "DOT_AGENT_DECK_PANE_ID",
+    "DOT_AGENT_DECK_PANE_CAPABILITY",
+    "DOT_AGENT_DECK_AGENT_ID",
+];
+
+/// Run `binary <args…>` from `cwd` with exactly `env` (minus the pane
+/// identity) and no terminal on stdin.
+fn deck_cli_output<K, V>(
+    binary: &Path,
+    cwd: &Path,
+    env: impl IntoIterator<Item = (K, V)>,
+    args: &[&str],
+) -> std::process::Output
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(args).current_dir(cwd).env_clear().envs(env);
+    for var in PANE_IDENTITY_ENV {
+        cmd.env_remove(var);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .output()
+        .expect("run the dot-agent-deck CLI")
+}
+
+/// PRD #1885: the launch default — [`approve_project_trust_with`], but a
+/// failure is only reported, not fatal: some fixtures carry a config that is
+/// deliberately malformed or declares no orchestration, which approves
+/// nothing and is the subject of their test.
+fn preapprove_project_trust(binary: &Path, dir: &Path, env: &HashMap<String, String>) {
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let output = deck_cli_output(binary, dir, env, &["trust", "approve", &dir_arg, "--yes"]);
+    if !output.status.success() {
+        eprintln!(
+            "note: harness pre-approval `trust approve {dir_arg} --yes` failed ({:?}); the \
+             fixture's orchestrations stay unapproved.\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// PRD #1885: approve every orchestration of the project at `dir` by running
+/// the REAL `dot-agent-deck trust approve <dir> --yes` in `env` — the deck's
+/// or daemon's own environment, so the approval lands in that per-test state
+/// dir's store. No bypass: the harness approves exactly the way a user does.
+/// Panics when the approval fails, naming the CLI's output, because a test
+/// built on it would otherwise fail later at a refusal far from the cause.
+fn approve_project_trust_with<K, V>(
+    binary: &Path,
+    dir: &Path,
+    env: impl IntoIterator<Item = (K, V)>,
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let output = deck_cli_output(binary, dir, env, &["trust", "approve", &dir_arg, "--yes"]);
+    assert!(
+        output.status.success(),
+        "harness pre-approval `trust approve {dir_arg} --yes` failed ({:?})\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 /// [`contained_deck_binary`] and the directory [`contain_path`] puts on `PATH`
@@ -11870,6 +11994,46 @@ pub fn spawn_daemon_serve_with_env(
     idle_shutdown_secs: &str,
     extra_env: &[(&str, &str)],
 ) -> DaemonProc {
+    spawn_daemon_serve_inner(initial_schedules_toml, idle_shutdown_secs, extra_env, true)
+}
+
+/// PRD #1885: [`spawn_daemon_serve_with_env`] WITHOUT its default
+/// pre-approval of each schedule's `working_dir`, so the projects start
+/// unapproved — for the `config-trust/*` tests, whose subject is the gate.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn spawn_daemon_serve_untrusted(
+    initial_schedules_toml: Option<&str>,
+    idle_shutdown_secs: &str,
+    extra_env: &[(&str, &str)],
+) -> DaemonProc {
+    spawn_daemon_serve_inner(initial_schedules_toml, idle_shutdown_secs, extra_env, false)
+}
+
+/// The `working_dir` of every `[[scheduled_tasks]]` in `toml` that holds a
+/// project config: what [`spawn_daemon_serve_with_env`] pre-approves.
+#[cfg(unix)]
+fn schedule_project_dirs(toml: &str) -> Vec<PathBuf> {
+    let Ok(parsed) = toml::from_str::<toml::Value>(toml) else {
+        return Vec::new();
+    };
+    parsed
+        .get("scheduled_tasks")
+        .and_then(|tasks| tasks.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|task| task.get("working_dir")?.as_str().map(PathBuf::from))
+        .filter(|dir| dir.join(".dot-agent-deck.toml").is_file())
+        .collect()
+}
+
+#[cfg(unix)]
+fn spawn_daemon_serve_inner(
+    initial_schedules_toml: Option<&str>,
+    idle_shutdown_secs: &str,
+    extra_env: &[(&str, &str)],
+    preapprove: bool,
+) -> DaemonProc {
     let tempdir = race_safe_tempdir();
     let work = tempdir.path().to_path_buf();
     let home = work.join("home");
@@ -11970,6 +12134,20 @@ pub fn spawn_daemon_serve_with_env(
     {
         env.retain(|(k, _)| k != "PATH");
         env.push(("PATH".into(), path));
+    }
+
+    // PRD #1885: each scheduled project starts approved, as `TuiDeck`'s
+    // fixture does, through the real CLI and into this daemon's store. An
+    // issue dispatch's project is its clone, which does not exist before the
+    // first fire, so it is not covered: `DaemonProc::approve_project_trust`.
+    if preapprove {
+        let approve_env: HashMap<String, String> = env.iter().cloned().collect();
+        for dir in initial_schedules_toml
+            .map(schedule_project_dirs)
+            .unwrap_or_default()
+        {
+            preapprove_project_trust(bin, &dir, &approve_env);
+        }
     }
 
     let mut cmd = std::process::Command::new(bin);
@@ -12108,6 +12286,19 @@ impl DaemonProc {
         req: &dot_agent_deck::daemon_protocol::AttachRequest,
     ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
         attach_request_on(&self.attach_socket, req)
+    }
+
+    /// PRD #1885: approve every orchestration of the project at `dir` through
+    /// the real `trust approve <dir> --yes`, into this daemon's store. Panics
+    /// when the approval fails.
+    pub fn approve_project_trust(&self, dir: &Path) {
+        approve_project_trust_with(contained_deck_binary(), dir, self.env.iter().cloned());
+    }
+
+    /// PRD #1885: run `dot-agent-deck <args…>` with this daemon's env from
+    /// `cwd`, without a terminal.
+    pub fn run_deck_cli(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
+        deck_cli_output(contained_deck_binary(), cwd, self.env.iter().cloned(), args)
     }
 
     /// Run `dot-agent-deck schedule <args…>` with the daemon's env, from the
@@ -14213,6 +14404,38 @@ pub struct InProcDaemon {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// PRD #1885: the state dir every in-process daemon of this test process keeps
+/// its approval store under (one per process, as the store's location is).
+#[cfg(unix)]
+fn inproc_trust_state_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = harness_temp_root().join("inproc-trust-state");
+        std::fs::create_dir_all(&dir).expect("create the in-process trust state dir");
+        dir
+    })
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl InProcDaemon {
+    /// PRD #1885: approve every orchestration of the project at `dir` through
+    /// the real `trust approve <dir> --yes`, into the store this process's
+    /// in-process daemons read. Panics when the approval fails.
+    pub fn approve_project_trust(&self, dir: &Path) {
+        let state = inproc_trust_state_dir().to_string_lossy().into_owned();
+        let home = self._dir.path().to_string_lossy().into_owned();
+        let mut env = vec![
+            ("DOT_AGENT_DECK_STATE_DIR".to_string(), state),
+            ("HOME".to_string(), home),
+        ];
+        if let Ok(path) = std::env::var("PATH") {
+            env.push(("PATH".to_string(), path));
+        }
+        approve_project_trust_with(contained_deck_binary(), dir, env);
+    }
+}
+
 #[allow(dead_code)]
 impl Drop for InProcDaemon {
     fn drop(&mut self) {
@@ -14248,6 +14471,13 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 
     init_test_env();
+    // PRD #1885: this daemon runs in the test process, whose own state dir is
+    // the developer's. Point its approval store at a per-process harness dir,
+    // so no test reads or writes the developer's approvals; a test approves a
+    // project into it with `InProcDaemon::approve_project_trust`.
+    let _ = dot_agent_deck::project_trust::TrustStore::use_state_dir_for_this_process(
+        inproc_trust_state_dir().to_path_buf(),
+    );
 
     // Issue prageethw/dot-agent-deck#253 round-4 verification, finding 1: `handle_delegate` run
     // through this in-process daemon executes in THIS test process, not the
@@ -14657,4 +14887,24 @@ impl Drop for AttachInput {
             let _ = drain.join();
         }
     }
+}
+
+/// PRD #1885: approve every orchestration of the config in `dir`, through the
+/// real store API, for an IN-PROCESS test whose subject is not the approval —
+/// the daemon's unattended paths (delegate to a `clear = true` role, `pane
+/// restart`, `pane spawn`, a dispatch, a prepared start) refuse an unapproved
+/// one. The store is pointed at a per-process directory under the harness root
+/// first, so a test never reads or writes the developer's own approvals. A
+/// subprocess deck has its own `DOT_AGENT_DECK_STATE_DIR`, and is approved
+/// through the CLI instead.
+#[allow(dead_code)]
+pub fn approve_project_fixture(dir: &Path) {
+    use dot_agent_deck::project_trust::{TrustStore, approve_all};
+    let state = harness_temp_root().join("trust-state");
+    std::fs::create_dir_all(&state).expect("create the per-process trust store dir");
+    harden_dir_0700(&state);
+    // The first call in this process wins; a later one keeps that directory.
+    let _ = TrustStore::use_state_dir_for_this_process(state);
+    approve_all(&TrustStore::default_location(), dir)
+        .unwrap_or_else(|e| panic!("fixture precondition: approve {}: {e}", dir.display()));
 }

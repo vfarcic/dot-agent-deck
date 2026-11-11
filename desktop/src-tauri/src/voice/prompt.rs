@@ -743,6 +743,7 @@ pub(crate) mod tests {
                 "choose_deck".to_string(),
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
+                "approve_project_commands".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
                 "none".to_string(),

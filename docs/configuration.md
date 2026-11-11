@@ -188,6 +188,8 @@ The dialog opens only when you press `g` or click **Generate**. The dialog's hin
 
 Unknown keys are ignored without a warning, so a misspelled key silently keeps its default.
 
+**Each orchestration is reviewed before it runs.** The deck starts an orchestration only after you have approved its roles' `name`, `command`, `agent`, `start`, `clear`, `description` and `prompt_template` as they read now, and asks again when any of them changes. Edits to comments, to the top-level keys above, or to another orchestration do not ask again. See [Approving Project Commands](project-trust.md).
+
 **A top-level key must come before the first table header in the file.** TOML assigns every key after a header such as `[[orchestrations]]`, `[[orchestrations.roles]]` or `[features]` to that table, so a `worker_response_timeout_minutes` appended at the end of the file belongs to the last table, where nothing reads it. The file still parses, `validate` still prints `Config is valid.`, and the default stays in effect:
 
 ```toml

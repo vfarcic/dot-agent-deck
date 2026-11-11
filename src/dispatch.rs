@@ -1025,6 +1025,22 @@ pub async fn handle_dispatch(
         }
     };
 
+    // PRD #1885: a dispatched orchestration runs, unattended, only when its text
+    // — read from the caller's checkout above, and carried to the spawn as
+    // `resolved_target` — is the approved text. Checked before the worktree
+    // exists, so a refusal creates nothing and its devbox warm-up never runs;
+    // the caller's `dispatch` fails with the reason and the approving command.
+    if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &resolved_target
+        && let Some(refusal) = crate::spawn::approval_refusal(&clone_dir, config, "dispatch").await
+    {
+        return DispatchResult {
+            worktree_dir: paths.worktree_dir.clone(),
+            success: false,
+            message: format!("dispatch: {refusal}"),
+            unit_id: None,
+        };
+    }
+
     // Read once, and the worktree is cut from exactly this sha, so the base the
     // reply names is the unit's base. See [`resolve_dispatch_base`].
     let base = resolve_dispatch_base(&clone_dir).await;
@@ -2677,6 +2693,9 @@ mod tests {
             // but the worktree the roles run in is a HEAD checkout.
             git_in(tmp.path(), &repo, &["add", "-A"]);
             git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
+            // PRD #1885: a dispatched orchestration starts only when approved;
+            // this test is about what the dispatch writes once it starts.
+            crate::project_trust::approve_all_for_test(&repo);
 
             let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
             let ctx = DispatchContext {
@@ -2833,6 +2852,9 @@ mod tests {
              [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
         )
         .unwrap();
+        // PRD #1885: a dispatched orchestration starts only when approved; this
+        // test is about the publish refusal behind that gate.
+        crate::project_trust::approve_all_for_test(&repo);
         // The obstruction: `.dot-agent-deck` is a symlink in the committed tree,
         // so the worktree `git worktree add` cuts has one too, and the publish
         // refuses to write the coordinator context through it. Dangling on

@@ -1369,6 +1369,13 @@ pub enum DesktopAction {
         cols: Option<u16>,
     },
     ActivateOrchestration {
+        /// PRD #1885 review: the deck the Runs launch was started on, captured
+        /// by the webview when the user pressed Activate, so the review's
+        /// query, its approval and this activation all go to that one deck
+        /// even if the selection moves meanwhile. Absent from a webview built
+        /// before the field existed, which launches on the selected deck.
+        #[serde(default)]
+        deck_id: Option<String>,
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,

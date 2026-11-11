@@ -183,6 +183,9 @@ export default {id:'deck-test-route',tui:async(api)=>{
         std::fs::write(work.join(".dot-agent-deck.toml"),format!(
             "[[orchestrations]]\nname = \"opencode-inbox\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"./delegate-loop.sh\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {role_command:?}\nagent = \"opencode\"\nclear = {clear}\n"
         )).unwrap();
+        // PRD #1885: approved as written, so the delegate runs; these tests
+        // are about the agent, not the gate.
+        deck.approve_project_trust(&work);
         let script = work.join("delegate-loop.sh");
         std::fs::write(&script, "#!/bin/sh\ni=1\nwhile :; do\n while [ ! -f \"delegate-$i.go\" ]; do sleep 0.1; done\n dot-agent-deck delegate --to coder --task-file \"delegate-$i.md\" > \"delegate-$i.log\" 2>&1\n printf '%s' \"$?\" > \"delegate-$i.exit\"\n i=$((i+1))\ndone\n").unwrap();
         use std::os::unix::fs::PermissionsExt;

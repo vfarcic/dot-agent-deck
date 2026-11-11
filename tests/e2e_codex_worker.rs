@@ -107,6 +107,9 @@ async fn codex_worker_inner(launch: WorkerLaunch) {
         ),
     )
     .expect("write Codex worker orchestration config");
+    // PRD #1885: approved as written, so the delegate runs; this test is
+    // about the agent, not the gate.
+    common::approve_project_fixture(cwd.path());
 
     let codex_home = cwd.path().join("codex-home");
     // Issue #502/#785: the importer registers what it copied for DIAGNOSTIC

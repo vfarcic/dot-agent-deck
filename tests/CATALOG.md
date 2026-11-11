@@ -271,6 +271,229 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
 - **Platform coverage:** mac+linux.
 
+### Project config trust (PRD #1885)
+
+#### config-trust/cli
+
+##### config-trust/cli/001 — `trust approve --yes` prints what it approves and `trust list` shows it `current`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`): the real binary against an isolated HOME and state dir; no daemon.
+- **Agent:** none.
+- **Asserts:** with no approvals `list` exits 0 and names nothing; `approve <dir> --yes` exits 0 and prints each role's command, description and prompt text; `list` then shows one line for the project (canonical path) and orchestration whose state word is `current`.
+- **Does not assert:** the y/N question on a terminal (the `trust_cli` unit tests own it); the list line's exact layout.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/002 — Changing one character of a role's command reads as `changed`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** after an approval, a one-character edit to a role `command` makes `list` show `changed`; restoring the text shows `current` again.
+- **Does not assert:** which other keys void an approval (unit tests own the field list).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/003 — `trust revoke` removes an approval and fails when there is nothing to revoke.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `revoke <dir>` exits 0 and the project leaves `list`; a second `revoke` exits non-zero with a message.
+- **Does not assert:** `--orchestration`-scoped revoke.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/004 — `trust approve` without a terminal and without `--yes` refuses.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** non-zero exit, a message naming `--yes`, and nothing stored.
+- **Does not assert:** the terminal question itself.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/005 — `trust approve` inside a deck pane refuses; `list` and `revoke` still run.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none; the pane identity is `DOT_AGENT_DECK_PANE_ID` in the CLI's environment.
+- **Asserts:** `approve --yes` with the pane identity exits non-zero with `run it from a terminal outside the deck` and stores nothing; `list` exits 0 and `revoke` removes an approval with the same identity present.
+- **Does not assert:** the other pane-identity variables, or a run from a real pane's shell.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/006 — A linked git worktree shares its main checkout's approval.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `approve <linked worktree> --yes` stores the approval under the main checkout (the list line names the main path, never the worktree's) as `current`, and `revoke <main checkout>` finds it.
+- **Does not assert:** a non-git project's identity (the canonical config directory).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/prompt
+
+##### config-trust/prompt/001 — The New Agent form asks before starting a never-approved orchestration.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), launched with `without_trust_preapproval`.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`).
+- **Asserts:** Ctrl+n + choosing the orchestration shows `Review project commands` with the project, the orchestration, `not approved before`, every role's command, description and prompt text and the footer `a approve and start · Esc cancel · ↑↓ scroll`, and no role is on the daemon; `Esc` closes it with nothing spawned; choosing again and pressing `a` starts both roles and `trust list` shows the approval `current`.
+- **Does not assert:** scrolling; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/002 — A changed role is marked `changed`, and Enter does not approve.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** after a one-character edit to an approved role's command, the prompt shows that role marked `changed` with its new command; Enter leaves the prompt open, spawns nothing, and the stored approval still reads `changed`.
+- **Does not assert:** the no-prompt open of an approved, unchanged orchestration (every other orchestration test opens one under the harness pre-approval).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/003 — The trust prompt's layout: state, role marks, removed roles, the restore footer and scrolling under a fixed footer.
+- **Layer:** L1 (`trust_prompt::render_to_buffer` + ratatui `TestBackend` + `insta`, `tests/render_trust_prompt.rs`), views built by `TrustCheck::evaluate(..).view()` against an in-memory `ApprovalStore`.
+- **Agent:** none.
+- **Asserts:** a never-approved orchestration shows `Review project commands`, the project, `not approved before`, every role's command, description and prompt with no mark, and the footer `a approve and start · Esc cancel · ↑↓ scroll`; a changed one shows `changed since you approved it`, the edited role marked `changed`, the added one `new`, the untouched one unmarked and `Removed since you approved it: <role>`; the restore variant's footer is `a approve and restore`; a long prompt in a short terminal keeps the footer on screen and shows `(more below)`, `(more above and below)` and `(more above)` at the top, middle and end; a first role whose prompt runs to 70,000 lines either leaves a later role's command reachable at the end or offers no `a approve`. Five snapshots pin the layout.
+- **Does not assert:** keys, approving or the spawned binary (`config-trust/prompt/001`/`002`, the `ui.rs` `prompt_004`–`006` unit tests); escaping of hostile config text (`trust_prompt` unit tests); the desktop dialog.
+- **Platform coverage:** mac+linux+windows.
+
+##### config-trust/prompt/004 — The trust prompt works with the mouse: clicking `a approve and start`/`a approve and restore` approves, clicking `Esc cancel` cancels, the wheel scrolls, and other clicks do nothing.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, four tests), SGR mouse reports through `TuiDeck::click`/`scroll_n`, each label located on the rendered grid; the restore test stages the `config-trust/restore/002` saved session.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`, `sleep 600`).
+- **Asserts:** clicks on the prompt's title, on a role's description, on the deck left of the popup and on the dashboard's `[Quit Ctrl+C]` and `[New Agent Ctrl+N]` buttons behind it, and Enter, leave the prompt open, open no quit dialog and spawn nothing; a click on `a approve and start` starts both roles and `trust list` reads `current`; a click on `Esc cancel` closes the prompt, spawns nothing and stores nothing; the wheel over a review longer than the popup scrolls it to `(more above and below)`, to its last line and `(more above)`, and back to `(more below)`, without approving; on the restore prompt a click on `a approve and restore` restores the roles and `trust list` reads `current`.
+- **Does not assert:** that a click on the approve label before the prompt's first frame is refused (the `ui.rs` unit tests own that guard: the prompt opens on a daemon reply, so a PTY cannot order a click between its opening and its first frame); clicking `Esc cancel` on the restore prompt; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/restore
+
+##### config-trust/restore/001 — A restored orchestration whose command changed asks before restoring.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** on a daemon-empty start the prompt shows the orchestration, the changed command, `coder` marked `changed` and `a approve and restore`, with no role spawned; `a` restores the roles.
+- **Does not assert:** cancelling a restore prompt (restore/002 does); several restored orchestrations.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/002 — Cancelling the restore prompt leaves the orchestration unrestored and restores the rest of the session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session holding the changed orchestration followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing; after a detach-quit the saved `session.toml` still holds the `restore-orch` snapshot, and the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** that the orchestration can be reopened from the New Agent form afterwards; several restored orchestrations; a periodic (mid-session) save while the prompt is open.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/003 — A saved orchestration that can no longer be trust-checked does not fall through to a plain-pane restore.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, three tests): saved session holding a never-approved orchestration whose saved orchestrator command writes a sentinel file, followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION` with an empty approval store.
+- **Agent:** stand-ins (`sh -c 'touch <sentinel>; exec sleep 600'`, `sleep 600`).
+- **Asserts:** after (a) a worker role is removed from the config, (b) the orchestration is renamed, or (c) the config file is deleted, launching the TUI never writes the sentinel, restores no `orchestrator` pane and no pane in the project, starts no role, and still restores the plain pane (a trust prompt, if one appears, is cancelled first).
+- **Does not assert:** what the warning says; role reorder or role rename drift.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/004 — Quitting while a restore prompt is unanswered keeps the orchestration in the saved session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): the `config-trust/restore/002` saved session (a changed orchestration, then a plain pane) staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** with the restore prompt open and unanswered (the plain pane already restored), `Ctrl+C` and Detach quit the deck cleanly; the saved `session.toml` still holds the `restore-orch` orchestration snapshot; the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** a terminal hang-up (SIGHUP) rather than a detach; a periodic (mid-session) save while the prompt is open; the order in which several held-back restores are asked.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/005 — Approving a held-back restore starts only the roles that were running when the session was saved (issue #929).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): a changed orchestration's current (`version = 2`) snapshot listing `started_role_indices = [0, 1]`, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** quitting (`Ctrl+C`, Detach) with the restore prompt unanswered leaves the saved block at `version = 2` with `[0, 1]`, so a held restore keeps which roles were running; on the next start, `a` restores the orchestrator and `coder` on the daemon, no `reviewer` agent appears, and the restored tab still shows a `reviewer` card.
+- **Does not assert:** a restore that needed no approval (`session/restore/025`); an old (`version = 1`) snapshot, which starts every role (`config-trust/restore/001`, `session/restore/008`); a declined (`Esc`) restore's saved block; a periodic (mid-session) save while the prompt is open.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/respawn
+
+##### config-trust/respawn/001 — A delegate to a `clear = true` role refuses after its config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** the delegate exits non-zero with the refusal (orchestration, project, `changed since you approved it`, `dot-agent-deck trust approve … --orchestration trust-orch`), and coder keeps its agent id.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/002 — `pane restart` refuses after the role's config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane restart coder --force` exits non-zero with the refusal text, and coder keeps its agent id.
+- **Does not assert:** a restart of a crashed pane.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/003 — `pane spawn` refuses after a role was added to the config.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane spawn reviewer` exits non-zero with the refusal text, and no reviewer appears on the daemon.
+- **Does not assert:** spawning a role whose text is unchanged.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/004 — A delegate to a non-clear role refuses after only its prompt changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** with an approved orchestration open, changing only a non-clear `reviewer` role's `prompt_template` makes `delegate --to reviewer` exit non-zero with the refusal text (`changed since you approved it`, the approve command), and the task never reaches the reviewer's inbox.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/schedule
+
+##### config-trust/schedule/001 — A scheduled fire into a never-approved orchestration is refused and reported.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins.
+- **Asserts:** run-now spawns nothing and `schedule list` shows the refusal (`never approved`, the project, the approve command); after `trust approve`, the same run-now opens the orchestration.
+- **Does not assert:** the TUI schedule manager's rendering of the refusal (a `ui.rs` unit test owns it); a cron-driven fire.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/002 — An issue dispatch whose default branch changed a role is refused before the devbox warm-up.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins; a `devbox` stub on `PATH` records each warm-up.
+- **Asserts:** the first fire is refused `never approved` with no worktree and no warm-up; after approving the clone, a fire dispatches issue 7 and warms its worktree once; after the remote's default branch changes the role command by one character, the next fire is refused `changed since you approved it`, creates no worktree for issue 8, runs no further warm-up and spawns nothing.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/003 — A forged `.git` file does not borrow another checkout's approval.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`sh ./agent.sh`, `cat`).
+- **Asserts:** with repository A's `team` approved, a directory B holding byte-identical TOML, a different `agent.sh` and a `.git` file copied from A's legitimate linked worktree is refused on run-now: B's marker file is never written, `schedule list` reports the refusal with the approve command naming B, and nothing spawns in B; a run-now in A's real linked worktree still opens the orchestration.
+- **Does not assert:** the wording of the refusal reason; other forged geometries (a `.git` directory, a symlinked `.git`).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/004 — A reattached issue branch with different role text is refused with a remedy that works.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the clone's default branch approved and a local `agent/issue-7` branch changing the role command, a fire for issue 7 is refused `changed since you approved it` and spawns nothing; every directory a printed `dot-agent-deck trust approve` command names exists after the fire; running each printed approve command (with `--yes`) succeeds, and a later fire for issue 8 on the default branch still dispatches.
+- **Does not assert:** the remedy's wording, or whether it prints an approve command at all; that issue 7 itself can be dispatched afterwards; a branch pushed to the remote rather than left in the clone.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/005 — A linked worktree shares its main checkout's approval of an unnamed orchestration.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with a repository whose one orchestration has no `name` approved by `trust approve <main checkout> --yes`, a run-now schedule in the main checkout opens the orchestration, and one in a `git worktree add` linked worktree opens it too.
+- **Does not assert:** the approval's stored name; `trust list` output for an unnamed orchestration; a non-git project.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/006 — An issue dispatch of an unnamed orchestration runs once its clone is approved.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the fixture remote's one orchestration unnamed and the scheduler's clone approved, a fire for issue 7 opens the orchestration in `<clone>/.worktrees/issue-7`.
+- **Does not assert:** the refusal for an unapproved unnamed orchestration; a reattached `agent/issue-<n>` branch (`config-trust/schedule/004`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/dispatch
+
+##### config-trust/dispatch/001 — `dispatch --orchestration` refuses until approved, then runs in a worktree that shares the approval.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane.
+- **Agent:** stand-ins.
+- **Asserts:** from a never-approved project the refusal reaches the caller's inbox (where `dispatch` posts its outcome), no worktree is created and nothing spawns; after `trust approve` of the main checkout a second dispatch succeeds and the roles run in the unit's linked worktree.
+- **Does not assert:** `dispatch --single` or `--command` (not gated).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/rearm
+
+##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.
+- **Layer:** L2 headless `daemon serve` + `RunNow` with a PTY-attached TUI warm-reattaching to it, lane 1 (`tests/e2e_config_trust.rs`); synthetic `Compacting` and `/clear` `SessionStart` hook events under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** after a schedule opens an approved orchestration and only its start role's `prompt_template` is edited to carry a sentinel (`trust list` reads `changed`), a TUI attaching to the warm daemon and then a compaction and a `/clear` on the start role publish no `.dot-agent-deck/orchestrator-context*` file and post no start-role inbox message containing the sentinel.
+- **Does not assert:** how the user is told (a prompt or a refusal); the re-arm of an unchanged orchestration (`orchestration/remit/*`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/escape
+
+##### config-trust/escape/001 — Refusals carry no raw terminal control characters from project-chosen names.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), with `DOT_AGENT_DECK_LOG` pointed into the test's tempdir and real agent-verb CLIs from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** an orchestration named with an ESC clear-screen sequence and a right-to-left override is refused on run-now with no raw ESC or U+202E in the daemon's stderr and no raw ESC, BEL or bidi control in its log; after approving, opening it, changing a command and adding a role with an OSC-8/bidi name, the refused `delegate` and `pane restart` print no raw ESC, BEL or bidi control.
+- **Does not assert:** the escaped spelling; `schedule list` (already escaped) or the TUI schedule manager.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/live
+
+##### config-trust/live/001 — A real agent starts only after the trust prompt is approved. [reel]
+- **Layer:** L2 PTY-attached, **lane 2** (`tests/e2e_config_trust_live.rs`).
+- **Agent:** real interactive Claude Code on Haiku (`--allowedTools Bash Read`), credentials imported, work dir trusted.
+- **Asserts:** Ctrl+n on a never-approved project shows `Review project commands` with the role's `claude …` command and nothing running; `a` starts the agent, which creates the uniquely named sentinel `config_trust_live_5e81c3.txt` its prompt asks for.
+- **Does not assert:** the agent's wording.
+- **Platform coverage:** mac+linux.
+
 ### Work journal (PRD #1889)
 
 The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
@@ -6153,21 +6376,21 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens; since PRD #1666 the replay is read from the role's inbox, not the recorder).
 - **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`. The staged snapshot is an old (`version = 1`) one listing `started_role_indices = [0, 1]`, and every declared role, the unlisted `reviewer` included, still gets a daemon agent, because a version-1 list was always `[start_role_index]` and is no record of what ran (issue #929); a clean detach then re-saves the block as `version = 2` with `started_role_indices = [0, 1, 2]`.
-- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); a current (`version = 2`) snapshot that leaves a role out (`session/restore/025`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); a current (`version = 2`) snapshot that leaves a role out (`session/restore/025`); the on-disk capture that produces the snapshot (`session/save/004`); a snapshot whose config no longer resolves, which is left unrestored (`session/restore/009`); a project whose orchestration is not approved (`config-trust/restore/*`) — this test pre-approves it through the harness's `trusting_project`; the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
-##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
+##### session/restore/009 — An orchestration snapshot whose config no longer resolves is left unrestored, with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift; PRD #1885 removed the plain-pane fallback).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon restores the saved pane as a plain dashboard card and emits a warning naming the missing orchestration.
+- **Agent:** none (the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon lands on the empty dashboard (`No active agents`), no `orchestrator` card appears, the saved command's sentinel file is never written, and the teardown flushes a warning naming the missing orchestration and saying it `was not restored`. A plain-pane fallback would run the saved command with no trust check (PRD #1885).
 - **Does not assert:** the exact warning wording (only that it names the missing orchestration); the successful rebuild path (`session/restore/008`); which other panes survive when multiple are staged (only one is here).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration falls back to a plain dashboard pane with a warning, never panicking at startup (PRD #89 review-fix F2).
+##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration is left unrestored with a warning, never panicking at startup (PRD #89 review-fix F2).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the saved pane restores as a PLAIN dashboard card (`orchestrator`) and a `session_warnings` message naming the orchestration (`tdd-cycle`) is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
-- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift fallback (`session/restore/009`).
+- **Agent:** none (the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the deck reaches its empty dashboard, no `orchestrator` card appears, the saved command's sentinel file is never written, and a `session_warnings` message naming the orchestration (`tdd-cycle`) and saying it `was not restored` is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
+- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift (`session/restore/009`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/011 — A saved `start_role_index` that differs from the config default is honored on restore: the orchestrator prompt is posted to the role at the saved index (PRD #89 review-fix F3).
@@ -6179,16 +6402,16 @@ without depending on the config struct API.
 
 ##### session/restore/012 — A snapshot whose `project_path` diverges from the saved pane `dir` does not auto-run the config planted at `project_path` (PRD #89 review-fix F1).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — while the saved pane still restores as a PLAIN card (`orchestrator`). Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
-- **Does not assert:** which fix shape the coder chooses (drift fallback vs. re-resolving from `saved_pane.dir`) — only that the divergent config is not executed; path canonicalization edge cases (symlinks, `..`).
+- **Agent:** none (the planted config's roles run `sleep 600`; the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — and, since PRD #1885, the saved pane is not restored as a plain `orchestrator` card either, and its saved command's sentinel file is never written; the teardown warning names `tdd-cycle` as `was not restored`, which proves the restore ran and refused. Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
+- **Does not assert:** whether the refusal comes from re-resolving against `saved_pane.dir` or from cross-checking it against `project_path` — only that neither the divergent config nor the saved command runs; the exact warning wording; path canonicalization edge cases (symlinks, `..`).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4, RED-pending-schema).
+##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. RED-pending-schema: `OrchestrationSnapshot` has no `display_title` field yet (the staged key parses but is dropped on load, since the struct sets no `deny_unknown_fields`) and restore passes `None` to `open_orchestration_tab`, so the tab comes back titled `tdd-cycle`; goes GREEN once the coder adds the field + capture + restore threading.
-- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
+- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. It was written RED, before `OrchestrationSnapshot` carried a `display_title` field, when the staged key was dropped on load and the tab came back titled `tdd-cycle`.
+- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the field in isolation (`src/config.rs` unit tests); an unapproved project (this test pre-approves it through the harness's `trusting_project`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/014 — A restored pane whose command identifies a supported agent immediately shows that agent as Idle.
@@ -6270,7 +6493,7 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (all three roles run `session/restore/008`'s recorder shell script, which logs its own start to `started-<role>.log`, self-posts `SessionStart` and records its stdin; no LLM).
 - **Asserts:** with a hand-staged `version = 2` snapshot of a three-role orchestration listing `started_role_indices = [0, 1]`, the rebuilt tab shows the `coder` and `reviewer` cards, the daemon runs agents for the orchestrator and `coder`, there is no daemon agent for `reviewer` and its command never ran (`started-reviewer.log` absent, read after the `coder`'s start, which the same pass spawns); a clean detach then re-saves `version = 2` with the same `[0, 1]`, so the empty slot stays empty across another restart. Seen red before the fix at the `reviewer` agent assertion, with the rebuilt-tab precondition passing.
-- **Does not assert:** that `dot-agent-deck pane spawn reviewer` starts the empty role afterwards (`pane/spawn/*` covers spawning into a dead slot); the old-snapshot path (`session/restore/008`); the periodic flush's capture, which runs the same `record_started_roles` as the detach save but is not separately driven here; the empty card's styling.
+- **Does not assert:** that `dot-agent-deck pane spawn reviewer` starts the empty role afterwards (`pane/spawn/*` covers spawning into a dead slot); the old-snapshot path (`session/restore/008`); an orchestration that is not approved, held for its trust prompt and then approved (`config-trust/restore/005`) — this test pre-approves it through the harness's `trusting_project`; the periodic flush's capture, which runs the same `record_started_roles` as the detach save but is not separately driven here; the empty card's styling.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -7635,7 +7858,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009`).
 - **Agent:** none.
 - **Asserts:** two legs on the same fixture tab shape (`[orchestrator, coder]`). Leg 1 — with the current config reading `[orchestrator, coder, reviewer]`, growing with `reviewer` still lands it last (returned index 2, vectors `[orchestrator, coder, reviewer]`, `start_role_index` unmoved): the case that was accidentally correct before placement existed must stay correct. Leg 2 — with a current config that does not mention `reviewer` at all, the growth still succeeds and appends (returned index 2), so placement degrades to the pre-#1096 behaviour rather than panicking or picking an arbitrary slot.
-- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement and still falls back to a plain pane.
+- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement, and since PRD #1885 the snapshot is left unrestored with a warning rather than restored as a plain pane (`config-trust/restore/003`).
 - **Platform coverage:** mac+linux (unix-only).
 
 ##### pane/spawn/016 — A role inserted BEFORE the start role carries `start_role_index` along with it (issue #1096).

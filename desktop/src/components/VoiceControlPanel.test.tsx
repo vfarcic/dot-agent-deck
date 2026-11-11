@@ -36,6 +36,8 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell as AppDeckShell } from "../App";
+import { ProjectTrustDialog } from "./ProjectTrustDialog";
+import { useProjectTrustReview, type ProjectTrust, type ProjectTrustTarget } from "../lib/projectTrust";
 
 /** Existing deck-specific voice cases enter the deck explicitly. */
 function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
@@ -43,6 +45,7 @@ function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
 }
 import {
   NOTHING_DISPATCHED,
+  REVIEW_MOVED_ON,
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
   VOICE_DICTATION_SEND_MS,
@@ -2370,6 +2373,63 @@ describe("voice control panel", () => {
 
     expect(screen.queryByTestId("settings-panel")).not.toBeInTheDocument();
     expect(screen.getByText(SCREEN_MOVED_ON)).toBeVisible();
+  });
+
+  /**
+   * PRD #1885 review (auditor 3). Scenario: review A of a project's commands is
+   * on screen and the user says "approve project commands"; while that answer
+   * is being worked out, A is cancelled and review B opens. When the answer
+   * arrives, B is not approved and nothing starts, and the report says the
+   * review changed so nothing ran.
+   */
+  it("does not approve a project commands review that replaced the one the words were spoken against", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("approve project commands"));
+    const { resolveVoice, settle } = deferredResolver();
+    const reviewOf = (path: string, digest: string): ProjectTrust => ({
+      kind: "review",
+      project: path,
+      orchestration: "team",
+      state: "never_approved",
+      roles: [{ name: "orchestrator", command: `run ${path}`, start: true, clear: true }],
+      removedRoles: [],
+      digest,
+    });
+    const trust = {
+      projectTrustState: vi.fn(async (target: ProjectTrustTarget) => reviewOf(target.path, target.path === "/work/a" ? "aa" : "bb")),
+      approveProjectTrust: vi.fn(async (target: ProjectTrustTarget) => ({ ...reviewOf(target.path, "x"), state: "approved" as const })),
+    };
+    const started: string[] = [];
+    function Reviews() {
+      const review = useProjectTrustReview(trust);
+      const open = (path: string) => { void review.check({ path, orchestration: "team" }, () => { started.push(path); }); };
+      return <>
+        {/* voice-registry-exempt: a test harness's stand-ins for a screen's launch */}
+        <button type="button" onClick={() => open("/work/a")}>open A</button>
+        {/* voice-registry-exempt: a test harness's stand-ins for a screen's launch */}
+        <button type="button" onClick={() => open("/work/b")}>open B</button>
+        {review.shown && <ProjectTrustDialog review={review.shown} onApprove={(token) => { void review.approve(token); }} onCancel={review.cancel} />}
+      </>;
+    }
+    render(<><DeckShell runtime={runtime(resolveVoice, voice)} /><Reviews /></>);
+
+    await turnVoiceOn(voice);
+    await act(async () => { fireEvent.click(screen.getByText("open A")); await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("project-trust-project")).toHaveTextContent("/work/a");
+    await completeAutomaticUtterance(voice);
+
+    await act(async () => { fireEvent.click(within(screen.getByTestId("project-trust-dialog")).getByRole("button", { name: "Cancel" })); await Promise.resolve(); });
+    await act(async () => { fireEvent.click(screen.getByText("open B")); await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("project-trust-project")).toHaveTextContent("/work/b");
+
+    await settle(result({ kind: "dispatch", transcript: "approve project commands", action: "approve_project_commands", invoke: "approveProjectCommands", params: [], sentence: "Approving the project commands." }));
+    await flush();
+
+    expect(trust.approveProjectTrust).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+    expect(screen.getByTestId("project-trust-project")).toHaveTextContent("/work/b");
+    expect(screen.getByText(REVIEW_MOVED_ON)).toBeInTheDocument();
+    await act(async () => { fireEvent.click(within(screen.getByTestId("project-trust-dialog")).getByRole("button", { name: "Cancel" })); await Promise.resolve(); });
   });
 
   /**

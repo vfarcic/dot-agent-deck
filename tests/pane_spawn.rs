@@ -84,6 +84,8 @@ async fn fixture(coder_command: &str) -> Fixture {
     let dir = common::race_safe_tempdir();
     std::fs::write(dir.path().join(".dot-agent-deck.toml"), config())
         .expect("write orchestration config");
+    // PRD #1885: spawning a role runs only an approved orchestration.
+    common::approve_project_fixture(dir.path());
     let cwd = dir.path().to_string_lossy().into_owned();
 
     daemon

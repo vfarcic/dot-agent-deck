@@ -381,6 +381,12 @@ pub enum UiMode {
     /// names, opened by the `restart_notice` key (default `a`) or the footer's
     /// `[Agents]` button. Its state lives in `UiState::restart_notice`.
     RestartNotice,
+    /// PRD #1885: `Review project commands` — the trust prompt shown before an
+    /// orchestration whose commands and prompts are not approved as they now
+    /// read is opened from the New Agent form or restored from the saved
+    /// session. Nothing of it is spawned while this is open. Its state lives in
+    /// `UiState::trust_prompt`.
+    TrustPrompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,9 +702,51 @@ fn build_dispatcher_seed(working_dir: &std::path::Path) -> String {
 /// Status of a schedule as shown in the manager dialog. "disabled" when
 /// `enabled = false`; "live" when the task currently has a live reused
 /// tab/agent; "idle" otherwise.
-fn schedule_status_label(enabled: bool, is_live: bool) -> &'static str {
+/// PRD #1885: the schedules whose last fire was refused as not approved.
+fn schedule_refusals() -> crate::schedule_outcome::Outcomes {
+    crate::schedule_outcome::OutcomeStore::default_location().load()
+}
+
+/// PRD #1885: how often the open Schedules manager re-reads the refusal
+/// records, so a fire refused after the manager opened shows up without
+/// reopening it.
+const SCHEDULE_REFUSALS_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Read the refusal records into the manager now.
+fn reload_schedule_refusals(ui: &mut UiState) {
+    ui.scheduled_refusals = schedule_refusals();
+    ui.scheduled_refusals_read_at = Some(std::time::Instant::now());
+}
+
+/// PRD #1885: while the Schedules manager is open, re-read the refusal records
+/// through `load` once [`SCHEDULE_REFUSALS_REFRESH`] has passed since the last
+/// read. Called every main-loop iteration; outside the manager it reads
+/// nothing.
+fn refresh_schedule_refusals_if_due(
+    ui: &mut UiState,
+    now: std::time::Instant,
+    load: impl FnOnce() -> crate::schedule_outcome::Outcomes,
+) {
+    if ui.mode != UiMode::ScheduledTasks {
+        return;
+    }
+    if ui
+        .scheduled_refusals_read_at
+        .is_some_and(|read| now.saturating_duration_since(read) < SCHEDULE_REFUSALS_REFRESH)
+    {
+        return;
+    }
+    ui.scheduled_refusals = load();
+    ui.scheduled_refusals_read_at = Some(now);
+}
+
+/// The manager's STATUS cell. PRD #1885: `refused` when the task's last fire
+/// was refused as not approved, so a schedule that stopped working says so.
+fn schedule_status_label_with(enabled: bool, is_live: bool, refused: bool) -> &'static str {
     if !enabled {
         "disabled"
+    } else if refused {
+        "refused"
     } else if is_live {
         "live"
     } else {
@@ -1780,6 +1828,50 @@ fn submit_debounce_duration(
 /// bound a persistent-failure retry rate.
 const CLEAR_REASSERT_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// PRD #1885: what the open trust prompt is for, and what answering it opens.
+enum TrustPromptPurpose {
+    /// The New Agent form chose this orchestration. `a` approves and then opens
+    /// it through the same `Action::SpawnPane` the form sent, with the form
+    /// kept for issue #555's title refusal.
+    Open {
+        req: Box<NewPaneRequest>,
+        form: Option<NewPaneFormState>,
+    },
+    /// The startup restore held this saved orchestration back.
+    Restore(PendingTrustRestore),
+}
+
+/// PRD #1885: the open `Review project commands` prompt.
+struct TrustPromptState {
+    /// The daemon's view: the text shown, and the digest an approval carries.
+    view: crate::project_trust::ProjectTrustView,
+    /// How many body rows are scrolled off the top (clamped when drawn). A
+    /// `usize`, so a body longer than 65,535 rows scrolls to its end.
+    scroll: usize,
+    /// The furthest the last frame could scroll, so the keys clamp too.
+    max_scroll: usize,
+    /// The popup inside its border as the last frame drew it: the wheel over
+    /// it scrolls the review. `None` until a frame has drawn it.
+    drawn_inner: Option<Rect>,
+    purpose: TrustPromptPurpose,
+}
+
+impl TrustPromptState {
+    fn action(&self) -> crate::trust_prompt::PromptAction {
+        match self.purpose {
+            TrustPromptPurpose::Open { .. } => crate::trust_prompt::PromptAction::Start,
+            TrustPromptPurpose::Restore(_) => crate::trust_prompt::PromptAction::Restore,
+        }
+    }
+}
+
+/// PRD #1885: a saved orchestration pane the startup restore held back.
+#[derive(Clone)]
+struct PendingTrustRestore {
+    saved_pane: config::SavedPane,
+    view: crate::project_trust::ProjectTrustView,
+}
+
 struct UiState {
     mode: UiMode,
     /// PRD #113: the Dashboard's selection is active/inactive. `Some(i)` paints
@@ -1802,6 +1894,18 @@ struct UiState {
     /// room for them, until the user dismisses it — agents later drops take
     /// join it meanwhile.
     restart_notice: Option<RestartNotice>,
+    /// PRD #1885: the open trust prompt (`UiMode::TrustPrompt`).
+    trust_prompt: Option<TrustPromptState>,
+    /// PRD #1885: saved orchestrations the startup restore held back because
+    /// they are not approved as they now read, each waiting for its own trust
+    /// prompt ([`open_next_trust_restore`]). Nothing of one is spawned until it
+    /// is approved.
+    pending_trust_restores: std::collections::VecDeque<PendingTrustRestore>,
+    /// PRD #1885: saved orchestrations whose restore prompt was cancelled.
+    /// Like [`Self::pending_trust_restores`] and the one an open prompt holds,
+    /// each stays in the saved session unchanged ([`keep_held_trust_restores`]),
+    /// so the next start asks about it again.
+    declined_trust_restores: Vec<config::SavedPane>,
     /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
@@ -2180,6 +2284,15 @@ struct UiState {
     /// Schedule names with a live tab/agent, snapshotted when the dialog opens
     /// (drives the live/idle status indicator).
     scheduled_live_names: HashSet<String>,
+    /// PRD #1885: each schedule whose last fire was refused because its
+    /// orchestration is not approved, snapshotted with
+    /// [`Self::scheduled_live_names`].
+    scheduled_refusals: crate::schedule_outcome::Outcomes,
+    /// PRD #1885: when [`Self::scheduled_refusals`] was last read from disk, so
+    /// the open manager re-reads it on [`SCHEDULE_REFUSALS_REFRESH`]'s cadence
+    /// and picks up a refusal recorded after it opened (a fire runs after its
+    /// `RunNow` returns).
+    scheduled_refusals_read_at: Option<std::time::Instant>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -2455,6 +2568,9 @@ impl UiState {
             selected_index: Some(0),
             last_focused_pane_id: None,
             restart_notice: None,
+            trust_prompt: None,
+            pending_trust_restores: std::collections::VecDeque::new(),
+            declined_trust_restores: Vec::new(),
             restart_notice_area: None,
             confirm_choices_drawn: None,
             confirm_drawing: None,
@@ -2524,6 +2640,8 @@ impl UiState {
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
+            scheduled_refusals: Default::default(),
+            scheduled_refusals_read_at: None,
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
@@ -4891,8 +5009,8 @@ fn surface_one_orchestration(
                 // `resolve_orchestration_for_restore` rebuild this tab on
                 // restore. That snapshot otherwise freezes at tab-open time —
                 // grow it here too, so a role added via `pane spawn` survives
-                // the next session flush instead of drift-triggering the
-                // restore fallback to a plain pane. Conditional on the entry
+                // the next session flush instead of drift-leaving the tab
+                // unrestored. Conditional on the entry
                 // existing: a tab opened via the batch daemon-surfacing path
                 // never captures `pane_metadata` at all (a separate,
                 // pre-existing gap out of scope here) and must not have one
@@ -5488,6 +5606,13 @@ pub enum Action {
     /// PRD #1258 M3: close the host overlay — its Escape key and its `[Close]`
     /// button share this arm.
     CloseHostMetrics,
+    /// PRD #1885: `a` in the trust prompt — approve the text it shows, through
+    /// the daemon, then open (or restore) what it was shown for. A click on
+    /// the prompt's drawn approve label sends it too.
+    ApproveProjectTrust,
+    /// PRD #1885: a click on the trust prompt's drawn `Esc cancel` label —
+    /// close it as `Esc` does, approving and starting nothing.
+    CancelTrustPrompt,
     /// PRD #1666 §6.4: open the deck-messages picker on the selected card.
     OpenInboxAttention,
     /// PRD #1666 §6.4: close it — Escape and its `[Close]` button.
@@ -7055,6 +7180,101 @@ fn star_message(opened: bool) -> String {
     } else {
         format!("Visit {} to star ⭐", repo_identity::DISPLAY)
     }
+}
+
+/// PRD #1885: open the trust prompt for `view`. Nothing it was opened for is
+/// spawned until it is answered; typed-ahead input never answers it, since it
+/// is a confirmation that waits for its own frame ([`confirmation_awaits_frame`]).
+fn open_trust_prompt(
+    ui: &mut UiState,
+    view: crate::project_trust::ProjectTrustView,
+    purpose: TrustPromptPurpose,
+) {
+    ui.trust_prompt = Some(TrustPromptState {
+        view,
+        scroll: 0,
+        max_scroll: 0,
+        drawn_inner: None,
+        purpose,
+    });
+    ui.confirm_choices_drawn = None;
+    // Its approve and cancel labels become click targets only once a flushed
+    // frame shows them (`record_flushed_confirmation`), never from what an
+    // earlier dialog left here.
+    ui.modal_button_rects.clear();
+    ui.mode = UiMode::TrustPrompt;
+}
+
+/// PRD #1885: close the trust prompt without approving: nothing is spawned and
+/// nothing is stored. A restore it was shown for stays unrestored, and stays in
+/// the saved session so the next start asks again.
+fn cancel_trust_prompt(ui: &mut UiState) {
+    ui.mode = UiMode::Normal;
+    let Some(prompt) = ui.trust_prompt.take() else {
+        return;
+    };
+    let name = crate::untrusted_text::escape_control_and_bidi(&prompt.view.orchestration);
+    let message = match prompt.purpose {
+        TrustPromptPurpose::Open { .. } => {
+            format!("Orchestration '{name}' not started: its commands were not approved.")
+        }
+        TrustPromptPurpose::Restore(pending) => {
+            ui.declined_trust_restores.push(pending.saved_pane);
+            format!("Orchestration '{name}' not restored: its commands were not approved.")
+        }
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// PRD #1885: the wheel over the trust prompt's popup scrolls the review one
+/// row a notch, as `↑`/`↓` do; a wheel elsewhere, or before a frame has drawn
+/// the popup, does nothing.
+fn scroll_trust_prompt(ui: &mut UiState, up: bool, col: u16, row: u16) {
+    let Some(prompt) = ui.trust_prompt.as_mut() else {
+        return;
+    };
+    if !prompt
+        .drawn_inner
+        .is_some_and(|inner| point_in_rect(&inner, col, row))
+    {
+        return;
+    }
+    prompt.scroll = if up {
+        prompt.scroll.saturating_sub(1)
+    } else {
+        prompt.scroll.saturating_add(1).min(prompt.max_scroll)
+    };
+}
+
+/// PRD #1885: the trust prompt's keys. `a` approves and starts (or restores);
+/// `Esc` cancels; `↑`/`↓`/`PgUp`/`PgDn` (and `Home`/`End`) scroll. Enter does
+/// NOT approve: a key that confirms every other dialog must not approve
+/// commands by habit.
+fn handle_trust_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    let Some(prompt) = ui.trust_prompt.as_mut() else {
+        ui.mode = UiMode::Normal;
+        return Action::Continue;
+    };
+    const PAGE: usize = 10;
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('a') if plain => return Action::ApproveProjectTrust,
+        KeyCode::Esc => cancel_trust_prompt(ui),
+        KeyCode::Up | KeyCode::Char('k') => prompt.scroll = prompt.scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            prompt.scroll = prompt.scroll.saturating_add(1).min(prompt.max_scroll);
+        }
+        KeyCode::PageUp => prompt.scroll = prompt.scroll.saturating_sub(PAGE),
+        KeyCode::PageDown => {
+            prompt.scroll = prompt.scroll.saturating_add(PAGE).min(prompt.max_scroll);
+        }
+        KeyCode::Home => prompt.scroll = 0,
+        KeyCode::End => prompt.scroll = prompt.max_scroll,
+        _ => {}
+    }
+    Action::Continue
 }
 
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -9601,7 +9821,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
 fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
     // Issue #1635: the upgrade dialog owns the keyboard the same way, so a
     // tab switch or a new pane cannot slip in under an upgrade's question.
-    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade {
+    // PRD #1885: so does the trust prompt: nothing may open, switch or spawn
+    // under a question about what is about to run.
+    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade || mode == UiMode::TrustPrompt {
         return None;
     }
     let resolved = global_action(kb, key).or_else(|| {
@@ -9945,6 +10167,10 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // Issue #1635: the upgrade dialog's buttons live in
             // `modal_button_rects` too.
             | UiMode::Upgrade
+            // PRD #1885: the trust prompt's approve and cancel labels live in
+            // `modal_button_rects` once a frame shows them; a click anywhere
+            // else is consumed rather than reaching what is behind it.
+            | UiMode::TrustPrompt
     )
 }
 
@@ -9983,7 +10209,9 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
-        | UiMode::RestartNotice => true,
+        | UiMode::RestartNotice
+        // PRD #1885: and the trust prompt.
+        | UiMode::TrustPrompt => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -10957,12 +11185,54 @@ fn dispatch_action(
                 }
             }
         }
-        Action::SpawnPane(req) => {
+        Action::SpawnPane(mut req) => {
             // Issue #555: whatever this spawn does, the form it came from is
             // restored at most once, and only from the orchestration arm below.
             let submitted_orchestration_form = ui.submitted_orchestration_form.take();
             if pane.is_available() {
                 let dir_str = req.dir.display().to_string();
+
+                // PRD #1885: an orchestration opens only when the daemon says its
+                // commands and prompts are approved as they now read, and what
+                // opens is exactly that text. Otherwise the trust prompt asks
+                // first, and nothing is spawned while it is open.
+                if let Some(chosen) = req.orchestration_config.as_ref() {
+                    let answer = pane.project_trust_state(&dir_str, &chosen.name);
+                    let reread = || {
+                        load_project_config(&req.dir).ok().flatten().and_then(|c| {
+                            c.orchestrations.into_iter().find(|o| o.name == chosen.name)
+                        })
+                    };
+                    let gate =
+                        crate::trust_prompt::decide_for_dir(answer, &req.dir, chosen, reread);
+                    match gate {
+                        crate::trust_prompt::Gate::Open(config) => {
+                            req.orchestration_config = Some(config);
+                        }
+                        crate::trust_prompt::Gate::Prompt(view) => {
+                            ui.pending_last_command = None;
+                            open_trust_prompt(
+                                ui,
+                                view,
+                                TrustPromptPurpose::Open {
+                                    req,
+                                    form: submitted_orchestration_form,
+                                },
+                            );
+                            return Flow::Continue;
+                        }
+                        crate::trust_prompt::Gate::Refuse(message) => {
+                            ui.pending_last_command = None;
+                            // Names a project path and orchestration from the
+                            // config: shown, never obeyed.
+                            ui.status_message = Some((
+                                crate::untrusted_text::escape_control_and_bidi(&message),
+                                std::time::Instant::now(),
+                            ));
+                            return Flow::Continue;
+                        }
+                    }
+                }
 
                 // Orchestration path — manage own panes, no agent pane.
                 if let Some(orch_config) = req.orchestration_config {
@@ -11787,6 +12057,7 @@ fn dispatch_action(
             ui.scheduled_selected = 0;
             ui.scheduled_delete_confirm = false;
             ui.scheduled_live_names = live_schedule_names();
+            reload_schedule_refusals(ui);
             ui.mode = UiMode::ScheduledTasks;
         }
         // PRD #127 finding #4: `[Add]` button parity for the `a` key. PRD #170
@@ -11812,6 +12083,88 @@ fn dispatch_action(
                 ui.scheduled_delete_confirm = true;
                 // Issue #1799: this question waits for its own frame.
                 ui.confirm_choices_drawn = None;
+            }
+        }
+        // PRD #1885: `a` in the trust prompt. The daemon approves exactly the
+        // text the prompt showed (its digest), then what the prompt was shown
+        // for goes through its own gate again — which opens it now that it is
+        // approved, or, when the file changed in the meantime, shows the new
+        // text instead.
+        Action::CancelTrustPrompt => {
+            cancel_trust_prompt(ui);
+        }
+        Action::ApproveProjectTrust => {
+            let Some(prompt) = ui.trust_prompt.take() else {
+                ui.mode = UiMode::Normal;
+                return Flow::Continue;
+            };
+            ui.mode = UiMode::Normal;
+            let view = &prompt.view;
+            let name = crate::untrusted_text::escape_control_and_bidi(&view.orchestration);
+            let proceed = match pane.approve_project_trust(
+                &view.config_dir,
+                &view.orchestration,
+                &view.digest,
+            ) {
+                Ok(crate::daemon_client::GatedQuery::Answered(_)) => true,
+                Err(e) if crate::trust_prompt::is_text_changed(&e) => {
+                    ui.status_message = Some((
+                        format!(
+                            "Orchestration '{name}' changed while it was shown, so nothing was \
+                             approved. Review the new text."
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                    true
+                }
+                Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+                    // The command names the config's path and orchestration:
+                    // shown, never obeyed.
+                    ui.status_message = Some((
+                        crate::untrusted_text::escape_control_and_bidi(&format!(
+                            "{} Not approved: run `{}` from a terminal outside the deck.",
+                            crate::trust_prompt::OLDER_DAEMON_NOTE,
+                            crate::project_trust::approve_command(
+                                std::path::Path::new(&view.config_dir),
+                                &view.orchestration
+                            )
+                        )),
+                        std::time::Instant::now(),
+                    ));
+                    false
+                }
+                Err(e) => {
+                    // The daemon's error can quote the config: shown, never
+                    // obeyed.
+                    let e = crate::untrusted_text::escape_control_and_bidi(&e);
+                    ui.status_message = Some((
+                        format!("Orchestration '{name}' not approved: {e}"),
+                        std::time::Instant::now(),
+                    ));
+                    false
+                }
+            };
+            if !proceed {
+                return Flow::Continue;
+            }
+            match prompt.purpose {
+                TrustPromptPurpose::Open { req, form } => {
+                    ui.submitted_orchestration_form = form;
+                    return dispatch_action(
+                        Action::SpawnPane(req),
+                        ui,
+                        pane,
+                        state,
+                        tab_manager,
+                        snapshot,
+                        filtered,
+                        selected_id,
+                        frame_area,
+                    );
+                }
+                TrustPromptPurpose::Restore(pending) => {
+                    restore_held_orchestration(ui, pane, state, tab_manager, frame_area, pending);
+                }
             }
         }
         Action::ScheduleRunNow(name) => {
@@ -11848,6 +12201,7 @@ fn dispatch_action(
             // PRD #127 N2: dialog stays open after run-now; refresh live-status snapshot.
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_live_names = live_schedule_names();
+                reload_schedule_refusals(ui);
             }
         }
         Action::ScheduleDelete(name) => {
@@ -11880,6 +12234,7 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
+                reload_schedule_refusals(ui);
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
                 }
@@ -11926,11 +12281,47 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
+                reload_schedule_refusals(ui);
             }
         }
         Action::Continue => {}
     }
     Flow::Continue
+}
+
+/// PRD #1885: add to `session` every saved orchestration the startup restore
+/// held back for approval — still waiting for its prompt, open in it, or
+/// declined — exactly as it was saved, so a save made before it is approved
+/// does not drop it and the next start asks about it again. One whose
+/// orchestration (the same project and config name) is open in a live tab, and
+/// so is already saved from that tab, is left out rather than restored twice.
+fn keep_held_trust_restores(ui: &UiState, session: &mut config::SavedSession) {
+    let open = ui
+        .trust_prompt
+        .as_ref()
+        .and_then(|prompt| match &prompt.purpose {
+            TrustPromptPurpose::Restore(pending) => Some(&pending.saved_pane),
+            TrustPromptPurpose::Open { .. } => None,
+        });
+    let held: Vec<config::SavedPane> = ui
+        .pending_trust_restores
+        .iter()
+        .map(|pending| &pending.saved_pane)
+        .chain(open)
+        .chain(&ui.declined_trust_restores)
+        .filter(|held| {
+            let Some(orch) = held.orchestration.as_ref() else {
+                return true;
+            };
+            !session.panes.iter().any(|live| {
+                live.orchestration.as_ref().is_some_and(|o| {
+                    o.project_path == orch.project_path && o.config_name == orch.config_name
+                })
+            })
+        })
+        .cloned()
+        .collect();
+    session.panes.extend(held);
 }
 
 /// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
@@ -11957,6 +12348,7 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState, tab_mana
     // pane-derived snapshot builder cannot know. `track_session_focus` keeps
     // `ui.session_focus` current and is what marked this write dirty.
     session.focus = ui.session_focus.clone();
+    keep_held_trust_restores(ui, &mut session);
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
@@ -12038,6 +12430,299 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
+/// PRD #89 M2b.3 — rebuild one saved orchestration tab on the daemon-empty
+/// restore path: the orchestrator and role panes in saved order, the saved
+/// prompt replayed to the start role, the start cursor. Answers the tab's
+/// index, or why it could not be opened (the caller leaves it unrestored
+/// then).
+///
+/// PRD #1885: called only for an orchestration whose commands and prompts are
+/// approved as `orch_config` holds them — at startup, and again once a trust
+/// prompt the startup restore held it back for is approved
+/// ([`restore_held_orchestration`]).
+#[allow(clippy::too_many_arguments)]
+fn restore_orchestration_tab(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    frame_area: Rect,
+    saved_pane: &config::SavedPane,
+    orch_snap: &config::OrchestrationSnapshot,
+    orch_config: &OrchestrationConfig,
+    saved_start_idx: usize,
+) -> Result<usize, String> {
+    // All roles share spawn dims (Tiled); role_index=0 so the
+    // helper falls back to "role 0 expanded" — the per-frame
+    // `resize_panes_to_layout` reconciles the exact rects once
+    // the tab is active. Mirrors the live new-pane path.
+    let spawn_dims = orchestration_role_pane_dims(
+        frame_area,
+        orch_config.roles.len(),
+        0,
+        PaneLayout::Tiled,
+        true,
+        // PRD #336: a restored tab adopts the current
+        // global split, like any other tab. The global is
+        // not persisted across launches, so a restore at
+        // startup lands on the 34/66 default.
+        tab_manager.orchestration_split_narrow(),
+    );
+    // Empty saved prompt → `None` so nothing is posted
+    // (matching the live path's "no prompt" semantics); a
+    // non-empty prompt is posted to the start role's inbox
+    // again.
+    let replay_prompt =
+        (!orch_snap.orchestrator_prompt.is_empty()).then(|| orch_snap.orchestrator_prompt.clone());
+    // PRD #89 review-fix F3: honor the SAVED start cursor,
+    // even when it differs from the role the config seats
+    // now, so the prompt's post and the landing focus
+    // target the role the user left as start. Issue #523
+    // review: passed as the tab's SEAT rather than patched
+    // onto `start_role_index` afterwards, so the membership
+    // the daemon registers (who may `delegate`) and the Pi
+    // seed name that same role — one orchestrator, not a
+    // prompt on one pane and delegate rights on another.
+    let (tab_idx, role_pane_ids) = tab_manager
+        .open_orchestration_tab_restoring(
+            orch_config,
+            &saved_pane.dir,
+            replay_prompt,
+            // PRD #89 review-fix F4: thread the saved user title
+            // so the rebuilt tab comes back under the user's name
+            // rather than the canonical config/cwd name. `None`
+            // when unset falls back to the canonical name.
+            orch_snap.display_title.as_deref(),
+            spawn_dims,
+            Some(saved_start_idx),
+            // Issue #929: only the roles that were running when
+            // the snapshot was saved; an old snapshot, every role.
+            &orch_snap.roles_to_start_on_restore(orch_config.roles.len()),
+        )
+        .map_err(|e| e.to_string())?;
+    // Snapshot each role pane's daemon agent_id before
+    // the placeholder insert so the strict-equality
+    // reuse guard accepts each role agent's first
+    // `SessionStart` (mirrors the live path).
+    let role_agent_ids: Vec<Option<String>> = role_pane_ids
+        .iter()
+        .map(|id| pane.pane_agent_id(id))
+        .collect();
+    // PRD #1666 part 2 (G-fix7): each card stamped
+    // from the attach that produced its pane.
+    let role_attached_on: Vec<_> = role_pane_ids
+        .iter()
+        .map(|id| pane.pane_incarnation(id))
+        .collect();
+    {
+        let mut st = state.blocking_write();
+        for ((id, agent_id), attached_on) in role_pane_ids
+            .iter()
+            .zip(role_agent_ids.iter())
+            .zip(role_attached_on)
+        {
+            // Issue #929: a role restore did not start keeps its
+            // card through a placeholder on its dead-slot id, as
+            // on a tab rebuilt from a daemon; it is no pane, so it
+            // is not registered.
+            if is_dead_slot_pane_id(id) {
+                st.insert_placeholder_session(id.clone(), Some(saved_pane.dir.clone()), None, None);
+                continue;
+            }
+            st.register_pane(id.clone());
+            let learned_from = attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+            st.insert_placeholder_session_learned(
+                id.clone(),
+                Some(saved_pane.dir.clone()),
+                None,
+                agent_id.clone(),
+                learned_from,
+            );
+        }
+        // Issue #462: `pane_orchestration_map` is
+        // deliberately omitted here too — the
+        // daemon-empty snapshot restore runs in the
+        // TUI process, which never routes. The full
+        // reasoning, including the `None == None`
+        // degeneracy in `delegate_targets` that a
+        // TUI-side router would silently hit, is on
+        // the first of these registrations in
+        // `surface_one_orchestration`.
+        // The tab's seat — the saved cursor (above).
+        for (i, role) in orch_config.roles.iter().enumerate() {
+            if is_dead_slot_pane_id(&role_pane_ids[i]) {
+                continue;
+            }
+            st.pane_role_map
+                .insert(role_pane_ids[i].clone(), role.name.clone());
+            st.pane_cwd_map
+                .insert(role_pane_ids[i].clone(), saved_pane.dir.clone());
+            if i == saved_start_idx {
+                st.orchestrator_pane_ids.insert(role_pane_ids[i].clone());
+            }
+        }
+    }
+    for (i, role) in orch_config.roles.iter().enumerate() {
+        ui.pane_display_names
+            .insert(role_pane_ids[i].clone(), role.name.clone());
+        ui.pane_names
+            .insert(role_pane_ids[i].clone(), role.name.clone());
+        // Issue #308: a restored role keeps its
+        // declared badge, so a session restore looks
+        // like the tab that was saved rather than
+        // reverting every launcher role to
+        // "No agent".
+        if let Some(declared) = role.declared_agent_type() {
+            ui.pane_declared_agent
+                .insert(role_pane_ids[i].clone(), declared);
+        }
+    }
+    // Re-capture the orchestration metadata onto the
+    // start role pane so a later snapshot keeps the
+    // tab (only the start role carries the block).
+    // PRD #89 review-fix F3: key it under the SAVED
+    // (validated) start cursor — consistent with the
+    // honored start role above — not the config
+    // default, so a re-save preserves the saved
+    // cursor on the same pane that carries the block.
+    ui.pane_metadata
+        .insert(role_pane_ids[saved_start_idx].clone(), saved_pane.clone());
+    Ok(tab_idx)
+}
+
+/// PRD #1885: what restoring `orch_config` — resolved from `orch_snap` — does:
+/// open it when the daemon says it is approved as it now reads, hold it back
+/// for a trust prompt when it is not, or leave it unrestored.
+fn restore_trust_gate(
+    pane: &dyn PaneController,
+    saved_pane: &config::SavedPane,
+    orch_snap: &config::OrchestrationSnapshot,
+    orch_config: &OrchestrationConfig,
+) -> crate::trust_prompt::Gate {
+    let answer = pane.project_trust_state(&saved_pane.dir, &orch_config.name);
+    crate::trust_prompt::decide_for_dir(
+        answer,
+        std::path::Path::new(&saved_pane.dir),
+        orch_config,
+        || {
+            resolve_orchestration_for_restore(orch_snap, &saved_pane.dir)
+                .ok()
+                .map(|(config, _)| config)
+        },
+    )
+}
+
+/// PRD #1885: whether a remit re-arm (compaction or `/clear` on the start
+/// role) may publish `config`, the text the running tab holds — which a warm
+/// reattach read from the config without a trust check. Answers `true` when it
+/// is the approved text (adopting the config as it now reads when that is the
+/// approved text with the same roles); otherwise reports why nothing was sent,
+/// in the status line and the log, and answers `false`. Never prompts.
+fn rearm_trust_gate(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    config: &mut OrchestrationConfig,
+    cwd: &str,
+) -> bool {
+    let name = config.name.clone();
+    let dir = std::path::Path::new(cwd);
+    let answer = pane.project_trust_state(cwd, &name);
+    let reread = || {
+        load_project_config(dir)
+            .ok()
+            .flatten()
+            .and_then(|c| c.orchestrations.into_iter().find(|o| o.name == name))
+    };
+    match crate::trust_prompt::decide_rearm_for_dir(answer, dir, config, reread) {
+        crate::trust_prompt::Rearm::Publish => true,
+        crate::trust_prompt::Rearm::PublishApproved(fresh) => {
+            *config = fresh;
+            true
+        }
+        crate::trust_prompt::Rearm::Refuse(message) => {
+            // Names a project path and orchestration from the config: shown,
+            // never obeyed.
+            let shown = crate::untrusted_text::escape_control_and_bidi(&message);
+            tracing::warn!(cwd = %crate::untrusted_text::escape_control_and_bidi(cwd), "{shown}");
+            ui.status_message = Some((shown, std::time::Instant::now()));
+            false
+        }
+    }
+}
+
+/// PRD #1885: restore a saved orchestration the startup restore held back,
+/// once its trust prompt was approved: re-resolved from the saved session and
+/// gated again, so what opens is exactly the approved text (and a config that
+/// changed meanwhile asks again instead). Lands on the restored tab.
+fn restore_held_orchestration(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    frame_area: Rect,
+    pending: PendingTrustRestore,
+) {
+    let saved_pane = &pending.saved_pane;
+    let Some(orch_snap) = saved_pane.orchestration.as_ref() else {
+        return;
+    };
+    let name = crate::untrusted_text::escape_control_and_bidi(&orch_snap.config_name);
+    let not_restored = |ui: &mut UiState, why: String| {
+        ui.status_message = Some((
+            format!(
+                "Orchestration '{name}' not restored: {}",
+                crate::untrusted_text::escape_control_and_bidi(&why)
+            ),
+            std::time::Instant::now(),
+        ));
+    };
+    let (orch_config, saved_start_idx) =
+        match resolve_orchestration_for_restore(orch_snap, &saved_pane.dir) {
+            Ok(resolved) => resolved,
+            Err(reason) => return not_restored(ui, reason),
+        };
+    match restore_trust_gate(pane, saved_pane, orch_snap, &orch_config) {
+        crate::trust_prompt::Gate::Open(config) => match restore_orchestration_tab(
+            ui,
+            pane,
+            state,
+            tab_manager,
+            frame_area,
+            saved_pane,
+            orch_snap,
+            &config,
+            saved_start_idx,
+        ) {
+            Ok(tab_idx) => {
+                tab_manager.switch_to(tab_idx);
+            }
+            Err(e) => not_restored(ui, e),
+        },
+        crate::trust_prompt::Gate::Prompt(view) => {
+            let held = PendingTrustRestore {
+                saved_pane: saved_pane.clone(),
+                view: view.clone(),
+            };
+            open_trust_prompt(ui, view, TrustPromptPurpose::Restore(held));
+        }
+        crate::trust_prompt::Gate::Refuse(why) => not_restored(ui, why),
+    }
+}
+
+/// PRD #1885: show the next held-back restore's trust prompt once the deck is
+/// free for it — on the dashboard or in a pane, with no other dialog open — so
+/// each one is asked about in turn and none of them blocks the rest of the
+/// session from restoring first.
+fn open_next_trust_restore(ui: &mut UiState) {
+    if ui.trust_prompt.is_some() || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput) {
+        return;
+    }
+    if let Some(pending) = ui.pending_trust_restores.pop_front() {
+        let view = pending.view.clone();
+        open_trust_prompt(ui, view, TrustPromptPurpose::Restore(pending));
+    }
+}
+
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
 /// orchestration metadata on the daemon-empty restore path.
 ///
@@ -12050,8 +12735,9 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 ///   added/removed/renamed/reordered) — the tab the user saved no longer
 ///   exists as saved.
 ///
-/// On `Err`, the caller surfaces the reason via `session_warnings` and falls
-/// back to a PLAIN dashboard pane (never a half-broken orchestration tab).
+/// On `Err`, the caller surfaces the reason via `session_warnings` and leaves
+/// the orchestration unrestored (never a half-broken orchestration tab, and,
+/// since PRD #1885, never a plain pane running its saved command unchecked).
 ///
 /// On `Ok`, returns the resolved config AND the validated start-role index to
 /// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
@@ -12067,7 +12753,7 @@ fn resolve_orchestration_for_restore(
     // config at a divergent `project_path` would execute a `.dot-agent-deck.toml`
     // an attacker controls. Canonicalize both and refuse to re-resolve unless
     // they name the same directory; a divergence (or a `project_path` that no
-    // longer resolves) is treated as drift -> plain-pane fallback, so the
+    // longer resolves) is treated as drift -> left unrestored, so the
     // planted config is never executed.
     let project_dir = std::path::Path::new(&snap.project_path);
     let canon_project = project_dir.canonicalize().map_err(|e| {
@@ -12137,11 +12823,11 @@ fn resolve_orchestration_for_restore(
     // is structurally valid yet role-less, and a tampered cursor could point
     // past the end. Either would index an empty/short `role_pane_ids` and panic
     // at startup (crash-loop). Treat an out-of-range cursor — which includes
-    // every index of an empty role set — as drift, so the caller falls back to
-    // a plain pane instead of panicking.
+    // every index of an empty role set — as drift, so the caller leaves it
+    // unrestored instead of panicking.
     if snap.start_role_index >= orch.roles.len() {
         return Err(format!(
-            "orchestration '{}' has no role at saved start index {} (role count {}) — falling back",
+            "orchestration '{}' has no role at saved start index {} (role count {})",
             snap.config_name,
             snap.start_role_index,
             orch.roles.len()
@@ -12703,6 +13389,15 @@ fn handle_key_event(
                 Action::Continue
             }
             UiMode::Upgrade => handle_upgrade_key(key, ui),
+            // PRD #1885: `Ctrl+C` keeps its PRD #40 safety net; leaving for
+            // the quit flow cancels the prompt, approving and spawning nothing.
+            UiMode::TrustPrompt if is_ctrl_c => {
+                cancel_trust_prompt(ui);
+                ui.quit_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                Action::Continue
+            }
+            UiMode::TrustPrompt => handle_trust_prompt_key(key, ui),
         });
     }
 
@@ -13386,180 +14081,81 @@ pub fn run_tui(
             // `OrchestrationConfig` from `project_path` + `config_name`. On
             // success we `continue`; on drift (config gone, orchestration
             // renamed/removed, role set changed) we push a clear warning NAMING
-            // the orchestration and fall through to the plain-pane restore below
-            // — never a half-broken tab. Unlike warm-daemon hydration (session/restore/007), this
+            // the orchestration and leave it unrestored — never a half-broken
+            // tab, and (PRD #1885) never a plain pane running its saved command
+            // without a trust check. Unlike warm-daemon hydration (session/restore/007), this
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
                 match resolve_orchestration_for_restore(orch_snap, &saved_pane.dir) {
                     Ok((orch_config, saved_start_idx)) => {
                         let frame_area = terminal.get_frame().area();
-                        // All roles share spawn dims (Tiled); role_index=0 so the
-                        // helper falls back to "role 0 expanded" — the per-frame
-                        // `resize_panes_to_layout` reconciles the exact rects once
-                        // the tab is active. Mirrors the live new-pane path.
-                        let spawn_dims = orchestration_role_pane_dims(
+                        // PRD #1885: a saved orchestration restores only when its
+                        // commands and prompts are approved as they now read.
+                        // One that is not is held back for its own trust prompt
+                        // once the deck is up, and nothing of it spawns until
+                        // then; it is not restored as a plain pane either.
+                        let orch_config =
+                            match restore_trust_gate(&*pane, saved_pane, orch_snap, &orch_config) {
+                                crate::trust_prompt::Gate::Open(config) => config,
+                                crate::trust_prompt::Gate::Prompt(view) => {
+                                    ui.pending_trust_restores.push_back(PendingTrustRestore {
+                                        saved_pane: saved_pane.clone(),
+                                        view,
+                                    });
+                                    continue;
+                                }
+                                crate::trust_prompt::Gate::Refuse(reason) => {
+                                    ui.session_warnings.push(
+                                        crate::untrusted_text::escape_control_and_bidi(&format!(
+                                            "Warning: orchestration '{}' was not restored: \
+                                             {reason}",
+                                            orch_snap.config_name
+                                        )),
+                                    );
+                                    continue;
+                                }
+                            };
+                        match restore_orchestration_tab(
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
                             frame_area,
-                            orch_config.roles.len(),
-                            0,
-                            PaneLayout::Tiled,
-                            true,
-                            // PRD #336: a restored tab adopts the current
-                            // global split, like any other tab. The global is
-                            // not persisted across launches, so a restore at
-                            // startup lands on the 34/66 default.
-                            tab_manager.orchestration_split_narrow(),
-                        );
-                        // Empty saved prompt → `None` so nothing is posted
-                        // (matching the live path's "no prompt" semantics); a
-                        // non-empty prompt is posted to the start role's inbox
-                        // again.
-                        let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
-                            .then(|| orch_snap.orchestrator_prompt.clone());
-                        // PRD #89 review-fix F3: honor the SAVED start cursor,
-                        // even when it differs from the role the config seats
-                        // now, so the prompt's post and the landing focus
-                        // target the role the user left as start. Issue #523
-                        // review: passed as the tab's SEAT rather than patched
-                        // onto `start_role_index` afterwards, so the membership
-                        // the daemon registers (who may `delegate`) and the Pi
-                        // seed name that same role — one orchestrator, not a
-                        // prompt on one pane and delegate rights on another.
-                        match tab_manager.open_orchestration_tab_restoring(
+                            saved_pane,
+                            orch_snap,
                             &orch_config,
-                            &saved_pane.dir,
-                            replay_prompt,
-                            // PRD #89 review-fix F4: thread the saved user title
-                            // so the rebuilt tab comes back under the user's name
-                            // rather than the canonical config/cwd name. `None`
-                            // when unset falls back to the canonical name.
-                            orch_snap.display_title.as_deref(),
-                            spawn_dims,
-                            Some(saved_start_idx),
-                            // Issue #929: only the roles that were running when
-                            // the snapshot was saved; an old snapshot, every role.
-                            &orch_snap.roles_to_start_on_restore(orch_config.roles.len()),
+                            saved_start_idx,
                         ) {
-                            Ok((tab_idx, role_pane_ids)) => {
-                                // Snapshot each role pane's daemon agent_id before
-                                // the placeholder insert so the strict-equality
-                                // reuse guard accepts each role agent's first
-                                // `SessionStart` (mirrors the live path).
-                                let role_agent_ids: Vec<Option<String>> = role_pane_ids
-                                    .iter()
-                                    .map(|id| pane.pane_agent_id(id))
-                                    .collect();
-                                // PRD #1666 part 2 (G-fix7): each card stamped
-                                // from the attach that produced its pane.
-                                let role_attached_on: Vec<_> = role_pane_ids
-                                    .iter()
-                                    .map(|id| pane.pane_incarnation(id))
-                                    .collect();
-                                {
-                                    let mut st = state.blocking_write();
-                                    for ((id, agent_id), attached_on) in role_pane_ids
-                                        .iter()
-                                        .zip(role_agent_ids.iter())
-                                        .zip(role_attached_on)
-                                    {
-                                        // Issue #929: a role restore did not
-                                        // start keeps its card through a
-                                        // placeholder on its dead-slot id, as
-                                        // on a tab rebuilt from a daemon; it is
-                                        // no pane, so it is not registered.
-                                        if is_dead_slot_pane_id(id) {
-                                            st.insert_placeholder_session(
-                                                id.clone(),
-                                                Some(saved_pane.dir.clone()),
-                                                None,
-                                                None,
-                                            );
-                                            continue;
-                                        }
-                                        st.register_pane(id.clone());
-                                        let learned_from = attached_on
-                                            .unwrap_or_else(|| st.stream_incarnation.clone());
-                                        st.insert_placeholder_session_learned(
-                                            id.clone(),
-                                            Some(saved_pane.dir.clone()),
-                                            None,
-                                            agent_id.clone(),
-                                            learned_from,
-                                        );
-                                    }
-                                    // Issue #462: `pane_orchestration_map` is
-                                    // deliberately omitted here too — the
-                                    // daemon-empty snapshot restore runs in the
-                                    // TUI process, which never routes. The full
-                                    // reasoning, including the `None == None`
-                                    // degeneracy in `delegate_targets` that a
-                                    // TUI-side router would silently hit, is on
-                                    // the first of these registrations in
-                                    // `surface_one_orchestration`.
-                                    // The tab's seat — the saved cursor (above).
-                                    for (i, role) in orch_config.roles.iter().enumerate() {
-                                        if is_dead_slot_pane_id(&role_pane_ids[i]) {
-                                            continue;
-                                        }
-                                        st.pane_role_map
-                                            .insert(role_pane_ids[i].clone(), role.name.clone());
-                                        st.pane_cwd_map.insert(
-                                            role_pane_ids[i].clone(),
-                                            saved_pane.dir.clone(),
-                                        );
-                                        if i == saved_start_idx {
-                                            st.orchestrator_pane_ids
-                                                .insert(role_pane_ids[i].clone());
-                                        }
-                                    }
-                                }
-                                for (i, role) in orch_config.roles.iter().enumerate() {
-                                    ui.pane_display_names
-                                        .insert(role_pane_ids[i].clone(), role.name.clone());
-                                    ui.pane_names
-                                        .insert(role_pane_ids[i].clone(), role.name.clone());
-                                    // Issue #308: a restored role keeps its
-                                    // declared badge, so a session restore looks
-                                    // like the tab that was saved rather than
-                                    // reverting every launcher role to
-                                    // "No agent".
-                                    if let Some(declared) = role.declared_agent_type() {
-                                        ui.pane_declared_agent
-                                            .insert(role_pane_ids[i].clone(), declared);
-                                    }
-                                }
-                                // Re-capture the orchestration metadata onto the
-                                // start role pane so a later snapshot keeps the
-                                // tab (only the start role carries the block).
-                                // PRD #89 review-fix F3: key it under the SAVED
-                                // (validated) start cursor — consistent with the
-                                // honored start role above — not the config
-                                // default, so a re-save preserves the saved
-                                // cursor on the same pane that carries the block.
-                                ui.pane_metadata.insert(
-                                    role_pane_ids[saved_start_idx].clone(),
-                                    saved_pane.clone(),
-                                );
+                            Ok(tab_idx) => {
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
                                 }
                                 continue;
                             }
                             Err(e) => {
-                                ui.session_warnings.push(format!(
-                                    "Warning: failed to rebuild orchestration '{}': {e}; restoring '{}' as a plain pane",
-                                    orch_snap.config_name, saved_pane.name
-                                ));
-                                // Fall through to the plain-pane restore below.
+                                ui.session_warnings.push(
+                                    crate::untrusted_text::escape_control_and_bidi(&format!(
+                                        "Warning: failed to rebuild orchestration '{}': {e}; \
+                                         it was not restored",
+                                        orch_snap.config_name
+                                    )),
+                                );
+                                continue;
                             }
                         }
                     }
                     Err(reason) => {
-                        ui.session_warnings.push(format!(
-                            "Warning: {reason}; restoring '{}' as a plain pane",
-                            saved_pane.name
-                        ));
-                        // Fall through to the plain-pane restore below.
+                        // PRD #1885: a snapshot that no longer resolves cannot
+                        // be trust-checked, so it stays unrestored. Restoring
+                        // it as a plain pane would run its saved command — the
+                        // start role's, as captured — with no approval.
+                        ui.session_warnings
+                            .push(crate::untrusted_text::escape_control_and_bidi(&format!(
+                                "Warning: {reason}; orchestration '{}' was not restored",
+                                orch_snap.config_name
+                            )));
+                        continue;
                     }
                 }
             }
@@ -13759,6 +14355,8 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
+        refresh_schedule_refusals_if_due(&mut ui, std::time::Instant::now(), schedule_refusals);
+
         // Issue #949 — notice a moved position (active tab / focused pane) and
         // mark the snapshot dirty, so the flush below has something to write.
         // Before the flush, not after: otherwise the move is a frame late every
@@ -13874,6 +14472,8 @@ pub fn run_tui(
         // last pass is on screen in this one, not a 16 ms input poll later,
         // and its shown age starts from what the daemon reported.
         poll_host_metrics(&mut ui, std::time::Instant::now());
+        // PRD #1885: a saved orchestration held back for approval asks now.
+        open_next_trust_restore(&mut ui);
         // PRD #1666 §6.4: the picker shows the daemon's current rows.
         poll_inbox_attention(&mut ui, &snapshot);
 
@@ -14183,6 +14783,12 @@ pub fn run_tui(
                         // The former reads that section back off the existing
                         // file first and carries it forward, falling back to
                         // today's no-task behavior when there is none.
+                        //
+                        // PRD #1885: and only the approved text. A warm
+                        // reattach adopted `config` from the file without a
+                        // trust check, so it is checked here, before anything
+                        // is published from it.
+                        && rearm_trust_gate(&mut ui, &*pane, config, cwd)
                         && let Some(published) =
                             reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
                     {
@@ -14309,7 +14915,18 @@ pub fn run_tui(
                                     >= CLEAR_REASSERT_RETRY_FLOOR
                             });
 
-                    if no_delivery_pending && !permanently_excluded && retry_floor_ok {
+                    if no_delivery_pending
+                        && !permanently_excluded
+                        && retry_floor_ok
+                        && !rearm_trust_gate(&mut ui, &*pane, config, cwd)
+                    {
+                        // PRD #1885: not the approved text, and the gate said
+                        // why. This `/clear` is settled — retrying it every
+                        // frame would only repeat the refusal.
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                        ui.orchestration_remit_clear_retry_at.remove(id);
+                    } else if no_delivery_pending && !permanently_excluded && retry_floor_ok {
                         ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
                         // See the compaction re-arm's identical comment above:
                         // `reassert_orchestrator_prompt` reads any existing
@@ -14626,6 +15243,17 @@ pub fn run_tui(
                         let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
                         dialog.scroll_by(if up { -1 } else { 1 });
                     }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #1885: the wheel over the trust prompt scrolls its review,
+                // as ↑/↓ do; anywhere else it is swallowed below.
+                if is_scroll && ui.mode == UiMode::TrustPrompt {
+                    let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                    scroll_trust_prompt(&mut ui, up, mouse.column, mouse.row);
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
                     }
@@ -15333,6 +15961,7 @@ pub fn run_tui(
         // move behind.
         track_session_focus(&mut ui, &tab_manager);
         session.focus = ui.session_focus.clone();
+        keep_held_trust_restores(&ui, &mut session);
         if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
@@ -17421,6 +18050,44 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
             .collect();
     }
+    if ui.mode == UiMode::TrustPrompt
+        && let Some(prompt) = ui.trust_prompt.as_mut()
+    {
+        let action = prompt.action();
+        let layout = crate::trust_prompt::render(frame, area, &prompt.view, action, prompt.scroll);
+        prompt.max_scroll = layout.max_scroll;
+        prompt.scroll = prompt.scroll.min(layout.max_scroll);
+        prompt.drawn_inner = Some(layout.inner);
+        // The approve key's label is the one choice: `a` counts only once a
+        // flushed frame shows it (`refuse_undrawn_choice`). The approve and
+        // cancel labels are its buttons: a click on either counts only where a
+        // flushed frame shows the whole label (`record_flushed_confirmation`).
+        let buttons = [
+            (
+                Action::ApproveProjectTrust,
+                layout.approve,
+                action.approve_label(),
+            ),
+            (
+                Action::CancelTrustPrompt,
+                layout.cancel,
+                crate::trust_prompt::CANCEL_LABEL,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(target, rect, label)| rect.map(|rect| (target, rect, label.to_string())))
+        .collect();
+        confirmation = Some(ConfirmDrawing {
+            buttons,
+            choices: ConfirmChoices {
+                inner: layout.inner,
+                cells: vec![match layout.footer {
+                    Some((x, y)) => (x, Some(y), action.approve_label().to_string()),
+                    None => (layout.inner.x, None, action.approve_label().to_string()),
+                }],
+            },
+        });
+    }
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
         // contract); its keystrokes (y/n/Enter/Esc) remain the only path.
@@ -19400,6 +20067,9 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
             | UiMode::StopConfirm
             | UiMode::ConfigGenPrompt
             | UiMode::StarPrompt
+            // PRD #1885: input typed before the trust prompt was on screen
+            // never approves it.
+            | UiMode::TrustPrompt
     ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm))
         && !ui
             .confirm_choices_drawn
@@ -19440,6 +20110,11 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
             return (!shown.contains(choice)).then_some(Action::Continue);
         }
         UiMode::DirPicker => return refuse_undrawn_pick(key, ui),
+        // PRD #1885: `a` approves only once a frame showed its label.
+        UiMode::TrustPrompt => {
+            let refused = key.code == KeyCode::Char('a') && !shown.contains(0);
+            return refused.then_some(Action::Continue);
+        }
         _ => {}
     }
     let selected = match mode {
@@ -21565,6 +22240,38 @@ fn render_scheduled_tasks(
     let status_col = 11usize; // widest status ("disabled") + padding
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
 
+    // PRD #1885: the selected task's last fire, when it was refused as not
+    // approved — the refusal names the command that approves it — wrapped to
+    // the list's width beneath the rows.
+    let refusal_lines: Vec<String> = if ui.scheduled_delete_confirm {
+        Vec::new()
+    } else {
+        ui.scheduled_tasks
+            .get(ui.scheduled_selected)
+            .and_then(|t| ui.scheduled_refusals.get(&t.name))
+            .map(|refusal| {
+                let width = (2 + name_col + status_col + next_col).max(56);
+                let mut lines = vec![format!(
+                    "  Last fire refused at {}:",
+                    crate::untrusted_text::strip_control_and_bidi(&refusal.at, false)
+                )];
+                let text = crate::untrusted_text::strip_control_and_bidi(&refusal.message, false);
+                let mut line = String::from("   ");
+                for word in text.split_whitespace() {
+                    if line.chars().count() + 1 + word.chars().count() > width && line.len() > 3 {
+                        lines.push(std::mem::replace(&mut line, String::from("   ")));
+                    }
+                    line.push(' ');
+                    line.push_str(word);
+                }
+                if line.len() > 3 {
+                    lines.push(line);
+                }
+                lines
+            })
+            .unwrap_or_default()
+    };
+
     // PRD #144: the delete confirmation renders on its natural lines (the name
     // on its own line, the fixed `… (y/n)` trailer on the next). The modal is
     // sized to contain them below, so the trailer is never pushed past the
@@ -21597,7 +22304,7 @@ fn render_scheduled_tasks(
     } else {
         2
     };
-    let chrome_lines = 3 + footer_lines;
+    let chrome_lines = 3 + footer_lines + refusal_lines.len();
 
     // Widest content line drives the modal width. The padded field rows fill to
     // the inner width, so they don't drive it — the list columns, the header,
@@ -21623,9 +22330,15 @@ fn render_scheduled_tasks(
     } else {
         0
     };
+    let refusal_w = refusal_lines
+        .iter()
+        .map(|l| count_chars(l))
+        .max()
+        .unwrap_or(0);
     let content_w = [
         list_w,
         header_w,
+        refusal_w,
         confirm_w,
         BUTTON_ROW_W,
         count_chars("  Esc close"),
@@ -21692,7 +22405,8 @@ fn render_scheduled_tasks(
             .take(win_end - win_start)
         {
             let is_live = ui.scheduled_live_names.contains(&task.name);
-            let status = schedule_status_label(task.enabled, is_live);
+            let refused = ui.scheduled_refusals.contains_key(&task.name);
+            let status = schedule_status_label_with(task.enabled, is_live, refused);
             let next = schedule_next_fire_display(task);
             let selected = i == ui.scheduled_selected;
             let marker = if selected { "\u{25b6} " } else { "  " };
@@ -21721,6 +22435,12 @@ fn render_scheduled_tasks(
                 },
             ));
             lines.push(Line::styled(row, style));
+        }
+        for line in &refusal_lines {
+            lines.push(Line::styled(
+                line.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
         }
     }
 
@@ -28493,6 +29213,8 @@ mod tests {
         };
 
         let open = |tm: &mut TabManager, ui: &mut UiState, name: &str| {
+            // PRD #1885: approved, so the tab opens without the trust prompt.
+            crate::project_trust::approve_orchestration_for_test(tmp.path(), &cfg(name));
             let req = NewPaneRequest {
                 dir: tmp.path().to_path_buf(),
                 name: name.to_string(),
@@ -39228,12 +39950,127 @@ mod tests {
         }
     }
 
+    /// PRD #1885 (Greptile P2 / Qodo finding 3 on PR #2256): the open manager
+    /// picks up a refusal recorded after it opened — a fire runs after its
+    /// `RunNow` returns — on its refresh cadence, and reads nothing before that
+    /// cadence is due or while it is closed.
+    #[test]
+    fn the_open_schedule_manager_picks_up_a_refusal_recorded_after_it_opened() {
+        let refused = || {
+            let mut outcomes = crate::schedule_outcome::Outcomes::new();
+            outcomes.insert(
+                "nightly".to_string(),
+                crate::schedule_outcome::Refusal {
+                    at: "2026-11-10T09:00:00Z".to_string(),
+                    message: "orchestration 'team' was never approved".to_string(),
+                },
+            );
+            outcomes
+        };
+        let opened = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.scheduled_tasks = vec![make_scheduled_task("nightly", true)];
+        ui.mode = UiMode::ScheduledTasks;
+        ui.scheduled_refusals_read_at = Some(opened);
+
+        refresh_schedule_refusals_if_due(&mut ui, opened, || panic!("not due yet"));
+        assert!(ui.scheduled_refusals.is_empty());
+
+        let later = opened + SCHEDULE_REFUSALS_REFRESH;
+        refresh_schedule_refusals_if_due(&mut ui, later, refused);
+        assert!(
+            ui.scheduled_refusals.contains_key("nightly"),
+            "the refusal recorded after the manager opened is shown"
+        );
+        assert_eq!(ui.scheduled_refusals_read_at, Some(later));
+
+        ui.mode = UiMode::Normal;
+        refresh_schedule_refusals_if_due(&mut ui, later + SCHEDULE_REFUSALS_REFRESH * 10, || {
+            panic!("a closed manager reads nothing")
+        });
+    }
+
+    /// PRD #1885: a schedule whose last fire was refused as not approved reads
+    /// `refused`, and the selected one shows the refusal — with the command that
+    /// approves it — beneath the rows.
+    #[test]
+    fn schedule_manager_shows_a_refused_last_fire() {
+        let mut ui = default_ui();
+        ui.scheduled_tasks = vec![
+            make_scheduled_task("nightly", true),
+            make_scheduled_task("weekly", true),
+        ];
+        ui.scheduled_refusals.insert(
+            "nightly".to_string(),
+            crate::schedule_outcome::Refusal {
+                at: "2026-11-10T09:00:00Z".to_string(),
+                message: "orchestration 'team' of project /work/p was never approved, so \
+                          nothing from it was started. Review and approve it from a terminal \
+                          outside the deck with: dot-agent-deck trust approve /work/p \
+                          --orchestration team"
+                    .to_string(),
+            },
+        );
+        let render = |ui: &UiState| {
+            let buffer = draw_to_buffer(100, 30, |frame| {
+                let frame_area = frame.area();
+                render_scheduled_tasks(frame, frame_area, ui);
+            });
+            let area = buffer.area();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+        };
+        let lines = render(&ui);
+        let screen = lines.join("\n");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("nightly") && l.contains("refused")),
+            "{screen}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("weekly") && l.contains("idle")),
+            "{screen}"
+        );
+        let flat = screen
+            .split_whitespace()
+            .filter(|w| !w.chars().all(|c| "│─┌┐└┘".contains(c)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("Last fire refused at 2026-11-10T09:00:00Z"),
+            "{screen}"
+        );
+        assert!(flat.contains("never approved"), "{screen}");
+        assert!(
+            flat.contains("dot-agent-deck trust approve /work/p --orchestration team"),
+            "{screen}"
+        );
+
+        ui.scheduled_selected = 1;
+        let screen = render(&ui).join("\n");
+        assert!(
+            !screen.contains("Last fire refused"),
+            "only the selected task's refusal is shown:\n{screen}"
+        );
+    }
+
     #[test]
     fn manager_status_label_derivation() {
-        assert_eq!(schedule_status_label(false, false), "disabled");
-        assert_eq!(schedule_status_label(false, true), "disabled"); // disabled wins
-        assert_eq!(schedule_status_label(true, true), "live");
-        assert_eq!(schedule_status_label(true, false), "idle");
+        assert_eq!(schedule_status_label_with(false, false, false), "disabled");
+        assert_eq!(schedule_status_label_with(false, true, false), "disabled"); // disabled wins
+        assert_eq!(schedule_status_label_with(true, true, false), "live");
+        assert_eq!(schedule_status_label_with(true, false, false), "idle");
+        // PRD #1885: a refused last fire reads `refused`, under `disabled`.
+        assert_eq!(schedule_status_label_with(true, true, true), "refused");
+        assert_eq!(schedule_status_label_with(false, false, true), "disabled");
     }
 
     #[test]
@@ -40638,6 +41475,8 @@ mod tests {
             ],
         };
 
+        // PRD #1885: approved, so the tab opens without the trust prompt.
+        crate::project_trust::approve_orchestration_for_test(&cwd, &config);
         // The submitted new-pane form: its Name field defaults to the dir
         // basename (transition_after_dir_pick), so req.name = FORM_TITLE while
         // orchestration_config still carries the canonical CONFIG_NAME.
@@ -41163,6 +42002,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("project dir");
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
+        // PRD #1885: approved, so the start reaches the daemon whose refusal
+        // these tests are about.
+        crate::project_trust::approve_orchestration_for_test(&dir, &make_orchestration("review"));
         ui.new_pane_form = Some(NewPaneFormState::new(
             dir,
             "myproj".to_string(),
@@ -41279,6 +42121,510 @@ mod tests {
         assert!(
             status.is_some_and(|m| m.starts_with("Orchestration failed:")),
             "any other failure is reported as before, got {status:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1885 — the New Agent form's trust prompt
+    // -----------------------------------------------------------------------
+
+    /// PRD #1885: a [`PaneController`] whose daemon answers trust requests with
+    /// `view` — `approved` once an approval carrying `view`'s digest landed —
+    /// and records every approval's digest. Pane creation is a
+    /// [`CapturingPaneController`]'s.
+    struct TrustingPaneController {
+        view: crate::project_trust::ProjectTrustView,
+        approved: std::sync::Mutex<bool>,
+        approvals: std::sync::Mutex<Vec<String>>,
+        /// When set, what the next approval answers instead of approving.
+        approve_answer: std::sync::Mutex<
+            Option<
+                Result<
+                    crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>,
+                    String,
+                >,
+            >,
+        >,
+        inner: CapturingPaneController,
+    }
+
+    impl TrustingPaneController {
+        fn new(dir: &std::path::Path, orchestration: &OrchestrationConfig) -> Self {
+            let check = crate::project_trust::TrustCheck::evaluate(
+                &crate::project_trust::ApprovalStore::default(),
+                dir.to_path_buf(),
+                dir,
+                orchestration,
+            );
+            Self {
+                view: check.view(),
+                approved: std::sync::Mutex::new(false),
+                approvals: std::sync::Mutex::new(Vec::new()),
+                approve_answer: std::sync::Mutex::new(None),
+                inner: CapturingPaneController::new(),
+            }
+        }
+    }
+
+    impl PaneController for TrustingPaneController {
+        fn create_pane_with_options(
+            &self,
+            command: Option<&str>,
+            cwd: Option<&str>,
+            opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            self.inner.create_pane_with_options(command, cwd, opts)
+        }
+        fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.focus_pane(pane_id)
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            self.inner.pane_agent_id(pane_id)
+        }
+        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.close_pane(pane_id)
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            self.inner.list_panes()
+        }
+        fn resize_pane(
+            &self,
+            pane_id: &str,
+            direction: crate::pane::PaneDirection,
+            amount: u16,
+        ) -> Result<(), PaneError> {
+            self.inner.resize_pane(pane_id, direction, amount)
+        }
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            self.inner.rename_pane(pane_id, name)
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            self.inner.toggle_layout()
+        }
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.inner.write_to_pane(pane_id, text)
+        }
+        fn project_trust_state(
+            &self,
+            _dir: &str,
+            _orchestration: &str,
+        ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+        {
+            let mut view = self.view.clone();
+            if *self.approved.lock().unwrap() {
+                view.state = "approved".to_string();
+                for role in &mut view.roles {
+                    role.change = None;
+                }
+            }
+            Ok(crate::daemon_client::GatedQuery::Answered(view))
+        }
+        fn approve_project_trust(
+            &self,
+            dir: &str,
+            orchestration: &str,
+            digest: &str,
+        ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+        {
+            self.approvals.lock().unwrap().push(digest.to_string());
+            if let Some(answer) = self.approve_answer.lock().unwrap().take() {
+                return answer;
+            }
+            if digest != self.view.digest {
+                return Err(format!(
+                    "{}: changed",
+                    crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED
+                ));
+            }
+            *self.approved.lock().unwrap() = true;
+            self.project_trust_state(dir, orchestration)
+        }
+        fn name(&self) -> &str {
+            "trusting"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn dispatch_against(
+        action: Action,
+        ui: &mut UiState,
+        pane: &dyn PaneController,
+        tm: &mut TabManager,
+    ) {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let _ = dispatch_action(
+            action,
+            ui,
+            pane,
+            &state,
+            tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+    }
+
+    fn open_request(dir: &std::path::Path, config: &OrchestrationConfig) -> Action {
+        Action::SpawnPane(Box::new(NewPaneRequest {
+            dir: dir.to_path_buf(),
+            name: config.name.clone(),
+            command: String::new(),
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            authoring_kind: None,
+        }))
+    }
+
+    /// Scenario: Choose a never-approved orchestration from the New Agent form
+    /// against a daemon that answers trust requests. The trust prompt opens
+    /// and nothing is spawned; Enter neither approves nor closes it, and Esc
+    /// closes it with nothing spawned and nothing approved. Choosing it again
+    /// and pressing `a` once the prompt is drawn approves the digest the prompt
+    /// showed and opens every role.
+    #[test]
+    fn prompt_004_the_form_asks_before_opening_and_a_approves_the_shown_digest() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_trust_prompt_key(enter, &mut ui),
+            Action::Continue
+        ));
+        assert_eq!(ui.mode, UiMode::TrustPrompt, "Enter does not approve");
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_trust_prompt_key(esc, &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.trust_prompt.is_none());
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
+        assert!(
+            pc.approvals.lock().unwrap().is_empty(),
+            "Esc stores nothing"
+        );
+
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(
+            refuse_undrawn_choice(&a, &ui).is_some(),
+            "`a` typed before the prompt was drawn approves nothing"
+        );
+        let mut shown = ChoicesShown::default();
+        shown.insert(0);
+        ui.confirm_choices_drawn = Some((UiMode::TrustPrompt, shown));
+        assert!(refuse_undrawn_choice(&a, &ui).is_none());
+        let action = handle_trust_prompt_key(a, &mut ui);
+        assert!(matches!(action, Action::ApproveProjectTrust));
+        dispatch_against(action, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(*pc.approvals.lock().unwrap(), vec![pc.view.digest.clone()]);
+        assert_eq!(
+            pc.inner.recorded_orchestration_names(),
+            vec!["review".to_string(), "review".to_string()],
+            "approving opens every role"
+        );
+        assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: Open the trust prompt from the New Agent form and draw it.
+    /// A click on the drawn `a approve and start` label resolves to the
+    /// approval and on `Esc cancel` to the cancel, while clicks on the title,
+    /// the body, the footer's scroll hint and the deck beside the popup resolve
+    /// to nothing. Reopened, the prompt takes no click on the approve label
+    /// until a frame has shown it again; after that frame the click approves
+    /// the shown digest and opens every role, and a click on `Esc cancel`
+    /// closes a fresh prompt with nothing stored.
+    #[test]
+    fn prompt_004_a_click_answers_only_a_drawn_label() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let open = |ui: &mut UiState, tm: &mut TabManager| {
+            dispatch_against(open_request(tmp.path(), &config), ui, pc.as_ref(), tm);
+            assert_eq!(ui.mode, UiMode::TrustPrompt);
+        };
+
+        open(&mut ui, &mut tm);
+        let rows = draw_sized(&mut ui, 100, 30);
+        let shown = rows.join("\n");
+        let approve = find_in_rows(&rows, "a approve and start").expect(&shown);
+        let cancel = find_in_rows(&rows, "Esc cancel").expect(&shown);
+        let scroll_hint = find_in_rows(&rows, "↑↓ scroll").expect(&shown);
+        let title = find_in_rows(&rows, crate::trust_prompt::TITLE).expect(&shown);
+        let body = find_in_rows(&rows, "coder").expect(&shown);
+        let middle = |(col, row): (u16, u16), len: u16| (col + len / 2, row);
+        assert!(matches!(
+            modal_click(&ui, middle(approve, 19)),
+            Some(Action::ApproveProjectTrust)
+        ));
+        assert!(matches!(
+            modal_click(&ui, middle(cancel, 10)),
+            Some(Action::CancelTrustPrompt)
+        ));
+        for (what, at) in [
+            ("the title", title),
+            ("the body", body),
+            ("the scroll hint", scroll_hint),
+            ("the deck beside the popup", (1, approve.1)),
+            ("the separator", (approve.0 + 20, approve.1)),
+        ] {
+            assert!(
+                modal_click(&ui, at).is_none(),
+                "a click on {what} at {at:?} answered the prompt:\n{shown}"
+            );
+        }
+
+        // Reopened: the last frame's targets are gone until a frame shows it.
+        dispatch_against(Action::CancelTrustPrompt, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(ui.mode, UiMode::Normal);
+        open(&mut ui, &mut tm);
+        assert!(confirmation_awaits_frame(&ui));
+        assert!(
+            modal_click(&ui, middle(approve, 19)).is_none(),
+            "a click on the approve label before its frame approved"
+        );
+        assert!(pc.approvals.lock().unwrap().is_empty());
+        draw_sized(&mut ui, 100, 30);
+        let action = modal_click(&ui, middle(approve, 19)).expect("the drawn approve label");
+        assert!(matches!(action, Action::ApproveProjectTrust));
+        dispatch_against(action, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(*pc.approvals.lock().unwrap(), vec![pc.view.digest.clone()]);
+        assert_eq!(
+            pc.inner.recorded_orchestration_names(),
+            vec!["review".to_string(), "review".to_string()],
+            "a click on approve opens every role, as `a` does"
+        );
+        assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: Open the trust prompt on a terminal too short for its whole
+    /// review. Before a frame the wheel does nothing; once drawn, the wheel
+    /// down over the popup scrolls one row a notch and stops at the end, the
+    /// wheel up scrolls back, and a wheel beside the popup scrolls nothing.
+    #[test]
+    fn prompt_004_the_wheel_over_the_review_scrolls_it() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        let scroll = |ui: &UiState| ui.trust_prompt.as_ref().map(|p| p.scroll);
+
+        scroll_trust_prompt(&mut ui, false, 50, 5);
+        assert_eq!(scroll(&ui), Some(0), "a wheel before the first frame");
+
+        let rows = draw_sized(&mut ui, 100, 10);
+        let max = ui.trust_prompt.as_ref().unwrap().max_scroll;
+        assert!(
+            max > 0,
+            "precondition: the review overflows:\n{}",
+            rows.join("\n")
+        );
+        let inner = ui.trust_prompt.as_ref().unwrap().drawn_inner.unwrap();
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        scroll_trust_prompt(&mut ui, false, 0, row);
+        assert_eq!(scroll(&ui), Some(0), "a wheel beside the popup");
+        scroll_trust_prompt(&mut ui, false, col, row);
+        assert_eq!(scroll(&ui), Some(1));
+        for _ in 0..max + 5 {
+            scroll_trust_prompt(&mut ui, false, col, row);
+        }
+        assert_eq!(scroll(&ui), Some(max), "the wheel stops at the end");
+        scroll_trust_prompt(&mut ui, true, col, row);
+        assert_eq!(scroll(&ui), Some(max - 1));
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
+    }
+
+    /// Scenario: approve, with `a`, an orchestration whose config name
+    /// carries ESC, BEL and RIGHT-TO-LEFT OVERRIDE, against a daemon too old to
+    /// approve and against one whose refusal carries the same characters. The
+    /// status line shows every one of them escaped (Qodo #8 on PR #2256).
+    #[test]
+    fn prompt_007_an_approval_refusal_shows_hostile_text_escaped() {
+        const HOSTILE: &str = "\u{1b}[2J\u{7}\u{202e}";
+        let answers = [
+            Ok(crate::daemon_client::GatedQuery::Unsupported),
+            Err(format!("daemon returned error: boom {HOSTILE}")),
+        ];
+        for answer in answers {
+            let tmp = tempdir().expect("tempdir");
+            let config = make_orchestration(&format!("review{HOSTILE}"));
+            let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_against(
+                open_request(tmp.path(), &config),
+                &mut ui,
+                pc.as_ref(),
+                &mut tm,
+            );
+            assert_eq!(ui.mode, UiMode::TrustPrompt);
+            let label = format!("{answer:?}");
+            *pc.approve_answer.lock().unwrap() = Some(answer);
+            dispatch_against(Action::ApproveProjectTrust, &mut ui, pc.as_ref(), &mut tm);
+            assert!(
+                pc.inner.recorded_orchestration_names().is_empty(),
+                "{label}"
+            );
+            let status = ui
+                .status_message
+                .as_ref()
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default();
+            assert!(
+                !status
+                    .chars()
+                    .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+                "{label}: a raw control or bidi character reached the status line: {status:?}"
+            );
+            assert!(
+                status.contains("review\\u{1b}") && status.contains("\\u{202e}"),
+                "{label}: the hostile text is shown escaped, not dropped: {status:?}"
+            );
+        }
+    }
+
+    /// Scenario: three saved orchestrations are held back by the startup
+    /// restore. One is cancelled with Esc, one is open in the trust prompt and
+    /// one still waits; a session save keeps all three exactly as saved, except
+    /// one whose orchestration a live tab already saves (Greptile P1 on PR
+    /// #2256).
+    #[test]
+    fn a_session_save_keeps_every_restore_awaiting_approval() {
+        let held = |project: &str, name: &str| {
+            let config = make_orchestration(name);
+            let view = crate::project_trust::TrustCheck::evaluate(
+                &crate::project_trust::ApprovalStore::default(),
+                std::path::PathBuf::from(project),
+                std::path::Path::new(project),
+                &config,
+            )
+            .view();
+            PendingTrustRestore {
+                saved_pane: config::SavedPane {
+                    dir: project.to_string(),
+                    name: name.to_string(),
+                    command: String::new(),
+                    mode: None,
+                    orchestration: Some(config::OrchestrationSnapshot {
+                        version: 1,
+                        roles: vec!["orchestrator".to_string()],
+                        start_role_index: 0,
+                        orchestrator_prompt: String::new(),
+                        config_name: name.to_string(),
+                        project_path: project.to_string(),
+                        started_role_indices: Vec::new(),
+                        display_title: None,
+                    }),
+                },
+                view,
+            }
+        };
+        let mut ui = default_ui();
+        let declined = held("/p/declined", "declined");
+        let open = held("/p/open", "open");
+        ui.pending_trust_restores
+            .push_back(held("/p/waiting", "waiting"));
+        ui.pending_trust_restores.push_back(held("/p/live", "live"));
+        open_trust_prompt(
+            &mut ui,
+            declined.view.clone(),
+            TrustPromptPurpose::Restore(declined),
+        );
+        cancel_trust_prompt(&mut ui);
+        open_trust_prompt(
+            &mut ui,
+            open.view.clone(),
+            TrustPromptPurpose::Restore(open),
+        );
+
+        let mut session = config::SavedSession {
+            panes: vec![held("/p/live", "live").saved_pane],
+            ..Default::default()
+        };
+        keep_held_trust_restores(&ui, &mut session);
+        let names: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["live", "waiting", "open", "declined"]);
+    }
+
+    /// Scenario: Choose an approved orchestration whose config is unchanged:
+    /// it opens straight away, with no prompt and no approval request.
+    #[test]
+    fn prompt_005_an_approved_orchestration_opens_with_no_prompt() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        *pc.approved.lock().unwrap() = true;
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_ne!(ui.mode, UiMode::TrustPrompt);
+        assert!(ui.trust_prompt.is_none());
+        assert_eq!(pc.inner.recorded_orchestration_names().len(), 2);
+        assert!(pc.approvals.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: Against a daemon too old to answer trust requests, choosing a
+    /// never-approved orchestration opens no prompt and spawns nothing: the
+    /// status line names `dot-agent-deck trust approve`.
+    #[test]
+    fn prompt_006_an_older_daemon_refuses_an_unapproved_orchestration() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("never-approved-here");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_ne!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.recorded_orchestration_names().is_empty());
+        let status = ui.status_message.as_ref().map(|(m, _)| m.as_str());
+        assert!(
+            status.is_some_and(|m| m.starts_with(crate::trust_prompt::OLDER_DAEMON_NOTE)
+                && m.contains("dot-agent-deck trust approve")),
+            "{status:?}"
         );
     }
 
@@ -41637,7 +42983,8 @@ mod tests {
             | UiMode::HostMetrics
             | UiMode::Upgrade
             | UiMode::InboxAttention
-            | UiMode::RestartNotice => mode,
+            | UiMode::RestartNotice
+            | UiMode::TrustPrompt => mode,
         }
     }
 
@@ -41662,6 +43009,7 @@ mod tests {
             UiMode::Upgrade,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
+            UiMode::TrustPrompt,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -41711,6 +43059,8 @@ mod tests {
         tmp_dir: &std::path::Path,
         name: &str,
     ) {
+        // PRD #1885: approved, so the tab opens without the trust prompt.
+        crate::project_trust::approve_orchestration_for_test(tmp_dir, &lock_test_orch_config(name));
         let req = NewPaneRequest {
             dir: tmp_dir.to_path_buf(),
             name: name.to_string(),

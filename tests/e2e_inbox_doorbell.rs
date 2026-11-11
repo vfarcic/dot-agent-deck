@@ -512,6 +512,9 @@ fn assert_aged_generation_waits_for_ready(session_start: bool, old: chrono::Date
         fn hook_socket(&self) -> &std::path::Path {
             &self.daemon.hook_path
         }
+        fn approve_project_trust(&self, dir: &std::path::Path) {
+            self.daemon.approve_project_trust(dir);
+        }
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

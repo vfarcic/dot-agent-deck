@@ -1,6 +1,7 @@
 import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { approvedProjectTrust } from "../test/projectTrust";
 import { agentDomKey } from "../components/AgentOverview";
 import { createFixtureSnapshot } from "../data/fixture";
 import { DEFAULT_DESKTOP_SETTINGS, fixtureDesktopFeatures, type DesktopSettingsDto, type VoiceResultDto, type VoiceStatusDto } from "./bridge";
@@ -78,6 +79,7 @@ function runtime(overrides: Partial<DeckRuntimeState> = {}): DeckRuntimeState {
     fleet: [snapshot],
     terminalData: {},
     clearError: vi.fn(),
+    ...approvedProjectTrust(),
     runAction: vi.fn(async () => ({ ok: true }) as DeckActionResult),
     sendTerminalInput: vi.fn(async () => undefined),
     resizeTerminal: vi.fn(async () => undefined),

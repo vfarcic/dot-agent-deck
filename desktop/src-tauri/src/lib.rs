@@ -46,6 +46,7 @@ mod selection_saves;
 mod self_upgrade;
 mod settings;
 mod terminal;
+mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
 // crate's shared upgrade procedure.
 mod upgrade;
@@ -5547,6 +5548,9 @@ struct StartedOrchestration {
 /// [`DesktopAction::ActivateOrchestration`]'s fields, unpacked for
 /// [`activate_orchestration_action`].
 struct ActivateOrchestrationRequest {
+    /// The deck the launch was started on (PRD #1885 review); `None` takes the
+    /// selected deck, refused under All Decks.
+    deck_id: Option<String>,
     name: String,
     /// The run's name (issue #1044), absent when the form's Name is empty.
     display_title: Option<String>,
@@ -5576,6 +5580,7 @@ async fn activate_orchestration_action(
     request: ActivateOrchestrationRequest,
 ) -> Result<OrchestrationLaunchResult, DesktopActionError> {
     let ActivateOrchestrationRequest {
+        deck_id,
         name,
         display_title,
         cwd,
@@ -5603,7 +5608,19 @@ async fn activate_orchestration_action(
     // The supported non-Pi coordinator still uses the readiness-gated,
     // identity-bound retry path in `launch_orchestration`; Pi is rejected
     // inside the preparation, before anything is spawned.
-    let daemon = trusted_daemon(&state.daemon).await?;
+    //
+    // PRD #1885 review: a launch that names its deck goes to that deck, the
+    // one its project-commands review was asked of and approved on, never to
+    // whatever is selected when it arrives. The id is resolved against the
+    // observed decks (`DeckScope::resolve`), so an id this app does not
+    // observe is refused before any deck is contacted.
+    let daemon = match deck_id.as_deref() {
+        Some(deck_id) => {
+            let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+            state.daemon.trusted(scope.endpoint()).await?
+        }
+        None => trusted_daemon(&state.daemon).await?,
+    };
     daemon.require_compatible()?;
     ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
     let launch_client = bind_launch(&daemon.client).await?;
@@ -6464,6 +6481,7 @@ async fn desktop_run_action(
             result_agent_ids = started.agent_ids;
         }
         DesktopAction::ActivateOrchestration {
+            deck_id,
             name,
             display_title,
             cwd,
@@ -6476,6 +6494,7 @@ async fn desktop_run_action(
             let launched = activate_orchestration_action(
                 &state,
                 ActivateOrchestrationRequest {
+                    deck_id,
                     name,
                     display_title,
                     cwd,
@@ -6942,6 +6961,8 @@ pub fn run() {
             desktop_list_projects,
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
+            trust_review::desktop_project_trust_state,
+            trust_review::desktop_approve_project_trust,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_new_agent_options,
