@@ -29934,7 +29934,12 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let editor = ModelEditor::spawn(&registry, "pane-ring-resize", OnEnter::Submit);
         let repaint = Arc::new(std::sync::Mutex::new(None));
-        const NARROWER: u16 = EDITOR_COLS - 10;
+        // Narrower by the least that is still a resize. Since issue #1730 the
+        // doorbell line names the deck by its absolute path, here the test
+        // binary's, so its length follows the checkout's path: ten columns
+        // less wrapped it in a long-named worktree, where the echo it waits
+        // for no longer matched.
+        const NARROWER: u16 = EDITOR_COLS - 1;
         editor.control.lock().unwrap().cols = NARROWER as usize;
         {
             let pusher = Arc::clone(&editor.bus);
