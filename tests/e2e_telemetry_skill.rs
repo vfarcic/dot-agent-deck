@@ -92,6 +92,7 @@ fn telemetry_otlp_048_a_skill_call_names_a_defined_skill_only() {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();
