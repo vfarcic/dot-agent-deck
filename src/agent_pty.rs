@@ -10533,10 +10533,13 @@ pub struct DeliveryNotice {
     /// conversation) carries no such constraint, because there is nothing to
     /// name.
     pub session_id: Option<String>,
-    /// FIXED, daemon-authored text. Nothing a repository, a prompt or a role
+    /// Daemon-authored text. Nothing a repository, a prompt or a role
     /// controls may be interpolated here — that rule outlives the transport,
-    /// because the text still reaches a human-readable surface.
-    pub detail: &'static str,
+    /// because the text still reaches a human-readable surface. Owned only so
+    /// a value the deck itself observed can be said, such as the exit code of
+    /// the command it started in the pane (issue #1933,
+    /// [`crate::inbox_display::PaneTermination::card_notice`]).
+    pub detail: std::borrow::Cow<'static, str>,
     /// PRD #1666 long-turn delivery: not a failure but the end of one — the
     /// inbox message an earlier notice reported not delivered was acknowledged
     /// after all, so the card's not-delivered `Error` is lifted

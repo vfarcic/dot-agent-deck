@@ -9906,7 +9906,7 @@ mod hook_ingestion_tests {
             agent_id: agent_id.clone(),
             delivery_id: "cap-exhausted-257".to_string(),
             session_id: None,
-            detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task",
+            detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task".into(),
             cleared: false,
         });
         let report = tokio::time::timeout(Duration::from_millis(300), async {
@@ -9987,7 +9987,8 @@ mod hook_ingestion_tests {
                 crate::inbox_display::NOTICE_DELIVERED_LATE
             } else {
                 crate::inbox_display::NOTICE_MAX_DELIVER
-            },
+            }
+            .into(),
             cleared,
         };
         let next_event = |rx: &mut broadcast::Receiver<BroadcastMsg>| {
@@ -13870,6 +13871,141 @@ mod hook_ingestion_tests {
                 "server_first={server_first}"
             );
         }
+    }
+
+    /// Issue #2276: an `opencode mini` pane on OpenCode 2, under the daemon a
+    /// deck TUI started from a macOS terminal. Under `mini` the server plugin
+    /// arms the stream from the private server, so the receiver it names is
+    /// that server and not the pane's own process, and placing it relative to
+    /// the agent walks up from the agent past the daemon, the TUI and the
+    /// terminal's shell to the root-owned `/usr/bin/login`. Where that
+    /// process's parent cannot be read (macOS `PROC_PIDTBSDINFO`, issue
+    /// #2237), the pane's one-shot verbs and a receiver naming the pane's own
+    /// process are still admitted: they read nothing above the agent. Read
+    /// past it, or with the daemon parented by launchd, the server's receiver
+    /// resolves to the client.
+    #[test]
+    fn opencode_2_minis_server_receiver_is_placed_through_the_daemons_ancestry() {
+        // 1 launchd ── 2 /usr/bin/login (root) ── 3 zsh ── 4 deck TUI ── 5 daemon
+        //   ── 10 opencode mini (the pane's agent root: the launcher exec'd it)
+        //        ├── 11 opencode serve --stdio ── 12 CLI (`inbox wait --stream`)
+        //        │                              └── 13 bash (a tool) ── 14 CLI (`inbox fetch`)
+        //        └── 15 CLI (a receiver naming the pane's own process)
+        fn table(pid: u32, login_parent: Option<u32>, daemon_parent: u32) -> Option<u32> {
+            match pid {
+                2 => login_parent,
+                3 => Some(2),
+                4 => Some(3),
+                5 => Some(daemon_parent),
+                10 => Some(5),
+                11 | 15 => Some(10),
+                12 | 13 => Some(11),
+                14 => Some(13),
+                _ => None,
+            }
+        }
+        // `login`'s parent unread, as macOS `PROC_PIDTBSDINFO` answers (#2237).
+        fn unread_login(pid: u32) -> Option<u32> {
+            table(pid, None, 4)
+        }
+        // `login`'s parent read, as Linux answers, and macOS once #2237 is fixed.
+        fn read_login(pid: u32) -> Option<u32> {
+            table(pid, Some(1), 4)
+        }
+        // The TUI detached, or a service or the desktop app started the daemon.
+        fn launchd_daemon(pid: u32) -> Option<u32> {
+            table(pid, None, 1)
+        }
+        fn lookups(
+            parent_of: fn(u32) -> Option<u32>,
+            descends: fn(u32, u32) -> Option<bool>,
+        ) -> ProcessLookups {
+            ProcessLookups {
+                descends,
+                parent_of,
+                executable_of: |pid| {
+                    let exe = match pid {
+                        2 => "/usr/bin/login",
+                        3 => "/bin/zsh",
+                        13 => "/bin/bash",
+                        10 | 11 => "/opt/homebrew/bin/opencode",
+                        4 | 5 | 12 | 14 | 15 => "/opt/homebrew/bin/dot-agent-deck",
+                        _ => return None,
+                    };
+                    Some(std::path::PathBuf::from(exe))
+                },
+                started: |_| Some(1),
+                arguments_of: |pid| {
+                    let argv: &[&str] = match pid {
+                        10 => &["opencode", "mini", "--standalone", "--session", "ses-team"],
+                        11 => &["opencode", "serve", "--stdio", "--port", "0"],
+                        _ => return None,
+                    };
+                    Some(argv.iter().map(|a| a.to_string()).collect())
+                },
+                stdio_is_sockets: |pid| pid == 11,
+            }
+        }
+        let admit = |lookups: &ProcessLookups, peer: u32, claimed: Option<u32>| {
+            let used_as = if claimed.is_some() {
+                ComponentUse::Receiver
+            } else {
+                ComponentUse::Cli
+            };
+            admit_inbox_component_with(
+                Some(AcceptedPeer {
+                    pid: peer,
+                    started: Some(1),
+                    same_user: Some(true),
+                }),
+                claimed,
+                Some(10),
+                used_as,
+                Evidence::Required,
+                lookups,
+            )
+        };
+
+        let unread = lookups(unread_login, |pid, root| {
+            crate::platform::proc::descends_from_with(pid, root, unread_login)
+        });
+        assert_eq!(
+            crate::platform::proc::ancestry_with(10, 11, unread_login),
+            crate::platform::proc::Ancestry::Unreadable,
+            "the walk from the agent toward its server climbs to login"
+        );
+        // Deliberately not pinned: `admit(&unread, 12, Some(11))`, the server
+        // plugin's `inbox wait` under an unread login. It is refused
+        // `Unidentified` today, which is #2276, and a fix may make it admit:
+        // the server descends from the agent, so it cannot be above it.
+        assert_eq!(
+            admit(&unread, 14, None),
+            Ok(None),
+            "the pane's one-shot `inbox fetch` is admitted"
+        );
+        assert_eq!(
+            admit(&unread, 15, Some(10)),
+            Ok(Some(10)),
+            "a receiver naming the pane's own process reads nothing above it"
+        );
+
+        let read = lookups(read_login, |pid, root| {
+            crate::platform::proc::descends_from_with(pid, root, read_login)
+        });
+        assert_eq!(
+            admit(&read, 12, Some(11)),
+            Ok(Some(10)),
+            "read past login, the server's receiver resolves to the client"
+        );
+
+        let detached = lookups(launchd_daemon, |pid, root| {
+            crate::platform::proc::descends_from_with(pid, root, launchd_daemon)
+        });
+        assert_eq!(
+            admit(&detached, 12, Some(11)),
+            Ok(Some(10)),
+            "under a daemon launchd parents, login is never read"
+        );
     }
 
     /// The real process table: this test process reads its own start time, the
