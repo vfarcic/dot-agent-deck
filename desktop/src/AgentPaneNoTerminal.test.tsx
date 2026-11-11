@@ -671,7 +671,7 @@ describe("a pane whose agent has left the fleet", () => {
 
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.getByTestId("agent-tile-planner-on-build-box")).toHaveAttribute("data-presentation", "tile");
-    expect(screen.getByRole("button", { name: "Open Planner on build-box agent" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open Plan / architecture on build-box agent" })).toBeVisible();
   });
 
   /**

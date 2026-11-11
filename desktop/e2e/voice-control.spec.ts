@@ -280,7 +280,7 @@ test.describe("the voice row is reserved space", () => {
    */
   test("is never covered by the enlarged agent pane", async ({ page }) => {
     await openWithSpeech(page);
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toBeVisible();
 
@@ -373,7 +373,7 @@ test.describe("the voice row is reserved space", () => {
   test("wraps the larger typing-mode status at a narrow window rather than cutting it off", async ({ page }) => {
     await page.setViewportSize({ width: 420, height: 760 });
     await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on");
-    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await page.getByRole("button", { name: "Open PRD 745 · agent dashboard / coder agent" }).click();
     await voiceButton(page).click();
     const status = page.getByTestId("voice-dictating");
     await expect(status).toHaveText("Typing to coder. Say “type off” to stop, “send it” to send.");
@@ -411,7 +411,7 @@ test.describe("the voice row is reserved space", () => {
    * passes the browser's real click hit test behind that modal. */
   test("Stop typing is clickable and tabbable behind the agent pane", async ({ page }) => {
     await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on");
-    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await page.getByRole("button", { name: "Open PRD 745 · agent dashboard / coder agent" }).click();
     await voiceButton(page).click();
     const stop = page.getByRole("button", { name: "Stop typing" });
     await expect(stop).toBeVisible();
@@ -429,7 +429,7 @@ test.describe("the voice row is reserved space", () => {
    */
   test("highlights how to send after a pause in typing mode", async ({ page }) => {
     await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on&voice=fix%20the%20bug");
-    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await page.getByRole("button", { name: "Open PRD 745 · agent dashboard / coder agent" }).click();
     await voiceButton(page).click();
     const hint = page.getByTestId("voice-send-hint");
     await expect(page.getByTestId("voice-report")).toContainText("fix the bug");
@@ -445,7 +445,7 @@ test.describe("the voice row is reserved space", () => {
   /** Scenario: the browser fixture enters typing mode in a writable agent pane, then hears a punctuated stop command. It ends the mode without typing those command words into the pane. */
   test("a spoken punctuated stop ends typing mode without typing it", async ({ page }) => {
     await openWithSpeech(page, "/?fixture=1&state=crowded&voice=type%20on&voice=stop%20typing.");
-    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await page.getByRole("button", { name: "Open PRD 745 · agent dashboard / coder agent" }).click();
     await voiceButton(page).click();
 
     await expect(page.getByTestId("voice-report")).toContainText("Typing mode off. Nothing was sent to coder.");
