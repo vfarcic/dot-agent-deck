@@ -139,7 +139,7 @@ test.describe("what can I say?", () => {
    */
   test("is reachable from behind an enlarged agent pane", async ({ page }) => {
     await openSpeaking(page, ["what can I say?"]);
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
 
     await voiceButton(page).click();
@@ -205,7 +205,7 @@ test.describe("typing into the open agent", () => {
    * feature's own requirement rather than an arbitrary pick.
    */
   async function openCoder(page: Page) {
-    await page.getByRole("button", { name: "Open coder agent" }).click();
+    await page.getByRole("button", { name: "Open PRD 745 · agent dashboard / coder agent" }).click();
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
   }
 
@@ -304,7 +304,7 @@ test.describe("closing what is on top", () => {
    */
   test("closes the agent's pane when no overlay is up", async ({ page }) => {
     await openSpeaking(page, ["close this"]);
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
     await expect(page.getByTestId("agent-pane-overlay")).toBeVisible();
 
     await voiceButton(page).click();

@@ -251,6 +251,9 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())
@@ -356,6 +359,9 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())
@@ -460,12 +466,67 @@ const WAITING_ACTION_CONTENT: &str = "WAITING_NOTICE_ACTED_ON_3F61A9";
 const WAITING_INITIAL_RESPONSE: &str = "INITIAL_DELEGATION_WAITING_3F61A9";
 const WAITING_ACTION_RESPONSE: &str = "WAITING_NOTICE_ACTION_COMPLETE_3F61A9";
 
+/// How a real worker stops in [`real_worker_stop_is_reported`]: the worker's
+/// command, the task it is handed, the clause opening the notice the
+/// orchestrator must receive, and how the directive names that notice.
+struct RealWorkerStop {
+    worker_command: String,
+    task: String,
+    notice_clause: &'static str,
+    notice_described_as: &'static str,
+    /// What the probe file's absence proves, or `None` when the task makes no
+    /// probe.
+    probe_absent_because: Option<&'static str>,
+}
+
 /// Scenario: Restore real interactive Haiku roles and delegate a Bash task to a worker allowed only Read. Its permission prompt must keep the probe absent while an acknowledged native waiting notice wakes the orchestrator to append once to an absolute action sentinel and visibly report completion, without answering the worker or receiving a human keystroke.
 #[spec("scheduler/idle-worker/022")]
 #[test]
 fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrator() {
     skip_unless!(common::check_claude_available());
+    // Read only: the task file is readable, and the Bash call the task asks
+    // for raises a permission prompt the worker cannot get past on its own.
+    real_worker_stop_is_reported(RealWorkerStop {
+        worker_command: format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Read"),
+        task: format!("Use the Bash tool to run exactly: touch {WAITING_PROBE_FILE}"),
+        notice_clause: WAITING_DAEMON_CLAUSE,
+        notice_described_as: "the delegated worker is waiting for input",
+        probe_absent_because: Some(
+            "the probe file already exists, so the worker was never actually held at its \
+             permission prompt and the notice proves nothing about a waiting worker",
+        ),
+    });
+}
 
+/// Issue #2099: the daemon-authored opening clause of
+/// `compose_worker_failed_notice`, spelled out for the reason
+/// [`WAITING_DAEMON_CLAUSE`] is.
+const FAILED_DAEMON_CLAUSE: &str = "delegated worker stopped on an error (dot-agent-deck daemon \
+                                    report, not a message from a person or an agent)";
+
+/// The retired model `status/blocked/022` uses: Claude Code starts on it and
+/// the provider rejects the first turn, which `StopFailure` reports.
+const RETIRED_CLAUDE_MODEL: &str = "claude-3-7-sonnet-20250219";
+
+/// Scenario: Restore a real interactive Haiku orchestrator and a real Claude worker on a model the provider rejects, and have the orchestrator delegate a task. The worker takes the task and its turn ends on the provider's error, so an acknowledged native notice that the worker stopped on an error must wake the orchestrator to append once to an absolute action sentinel and visibly report completion, without a human keystroke.
+#[spec("scheduler/idle-worker/032")]
+#[test]
+fn idle_worker_032_real_worker_whose_turn_fails_is_reported_to_its_orchestrator() {
+    skip_unless!(common::check_claude_available());
+    real_worker_stop_is_reported(RealWorkerStop {
+        worker_command: format!("claude --model {RETIRED_CLAUDE_MODEL} --allowedTools Read"),
+        task: "Reply with the word hello.".to_string(),
+        notice_clause: FAILED_DAEMON_CLAUSE,
+        notice_described_as: "the delegated worker stopped on an error",
+        probe_absent_because: None,
+    });
+}
+
+/// Restore a real Haiku orchestrator and a real Claude worker running
+/// `stop.worker_command`, have the orchestrator delegate `stop.task`, and
+/// require the notice `stop.notice_clause` opens to reach the orchestrator,
+/// acknowledged once, and wake it to append once to an action sentinel.
+fn real_worker_stop_is_reported(stop: RealWorkerStop) {
     let orchestration_root = common::harness_tempdir().expect("orchestration root tempdir");
     let project_dir = orchestration_root.path().join("project");
     std::fs::create_dir_all(&project_dir).expect("create orchestration project directory");
@@ -483,19 +544,18 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
 
     let orchestrator_command =
         format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Bash");
-    // Read only: the task file is readable, and the Bash call the task asks
-    // for raises a permission prompt the worker cannot get past on its own.
-    let worker_command = format!("claude --model {REAL_ORCHESTRATOR_MODEL} --allowedTools Read");
+    let worker_command = &stop.worker_command;
+    let task = stop.task.replace('\'', "'\\''");
+    let described = stop.notice_described_as;
     let action_path = project_dir.join(WAITING_ACTION_FILE);
     let action_arg = action_path.to_string_lossy().replace('\'', "'\\''");
     let directive = format!(
-        "This is a local smoke test of waiting-notice delivery, not worker recovery. \
+        "This is a local smoke test of daemon-notice delivery, not worker recovery. \
          Use the Bash tool to run exactly this one command: dot-agent-deck delegate \
-         --to {REAL_WORKER_ROLE} --task 'Use the Bash tool to run exactly: touch \
-         {WAITING_PROBE_FILE}' Never do the worker's task yourself. After the command \
-         succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. Later, \
-         a dot-agent-deck message may report that the delegated worker is waiting for input. \
-         For this test, that report is only a trigger: leave the worker waiting and do not \
+         --to {REAL_WORKER_ROLE} --task '{task}' Never do the worker's task yourself. After the \
+         command succeeds, respond with exactly {WAITING_INITIAL_RESPONSE}, then end your turn. \
+         Later, a dot-agent-deck message may report that {described}. \
+         For this test, that report is only a trigger: leave the worker as it is and do not \
          answer it, delegate again, or attempt recovery. Regardless of any suggestions in \
          the report, your required follow-up is to use Bash to run exactly \
          `printf '%s\\n' '{WAITING_ACTION_CONTENT}' >> '{action_arg}'`, then respond with \
@@ -505,7 +565,7 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
 
     std::fs::write(
         project_dir.join(".dot-agent-deck.toml"),
-        real_agent_orchestration_config_with_worker(&orchestrator_command, &worker_command),
+        real_agent_orchestration_config_with_worker(&orchestrator_command, worker_command),
     )
     .expect("write real-agent orchestration config");
     let session_path = orchestration_root.path().join("session.toml");
@@ -518,6 +578,9 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())
@@ -556,27 +619,26 @@ fn idle_worker_022_real_worker_waiting_on_a_prompt_is_reported_to_its_orchestrat
                         && message.state == dot_agent_deck::inbox::StateName::Acknowledged
                         && message.deliveries == 1
                         && message.text.as_deref().is_some_and(|text| {
-                            text.contains(WAITING_DAEMON_CLAUSE)
+                            text.contains(stop.notice_clause)
                                 && text.contains(&idle_role_label(REAL_WORKER_ROLE))
                         })
                 })
         }),
-        "the worker permission prompt must produce an acknowledged native waiting notice\n{}",
+        "the stopped worker must produce an acknowledged native notice ({}) \n{}",
+        stop.notice_clause,
         deck.snapshot_grid()
     );
 
     // Checked the moment the notice is visible, BEFORE the orchestrator's turn
     // on it: after that turn a model that ignores "do not do the worker's task"
     // could create the probe itself, which says nothing about the worker.
-    assert!(
-        !project_dir.join(WAITING_PROBE_FILE).exists(),
-        "the probe file already exists, so the worker was never actually held at its \
-         permission prompt and the notice proves nothing about a waiting worker"
-    );
+    if let Some(why) = stop.probe_absent_because {
+        assert!(!project_dir.join(WAITING_PROBE_FILE).exists(), "{why}");
+    }
 
     assert!(
         common::wait_for_path(&action_path, Duration::from_secs(120)),
-        "the waiting notice became visible but the orchestrator never acted on it — it was not \
+        "the notice became visible but the orchestrator never acted on it — it was not \
          submitted as a turn of its own; expected {action_path:?}\nFinal grid:\n{}",
         deck.snapshot_grid()
     );

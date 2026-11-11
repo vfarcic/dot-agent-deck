@@ -48,6 +48,8 @@ pub fn command(dir: &Path) -> String {
     std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, time, re
 tty.setraw(0, termios.TCSANOW)
 base = os.path.join(os.getcwd(), '.route-' + os.environ['DOT_AGENT_DECK_AGENT_ID'])
+# PRD #1889: the work id the deck gave this generation, empty when none.
+with open(base + '.work', 'w') as f: f.write(os.environ.get('DOT_AGENT_DECK_WORK_ID', ''))
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 ring = re.compile(r'^\([a-z]{6}\) dot-agent-deck: message ')
@@ -190,6 +192,8 @@ pub fn team(endpoint: &impl Endpoint, clear: bool) -> (Pane, Pane) {
         serde_json::to_string(&cmd).unwrap()
     );
     std::fs::write(endpoint.cwd().join(".dot-agent-deck.toml"), cfg).unwrap();
+    // PRD #1885: the team under test is approved, as the user's is.
+    endpoint.approve_project_trust(endpoint.cwd());
     let membership = |role: &str, index, start| {
         json!({"tab_membership": {
         "kind":"orchestration", "name":"route", "role_name":role,
@@ -202,6 +206,43 @@ pub fn team(endpoint: &impl Endpoint, clear: bool) -> (Pane, Pane) {
         membership("orchestrator", 0, true),
     );
     let worker = start(endpoint, "route-coder", membership("coder", 1, false));
+    (orch, worker)
+}
+
+/// Issue #545: one tab of the `route` orchestration among several in the same
+/// daemon and directory — an orchestrator and a `coder`, the same role names
+/// every other tab has, told apart only by the per-tab `orchestration_id`.
+/// `tab` names the panes, the token and the run title, so the tabs' titles do
+/// not collide (issue #555).
+pub fn tab_team(endpoint: &impl Endpoint, tab: &str) -> (Pane, Pane) {
+    let cmd = command(endpoint.cwd());
+    let cfg = format!(
+        "[[orchestrations]]\nname = 'route'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = {}\nstart = true\n[[orchestrations.roles]]\nname = 'coder'\ncommand = {}\nclear = false\n",
+        serde_json::to_string(&cmd).unwrap(),
+        serde_json::to_string(&cmd).unwrap()
+    );
+    std::fs::write(endpoint.cwd().join(".dot-agent-deck.toml"), cfg).unwrap();
+    // PRD #1885: the team under test is approved, as the user's is. Every
+    // tab writes the same config, so approving it again is idempotent.
+    endpoint.approve_project_trust(endpoint.cwd());
+    let membership = |role: &str, index, start| {
+        json!({"tab_membership": {
+        "kind":"orchestration", "name":"route", "role_name":role,
+        "role_index":index, "is_start_role":start,
+        "orchestration_id":format!("route-fixture-{tab}"),
+        "display_title":format!("route {tab}"),
+        "orchestration_cwd":endpoint.cwd()}})
+    };
+    let orch = start(
+        endpoint,
+        &format!("route-{tab}-orchestrator"),
+        membership("orchestrator", 0, true),
+    );
+    let worker = start(
+        endpoint,
+        &format!("route-{tab}-coder"),
+        membership("coder", 1, false),
+    );
     (orch, worker)
 }
 
@@ -814,6 +855,8 @@ pub fn client_orchestration(reassert: bool) {
     let cmd = command(deck.workdir());
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = 'route'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = {}\n", serde_json::to_string(&cmd).unwrap())).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e ");
     deck.wait_for_string("No mode");
     let (col, row) = deck.wait_for_in_grid("[Orch: route]");
@@ -936,6 +979,8 @@ pub fn dispatch_return(case: u8) {
     if case <= 2 {
         std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
             "[[orchestrations]]\nname = 'return-team'\n[[orchestrations.roles]]\nname = 'orchestrator'\nstart = true\ncommand = {}\n", serde_json::to_string(&cmd).unwrap())).unwrap();
+        // PRD #1885: the team this test dispatches is approved, as the user's is.
+        deck.approve_project_trust(deck.workdir());
     }
     common::commit_fixture_repo(deck.workdir());
     let caller = start(&deck, "dispatch-caller", json!({}));
@@ -1060,8 +1105,11 @@ pub fn dispatch_return(case: u8) {
         "completion must render in caller's attached pane: {}",
         deck.snapshot_grid()
     );
+    // A repeat of the SAME report is what the edge answers once. A different
+    // body is an update to the report (issue #2260), delivered on purpose
+    // and covered by `dispatch/return/019`, so it would not test this edge.
     let mut duplicate = inbox::request(&child, "work_done");
-    duplicate["task"] = json!("DUPLICATE-COMPLETION");
+    duplicate["task"] = json!(report);
     duplicate["done"] = json!(true);
     duplicate["timestamp"] = json!(chrono::Utc::now());
     inbox::hook(&deck, duplicate);

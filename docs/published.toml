@@ -33,6 +33,11 @@ title = "Orchestration"
 description = "Set up a multi-role orchestration in .dot-agent-deck.toml, start it in either client, and the full role, delegate and work-done reference."
 
 [[page]]
+slug = "project-trust"
+title = "Approving Project Commands"
+description = "Why the deck asks before it runs a project's orchestration, how to approve it in either client or with dot-agent-deck trust, what is remembered, what unattended work does when it is not approved, and what the review does not cover."
+
+[[page]]
 slug = "idle-workers-and-notifications"
 title = "Idle Workers & Notifications"
 description = "What the deck reports to an orchestrator about a stuck, waiting, blocked or exited worker, and how to tune or turn the reports off."

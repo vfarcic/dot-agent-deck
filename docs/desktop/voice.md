@@ -40,6 +40,7 @@ What you can do by voice, by screen:
 | New agent dialog | Choose the daemon; open a directory, go up, use the directory shown; [filter the directories](#filtering-directories) or clear the filter; choose a Mode chip or the agent to run; set the Name; [set the Command](#setting-the-command); start; discard |
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; with typing off, say "stop" or "close this agent" on its own to ask to close the open agent (confirm by hand); in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); [open its pull request, or another agent's](#pull-requests) |
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
+| Review project commands | [Approve the commands shown and start the orchestration, or cancel](#approving-project-commands) |
 
 "Close" on its own closes what is in front. With a confirmation or an upgrade dialog open, it closes that dialog the way **Cancel** or `Esc` does and leaves everything behind it as it was. With an agent's output **Reader** open, it closes the Reader, unless a confirmation or Settings is open over it, which closes first. While an upgrade is running, the dialog stays open and the app says why; when the dialog is asking whether to restart and stop running agents, "close" answers **Keep current daemon**, so nothing is stopped. In an agent's pane with typing off, **"close this agent"**, **"close the agent"** or **"close agent"** instead asks to end that agent, opening its **Close agent** confirmation. **"Back to dashboard"** closes the pane without ending the agent.
 
@@ -227,6 +228,10 @@ While the pull request page is open:
 - **"close"**, **"close the PR"** or **"close the pull request"** closes the page and returns to the screen under it. It only closes the page in the app; nothing happens to the pull request on GitHub.
 
 Typing into the agent does not work while the page is open over its pane: close the page first.
+
+## Approving project commands
+
+While **Review project commands** is open ([Approving Project Commands](../project-trust.md)), say **"approve and start"**, or any request that says *approve*, such as "approve the commands" or "I approve", to press **Approve and start**: it approves exactly the text on screen and starts the orchestration. A start that does not say *approve*, such as "start it" or "go ahead", does not approve anything. Say **"cancel"**, **"never mind"** or **"close"** to cancel the review, which starts nothing. With no review open, the app says there is nothing to approve. An approval applies only to the review that was on screen when you spoke: if it was cancelled, replaced by another, or re-shown with changed text before your words were understood, nothing is approved and the app asks you to look again.
 
 ## Checking a daemon's machine
 

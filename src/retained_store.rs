@@ -364,8 +364,9 @@ pub struct Envelope {
 const PRODUCER_FIELD_CHARS: usize = 256;
 
 /// A JSON formatter that writes every non-ASCII character as an escape, so
-/// the line holds no raw newline, control or bidi mark.
-struct AsciiFormatter;
+/// the line holds no raw newline, control or bidi mark. Shared with the work
+/// journal (PRD #1889), whose lines are written the same way.
+pub(crate) struct AsciiFormatter;
 
 impl serde_json::ser::Formatter for AsciiFormatter {
     fn write_string_fragment<W: ?Sized + io::Write>(

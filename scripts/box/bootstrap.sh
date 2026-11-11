@@ -240,7 +240,7 @@ if [ ! -s /etc/apt/keyrings/docker.asc ]; then
 fi
 put_root_file /etc/apt/sources.list.d/docker.list \
   "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu $codename stable" || true
-APT_PACKAGES=(build-essential auditd nodejs npm xz-utils ca-certificates curl git
+APT_PACKAGES=(build-essential auditd nodejs npm xz-utils ca-certificates curl git lsof
               docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
 # --use-vals: `vals` reads .env.vals.yaml's secrets from GCP Secret Manager with
 # the credentials `gcloud auth application-default login` writes. Google's repo

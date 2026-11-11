@@ -382,6 +382,16 @@ slow-timeout = { period = "60s", terminate-after = 6 }
 filter = 'test(close_verb_008_real_dispatcher_closes_its_reported_single_unit)'
 slow-timeout = { period = "60s", terminate-after = 15 }
 
+# Issue #2260: `dispatch/return/030` adds a second unit turn (the update)
+# after the real dispatch and report. Its phase waits are dispatcher ready
+# (120s), settle (90s), unit start (90s), report (210s), unit settle (60s),
+# card selection (10s), stamp (60s) and update (210s): 850s, before setup,
+# worktree creation and keystrokes. 900s leaves that slack, and matches both
+# the test's pinned 900s pane/daemon lifetime and `close_verb_008`'s bound.
+[[profile.default.overrides]]
+filter = 'test(dispatch_return_030_real_single_unit_sends_an_update_to_its_report)'
+slow-timeout = { period = "60s", terminate-after = 15 }
+
 # Issue #1616: `scheduler/dispatch/028` waits in five phases on a real
 # interactive Haiku — the first turn starting (90s), its output (90s), the card
 # settling Idle (120s), the follow-up's turn starting (60s) and its output
@@ -427,7 +437,8 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # `target/version-injection-e2e` CARGO_TARGET_DIR. That isolation is required so
 # it cannot clobber the `target/debug` binary the rest of the suite spawns. The
 # nested builds are `--jobs`-capped so they cannot starve the timed e2e tests
-# running alongside them.
+# running alongside them — except in CI's `version` shard, where nothing runs
+# alongside them and `scripts/e2e-shard.sh` lifts the cap (issue #2109).
 #
 # `priority` IS THE FIX FOR ISSUE #928, and what it fixes is not the build's
 # cost — it is WHEN the build starts. nextest schedules in binary-name order,

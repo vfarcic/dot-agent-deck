@@ -163,6 +163,8 @@ pub mod project_config;
 // there is for files this process wrote, and this one is for a path a caller
 // selected over the attach socket.
 pub mod project_resolve;
+// PRD #1885: remembered approvals of a project's orchestration commands and prompts.
+pub mod project_trust;
 // Issue #1884: the bounded macOS retry of PTY allocation.
 pub mod pty_open_retry;
 // PRD #1401: the pull request an agent's work produced, on the session wire.
@@ -182,6 +184,8 @@ pub mod report_recovery;
 pub mod retained_store;
 pub mod roles_cli;
 pub mod schedule_cli;
+// PRD #1885: a schedule's last fire, when it was refused as not approved.
+pub mod schedule_outcome;
 // Issue #1635: upgrading this machine's CLI and desktop app in place.
 pub mod scheduler;
 pub mod self_upgrade;
@@ -227,6 +231,9 @@ mod test_paths;
 // deterministic were private to one of them.
 #[cfg(test)]
 mod test_pty_wait;
+// PRD #1885: `dot-agent-deck trust list | approve | revoke`.
+pub mod trust_cli;
+pub mod trust_prompt;
 pub mod turn_reply;
 pub mod ui;
 // Issue #2094: what the deck sets for an agent in a pane another agent drives.
@@ -240,6 +247,10 @@ pub mod version;
 pub mod vt_grid;
 pub mod vt_work;
 pub mod watch;
+// PRD #1889: the work journal, the deck's durable record of its units of work.
+pub mod work_journal;
+// PRD #1889: which work each launch, attempt, report and end belongs to.
+pub mod work_tracking;
 pub mod worktree_owner;
 pub mod worktree_reclaim;
 pub mod wrap;

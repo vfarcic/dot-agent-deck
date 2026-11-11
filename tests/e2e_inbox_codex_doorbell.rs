@@ -488,6 +488,48 @@ fn codex_027_a_measured_codex_is_rung_in_two_stages_after_its_settle_window() {
     assert!(record["inbox"]["wake_hold"].is_null(), "{record}");
 }
 
+/// Scenario: Start the scripted Codex screen drawing measured release 0.164.0 with its hooks switched off, so a submitted line runs no hook, and queue a task. The deck rings with a line naming its absolute path, longer than the 140-column row, which Codex draws over more than one row; with no hook to report the ring, the attempt still ends Submitted, proved by the submitted line in Codex's transcript alone.
+#[spec("inbox/codex/027")]
+#[test]
+fn codex_027_a_long_line_is_proved_submitted_by_the_transcript_alone() {
+    let deck = Deck::new();
+    let codex = deck.codex(
+        "codex-027-transcript",
+        MEASURED,
+        Some("codex"),
+        &[(".nohook", "")],
+    );
+    deck.latched(&codex, MEASURED);
+    deck.idle(&codex);
+    let id = enqueue(&deck.daemon, &codex.pane, BODY);
+    let ended = || {
+        deck.lines(&codex.pane.agent, "doorbell attempt ended")
+            .into_iter()
+            .find(|l| l.contains("attempt=1"))
+    };
+    assert!(
+        common::wait_until(RING_WAIT, || ended().is_some()),
+        "the first ring ends: {:?}\n{}",
+        codex.typed(),
+        deck.log()
+    );
+    let line = codex.rung(&id).expect("the ring's line was submitted");
+    // Issue #1730: the line names the deck's absolute path, so it is wider
+    // than the composer's 138 columns and its transcript row wraps.
+    assert!(line.chars().count() > 138, "{line}");
+    assert!(
+        ended().is_some_and(|l| l.contains("outcome=Submitted")),
+        "proved submitted with no hook: {:?}\n{}",
+        ended(),
+        deck.log()
+    );
+    assert!(
+        codex.hook_events().is_empty(),
+        "no hook ran: {:?}",
+        codex.hook_events()
+    );
+}
+
 /// Scenario: With measured Codex 0.164.0's header latched and the generation idle, open each of its post-ready dialogs in turn (update, folder trust, hooks review) and queue a task. After the settle window the deck's admission sees the dialog and types nothing, neither into the dialog nor anywhere else, and logs the dialog as why; once the dialog closes the empty composer is rung and the task delivered.
 #[spec("inbox/codex/027")]
 #[test]

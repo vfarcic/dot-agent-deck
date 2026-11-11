@@ -464,6 +464,10 @@ pub struct PostedDelegate {
     pub id: MessageId,
     pub ended: oneshot::Receiver<DelegateEnd>,
     pub superseded: Vec<DelegateLedger>,
+    /// PRD #1889: the ids of exactly the tasks the post superseded in the task
+    /// ledger (empty when the report state is torn), so the work journal
+    /// retires those and never a newer task to the same pane.
+    pub superseded_tasks: Vec<String>,
 }
 
 /// PRD #1666 S5: a delegated task the deck reports on if it does not reach
@@ -1450,6 +1454,7 @@ impl InboxHub {
         let mut saved = false;
         let mut owed = false;
         let mut superseded_debt = Vec::new();
+        let mut superseded_tasks = Vec::new();
         let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -1511,7 +1516,12 @@ impl InboxHub {
                     }
                     debt
                 }) {
-                    Ok(debt) => superseded_debt = debt,
+                    Ok(debt) => {
+                        for (task, ledger) in debt {
+                            superseded_tasks.push(task);
+                            superseded_debt.push(ledger);
+                        }
+                    }
                     Err(_) => st.log_torn_once("post_delegate"),
                 }
             }
@@ -1557,6 +1567,7 @@ impl InboxHub {
             id,
             ended: rx,
             superseded: superseded_debt,
+            superseded_tasks,
         })
     }
 
@@ -1606,6 +1617,19 @@ impl InboxHub {
     pub fn open_tasks_of(&self, pane_id: &str) -> Vec<String> {
         self.lock()
             .guarded_read(|reports| reports.tasks.open_of_pane(pane_id))
+            .unwrap_or_default()
+    }
+
+    /// Issue #2099: the delegated tasks generation `(pane_id, agent_id)` still
+    /// owes a report for, by id — not one a report is being saved for; empty
+    /// when the report state is torn.
+    pub fn tasks_awaiting_report(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+        self.lock()
+            .guarded_read(|reports| {
+                reports
+                    .tasks
+                    .awaiting_report_of_generation(pane_id, agent_id)
+            })
             .unwrap_or_default()
     }
 
@@ -4663,7 +4687,7 @@ fn supersede_tasks(
     reports: &mut crate::report_recovery::ReportState,
     pane_id: &str,
     by: Option<&str>,
-) -> Vec<DelegateLedger> {
+) -> Vec<(String, DelegateLedger)> {
     use crate::report_recovery::{TaskLookup, TaskState, Tombstone};
     let mut debt = Vec::new();
     for id in reports.tasks.open_of_pane(pane_id) {
@@ -4679,7 +4703,7 @@ fn supersede_tasks(
                 by: by.map(str::to_string),
             },
         ) {
-            debt.push(task_debt(&task));
+            debt.push((id, task_debt(&task)));
         }
     }
     debt
@@ -5394,14 +5418,16 @@ fn kind_sender_label(kind: &str, from: &Sender, trust: BodyTrust) -> String {
 /// message was replaced, and a shut inbox is the daemon going away; neither is
 /// the agent's to explain.
 fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
-    use crate::inbox_display::{NOTICE_AGENT_EXITED, NOTICE_MAX_DELIVER};
+    use crate::inbox_display::{NOTICE_MAX_DELIVER, PaneTermination};
     if st.card_notice_sink.is_none() || event.state != StateName::Undeliverable {
         return;
     }
     let detail = match event.undeliverable_reason {
-        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER,
+        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER.into(),
         Some(UndeliverableReason::AgentExited) => event_termination(st, event)
-            .map_or(NOTICE_AGENT_EXITED, |termination| termination.card_notice()),
+            .unwrap_or(&PaneTermination::Unknown)
+            .card_notice()
+            .into(),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5667,7 +5693,7 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         agent_id,
         delivery_id: event.message_id.to_string(),
         session_id: None,
-        detail: crate::inbox_display::NOTICE_DELIVERED_LATE,
+        detail: crate::inbox_display::NOTICE_DELIVERED_LATE.into(),
         cleared: true,
     });
 }
