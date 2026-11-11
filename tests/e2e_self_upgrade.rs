@@ -21,7 +21,7 @@
 //! the `e2e`-only `DOT_AGENT_DECK_TEST_SYSTEM_ROOT`. So a desktop app, a
 //! `gh` or a `.deb` installed on the host cannot change what a test sees.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/fake_releases.rs"]
 mod fake_releases;
 

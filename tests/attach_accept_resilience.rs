@@ -32,7 +32,7 @@ use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::platform::ipc::IpcListener;
 use dot_agent_deck::state::{AppState, SharedState};
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 

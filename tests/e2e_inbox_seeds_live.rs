@@ -2,7 +2,7 @@
 
 //! Spawn seeds remain queued through boot and are acknowledged when consumed.
 //! The real-agent cases run interactive Haiku in attached deck panes.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

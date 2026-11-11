@@ -4959,10 +4959,9 @@ fn surface_one_orchestration(
                     {
                         // `started_role_indices` indexes `roles` too, so an
                         // insert ahead of a recorded index would silently
-                        // repoint it at a different role. It has no reader
-                        // today (it is forward-compat only), which is a
-                        // reason to keep it honest rather than a licence to
-                        // let it rot.
+                        // repoint it at a different role. The next save
+                        // re-records it from the tab (issue #929), and this
+                        // keeps the block honest until then.
                         if was_new {
                             for started in snapshot.started_role_indices.iter_mut() {
                                 if *started >= placed_at {
@@ -11789,7 +11788,7 @@ fn dispatch_action(
                                     command: orch_config.roles[start_idx].command.clone(),
                                     mode: None,
                                     orchestration: Some(config::OrchestrationSnapshot {
-                                        version: 1,
+                                        version: config::ORCHESTRATION_SNAPSHOT_VERSION,
                                         roles: orch_config
                                             .roles
                                             .iter()
@@ -11799,7 +11798,11 @@ fn dispatch_action(
                                         orchestrator_prompt: captured_prompt.clone(),
                                         config_name: orch_config.name.clone(),
                                         project_path: dir_str.clone(),
-                                        started_role_indices: vec![start_idx],
+                                        // Issue #929: every role was just
+                                        // started; each save re-records the
+                                        // live ones (`record_started_roles`).
+                                        started_role_indices: (0..orch_config.roles.len())
+                                            .collect(),
                                         // PRD #89 review-fix F4: capture the
                                         // user-typed tab title so the
                                         // daemon-empty restore rebuilds the tab
@@ -12535,12 +12538,14 @@ fn dispatch_action(
 /// without writing on every keystroke. Mirrors the pre-teardown snapshot block
 /// (build from the live panes, clear when empty), then records the write so the
 /// throttle re-arms.
-fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState) {
+fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState, tab_manager: &TabManager) {
     let now = ui.session_epoch.elapsed();
     if !ui.session_coalescer.is_due(now) {
         return;
     }
     let live_panes = state.blocking_read().managed_pane_ids.clone();
+    // Issue #929: record which roles each orchestration is running now.
+    tab_manager.record_started_roles(&mut ui.pane_metadata, &live_panes);
     let mut session =
         config::SavedSession::snapshot(&mut ui.pane_metadata, &ui.pane_display_names, &live_panes);
     // PRD #196: overlay the runtime last-command onto the live-pane snapshot so
@@ -14129,7 +14134,7 @@ pub fn run_tui(
                         // the daemon registers (who may `delegate`) and the Pi
                         // seed name that same role — one orchestrator, not a
                         // prompt on one pane and delegate rights on another.
-                        match tab_manager.open_orchestration_tab_seated(
+                        match tab_manager.open_orchestration_tab_restoring(
                             &orch_config,
                             &saved_pane.dir,
                             replay_prompt,
@@ -14140,6 +14145,9 @@ pub fn run_tui(
                             orch_snap.display_title.as_deref(),
                             spawn_dims,
                             Some(saved_start_idx),
+                            // Issue #929: only the roles that were running when
+                            // the snapshot was saved; an old snapshot, every role.
+                            &orch_snap.roles_to_start_on_restore(orch_config.roles.len()),
                         ) {
                             Ok((tab_idx, role_pane_ids)) => {
                                 // Snapshot each role pane's daemon agent_id before
@@ -14163,6 +14171,20 @@ pub fn run_tui(
                                         .zip(role_agent_ids.iter())
                                         .zip(role_attached_on)
                                     {
+                                        // Issue #929: a role restore did not
+                                        // start keeps its card through a
+                                        // placeholder on its dead-slot id, as
+                                        // on a tab rebuilt from a daemon; it is
+                                        // no pane, so it is not registered.
+                                        if is_dead_slot_pane_id(id) {
+                                            st.insert_placeholder_session(
+                                                id.clone(),
+                                                Some(saved_pane.dir.clone()),
+                                                None,
+                                                None,
+                                            );
+                                            continue;
+                                        }
                                         st.register_pane(id.clone());
                                         let learned_from = attached_on
                                             .unwrap_or_else(|| st.stream_incarnation.clone());
@@ -14185,6 +14207,9 @@ pub fn run_tui(
                                     // `surface_one_orchestration`.
                                     // The tab's seat — the saved cursor (above).
                                     for (i, role) in orch_config.roles.iter().enumerate() {
+                                        if is_dead_slot_pane_id(&role_pane_ids[i]) {
+                                            continue;
+                                        }
                                         st.pane_role_map
                                             .insert(role_pane_ids[i].clone(), role.name.clone());
                                         st.pane_cwd_map.insert(
@@ -14453,7 +14478,7 @@ pub fn run_tui(
         // coalescer's throttle window has elapsed, flush it to disk now. This
         // runs every iteration (including the 16ms idle ticks below), so the
         // trailing write of a coalesced burst lands without further input.
-        flush_session_snapshot_if_due(&mut ui, &state);
+        flush_session_snapshot_if_due(&mut ui, &state, &tab_manager);
 
         // PRD #120: build live tabs for any orchestrations the daemon spawned
         // mid-session (issue dispatch). Done before the snapshot clone + tab
@@ -15892,6 +15917,8 @@ pub fn run_tui(
     // Snapshot the session for auto-restore on exit.
     {
         let live_panes = state.blocking_read().managed_pane_ids.clone();
+        // Issue #929: as in `flush_session_snapshot_if_due`.
+        tab_manager.record_started_roles(&mut ui.pane_metadata, &live_panes);
 
         let mut session = config::SavedSession::snapshot(
             &mut ui.pane_metadata,
@@ -23763,7 +23790,14 @@ fn render_session_card(
     // Blocked reason, and an attention reason like it, so at Minimal density
     // it keeps the row ahead of background work, as the desktop tile orders
     // them (PRD #1666 MC-2, CLAUDE.md rule 22).
+    //
+    // Issue #1933: the notice says how the agent's pane ended, the exit code
+    // included, in a sentence longer than a card in a two-column grid is wide,
+    // so it wraps like the agent notice below (which takes the wrap instead
+    // when both are on the card, as the row that explains everything else).
+    let mut wrapped_notice: Option<usize> = None;
     if !is_placeholder && let Some(notice) = session.delivery_notice() {
+        wrapped_notice = Some(attention.len());
         attention.push((
             notice.to_string(),
             Style::default().fg(palette::status_color(&SessionStatus::Error)),
@@ -23790,7 +23824,6 @@ fn render_session_card(
     // shown first in this row) says what to do in a sentence longer than a
     // card is wide, so it wraps over up to [`CARD_AGENT_NOTICE_ROWS`] rows, as
     // the desktop tile shows it whole; the other notices keep one row.
-    let mut wrapped_notice: Option<usize> = None;
     if !is_placeholder && let Some(notice) = session.inbox_notice() {
         let is_agent_notice = session
             .card_inbox()
@@ -23824,7 +23857,7 @@ fn render_session_card(
         Line::from(Span::styled(truncate_with_ellipsis(&text, w), style))
     };
     let shares_row = density == CardDensity::Minimal && !attention.is_empty();
-    // The rows the agent notice may take: what the card has left after its
+    // The rows the wrapped notice may take: what the card has left after its
     // tools and every other status row, between one and
     // [`CARD_AGENT_NOTICE_ROWS`].
     let other_rows = attention.len().saturating_sub(1)
@@ -23962,7 +23995,8 @@ const CARD_ORCHESTRATOR_BADGE: &str = "ORCHESTRATOR";
 
 /// PRD #2050: the most rows a card gives the daemon's agent notice, which
 /// leads with what to do (`crate::agent_notice`), so its first two rows carry
-/// the remedy on a card of about 60 columns.
+/// the remedy on a card of about 60 columns. Issue #1933: the delivery notice
+/// wraps over as many, so how the pane ended fits a card of that width.
 const CARD_AGENT_NOTICE_ROWS: usize = 3;
 
 /// `text` word-wrapped to `width` columns over at most `max_rows` rows, the

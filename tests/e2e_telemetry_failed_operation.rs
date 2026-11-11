@@ -5,7 +5,7 @@
 //! when the call does, not when the run does. The real-agent half is
 //! `tests/e2e_telemetry_failed_operation_live.rs`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 mod telemetry_operation_receiver;
 
 use common::TuiDeck;

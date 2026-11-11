@@ -167,8 +167,8 @@ impl Walk<'_> {
         // Keys are canonical, so `tests/../src/x.rs` and `src/x.rs` are one file.
         let file = canonical(file);
         // A file reached twice in one crate would be a compile error; across
-        // crates (`tests/common` from many roots) it is reached once per root,
-        // and the findings set dedups.
+        // crates (a `#[path]`-shared file under `tests/support` from many
+        // roots) it is reached once per root, and the findings set dedups.
         if !self.visited.insert(file.clone()) {
             return;
         }

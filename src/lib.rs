@@ -214,7 +214,7 @@ mod test_temp;
 // endpoint variables never ran for them and a fixture that spawned an emitter
 // posted hook events into the developer's live dashboard.
 // Issue #709's load-scaled wait ceilings, for the lib target's own unit tests.
-// `tests/common/mod.rs` has the same helper and the full rationale, but this
+// `tests/common/lib.rs` has the same helper and the full rationale, but this
 // target does not link that file — the wall `test_isolation` documents.
 #[cfg(test)]
 mod test_budget;
@@ -244,6 +244,10 @@ pub mod watch;
 // PRD #385: the deck's ratatui backend, drawing a two-column glyph so its
 // second column is right whichever width the host terminal gives it.
 pub mod wide_glyph_backend;
+// PRD #1889: the work journal, the deck's durable record of its units of work.
+pub mod work_journal;
+// PRD #1889: which work each launch, attempt, report and end belongs to.
+pub mod work_tracking;
 pub mod worktree_owner;
 pub mod worktree_reclaim;
 pub mod wrap;

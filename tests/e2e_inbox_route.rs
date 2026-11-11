@@ -4,7 +4,7 @@
 //! stand-in panes' mail from outside them; inbox/protocol/014 and /015 pin the
 //! binding itself.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]
@@ -38,6 +38,69 @@ fn delegate_001_posts_one_bound_task_and_worker_fetches() {
     route::no_messages(&daemon, &orch, Duration::from_millis(250));
     assert!(bytes(&orch).is_empty());
     assert_eq!(route::count(&daemon, &worker, 1).len(), 1);
+}
+
+/// Scenario: Start two tabs of the same orchestration in one daemon and folder, each with its own orchestrator and a worker both named `coder`. Each orchestrator runs the real `delegate --to coder` CLI; it must exit 0 and print the pane of its own coder and the task id, never the other tab's coder, and the task must land only in its own coder's inbox (issue #545).
+#[spec("orchestration/delegate/053")]
+#[test]
+fn delegate_053_each_delegate_names_and_reaches_its_own_orchestration_s_worker() {
+    let daemon = daemon_unbound(&[]);
+    let (orch_a, coder_a) = route::tab_team(&daemon, "a");
+    let (orch_b, coder_b) = route::tab_team(&daemon, "b");
+    assert_ne!(coder_a.id, coder_b.id, "two distinct coder panes");
+
+    // `other_holds`: what the other tab's coder already holds when this
+    // delegate runs — nothing, then the task the first delegate gave it.
+    for (orch, own, other, other_holds, task) in [
+        (&orch_a, &coder_a, &coder_b, 0, "ROUTE-545-TASK-alpha"),
+        (&orch_b, &coder_b, &coder_a, 1, "ROUTE-545-TASK-beta"),
+    ] {
+        let out = route::cli_output(
+            &daemon,
+            orch,
+            daemon.cwd(),
+            &["delegate", "--to", "coder", "--task", task],
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{}'s delegate must succeed: stderr={stderr}",
+            orch.id
+        );
+        // What lands, first: the routing guard, which holds on main.
+        let messages = route::count(&daemon, own, 1);
+        let id = messages[0]["id"].as_str().expect("message id").to_string();
+        let crossed = |others: &[serde_json::Value]| {
+            others.len() != other_holds || others.iter().any(|m| m["id"] == id.as_str())
+        };
+        assert!(
+            !common::wait_until(Duration::from_millis(250), || crossed(&route::messages(
+                &daemon, other
+            ))),
+            "{}'s task {id} must not reach the other tab's coder {}: {:?}",
+            orch.id,
+            other.id,
+            route::messages(&daemon, other)
+        );
+        // What the sender is told: issue #545's reproduction.
+        assert!(
+            stderr.contains(&format!(
+                "[UNTRUSTED-PANE-ID: {} :END-UNTRUSTED-PANE-ID] as task {id}",
+                own.id
+            )),
+            "issue #545: {}'s delegate must name the pane and task it reached ({} as {id}), \
+             so a mis-route is visible: stderr={stderr:?}",
+            orch.id,
+            own.id
+        );
+        assert!(
+            !stderr.contains(&other.id),
+            "{}'s delegate must never name the other tab's coder {}: stderr={stderr}",
+            orch.id,
+            other.id
+        );
+        route::fetched(&daemon, own, &id, task, "the orchestrator");
+    }
 }
 
 /// Scenario: Complete a commissioned task from a synthetic worker. Its report is saved and reaches the recorded orchestrator generation as exactly one Untrusted-framed inbox message, fetched by the orchestrator's own pane CLI.

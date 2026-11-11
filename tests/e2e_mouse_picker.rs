@@ -14,7 +14,7 @@
 //! sibling dir. So `childdir` is a clickable row, double-clicking it reveals
 //! `grandkid`, and going back up reveals `home` again.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;

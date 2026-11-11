@@ -36,7 +36,7 @@
 //!
 //! [`arm_child_group_backstop`]: https://github.com/vfarcic/dot-agent-deck/pull/661
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::io::Read as _;
 use std::os::unix::net::UnixListener;

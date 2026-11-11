@@ -2,7 +2,7 @@
 
 //! Real interactive Haiku discovers and messages another orchestration's leader.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 

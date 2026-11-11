@@ -166,9 +166,9 @@ describe("agent pane deck identity", () => {
     const runAction = vi.fn(async () => ({ ok: true }));
     const deck = harness(documentSelectingOneDeck(), { runAction }, (agent) => ({ ...agent, incarnation: "listed-process-a" }));
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
-    fireEvent.click(screen.getByRole("button", { name: "Rename Planner" }));
-    fireEvent.change(screen.getByRole("textbox", { name: "Rename Planner" }), { target: { value: "Pinned name" } });
-    fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename Planner" }), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Rename Plan / architecture" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "Rename Plan / architecture" }), { target: { value: "Pinned name" } });
+    fireEvent.keyDown(screen.getByRole("textbox", { name: "Rename Plan / architecture" }), { key: "Enter" });
     await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "rename_agent", agentId: "planner", displayName: "Pinned name", incarnation: "listed-process-a" }));
   });
 
@@ -268,7 +268,7 @@ describe("agent pane deck identity", () => {
     expect(declaration).toContain("planner");
     expect(declaration).not.toContain(FIXTURE_DAEMON_ID);
 
-    fireEvent.click(within(pane).getByRole("button", { name: "Type into Planner on build-box terminal" }));
+    fireEvent.click(within(pane).getByRole("button", { name: "Type into Plan / architecture on build-box terminal" }));
     expect(deck.sendTerminalInput).toHaveBeenCalledTimes(1);
     const routedInput = JSON.stringify(deck.sendTerminalInput.mock.calls[0]);
     expect(routedInput).toContain(REMOTE_DECK_ID);
@@ -500,7 +500,7 @@ describe("agent pane identity fence", () => {
       (agent) => agent.id === "planner" ? { ...agent, status: "running", writeLease: "write" } : agent,
     );
     render(<DeckShell runtime={deck.runtime("local")} initialView={{ kind: "deck" }} />);
-    fireEvent.click(openControl("Planner"));
+    fireEvent.click(openControl("Plan / architecture"));
     const pane = screen.getByTestId("agent-pane-overlay");
     fireEvent.click(screen.getByTestId("voice-trigger"));
     const stop = await screen.findByRole("button", { name: "Stop typing" });
@@ -544,7 +544,7 @@ describe("agent pane identity fence", () => {
     // opened for the other machine's agent.
     expect(screen.getByTestId("agent-tile-planner-on-build-box")).toHaveAttribute("data-presentation", "tile");
     expect(screen.queryByRole("button", { name: "Back to dashboard" })).not.toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Open Planner on build-box agent" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Open Plan / architecture on build-box agent" })).toBeVisible();
 
     await act(async () => { rerender(<DeckShell runtime={deck.runtime("local")} initialView={paneView} />); });
 

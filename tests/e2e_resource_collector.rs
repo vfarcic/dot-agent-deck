@@ -2,7 +2,7 @@
 
 //! Synthetic processes exercise the per-machine collector through its binary.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[allow(dead_code)]
 mod resource_collector;
 

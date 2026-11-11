@@ -50,7 +50,7 @@
 //!     captures the retired session's `display_name` (keyed by the stable pane
 //!     id) and seeds the replacement session with it. Shipped green in v0.35.0.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

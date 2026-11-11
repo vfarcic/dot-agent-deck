@@ -817,6 +817,23 @@ impl TaskLedger {
         self.open_where(|b| b.worker_pane == pane_id && b.worker_agent == agent_id)
     }
 
+    /// Issue #2099: the open tasks bound to `(pane, agent)` still waiting for
+    /// their report — not one a report is being saved for.
+    pub fn awaiting_report_of_generation(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, task)| {
+                task.binding.worker_pane == pane_id
+                    && task.binding.worker_agent == agent_id
+                    && matches!(task.state, TaskState::Open { .. })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The open tasks bound to any generation of `pane_id`.
     pub fn open_of_pane(&self, pane_id: &str) -> Vec<String> {
         self.open_where(|b| b.worker_pane == pane_id)
@@ -1329,6 +1346,27 @@ mod tests {
         assert!(matches!(tasks.lookup("open"), TaskLookup::Open(_)));
         assert_eq!(tasks.open_of_generation("w", "a"), vec!["open".to_string()]);
         assert!(tasks.open_of_generation("w", "b").is_empty());
+    }
+
+    /// Issue #2099: a stopped worker's report ends only the tasks still
+    /// waiting for a report from that generation — not one a report is being
+    /// saved for, and not another generation's.
+    #[test]
+    fn awaiting_report_skips_a_task_being_reported_and_other_generations() {
+        let mut tasks = TaskLedger::new(8);
+        for (id, agent) in [("t1", "a"), ("t2", "a"), ("t3", "b")] {
+            tasks.bind(id, binding("w", agent, Some("i"))).unwrap();
+        }
+        tasks.open_task_mut("t2").unwrap().state = TaskState::Reporting { claim_id: 1 };
+        assert_eq!(
+            tasks.awaiting_report_of_generation("w", "a"),
+            vec!["t1".to_string()]
+        );
+        assert_eq!(
+            tasks.open_of_generation("w", "a"),
+            vec!["t1".to_string(), "t2".to_string()],
+            "control: both are open"
+        );
     }
 
     #[test]

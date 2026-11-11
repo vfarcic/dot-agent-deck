@@ -38,7 +38,7 @@ use dot_agent_deck::ui::{
 use ratatui::style::Modifier;
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 use common::{joined_rows, nonblank_rows, role_pane_border_title, role_pane_left_edge};
 
 /// Scenario: Render the full dashboard button bar (global + context buttons,

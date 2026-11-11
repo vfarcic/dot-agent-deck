@@ -2,7 +2,7 @@
 
 //! Synthetic coverage through the real wrapper; the real-agent case is lane 2.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

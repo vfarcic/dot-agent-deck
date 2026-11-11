@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 //! Real Codex through the wrapper and inbox hooks in a scratch HOME.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/codex_inbox_live.rs"]

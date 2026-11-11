@@ -7,7 +7,7 @@
 //! to the fixed global `schedules.toml` regardless of cwd and then trigger a
 //! daemon reload so the running daemon picks the new task up live.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use spec::spec;
 

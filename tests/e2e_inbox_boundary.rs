@@ -3,7 +3,7 @@
 //! capability-gated Retry and Cancel verbs, the adapter floor's notices in the
 //! snapshot both clients hydrate from and in the live broadcast, and the
 //! legacy hook command beside a receipt-owned OpenCode pane.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 use inbox::*;

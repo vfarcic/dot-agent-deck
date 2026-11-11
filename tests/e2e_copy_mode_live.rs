@@ -10,7 +10,7 @@
 //! the native clipboard off, so the copy is read back as the OSC 52 sequence in
 //! the byte history.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

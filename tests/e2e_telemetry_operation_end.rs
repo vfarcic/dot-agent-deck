@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", unix))]
 
-mod common;
+dot_agent_deck_test_harness::link!();
 mod telemetry_operation_receiver;
 
 use common::TuiDeck;

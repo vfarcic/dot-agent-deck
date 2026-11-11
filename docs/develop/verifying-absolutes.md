@@ -25,4 +25,4 @@ Each row is the same shape — a narrower fact written one quantifier too wide �
 
 ## Why the grep needs word boundaries
 
-**Grep with word boundaries, and blank inline code spans first** — the inverse trap cost a round of its own. A case-insensitive search for `actions` in `tests/common/mod.rs` matched 110 lines on PR #805's branch, and all 132 occurrences sat inside a `…redactions…` identifier; `\bActions\b` matched none of them. A sweep that drowns in substring noise gets abandoned, which buys exactly as much as not sweeping at all.
+**Grep with word boundaries, and blank inline code spans first** — the inverse trap cost a round of its own. A case-insensitive search for `actions` in `tests/common/lib.rs` matched 110 lines on PR #805's branch, and all 132 occurrences sat inside a `…redactions…` identifier; `\bActions\b` matched none of them. A sweep that drowns in substring noise gets abandoned, which buys exactly as much as not sweeping at all.

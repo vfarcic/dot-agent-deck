@@ -12,7 +12,7 @@
 //! terminal, so the copy is observed as the OSC 52 sequence in the byte
 //! history, and the status line says that only OSC 52 went out.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use spec::spec;
