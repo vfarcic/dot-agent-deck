@@ -1459,7 +1459,7 @@ fn status_waiting_024_real_codex_background_command_reads_waiting_until_it_exits
     // composer nor that hold (`codex_hooks_001` measured both).
     let submit_deadline = std::time::Instant::now() + common::load_scaled(Duration::from_secs(60));
     let mut enters = 0_usize;
-    let submitted = loop {
+    let composer_emptied = loop {
         if enters == 0 || !deck.snapshot_grid().contains(CODEX_STARTUP_HOLD) {
             deck.send_keys(b"\r");
             enters += 1;
@@ -1472,7 +1472,7 @@ fn status_waiting_024_real_codex_background_command_reads_waiting_until_it_exits
         }
     };
     assert!(
-        submitted,
+        composer_emptied,
         "PROMPT NOT DELIVERED: after {enters} Enter(s) the prompt is still in Codex's \
          composer:\n{}",
         deck.snapshot_grid()
