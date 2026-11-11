@@ -394,7 +394,7 @@ jobs:
     # 16-core dev box after #836's second phase took the suite from 20 tests to
     # 54 across two engines, including the `vite build` the Playwright
     # `webServer` runs first: 24.6s at 8 workers, 1m06s at `--workers=1`, which
-    # is the shape CI runs in. On top of that CI pays for `pnpm install`, the
+    # was the shape CI ran in until issue #2079 raised it to 4. On top of that CI pays for `pnpm install`, the
     # ~400 MiB browser download and the apt install for WebKit's runtime deps,
     # and those three dominate. The original 20-minute budget aimed to leave
     # room for all of it while capping a wedged browser at a fraction of the
