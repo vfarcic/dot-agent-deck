@@ -260,6 +260,91 @@ pub struct TokenOwner {
     pub facts: AttestFacts,
 }
 
+/// Issue #2104: the tokens of generations this daemon has taken down, kept
+/// only so the hook loop can tell a refused [`Refusal::UnknownToken`] that is
+/// teardown from one that is not.
+///
+/// Closing or respawning an agent removes its record, and its token with it,
+/// before the child has exited, so the dying agent's own last hook — Claude
+/// Code's `SessionEnd`, mostly — presents a token nobody owns and is refused.
+/// Telemetry put that at nine refusals in ten (issue #2104). The refusal is
+/// right and stays; what this set changes is only how loudly it is logged.
+/// A token in here resolves to nothing in [`HookTokenDirectory`]: membership
+/// grants no admission, and [`classify`] never reads it.
+///
+/// Each entry binds the token to the pane and the agent id of the generation
+/// it was minted for, and a refusal counts as that generation's last report
+/// only when it claims that same pane and, when it names an agent, that same
+/// agent; a paneless claim must name it (Qodo on PR #2257). A retired token
+/// presented for any other pane or agent is not teardown and still warns.
+///
+/// Holds a SHA-256 digest of each token rather than the token, so a retired
+/// capability is not kept in memory for longer than its record was. Bounded
+/// at [`Self::CAPACITY`], oldest first out; a token evicted from it is merely
+/// warned about again, which is the behaviour before this set existed.
+#[derive(Debug, Default)]
+pub(crate) struct RetiredHookTokens {
+    order: std::collections::VecDeque<[u8; 32]>,
+    /// Digest → the retired generation's pane (`None`: paneless) and agent id.
+    digests: std::collections::HashMap<[u8; 32], (Option<String>, String)>,
+}
+
+impl RetiredHookTokens {
+    /// How many retired tokens are remembered. A dying agent's last hook
+    /// arrives within a second of its teardown (issue #2104 measured 102 of
+    /// 116 within one), so this only has to outlast the teardowns of one busy
+    /// burst. Each entry is a 32-byte digest held in both `order` and
+    /// `digests`, plus its pane and agent ids, so a full set is 64 KiB of
+    /// digests plus those ids and the two collections' own overhead.
+    pub(crate) const CAPACITY: usize = 1024;
+
+    fn digest(token: &str) -> [u8; 32] {
+        use sha2::{Digest as _, Sha256};
+        Sha256::digest(token.as_bytes()).into()
+    }
+
+    /// Remember that `token`'s generation — registry id `agent_id`, which
+    /// held `pane` — was taken down.
+    pub(crate) fn record(&mut self, token: &str, pane: Option<&str>, agent_id: &str) {
+        let digest = Self::digest(token);
+        if self
+            .digests
+            .insert(digest, (pane.map(str::to_string), agent_id.to_string()))
+            .is_some()
+        {
+            return;
+        }
+        self.order.push_back(digest);
+        while self.order.len() > Self::CAPACITY {
+            if let Some(oldest) = self.order.pop_front() {
+                self.digests.remove(&oldest);
+            }
+        }
+    }
+
+    /// Whether `token` belongs to a generation this daemon took down, and the
+    /// claim is that generation's own: the same pane (`None` matching only a
+    /// paneless generation) and, when `claimed_agent` is given, the same
+    /// agent. A paneless claim has nothing but its agent to match, so it must
+    /// name one.
+    pub(crate) fn contains(
+        &self,
+        token: &str,
+        claimed_pane: Option<&str>,
+        claimed_agent: Option<&str>,
+    ) -> bool {
+        self.digests
+            .get(&Self::digest(token))
+            .is_some_and(|(pane, agent)| {
+                pane.as_deref() == claimed_pane
+                    && match claimed_agent {
+                        Some(claimed) => claimed == agent,
+                        None => claimed_pane.is_some(),
+                    }
+            })
+    }
+}
+
 /// PRD #1666 part 3, round 5 (plan D7): how an orchestration instance came to
 /// be, written by the daemon's spawn path and never taken from the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1131,5 +1216,67 @@ mod tests {
         assert_eq!(normalise(Some("")), None);
         assert_eq!(normalise(Some("   ")), None);
         assert_eq!(normalise(Some(" abc ")), Some("abc".to_string()));
+    }
+
+    #[test]
+    fn retired_hook_tokens_remember_a_retired_token_and_nothing_else() {
+        let mut retired = RetiredHookTokens::default();
+        let gone = mint();
+        let live = mint();
+        assert!(!retired.contains(&gone, Some("p"), Some("7")));
+        retired.record(&gone, Some("p"), "7");
+        assert!(retired.contains(&gone, Some("p"), Some("7")));
+        assert!(
+            retired.contains(&gone, Some("p"), None),
+            "untagged, same pane"
+        );
+        assert!(
+            !retired.contains(&gone, Some("p"), Some("8")),
+            "another agent"
+        );
+        assert!(
+            !retired.contains(&gone, Some("other"), Some("7")),
+            "another pane"
+        );
+        assert!(!retired.contains(&gone, None, Some("7")), "no pane");
+        assert!(!retired.contains(&live, Some("p"), Some("7")));
+        let paneless = mint();
+        retired.record(&paneless, None, "9");
+        assert!(retired.contains(&paneless, None, Some("9")));
+        assert!(
+            !retired.contains(&paneless, None, Some("10")),
+            "another paneless agent"
+        );
+        assert!(
+            !retired.contains(&paneless, None, None),
+            "a paneless claim names no one"
+        );
+        assert!(!retired.contains(&paneless, Some("p"), Some("9")));
+        retired.record(&paneless, None, "9");
+        assert_eq!(retired.order.len(), 2);
+        // Recording the same token twice keeps one entry.
+        retired.record(&gone, Some("p"), "7");
+        assert_eq!(retired.order.len(), 2);
+    }
+
+    #[test]
+    fn retired_hook_tokens_are_bounded_oldest_first() {
+        let mut retired = RetiredHookTokens::default();
+        let first = mint();
+        retired.record(&first, Some("p"), "1");
+        let rest: Vec<String> = (0..RetiredHookTokens::CAPACITY).map(|_| mint()).collect();
+        for token in &rest {
+            retired.record(token, Some("p"), "1");
+        }
+        assert_eq!(retired.order.len(), RetiredHookTokens::CAPACITY);
+        assert_eq!(retired.digests.len(), RetiredHookTokens::CAPACITY);
+        assert!(
+            !retired.contains(&first, Some("p"), Some("1")),
+            "the oldest entry is evicted"
+        );
+        assert!(
+            rest.iter()
+                .all(|t| retired.contains(t, Some("p"), Some("1")))
+        );
     }
 }

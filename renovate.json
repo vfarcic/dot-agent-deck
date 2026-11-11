@@ -145,6 +145,22 @@
       "description": "The static tools `/code-cleanup` picks its targets from (issue #1819): cargo-shear, cargo-mutants and knip, each pinned once in `.claude/skills/code-cleanup/find-targets.sh` as `<NAME>_VERSION=<X.Y.Z>` under a `# renovate: datasource=<datasource> depName=<package>` comment, which is where this manager reads the datasource and package from. The script refuses a cargo tool installed at any other version, naming the `cargo install --locked` command for the pin, and runs knip as `pnpm dlx knip@<pin>`, so a bump here is the whole upgrade. `code_cleanup_009_renovate_reads_every_tool_pin` in xtask/linkage-check/src/code_cleanup_scope.rs runs this matchString over the real script and requires it to extract every pin, so a pin written in another layout goes red there instead of silently rotting. `.rwx/sandbox.yml` repeats the cargo-mutants pin in the same layout, indented inside a `run:` block (hence the `\\s*` before the variable), so the RWX sandbox can run `/code-cleanup`'s mutation step; this manager bumps both copies in one PR, and `code_cleanup_018_the_sandbox_installs_the_pinned_cargo_mutants` fails when they differ or when this matchString stops reading the sandbox's copy.",
       "managerFilePatterns": ["/^\\.claude/skills/code-cleanup/find-targets\\.sh$/", "/^\\.rwx/sandbox\\.yml$/"],
       "matchStrings": ["#\\s*renovate:\\s*datasource=(?<datasource>[a-z-]+)\\s+depName=(?<depName>[a-z0-9-]+)\\s*\\n\\s*[A-Z_]+_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"]
+    },
+    {
+      "customType": "regex",
+      "description": "Issue #2051: the OpenCode 1.x scripts/box/bootstrap.sh installs on a dev box (`OPENCODE_1_VERSION=<X.Y.Z>`), the same release scripts/opencode-pins/v1/package.json pins for CI's lane 1. Renovate's npm manager bumps that package.json and its lockfile; this manager bumps the bootstrap line, and the `OpenCode 1.x` rule in packageRules groups the two into one PR. `opencode_pins_agree_with_their_lockfiles_and_the_box_bootstrap` in xtask/linkage-check/src/pin_lockstep.rs fails when they disagree, and `renovate_reads_the_box_bootstraps_opencode_pins` when this matchString stops reading the line.",
+      "managerFilePatterns": ["/^scripts/box/bootstrap\\.sh$/"],
+      "matchStrings": ["OPENCODE_1_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "npm",
+      "depNameTemplate": "opencode-ai"
+    },
+    {
+      "customType": "regex",
+      "description": "Issue #2051: the OpenCode 2.x scripts/box/bootstrap.sh installs on a dev box (`OPENCODE_2_VERSION=<X.Y.Z>`), the same release scripts/opencode-pins/v2/package.json pins for CI's lane 1. Grouped and guarded as the OpenCode 1.x manager above.",
+      "managerFilePatterns": ["/^scripts/box/bootstrap\\.sh$/"],
+      "matchStrings": ["OPENCODE_2_VERSION=(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
+      "datasourceTemplate": "npm",
+      "depNameTemplate": "@opencode/cli"
     }
   ],
   "packageRules": [
@@ -323,6 +339,21 @@
       "matchPackageNames": ["unicode-width"],
       "allowedVersions": "<0.2.3",
       "description": "unicode-width is held at =0.2.2 in Cargo.toml, and this rule keeps Renovate from proposing 0.2.3 or later against that pin (Renovate PR #1982, closed). 0.2.3 gives the halfwidth katakana sound marks U+FF9E/U+FF9F width 1, and ratatui-core 0.1.2's `CellWidth` still adds 1 per mark to make up for the zero width 0.2.2 reported, so ratatui lays a halfwidth `ｶﾞ` out across 3 cells while a terminal draws it in 2 (glibc wcwidth gives each char 1): a blank cell after every such cluster in TUI text, and `ui::tests::truncate_styled_segments_budgets_clusters_at_their_drawn_width` fails. The Cargo.toml pin is what holds the lock file, Renovate's lock file maintenance included; this rule only stops the standing PR. Remove both once a ratatui-core release adds that 1 only when unicode-width reports the mark as zero-width (`ratatui-core/src/buffer/cell_width.rs`). Placed before the release.yml artifact-actions hold, which the release-workflow wiring guard requires to stay the last rule."
+    },
+    {
+      "matchPackageNames": ["opencode-ai"],
+      "groupName": "OpenCode 1.x (lane-1 pin and box bootstrap)",
+      "allowedVersions": "<2",
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "Issue #2051: one PR moves the OpenCode 1.x that CI's lane 1 runs (scripts/opencode-pins/v1, npm manager) and the one scripts/box/bootstrap.sh installs (the regex manager), so the two stay one version. Held below 2: this pin is the 1.x half the deck still supports, which tests/e2e_opencode_real_binary.rs requires to report major 1; OpenCode 2 is the `@opencode/cli` package and has its own rule below. Held for a human, because a new OpenCode can change what its plugin loader accepts, which is what those tests exist to catch."
+    },
+    {
+      "matchPackageNames": ["@opencode/cli"],
+      "groupName": "OpenCode 2.x (lane-1 pin and box bootstrap)",
+      "automerge": false,
+      "labels": ["dependencies", "manual-review"],
+      "description": "Issue #2051: as the OpenCode 1.x rule above, for scripts/opencode-pins/v2 and bootstrap.sh's `OPENCODE_2_VERSION`. No allowedVersions: a major bump arrives as a manual-review PR like any other, and the lane-1 tests, which require major 2, go red on it until the deck's support follows."
     },
     {
       "matchManagers": ["github-actions"],
