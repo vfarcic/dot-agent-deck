@@ -36,7 +36,7 @@ async function onDeck(page: Page) {
   await enterDeck(page);
 }
 
-const deckControl = (page: Page) => page.getByRole("button", { name: "Open Planner agent" });
+const deckControl = (page: Page) => page.getByRole("button", { name: "Open Plan / architecture agent" });
 
 test.describe("the New agent dialog on the dashboard", () => {
   /**

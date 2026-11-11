@@ -726,6 +726,10 @@ pub struct DispatchContext {
     /// for any future producer with no live caller to report to, in which case
     /// the dispatch simply keeps its pre-Phase-2 fire-and-forget behaviour.
     pub caller: Option<crate::dispatch_return::DispatchCaller>,
+    /// PRD #1889: the dispatcher's work (its pane's `DOT_AGENT_DECK_WORK_ID`),
+    /// read from the caller's attested facts: the parent of the work this
+    /// dispatch opens. `None` when the caller has none (or in unit tests).
+    pub caller_work: Option<crate::work_journal::WorkId>,
 }
 
 /// Translate the wire choice into the spawn-side override.
@@ -1087,7 +1091,15 @@ pub async fn handle_dispatch(
         crate::worktree_owner::main_worktree_if_linked(&paths.worktree_dir).as_deref(),
     );
 
+    // PRD #1889: the dispatch's work, a child of the dispatcher's. Its
+    // `opened` is held until the unit is registered, so it names the unit.
+    let work_id = ctx.registry.work().dispatch_minted(
+        ctx.caller_work.as_ref(),
+        &paths.branch,
+        &paths.worktree_dir,
+    );
     let req = SpawnRequest {
+        work_id: work_id.clone(),
         task_name: format!("dispatch-{name}"),
         working_dir: paths.worktree_dir.to_string_lossy().into_owned(),
         // A real agent command, never `None` — see `resolve_single_unit_launch`.
@@ -1156,6 +1168,26 @@ pub async fn handle_dispatch(
             .await
         }
     };
+    // PRD #1889: a dispatch with a caller registered a unit, whose end closes
+    // its work. One with no caller registered none, so its work closes with
+    // what it spawned: its pane (single agent) or its orchestration, at once
+    // when that is already gone. A failed one leaves no work behind when it
+    // started nothing, and keeps and closes it when something it started was
+    // already written (a role of its orchestration that came up before a
+    // later one failed).
+    if let Some(work) = &work_id {
+        if spawned.is_ok() {
+            if ctx.caller.is_some() {
+                ctx.registry.work().launch_succeeded(work);
+            } else {
+                ctx.registry.work().launched_without_unit(work);
+            }
+        } else {
+            ctx.registry
+                .work()
+                .launch_failed(work, Some(crate::work_journal::CloseHow::UnitEnded));
+        }
+    }
     match spawned {
         Ok(handle) => {
             // PRD #220 M2.0 / PRD #1589 D5: the caller was retained for the
@@ -2648,6 +2680,7 @@ mod tests {
 
             let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
             let ctx = DispatchContext {
+                caller_work: None,
                 working_dir: repo.clone(),
                 registry: Arc::new(AgentPtyRegistry::new()),
                 event_tx,
@@ -2824,6 +2857,7 @@ mod tests {
         let state: crate::state::SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let ctx = DispatchContext {
+            caller_work: None,
             working_dir: repo.clone(),
             registry: Arc::new(AgentPtyRegistry::new()),
             event_tx,
@@ -2949,6 +2983,7 @@ mod tests {
         let state: crate::state::SharedState =
             Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
         let ctx = DispatchContext {
+            caller_work: None,
             working_dir: repo.clone(),
             registry: Arc::new(AgentPtyRegistry::new()),
             event_tx,
@@ -3060,6 +3095,7 @@ mod tests {
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
+            caller_work: None,
             working_dir: repo.clone(),
             registry: Arc::new(AgentPtyRegistry::new()),
             event_tx,
@@ -3262,6 +3298,7 @@ mod tests {
                 is_start_role: idx == 0,
             };
             let req = SpawnRequest {
+                work_id: None,
                 task_name: "dispatch-nit-r1".to_string(),
                 working_dir: worktree_dir.to_string_lossy().into_owned(),
                 command: None,
@@ -3409,6 +3446,7 @@ mod tests {
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
+            caller_work: None,
             working_dir: repo.clone(),
             registry: Arc::new(AgentPtyRegistry::new()),
             event_tx,
@@ -3465,6 +3503,7 @@ mod tests {
 
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let ctx = DispatchContext {
+            caller_work: None,
             working_dir: repo.clone(),
             registry: Arc::new(AgentPtyRegistry::new()),
             event_tx,
@@ -3540,6 +3579,7 @@ mod tests {
         let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
         let registry = Arc::new(AgentPtyRegistry::new());
         let ctx = DispatchContext {
+            caller_work: None,
             working_dir: repo.clone(),
             registry: registry.clone(),
             event_tx,

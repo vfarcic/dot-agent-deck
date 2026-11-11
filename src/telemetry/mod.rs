@@ -262,13 +262,15 @@ fn prepare_run_for_spawn(
     membership: Option<&crate::agent_pty::TabMembership>,
 ) -> Option<PreparedRun> {
     let telemetry = telemetry?;
-    let start = RunStart::for_spawn(
+    let mut start = RunStart::for_spawn(
         pane_id?,
         agent_id,
         opts.agent_type.as_ref(),
         opts.command,
         membership,
     );
+    // PRD #1889: the work this attempt serves, decided by the spawn path.
+    start.work_id = opts.work_id.as_ref().map(ToString::to_string);
     let run = telemetry.prepare_run(start, &opts.env, opts.cwd.map(std::path::PathBuf::from))?;
     opts.env.extend(run.env.iter().cloned());
     Some(run)
@@ -515,6 +517,9 @@ pub enum AttrKey {
     CiFailuresCount,
     AgentSource,
     DispatchName,
+    /// PRD #1889: the work the run's attempt serves, the agent's
+    /// `DOT_AGENT_DECK_WORK_ID`.
+    WorkId,
     /// Issue #1981 M7: an `agent.handoff`'s task id, the worker's run, how
     /// it ended and, when its task never reached the worker, why; and the
     /// reports an orchestrator run received that named no task.
@@ -594,6 +599,7 @@ impl AttrKey {
         AttrKey::CiFailuresCount,
         AttrKey::AgentSource,
         AttrKey::DispatchName,
+        AttrKey::WorkId,
         AttrKey::HandoffId,
         AttrKey::HandoffWorkerRunId,
         AttrKey::HandoffOutcome,
@@ -662,6 +668,7 @@ impl AttrKey {
             AttrKey::CiFailuresCount => "deck.ci.failures.count",
             AttrKey::AgentSource => "deck.agent.source",
             AttrKey::DispatchName => "deck.dispatch.name",
+            AttrKey::WorkId => "deck.work.id",
             AttrKey::HandoffId => "deck.handoff.id",
             AttrKey::HandoffWorkerRunId => "deck.handoff.worker.run.id",
             AttrKey::HandoffOutcome => "deck.handoff.outcome",

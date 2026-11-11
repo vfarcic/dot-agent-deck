@@ -5921,12 +5921,12 @@ pub(crate) fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// the check and the scenario then failed deep inside a PTY wait with a
 /// confusing timeout. The extra checks below are all **cheap and offline** —
 /// no probe request, unlike [`check_codex_available`], because the equivalent
-/// `claude -p` round trip costs real tokens on every e2e run. Expiry is
-/// treated the way Claude Code itself treats it: an expired access token is
-/// fine while a live refresh token can still renew it, so only the case where
-/// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
-/// holds that half as a pure function so `tests/real_agent_preflight.rs` can
-/// assert every accepted and rejected credential shape.
+/// `claude -p` round trip costs real tokens on every e2e run. Since issue
+/// #1731 a test HOME gets an access-only copy of the login, so the access token
+/// alone decides, and it must last [`SCRATCH_LOGIN_RUN_MARGIN`] — see
+/// [`claude_oauth_usable`], which holds that half as a pure function so
+/// `tests/real_agent_preflight.rs` can assert every accepted and rejected
+/// credential shape.
 ///
 /// PRD #386: the credential set is no longer necessarily a FILE. Claude Code
 /// 2.x on macOS keeps it in the login Keychain as the generic-password item
@@ -6261,11 +6261,22 @@ fn now_epoch_ms() -> i64 {
 /// buffer can; it is local, dropped when this returns, and never read except
 /// through `claude_oauth_usable`.
 fn claude_credential_document_usable(raw: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(raw)
-        .ok()
-        .as_ref()
-        .and_then(|parsed| parsed.get("claudeAiOauth"))
-        .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok())
+    claude_credential_document_check(raw).is_ok()
+}
+
+/// [`claude_credential_document_usable`] with the reason, for the import's
+/// refusal. The message quotes no value from the document.
+fn claude_credential_document_check(raw: &[u8]) -> Result<(), String> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(raw).map_err(|_| {
+        "Claude Code credentials at ~/.claude/.credentials.json are not valid JSON — \
+         log in again with `claude login`"
+            .to_string()
+    })?;
+    let oauth = parsed.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    claude_oauth_usable(oauth, now_epoch_ms())
 }
 
 /// Service name Claude Code 2.x files its OAuth credential set under in the
@@ -6414,44 +6425,86 @@ fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
 /// was already spent — precisely the "credentials look fine, then the real agent
 /// fails deep inside a PTY wait" case this check exists to catch.
 ///
-/// Two deliberate decisions are preserved. An expired access token with a LIVE
-/// refresh token still passes, because Claude Code itself refreshes on that
-/// shape. And there is **no probe request**: revoked credentials and network
+/// **Issue #1731: the ACCESS token alone decides, and it must last the run.**
+/// A test HOME gets an access-only copy of the login ([`claude_scratch_login`]),
+/// so a refresh token no longer makes an expired or expiring access token
+/// usable: the copy has nothing to refresh with. The set is usable when its
+/// `accessToken` is non-empty and its `expiresAt` is at least
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now_ms`; an absent `expiresAt` is
+/// refused, because the harness cannot then tell whether the token lasts. This
+/// replaced PRD #126's acceptance of an expired access token beside a live
+/// refresh token, which was right for Claude Code on the host and is wrong for
+/// a copy that must never refresh.
+///
+/// There is still **no probe request**: revoked credentials and network
 /// failures remain an accepted false-positive class, since a live round trip
 /// would spend real tokens on every e2e run.
 pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(), String> {
+    const REMEDY: &str = "log in again with `claude login` (or `/login` inside `claude`) \
+                          to refresh the host login; the test copy carries no refresh token, \
+                          so it cannot refresh on its own";
     let non_empty = |key: &str| {
         oauth
             .get(key)
             .and_then(|v| v.as_str())
             .is_some_and(|v| !v.is_empty())
     };
-    if !non_empty("accessToken") && !non_empty("refreshToken") {
-        return Err(
-            "Claude Code credentials at ~/.claude/.credentials.json carry no access or refresh \
-             token — log in with `claude login`"
-                .into(),
-        );
+    if !non_empty("accessToken") {
+        if !non_empty("refreshToken") {
+            return Err(
+                "Claude Code credentials at ~/.claude/.credentials.json carry no access or \
+                 refresh token — log in with `claude login`"
+                    .into(),
+            );
+        }
+        return Err(format!(
+            "Claude Code credentials at ~/.claude/.credentials.json carry no access token, \
+             only a refresh token; {REMEDY}"
+        ));
     }
-    // Both timestamps are epoch MILLISECONDS. An absent field is treated as
-    // "no expiry information", never as expired.
-    let live = |key: &str| {
-        oauth
-            .get(key)
-            .and_then(|v| v.as_i64())
-            .is_none_or(|at| at > now_ms)
+    // Epoch MILLISECONDS.
+    let Some(expires_at) = oauth.get("expiresAt").and_then(serde_json::Value::as_i64) else {
+        return Err(format!(
+            "Claude Code credentials at ~/.claude/.credentials.json have no `expiresAt`, so \
+             the harness cannot tell whether the access token lasts the run; {REMEDY}"
+        ));
     };
-    // A token is usable only if it is BOTH present and unexpired; an expiry
-    // alone says nothing about a token that does not exist.
-    let usable = |token_key: &str, expiry_key: &str| non_empty(token_key) && live(expiry_key);
-    if !usable("accessToken", "expiresAt") && !usable("refreshToken", "refreshTokenExpiresAt") {
-        return Err(
-            "Claude Code credentials at ~/.claude/.credentials.json are expired and cannot be \
-             refreshed — log in again with `claude login`"
-                .into(),
-        );
+    scratch_login_lasts_the_run(
+        u128::try_from(expires_at).unwrap_or(0),
+        u128::try_from(now_ms).unwrap_or(0),
+        "the Claude Code login at ~/.claude/.credentials.json",
+        REMEDY,
+    )
+}
+
+/// The copy of a host Claude Code credentials `document` that a test HOME gets
+/// (issue #1731): `{"claudeAiOauth": …}` with every refresh-token key removed,
+/// and nothing else. `mcpOAuth` — MCP servers' OAuth logins, each with its own
+/// refresh token — is left out entirely, so a host MCP server that the test
+/// HOME's configuration still names starts unauthenticated there.
+/// Refused, with the remedy, by the [`claude_oauth_usable`] rule.
+///
+/// **Why no refresh token**, the reason [`pi_scratch_login`] gives: a refresh
+/// in the copy writes the new tokens only into the scratch HOME, which is
+/// deleted at teardown, and a provider that rotates refresh tokens leaves the
+/// host login holding a spent one. Measured on 2026-11-10 that Claude Code
+/// 2.1.322 authenticates from the access-only copy (`claude -p` on Haiku in a
+/// scratch HOME holding only this document) and writes no refresh token into
+/// it.
+pub(crate) fn claude_scratch_login(
+    document: &serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    let oauth = document.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    claude_oauth_usable(oauth, i64::try_from(epoch_ms(now)).unwrap_or(i64::MAX))?;
+    let mut oauth = oauth.clone();
+    if let Some(fields) = oauth.as_object_mut() {
+        fields.retain(|key, _| !is_refresh_token_key(key));
     }
-    Ok(())
+    Ok(serde_json::json!({ "claudeAiOauth": oauth }))
 }
 
 /// PRD #77 Decision 26 runtime-skip helper for OpenCode. Mirrors
@@ -6928,15 +6981,92 @@ fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
         .filter(serde_json::Value::is_object)
 }
 
-/// How long a Pi OAuth access token must still be valid when a scratch copy is
-/// made of it ([`pi_scratch_login`]): the copy carries no refresh token, so a
-/// test that outlives the token fails rather than refreshing. One hour covers a
-/// lane-2 Pi test with its preflight many times over.
-const PI_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+/// How long an OAuth access token must still be valid when a scratch copy is
+/// made of it — Pi's ([`pi_scratch_login`]), Claude's ([`claude_scratch_login`]),
+/// Codex's ([`codex_scratch_login`]) and OpenCode's ([`opencode_scratch_auth`]).
+/// Each copy carries no refresh token (PRD #1666, issue #1731), so a test that
+/// outlives the token fails rather than refreshing. One hour covers a lane-2
+/// test with its preflight many times over: the copy is made when that one test
+/// starts, not when the run does.
+pub(crate) const SCRATCH_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+
+/// Whether an OAuth document key names a refresh token. Matched on the key, not
+/// the value, the way [`pi_scratch_login`] matches; `last_refresh` (Codex's
+/// timestamp of its last refresh, not a token) is the one exception.
+fn is_refresh_token_key(key: &str) -> bool {
+    key != "last_refresh" && key.to_ascii_lowercase().contains("refresh")
+}
+
+/// The `exp` claim (seconds since the epoch) of a JWT, read without verifying
+/// it: the harness only needs to know whether the token lasts the run, and the
+/// agent that receives it does the verifying. `None` for anything that is not a
+/// three-part token with a base64url JSON payload carrying a numeric `exp`.
+pub(crate) fn jwt_expiry_secs(token: &str) -> Option<u64> {
+    let mut parts = token.split('.');
+    let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(payload.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in payload.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
+/// Milliseconds since the epoch at `now`, `0` on a pre-epoch clock.
+fn epoch_ms(now: std::time::SystemTime) -> u128 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0)
+}
+
+/// `Err` naming how long is left when `expires_ms` is less than
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now_ms`. `what` names the login, and
+/// `remedy` how to refresh it on the host; the message quotes no secret.
+fn scratch_login_lasts_the_run(
+    expires_ms: u128,
+    now_ms: u128,
+    what: &str,
+    remedy: &str,
+) -> Result<(), String> {
+    let left_ms = expires_ms.saturating_sub(now_ms);
+    if left_ms < SCRATCH_LOGIN_RUN_MARGIN.as_millis() {
+        let when = if left_ms == 0 {
+            "has expired".to_string()
+        } else {
+            format!("expires in {} min", left_ms / 60_000)
+        };
+        return Err(format!(
+            "{what}'s access token {when}, less than the {} min a test run needs; {remedy}",
+            SCRATCH_LOGIN_RUN_MARGIN.as_secs() / 60
+        ));
+    }
+    Ok(())
+}
 
 /// The copy of the host's stored Pi login `entry` that a scratch agent
 /// directory gets: every refresh token taken out, and refused unless its access
-/// token is still valid for [`PI_LOGIN_RUN_MARGIN`] after `now`.
+/// token is still valid for [`SCRATCH_LOGIN_RUN_MARGIN`] after `now`.
 ///
 /// **Why no refresh token.** A refresh run in the scratch copy writes the new
 /// tokens only there, and they go when the directory does. On a provider that
@@ -6979,12 +7109,12 @@ pub(crate) fn pi_scratch_login(
         .map(|since| since.as_millis())
         .unwrap_or(0);
     let left_ms = u128::from(expires).saturating_sub(now_ms);
-    if left_ms < PI_LOGIN_RUN_MARGIN.as_millis() {
+    if left_ms < SCRATCH_LOGIN_RUN_MARGIN.as_millis() {
         return Err(format!(
             "the stored Pi login's access token expires in {} min, less than the {} min a \
              test run needs; {remedy}",
             left_ms / 60_000,
-            PI_LOGIN_RUN_MARGIN.as_secs() / 60
+            SCRATCH_LOGIN_RUN_MARGIN.as_secs() / 60
         ));
     }
     for key in refresh_keys {
@@ -7258,6 +7388,66 @@ pub const OPENCODE_TEST_BIN_V1: &str = "v1";
 /// owns `~/.opencode/bin/opencode`, so the 1.x half lives here.
 pub const OPENCODE_PINNED_V1: &str = ".local/share/dot-agent-deck/opencode-1/bin/opencode";
 
+/// The [`OPENCODE_TEST_BIN_ENV`] value naming the pinned OpenCode 2.x
+/// ([`OPENCODE_PINNED_V2`]), as [`OPENCODE_TEST_BIN_V1`] names the 1.x (issue
+/// #2051).
+pub const OPENCODE_TEST_BIN_V2: &str = "v2";
+
+/// Where `scripts/box/bootstrap.sh` installs the pinned OpenCode 2.x, relative
+/// to the home directory: npm's own link under its prefix, which bootstrap
+/// then links `~/.opencode/bin/opencode` to (issue #2051).
+pub const OPENCODE_PINNED_V2: &str =
+    ".local/share/dot-agent-deck/opencode-2/node_modules/.bin/opencode";
+
+/// Set (non-empty) where the pinned OpenCode binaries are known to be
+/// installed, as CI's lane-1 shards are (`scripts/install-pinned-opencode.sh`
+/// runs before them on both backends): [`pinned_opencode_bin`] then fails a
+/// test whose binary is missing instead of letting it skip (issue #2051).
+pub const REQUIRE_PINNED_OPENCODE_ENV: &str = "DAD_E2E_REQUIRE_PINNED_OPENCODE";
+
+/// The pinned real OpenCode `major`.x (1 or 2) under the host's home — the
+/// [`OPENCODE_TEST_BIN_V1`] / [`OPENCODE_TEST_BIN_V2`] choice of
+/// [`OPENCODE_TEST_BIN_ENV`], resolved directly so one test can run both — once
+/// its `--version` reports that major (issue #2051). `Err` says what is
+/// missing, for [`skip_unless!`]; with [`REQUIRE_PINNED_OPENCODE_ENV`] set it
+/// panics instead, so a CI shard missing its install goes red rather than
+/// green.
+pub fn pinned_opencode_bin(major: u32) -> Result<PathBuf, String> {
+    let (choice, rel) = match major {
+        1 => (OPENCODE_TEST_BIN_V1, OPENCODE_PINNED_V1),
+        2 => (OPENCODE_TEST_BIN_V2, OPENCODE_PINNED_V2),
+        _ => panic!("no pinned OpenCode {major}.x"),
+    };
+    let found = resolve_opencode_test_bin(choice, &host_home(), std::ffi::OsStr::new(""))
+        .ok_or_else(|| {
+            format!(
+                "the pinned OpenCode {major}.x is not installed at ~/{rel}; install it with \
+                 scripts/install-pinned-opencode.sh (or scripts/box/bootstrap.sh)"
+            )
+        })
+        .and_then(|bin| {
+            let output = std::process::Command::new(&bin)
+                .arg("--version")
+                .current_dir(std::env::temp_dir())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("could not run `{} --version`: {e}", bin.display()))?;
+            match parse_opencode_version(&String::from_utf8_lossy(&output.stdout)) {
+                Some((found, _, _)) if found == major => Ok(bin),
+                other => Err(format!(
+                    "`{} --version` reports {other:?}, not OpenCode {major}.x",
+                    bin.display()
+                )),
+            }
+        });
+    if let Err(why) = &found
+        && std::env::var(REQUIRE_PINNED_OPENCODE_ENV).is_ok_and(|v| !v.trim().is_empty())
+    {
+        panic!("{REQUIRE_PINNED_OPENCODE_ENV} is set, so this is a failure, not a skip: {why}");
+    }
+    found
+}
+
 /// The OpenCode binary [`OPENCODE_TEST_BIN_ENV`] selects, resolved to a path:
 /// the variable's value (looked up on `PATH` when it has no `/`), else the
 /// first `opencode` on `PATH`. `None` when nothing resolves, which the
@@ -7283,17 +7473,23 @@ fn opencode_test_bin_choice() -> String {
         .unwrap_or_else(|| "opencode".to_string())
 }
 
-/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` is the
-/// pinned 1.x under `home`, a value with a `/` is a path, and anything else is
-/// a name looked up on `path`. Only an existing file resolves.
+/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` and `v2`
+/// are the pinned 1.x and 2.x under `home`, a value with a `/` is a path, and
+/// anything else is a name looked up on `path`. Only an existing file
+/// resolves.
 pub(crate) fn resolve_opencode_test_bin(
     chosen: &str,
     home: &Path,
     path: &std::ffi::OsStr,
 ) -> Option<PathBuf> {
-    if chosen == OPENCODE_TEST_BIN_V1 {
-        let pinned = home.join(OPENCODE_PINNED_V1);
-        return pinned.is_file().then_some(pinned);
+    for (name, rel) in [
+        (OPENCODE_TEST_BIN_V1, OPENCODE_PINNED_V1),
+        (OPENCODE_TEST_BIN_V2, OPENCODE_PINNED_V2),
+    ] {
+        if chosen == name {
+            let pinned = home.join(rel);
+            return pinned.is_file().then_some(pinned);
+        }
     }
     if chosen.contains('/') {
         let path = PathBuf::from(chosen);
@@ -7307,10 +7503,16 @@ pub(crate) fn resolve_opencode_test_bin(
 /// Why [`opencode_test_bin`] found nothing, for a preflight's `SKIP:`: for
 /// `v1`, where the pinned 1.x belongs and the script that installs it.
 pub fn opencode_test_bin_missing() -> String {
-    if opencode_test_bin_choice() == OPENCODE_TEST_BIN_V1 {
+    let choice = opencode_test_bin_choice();
+    if choice == OPENCODE_TEST_BIN_V1 || choice == OPENCODE_TEST_BIN_V2 {
+        let rel = if choice == OPENCODE_TEST_BIN_V1 {
+            OPENCODE_PINNED_V1
+        } else {
+            OPENCODE_PINNED_V2
+        };
         format!(
-            "the pinned OpenCode 1.x that {OPENCODE_TEST_BIN_ENV}={OPENCODE_TEST_BIN_V1} names is \
-             not installed at ~/{OPENCODE_PINNED_V1}; install it with scripts/box/bootstrap.sh"
+            "the pinned OpenCode that {OPENCODE_TEST_BIN_ENV}={choice} names is not installed at \
+             ~/{rel}; install it with scripts/box/bootstrap.sh"
         )
     } else {
         format!(
@@ -7580,14 +7782,13 @@ pub fn check_codex_available() -> Result<(), String> {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
 
-    // Both commands below read the home that `codex_test_model` and
-    // `import_codex_credentials` read, `~/.codex`, rather than an ambient
-    // `CODEX_HOME` the launched test never sees (the harness clears the
+    // Both commands below read the login that `codex_test_model` and
+    // `import_codex_credentials` read, `~/.codex/auth.json`, rather than an
+    // ambient `CODEX_HOME` the launched test never sees (the harness clears the
     // environment). Otherwise a host whose `CODEX_HOME` holds the other auth
     // mode would be probed with the wrong login and, since #656, fail on a
     // model refusal that the test itself would not meet.
-    let codex_home = host_home().join(".codex");
-    let auth_path = codex_home.join("auth.json");
+    let auth_path = host_home().join(".codex").join("auth.json");
     let auth_is_regular = std::fs::symlink_metadata(&auth_path)
         .map(|meta| meta.file_type().is_file())
         .unwrap_or(false);
@@ -7596,6 +7797,15 @@ pub fn check_codex_available() -> Result<(), String> {
             "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`".into(),
         );
     }
+    // Issue #1731: the probe runs in a scratch `CODEX_HOME` holding the same
+    // access-only copy a test gets ([`seed_codex_scratch_auth`]), not in the
+    // host's `~/.codex`. So it measures the login the test will run with, a
+    // login that would not last the run is a skip here rather than a panic at
+    // launch, and no probe — one per gated test, run concurrently — can
+    // refresh the developer's own login.
+    let probe_home = race_safe_tempdir();
+    let codex_home = probe_home.path().join(".codex");
+    seed_codex_scratch_auth(&codex_home).map_err(|e| e.to_string())?;
 
     let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
     let deadline = Instant::now() + ceiling;
@@ -7940,6 +8150,13 @@ fn host_home() -> PathBuf {
 /// the test). M3.1 auditor S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
 ///
+/// **The credentials file is an access-only copy (issue #1731)**: the
+/// `claudeAiOauth` login without its refresh token, and no `mcpOAuth`
+/// ([`claude_scratch_login`]). A login whose access token would not last
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] is refused with the remedy rather than copied.
+/// Every value of the source document, refresh tokens included, is registered
+/// for redaction before anything is written.
+///
 /// # Returns the credential values the recording must redact (issue #502/#785)
 ///
 /// Same contract as [`import_codex_credentials`], [`import_opencode_credentials`]
@@ -8044,9 +8261,17 @@ pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String
         Ok(bytes) => match claude_keychain_credentials_export() {
             Some(keychain) => Some(keychain),
             None if key_authorises => None,
-            // Unchanged: copy what we have and let it fail loudly rather than
-            // silently importing nothing.
-            None => Some(bytes),
+            // Issue #1731: this used to copy what we had and let it fail
+            // loudly. An unusable document cannot be turned into an access-only
+            // copy that lasts the run, so the import refuses with the reason —
+            // which `check_claude_available` has already given as a skip on
+            // every path that calls it first.
+            None => {
+                let reason = claude_credential_document_check(&bytes)
+                    .err()
+                    .unwrap_or_default();
+                return Err(std::io::Error::other(reason));
+            }
         },
         // A symlinked or unreadable source lands here too, and falls through to
         // the same alternatives the absent-file case does — the same posture the
@@ -8065,16 +8290,27 @@ pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String
     let seeded_oauth = creds_bytes.is_some();
     let _ = CLAUDE_OAUTH_SEEDED.set(seeded_oauth);
     if let Some(bytes) = creds_bytes {
-        // Registered from the bytes actually WRITTEN, not from a second read of
-        // the host — the Keychain fallback and the API-key branch mean the
-        // document that lands in the test HOME is not always the file this
-        // function started from.
-        redactions.extend(claude_recording_redactions(
+        // Registered from the SOURCE document the copy is made from, not from a
+        // second read of the host — the Keychain fallback and the API-key branch
+        // mean that is not always the file this function started from — and
+        // registered BEFORE anything is written: every value in it, the refresh
+        // tokens and `mcpOAuth` the copy leaves out included (issue #1731).
+        let host_values = claude_recording_redactions(
             &bytes,
             "~/.claude/.credentials.json",
             CredentialScope::AuthDocument,
-        )?);
-        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &bytes)?;
+        )?;
+        register_diagnostic_redactions(host_values.clone());
+        redactions.extend(host_values);
+        // Issue #1731: the test HOME gets an access-only copy
+        // ([`claude_scratch_login`]), never the host's refresh token. `bytes`
+        // parsed above, so the parse here cannot fail.
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let scratch = claude_scratch_login(&document, std::time::SystemTime::now())
+            .map_err(std::io::Error::other)?;
+        let scratch_bytes = serde_json::to_vec_pretty(&scratch).map_err(std::io::Error::other)?;
+        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &scratch_bytes)?;
     }
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
@@ -9010,12 +9246,29 @@ pub(crate) fn minimal_opencode_config() -> String {
 /// may execute them, and the PTY stream is persisted as a recording artifact.
 /// Every source ancestor plus the auth leaf is checked without following
 /// symlinks; destination credentials are atomically created with mode 0o600.
+///
+/// The `auth.json` written carries no refresh token (issue #1731,
+/// [`opencode_scratch_auth`]); every value of the host file is registered for
+/// redaction before it is written. A login the copy leaves out is refused only
+/// when it is the test model's provider, no other auth file's copy kept a login
+/// for that provider, and no env key authorises that model.
 pub(crate) fn import_opencode_credentials_from(
     source_home: &Path,
     test_home: &Path,
 ) -> std::io::Result<Vec<String>> {
     let mut imported_auth = false;
     let mut recording_redactions = Vec::new();
+    // Issue #1731: the test model's provider, whether some file's copy kept a
+    // login for it, and why one was left out. Judged after every file is
+    // staged, so a stale login in one file cannot refuse a run that a lasting
+    // login in another authorises.
+    let needed = opencode_test_model()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut needed_copied = false;
+    let mut needed_left_out: Option<String> = None;
     let credentials = [
         (
             source_home
@@ -9060,9 +9313,28 @@ pub(crate) fn import_opencode_credentials_from(
             &format!("OpenCode credentials not found at {redacted}"),
             redacted,
         )?;
+        // Issue #1731: every value of the HOST document, refresh tokens
+        // included, is registered before anything is written or refused.
+        let host_values = opencode_recording_redactions(&bytes, redacted)?;
+        register_diagnostic_redactions(host_values.clone());
+        recording_redactions.extend(host_values);
+        // `opencode_recording_redactions` refused anything that does not parse.
+        let auth: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let (scratch, dropped) = opencode_scratch_auth(auth.clone(), std::time::SystemTime::now());
+        if scratch.get(&needed).is_some() {
+            needed_copied = true;
+        }
+        if let Some((_, why)) = dropped.iter().find(|(provider, _)| *provider == needed) {
+            needed_left_out.get_or_insert_with(|| format!("{redacted}: {why}"));
+        }
+        let written = if scratch == auth {
+            bytes
+        } else {
+            serde_json::to_vec(&scratch).map_err(std::io::Error::other)?
+        };
         std::fs::create_dir_all(dst.parent().expect("OpenCode auth path has a parent"))?;
-        write_credential_file_atomic_0o600(&dst, &bytes)?;
-        recording_redactions.extend(opencode_recording_redactions(&bytes, redacted)?);
+        write_credential_file_atomic_0o600(&dst, &written)?;
         imported_auth = true;
     }
 
@@ -9081,11 +9353,82 @@ pub(crate) fn import_opencode_credentials_from(
                 .to_string(),
         ));
     }
+    if let Some(why) = needed_left_out
+        && !needed_copied
+        && !opencode_env_key_authorises()
+    {
+        return Err(std::io::Error::other(format!(
+            "OpenCode login for provider {needed:?} in {why}"
+        )));
+    }
     write_minimal_opencode_config(test_home)?;
 
     normalise_redactions(&mut recording_redactions);
     register_diagnostic_redactions(recording_redactions.clone());
     Ok(recording_redactions)
+}
+
+/// The copy of a host OpenCode `auth.json` that a test HOME gets (issue #1731),
+/// with the providers left out of it and why. Per provider entry, the
+/// [`pi_scratch_login`] rule: an entry with no refresh-token key (an API key)
+/// is kept as it is; an OAuth entry whose numeric `expires` (epoch
+/// milliseconds) is at least [`SCRATCH_LOGIN_RUN_MARGIN`] after `now` is kept
+/// with every refresh-token key blanked to `""`; any other OAuth entry is
+/// LEFT OUT rather than copied. Left out, not refused: a host with an expired
+/// login for a provider the test model does not use must still run, so the
+/// importer refuses only when the test model's own provider was left out.
+///
+/// **Blanked rather than removed** because OpenCode's stored-login schema
+/// requires the field, the shape Codex was measured to need
+/// ([`codex_scratch_login`]). That OpenCode then authenticates from the
+/// access-only entry is NOT measured: this host's only OpenCode OAuth login
+/// had expired when this was written, and the default test model is
+/// `anthropic/…` from `ANTHROPIC_API_KEY`, which no stored login affects.
+pub(crate) fn opencode_scratch_auth(
+    mut auth: serde_json::Value,
+    now: std::time::SystemTime,
+) -> (serde_json::Value, Vec<(String, String)>) {
+    const REMEDY: &str = "run `opencode auth login` to refresh the host login; the test \
+                          copy carries no refresh token, so it cannot refresh on its own";
+    let mut dropped = Vec::new();
+    let Some(providers) = auth.as_object_mut() else {
+        return (auth, dropped);
+    };
+    providers.retain(|provider, entry| {
+        let Some(fields) = entry.as_object_mut() else {
+            return true;
+        };
+        if !fields.keys().any(|key| is_refresh_token_key(key)) {
+            return true;
+        }
+        let verdict = match fields.get("expires").and_then(serde_json::Value::as_u64) {
+            None => Err(format!(
+                "it has a refresh token but no `expires` time, so the harness cannot tell \
+                 whether its access token lasts the run; {REMEDY}"
+            )),
+            Some(expires) => scratch_login_lasts_the_run(
+                u128::from(expires),
+                epoch_ms(now),
+                "the stored login",
+                REMEDY,
+            ),
+        };
+        match verdict {
+            Ok(()) => {
+                for (key, value) in fields.iter_mut() {
+                    if is_refresh_token_key(key) {
+                        *value = serde_json::Value::String(String::new());
+                    }
+                }
+                true
+            }
+            Err(why) => {
+                dropped.push((provider.clone(), why));
+                false
+            }
+        }
+    });
+    (auth, dropped)
 }
 
 /// The isolated OpenCode config every seeded HOME gets: the test model and
@@ -9142,18 +9485,12 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// also not a state a working host reaches — `check_codex_available` ends in a
 /// live model probe against this very file, so a host that got here has one
 /// codex itself just authenticated from.
+///
+/// **The `auth.json` written is access-only (issue #1731)** — see
+/// [`seed_codex_scratch_auth`].
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
-    let src = host_home().join(".codex").join("auth.json");
-    let bytes = read_credential_file_no_symlink(
-        &src,
-        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
-        "~/.codex/auth.json",
-    )?;
-    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
-    register_diagnostic_redactions(redactions.clone());
     let dst = test_home.join(".codex");
-    std::fs::create_dir_all(&dst)?;
-    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)?;
+    let redactions = seed_codex_scratch_auth(&dst)?;
 
     let project = test_home.parent().ok_or_else(|| {
         std::io::Error::other("isolated Codex HOME has no fixture working directory")
@@ -9186,6 +9523,94 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>
     // be on, neither of which a test wants to inherit.
     let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
     Ok(redactions)
+}
+
+/// Write an access-only copy of the host's `~/.codex/auth.json` into
+/// `codex_dir` (a scratch `CODEX_HOME`), mode 0600, and return the values a
+/// recording must redact: every value of the HOST document, refresh token
+/// included, registered for diagnostic redaction before anything is written or
+/// refused. [`import_codex_credentials`] and [`check_codex_available`]'s probe
+/// both seed through here, so the probe measures the login a test gets.
+///
+/// An API-key login (no `tokens`) is copied byte for byte; a ChatGPT login goes
+/// through [`codex_scratch_login`].
+pub(crate) fn seed_codex_scratch_auth(codex_dir: &Path) -> std::io::Result<Vec<String>> {
+    let src = host_home().join(".codex").join("auth.json");
+    let bytes = read_credential_file_no_symlink(
+        &src,
+        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
+        "~/.codex/auth.json",
+    )?;
+    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
+    register_diagnostic_redactions(redactions.clone());
+    // `codex_recording_redactions` refused anything that does not parse.
+    let auth: serde_json::Value = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    let scratch = codex_scratch_login(auth.clone(), std::time::SystemTime::now())
+        .map_err(std::io::Error::other)?;
+    let written = if scratch == auth {
+        bytes
+    } else {
+        serde_json::to_vec(&scratch).map_err(std::io::Error::other)?
+    };
+    std::fs::create_dir_all(codex_dir)?;
+    write_credential_file_atomic_0o600(&codex_dir.join("auth.json"), &written)?;
+    Ok(redactions)
+}
+
+/// The copy of a host Codex `auth.json` that a scratch `CODEX_HOME` gets (issue
+/// #1731): every refresh-token member of `tokens` blanked to `""`, and refused
+/// unless the `access_token`'s JWT `exp` is at least
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now`. A document with no `tokens` object
+/// (an API-key login) has nothing to refresh and comes back unchanged.
+///
+/// **Blanked, not removed, and measured** (codex-cli 0.164.0, 2026-11-10, a
+/// scratch `CODEX_HOME` holding a copy of a live ChatGPT login): with the
+/// member removed, `codex login status` fails on `missing field
+/// \`refresh_token\`` and `codex exec` answers 401; with it `""`, both succeed
+/// and a one-turn `codex exec` answers — including with `last_refresh` nine
+/// days old, so a stale `last_refresh` does not make Codex try a refresh it
+/// cannot make. The id token is left as it is: Codex accepted one already
+/// expired.
+///
+/// **Why no refresh token**, the reason [`pi_scratch_login`] gives: a refresh
+/// in the copy writes the rotated tokens only into the scratch home, which is
+/// deleted at teardown, leaving the host login holding a refresh token OpenAI
+/// has already spent — which Codex reports as "refresh token was already
+/// used". The refusal names no value from the document.
+pub(crate) fn codex_scratch_login(
+    mut auth: serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    const REMEDY: &str = "run `codex login` to refresh the host login; the test copy \
+                          carries no refresh token, so it cannot refresh on its own";
+    let Some(tokens) = auth
+        .get_mut("tokens")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(auth);
+    };
+    let Some(expires_secs) = tokens
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .and_then(jwt_expiry_secs)
+    else {
+        return Err(format!(
+            "the Codex login at ~/.codex/auth.json has no access token with a readable \
+             expiry, so the harness cannot tell whether it lasts the run; {REMEDY}"
+        ));
+    };
+    scratch_login_lasts_the_run(
+        u128::from(expires_secs) * 1000,
+        epoch_ms(now),
+        "the Codex login at ~/.codex/auth.json",
+        REMEDY,
+    )?;
+    for (key, value) in tokens.iter_mut() {
+        if is_refresh_token_key(key) {
+            *value = serde_json::Value::String(String::new());
+        }
+    }
+    Ok(auth)
 }
 
 /// The credential values inside a Codex `auth.json` that a recording must

@@ -5910,6 +5910,14 @@ pub(crate) async fn end_unit_if_last_pane(
             agent_id = %record.id,
             "dispatch: the unit's last pane closed; the unit has ended"
         );
+        // PRD #1889: the unit's work closes with it.
+        registry.work().unit_ended(&unit_id);
+    }
+    // PRD #1889: and an orchestration's work closes with its last role pane.
+    if let Some(instance) = instance.as_deref()
+        && !registry.instance_has_records(instance)
+    {
+        registry.work().orchestration_ended(instance);
     }
 }
 
@@ -6042,6 +6050,9 @@ pub(crate) async fn stop_agent_steps(
                 if let Some(record) = stopping_record {
                     crate::spawn::surface_attach_stopped_agent(event_tx, record, pane_id);
                 }
+                // PRD #1889: a pane's own work (or a plain fire's) closes
+                // with the pane.
+                registry.work().pane_closed(pane_id);
             }
             // PRD #1589 D5: the unit this agent belonged to ends once no pane
             // of it remains.
@@ -6952,6 +6963,10 @@ async fn handle_connection(
                 // PRD #1666 part 3, round 5 (plan D7): a client's start is an
                 // orchestration nobody dispatched.
                 origin: Some(crate::hook_provenance::InstanceOrigin::Direct),
+                // PRD #1889: a client's start is a pane of its own (a fresh
+                // pane work, minted by the spawn), or a role of its
+                // orchestration's work.
+                work_id: None,
             };
             #[cfg(unix)]
             let spawned = match prepared_dir.as_ref() {
