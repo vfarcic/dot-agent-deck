@@ -417,6 +417,13 @@ enum Command {
     DelegatePosted {
         seq: u64,
     },
+    /// Issue #2099: the deck told the orchestrator that the worker owing
+    /// `tasks` stopped ([`super::observe_worker_stopped`]). Applied after the
+    /// broadcast sent before it.
+    WorkerStopped {
+        tasks: Vec<String>,
+        stopped: super::handoff::Stopped,
+    },
     /// Acknowledged once everything sent before it, broadcast included, is
     /// applied.
     #[cfg(test)]
@@ -1381,6 +1388,21 @@ impl Telemetry {
         let _ = exporting.commands.send(Command::DelegatePosted { seq });
     }
 
+    /// Issue #2099: the deck told the orchestrator that the worker owing
+    /// `tasks` stopped, which ends their hand-offs.
+    pub fn observe_worker_stopped(&self, tasks: &[String], stopped: super::handoff::Stopped) {
+        let Some(exporting) = &self.exporting else {
+            return;
+        };
+        if tasks.is_empty() {
+            return;
+        }
+        let _ = exporting.commands.send(Command::WorkerStopped {
+            tasks: tasks.to_vec(),
+            stopped,
+        });
+    }
+
     /// Feed the daemon's broadcast to the tracker until it closes. Nothing
     /// happens when not exporting, so an off deck spawns nothing.
     pub fn subscribe(&self, rx: broadcast::Receiver<BroadcastMsg>) {
@@ -2316,6 +2338,10 @@ fn apply(shared: &Arc<Shared>, command: Command) -> bool {
             if let Some(run_id) = run_id {
                 shared.forget_ended_input(&pane_id, &run_id);
             }
+        }
+        Command::WorkerStopped { tasks, stopped } => {
+            let now = now_unix_nanos();
+            shared.with_tracker(|t| t.observe_worker_stopped(&tasks, stopped, now));
         }
         // Counted and applied by `run_ingest`, in order with the broadcast.
         Command::HumanInput { .. } | Command::DelegatePosted { .. } => {}
