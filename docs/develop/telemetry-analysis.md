@@ -77,7 +77,7 @@ Round 1's issues also give the cost, the type (which sets when the change takes 
 - **Agent versions can break a source mid-window.** OpenCode 2.2.5 (2026-10-31 15:09 UTC) broke OpenCode's deck data for the rest of round 1's window. Record such splits in phase 2.
 - **Skill names are redacted.** Claude Code exports `skill_activated` with `skill.name=custom_skill` for project skills (#2087).
 - **`cost_usd` is an estimate.** It is Claude Code's API-price estimate. On a subscription account it is a relative measure, not spend.
-- **`deck.instructions.commit` moves on script-only commits** (#2086). Check what changed between two values before comparing them.
+- **`deck.instructions.commit` moved on script-only commits until #2086.** A daemon on a release without #2086's fix also moves it when only a script or pin under `.claude/skills` changes; for data from such a daemon, check what changed between two values before comparing them. From the fix on, only `CLAUDE.md`, `AGENTS.md` and Markdown under `.claude/skills` move it.
 - **The `renovate` dataset is not the hosted Renovate.** In round 1 it held one local trace, so Renovate figures come from its PRs.
 - **Triggers and boards:** round 1 found none in `test` (#2080). Check with `get_triggers` and `list_boards`, not from an issue's checklist.
 
