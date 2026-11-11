@@ -1766,31 +1766,24 @@ fn status_042_the_directory_cannot_imitate_the_line_on_the_dir_row() {
     assert!(rows[1].starts_with("│Dir:  x✉ delivered "), "{text}");
 }
 
-/// Scenario: An undeliverable message emits the existing delivery_notice error channel for this pane. Its card must show Error and the complete not-delivered notice instead of keeping the old user prompt as its only explanation.
-#[spec("inbox/status/008")]
-#[test]
-fn status_008_card_shows_not_delivered_error_notice() {
+/// Render one card that took the daemon's delivery-notice error event.
+fn delivery_notice_card(notice: &str, width: u16) -> String {
     let session = card_stats_session("/home/dev/api-svc");
     let mut state = AppState::default();
     state.register_pane("pane-card-stats".to_string());
     state.sessions.insert(session.session_id.clone(), session);
-    let words = inbox_display_words();
-    let notice = format!(
-        "{}: review fixture (agent exited)",
-        words["notDelivered"].as_str().unwrap()
-    );
     state.apply_daemon_report_event(AgentEvent {
         session_id: "sess-card-stats".into(),
         agent_type: AgentType::ClaudeCode,
         event_type: EventType::Error,
         tool_name: None,
-        tool_detail: Some(notice.clone()),
+        tool_detail: Some(notice.to_string()),
         cwd: None,
         timestamp: render_now(),
         user_prompt: None,
         metadata: HashMap::from([(
             dot_agent_deck::event::DELIVERY_NOTICE_METADATA_KEY.to_string(),
-            notice.clone(),
+            notice.to_string(),
         )]),
         pane_id: Some("pane-card-stats".into()),
         agent_id: Some("agent-card-stats".into()),
@@ -1809,19 +1802,102 @@ fn status_008_card_shows_not_delivered_error_notice() {
         0,
         render_now(),
         false,
-        80,
+        width,
         CardDensityKind::Normal.rendered_height(),
     );
-    let rendered = buffer_to_text(&buffer);
+    buffer_to_text(&buffer)
+}
+
+/// Scenario: A message waits for a worker whose pane then ends: its command exits with code 0, 7 or 23, the deck's connection to it ends, or the pane is replaced, closed or ends some unknown way. The real inbox hub's notice turns the card to Error and says how the pane ended, the exit code included, in the words the desktop's tile reads from the shared fixture.
+#[spec("inbox/status/008")]
+#[test]
+fn status_008_card_shows_not_delivered_error_notice() {
+    use dot_agent_deck::inbox::{Content, DeckId, InboxLimits, Recipient};
+    use dot_agent_deck::inbox_hub::{ExitKind, InboxHub};
+
+    let words = inbox_display_words();
+    let not_delivered = words["notDelivered"].as_str().unwrap();
+    let cases: Vec<serde_json::Value> =
+        serde_json::from_str(include_str!("fixtures/inbox-termination-cards.json")).unwrap();
+    assert_eq!(cases.len(), 7, "every termination kind, three exit codes");
+    let mut cards = String::new();
+    let mut failures = Vec::new();
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let termination = &case["termination"];
+        let kind = termination["kind"].as_str().unwrap();
+        // The desktop composes nothing: both clients print the daemon's
+        // notice, and these are the words its tile is pinned against.
+        let expected = format!(
+            "{not_delivered}: {}",
+            words["terminations"][kind]
+                .as_str()
+                .unwrap()
+                .replace("{code}", &termination["code"].to_string())
+        );
+        let hub = InboxHub::new(
+            DeckId::parse("k3xzq2ab").unwrap(),
+            InboxLimits::default(),
+            std::time::Duration::from_secs(30),
+        );
+        let notices = Arc::new(Mutex::new(Vec::new()));
+        let told = Arc::clone(&notices);
+        hub.set_card_notice_sink(Arc::new(move |notice| {
+            told.lock().unwrap().push(notice.detail.to_string());
+        }));
+        hub.post_direct(
+            Recipient::bound("pane-card-stats", "agent-card-stats"),
+            Content::from_deck("test", "review fixture", "inspect the sentinel"),
+        )
+        .unwrap();
+        hub.agent_exited_as(
+            "pane-card-stats",
+            "agent-card-stats",
+            ExitKind::Natural,
+            Some(serde_json::from_value(termination.clone()).unwrap()),
+        );
+        hub.post_owed_notices();
+        let notices = notices.lock().unwrap();
+        assert_eq!(
+            notices.len(),
+            1,
+            "{name}: one notice for the waiting message"
+        );
+        let rendered = delivery_notice_card(&notices[0], 180);
+        assert!(
+            rendered.contains("Error"),
+            "{name}: the card is not Error:\n{rendered}"
+        );
+        if !rendered.contains(&expected) {
+            failures.push(format!("{name}: expected {expected:?} on\n{rendered}"));
+        }
+        // A card in a 120-column dashboard's two-column grid is about 60
+        // columns wide: the notice wraps there, so the exit code and the rest
+        // of it are still on the card (PR #2245 review).
+        let narrow = delivery_notice_card(&notices[0], 60);
+        let words_on_card = narrow
+            .lines()
+            .map(|row| row.trim_matches(|c: char| c == '│' || c.is_whitespace()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !words_on_card
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .contains(&expected)
+        {
+            failures.push(format!(
+                "{name}: expected {expected:?} on the 60-column card\n{narrow}"
+            ));
+        }
+        cards.push_str(&format!("=== {name} ===\n{rendered}\n{narrow}\n"));
+    }
     assert!(
-        rendered.contains("Error"),
-        "undeliverable message did not make the card Error:\n{rendered}"
+        failures.is_empty(),
+        "the card does not say how the pane ended:\n{}",
+        failures.join("\n")
     );
-    assert!(
-        rendered.contains(&notice),
-        "Error card lost its not-delivered explanation:\n{rendered}"
-    );
-    insta::assert_snapshot!(rendered);
+    insta::assert_snapshot!(cards);
 }
 
 /// Scenario: After a human prompt, the daemon broadcasts a deck-message prompt labelled with its subject. The card must render that envelope subject, while its user-prompt history still contains only the human's text.

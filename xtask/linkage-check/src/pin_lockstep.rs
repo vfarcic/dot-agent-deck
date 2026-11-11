@@ -475,6 +475,159 @@ fn renovate_reads_exactly_the_declared_msrv() {
     );
 }
 
+/// Issue #2051: each real OpenCode CI's lane 1 runs is pinned twice — in
+/// `scripts/opencode-pins/<dir>/package.json` with its `package-lock.json`,
+/// which `scripts/install-pinned-opencode.sh` installs with `npm ci`, and as
+/// `scripts/box/bootstrap.sh`'s `<VAR>=<X.Y.Z>`, which a dev box installs and
+/// the same tests find there. One entry per pin: its directory, its npm
+/// package and its bootstrap variable.
+const OPENCODE_PINS: [(&str, &str, &str); 2] = [
+    (
+        "scripts/opencode-pins/v1",
+        "opencode-ai",
+        "OPENCODE_1_VERSION",
+    ),
+    (
+        "scripts/opencode-pins/v2",
+        "@opencode/cli",
+        "OPENCODE_2_VERSION",
+    ),
+];
+
+fn read_json(rel: &str) -> serde_json::Value {
+    let text =
+        fs::read_to_string(repo_root().join(rel)).unwrap_or_else(|e| panic!("read {rel}: {e}"));
+    serde_json::from_str(&text).unwrap_or_else(|e| panic!("{rel} is not valid JSON: {e}"))
+}
+
+/// `bootstrap.sh`'s `<var>=<value>` lines, as `(line, value)`.
+fn bootstrap_assignments(var: &str) -> Vec<(usize, String)> {
+    let text = fs::read_to_string(repo_root().join("scripts/box/bootstrap.sh"))
+        .expect("read scripts/box/bootstrap.sh");
+    let prefix = format!("{var}=");
+    text.lines()
+        .enumerate()
+        .filter_map(|(n, line)| line.strip_prefix(&prefix).map(|v| (n + 1, v.to_string())))
+        .collect()
+}
+
+/// The exact version `dir`'s package.json pins `package` at, after checking
+/// that its lockfile records that same version, with an integrity hash, as
+/// the root's dependency and as the installed package.
+fn opencode_pin(dir: &str, package: &str) -> String {
+    let manifest = read_json(&format!("{dir}/package.json"));
+    let pinned = manifest["dependencies"][package]
+        .as_str()
+        .unwrap_or_else(|| panic!("{dir}/package.json must depend on {package}"))
+        .to_string();
+    assert!(
+        Regex::new(r"^\d+\.\d+\.\d+$").unwrap().is_match(&pinned),
+        "{dir}/package.json must pin {package} to an exact X.Y.Z, not {pinned:?}"
+    );
+    let lock = read_json(&format!("{dir}/package-lock.json"));
+    assert_eq!(
+        lock["packages"][""]["dependencies"][package], pinned,
+        "{dir}/package-lock.json's root must name the version package.json pins"
+    );
+    let installed = &lock["packages"][format!("node_modules/{package}")];
+    assert_eq!(
+        installed["version"], pinned,
+        "{dir}/package-lock.json must lock {package} at {pinned}"
+    );
+    assert!(
+        installed["integrity"]
+            .as_str()
+            .is_some_and(|i| i.starts_with("sha512-")),
+        "{dir}/package-lock.json must record {package}'s integrity hash: {installed}"
+    );
+    pinned
+}
+
+#[test]
+fn opencode_pins_agree_with_their_lockfiles_and_the_box_bootstrap() {
+    for (dir, package, var) in OPENCODE_PINS {
+        let pinned = opencode_pin(dir, package);
+        let bootstrap = bootstrap_assignments(var);
+        assert_eq!(
+            bootstrap
+                .iter()
+                .map(|(_, v)| v.as_str())
+                .collect::<Vec<_>>(),
+            vec![pinned.as_str()],
+            "scripts/box/bootstrap.sh must assign {var} once, to the {package} version \
+             {dir}/package.json pins (issue #2051)"
+        );
+    }
+}
+
+/// The two bootstrap lines are where Renovate's regex managers read them, and
+/// as the package each names: a reformatted line would silently stop being
+/// bumped while the npm side moved on, which the test above then reports only
+/// after the fact.
+#[test]
+fn renovate_reads_the_box_bootstraps_opencode_pins() {
+    let config = read_json("renovate.json");
+    let bootstrap = "scripts/box/bootstrap.sh";
+    let text = fs::read_to_string(repo_root().join(bootstrap)).expect("read bootstrap.sh");
+    let mut sites = Vec::new();
+    for manager in config["customManagers"].as_array().expect("customManagers") {
+        let reads_bootstrap = manager["managerFilePatterns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p.as_str())
+            .filter_map(|p| p.strip_prefix('/').and_then(|p| p.strip_suffix('/')))
+            .any(|p| {
+                Regex::new(p)
+                    .expect("a managerFilePatterns regex")
+                    .is_match(bootstrap)
+            });
+        if !reads_bootstrap {
+            continue;
+        }
+        for matcher in manager["matchStrings"].as_array().expect("matchStrings") {
+            let matcher = Regex::new(matcher.as_str().expect("a matchString")).expect("a regex");
+            for caps in matcher.captures_iter(&text) {
+                let value = caps.name("currentValue").expect("captures currentValue");
+                let line = text[..value.start()].matches('\n').count() + 1;
+                sites.push((
+                    manager["depNameTemplate"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    manager["datasourceTemplate"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                    line,
+                    value.as_str().to_string(),
+                ));
+            }
+        }
+    }
+    sites.sort();
+    let mut expected: Vec<(String, String, usize, String)> = OPENCODE_PINS
+        .iter()
+        .map(|(dir, package, var)| {
+            let [(line, _)] = bootstrap_assignments(var)[..] else {
+                panic!("bootstrap.sh must assign {var} exactly once");
+            };
+            (
+                package.to_string(),
+                "npm".to_string(),
+                line,
+                opencode_pin(dir, package),
+            )
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        sites, expected,
+        "renovate.json's customManagers must read exactly bootstrap.sh's two OpenCode pins, \
+         as npm's opencode-ai and @opencode/cli (issue #2051)"
+    );
+}
+
 #[test]
 fn agreeing_fixture_passes() {
     if !bash_present() {

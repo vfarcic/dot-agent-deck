@@ -2844,9 +2844,9 @@ fn opencode_version_parser_reads_both_majors_and_refuses_noise() {
 }
 
 /// Scenario: Resolve the OpenCode test-binary knob against a scratch home and
-/// PATH. `v1` names the pinned 1.x under the home only once that file exists,
-/// a path names itself, and a bare name is found on PATH; nothing else
-/// resolves.
+/// PATH. `v1` and `v2` name the pinned 1.x and 2.x under the home only once
+/// each file exists, a path names itself, and a bare name is found on PATH;
+/// nothing else resolves.
 #[test]
 fn opencode_test_bin_resolves_v1_to_the_pinned_install() {
     let home = race_safe_tempdir();
@@ -2876,6 +2876,19 @@ fn opencode_test_bin_resolves_v1_to_the_pinned_install() {
     assert_eq!(
         resolve_opencode_test_bin("opencode", home.path(), &path),
         Some(bin_dir.path().join("opencode"))
+    );
+    // Issue #2051: `v2` names the pinned 2.x the same way.
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V2, home.path(), &path),
+        None,
+        "v2 resolves only once the pinned 2.x is installed"
+    );
+    let pinned_v2 = home.path().join(OPENCODE_PINNED_V2);
+    std::fs::create_dir_all(pinned_v2.parent().unwrap()).expect("pinned 2.x dir");
+    std::fs::write(&pinned_v2, "").expect("pinned 2.x binary");
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V2, home.path(), &path),
+        Some(pinned_v2)
     );
 }
 

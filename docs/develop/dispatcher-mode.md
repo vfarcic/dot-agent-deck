@@ -124,7 +124,7 @@ The caller's `(pane_id, agent_id)` pair — already captured at dispatch time so
 
 Delivery posts to the caller generation's inbox through `inbox_hub::post_to_live`, the call the acknowledgement makes too, so the caller-identity binding and the never-retried refusal policy are the acknowledgement's rather than a second copy that can drift.
 
-**This is the live-recipient path only.** A caller pane that is gone degrades to drop-and-log: there is no queue, no file-backed outbox and no retry. An outcome with no live recipient is a deck-wide attention question and belongs with [#630](https://github.com/vfarcic/dot-agent-deck/issues/630), not here.
+**This is the live-recipient path.** An outcome whose caller generation is gone, or whose inbox refuses it, is no longer dropped: since PRD #1666 part 3 it is set aside as a recovery row (`report_recovery`, cause `recipient_exited` or `recipient_refused`), and its body is kept in the retained store (`retained-reports/`) for up to 7 days. The rows live in the daemon's memory, so a daemon restart loses the link between a set-aside outcome and the caller it was for; the retained file stays.
 
 The edge is #220's own Phase 2. It is *not* tracked by #174 — that is the separate *Cross-project orchestration dispatch* PRD, which **depends on** this one. The dependency has been stated backwards more than once.
 

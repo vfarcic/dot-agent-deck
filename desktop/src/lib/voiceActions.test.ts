@@ -562,7 +562,7 @@ describe("VOICE_ACTIONS", () => {
   it("dispatches the agent-pane round trip through the two voice navigation actions", () => {
     renderDeck();
     const planner = screen.getByTestId("agent-tile-planner");
-    fireEvent.click(within(planner).getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(within(planner).getByRole("button", { name: "Open Plan / architecture agent" }));
 
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expectOneRegistryDispatch("openAgent");

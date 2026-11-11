@@ -1,0 +1,9 @@
+[
+  { "name": "exit-zero", "termination": { "kind": "pane_command_exited", "code": 0, "reported_by": "deck" } },
+  { "name": "exit-seven", "termination": { "kind": "pane_command_exited", "code": 7, "reported_by": "deck" } },
+  { "name": "wrapper-exit-twenty-three", "termination": { "kind": "pane_command_exited", "code": 23, "reported_by": "wrapper" } },
+  { "name": "connection-ended", "termination": { "kind": "connection_ended", "read_end": "eof" } },
+  { "name": "replaced", "termination": { "kind": "replaced" } },
+  { "name": "closed", "termination": { "kind": "closed" } },
+  { "name": "unknown", "termination": { "kind": "unknown" } }
+]
