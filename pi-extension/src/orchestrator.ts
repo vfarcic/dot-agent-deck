@@ -883,8 +883,16 @@ export const INBOX_FRAMING =
 
 /** The doorbell line's text before the message id (the deck's `doorbell::LINE_PREFIX`, trimmed). */
 export const DOORBELL_PREFIX = "dot-agent-deck: message";
-/** The doorbell line's text after the message id (the deck's `doorbell::LINE_SUFFIX`). */
-export const DOORBELL_SUFFIX = " waiting, run: dot-agent-deck inbox fetch";
+/** The doorbell line's text between the message id and the command word (the deck's `doorbell::LINE_WAITING`). */
+export const DOORBELL_WAITING = " waiting, run: ";
+/**
+ * The command word's pattern (the deck's `doorbell::COMMAND_WORD_PATTERN`):
+ * one shell word, since issue #1730 the absolute path of the deck the daemon
+ * runs from, before it a bare `dot-agent-deck`.
+ */
+export const DOORBELL_COMMAND_WORD = String.raw`(?:'[^'\r\n]*'|\\.|[^\s'\\])+`;
+/** The doorbell line's text after the command word (the deck's `doorbell::LINE_FETCH`). */
+export const DOORBELL_FETCH = " inbox fetch";
 
 const MESSAGE_ID = "(m-[a-z2-7]{8}-[0-9a-f]{16})";
 const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -935,7 +943,10 @@ export function doorbellIdsIn(text: unknown): string[] {
 	if (typeof text !== "string") {
 		return [];
 	}
-	const line = new RegExp(`${escapeRegExp(DOORBELL_PREFIX)} ${MESSAGE_ID}${escapeRegExp(DOORBELL_SUFFIX)}`, "g");
+	const line = new RegExp(
+		`${escapeRegExp(DOORBELL_PREFIX)} ${MESSAGE_ID}${escapeRegExp(DOORBELL_WAITING)}${DOORBELL_COMMAND_WORD}${escapeRegExp(DOORBELL_FETCH)}`,
+		"g",
+	);
 	const ids = [...text.matchAll(line)].map((m) => m[1]);
 	if (ids.length === 0 || text.replace(line, "").trim() !== "") {
 		return [];

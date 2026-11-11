@@ -871,7 +871,13 @@ fn dispatch_prompt(
          signal still reports success with the words missing.\n\n\
          That report is delivered straight into the conversation that dispatched you, so \
          write it for someone who cannot see this pane: what you did, what the outcome was, \
-         and anything they have to act on. Run it exactly once, when you are done."
+         and anything they have to act on. Run it once, when you are done.\n\n\
+         If that report later turns out to be wrong or stale — a test run finished after you \
+         sent it, or the outcome changed — run the same command again with a corrected report \
+         in a fresh file. It is delivered as an update to your report: the first report still \
+         stands and is not replaced, so say what changed. A unit may send {max_updates} updates, \
+         and running the command again with the same report sends nothing new.",
+        max_updates = crate::report_recovery::MAX_REPORT_UPDATES
     ));
     // Issue #550: the report above travels back over the wire and is deleted, so
     // it needs nowhere durable. Anything BIGGER than that does — the return edge
@@ -1018,6 +1024,22 @@ pub async fn handle_dispatch(
             };
         }
     };
+
+    // PRD #1885: a dispatched orchestration runs, unattended, only when its text
+    // — read from the caller's checkout above, and carried to the spawn as
+    // `resolved_target` — is the approved text. Checked before the worktree
+    // exists, so a refusal creates nothing and its devbox warm-up never runs;
+    // the caller's `dispatch` fails with the reason and the approving command.
+    if let crate::spawn::SpawnTarget::Orchestration { config, .. } = &resolved_target
+        && let Some(refusal) = crate::spawn::approval_refusal(&clone_dir, config, "dispatch").await
+    {
+        return DispatchResult {
+            worktree_dir: paths.worktree_dir.clone(),
+            success: false,
+            message: format!("dispatch: {refusal}"),
+            unit_id: None,
+        };
+    }
 
     // Read once, and the worktree is cut from exactly this sha, so the base the
     // reply names is the unit's base. See [`resolve_dispatch_base`].
@@ -2671,6 +2693,9 @@ mod tests {
             // but the worktree the roles run in is a HEAD checkout.
             git_in(tmp.path(), &repo, &["add", "-A"]);
             git_in(tmp.path(), &repo, &["commit", "-qm", "add orchestration"]);
+            // PRD #1885: a dispatched orchestration starts only when approved;
+            // this test is about what the dispatch writes once it starts.
+            crate::project_trust::approve_all_for_test(&repo);
 
             let (event_tx, _rx) = tokio::sync::broadcast::channel(64);
             let ctx = DispatchContext {
@@ -2827,6 +2852,9 @@ mod tests {
              [[orchestrations.roles]]\nname = \"worker\"\ncommand = \"cat\"\ndescription = \"Does the work\"\n",
         )
         .unwrap();
+        // PRD #1885: a dispatched orchestration starts only when approved; this
+        // test is about the publish refusal behind that gate.
+        crate::project_trust::approve_all_for_test(&repo);
         // The obstruction: `.dot-agent-deck` is a symlink in the committed tree,
         // so the worktree `git worktree add` cuts has one too, and the publish
         // refuses to write the coordinator context through it. Dangling on

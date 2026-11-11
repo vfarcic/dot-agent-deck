@@ -436,7 +436,7 @@ fn telemetry_otlp_002_exports_run_and_status_intervals() {
             assert_eq!(attribute(resource, "service.name"), "dot-agent-deck");
             assert!(!attribute(resource, "service.version").is_empty());
             assert!(!attribute(resource, "host.name").is_empty());
-            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "3");
+            assert_eq!(attribute(resource, "deck.telemetry.schema_version"), "4");
         }
     }
 }
@@ -471,6 +471,8 @@ fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-pi\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -1188,6 +1190,8 @@ fn telemetry_otlp_011_respawn_mints_a_new_run_id() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-respawn\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");

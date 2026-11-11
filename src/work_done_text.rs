@@ -25,6 +25,8 @@ pub mod code {
     /// `already_accepted` with `differs`: the legacy verb's acknowledgement
     /// has no such field, so it refuses a differing repeat with this code.
     pub const REPORT_DIFFERS: &str = "report_differs";
+    /// Issue #2260: a unit sent as many updates to its report as it may.
+    pub const REPORT_UPDATES_EXHAUSTED: &str = "report_updates_exhausted";
 }
 
 const NOTHING: &str = "nothing was reported";
@@ -226,11 +228,22 @@ pub fn task_differs(task_id: &str) -> String {
     )
 }
 
-/// A repeat of a unit's terminal report with a different body.
+/// A repeat of a unit's terminal report with a different body, as a daemon
+/// that takes no updates answers it (one older than issue #2260).
 pub fn unit_differs() -> String {
     "This unit already reported that it finished; this different report was NOT delivered, and \
-     the first one stands."
+     the first one stands. The deck daemon running this unit takes no updates to a report."
         .to_string()
+}
+
+/// Issue #2260: a different report from a unit that already sent `max`
+/// updates to its report.
+pub fn unit_updates_exhausted(max: usize) -> String {
+    format!(
+        "{NOTHING}: this unit already reported and then sent {max} updates to that report, the \
+         most it may send. This report was NOT delivered; the earlier report and its updates \
+         stand."
+    )
 }
 
 /// The CLI's line when the daemon did not confirm task-scoped completion.
@@ -305,11 +318,24 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
             (None, true) if reply.destination == Some(Destination::None) => {
                 ok("Reported the orchestration complete.".to_string())
             }
+            (None, true) if recovered && reply.update.is_some() => ok(format!(
+                "Sent update {} to this unit's report. The agent that dispatched it is no \
+                 longer running, so {}",
+                reply.update.unwrap_or_default(),
+                saved_for_recovery(reply.report_id.as_deref())
+            )),
             (None, true) if recovered => ok(format!(
                 "Reported this unit complete. The agent that dispatched it is no longer \
                  running, so {}",
                 saved_for_recovery(reply.report_id.as_deref())
             )),
+            (None, true) if reply.update.is_some() => {
+                let n = reply.update.unwrap_or_default();
+                ok(format!(
+                    "Sent update {n} to this unit's report to the agent that dispatched it. Its \
+                     earlier report still stands; this update does not replace it."
+                ))
+            }
             (None, _) => ok("Reported this unit complete to the agent that dispatched it.".into()),
         },
         WorkDoneDisposition::AlreadyAccepted => match (task_id, reply.differs) {
@@ -317,7 +343,7 @@ pub fn cli_answer(reply: &WorkDoneTaskReply, task_id: Option<&str>, terminal: bo
                 "Task {id} was already reported; nothing new was sent."
             )),
             (Some(id), true) => err(task_differs(id)),
-            (None, false) => ok("This unit was already reported complete; nothing new was \
+            (None, false) => ok("This unit already sent this exact report; nothing new was \
                  sent."
                 .to_string()),
             (None, true) => err(unit_differs()),
@@ -352,6 +378,7 @@ mod tests {
             report_id: Some("0123abcd".to_string()),
             destination: Some(Destination::Recovery),
             differs: false,
+            update: None,
             code: None,
             message: None,
         }

@@ -455,6 +455,23 @@ dialog = true
 action = "discard_new_agent"
 outcome = "dispatch"
 
+# PRD #1885 — the Review project commands dialog's Approve and start: its own
+# label over the New agent dialog, and other words over the Runs screen.
+[[fixtures]]
+name = "approve-project-commands-by-its-label"
+utterance = "Approve and start"
+screen = "overview"
+dialog = true
+action = "approve_project_commands"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "approve-project-commands-on-the-runs-screen"
+utterance = "approve the project commands"
+screen = "deck"
+action = "approve_project_commands"
+outcome = "dispatch"
+
 # Issue #1263 — the deck field once the dialog is open. Over a dialog with no
 # form yet, and over a live form (where a different deck clears the directory);
 # the field's label said with a deck's name; and the deck screen, where there is

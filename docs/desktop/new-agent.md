@@ -16,6 +16,8 @@
 
 To start an orchestration instead, choose a directory tagged **project** in step 3, pick its `Orch: <name>` chip in step 4, and press **Activate orchestration**. Every role the orchestration defines starts, and each appears as a row in one **ORCHESTRATION** group. See [Orchestration](../orchestration.md) for defining one.
 
+If you have not approved that orchestration yet, or its roles changed since you did, **Review project commands** opens first and nothing starts until you answer it. It lists each role's command, description and prompt, marks the roles that are `changed` or `new`, and names removed ones. **Approve and start** approves exactly that text and starts the orchestration; **Cancel** or `Esc` starts and remembers nothing; `Enter` does not approve. By voice, say "approve and start". The TUI shows the same review. See [Approving Project Commands](../project-trust.md).
+
 ## Daemon
 
 The daemons that can take a new agent are listed, each with a tag saying whether it is **LOCAL** or **REMOTE**. A daemon that cannot take one right now, for example because it is not connected or is a different version from this app, is not listed here; the dashboard shows it with the reason and what you can do about it. When exactly one daemon can take an agent, it is chosen for you. If none can, or no daemon is configured, the dialog says so in one line instead of showing a list. Keys: `j` / `k` or the arrow keys move, `Enter` chooses. If you ask for a daemon by voice that cannot take a new agent, the app says which one and why, for example "“build box” can't take a new agent: it is older than this app."
@@ -81,5 +83,6 @@ Closing the dialog (`Escape`, `q`, the close button, or a click outside it) keep
 | "This daemon cannot list directories, so no directory can be chosen on it here." | That daemon does not answer the directory-listing request, which is what a daemon from an older release does. Upgrade the deck on that machine, or choose another daemon. |
 | The directory you want is not listed | It may be hidden (press `.`), or past the daemon's listing limit (type part of its name in the filter). |
 | No `Orch:` chip for a project | The chosen directory is not the one holding `.dot-agent-deck.toml`, or the file has an error; the form shows the daemon's reason when it has one. [Orchestration](../orchestration.md) covers the file. |
+| "This deck's daemon is older than this app and cannot show the review…" after **Activate orchestration** | The daemon is from an older release, so the app starts no orchestration on it. Upgrade that daemon, or approve on its host with the command in the message and start from the TUI there ([Approving Project Commands](../project-trust.md#a-daemon-from-an-older-release)). |
 | An error under the form after **Create agent** | The daemon refused the start; the message says why, and **Detail** shows the full text. |
 | The agent starts but its status never leaves **RUNNING** | Its hooks are not reporting; see [Troubleshooting → Hooks](../troubleshooting.md#hooks). |

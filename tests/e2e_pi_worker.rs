@@ -98,6 +98,9 @@ async fn chain_smoke_pi_002_worker_receives_delegate_and_signals_work_done_inner
         ),
     )
     .expect("write worker orchestration .dot-agent-deck.toml");
+    // PRD #1885: approved as written, so the delegate runs; this test is
+    // about the agent, not the gate.
+    common::approve_project_fixture(cwd.path());
 
     // --- WORKER: real pi whose HOME carries the bundled extension. In production
     // the extension is materialized ONCE at daemon startup

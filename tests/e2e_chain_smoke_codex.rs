@@ -48,6 +48,9 @@ fn write_orchestration(deck: &common::TuiDeck, line: &str) {
         ),
     )
     .unwrap();
+    // PRD #1885: approved as written, so the delegate runs; this test is
+    // about the agent, not the gate.
+    deck.approve_project_trust(&dir);
     std::fs::write(
         dir.join("delegate-task.md"),
         format!(

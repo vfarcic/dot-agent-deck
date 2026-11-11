@@ -73,6 +73,8 @@ async fn fixture(worker_command: &str) -> Fixture {
         config(worker_command),
     )
     .expect("write orchestration config");
+    // PRD #1885: a restart runs only an approved orchestration.
+    common::approve_project_fixture(dir.path());
     let cwd = dir.path().to_string_lossy().into_owned();
 
     daemon
@@ -346,6 +348,7 @@ async fn pane_restart_006_two_same_name_cwd_instances_do_not_cross_restart() {
     let dir = common::race_safe_tempdir();
     std::fs::write(dir.path().join(".dot-agent-deck.toml"), config("cat"))
         .expect("write orchestration config");
+    common::approve_project_fixture(dir.path());
     let cwd = dir.path().to_string_lossy().into_owned();
 
     const ORCH_PANE_A: &str = "restart-iso-orch-a";
@@ -956,6 +959,8 @@ async fn pane_restart_012_force_restart_cancels_the_task_a_busy_refusal_names() 
     )
     .await
     .expect("rewrite the orchestration config with a clear = false worker");
+    // PRD #1885: the rewritten text is approved as the user would approve it.
+    common::approve_project_fixture(fx._dir.path());
 
     let first = delegate_to_worker(&fx, false).await;
     assert_eq!(
@@ -1134,6 +1139,7 @@ fn pane_restart_013_force_restart_cancels_the_silent_worker_notice() {
             )
             .await
             .expect("rewrite the orchestration config with a clear = false worker");
+            common::approve_project_fixture(fx._dir.path());
 
             let first = delegate_to_worker(&fx, false).await;
             assert_eq!(first.delivered, vec![WORKER_ROLE.to_string()], "{first:?}");
@@ -1196,6 +1202,7 @@ fn pane_restart_015_draft_wait_does_not_block_restart_or_lose_delegate() {
             )
             .await
             .expect("configure delivery to the current worker");
+            common::approve_project_fixture(fx._dir.path());
 
             // Typed as a person's keys, through the generation's fence gate
             // (PRD #1666 part 3, Q16-2: the blocking writer is test-only).
@@ -1309,6 +1316,7 @@ async fn prepared_fixture(
         config(worker_restart_command),
     )
     .expect("write orchestration config");
+    common::approve_project_fixture(&project);
     let cwd = project.to_string_lossy().into_owned();
 
     daemon

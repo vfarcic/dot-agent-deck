@@ -1236,10 +1236,24 @@ mod tests {
         );
         assert!(
             source.contains(&format!(
-                "export const DOORBELL_SUFFIX = \"{}\";",
-                crate::doorbell::LINE_SUFFIX
+                "export const DOORBELL_WAITING = \"{}\";",
+                crate::doorbell::LINE_WAITING
             )),
-            "DOORBELL_SUFFIX drifted from doorbell::LINE_SUFFIX"
+            "DOORBELL_WAITING drifted from doorbell::LINE_WAITING"
+        );
+        assert!(
+            source.contains(&format!(
+                "export const DOORBELL_COMMAND_WORD = String.raw`{}`;",
+                crate::doorbell::COMMAND_WORD_PATTERN
+            )),
+            "DOORBELL_COMMAND_WORD drifted from doorbell::COMMAND_WORD_PATTERN"
+        );
+        assert!(
+            source.contains(&format!(
+                "export const DOORBELL_FETCH = \"{}\";",
+                crate::doorbell::LINE_FETCH
+            )),
+            "DOORBELL_FETCH drifted from doorbell::LINE_FETCH"
         );
         assert!(
             source.contains(&format!(
@@ -1276,7 +1290,9 @@ mod tests {
         for placeholder in [
             "__FRAMING_JSON__",
             "__DOORBELL_PREFIX_JSON__",
-            "__DOORBELL_SUFFIX_JSON__",
+            "__DOORBELL_WAITING_JSON__",
+            "__DOORBELL_COMMAND_WORD_JSON__",
+            "__DOORBELL_FETCH_JSON__",
             "__ADAPTER_INTEGRATION__",
             "__RETIRE_KEEPALIVES__",
         ] {

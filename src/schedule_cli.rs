@@ -314,6 +314,16 @@ pub fn write_atomic(path: &Path, tasks: &[ScheduledTask]) -> Result<(), String> 
 /// enabled/disabled state and next-fire time (local). A malformed cron (should
 /// not happen for a writer-produced file) renders as `next: <invalid cron>`.
 pub fn format_list(tasks: &[ScheduledTask]) -> String {
+    format_list_with_outcomes(tasks, &crate::schedule_outcome::Outcomes::new())
+}
+
+/// [`format_list`], with a task's last fire beneath it when that fire was
+/// refused because its orchestration is not approved (PRD #1885): when, and
+/// the refusal itself, which names the command that approves it.
+pub fn format_list_with_outcomes(
+    tasks: &[ScheduledTask],
+    outcomes: &crate::schedule_outcome::Outcomes,
+) -> String {
     if tasks.is_empty() {
         return "No schedules.".to_string();
     }
@@ -344,6 +354,13 @@ pub fn format_list(tasks: &[ScheduledTask]) -> String {
             cron = t.cron,
             dir = t.working_dir,
         ));
+        if let Some(refusal) = outcomes.get(&t.name) {
+            out.push_str(&format!(
+                "          last fire refused at {}: {}\n",
+                crate::untrusted_text::escape_control_and_bidi(&refusal.at),
+                crate::untrusted_text::escape_control_and_bidi(&refusal.message),
+            ));
+        }
     }
     out
 }
@@ -351,6 +368,30 @@ pub fn format_list(tasks: &[ScheduledTask]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #1885: a fire refused as not approved is listed beneath its task.
+    #[test]
+    fn format_list_shows_a_refused_last_fire_beneath_its_task() {
+        let mut tasks = Vec::new();
+        add(&mut tasks, sample_add("nightly", "0 9 * * *")).unwrap();
+        add(&mut tasks, sample_add("weekly", "0 9 * * 1")).unwrap();
+        let mut outcomes = crate::schedule_outcome::Outcomes::new();
+        outcomes.insert(
+            "nightly".to_string(),
+            crate::schedule_outcome::Refusal {
+                at: "2026-11-10T09:00:00Z".to_string(),
+                message: "orchestration 'team' of project /p was never approved".to_string(),
+            },
+        );
+        let listed = format_list_with_outcomes(&tasks, &outcomes);
+        let lines: Vec<&str> = listed.lines().collect();
+        assert_eq!(lines.len(), 3, "{listed}");
+        assert!(lines[0].contains("nightly"));
+        assert!(lines[1].contains("last fire refused at 2026-11-10T09:00:00Z"));
+        assert!(lines[1].contains("never approved"));
+        assert!(lines[2].contains("weekly"));
+        assert_eq!(format_list(&tasks).lines().count(), 2);
+    }
 
     fn sample_add(name: &str, cron: &str) -> AddArgs {
         AddArgs {

