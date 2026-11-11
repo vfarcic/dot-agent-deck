@@ -729,9 +729,10 @@ describe("TauriDeckBridge", () => {
     const { TauriDeckBridge, mapDesktopSnapshot } = await import("./bridge");
     const bridge = new TauriDeckBridge();
 
-    await bridge.runAction({ type: "stop_daemon" });
+    await bridge.runAction({ type: "stop_daemon", deckId: "deck-000000000000dec1" });
 
-    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon" } });
+    // Issue #1073: the deck goes through untouched — the crate resolves it.
+    expect(invoke).toHaveBeenCalledWith("desktop_run_action", { action: { type: "stop_daemon", deckId: "deck-000000000000dec1" } });
     const listed = mapDesktopSnapshot({ ...snapshot, agents: [{ ...snapshot.agents[0], incarnation: "listed-process-a" }] }).agents[0];
     expect(listed.incarnation).toBe("listed-process-a");
     for (const action of [
@@ -946,7 +947,7 @@ describe("TauriDeckBridge", () => {
     invoke.mockResolvedValueOnce({ ok: true });
     invoke.mockResolvedValueOnce({ ok: true, agentId: 42 });
 
-    expect(await bridge.runAction({ type: "stop_daemon" })).not.toHaveProperty("agentId");
+    expect(await bridge.runAction({ type: "stop_daemon", deckId: "deck-000000000000dec1" })).not.toHaveProperty("agentId");
     expect(await bridge.runAction({ type: "start_agent", deckId: "deck-000000000000dec1" })).not.toHaveProperty("agentId");
     await bridge.dispose();
   });
@@ -2171,6 +2172,7 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
   const holdableAttach = () => {
     let heldAgentId: string | undefined;
     let release: (() => void) | undefined;
+    let fail: (() => void) | undefined;
     invoke.mockImplementation(async (command: string, args?: { agentId?: string }) => {
       if (command === "desktop_bootstrap") return fleetSnapshot();
       if (command === "desktop_terminal_attach") {
@@ -2178,7 +2180,10 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
         const agentId = args?.agentId ?? "";
         const result: TerminalAttachResult = { sessionId: `session-${agentId}-${generation}`, agentId, generation, reused: false };
         if (agentId === heldAgentId) {
-          return new Promise<TerminalAttachResult>((resolve) => { release = () => resolve(result); });
+          return new Promise<TerminalAttachResult>((resolve, reject) => {
+            release = () => resolve(result);
+            fail = () => reject(new Error("the daemon is not answering"));
+          });
         }
         return result;
       }
@@ -2187,6 +2192,8 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     return {
       hold: (agentId: string) => { heldAgentId = agentId; },
       release: () => release?.(),
+      /** Settle the held attach with a rejection instead of a session. */
+      fail: () => fail?.(),
     };
   };
 
@@ -2819,6 +2826,99 @@ describe("TauriDeckBridge demand-driven attach (PRD 745 M7)", () => {
     // And writes now route through the NEW session, not the evicted one.
     await bridge.sendTerminalInput(on("agent-1"), "x");
     expect(invoke).toHaveBeenCalledWith("desktop_terminal_write", { sessionId: `session-agent-1-${reattachGeneration}`, data: [120] });
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario (issue #1073, Qodo on PR #2259): show two terminals, let one
+   * attach and hold the other's attach in flight, then stop their deck's
+   * daemon and only then let the held attach resolve. The installed session is
+   * forgotten, and the late attach is detached rather than installed, so no
+   * input reaches the stopped daemon and the next declaration re-attaches.
+   */
+  it("forgets the stopped deck's sessions, an attach still in flight included", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+
+    attach.hold("agent-2");
+    const showing = bridge.setShownTerminals([on("agent-1"), on("agent-2")]);
+    await vi.waitFor(() => expect(attachedAgentIds().sort()).toEqual(["agent-1", "agent-2"]));
+    await settle();
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).resolves.toBeUndefined();
+
+    await bridge.runAction({ type: "stop_daemon", deckId: on("agent-1").deckId });
+    attach.release();
+    await Promise.allSettled([showing]);
+    await settle();
+
+    expect(detachedAgentIds()).toContain("agent-2");
+    await expect(bridge.sendTerminalInput(on("agent-1"), "x")).rejects.toThrow(/not attached/);
+    await expect(bridge.sendTerminalInput(on("agent-2"), "x")).rejects.toThrow(/not attached/);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario (issue #1073, Qodo on PR #2259): hold one terminal's attach in
+   * flight, stop its deck's daemon, then have the held attach REJECT. The stop
+   * cancelled that attempt, so its failure is not delivered to the pane as an
+   * attach error.
+   */
+  it("delivers no attach error for an attempt the deck's stop cancelled", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const attach = holdableAttach();
+    const bridge = new TauriDeckBridge();
+    const output = vi.fn();
+    await bridge.subscribe(vi.fn(), output);
+    await bridge.connect();
+
+    attach.hold("agent-2");
+    const showing = bridge.setShownTerminals([on("agent-2")]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-2"]));
+
+    await bridge.runAction({ type: "stop_daemon", deckId: on("agent-2").deckId });
+    attach.fail();
+    await Promise.allSettled([showing]);
+    await settle();
+
+    const errors = output.mock.calls.filter(([event]) => event.agentId === "agent-2" && event.stream === "error");
+    expect(errors).toHaveLength(0);
+    await bridge.dispose();
+  });
+
+  /**
+   * Scenario (issue #1073, the agent reviewer on PR #2259): hold one agent's
+   * attach in flight, push it out of the warm set, then show it again, which
+   * queues a replay behind the outstanding attach BEFORE any stop. Then stop
+   * its deck's daemon and let the held attach resolve. The queued replay was
+   * declared against the daemon that is now stopped, so it is dropped with the
+   * deck's other sessions rather than attaching after the stop.
+   */
+  it("drops a replay queued before the deck's stop", async () => {
+    const { TauriDeckBridge, MAX_WARM_TERMINALS } = await import("./bridge");
+    const attach = holdableAttach();
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+
+    attach.hold("agent-1");
+    const showing = bridge.setShownTerminals([on("agent-1")]);
+    await vi.waitFor(() => expect(attachedAgentIds()).toEqual(["agent-1"]));
+    for (let index = 2; index <= MAX_WARM_TERMINALS + 2; index += 1) {
+      await bridge.setShownTerminals([on(`agent-${index}`)]);
+    }
+    const reshowing = bridge.setShownTerminals([on("agent-1")]);
+    await settle();
+    expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(1);
+
+    await bridge.runAction({ type: "stop_daemon", deckId: on("agent-1").deckId });
+    attach.release();
+    await Promise.allSettled([showing, reshowing]);
+    await settle();
+
+    expect(attachedAgentIds().filter((agentId) => agentId === "agent-1")).toHaveLength(1);
     await bridge.dispose();
   });
 
