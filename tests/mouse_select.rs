@@ -569,7 +569,7 @@ fn select_010_a_drag_over_joined_emoji_and_flags_copies_what_it_highlights() {
     }
 }
 
-/// Scenario: A pane shows `你AB 漢字x` or `👩‍💻AB`, with two-column glyphs among the letters. Drags that start on a glyph's second column, forward and backward, leave that glyph out of both the highlight and the copy, and drags that end on either column of a glyph highlight and copy the whole glyph: what the terminal shows highlighted is exactly what is copied.
+/// Scenario: A pane shows `你AB 漢字x` or `👩‍💻AB`, with two-column glyphs among the letters. Whichever end the press is on, a drag whose leftmost cell is a glyph's second column leaves that glyph out of both the highlight and the copy, and a drag whose rightmost cell is either column of a glyph highlights and copies the whole glyph: what the terminal shows highlighted is exactly what is copied.
 #[spec("mouse/select/010")]
 #[test]
 fn select_010_a_drag_from_or_to_either_half_of_a_wide_glyph_highlights_what_it_copies() {
