@@ -5470,8 +5470,41 @@ fn contained_deck() -> &'static ContainedDeck {
                 checkout_root().display(),
             );
         }
+        #[cfg(target_os = "macos")]
+        pay_first_launch(&binary);
         ContainedDeck { binary, path_dir }
     })
+}
+
+/// Issue #2237: macOS scans an executable the first time it is launched from
+/// a path it has not seen, a hard link to an already-run build included
+/// (measured on Darwin 25: 3.3 s for the first `--version` through a fresh
+/// link while XProtect was busy, 0.00 s for the second). The link above is
+/// new in every test process, so without this its first launch is whichever
+/// call a test makes first, inside that test's own budget: `inbox/doorbell/008`'s
+/// stand-in runs `inbox fetch` with 8 s, and timed out. Pay it here, once per
+/// process, bounded by the load-scaled boot ceiling; a launch that still has
+/// not answered by then is left to the test, which reports its own failure.
+#[cfg(target_os = "macos")]
+fn pay_first_launch(binary: &Path) {
+    let Ok(mut child) = std::process::Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + child_boot_budget();
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Whether `path` is the developer's checkout or below it, lexically or through

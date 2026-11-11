@@ -464,6 +464,10 @@ pub struct PostedDelegate {
     pub id: MessageId,
     pub ended: oneshot::Receiver<DelegateEnd>,
     pub superseded: Vec<DelegateLedger>,
+    /// PRD #1889: the ids of exactly the tasks the post superseded in the task
+    /// ledger (empty when the report state is torn), so the work journal
+    /// retires those and never a newer task to the same pane.
+    pub superseded_tasks: Vec<String>,
 }
 
 /// PRD #1666 S5: a delegated task the deck reports on if it does not reach
@@ -1450,6 +1454,7 @@ impl InboxHub {
         let mut saved = false;
         let mut owed = false;
         let mut superseded_debt = Vec::new();
+        let mut superseded_tasks = Vec::new();
         let (id, superseded) = {
             let mut st = self.lock();
             let now = Instant::now();
@@ -1511,7 +1516,12 @@ impl InboxHub {
                     }
                     debt
                 }) {
-                    Ok(debt) => superseded_debt = debt,
+                    Ok(debt) => {
+                        for (task, ledger) in debt {
+                            superseded_tasks.push(task);
+                            superseded_debt.push(ledger);
+                        }
+                    }
                     Err(_) => st.log_torn_once("post_delegate"),
                 }
             }
@@ -1557,6 +1567,7 @@ impl InboxHub {
             id,
             ended: rx,
             superseded: superseded_debt,
+            superseded_tasks,
         })
     }
 
@@ -4676,7 +4687,7 @@ fn supersede_tasks(
     reports: &mut crate::report_recovery::ReportState,
     pane_id: &str,
     by: Option<&str>,
-) -> Vec<DelegateLedger> {
+) -> Vec<(String, DelegateLedger)> {
     use crate::report_recovery::{TaskLookup, TaskState, Tombstone};
     let mut debt = Vec::new();
     for id in reports.tasks.open_of_pane(pane_id) {
@@ -4692,7 +4703,7 @@ fn supersede_tasks(
                 by: by.map(str::to_string),
             },
         ) {
-            debt.push(task_debt(&task));
+            debt.push((id, task_debt(&task)));
         }
     }
     debt
