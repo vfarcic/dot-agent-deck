@@ -464,7 +464,16 @@ fn role_record(attach: &Path, role: &str) -> Option<AgentRecord> {
     })
 }
 
-/// Whether no orchestration role appears on the daemon for the whole `window`.
+/// Whether the daemon holds no orchestration role right now. Read it only after
+/// a checkpoint that the action under test reaches after the point where it
+/// would have spawned a role, so an empty answer means "did not", not "not yet".
+fn no_roles(attach: &Path) -> bool {
+    role_records(attach).is_empty()
+}
+
+/// Whether no orchestration role appears on the daemon for the whole `window`:
+/// for an input with no observable effect to wait for, where only a window can
+/// tell "ignored" from "not handled yet".
 fn no_roles_for(attach: &Path, window: Duration) -> bool {
     !common::wait_until(window, || !role_records(attach).is_empty())
 }
@@ -536,16 +545,19 @@ fn prompt_001_an_unapproved_orchestration_asks_before_anything_starts() {
             "the trust prompt must show {needle:?}.\nGrid:\n{grid}"
         );
     }
+    // Choosing the orchestration either spawns its roles or opens this prompt
+    // instead, in the same step, so with the prompt on screen that step is over.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(2)),
+        no_roles(&attach),
         "nothing may be spawned while the prompt is open: {:?}",
         role_records(&attach)
     );
 
     deck.send_keys(b"\x1b"); // Esc -> cancel
     deck.wait_for_absence(PROMPT_TITLE);
+    // `Esc` closes the prompt in the same step that would have spawned on approval.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(2)),
+        no_roles(&attach),
         "Esc must spawn nothing: {:?}",
         role_records(&attach)
     );
@@ -614,6 +626,9 @@ fn prompt_002_a_changed_role_is_marked_and_enter_does_not_approve() {
     }
 
     deck.send_keys(b"\r"); // Enter must NOT approve
+    // A window, not a checkpoint: Enter is meant to change nothing on screen,
+    // and `Esc` as a barrier would close the prompt just as an Enter that wrongly
+    // cancelled it would, hiding the "stays open" half below.
     assert!(
         no_roles_for(&attach, Duration::from_secs(3)),
         "Enter must not approve or spawn anything: {:?}",
@@ -689,6 +704,9 @@ fn prompt_004_clicking_approve_starts_and_clicks_elsewhere_do_nothing() {
     click_label(&deck, "[Quit Ctrl+C]");
     click_label(&deck, "[New Agent Ctrl+N]");
     deck.send_keys(b"\r"); // Enter still does not approve
+    // A window, not a checkpoint: these inputs are meant to change nothing on
+    // screen, so only a window can tell "ignored" from "not handled yet" (as in
+    // `config-trust/prompt/002`). The checks after it read the state it leaves.
     assert!(
         prompt_stays_open(&deck, Duration::from_secs(2)),
         "a click off the footer's labels, or Enter, must leave the prompt open.\nGrid:\n{}",
@@ -700,7 +718,7 @@ fn prompt_004_clicking_approve_starts_and_clicks_elsewhere_do_nothing() {
         deck.snapshot_grid()
     );
     assert!(
-        no_roles_for(&attach, Duration::from_secs(1)),
+        no_roles(&attach),
         "a click off the footer's labels, or Enter, must spawn nothing: {:?}",
         role_records(&attach)
     );
@@ -751,8 +769,10 @@ fn prompt_004_clicking_cancel_closes_and_stores_nothing() {
         "clicking {CANCEL_LABEL:?} must close the prompt, as `Esc` does.\nGrid:\n{}",
         deck.snapshot_grid()
     );
+    // The click closes the prompt in the same step that would have spawned on
+    // approval, so with the prompt gone that step is over.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(2)),
+        no_roles(&attach),
         "a cancelled prompt must spawn nothing: {:?}",
         role_records(&attach)
     );
@@ -829,8 +849,9 @@ fn prompt_004_the_mouse_wheel_scrolls_the_review() {
         "the wheel must not close the prompt.\nGrid:\n{}",
         deck.snapshot_grid()
     );
+    // The review back at its top is the last wheel notch handled.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(1)),
+        no_roles(&attach),
         "the wheel must not approve or spawn anything: {:?}",
         role_records(&attach)
     );
@@ -1012,8 +1033,10 @@ fn restore_001_a_changed_restored_orchestration_asks_before_restoring() {
         role_marked_changed(&grid, "coder"),
         "the changed role must be marked `changed`.\nGrid:\n{grid}"
     );
+    // The startup restore holds the orchestration back for this prompt instead
+    // of starting it, so with the prompt on screen that decision is made.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(2)),
+        no_roles(&attach),
         "a changed orchestration restores nothing until approved: {:?}",
         role_records(&attach)
     );
@@ -1200,8 +1223,10 @@ fn restore_002_cancelling_the_restore_prompt_leaves_the_orchestration_unrestored
             .collect::<Vec<_>>(),
         deck.snapshot_grid()
     );
+    // The plain pane is saved after the orchestration and restored after it,
+    // and `Esc` cancels in one step, so both are past their spawn points.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(3)),
+        no_roles(&attach),
         "a cancelled restore must start none of the orchestration's roles: {:?}",
         role_records(&attach)
             .iter()
@@ -1361,12 +1386,23 @@ fn restore_005_an_approved_held_restore_starts_only_the_roles_that_were_running(
     let second = launch();
     let attach = second.attach_socket_path().to_path_buf();
     second.send_keys(b"a");
+    // Checkpoint: the prompt is gone and the restored tab is drawn with its
+    // `reviewer` card. Approving restores in one pass that starts the roles in
+    // order and builds the tab only after the last of them, so once that card
+    // is on screen any `reviewer` spawn would already be on the daemon. With
+    // the prompt closed, the `reviewer` on screen is the tab's card, not the
+    // review's role list.
     let restored = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
-        role_record(&attach, "orchestrator").is_some() && role_record(&attach, "coder").is_some()
+        let grid = second.snapshot_grid();
+        !grid.contains(PROMPT_TITLE)
+            && grid.contains("reviewer")
+            && role_record(&attach, "orchestrator").is_some()
+            && role_record(&attach, "coder").is_some()
     });
     assert!(
         restored,
-        "`a` must approve and restore the orchestrator and `coder`; roles = {:?}\nGrid:\n{}",
+        "`a` must approve and restore the orchestrator and `coder`, with the `reviewer` card on \
+         the restored tab; roles = {:?}\nGrid:\n{}",
         role_records(&attach)
             .iter()
             .map(|r| &r.tab_membership)
@@ -1374,8 +1410,7 @@ fn restore_005_an_approved_held_restore_starts_only_the_roles_that_were_running(
         second.snapshot_grid()
     );
     assert!(
-        !common::wait_until(Duration::from_secs(2), || role_record(&attach, "reviewer")
-            .is_some()),
+        role_record(&attach, "reviewer").is_none(),
         "the `reviewer` was not running when the session was saved, so approving the restore \
          must not start it; roles = {:?}\nGrid:\n{}",
         role_records(&attach)
@@ -1476,7 +1511,10 @@ fn assert_drifted_restore_runs_nothing(drift: RestoreDrift) {
             .iter()
             .any(|r| r.display_name.as_deref() == Some(PLAIN))
     });
-    // Give a saved command that did start time to write its sentinel.
+    // Give a saved command that did start time to write its sentinel. A window,
+    // not a checkpoint: the command writes it at its own pace after it starts,
+    // and nothing the deck shows follows that write. The daemon-record checks
+    // below are the immediate witnesses.
     let sentinel_written = common::wait_until(Duration::from_secs(3), || sentinel.exists());
     let agents = common::agent_records_on(&attach)
         .iter()
@@ -1501,8 +1539,10 @@ fn assert_drifted_restore_runs_nothing(drift: RestoreDrift) {
         }),
         "nothing of the orchestration may be restored as a plain pane.\nAgents: {agents:?}"
     );
+    // The plain pane is saved after the orchestration, so its restore is past
+    // the orchestration's.
     assert!(
-        no_roles_for(&attach, Duration::from_secs(1)),
+        no_roles(&attach),
         "no orchestration role starts: {:?}",
         role_records(&attach)
             .iter()
@@ -1588,12 +1628,12 @@ fn agent_verb(deck: &TuiDeck, caller_pane: &str, args: &[&str]) -> Output {
         .expect("run the agent verb")
 }
 
-/// Coder's agent id must still be the one it had before the refused verb.
+/// Coder's agent id must still be the one it had before the refused verb. Read
+/// once the verb has exited: the daemon answers it with the refusal from the
+/// trust check it makes before it starts, restarts or delivers anything.
 fn assert_coder_untouched(deck: &TuiDeck, coder_before: &str) {
     let attach = deck.attach_socket_path();
-    let unchanged = !common::wait_until(Duration::from_secs(2), || {
-        role_record(attach, "coder").is_none_or(|r| r.id != coder_before)
-    });
+    let unchanged = role_record(attach, "coder").is_some_and(|r| r.id == coder_before);
     assert!(
         unchanged,
         "a refused verb must start no new process for coder (was {coder_before}); roles = {:?}",
@@ -1668,9 +1708,9 @@ fn respawn_003_pane_spawn_refuses_after_a_change() {
     );
     assert_refusal(&text(&out), deck.workdir(), "changed since you approved it");
     let attach = deck.attach_socket_path();
+    // The refusal is the daemon's answer to the spawn, given before it spawns.
     assert!(
-        !common::wait_until(Duration::from_secs(2), || role_record(attach, "reviewer")
-            .is_some()),
+        role_record(attach, "reviewer").is_none(),
         "a refused spawn starts no reviewer"
     );
 }
@@ -1735,10 +1775,10 @@ fn respawn_004_delegate_to_a_non_clear_role_refuses_after_a_prompt_only_change()
         describe(&out)
     );
     assert_refusal(&text(&out), deck.workdir(), "changed since you approved it");
+    // The refusal is the daemon's answer to the delegate, given before it
+    // delivers anything.
     assert!(
-        !common::wait_until(Duration::from_secs(2), || {
-            inbox_view::count_containing(&attach, &reviewer, TASK) > 0
-        }),
+        inbox_view::count_containing(&attach, &reviewer, TASK) == 0,
         "a refused delegate must not deliver its task:\n{}",
         inbox_view::text(&attach, &reviewer)
     );

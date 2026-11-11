@@ -679,11 +679,20 @@ fn sentinel_command(sentinel: &Path) -> String {
 /// PRD #1885: a snapshot that cannot be resolved cannot be trust-checked, so
 /// it is never restored as a plain pane running its saved command.
 fn assert_drifted_snapshot_left_unrestored(deck: &TuiDeck, sentinel: &Path) {
-    let restored = common::wait_until(Duration::from_secs(3), || {
-        deck.snapshot_grid().contains("orchestrator")
+    // Checkpoint: the deck's first frame. The startup restore runs before the
+    // deck draws anything, so once a frame shows the empty dashboard or a card
+    // the restore pass is over, and a card it restored is on screen.
+    let drawn = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        let grid = deck.snapshot_grid();
+        grid.contains("No active agents") || grid.contains("orchestrator")
     });
     assert!(
-        !restored,
+        drawn,
+        "the deck never drew its dashboard after the restore.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        !deck.snapshot_grid().contains("orchestrator"),
         "a drifted orchestration snapshot must not restore as a plain `orchestrator` card \
          (its saved command would run unchecked).\nFinal grid:\n{}",
         deck.snapshot_grid()
