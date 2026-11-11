@@ -52,10 +52,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-#[cfg(unix)]
-use dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
 use dot_agent_deck::platform::proc::{
-    CommandLine, ProcessInfo, descendant_shell_activity, descendants, process_table,
+    CLAUDE_BASH_TOOL_SHAPE, CommandLine, ProcessInfo, descendant_shell_activity, descendants,
+    process_table,
 };
 
 use spec::spec;
