@@ -3121,6 +3121,42 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the 1.x TUI half and `tui.json` across the switch (unit-tested in `opencode_alternating_generations_rewrite_nothing`); that a real OpenCode 2 reloads on a rewrite; an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent; a daemon of another template revision (`an_older_deck_never_downgrades_a_newer_template`).
 - **Platform coverage:** mac+linux.
 
+#### hooks/opencode-real
+
+Issue #2051: the deck's OpenCode plugin under the real, pinned OpenCode binaries, in CI's lane 1 on both backends, with no model. The file header has the no-model guarantee in full and the measurements behind what each check reads.
+
+##### hooks/opencode-real/001 — A real OpenCode 1.x loads both halves of the deck's plugin, and a session it creates reaches the card (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 1.x (1.19.5 when written) (`scripts/opencode-pins/v1`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(1)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** the pane draws OpenCode's own `No provider selected`; the deck adds no `--standalone`; the plugin's server half (`inbox wait --doorbell-only`) and TUI half (`inbox wait` without it) run their watchers inside OpenCode, and `inbox_list` reports the pane armed by `opencode_plugin`; the card has no status until `POST /session` on OpenCode's loopback server (`--port`) creates a session, whose `SessionStart` arrives with that `ses_` id, owned by the pane's agent and pane, after which the card reads Idle in `daemon status --json` and on the dashboard; OpenCode reports no failed plugin.
+- **Does not assert:** a failed-plugin report from 1.x (1.19.5 reported a deliberately broken plugin nowhere, in its log or on screen, so the watchers are the evidence); a turn, a tool or a prompt (there is no model); delivery of a deck message (1.x's TUI half opens its "connect a provider" dialog instead).
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/002 — A real OpenCode 2.x gets `--standalone`, and its plugin runs with the pane's environment (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 2.x (2.2.5 when written) (`scripts/opencode-pins/v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** the deck starts it with `--standalone` exactly once; its private server (`serve --stdio`) carries the pane's `DOT_AGENT_DECK_PANE_ID` and `DOT_AGENT_DECK_AGENT_ID`, the server half's watcher runs under that server and the TUI half's under the client, and `inbox_list` reports the pane armed by `opencode_plugin`; a deck message posted to the pane starts a `ses_` session whose `SessionStart` and `Error` (the turn fails for want of a model) are owned by the pane's agent and pane, and the card goes from no status to Error in `daemon status --json` and on the dashboard; no `failed to load plugin` in OpenCode's log and no `Plugin failed` on screen.
+- **Does not assert:** the message being answered or acknowledged; OpenCode's shared background service (a real 2.x off `--standalone` would join the machine's one service on a fixed port; the stand-in `inbox/opencode/061` covers it); `mini`.
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/003 — A real OpenCode 2.x reports a broken plugin beside the deck's, so the failed-plugin check can fail (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 2.x (`scripts/opencode-pins/v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** with a plugin that throws as it loads in the config root's `plugin/` beside the deck's, the deck's plugin still loads (watchers, armed) and OpenCode reports a failed plugin both in its log (`failed to load plugin`) and on screen (`Plugin failed`), every such log line naming the broken file and none naming a deck file.
+- **Does not assert:** 1.x (which reports such a plugin nowhere, measured on 1.19.5).
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/004 — Switching one config root between real OpenCode 2.x, 1.x and 2.x again keeps the deck's plugin loading (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent. Three panes in turn, each stopped before the next starts.
+- **Agent:** the pinned REAL OpenCode 1.x and 2.x (`scripts/opencode-pins/v1` and `v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(1)` / `(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** each start loads the deck's plugin (watchers, armed) with no failed plugin reported; the first 2.x start leaves a deck entry in `cli.json` (the deck's 1.x TUI entry, which 2.x copies from `tui.json`; a precondition, so a 2.x that stops copying it fails rather than leaving the repair untested), after the 1.x start's install `cli.json` holds no deck entry, and the second 2.x start finds none; the deck's server module keeps its bytes, inode and mtime from the first start to the last.
+- **Does not assert:** one data root across the switch: each pane gets its own `XDG_DATA_HOME`, because after OpenCode 2.x has run, 1.19.5 refuses to start on the database 2.x migrated (`Database is not empty and has no session table`, measured), whatever the deck does; a switch while an agent runs.
+- **Platform coverage:** linux.
+- **Cost:** none.
+
 #### hooks/stale
 
 ##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
