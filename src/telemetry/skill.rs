@@ -15,6 +15,11 @@
 //! path, or a name the model made up. The shape check comes first, so no path
 //! is built from a name that could leave the root.
 //!
+//! The daemon's run tracker looks for the skill directory again, from the
+//! event's own working directory, before the name goes on a span: an event
+//! can reach the hook socket from something other than the deck's hook, and
+//! the shape check alone would let it put an invented name there.
+//!
 //! The tool call is still counted when its name is not kept: the event goes out
 //! without `deck.skill.name`, so the share of calls whose skill is known can be
 //! measured.
