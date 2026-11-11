@@ -4029,11 +4029,19 @@ mod tests {
         }
         let tmp = crate::test_temp::tempdir().unwrap();
         // One path component is capped at 255 bytes, so the length comes from
-        // nesting under the hostile component.
+        // nesting under the hostile component. Long enough that the logged
+        // line, which keeps at most `MAX_LOGGED_PATH_CHARS` of it plus the
+        // event's own text, is shorter than the path; short enough for macOS,
+        // whose whole path is capped at 1024 bytes (Linux allows 4096).
         let mut hostile = tmp.path().join("wt\nWARN forged line\r\u{1b}[2J\u{202e}");
-        for _ in 0..6 {
-            hostile.push("x".repeat(200));
+        while hostile.as_os_str().len() < crate::daemon_stop::MAX_LOGGED_PATH_CHARS + 400 {
+            hostile.push("x".repeat(100));
         }
+        assert!(
+            hostile.as_os_str().len() < 1024,
+            "test prerequisite: the path fits macOS's limit ({} bytes)",
+            hostile.as_os_str().len()
+        );
         std::fs::create_dir_all(&hostile).unwrap();
         let registry = Arc::new(AgentPtyRegistry::new());
         let worktrees = new_worktree_registry();
