@@ -27,6 +27,9 @@ Files beside `base` (argv[1]) steer it, each read on every loop:
   .redraw         redraw once now (removed when done)
   .noheader       draw no start-up header box, as a resumed session's
                   screen does not show the one the deck reads
+  .nohook         a submitted line runs no hook, as for a Codex whose deck
+                  hooks are switched off: the ring's only proof is the
+                  transcript
 At 24 rows or fewer it draws no logo before the first prompt, as Codex does
 at 24 x 80, so that frame has no width witness.
 It writes .pid, .bytes (every byte read), .inputs (each read with its
@@ -63,6 +66,7 @@ Tool mailbox contract (one publisher, one composer per base; no crash recovery):
   error "exec_failed" with exit null. Acknowledge errors the same way.
 """
 import json
+import re
 import os
 import select
 import subprocess
@@ -195,6 +199,34 @@ def at(row, col):
     return ('\x1b[%d;%dH' % (row + 1, col + 1)).encode()
 
 
+def wrapped(composer, width):
+    """The composer's text as the rows Codex draws it in: one row while it
+    fits, else wrapped into rows of `width` at a space, which the row break
+    replaces, or right after a hyphen, which stays at the end of its row
+    (measured on live Codex 0.164.0, inbox/codex/009, issue #1730); a piece
+    wider than a row is split. Text holding a control character is drawn as
+    it is, on one row."""
+    text = composer.decode('utf-8', 'replace')
+    if len(text) <= width or any(ord(c) < 32 for c in text):
+        return [text]
+    rows, row = [], None
+    for word in text.split(' '):
+        for i, part in enumerate(re.findall(r'[^-]*-|[^-]+', word) or ['']):
+            sep = ' ' if i == 0 else ''
+            if row is None:
+                row = part
+            elif len(row) + len(sep) + len(part) <= width:
+                row += sep + part
+            else:
+                rows.append(row)
+                row = part
+            while len(row) > width:
+                rows.append(row[:width])
+                row = row[width:]
+    rows.append(row)
+    return rows
+
+
 def redraw():
     cols, rows = os.get_terminal_size(0)
     out = bytearray(MARKER)
@@ -231,8 +263,17 @@ def redraw():
     if extra:
         rows_shown.append(extra.encode())
     for line in rows_shown:
-        out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + line
-        row += 2
+        # Issue #1730: a submitted line longer than the row (the doorbell line
+        # naming the deck's absolute path) continues at the indent, wrapped as
+        # the composer wraps it.
+        lines = wrapped(line, cols - 2)
+        if len(lines) == 1:
+            out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + line
+        else:
+            out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + lines[0].encode()
+            for i, cont in enumerate(lines[1:], 1):
+                out += at(row + i, 0) + b'  ' + cont.encode()
+        row += len(lines) + 1
     if external_edit and external_edit.error:
         out += at(row, 0) + external_edit.error
         row += 2
@@ -243,15 +284,23 @@ def redraw():
         return
     prompt_row = row
     out += at(prompt_row, 0) + b'\x1b[1m\xe2\x80\xba\x1b[0m '
-    if composer:
+    lines = wrapped(composer, cols - 2)
+    if len(lines) > 1:
+        # Issue #1730: a line longer than the row (the doorbell line naming
+        # the deck's absolute path) continues at the composer's indent.
+        out += lines[0].encode()
+        for i, line in enumerate(lines[1:], 1):
+            out += at(prompt_row + i, 0) + b'  ' + line.encode()
+    elif composer:
         out += bytes(composer)
     else:
         out += b'\x1b[2mAsk Codex to do anything\x1b[0m'
-    out += at(prompt_row + 2, 2) + b'gpt-test low \xc2\xb7 ~/work'
+    below = len(lines) - 1
+    out += at(prompt_row + below + 2, 2) + b'gpt-test low \xc2\xb7 ~/work'
     if not composer:
         out += at(prompt_row + 3, 2) + b'? for shortcuts'
-    shown = len(composer.decode('utf-8', 'replace'))
-    out += at(prompt_row, 2 + shown)
+    shown = len(lines[-1])
+    out += at(prompt_row + below, 2 + shown)
     out += b'\x1b[?2026l'
     os.write(1, bytes(out))
 
@@ -268,7 +317,10 @@ def run_hook(event, extra):
 
 def hook(line):
     # The prompt hook hands the agent its mail; with no model, the turn ends
-    # at once with Codex's Stop hook.
+    # at once with Codex's Stop hook. Under `.nohook` neither runs, as for a
+    # Codex whose deck hooks are switched off.
+    if flag('.nohook'):
+        return
     run_hook('UserPromptSubmit', {'prompt': line.decode('utf-8', 'replace')})
     run_hook('Stop', {})
 

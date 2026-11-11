@@ -93,13 +93,20 @@ impl RingToken {
     }
 
     /// The line the deck types for message `id`: `(token)` and the doorbell
-    /// line, `L_t` (plan §1.2). A message id is ASCII with no control
-    /// character, so the line is too.
+    /// line, `L_t` (plan §1.2), naming the running deck
+    /// ([`crate::doorbell::doorbell_line`]). A message id is ASCII with no
+    /// control character, and the command word holds none either
+    /// ([`crate::platform::paths::binary_name`]), so the line has none.
     pub fn line(self, id: &MessageId) -> String {
+        self.line_naming(id, &crate::platform::paths::binary_name())
+    }
+
+    /// [`Self::line`] with `command` as the doorbell line's command word.
+    pub fn line_naming(self, id: &MessageId, command: &str) -> String {
         format!(
             "({}){}",
             self.letters(),
-            crate::doorbell::doorbell_line(id.as_str())
+            crate::doorbell::doorbell_line_naming(id.as_str(), command)
         )
     }
 }
@@ -707,6 +714,9 @@ pub struct Admission {
     pub settling: bool,
     pub submit_route: bool,
     pub still_admitted: bool,
+    /// The command word the line names for `inbox fetch`: the deck the daemon
+    /// runs from ([`crate::platform::paths::binary_name`], issue #1730).
+    pub command: String,
 }
 
 /// How a transaction ended.
@@ -1075,7 +1085,7 @@ pub fn admit<'c>(
         cell,
         attempt,
         token,
-        line: token.line(id),
+        line: token.line_naming(id, &admission.command),
         caps,
         deadline: now + TXN_MAX,
         w0: admission.watermark,

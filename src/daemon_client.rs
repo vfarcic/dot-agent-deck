@@ -1521,6 +1521,21 @@ pub enum GatedQuery<T> {
     Unsupported,
 }
 
+/// PRD #1885: the answer of a trust request, or its refusal.
+fn project_trust_answer(
+    resp: AttachResponse,
+    op: &str,
+) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, ClientError> {
+    if !resp.ok {
+        return Err(ClientError::Server(
+            resp.error.unwrap_or_else(|| format!("{op} failed")),
+        ));
+    }
+    resp.project_trust
+        .map(GatedQuery::Answered)
+        .ok_or_else(|| ClientError::Malformed(format!("{op} ok but no trust state")))
+}
+
 /// Issue #1540 — who keeps a deck's last New-agent-form command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LastCommandKeeper {
@@ -2797,6 +2812,78 @@ impl DaemonClient {
         }
         resp.project
             .ok_or_else(|| ClientError::Malformed("resolve-project ok but no project".into()))
+    }
+
+    /// PRD #1885 — the trust state of `orchestration` of the project config in
+    /// `path` (the daemon-canonical spelling, as for [`Self::resolve_project`]):
+    /// whether its commands and prompts are approved, the full text to show the
+    /// user, which roles changed, and the digest [`Self::approve_project_trust`]
+    /// carries back. Read-only.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_PROJECT_TRUST`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything: such a daemon gates
+    /// nothing, so there is nothing to show.
+    pub async fn project_trust_state(
+        &self,
+        path: &str,
+        orchestration: &str,
+    ) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_PROJECT_TRUST)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::ProjectTrustState {
+                path: path.to_string(),
+                orchestration: orchestration.to_string(),
+            },
+        )
+        .await?;
+        project_trust_answer(resp, "project-trust-state")
+    }
+
+    /// PRD #1885 — approve `orchestration` of the project config in `path` on the
+    /// user's answer, carrying the `digest` of the text the user was shown
+    /// ([`Self::project_trust_state`]). The daemon approves only while the
+    /// config still hashes to it; otherwise it refuses with
+    /// [`crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED`], and the
+    /// caller shows the new text. Answers the new state.
+    ///
+    /// **Withholds unless the daemon advertises
+    /// [`crate::daemon_protocol::CAP_PROJECT_TRUST`]**, answering
+    /// [`GatedQuery::Unsupported`] without sending anything.
+    pub async fn approve_project_trust(
+        &self,
+        path: &str,
+        orchestration: &str,
+        digest: &str,
+    ) -> Result<GatedQuery<crate::project_trust::ProjectTrustView>, ClientError> {
+        if !self
+            .capabilities()
+            .await?
+            .supports(crate::daemon_protocol::CAP_PROJECT_TRUST)
+        {
+            return Ok(GatedQuery::Unsupported);
+        }
+        let (mut rd, mut wr) = self.admitted_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::ApproveProjectTrust {
+                path: path.to_string(),
+                orchestration: orchestration.to_string(),
+                digest: digest.to_string(),
+            },
+        )
+        .await?;
+        project_trust_answer(resp, "approve-project-trust")
     }
 
     /// PRD #819 M6: prepare a launch — the only project verb that writes.
@@ -7499,6 +7586,8 @@ start = true
 "#,
         )
         .expect("write the project config");
+        // PRD #1885: preparing runs only an approved orchestration.
+        crate::project_trust::approve_all_for_test(&project);
         let project_wire = project.to_str().expect("utf-8 scratch path");
         let prepared = client
             .prepare_orchestration(project_wire, "loop", "", None)

@@ -114,7 +114,7 @@ It prints `DUE=<mode>` for each mode to dispatch, and `SKIP=<mode>`, the PR and 
 
 ## Step 2: disk and parallelism
 
-Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule applies unchanged: `df -h /` before each dispatch, and below ~100G free, reclaim finished units' worktrees with the runner's agreement or pause. Cleanup units count against the parallelism the runner set for the queue run. Run on its own, this skill asks the runner how many may run at once (recommend 2–3, as `/issue-queue` does) before dispatching more than one, and dispatches the rest as units finish.
+Each unit builds its own `target/` tree, so `/issue-queue` step 5's disk rule applies unchanged: the `cargo xtask clean-targets` sweep and `df -h /` before each dispatch, and below ~100G free, `cargo xtask clean-targets --apply` first, then reclaim finished units' worktrees with the runner's agreement or pause. Cleanup units count against the parallelism the runner set for the queue run. Run on its own, this skill asks the runner how many may run at once (recommend 2–3, as `/issue-queue` does) before dispatching more than one, and dispatches the rest as units finish.
 
 ## Step 3: name each unit
 

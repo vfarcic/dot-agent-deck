@@ -235,3 +235,94 @@ describe("a spoken stop holds to the daemon process it named (PRD #1666 part 2, 
     expect(runAction).not.toHaveBeenCalled();
   });
 });
+
+describe("stopping a whole daemon from its card (issue #1073)", () => {
+  /** A deck's card, by the name its header shows: "Local daemon" for this machine's, the address for a remote one. */
+  const card = (deckId: string) => {
+    const name = deckId === FIXTURE_DAEMON_ID ? "Local daemon" : deckId;
+    const found = screen.getAllByTestId("daemon-group").find((section) => within(section).getByTestId("daemon-identity").textContent === name);
+    if (!found) throw new Error(`no card for ${name}`);
+    return found;
+  };
+  const live = (runAction: DeckRuntimeState["runAction"], fleet: DeckFleet = createFixtureFleet("fleet")) => ({ ...runtime(runAction, fleet), mode: "live" as const });
+
+  /** Scenario: With the local daemon selected, Stop daemon on a remote daemon's card asks first, naming that daemon, and then stops THAT daemon rather than the selected one. */
+  it("stops the daemon whose card it was pressed on, not the selected one", async () => {
+    const runAction = vi.fn(async () => ({ ok: true, message: "Daemon stopped." }) as DeckActionResult);
+    const deck = live(runAction);
+    expect(deck.snapshot.connection.deckId).toBe(FIXTURE_DAEMON_ID);
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(card(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-stop"));
+    expect(confirmation()).toHaveTextContent(`Stop the daemon on ${FIXTURE_REMOTE_DAEMON_ID}?`);
+    expect(runAction).not.toHaveBeenCalled();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "stop_daemon", deckId: FIXTURE_REMOTE_DAEMON_ID }));
+    expect(runAction).toHaveBeenCalledTimes(1);
+  });
+
+  /** Scenario: A remote daemon accepts the stop but has not gone yet when the app stops waiting; the Dashboard shows the daemon's own "still shutting down" sentence, naming the daemon, until it is dismissed. */
+  it("says what the stop did, naming the daemon", async () => {
+    const still = "The daemon accepted the stop and is still shutting down; its agents are being closed.";
+    const runAction = vi.fn(async () => ({ ok: true, message: still }) as DeckActionResult);
+    render(<AgentOverview runtime={live(runAction)} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(card(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-stop"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+
+    const notice = await screen.findByTestId("overview-daemon-notice");
+    expect(notice).toHaveTextContent(`${FIXTURE_REMOTE_DAEMON_ID}: ${still}`);
+    fireEvent.click(within(notice).getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByTestId("overview-daemon-notice")).not.toBeInTheDocument();
+  });
+
+  /** Scenario: Two stops are confirmed one after the other and the FIRST one settles last; the notice keeps the result of the stop pressed most recently. */
+  it("keeps the latest stop's result when an older stop settles later", async () => {
+    let settleFirst: ((result: DeckActionResult) => void) | undefined;
+    const runAction = vi.fn(async (action: { type: string; deckId?: string }) => action.deckId === FIXTURE_REMOTE_DAEMON_ID
+      ? new Promise<DeckActionResult>((resolve) => { settleFirst = resolve; })
+      : ({ ok: true, message: "Daemon stopped gracefully." }) as DeckActionResult);
+    render(<AgentOverview runtime={live(runAction as DeckRuntimeState["runAction"])} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(card(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-stop"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+    await waitFor(() => expect(settleFirst).toBeDefined());
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
+    fireEvent.click(within(card(FIXTURE_DAEMON_ID)).getByTestId("daemon-stop"));
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+    expect(await screen.findByTestId("overview-daemon-notice")).toHaveTextContent("Local daemon: Daemon stopped gracefully.");
+
+    await act(async () => { settleFirst?.({ ok: true, message: "The daemon accepted the stop and is still shutting down." }); });
+    expect(screen.getByTestId("overview-daemon-notice")).toHaveTextContent("Local daemon: Daemon stopped gracefully.");
+  });
+
+  /** Scenario: The local daemon's card offers Stop daemon too, and it stops the local daemon by its own id. */
+  it("stops the local daemon from its own card", async () => {
+    const runAction = vi.fn(async () => ({ ok: true }) as DeckActionResult);
+    render(<AgentOverview runtime={live(runAction)} onNavigate={vi.fn()} />);
+
+    fireEvent.click(within(card(FIXTURE_DAEMON_ID)).getByTestId("daemon-stop"));
+    expect(confirmation()).toHaveTextContent("Stop the daemon on this machine?");
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Stop daemon" }));
+    await waitFor(() => expect(runAction).toHaveBeenCalledWith({ type: "stop_daemon", deckId: FIXTURE_DAEMON_ID }));
+  });
+
+  /** Scenario: A remote daemon too old to be stopped from the app shows Stop daemon disabled with the reason; daemons that are not answering show no Stop at all, and neither does the fixture preview. */
+  it("offers Stop only where it can act", () => {
+    const reason = "This daemon is too old to be stopped from this app.";
+    const fleet = createFixtureFleet("fleet").map((deck) => deck.connection.deckId === FIXTURE_REMOTE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, stopDaemonReason: reason } } : deck);
+    const view = render(<AgentOverview runtime={live(vi.fn(), fleet)} onNavigate={vi.fn()} />);
+
+    const old = within(card(FIXTURE_REMOTE_DAEMON_ID)).getByTestId("daemon-stop");
+    expect(old).toBeDisabled();
+    expect(old).toHaveAttribute("title", reason);
+    for (const section of screen.getAllByTestId("daemon-group").filter((section) => section.getAttribute("data-deck-connected") === "no")) {
+      expect(within(section).queryByTestId("daemon-stop")).not.toBeInTheDocument();
+    }
+
+    view.unmount();
+    render(<AgentOverview runtime={runtime(vi.fn())} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("daemon-stop")).not.toBeInTheDocument();
+  });
+});

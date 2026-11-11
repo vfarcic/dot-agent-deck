@@ -610,6 +610,32 @@ test("pi_016 doorbell: fetched to the receiver and transformed in place", async 
 	}
 });
 
+/// Scenario: Doorbell lines naming the deck by an absolute path, by a quoted path with a space and by an older deck's bare name are each submitted to Pi; each is fetched and transformed in place. A line whose command is two words is left for the model.
+test("pi_016 doorbell: the command word is the deck's path, or an older deck's bare name", async () => {
+	for (const word of ["/opt/deck/dot-agent-deck", "'/Users/me/My Apps/dot-agent-deck'", "dot-agent-deck"]) {
+		const { pi } = await started();
+		pi.pi.exec = async (_bin: string, argv: string[]) => {
+			pi.execs.push(argv);
+			const messages = argv[1] === "fetch" ? [{ ...ref(), d: 1, text: block() }] : [];
+			return { code: 0, stdout: JSON.stringify({ messages }), stderr: "", killed: false };
+		};
+		const line = `dot-agent-deck: message ${ID} waiting, run: ${word} inbox fetch`;
+		const answer: any = await pi.emit("input", { text: line, source: "interactive" });
+		assert.equal(answer.action, "transform", word);
+		assert.ok(answer.text.includes(block()), word);
+	}
+	const { pi } = await started();
+	pi.pi.exec = async (_bin: string, argv: string[]) => {
+		pi.execs.push(argv);
+		return { code: 0, stdout: JSON.stringify({ messages: [] }), stderr: "", killed: false };
+	};
+	const typed = `dot-agent-deck: message ${ID} waiting, run: please run inbox fetch`;
+	const answer: any = await pi.emit("input", { text: typed, source: "interactive" });
+	assert.notEqual(answer?.action, "transform");
+	assert.notDeepEqual(answer, { action: "handled" });
+	assert.ok(!pi.execs.some((argv) => argv[1] === "fetch"), "a two-word command is not a doorbell");
+});
+
 /// Scenario: A doorbell line names two messages, each of whose fetches takes most of the receiver's approval window (900 ms, at a 100 ms keepalive). The fetches run at once, so the approval is still fresh when they return and the line is transformed into both.
 test("pi_016 a doorbell's fetches together stay within its approval", async () => {
 	const { pi, child } = await started();

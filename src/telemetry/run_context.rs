@@ -55,9 +55,18 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::{Semaphore, watch};
 
 /// The instruction files whose last commit is `deck.instructions.commit`, at
-/// the root of the repository whatever directory in it the agent runs from.
-pub const INSTRUCTION_PATHS: [&str; 3] =
-    [":(top)CLAUDE.md", ":(top)AGENTS.md", ":(top).claude/skills"];
+/// the root of the repository whatever directory in it the agent runs from:
+/// `CLAUDE.md`, `AGENTS.md` and the Markdown under `.claude/skills`, at any
+/// depth. A script or a tool pin beside a skill is not text an agent reads as
+/// instructions, so a commit that changes only one of those does not move the
+/// value (issue #2086). `glob` magic makes `**/` match any number of
+/// directories, none included; [`HARDENING_ENV_REMOVED`] drops the switches
+/// that would turn that magic off.
+pub const INSTRUCTION_PATHS: [&str; 3] = [
+    ":(top)CLAUDE.md",
+    ":(top)AGENTS.md",
+    ":(top,glob).claude/skills/**/*.md",
+];
 
 /// How long one git command may run before it is killed.
 pub const PROBE_DEADLINE: Duration = Duration::from_secs(5);
@@ -798,6 +807,51 @@ mod tests {
         assert_eq!(
             resolve(&nested).await.instructions_commit.as_deref(),
             Some(rules_commit.as_str())
+        );
+    }
+
+    /// Issue #2086: a commit that changes only a script or a tool pin under
+    /// `.claude/skills` leaves the value where it was, while one that changes
+    /// a skill's Markdown, in a skill's own directory or deeper, moves it.
+    #[tokio::test]
+    async fn only_instruction_text_under_skills_moves_the_commit() {
+        let scratch = crate::test_temp::tempdir().expect("scratch tempdir");
+        let (repo, _) = repo_with_rules(scratch.path());
+        let commit = |path: &str, body: &str| {
+            let file = repo.join(path);
+            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+            std::fs::write(&file, body).unwrap();
+            git(&repo, scratch.path(), &["add", path]);
+            git(&repo, scratch.path(), &["commit", "--quiet", "-m", path]);
+            git(&repo, scratch.path(), &["rev-parse", "HEAD"])
+        };
+
+        let skill = commit(".claude/skills/code-cleanup/SKILL.md", "steps");
+        assert_eq!(
+            resolve(&repo).await.instructions_commit.as_deref(),
+            Some(skill.as_str()),
+            "a SKILL.md change moves the value"
+        );
+
+        commit(".claude/skills/code-cleanup/find-targets.sh", "knip@1");
+        commit(".claude/skills/code-cleanup/reviewers.json", "{}");
+        assert_eq!(
+            resolve(&repo).await.instructions_commit.as_deref(),
+            Some(skill.as_str()),
+            "a script or a pin under .claude/skills does not move the value"
+        );
+
+        let nested = commit(".claude/skills/prd-start/refs/layout.md", "layout");
+        assert_eq!(
+            resolve(&repo).await.instructions_commit.as_deref(),
+            Some(nested.as_str()),
+            "Markdown below a skill's own directory moves the value"
+        );
+
+        let agents = commit("AGENTS.md", "agents");
+        assert_eq!(
+            resolve(&repo).await.instructions_commit.as_deref(),
+            Some(agents.as_str())
         );
     }
 

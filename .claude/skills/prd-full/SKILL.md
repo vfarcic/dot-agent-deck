@@ -21,7 +21,7 @@ Standard harness guardrails for genuinely destructive actions still apply.
 ## Flow
 
 1. **Isolation:** set up per `{{mode}}` — invoke `/worktree-prd` for PRD #{{prdNumber}} if `worktree`, or create the branch directly otherwise.
-2. **Start:** run `/prd-start {{prdNumber}}`. Skip its branch-creation step (Step 1 already handled it).
+2. **Start:** run `/prd-start {{prdNumber}}`. Skip its branch-creation step (Step 1 already handled it). Its Step 2 relevance check is the exception to the global rule above: when it closes the PRD as fully landed or obsolete, that "stop" ends this run. Report the closure and its evidence, and do not iterate or open an implementation PR.
 3. **Iterate** without resetting conversation context:
    - run `/prd-next`, including implementing the recommended task in the same turn,
    - run `/prd-update-progress`,

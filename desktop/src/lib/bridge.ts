@@ -1,4 +1,4 @@
-import { createFixtureFleet, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
+import { createFixtureFleet, DOCS_TRUST_ORCHESTRATION, DOCS_TRUST_REMOVED_ROLES, DOCS_TRUST_ROLES, createFixtureStartedAgent, FIXTURE_RESTART_AFTER_MS, restartedFixtureSnapshot, DEFAULT_PROFILES, FIXTURE_APP_VERSION, FIXTURE_DAEMON_VERSION, FIXTURE_UPGRADE_STEP_MS, FIXTURE_DEFAULT_COMMANDS, FIXTURE_EXPERIMENTAL_DECKS, FIXTURE_HOMES, fixtureAgentRegistry, fixtureDirectoryTree, fixtureProjectOrchestrations, FIXTURE_ROLE_COMMANDS, fixtureVoiceCommands, nextFixtureAgentId, fixtureVoiceHeard, fixtureVoiceScript, fixtureVoiceStatus, fixtureVoiceTranscription, resolveFixtureQuestion, resolveFixtureVoice, type FixtureState } from "../data/fixture";
 import { voicePagesDirectory, voicePagesOrchestrations } from "../data/fixtureCrowded";
 import { actionErrorFrom, LaunchCleanupError, startDaemonErrorFrom } from "./actionError";
 import { PartialSettingsSaveError, partialSettingsSave } from "./settingsError";
@@ -19,6 +19,7 @@ import { speechAudioError } from "./speech";
 import { DEFAULT_SPEECH_LANGUAGE, SPEECH_LANGUAGE_TOKENS } from "./speechLanguages";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { pullRequestFromDto } from "./pullRequest";
+import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -93,8 +94,10 @@ export interface DesktopSnapshotDto {
     deckId: string;
     /** `"local"` or `"remote"` — PRD #741 M7. Always present. */
     deckKind: string;
-    /** Why Stop and Replace are unavailable; present exactly for a remote deck. */
+    /** Why Replace is unavailable; present exactly for a remote deck. */
     localOnlyReason?: string;
+    /** Why Stop daemon cannot act on this deck while it answers (issue #1073). */
+    stopDaemonReason?: string;
     /** Why the app is on the local deck when the stored selection named another. */
     selectionFallback?: string;
     /**
@@ -1836,8 +1839,8 @@ export type DesktopRunActionDto =
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string }
   | { type: "attach_terminal"; agentId: string; onOutput: import("@tauri-apps/api/core").Channel<ArrayBuffer>; incarnation?: string }
   | { type: "detach_terminal"; sessionId: string }
-  | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
-  | { type: "stop_daemon"; force?: boolean }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: { role: string; command: string; start: boolean }[]; rows?: number; cols?: number; configRevision?: string }
+  | { type: "stop_daemon"; deckId: string; force?: boolean }
   | { type: "allow_build_mismatch"; deckId?: string };
 
 /**
@@ -1867,6 +1870,10 @@ type Unsubscribe = () => void;
 
 interface PendingTerminalAttachment {
   lifecycle: number;
+  /** The deck the attach is for, so a teardown of that deck alone can cancel it (issue #1073). */
+  deckId: string;
+  /** Set when that teardown cancelled this attempt: its late failure is not the pane's error to show. */
+  cancelled?: boolean;
   channel: import("@tauri-apps/api/core").Channel<ArrayBuffer>;
   output: Uint8Array[];
   stateEvents: DesktopTerminalStateDto[];
@@ -2289,6 +2296,19 @@ export interface DeckBridge {
    * one from this flow. Rejects exactly as {@link listDirectories} does.
    */
   newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations>;
+  /**
+   * PRD #1885 — whether `target`'s orchestration is approved on the deck its
+   * launch goes to (`target.deckId`, or the selected deck when absent), and
+   * the escaped text the review dialog shows when it is not; `unsupported`
+   * with the refusal to show for a deck older than the review.
+   */
+  projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust>;
+  /**
+   * PRD #1885 — approve `target`'s orchestration, carrying the `digest` of the
+   * text the dialog showed. Rejects with the deck's `trust-text-changed`
+   * refusal when the config changed since, and approves nothing then.
+   */
+  approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
   /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
@@ -3004,6 +3024,7 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
       daemonBuildVersion: dto.connection.daemonBuildVersion,
       deckKind: dto.connection.deckKind === "remote" ? "remote" : "local",
       localOnlyReason: dto.connection.localOnlyReason,
+      ...(dto.connection.stopDaemonReason === undefined ? {} : { stopDaemonReason: dto.connection.stopDaemonReason }),
       selectionFallback: dto.connection.selectionFallback,
       projectActionsReason: dto.connection.projectActionsReason,
       newAgentReason: dto.connection.newAgentReason,
@@ -3082,6 +3103,13 @@ class FixtureDeckBridge implements DeckBridge {
    * deck ids. Empty by default.
    */
   private nonUnixDecks: ReadonlySet<string> = new Set();
+  /**
+   * PRD #1885 — `?trust=changed` plays the `project-trust` docs scene: the
+   * fixture project defines `team` ({@link DOCS_TRUST_ORCHESTRATION}), and its
+   * review answers `changed` instead of approved, so starting it opens the
+   * Review project commands dialog. Off by default.
+   */
+  private docsTrustReview = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
@@ -3115,6 +3143,7 @@ class FixtureDeckBridge implements DeckBridge {
     else if (older) this.olderDecks = new Set(older.split(",").map((deckId) => deckId.trim()).filter(Boolean));
     const nonUnix = new URLSearchParams(window.location.search).get("nonunix");
     if (nonUnix) this.nonUnixDecks = new Set(nonUnix.split(",").map((deckId) => deckId.trim()).filter(Boolean));
+    this.docsTrustReview = new URLSearchParams(window.location.search).get("trust") === "changed";
     this.fleet.forEach((deck) => this.markOlderDeck(deck));
   }
 
@@ -3905,12 +3934,49 @@ class FixtureDeckBridge implements DeckBridge {
    * way — and `unsupported` for a deck this preview plays as older or as
    * non-Unix.
    */
+  /**
+   * PRD #1885 — the browser preview has no approval store: every fixture
+   * orchestration answers approved, with its roles as the review would show
+   * them, so a fixture launch starts as it always did. Approving answers the
+   * same.
+   */
+  async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    await Promise.resolve();
+    const home = FIXTURE_HOMES[target.deckId ?? ""] ?? "/home/dev";
+    if (this.docsTrustReview && target.path === `${home}/demo-project` && target.orchestration === DOCS_TRUST_ORCHESTRATION.name) {
+      return {
+        kind: "review",
+        project: target.path,
+        orchestration: target.orchestration,
+        state: "changed",
+        roles: DOCS_TRUST_ROLES.map((role) => ({ ...role })),
+        removedRoles: [...DOCS_TRUST_REMOVED_ROLES],
+        digest: "fixture-digest",
+      };
+    }
+    const roles = fixtureProjectOrchestrations(home, target.path)?.find((candidate) => candidate.name === target.orchestration)?.roles ?? [];
+    return {
+      kind: "review",
+      project: target.path,
+      orchestration: target.orchestration,
+      state: "approved",
+      roles: roles.map((role) => ({ name: role.name, command: FIXTURE_ROLE_COMMANDS[role.name] ?? "", start: role.start, clear: true })),
+      removedRoles: [],
+      digest: "fixture-digest",
+    };
+  }
+
+  async approveProjectTrust(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    return this.projectTrustState(target);
+  }
+
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     await Promise.resolve();
     this.connectedDeck(deckId);
     if (this.withholdsConfiguredRoles(deckId)) return { kind: "unsupported", reason: FIXTURE_CONFIGURED_ROLES_UNSUPPORTED };
     const home = FIXTURE_HOMES[deckId] ?? "/home/dev";
-    const orchestrations = (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
+    const docsTrust = this.docsTrustReview && path === `${home}/demo-project` ? [DOCS_TRUST_ORCHESTRATION] : undefined;
+    const orchestrations = docsTrust ?? (this.fixtureState === "voice-pages" ? voicePagesOrchestrations(path) : undefined) ?? fixtureProjectOrchestrations(home, path);
     if (!orchestrations) return { kind: "not_project" };
     return { kind: "project", path, displayPath: path, displayName: path.split("/").at(-1) ?? path, orchestrations, configRevision: "fixture-revision" };
   }
@@ -4484,6 +4550,7 @@ export class TauriDeckBridge implements DeckBridge {
       const onOutput = new Channel<ArrayBuffer>();
       const attempt: PendingTerminalAttachment = {
         lifecycle,
+        deckId: target.deckId,
         channel: onOutput,
         output: [],
         stateEvents: [],
@@ -4604,13 +4671,18 @@ export class TauriDeckBridge implements DeckBridge {
           if (this.pendingAttachments.get(key) === attempt) this.pendingAttachments.delete(key);
           this.attached.delete(key);
           if (this.terminalChannels.get(key) === onOutput) this.terminalChannels.delete(key);
-          this.deliverTerminal(target, {
-            agentId: target.agentId,
-            data: new Uint8Array(),
-            stream: "error",
-            operation: "append",
-            message: terminalAttachFailure(cause),
-          });
+          // An attempt its deck's stop or replacement cancelled fails because
+          // that daemon is going away; the next declaration attaches afresh, so
+          // this failure is not the pane's to show (issue #1073).
+          if (!attempt.cancelled) {
+            this.deliverTerminal(target, {
+              agentId: target.agentId,
+              data: new Uint8Array(),
+              stream: "error",
+              operation: "append",
+              message: terminalAttachFailure(cause),
+            });
+          }
         }
         throw cause;
       } finally {
@@ -5146,16 +5218,13 @@ export class TauriDeckBridge implements DeckBridge {
       } catch (cause) {
         throw actionErrorFrom(cause);
       }
-      if (action.type === "stop_daemon") {
-        this.sessions.clear();
-        this.sessionKeys.clear();
-        this.attached.clear();
-        this.terminalChannels.clear();
-        // Nothing is attached any more, so nothing is warm. `shown` is left
-        // alone on purpose: it mirrors what the UI is displaying, which a
-        // daemon stop does not change, and re-declaring it re-attaches.
-        this.warm.clear();
-        this.lifecycle += 1;
+      if (action.type === "stop_daemon" && result?.ok !== false) {
+        // Issue #1073: the stopped deck's sessions only — the crate detached
+        // exactly those, and every other deck's terminals belong to daemons
+        // this stop never touched. `shown` is left alone on purpose: it mirrors
+        // what the UI is displaying, which a daemon stop does not change, and
+        // re-declaring it re-attaches.
+        this.forgetDeckSessions(action.deckId);
       }
       // The crate already returned `agentId` for every agent-scoped action and
       // this dropped it, which left a started agent's id — the one thing the
@@ -5730,12 +5799,30 @@ export class TauriDeckBridge implements DeckBridge {
   }
 
   /**
-   * Forget every terminal session on `deckId` after its daemon was replaced —
-   * the crate already detached them. Other decks' sessions are untouched, and
-   * `shown` is kept for the reason `stop_daemon` keeps it: re-declaring it
-   * re-attaches against the new daemon.
+   * Forget every terminal session on `deckId` after its daemon was replaced or
+   * stopped — the crate already detached them. Other decks' sessions are
+   * untouched, and `shown` is kept on purpose: re-declaring it re-attaches
+   * against whatever daemon answers next.
+   *
+   * An attach still in flight on that deck is cancelled too (issue #1073,
+   * Qodo on PR #2259): dropping its pending entry and channel is what makes
+   * the post-await guard in the attach detach its late result instead of
+   * installing a session for a daemon that is gone. A replay queued behind
+   * such an attach (`attachRequested`, which a warm-set eviction can leave
+   * while the invocation is still outstanding) was declared against the same
+   * daemon and is dropped with it; a later declaration attaches afresh.
    */
   private forgetDeckSessions(deckId: string): void {
+    for (const [key, requested] of Array.from(this.attachRequested.entries())) {
+      if (requested.deckId === deckId) this.attachRequested.delete(key);
+    }
+    for (const [key, pending] of Array.from(this.pendingAttachments.entries())) {
+      if (pending.deckId !== deckId) continue;
+      pending.cancelled = true;
+      this.pendingAttachments.delete(key);
+      this.attached.delete(key);
+      if (this.terminalChannels.get(key) === pending.channel) this.terminalChannels.delete(key);
+    }
     for (const [key, session] of Array.from(this.sessions.entries())) {
       if (session.target.deckId !== deckId) continue;
       this.sessions.delete(key);
@@ -5768,6 +5855,17 @@ export class TauriDeckBridge implements DeckBridge {
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     const invoke = await this.getInvoke();
     return invoke<NewAgentOrchestrations>("desktop_new_agent_orchestrations", { deckId, path });
+  }
+
+  /** PRD #1885. `deckId` is sent only when the target names one; without it the crate takes the selected deck, as the Runs launch does. */
+  async projectTrustState(target: ProjectTrustTarget): Promise<ProjectTrust> {
+    const invoke = await this.getInvoke();
+    return invoke<ProjectTrust>("desktop_project_trust_state", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration });
+  }
+
+  async approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust> {
+    const invoke = await this.getInvoke();
+    return invoke<ProjectTrust>("desktop_approve_project_trust", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration, digest });
   }
 
   async dispose(): Promise<void> {

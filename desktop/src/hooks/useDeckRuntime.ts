@@ -6,6 +6,7 @@ import type { ReadingSentenceDto, ReadingTarget } from "../lib/reading";
 import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
+import type { ProjectTrustTarget } from "../lib/projectTrust";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 import type { WorktreeKeptEntry } from "../lib/worktreeClose";
@@ -410,6 +411,10 @@ export function useDeckRuntime(): DeckRuntimeState {
   const listDirectories = useCallback((deckId: string, path?: string, options?: DeckListingOptions) => (options ? bridge.listDirectories(deckId, path, options) : bridge.listDirectories(deckId, path)), [bridge]);
   const newAgentOptions = useCallback((deckId: string) => bridge.newAgentOptions(deckId), [bridge]);
   const newAgentOrchestrations = useCallback((deckId: string, path: string) => bridge.newAgentOrchestrations(deckId, path), [bridge]);
+  // PRD #1885, for the same reason: a review the deck could not answer is the
+  // launching screen's to say, not the global toast's.
+  const projectTrustState = useCallback((target: ProjectTrustTarget) => bridge.projectTrustState(target), [bridge]);
+  const approveProjectTrust = useCallback((target: ProjectTrustTarget, digest: string) => bridge.approveProjectTrust(target, digest), [bridge]);
   // PRD #1487 M5: Upgrade and Replace daemon. Their outcome — kept running,
   // failed while installing — is the dialog's to show, not the global error
   // toast's, so these bypass `runAction` too. A bridge without the verbs (some
@@ -512,6 +517,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     listDirectories,
     newAgentOptions,
     newAgentOrchestrations,
+    projectTrustState,
+    approveProjectTrust,
     getSettings,
     saveSettings,
     testEndpoint,

@@ -475,10 +475,39 @@ pub enum UnitEntry {
         digest: [u8; 32],
         destination: Destination,
         unit_mark: UnitMark,
+        /// Issue #2260: where an update to the report goes, the caller the
+        /// first report was committed to (`None`: it went to recovery, and
+        /// so does an update).
+        caller: Option<Recipient>,
+        /// The dispatched unit's name, for an update's post.
+        unit_name: Option<String>,
+        /// The updates taken after the first report, oldest first; update
+        /// `n` is at index `n - 1`. At most [`MAX_REPORT_UPDATES`].
+        updates: Vec<ReportUpdate>,
+        /// The claim saving an update now, which a repeat waits on.
+        updating: Option<u64>,
     },
     /// It ended without a report.
     Ended { how: EndedHow },
 }
+
+/// Issue #2260: one update a unit sent to its report, as it was committed:
+/// what a repeat of it is answered with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportUpdate {
+    pub digest: [u8; 32],
+    pub report_id: String,
+    /// Where this update went, which is not always where the first report
+    /// went: the dispatcher may have exited in between.
+    pub destination: Destination,
+}
+
+/// Issue #2260: how many updates a dispatched unit may send after its first
+/// report. A unit corrects a report it knows is stale or wrong, which in
+/// practice takes one or two (a test run that finished after the report, then
+/// the PR's state); three leaves room for that, while a unit that loops on
+/// `work-done` puts at most four turns into its dispatcher's conversation.
+pub const MAX_REPORT_UPDATES: usize = 3;
 
 /// The environment variable that lowers the per-instance tombstone bound (a
 /// test knob); the daemon-wide bound is sixteen times it.
@@ -548,6 +577,12 @@ impl UnitTable {
         self.units.remove(unit_id)
     }
 
+    /// Unit `unit_id`'s entry, to change in place without moving it in the
+    /// eviction order.
+    pub fn get_mut(&mut self, unit_id: &str) -> Option<&mut UnitEntry> {
+        self.units.get_mut(unit_id)
+    }
+
     fn touch(&mut self, unit_id: &str) {
         if !self.order.iter().any(|u| u == unit_id) {
             self.order.push_back(unit_id.to_string());
@@ -572,8 +607,8 @@ impl UnitTable {
         self.order.is_empty()
     }
 
-    /// Evict the oldest units past the cap, skipping a `Claimed` one and any
-    /// `protected` answers true for (given the unit and its generations).
+    /// Evict the oldest units past the cap, skipping a `Claimed` one, one
+    /// whose report update is being saved, and any `protected` answers true for (given the unit and its generations).
     /// Answers the units evicted.
     pub fn evict(&mut self, protected: impl Fn(&str, &[(String, String)]) -> bool) -> Vec<String> {
         let mut evicted = Vec::new();
@@ -583,7 +618,16 @@ impl UnitTable {
                 break;
             };
             let generations = self.generations_of(&unit);
-            let claimed = matches!(self.units.get(&unit), Some(UnitEntry::Claimed { .. }));
+            let claimed = matches!(
+                self.units.get(&unit),
+                Some(
+                    UnitEntry::Claimed { .. }
+                        | UnitEntry::Completed {
+                            updating: Some(_),
+                            ..
+                        }
+                )
+            );
             if claimed || protected(&unit, &generations) {
                 kept.push_back(unit);
                 continue;
@@ -817,6 +861,23 @@ impl TaskLedger {
         self.open_where(|b| b.worker_pane == pane_id && b.worker_agent == agent_id)
     }
 
+    /// Issue #2099: the open tasks bound to `(pane, agent)` still waiting for
+    /// their report — not one a report is being saved for.
+    pub fn awaiting_report_of_generation(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .open
+            .iter()
+            .filter(|(_, task)| {
+                task.binding.worker_pane == pane_id
+                    && task.binding.worker_agent == agent_id
+                    && matches!(task.state, TaskState::Open { .. })
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     /// The open tasks bound to any generation of `pane_id`.
     pub fn open_of_pane(&self, pane_id: &str) -> Vec<String> {
         self.open_where(|b| b.worker_pane == pane_id)
@@ -920,6 +981,9 @@ pub enum ClaimMode {
     Task { task_id: String },
     /// Dispatched unit `unit_id`, whose terminal is on `unit_pane`.
     Terminal { unit_id: String, unit_pane: String },
+    /// Issue #2260: update number `update` (from 1) to dispatched unit
+    /// `unit_id`'s report, which it sent after that report was taken.
+    TerminalUpdate { unit_id: String, update: u32 },
     /// A note that completes no task.
     Uncorrelated,
 }
@@ -1329,6 +1393,27 @@ mod tests {
         assert!(matches!(tasks.lookup("open"), TaskLookup::Open(_)));
         assert_eq!(tasks.open_of_generation("w", "a"), vec!["open".to_string()]);
         assert!(tasks.open_of_generation("w", "b").is_empty());
+    }
+
+    /// Issue #2099: a stopped worker's report ends only the tasks still
+    /// waiting for a report from that generation — not one a report is being
+    /// saved for, and not another generation's.
+    #[test]
+    fn awaiting_report_skips_a_task_being_reported_and_other_generations() {
+        let mut tasks = TaskLedger::new(8);
+        for (id, agent) in [("t1", "a"), ("t2", "a"), ("t3", "b")] {
+            tasks.bind(id, binding("w", agent, Some("i"))).unwrap();
+        }
+        tasks.open_task_mut("t2").unwrap().state = TaskState::Reporting { claim_id: 1 };
+        assert_eq!(
+            tasks.awaiting_report_of_generation("w", "a"),
+            vec!["t1".to_string()]
+        );
+        assert_eq!(
+            tasks.open_of_generation("w", "a"),
+            vec!["t1".to_string(), "t2".to_string()],
+            "control: both are open"
+        );
     }
 
     #[test]

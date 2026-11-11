@@ -17,6 +17,8 @@ pub trait Endpoint {
     fn cwd(&self) -> &Path;
     fn attach_socket(&self) -> &Path;
     fn hook_socket(&self) -> &Path;
+    /// PRD #1885: approve the project at `dir` into this endpoint's store.
+    fn approve_project_trust(&self, dir: &Path);
 }
 impl Endpoint for DaemonProc {
     fn home(&self) -> &Path {
@@ -31,6 +33,9 @@ impl Endpoint for DaemonProc {
     fn hook_socket(&self) -> &Path {
         &self.hook_socket
     }
+    fn approve_project_trust(&self, dir: &Path) {
+        DaemonProc::approve_project_trust(self, dir);
+    }
 }
 impl Endpoint for common::TuiDeck {
     fn home(&self) -> &Path {
@@ -44,6 +49,9 @@ impl Endpoint for common::TuiDeck {
     }
     fn hook_socket(&self) -> &Path {
         self.hook_socket_path()
+    }
+    fn approve_project_trust(&self, dir: &Path) {
+        common::TuiDeck::approve_project_trust(self, dir);
     }
 }
 
@@ -113,9 +121,19 @@ pub fn wait_budget() -> Duration {
     })
 }
 
+/// Refresh a socket's timeout. macOS refuses `SO_RCVTIMEO`/`SO_SNDTIMEO` with
+/// EINVAL once the peer has closed the connection, while what it sent is still
+/// buffered to read; the read or write that follows reports the end itself.
+fn refresh_timeout(set: std::io::Result<()>) -> std::io::Result<()> {
+    match set {
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+        other => other,
+    }
+}
+
 fn read_exact_budgeted(socket: &mut UnixStream, mut bytes: &mut [u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        socket.set_read_timeout(Some(wait_budget()))?;
+        refresh_timeout(socket.set_read_timeout(Some(wait_budget())))?;
         let read = socket.read(bytes)?;
         if read == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
@@ -127,7 +145,7 @@ fn read_exact_budgeted(socket: &mut UnixStream, mut bytes: &mut [u8]) -> std::io
 
 fn write_all_budgeted(socket: &mut UnixStream, mut bytes: &[u8]) -> std::io::Result<()> {
     while !bytes.is_empty() {
-        socket.set_write_timeout(Some(wait_budget()))?;
+        refresh_timeout(socket.set_write_timeout(Some(wait_budget())))?;
         let written = socket.write(bytes)?;
         if written == 0 {
             return Err(std::io::ErrorKind::WriteZero.into());
@@ -772,10 +790,16 @@ fn report_handed(
 /// End a one-shot receiver: closing our half ends it, and the deck closes its
 /// own once it has applied every control written before.
 pub fn close(mut socket: BufReader<UnixStream>) {
-    socket
-        .get_mut()
-        .shutdown(std::net::Shutdown::Write)
-        .unwrap();
+    // A deck with nothing to hand closes its half first; macOS then refuses
+    // the shutdown with ENOTCONN where Linux accepts it, and either way the
+    // connection is over.
+    if let Err(error) = socket.get_mut().shutdown(std::net::Shutdown::Write) {
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::NotConnected,
+            "closing a one-shot receiver: {error}"
+        );
+    }
     let mut rest = String::new();
     let _ = socket.read_to_string(&mut rest);
 }
@@ -824,16 +848,39 @@ pub fn fetch_not_handed(daemon: &impl Endpoint, pane: &Pane) -> Value {
     reply
 }
 
-/// The doorbell line naming `id`, without its ring token.
+/// What the doorbell line says between the message id and the command word.
+pub const WAITING: &str = " waiting, run: ";
+
+/// What the doorbell line's command says after the command word.
+pub const FETCH: &str = " inbox fetch";
+
+/// The doorbell line naming `id`, without its ring token, as a deck whose
+/// daemon runs the harness's contained binary types it (issue #1730: the
+/// line names the daemon's own binary, not a bare `dot-agent-deck`).
 pub fn fixed_line(id: &str) -> String {
-    format!("{PREFIX}{id} waiting, run: dot-agent-deck inbox fetch")
+    let bin = common::contained_deck_binary()
+        .to_str()
+        .expect("the harness's deck path is UTF-8");
+    format!("{PREFIX}{id}{WAITING}{bin}{FETCH}")
+}
+
+/// The command word a doorbell line `line` tells the agent to run `inbox
+/// fetch` with: the text between [`WAITING`] and the trailing [`FETCH`].
+pub fn command_word(line: &str) -> Option<&str> {
+    let (_, rest) = line.split_once(WAITING)?;
+    rest.strip_suffix(FETCH).filter(|word| !word.is_empty())
 }
 
 /// Whether `line` is the doorbell's token-led line naming `id`: `(`, six
-/// lowercase letters, `)`, then [`fixed_line`] (PRD #1666 part 3, round
-/// 5-wake).
+/// lowercase letters, `)`, then [`fixed_line`]'s shape with any command word
+/// (PRD #1666 part 3, round 5-wake; issue #1730).
 pub fn is_ring_line(line: &str, id: &str) -> bool {
-    token_led(line).is_some_and(|rest| rest == fixed_line(id))
+    token_led(line).is_some_and(|rest| {
+        rest.strip_prefix(PREFIX)
+            .and_then(|rest| rest.strip_prefix(id))
+            .is_some_and(|rest| rest.starts_with(WAITING))
+            && command_word(rest).is_some()
+    })
 }
 
 /// The doorbell line `line` carries after its ring token, if it has one.

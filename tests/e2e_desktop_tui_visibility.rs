@@ -719,6 +719,9 @@ fn run_mid_attach_start_attempt(attempt: usize) {
 /// covered by `project/launch/*`. Its dimensions are the desktop
 /// orchestration defaults (32×120), distinct from the plain action's 24×80.
 fn start_orchestration_from_desktop(daemon: &DaemonProc, project_path: &str) {
+    // PRD #1885: the daemon prepares only an approved orchestration; these
+    // tests are about where its tab surfaces, not the gate.
+    daemon.approve_project_trust(Path::new(project_path));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

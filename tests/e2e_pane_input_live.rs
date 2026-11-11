@@ -79,6 +79,8 @@ fn prompt_pane_input_042_live_claude_draft_defers_delegate() {
     );
     assert_ne!(updated, original, "worker command must be replaced");
     std::fs::write(&config, updated).expect("configure real Claude worker");
+    // PRD #1885: this edit is setup, not the subject — approve it as the user would.
+    deck.approve_project_trust(deck.workdir());
 
     deck.send_keys(b"\x0e");
     deck.send_keys(b" ");

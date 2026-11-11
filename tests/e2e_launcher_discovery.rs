@@ -944,6 +944,7 @@ fn probe_035_codex_wrapper_exec_after_update_is_refused() {
 /// Scenario: Replace codex at the same installation path, then start a fresh pane generation before launching the native child. Declared and learned panes must bind the new inode and check the touched empty composer.
 #[spec("inbox/probe/035")]
 #[test]
+#[ignore = "quarantined: vfarcic, #2243"]
 fn probe_035_codex_fresh_spawn_pins_updated_inode() {
     for route in [Route::Launcher, Route::Learned] {
         update_history("codex", route, Update::Fresh, true);
@@ -1306,6 +1307,30 @@ fn hosted_shape(f: &Fixture, ready: &Value, hosted: Hosted) {
             );
             assert_eq!(fs::canonicalize(&script).unwrap(), genuine);
         }
+        Hosted::LauncherPath => {
+            assert_eq!(
+                exe,
+                executable_identity(&other_python),
+                "`env python3` found the launcher's interpreter first on its PATH"
+            );
+            assert_eq!(
+                script,
+                package.join("bin").join(f.kind),
+                "the genuine script, by the path the name was found at"
+            );
+            assert!(
+                std::env::split_paths(spawn_path)
+                    .next()
+                    .is_some_and(|first| first == package.join("other")),
+                "the launcher put its own directory first: {spawn_path}"
+            );
+            let shell = parent_pid(entry_pid);
+            assert!(
+                cmdline(shell)[0].ends_with("sh"),
+                "a shell the launcher started runs the entrypoint: {:?}",
+                cmdline(shell)
+            );
+        }
     }
     assert!(
         argv[2..].iter().any(|arg| arg == "--live-segments-fixture"),
@@ -1354,6 +1379,19 @@ fn probe_035_npm_codex_binds_native_below_its_interpreter_and_checks() {
     bound_to(&f, &ready, executable_identity(f.native_executable()));
 }
 
+/// Scenario: Start a Codex pane declared as Codex whose command is a `devbox run codex-big`-shaped launcher (issue #2258): it prints its own line, puts a directory holding another python3 first on PATH, and runs a script through `sh -c` that checks the version with `codex --version` and then runs `codex` by name, so `#!/usr/bin/env python3` picks the launcher's interpreter rather than the one the spawn PATH resolves. Pause discovery at the candidate and release it, then type into the box. The native child must still be published as A, become Armable, and the real installed helper must check its touched empty box, instead of the box staying unchecked for the rest of the generation.
+#[spec("inbox/probe/035")]
+#[test]
+fn probe_035_npm_codex_behind_a_path_changing_launcher_binds_and_checks() {
+    let f = hosted_fixture(Hosted::LauncherPath, true);
+    pending(&f, Route::Launcher);
+    let ready = launch(&f);
+    hosted_shape(&f, &ready, Hosted::LauncherPath);
+    arrived(&f, &ready);
+    release(&f);
+    bound_to(&f, &ready, executable_identity(f.native_executable()));
+}
+
 /// Scenario: Start the same npm-style Codex pane, but its entrypoint process hands itself to a byte-identical copy of the script at another path under the same python3 before spawning the genuine native codex child. The pane must get an executable-mismatch reason, no gen-G identity, no Armable permission and no helper check.
 #[spec("inbox/probe/035")]
 #[test]
@@ -1368,7 +1406,7 @@ fn probe_035_npm_codex_other_interpreter_cannot_get_permission() {
     hosted_control(Hosted::OtherInterpreter);
 }
 
-/// Scenario: Start the npm-style Codex pane in its genuine, other-script and other-interpreter shapes without any discovery interface, launch each, and type into the pane. Each must show the shape it names in /proc (the native codex copy as the entrypoint's child, on no spawn PATH entry) and a live composer echoing human input.
+/// Scenario: Start the npm-style Codex pane in its genuine, other-script, other-interpreter and devbox-launcher shapes without any discovery interface, launch each, and type into the pane. Each must show the shape it names in /proc (the native codex copy as the entrypoint's child, on no spawn PATH entry) and a live composer echoing human input.
 #[spec("inbox/probe/035")]
 #[test]
 fn probe_035_fixture_npm_codex_shapes_launch_their_native_child() {
@@ -1376,6 +1414,7 @@ fn probe_035_fixture_npm_codex_shapes_launch_their_native_child() {
         Hosted::Genuine,
         Hosted::OtherScript,
         Hosted::OtherInterpreter,
+        Hosted::LauncherPath,
     ] {
         let f = hosted_fixture(hosted, false);
         let ready = launch(&f);

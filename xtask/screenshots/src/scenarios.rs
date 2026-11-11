@@ -196,6 +196,11 @@ pub const SCENARIOS: &[Scenario] = &[
         description: "The deck restarted while the client was attached: the notice naming the two agents the restart stopped, api-fix and docs-review, in the TUI's footer row and the desktop's corner notice, over a deck now running none.",
         clients: &[Client::Tui, Client::Desktop],
     },
+    Scenario {
+        name: "project-trust",
+        description: "Review project commands for the orchestration `team`, changed since it was approved: `coder` changed, `tester` new, `reviewer` removed — opened from New Agent in both clients (PRD #1885).",
+        clients: &[Client::Tui, Client::Desktop],
+    },
 ];
 
 /// Look a scenario up by name.

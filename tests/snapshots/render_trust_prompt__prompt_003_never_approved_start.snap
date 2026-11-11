@@ -1,0 +1,36 @@
+---
+source: tests/render_trust_prompt.rs
+expression: never
+---
+
+
+
+
+
+
+
+
+  ┌ Review project commands ─────────────────────────────────────────────────────────────────────┐
+  │ Project: /work/demo-project                                                                  │
+  │ Orchestration: team                                                                          │
+  │ State: not approved before                                                                   │
+  │                                                                                              │
+  │ Starting it runs these commands and gives these prompts to its agents. Approve only what you │
+  │ trust.                                                                                       │
+  │                                                                                              │
+  │ Role: orchestrator                                                                           │
+  │   command: claude                                                                            │
+  │   start: true — the orchestration starts with this role                                      │
+  │   clear: false — keeps running between tasks                                                 │
+  │   description: The orchestrator of the team                                                  │
+  │   prompt: Coordinate the team.                                                               │
+  │                                                                                              │
+  │ Role: coder                                                                                  │
+  │   command: claude --model sonnet                                                             │
+  │   start: false                                                                               │
+  │   clear: false — keeps running between tasks                                                 │
+  │   description: The coder of the team                                                         │
+  │   prompt: Write the code.                                                                    │
+  │                                                                                              │
+  │ a approve and start · Esc cancel · ↑↓ scroll                                                 │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

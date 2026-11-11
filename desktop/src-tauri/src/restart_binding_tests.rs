@@ -372,6 +372,7 @@ async fn handshake_013_runs_launch_never_starts_on_the_preparations_successor() 
     let result = crate::activate_orchestration_action(
         &state,
         crate::ActivateOrchestrationRequest {
+            deck_id: None,
             name: "review".into(),
             display_title: None,
             cwd: "/project".into(),

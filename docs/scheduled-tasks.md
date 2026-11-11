@@ -94,6 +94,7 @@ Each row shows the schedule's name, a status and its next run time. The statuses
 | `live` | Enabled, and a tab or agent this schedule started is still running. |
 | `idle` | Enabled, with nothing it started running now. |
 | `disabled` | Paused (`enabled = false`). Its next-fire cell shows `—`. |
+| `refused` | Its last run was refused because the orchestration it opens is not approved. With the schedule selected, the refusal and the command that approves it are shown beneath the list ([Runs refused as not approved](#runs-refused-as-not-approved)). |
 
 | Key / button | Action |
 |---|---|
@@ -127,6 +128,8 @@ Set `shape` to decide it yourself:
 dot-agent-deck schedule update --name morning-digest --shape single
 dot-agent-deck schedule update --name morning-digest --shape ""   # back to config-derived
 ```
+
+A run that opens an orchestration starts it only once you have approved that orchestration's commands and prompts; see [Runs refused as not approved](#runs-refused-as-not-approved).
 
 If a `shape` cannot be satisfied when the run comes due (the named orchestration no longer exists, more than one orchestration with roles uses that name, none has roles, or the directory's `.dot-agent-deck.toml` cannot be parsed), the run is skipped and nothing opens in its place. The reason, including the orchestrations that do exist, goes to the [daemon's output](#where-schedule-errors-are-reported).
 
@@ -246,7 +249,7 @@ An issue that is still open after its pull request merged or closed has no open 
 
 ### Where schedule errors are reported
 
-Schedule problems are not shown in the TUI or the desktop app. The daemon writes one line per problem, each starting with `[scheduler]`, to its output. For a daemon the deck started in the background, that output is appended to `daemon.log` in the state directory: `$XDG_STATE_HOME/dot-agent-deck/daemon.log`, or `~/.local/state/dot-agent-deck/daemon.log` when `XDG_STATE_HOME` is unset (on Windows, `%LOCALAPPDATA%\dot-agent-deck\daemon.log`). `DOT_AGENT_DECK_STATE_DIR` moves it. For a daemon started with `dot-agent-deck daemon serve`, the lines go to that terminal.
+Apart from a [run refused as not approved](#runs-refused-as-not-approved), schedule problems are not shown in the TUI or the desktop app. The daemon writes one line per problem, each starting with `[scheduler]`, to its output. For a daemon the deck started in the background, that output is appended to `daemon.log` in the state directory: `$XDG_STATE_HOME/dot-agent-deck/daemon.log`, or `~/.local/state/dot-agent-deck/daemon.log` when `XDG_STATE_HOME` is unset (on Windows, `%LOCALAPPDATA%\dot-agent-deck\daemon.log`). `DOT_AGENT_DECK_STATE_DIR` moves it. For a daemon started with `dot-agent-deck daemon serve`, the lines go to that terminal.
 
 ```bash
 grep '\[scheduler\]' ~/.local/state/dot-agent-deck/daemon.log | tail -20
@@ -254,10 +257,21 @@ grep '\[scheduler\]' ~/.local/state/dot-agent-deck/daemon.log | tail -20
 
 For more detail, see [Troubleshooting](troubleshooting.md#enabling-debug-logs).
 
+### Runs refused as not approved
+
+A run that would start an orchestration, from its schedule, **Run now** or an issue dispatch, starts nothing when you have not approved that orchestration as its `.dot-agent-deck.toml` now reads: never approved, or its roles changed since. A run never asks; nobody is there to answer. Instead:
+
+- `dot-agent-deck schedule list` prints `last fire refused at <time>: <message>` beneath the schedule;
+- the TUI's [Schedules manager](#the-tuis-schedules-manager) shows the status `refused`, and the message while the schedule is selected;
+- the daemon log has the same message.
+
+The message names the orchestration, the project and the command that approves it, such as `dot-agent-deck trust approve /home/you/code/demo --orchestration team`. Run it from a terminal outside the deck, read what it prints, approve, then `dot-agent-deck schedule run-now --name <name>`. For an issue-dispatch schedule, the project is the schedule's clone, so its very first run clones the repository and is then refused: approve the clone with the command that refusal prints. See [Approving Project Commands](project-trust.md).
+
 ### Symptoms
 
 | Symptom | Cause | What to do |
 |---|---|---|
+| `schedule list` says `last fire refused`, or the Schedules manager says `refused` | The orchestration the run opens is not approved, or its roles changed. | Run the approve command in the message; see [Runs refused as not approved](#runs-refused-as-not-approved). |
 | `schedule add` fails with `invalid cron expression: …` | The cron expression does not parse. | Fix it using [Cron syntax](#cron-syntax). |
 | `schedule add` fails with `--command is required: …` | A plain schedule has no `--command`. | Pass `--command`. |
 | `schedule add` fails with `a schedule named "<name>" already exists; …` | Names are unique. | Use `schedule update`, or another name. |

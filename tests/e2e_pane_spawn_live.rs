@@ -244,6 +244,8 @@ fn spawn_005_pane_spawn_joins_the_already_open_orchestration_tab() {
 
     let (orchestrator_pane_id, orchestration_cwd) = orchestrator_pane_id_and_cwd(&deck);
     insert_reviewer_role_mid_config(&orchestration_cwd);
+    // PRD #1885: this edit is setup, not the subject — approve it as the user would.
+    deck.approve_project_trust(std::path::Path::new(&orchestration_cwd));
     run_pane_spawn_reviewer(&deck, &orchestrator_pane_id);
 
     // The pin, part 1: reviewer's card must join the SAME orchestration tab
@@ -358,6 +360,8 @@ fn drift_001_role_grown_via_pane_spawn_survives_session_capture() {
     // Grow the already-open tab with `reviewer`, mirroring `pane/spawn/005`.
     let (orchestrator_pane_id, orchestration_cwd) = orchestrator_pane_id_and_cwd(&deck);
     insert_reviewer_role_mid_config(&orchestration_cwd);
+    // PRD #1885: this edit is setup, not the subject — approve it as the user would.
+    deck.approve_project_trust(std::path::Path::new(&orchestration_cwd));
     run_pane_spawn_reviewer(&deck, &orchestrator_pane_id);
 
     assert!(

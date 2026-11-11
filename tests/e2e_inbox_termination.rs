@@ -33,6 +33,8 @@ fn fixture(mode: &str, wrapped: bool) -> (common::DaemonProc, Pane, Pane, String
         "[[orchestrations]]\nname = 'route'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = {}\nstart = true\n[[orchestrations.roles]]\nname = 'coder'\ncommand = {}\nclear = false\n",
         serde_json::to_string(&successor_command).unwrap(), serde_json::to_string(&successor_command).unwrap()
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    daemon.approve_project_trust(daemon.cwd());
     let orch = route::start(
         &daemon,
         "route-orchestrator",
