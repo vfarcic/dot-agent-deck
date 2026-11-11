@@ -82,6 +82,13 @@ pub enum PromptAction {
     Restore,
 }
 
+/// The cancel key and what it does, as the footer shows it. A click on it
+/// cancels, as `Esc` does.
+pub const CANCEL_LABEL: &str = "Esc cancel";
+
+/// What separates the footer's items.
+const FOOTER_SEPARATOR: &str = " · ";
+
 impl PromptAction {
     /// The approve key and what it does, as the footer shows it.
     pub fn approve_label(self) -> &'static str {
@@ -93,7 +100,10 @@ impl PromptAction {
 
     /// The footer: `a approve and start · Esc cancel · ↑↓ scroll`.
     pub fn footer(self) -> String {
-        format!("{} · Esc cancel · ↑↓ scroll", self.approve_label())
+        format!(
+            "{}{FOOTER_SEPARATOR}{CANCEL_LABEL}{FOOTER_SEPARATOR}↑↓ scroll",
+            self.approve_label()
+        )
     }
 }
 
@@ -480,6 +490,13 @@ pub struct PromptLayout {
     pub inner: Rect,
     /// The footer row's position, `(x, y)`, when the popup has room for it.
     pub footer: Option<(u16, u16)>,
+    /// Where the footer's approve label ([`PromptAction::approve_label`]) was
+    /// drawn, when the footer row has room for all of it: clicking it approves,
+    /// as `a` does.
+    pub approve: Option<Rect>,
+    /// Where the footer's [`CANCEL_LABEL`] was drawn, when the footer row has
+    /// room for all of it: clicking it cancels, as `Esc` does.
+    pub cancel: Option<Rect>,
     /// The furthest the body can scroll: rows of body below the last row shown
     /// at scroll 0. A `usize`, not ratatui's `u16` scroll offset, so a body
     /// longer than 65,535 rows is reachable to its end.
@@ -563,15 +580,29 @@ pub fn render(
         };
         spans.push(Span::styled(more, label_style()));
         let at = inner.x.saturating_add(1);
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)),
-            Rect::new(at, row, inner.width.saturating_sub(2), 1),
-        );
-        (at, row)
+        let footer_area = Rect::new(at, row, inner.width.saturating_sub(2), 1);
+        frame.render_widget(Paragraph::new(Line::from(spans)), footer_area);
+        (footer_area, row)
+    });
+    // The two labels a click answers with, each only where the footer row
+    // holds the whole of it.
+    let label_rect = |footer_area: Rect, offset: usize, label: &str| {
+        let width = u16::try_from(label.chars().count()).ok()?;
+        let x = footer_area.x.checked_add(u16::try_from(offset).ok()?)?;
+        let rect = Rect::new(x, footer_area.y, width, 1);
+        (rect.right() <= footer_area.right()).then_some(rect)
+    };
+    let approve_label = action.approve_label();
+    let approve = footer.and_then(|(area, _)| label_rect(area, 0, approve_label));
+    let cancel = footer.and_then(|(area, _)| {
+        let offset = approve_label.chars().count() + FOOTER_SEPARATOR.chars().count();
+        label_rect(area, offset, CANCEL_LABEL)
     });
     PromptLayout {
         inner,
-        footer,
+        footer: footer.map(|(area, row)| (area.x, row)),
+        approve,
+        cancel,
         max_scroll,
     }
 }

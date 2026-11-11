@@ -44,6 +44,8 @@ Read the commands and prompts as what they are: commands that will run as you, a
 | `Esc` | Cancel. Nothing starts and nothing is remembered. |
 | `↑` / `↓`, `PgUp` / `PgDn` | Scroll a review taller than the window. `(more above)` and `(more below)` say there is more. |
 
+With the mouse, click `a approve and start` (or `a approve and restore`) in the footer to approve, or `Esc cancel` to cancel, and use the wheel over the review to scroll it. A click anywhere else does nothing.
+
 `Enter` does not approve, and a key you pressed before the prompt appeared does not answer it.
 
 **Desktop app:** the **Review project commands** dialog shows the same text. Press **Approve and start** to approve it and start the orchestration, or **Cancel** (or `Esc`) to start and remember nothing. `Enter` does not approve here either. With [voice control](desktop/voice.md#approving-project-commands) on, say "approve and start" (any request that says *approve*, such as "approve the commands"); "cancel" or "close" cancels.

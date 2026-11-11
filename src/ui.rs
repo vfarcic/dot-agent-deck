@@ -1850,6 +1850,9 @@ struct TrustPromptState {
     scroll: usize,
     /// The furthest the last frame could scroll, so the keys clamp too.
     max_scroll: usize,
+    /// The popup inside its border as the last frame drew it: the wheel over
+    /// it scrolls the review. `None` until a frame has drawn it.
+    drawn_inner: Option<Rect>,
     purpose: TrustPromptPurpose,
 }
 
@@ -5605,8 +5608,12 @@ pub enum Action {
     /// button share this arm.
     CloseHostMetrics,
     /// PRD #1885: `a` in the trust prompt — approve the text it shows, through
-    /// the daemon, then open (or restore) what it was shown for.
+    /// the daemon, then open (or restore) what it was shown for. A click on
+    /// the prompt's drawn approve label sends it too.
     ApproveProjectTrust,
+    /// PRD #1885: a click on the trust prompt's drawn `Esc cancel` label —
+    /// close it as `Esc` does, approving and starting nothing.
+    CancelTrustPrompt,
     /// PRD #1666 §6.4: open the deck-messages picker on the selected card.
     OpenInboxAttention,
     /// PRD #1666 §6.4: close it — Escape and its `[Close]` button.
@@ -7188,9 +7195,14 @@ fn open_trust_prompt(
         view,
         scroll: 0,
         max_scroll: 0,
+        drawn_inner: None,
         purpose,
     });
     ui.confirm_choices_drawn = None;
+    // Its approve and cancel labels become click targets only once a flushed
+    // frame shows them (`record_flushed_confirmation`), never from what an
+    // earlier dialog left here.
+    ui.modal_button_rects.clear();
     ui.mode = UiMode::TrustPrompt;
 }
 
@@ -7213,6 +7225,26 @@ fn cancel_trust_prompt(ui: &mut UiState) {
         }
     };
     ui.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// PRD #1885: the wheel over the trust prompt's popup scrolls the review one
+/// row a notch, as `↑`/`↓` do; a wheel elsewhere, or before a frame has drawn
+/// the popup, does nothing.
+fn scroll_trust_prompt(ui: &mut UiState, up: bool, col: u16, row: u16) {
+    let Some(prompt) = ui.trust_prompt.as_mut() else {
+        return;
+    };
+    if !prompt
+        .drawn_inner
+        .is_some_and(|inner| point_in_rect(&inner, col, row))
+    {
+        return;
+    }
+    prompt.scroll = if up {
+        prompt.scroll.saturating_sub(1)
+    } else {
+        prompt.scroll.saturating_add(1).min(prompt.max_scroll)
+    };
 }
 
 /// PRD #1885: the trust prompt's keys. `a` approves and starts (or restores);
@@ -10136,8 +10168,9 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // Issue #1635: the upgrade dialog's buttons live in
             // `modal_button_rects` too.
             | UiMode::Upgrade
-            // PRD #1885: the trust prompt is answered by key only; a click
-            // anywhere is consumed rather than reaching what is behind it.
+            // PRD #1885: the trust prompt's approve and cancel labels live in
+            // `modal_button_rects` once a frame shows them; a click anywhere
+            // else is consumed rather than reaching what is behind it.
             | UiMode::TrustPrompt
     )
 }
@@ -12054,6 +12087,9 @@ fn dispatch_action(
         // for goes through its own gate again — which opens it now that it is
         // approved, or, when the file changed in the meantime, shows the new
         // text instead.
+        Action::CancelTrustPrompt => {
+            cancel_trust_prompt(ui);
+        }
         Action::ApproveProjectTrust => {
             let Some(prompt) = ui.trust_prompt.take() else {
                 ui.mode = UiMode::Normal;
@@ -15194,6 +15230,17 @@ pub fn run_tui(
                     continue;
                 }
 
+                // PRD #1885: the wheel over the trust prompt scrolls its review,
+                // as ↑/↓ do; anywhere else it is swallowed below.
+                if is_scroll && ui.mode == UiMode::TrustPrompt {
+                    let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                    scroll_trust_prompt(&mut ui, up, mouse.column, mouse.row);
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
                 // PRD #80 review FIX 5: when a blocking overlay (any modal, the
                 // directory picker, or the new-pane form) is the topmost layer,
                 // swallow scroll-wheel events so they don't scroll the pane
@@ -17989,10 +18036,28 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
         let layout = crate::trust_prompt::render(frame, area, &prompt.view, action, prompt.scroll);
         prompt.max_scroll = layout.max_scroll;
         prompt.scroll = prompt.scroll.min(layout.max_scroll);
+        prompt.drawn_inner = Some(layout.inner);
         // The approve key's label is the one choice: `a` counts only once a
-        // flushed frame shows it (`refuse_undrawn_choice`).
+        // flushed frame shows it (`refuse_undrawn_choice`). The approve and
+        // cancel labels are its buttons: a click on either counts only where a
+        // flushed frame shows the whole label (`record_flushed_confirmation`).
+        let buttons = [
+            (
+                Action::ApproveProjectTrust,
+                layout.approve,
+                action.approve_label(),
+            ),
+            (
+                Action::CancelTrustPrompt,
+                layout.cancel,
+                crate::trust_prompt::CANCEL_LABEL,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(target, rect, label)| rect.map(|rect| (target, rect, label.to_string())))
+        .collect();
         confirmation = Some(ConfirmDrawing {
-            buttons: Vec::new(),
+            buttons,
             choices: ConfirmChoices {
                 inner: layout.inner,
                 cells: vec![match layout.footer {
@@ -42253,6 +42318,126 @@ mod tests {
             "approving opens every role"
         );
         assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: Open the trust prompt from the New Agent form and draw it.
+    /// A click on the drawn `a approve and start` label resolves to the
+    /// approval and on `Esc cancel` to the cancel, while clicks on the title,
+    /// the body, the footer's scroll hint and the deck beside the popup resolve
+    /// to nothing. Reopened, the prompt takes no click on the approve label
+    /// until a frame has shown it again; after that frame the click approves
+    /// the shown digest and opens every role, and a click on `Esc cancel`
+    /// closes a fresh prompt with nothing stored.
+    #[test]
+    fn prompt_004_a_click_answers_only_a_drawn_label() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let open = |ui: &mut UiState, tm: &mut TabManager| {
+            dispatch_against(open_request(tmp.path(), &config), ui, pc.as_ref(), tm);
+            assert_eq!(ui.mode, UiMode::TrustPrompt);
+        };
+
+        open(&mut ui, &mut tm);
+        let rows = draw_sized(&mut ui, 100, 30);
+        let shown = rows.join("\n");
+        let approve = find_in_rows(&rows, "a approve and start").expect(&shown);
+        let cancel = find_in_rows(&rows, "Esc cancel").expect(&shown);
+        let scroll_hint = find_in_rows(&rows, "↑↓ scroll").expect(&shown);
+        let title = find_in_rows(&rows, crate::trust_prompt::TITLE).expect(&shown);
+        let body = find_in_rows(&rows, "coder").expect(&shown);
+        let middle = |(col, row): (u16, u16), len: u16| (col + len / 2, row);
+        assert!(matches!(
+            modal_click(&ui, middle(approve, 19)),
+            Some(Action::ApproveProjectTrust)
+        ));
+        assert!(matches!(
+            modal_click(&ui, middle(cancel, 10)),
+            Some(Action::CancelTrustPrompt)
+        ));
+        for (what, at) in [
+            ("the title", title),
+            ("the body", body),
+            ("the scroll hint", scroll_hint),
+            ("the deck beside the popup", (1, approve.1)),
+            ("the separator", (approve.0 + 20, approve.1)),
+        ] {
+            assert!(
+                modal_click(&ui, at).is_none(),
+                "a click on {what} at {at:?} answered the prompt:\n{shown}"
+            );
+        }
+
+        // Reopened: the last frame's targets are gone until a frame shows it.
+        dispatch_against(Action::CancelTrustPrompt, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(ui.mode, UiMode::Normal);
+        open(&mut ui, &mut tm);
+        assert!(confirmation_awaits_frame(&ui));
+        assert!(
+            modal_click(&ui, middle(approve, 19)).is_none(),
+            "a click on the approve label before its frame approved"
+        );
+        assert!(pc.approvals.lock().unwrap().is_empty());
+        draw_sized(&mut ui, 100, 30);
+        let action = modal_click(&ui, middle(approve, 19)).expect("the drawn approve label");
+        assert!(matches!(action, Action::ApproveProjectTrust));
+        dispatch_against(action, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(*pc.approvals.lock().unwrap(), vec![pc.view.digest.clone()]);
+        assert_eq!(
+            pc.inner.recorded_orchestration_names(),
+            vec!["review".to_string(), "review".to_string()],
+            "a click on approve opens every role, as `a` does"
+        );
+        assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: Open the trust prompt on a terminal too short for its whole
+    /// review. Before a frame the wheel does nothing; once drawn, the wheel
+    /// down over the popup scrolls one row a notch and stops at the end, the
+    /// wheel up scrolls back, and a wheel beside the popup scrolls nothing.
+    #[test]
+    fn prompt_004_the_wheel_over_the_review_scrolls_it() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        let scroll = |ui: &UiState| ui.trust_prompt.as_ref().map(|p| p.scroll);
+
+        scroll_trust_prompt(&mut ui, false, 50, 5);
+        assert_eq!(scroll(&ui), Some(0), "a wheel before the first frame");
+
+        let rows = draw_sized(&mut ui, 100, 10);
+        let max = ui.trust_prompt.as_ref().unwrap().max_scroll;
+        assert!(
+            max > 0,
+            "precondition: the review overflows:\n{}",
+            rows.join("\n")
+        );
+        let inner = ui.trust_prompt.as_ref().unwrap().drawn_inner.unwrap();
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        scroll_trust_prompt(&mut ui, false, 0, row);
+        assert_eq!(scroll(&ui), Some(0), "a wheel beside the popup");
+        scroll_trust_prompt(&mut ui, false, col, row);
+        assert_eq!(scroll(&ui), Some(1));
+        for _ in 0..max + 5 {
+            scroll_trust_prompt(&mut ui, false, col, row);
+        }
+        assert_eq!(scroll(&ui), Some(max), "the wheel stops at the end");
+        scroll_trust_prompt(&mut ui, true, col, row);
+        assert_eq!(scroll(&ui), Some(max - 1));
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
     }
 
     /// Scenario: approve, with `a`, an orchestration whose config name
