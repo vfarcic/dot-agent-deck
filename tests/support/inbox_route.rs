@@ -1096,8 +1096,11 @@ pub fn dispatch_return(case: u8) {
         "completion must render in caller's attached pane: {}",
         deck.snapshot_grid()
     );
+    // A repeat of the SAME report is what the edge answers once. A different
+    // body is an update to the report (issue #2260), delivered on purpose
+    // and covered by `dispatch/return/019`, so it would not test this edge.
     let mut duplicate = inbox::request(&child, "work_done");
-    duplicate["task"] = json!("DUPLICATE-COMPLETION");
+    duplicate["task"] = json!(report);
     duplicate["done"] = json!(true);
     duplicate["timestamp"] = json!(chrono::Utc::now());
     inbox::hook(&deck, duplicate);

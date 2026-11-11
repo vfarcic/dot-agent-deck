@@ -5747,11 +5747,11 @@ without depending on the config struct API.
 - **Does not assert:** the hook socket's reply line itself (the arm writes the same code and sentence).
 - **Platform coverage:** mac+linux.
 
-##### dispatch/return/019 — A differing terminal repeat is not delivered.
+##### dispatch/return/019 — A differing terminal repeat is delivered as a labelled update, and the first report stands.
 - **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
 - **Agent:** none.
-- **Asserts:** `differs`, exit 1, one report.
-- **Why it exists:** PRD #1666 part 3, round 5 (plan D4): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Asserts:** the second, different report is accepted as update 1 under its own report id, posted as its own `dispatch report updated` turn that opens with the update wording and carries the untrusted-report markers, while the first report's turn and unit entry are unchanged and the store holds both files; identical repeats of either report answer `already_accepted` with that report's id and post nothing; the legacy verb's adapter acknowledges and delivers the update the same way.
+- **Why it exists:** issue #2260 (replacing PRD #1666 part 3a's refusal): a unit could not correct a report it knew was stale, and fell back to side channels the deck does not see.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
@@ -5774,7 +5774,7 @@ without depending on the config struct API.
 ##### dispatch/return/022 — Terminal retries after the route was consumed.
 - **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
 - **Agent:** none.
-- **Asserts:** For a single and an orchestration unit: identical repeat `already_accepted`, differing `differs`, after the close still answered through the index, a generation naming no unit `incompatible_mode`; one report.
+- **Asserts:** For a single and an orchestration unit: identical repeat `already_accepted`, differing delivered as update 1, after the close still answered through the index, a generation naming no unit `incompatible_mode`; one first report.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §2 step 2): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
@@ -5831,6 +5831,48 @@ without depending on the config struct API.
 - **Why it exists:** plan D2: a generation that can still attest freshly always finds its unit's entry.
 - **Does not assert:** the publication protection (exercised by `/026` (g)); a fresh report presenting the removed token (refused `unattested` before admission).
 - **Platform coverage:** mac+linux.
+
+##### dispatch/return/029 — A unit's updates to its report are bounded.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** after its first report a unit's next `MAX_REPORT_UPDATES` different reports are accepted as updates 1 to 3; one more different report is refused `report_updates_exhausted` with an exit-1 CLI line saying it was not delivered, and posts and saves nothing; an identical repeat of an earlier update still answers `already_accepted` with that update's id.
+- **Why it exists:** issue #2260: a unit that loops on `work-done` must not flood the conversation that dispatched it.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/031 — Reports that arrive while an update is being saved wait for it, then settle in order.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** with an update paused after its save, the unit entry records it in flight, and an identical repeat and a different report both wait rather than finish; released, the update is update 1, the repeat answers `already_accepted` with update 1's id and number and posts nothing, the different report becomes update 2, and the first report is unchanged.
+- **Why it exists:** issue #2260 (PR #2275 review): the in-flight state is what keeps a repeat from posting twice or racing the update it repeats.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/032 — A failed update save changes nothing, and a retry is accepted.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** an update whose save fails is refused `report_save_failed`; the unit entry, the saved files and the dispatcher's inbox are unchanged and no update is left in flight; the same update sent again is accepted as update 1.
+- **Why it exists:** issue #2260 (PR #2275 review): a failed update must neither touch the first report nor leave the unit unable to send an update.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/033 — An update sent after the dispatcher exited is kept for recovery, and its repeat says so.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** with the first report delivered to a live dispatcher, an update paused after its save while the dispatcher's agent exits is accepted with destination `recovery` and update 1, and the CLI line says it was update 1 and was saved; the first report's entry still reads `inbox`; an identical repeat of the update answers with the update's own destination and number.
+- **Why it exists:** issue #2260 (PR #2275 review): a repeat of an update used to answer with the first report's destination and no number.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/030 — A real dispatched single unit, told its report is out of date, sends an update, and the dispatcher receives it as a separate turn beside the first report.
+- **Layer:** L2 PTY-attached, lane 2 (`TuiDeck` on `minimal`, `tests/e2e_dispatcher_mode.rs`) driving the real new-pane dispatcher flow and two real interactive Claude Code panes through the branch binary; the dispatcher runs `dot-agent-deck dispatch --single` itself, and no test process runs `dispatch` or `work-done`.
+- **Agent:** REAL interactive Claude Code Haiku (`claude-haiku-4-5-20251001`) for the dispatcher and the unit, with `--allowedTools Bash Read Write`. Credentialed lane 2: run with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`, never in CI.
+- **Fixture sentinel:** `dispatch-update-live-first-3a1d.txt` is committed and the unit's task names only its prefix. Once the report is in the dispatcher's inbox, the user types into the unit's pane that the report is out of date and asks it to write the current Unix time to `dispatch-update-live-stamp.txt` and send an update giving it; the stamp did not exist when the unit reported. How to send an update comes only from the production `dispatch_prompt`. Three single-turn designs failed on the agent, not the deck: Haiku folded a later step into one combined report each time (twice), or waited before reporting through the `Monitor` tool and stalled on its permission prompt.
+- **Asserts:** the dispatcher's inbox holds exactly one acknowledged completion from the unit, whose untrusted-report frame carries the sentinel and not the stamp, and a separate acknowledged turn opening `dispatch: a unit you dispatched sent an update to its report` whose frame carries the stamp read back from the unit's worktree; at most `MAX_REPORT_UPDATES` updates; the dispatcher visibly relays the stamp.
+- **Why it exists:** issue #2260: the user-visible path of a unit correcting its report.
+- **Does not assert:** the update bound (`dispatch/return/029`); an orchestration unit's update; the agent's prose beyond the sentinel and the stamp.
+- **Platform coverage:** mac+linux (lane 2 is local-only).
+- **Cost note:** a few short interactive Haiku turns: the dispatcher's command, the unit's report, and the unit's stamp and update.
 
 ##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
 - **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
