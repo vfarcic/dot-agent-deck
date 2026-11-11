@@ -1,0 +1,514 @@
+//! Keyboard copy mode (PRD #385 M5): select text in the focused pane, its
+//! history included, with the keyboard, and copy it.
+//!
+//! It exists for setups where the mouse cannot select: a terminal that does
+//! not pass mouse reports through, or an ssh session in one. `v` in command
+//! mode opens it on the focused pane; the keys are limited to select-and-yank
+//! (`ui::handle_copy_mode_key` maps them to the operations here).
+//!
+//! **The view is frozen.** Copy mode works on a copy of the pane's terminal
+//! screen taken when it opens (`vt100::Screen` is `Clone`), not on the live
+//! one. Output that arrives while copy mode is open goes to the live screen
+//! only, so the text under the cursor never moves and the highlight always
+//! shows exactly what a yank copies (PRD #385 decision 6). Paging moves the
+//! copy's scrollback offset, never the live pane's, so leaving copy mode
+//! leaves the pane at the scroll position it had (vt100 itself keeps a pane
+//! that was scrolled back anchored to its text as new lines arrive).
+//!
+//! Selection is a stream, as a mouse drag is: from the anchor to the cursor,
+//! running to the end of each line in between.
+//!
+//! **Whole glyphs.** A wide (two-column) glyph is one stop for the cursor and
+//! is selected, highlighted and copied whole: the cursor never rests on its
+//! second column.
+//!
+//! **Only drawn cells.** A pane draws its screen from the top-left cell,
+//! clipped to the pane (`terminal_widget::drawn_screen_size`), and the screen
+//! can be larger than the pane while another attached client decides its
+//! size. Copy mode keeps its view, cursor and selection inside the part that
+//! is drawn, so it never highlights, or yanks, a cell the user cannot see.
+
+use std::sync::{Arc, Mutex};
+
+/// A cell in copy mode's text. `line` counts from the oldest line of the
+/// pane's history (0) through the history and then the screen's rows; `col`
+/// is a screen column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Pos {
+    pub line: usize,
+    pub col: u16,
+}
+
+/// A cursor movement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Move {
+    Left,
+    Right,
+    Up,
+    Down,
+    /// Back one screen into the history.
+    PageUp,
+    /// Forward one screen.
+    PageDown,
+    /// The first line of the history.
+    Top,
+    /// The last line of the screen.
+    Bottom,
+}
+
+/// One open copy mode, on one pane.
+pub struct CopyMode {
+    pane_id: String,
+    /// The pane's screen as it was when copy mode opened. Its scrollback
+    /// offset is copy mode's view.
+    frozen: Arc<Mutex<vt100::Parser>>,
+    history: usize,
+    rows: u16,
+    cols: u16,
+    /// The rows and columns of the screen the pane draws, from its top-left
+    /// cell; at most `rows` x `cols`.
+    shown_rows: u16,
+    shown_cols: u16,
+    /// Scrollback offset of the view (0 = the screen's own rows).
+    view: usize,
+    cursor: Pos,
+    anchor: Option<Pos>,
+}
+
+/// What one visible row of copy mode's view shows besides its text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RowMarks {
+    /// The selected columns, first to last, inclusive.
+    pub selected: Option<(u16, u16)>,
+    /// The cursor's column, when the cursor is on this row.
+    pub cursor: Option<u16>,
+}
+
+impl CopyMode {
+    /// Open copy mode on `pane_id`, whose live screen is `screen` and whose
+    /// pane draws `shown` (rows, cols) of it. The view starts where the pane is
+    /// scrolled to, and the cursor at the pane's own cursor when the pane shows
+    /// its live screen, or on the view's last row when it is scrolled back,
+    /// each kept to the drawn cells.
+    pub fn open(pane_id: impl Into<String>, screen: &vt100::Screen, shown: (u16, u16)) -> Self {
+        let (rows, cols) = crate::vt_grid::size(screen);
+        let mut parser = crate::vt_grid::parser(rows, cols, 0);
+        *parser.screen_mut() = screen.clone();
+        let history = screen.scrollback_len();
+        let view = screen.scrollback().min(history);
+        let (shown_rows, shown_cols) = Self::clamp_shown(shown, rows, cols);
+        let cursor = if view == 0 {
+            let (row, col) = screen.cursor_position();
+            Pos {
+                line: history + usize::from(row.min(shown_rows - 1)),
+                col: col.min(shown_cols - 1),
+            }
+        } else {
+            Pos {
+                line: history - view + usize::from(shown_rows - 1),
+                col: 0,
+            }
+        };
+        let mut copy = Self {
+            pane_id: pane_id.into(),
+            frozen: Arc::new(Mutex::new(parser)),
+            history,
+            rows,
+            cols,
+            shown_rows,
+            shown_cols,
+            view,
+            cursor,
+            anchor: None,
+        };
+        copy.cursor = copy.glyph_start(copy.cursor);
+        copy
+    }
+
+    /// `pos` with its line and column each at most `last`'s.
+    fn clamp_pos(pos: Pos, last: Pos) -> Pos {
+        Pos {
+            line: pos.line.min(last.line),
+            col: pos.col.min(last.col),
+        }
+    }
+
+    fn clamp_shown((rows, cols): (u16, u16), max_rows: u16, max_cols: u16) -> (u16, u16) {
+        (rows.min(max_rows).max(1), cols.min(max_cols).max(1))
+    }
+
+    /// The pane now draws `shown` (rows, cols) of the screen, as a resize can
+    /// change it: the selection keeps only its cells that are still drawn, and
+    /// is dropped when none are; the cursor is brought onto a drawn cell, and
+    /// the view onto the cursor.
+    pub fn set_shown(&mut self, shown: (u16, u16)) {
+        let (shown_rows, shown_cols) = Self::clamp_shown(shown, self.rows, self.cols);
+        if (shown_rows, shown_cols) == (self.shown_rows, self.shown_cols) {
+            return;
+        }
+        let selection = self.selection();
+        let cursor_first = self.anchor.is_some_and(|anchor| self.cursor < anchor);
+        self.shown_rows = shown_rows;
+        self.shown_cols = shown_cols;
+        let last = Pos {
+            line: self.total_lines() - 1,
+            col: shown_cols - 1,
+        };
+        self.cursor = self.glyph_start(Self::clamp_pos(self.cursor, last));
+        self.anchor = None;
+        if let Some((start, end)) = selection.and_then(|sel| Self::drawn_part(sel, last)) {
+            let (start, end) = (self.glyph_start(start), self.glyph_start(end));
+            // The cursor stays the end of the selection it was.
+            let (anchor, cursor) = if cursor_first {
+                (end, start)
+            } else {
+                (start, end)
+            };
+            self.anchor = Some(anchor);
+            self.cursor = cursor;
+        }
+        self.keep_cursor_in_view();
+        self.scroll_frozen_to(self.view);
+    }
+
+    /// The part of the stream selection `start..=end` that falls on drawn
+    /// cells, whose last is `last`, or `None` when no cell of it is drawn. A
+    /// first line that starts past the drawn columns gives way to the next
+    /// line's first cell; an end past them is cut to the last drawn column.
+    fn drawn_part((mut start, end): (Pos, Pos), last: Pos) -> Option<(Pos, Pos)> {
+        if start.col > last.col {
+            start = Pos {
+                line: start.line + 1,
+                col: 0,
+            };
+        }
+        let end = if end.line > last.line {
+            last
+        } else {
+            Self::clamp_pos(end, last)
+        };
+        (start <= end && start.line <= last.line).then_some((start, end))
+    }
+
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    /// The frozen screen, scrolled to copy mode's view, for drawing.
+    pub fn frozen(&self) -> Arc<Mutex<vt100::Parser>> {
+        Arc::clone(&self.frozen)
+    }
+
+    pub fn cursor(&self) -> Pos {
+        self.cursor
+    }
+
+    /// The history, then the screen rows the pane draws: the rows below
+    /// those are never drawn, at any scroll offset.
+    fn total_lines(&self) -> usize {
+        self.history + usize::from(self.shown_rows)
+    }
+
+    /// The line shown on the view's first row.
+    fn top(&self) -> usize {
+        self.history - self.view
+    }
+
+    fn page(&self) -> usize {
+        usize::from(self.shown_rows.saturating_sub(1).max(1))
+    }
+
+    pub fn apply(&mut self, movement: Move) {
+        let last_line = self.total_lines() - 1;
+        let last_col = self.shown_cols - 1;
+        let page = self.page();
+        match movement {
+            Move::Left => self.cursor.col = self.cursor.col.saturating_sub(1),
+            Move::Right => {
+                // Past the second column of a wide glyph, when the next stop
+                // is still drawn.
+                let mut next = Pos {
+                    col: self.cursor.col + 1,
+                    ..self.cursor
+                };
+                if self.is_continuation(next) {
+                    next.col += 1;
+                }
+                if next.col <= last_col {
+                    self.cursor = next;
+                }
+            }
+            Move::Up => self.cursor.line = self.cursor.line.saturating_sub(1),
+            Move::Down => self.cursor.line = (self.cursor.line + 1).min(last_line),
+            Move::PageUp => {
+                self.view = (self.view + page).min(self.history);
+                self.cursor.line = self.cursor.line.saturating_sub(page);
+            }
+            Move::PageDown => {
+                self.view = self.view.saturating_sub(page);
+                self.cursor.line = (self.cursor.line + page).min(last_line);
+            }
+            Move::Top => {
+                self.view = self.history;
+                self.cursor = Pos { line: 0, col: 0 };
+            }
+            Move::Bottom => {
+                self.view = 0;
+                self.cursor = Pos {
+                    line: last_line,
+                    col: 0,
+                };
+            }
+        }
+        self.cursor = self.glyph_start(self.cursor);
+        self.keep_cursor_in_view();
+        self.scroll_frozen_to(self.view);
+    }
+
+    /// Run `f` on the frozen screen scrolled so that `line` is on it, with that
+    /// line's row; the view is put back afterwards.
+    fn on_line<R>(&self, line: usize, f: impl FnOnce(&vt100::Screen, u16) -> R) -> Option<R> {
+        let mut parser = self.frozen.lock().ok()?;
+        let (offset, row) = if line < self.history {
+            (self.history - line, 0)
+        } else {
+            (0, u16::try_from(line - self.history).ok()?)
+        };
+        parser.screen_mut().set_scrollback(offset);
+        let result = f(parser.screen(), row);
+        parser.screen_mut().set_scrollback(self.view);
+        Some(result)
+    }
+
+    /// Whether `pos` is the second column of a wide glyph.
+    fn is_continuation(&self, pos: Pos) -> bool {
+        self.on_line(pos.line, |screen, row| {
+            screen
+                .cell(row, pos.col)
+                .is_some_and(|cell| cell.is_wide_continuation())
+        })
+        .unwrap_or(false)
+    }
+
+    /// `pos`, or the glyph's first column when `pos` is a wide glyph's second.
+    fn glyph_start(&self, pos: Pos) -> Pos {
+        if pos.col > 0 && self.is_continuation(pos) {
+            Pos {
+                col: pos.col - 1,
+                ..pos
+            }
+        } else {
+            pos
+        }
+    }
+
+    /// Scroll the view just enough to show the cursor.
+    fn keep_cursor_in_view(&mut self) {
+        let rows = usize::from(self.shown_rows);
+        let top = self.top();
+        if self.cursor.line < top {
+            self.view = self.history - self.cursor.line;
+        } else if self.cursor.line >= top + rows {
+            self.view = self.history - (self.cursor.line + 1 - rows);
+        }
+    }
+
+    fn scroll_frozen_to(&self, offset: usize) {
+        if let Ok(mut parser) = self.frozen.lock() {
+            parser.screen_mut().set_scrollback(offset);
+        }
+    }
+
+    /// Start the selection at the cursor, or drop the one started.
+    pub fn toggle_anchor(&mut self) {
+        self.anchor = match self.anchor {
+            Some(_) => None,
+            None => Some(self.cursor),
+        };
+    }
+
+    /// The selection, first cell to last, inclusive.
+    pub fn selection(&self) -> Option<(Pos, Pos)> {
+        let anchor = self.anchor?;
+        Some(if anchor <= self.cursor {
+            (anchor, self.cursor)
+        } else {
+            (self.cursor, anchor)
+        })
+    }
+
+    /// What the view's `row` shows besides its text. A row the pane draws no
+    /// screen row on (below a screen shorter than the pane) has no marks, and
+    /// marks stop at the last drawn column: the highlight covers only cells
+    /// whose text a yank copies.
+    pub fn row_marks(&self, row: u16) -> RowMarks {
+        if row >= self.shown_rows {
+            return RowMarks::default();
+        }
+        let last_col = self.shown_cols - 1;
+        let line = self.top() + usize::from(row);
+        let selected = self.selection().and_then(|(start, end)| {
+            (start.line..=end.line).contains(&line).then(|| {
+                let first = if line == start.line { start.col } else { 0 };
+                let last = if line == end.line {
+                    end.col.min(last_col)
+                } else {
+                    last_col
+                };
+                (first, last)
+            })
+        });
+        RowMarks {
+            selected: selected.filter(|&(first, last)| first <= last),
+            cursor: (self.cursor.line == line && self.cursor.col <= last_col)
+                .then_some(self.cursor.col),
+        }
+    }
+
+    /// The selected text, or `None` with nothing selected. Each line is cut
+    /// as [`row_text`] cuts it, and ends in a newline unless the terminal
+    /// wrapped it onto the next one.
+    pub fn yank(&self) -> Option<String> {
+        let (start, end) = self.selection()?;
+        let Ok(mut parser) = self.frozen.lock() else {
+            return None;
+        };
+        let mut text = String::new();
+        for line in start.line..=end.line {
+            let (offset, row) = if line < self.history {
+                (self.history - line, 0)
+            } else {
+                (0, (line - self.history) as u16)
+            };
+            parser.screen_mut().set_scrollback(offset);
+            let screen = parser.screen();
+            let first = if line == start.line { start.col } else { 0 };
+            let last = if line == end.line {
+                end.col
+            } else {
+                self.shown_cols - 1
+            };
+            let last = last.min(self.shown_cols - 1);
+            // Joined only when the whole row is drawn: a row clipped at the
+            // pane's edge ends where the highlight does.
+            let joined = line != end.line && screen.row_wrapped(row) && last == self.cols - 1;
+            // The user chose where the selection ends, and a joined row runs
+            // on into the next, so their written spaces are kept.
+            let keep_spaces = line == end.line || joined;
+            text.push_str(&row_text(
+                screen,
+                row,
+                first,
+                last,
+                self.shown_cols,
+                keep_spaces,
+            ));
+            if line != end.line && !joined {
+                text.push('\n');
+            }
+        }
+        parser.screen_mut().set_scrollback(self.view);
+        Some(text)
+    }
+}
+
+/// The text a copy takes from `screen`'s `row`, columns `first..=last`, of a
+/// pane that draws `drawn_cols` columns. Shared by copy mode and the mouse
+/// selection, so both cut a row the same way:
+///
+/// - A wide glyph is copied once, and a glyph whose second column is past
+///   the drawn columns is not drawn and not copied.
+/// - Cells nothing was written to (never written, or erased) read as spaces
+///   between text, and are dropped after the last written cell: they are the
+///   terminal's padding, not text.
+/// - Everything written is kept, whatever it is (a no-break space included),
+///   except that with `keep_spaces` false (a row the selection runs through to
+///   its end rather than ending on) trailing ASCII spaces are dropped as well.
+pub(crate) fn row_text(
+    screen: &vt100::Screen,
+    row: u16,
+    first: u16,
+    last: u16,
+    drawn_cols: u16,
+    keep_spaces: bool,
+) -> String {
+    let mut text = String::new();
+    let mut written = 0;
+    for col in first..=last {
+        let Some(cell) = screen.cell(row, col) else {
+            break;
+        };
+        if cell.is_wide_continuation() {
+            continue;
+        }
+        if cell.is_wide() && col + 1 >= drawn_cols {
+            break;
+        }
+        if cell.has_contents() {
+            text.push_str(cell.contents());
+            written = text.len();
+        } else {
+            text.push(' ');
+        }
+    }
+    text.truncate(written);
+    if !keep_spaces {
+        text.truncate(text.trim_end_matches(' ').len());
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(rows: u16, cols: u16, bytes: &[u8]) -> vt100::Parser {
+        let mut parser = crate::vt_grid::parser(rows, cols, 100);
+        parser.process(bytes);
+        parser
+    }
+
+    #[test]
+    fn a_stream_selection_runs_to_the_end_of_each_line_between() {
+        let parser = screen(4, 10, b"alpha one\r\nbravo two\r\ncharlie\r\n");
+        let mut copy = CopyMode::open("p", parser.screen(), crate::vt_grid::size(parser.screen()));
+        copy.apply(Move::Top);
+        copy.apply(Move::Right);
+        copy.apply(Move::Right);
+        copy.toggle_anchor();
+        copy.apply(Move::Down);
+        copy.apply(Move::Down);
+        copy.apply(Move::Right);
+        assert_eq!(copy.yank().as_deref(), Some("pha one\nbravo two\nchar"));
+    }
+
+    #[test]
+    fn a_wrapped_line_is_copied_without_a_newline() {
+        let parser = screen(4, 5, b"abcdefgh");
+        let mut copy = CopyMode::open("p", parser.screen(), crate::vt_grid::size(parser.screen()));
+        copy.apply(Move::Top);
+        copy.toggle_anchor();
+        copy.apply(Move::Down);
+        copy.apply(Move::Right);
+        copy.apply(Move::Right);
+        assert_eq!(copy.yank().as_deref(), Some("abcdefgh"));
+    }
+
+    #[test]
+    fn the_cursor_keeps_the_view_on_itself_through_the_history() {
+        let lines: Vec<String> = (1..=20).map(|n| format!("l{n}")).collect();
+        let parser = screen(4, 10, lines.join("\r\n").as_bytes());
+        let mut copy = CopyMode::open("p", parser.screen(), crate::vt_grid::size(parser.screen()));
+        assert_eq!(copy.cursor().line, 19);
+        for _ in 0..19 {
+            copy.apply(Move::Up);
+        }
+        assert_eq!(copy.cursor(), Pos { line: 0, col: 3 });
+        assert_eq!(copy.row_marks(0).cursor, Some(3));
+        copy.apply(Move::PageDown);
+        assert_eq!(copy.cursor().line, 3);
+        copy.apply(Move::Bottom);
+        assert_eq!(copy.cursor(), Pos { line: 19, col: 0 });
+        assert_eq!(copy.row_marks(3).cursor, Some(0));
+    }
+}

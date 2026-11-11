@@ -4643,7 +4643,7 @@ pub(crate) fn in_guarded_parser_feed() -> bool {
 /// mid-unwind and poison the lock.
 ///
 /// [`catch_unwind`]: std::panic::catch_unwind
-fn guarded_parser_feed<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
+pub(crate) fn guarded_parser_feed<T>(f: impl FnOnce() -> T) -> std::thread::Result<T> {
     IN_GUARDED_PARSER_FEED.with(|flag| flag.set(true));
     let result = std::panic::catch_unwind(AssertUnwindSafe(f));
     IN_GUARDED_PARSER_FEED.with(|flag| flag.set(false));

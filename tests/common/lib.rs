@@ -1349,6 +1349,7 @@ impl TuiDeck {
             // Disable the idle-shutdown so the daemon does not race the
             // test by exiting after a brief detach.
             ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0"),
+            ("DOT_AGENT_DECK_NATIVE_CLIPBOARD", "0"), // PRD #385: not the real clipboard
             // Leaked-daemon safety net: the deck lazy-spawns its daemon
             // DETACHED (its own session → parent is PID 1 from birth), so the
             // orphan watchdog can't be enabled here (it would fire instantly).
@@ -2733,6 +2734,16 @@ impl TuiDeck {
         // \x1b[<0;cx;cyM = left-button press; trailing `m` = release.
         self.send_bytes(format!("\x1b[<0;{cx};{cy}M").as_bytes());
         self.send_bytes(format!("\x1b[<0;{cx};{cy}m").as_bytes());
+    }
+
+    /// Left-button drag from one 0-based cell to another as SGR reports:
+    /// press at `from`, motion with the button held (code 32) to `to`, then
+    /// release at `to`.
+    pub fn drag(&self, from: (u16, u16), to: (u16, u16)) {
+        let ((fx, fy), (tx, ty)) = ((from.0 + 1, from.1 + 1), (to.0 + 1, to.1 + 1));
+        self.send_bytes(
+            format!("\x1b[<0;{fx};{fy}M\x1b[<32;{tx};{ty}M\x1b[<0;{tx};{ty}m").as_bytes(),
+        );
     }
 
     /// Send a mouse wheel scroll at the given 0-based grid cell as an SGR
