@@ -399,7 +399,7 @@ While the TUI is **locked**, it moves focus within the active orchestration tab:
 
 ### Prompt suggestions are off in workers
 
-Claude Code suggests your next prompt after each turn, and each suggestion costs a model request. Nobody types into a worker, so the deck starts Claude Code workers with suggestions off. The orchestrator keeps them, as you configured Claude Code. See [Configuration](configuration.md#set-by-the-deck).
+Claude Code suggests your next prompt after each turn, and each suggestion costs a model request. A worker takes its tasks from the orchestrator rather than from you, so the deck starts Claude Code workers with suggestions off. You can still type into a worker; you just get no suggestion there. The orchestrator keeps them, as you configured Claude Code. See [Configuration](configuration.md#set-by-the-deck).
 
 ### Closing an orchestration
 

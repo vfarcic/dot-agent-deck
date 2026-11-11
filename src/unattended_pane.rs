@@ -1,20 +1,22 @@
-//! Issue #2094: the settings the deck gives an agent in a pane nobody types
-//! into.
+//! Issue #2094: the settings the deck gives an agent in a pane another agent
+//! drives.
 //!
 //! Claude Code generates *prompt suggestions* — a guessed next prompt, shown
 //! greyed out in its input box — with an extra model request after each turn.
 //! Telemetry round 1 (#1980) measured those requests at 3 % of Claude Code's
-//! estimated cost, and in a dispatched unit's pane or an orchestration worker's
-//! pane there is no person to accept one. So those panes start with
+//! estimated cost, and a dispatched unit's pane or an orchestration worker's
+//! pane takes its work from its task or its orchestrator, not from a person
+//! who would accept one. (A person can still type there.) So those panes start with
 //! `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`; the panes where a person types
 //! (an orchestrator, a dispatcher, a plain pane the user opened) are left as
 //! Claude Code configures them.
 //!
 //! The switch is per process: Claude Code reads the variable before its
 //! `promptSuggestionEnabled` setting (checked against 2.1.322), so the user's
-//! own settings file is never written. Other agents read nothing under this
-//! name, which is why it is set by pane rather than by agent type: a role
-//! started through a launcher (`devbox run -- claude`) is covered too.
+//! own settings file is never written. It is set by pane rather than by agent
+//! type, so a role started through a launcher (`devbox run -- claude`) is
+//! covered too. Codex, OpenCode and Pi showed no use of the name when this was
+//! written; Devin was not checked.
 
 use crate::agent_pty::TabMembership;
 use crate::hook_provenance::InstanceOrigin;
@@ -24,8 +26,8 @@ use crate::hook_provenance::InstanceOrigin;
 /// them off whatever that setting says.
 pub const CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION: &str = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
 
-/// Whether a pane spawned with this membership and origin has no person typing
-/// into it: an orchestration role that is not the orchestrator seat (whether
+/// Whether a pane spawned with this membership and origin is driven by another
+/// agent rather than by a person: an orchestration role that is not the orchestrator seat (whether
 /// the orchestration was dispatched or opened with `Ctrl+N`), or a dispatched
 /// single-agent unit.
 pub fn is_unattended(membership: Option<&TabMembership>, origin: Option<InstanceOrigin>) -> bool {

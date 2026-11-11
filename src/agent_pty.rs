@@ -14322,8 +14322,8 @@ impl AgentPtyRegistry {
             }),
             _ => None,
         };
-        // Issue #2094: a worker role or a dispatched single agent has nobody
-        // typing into it, so Claude Code's prompt suggestions are turned off.
+        // Issue #2094: a worker role or a dispatched single agent is driven by
+        // another agent, so Claude Code's prompt suggestions are turned off.
         crate::unattended_pane::apply(&mut opts.env, tab_membership.as_ref(), opts.origin);
         let (preallocated_id, reservation) = self.reserve_spawn(
             &pane_id_env,
@@ -25273,10 +25273,13 @@ mod spawn_tests {
         );
         let plain = child_observed_prompt_suggestion(&registry, "pane-2094-plain", None, None);
         registry.shutdown_all();
-        assert_eq!(worker, "false", "a worker role has nobody typing into it");
+        assert_eq!(
+            worker, "false",
+            "a worker role is driven by its orchestrator"
+        );
         assert_eq!(
             dispatched, "false",
-            "a dispatched unit has nobody typing into it"
+            "a dispatched unit is driven by its task"
         );
         assert_eq!(
             orchestrator, inherited,
