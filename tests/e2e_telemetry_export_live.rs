@@ -917,7 +917,7 @@ fn telemetry_otlp_018_real_codex_safe_telemetry_joins_deck_run() {
     );
 }
 
-/// Scenario: Start real interactive Pi Haiku through the deck's bundled extension and post an inbox directive to copy a uniquely named fixture and reply with a private output marker. Observe the real work and settled card, then require Pi's own metadata export to share the deck's resource run id while prompt, file and output markers stay out of every captured request.
+/// Scenario: Start real interactive Pi Haiku through the deck's bundled extension and post an inbox directive to copy a uniquely named fixture and reply with a private output marker. Observe the real work and settled card, then require Pi's own metadata export to share the deck's resource run id and the deck's export of the run to carry busy and idle status intervals, while prompt, file and output markers stay out of every captured request.
 #[spec("telemetry/otlp/019")]
 #[test]
 fn telemetry_otlp_019_real_pi_metadata_joins_deck_run() {
@@ -991,6 +991,28 @@ fn telemetry_otlp_019_real_pi_metadata_joins_deck_run() {
         "Pi",
         &[PROMPT, CONTENT, SENTINEL, OUTPUT],
         false,
+    );
+    // Issue #2078: the deck's own status intervals for the Pi run — what its
+    // card showed while Pi worked — reach the export, not only its shell
+    // commands.
+    let pane = agent.pane_id_env.as_deref().unwrap();
+    let run = receiver.run(pane);
+    let statuses: Vec<String> = receiver
+        .spans()
+        .iter()
+        .filter(|span| {
+            span["name"] == "agent.status"
+                && attribute(span, "deck.run.id") == attribute(&run, "deck.run.id")
+        })
+        .map(|span| attribute(span, "deck.status"))
+        .collect();
+    assert!(
+        statuses.iter().any(|s| s == "thinking" || s == "working"),
+        "the Pi run exported no busy status interval: {statuses:?}"
+    );
+    assert!(
+        statuses.iter().any(|s| s == "idle"),
+        "the Pi run exported no idle status interval: {statuses:?}"
     );
 }
 

@@ -1609,6 +1609,19 @@ impl InboxHub {
             .unwrap_or_default()
     }
 
+    /// Issue #2099: the delegated tasks generation `(pane_id, agent_id)` still
+    /// owes a report for, by id — not one a report is being saved for; empty
+    /// when the report state is torn.
+    pub fn tasks_awaiting_report(&self, pane_id: &str, agent_id: &str) -> Vec<String> {
+        self.lock()
+            .guarded_read(|reports| {
+                reports
+                    .tasks
+                    .awaiting_report_of_generation(pane_id, agent_id)
+            })
+            .unwrap_or_default()
+    }
+
     /// PRD #1666 S5: retire every delegated task to `pane_id` that is not yet
     /// acknowledged, as superseded — a newer delegation, or the pane's agent
     /// restarting, has made it moot. Superseded tasks are not reported. A

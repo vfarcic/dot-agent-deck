@@ -62,6 +62,9 @@ pub(crate) struct HandshakeInfo {
     /// Whether the deck honours the directory browser's listing options
     /// (issue #1240) — see [`listing_options`].
     pub(crate) listing_options: bool,
+    /// Whether the deck advertised the wire stop (issue #1049), which is the
+    /// only way to stop a remote deck — see [`stop_daemon_reason`].
+    pub(crate) wire_stop: bool,
     /// Issue #1637: the daemon's hook-binary notices, from the same reply.
     pub(crate) hook_binary_notices: Vec<crate::dto::HookBinaryNoticeDto>,
 }
@@ -1081,6 +1084,26 @@ fn listing_options(response: &AttachResponse) -> bool {
         .supports(dot_agent_deck::daemon_protocol::CAP_LIST_DIRECTORIES_OPTIONS)
 }
 
+/// Why **Stop daemon** cannot act on `endpoint`, or `None` when it can (issue
+/// #1073). `wire_stop` is whether the deck's `Hello` advertised
+/// `AttachRequest::StopDaemon`.
+///
+/// The local deck is always stoppable: `stop_daemon_action` falls back to the
+/// pid stop, which reaches a daemon of any version. A remote deck has only the
+/// wire verb — the pid stop over a forwarded socket would signal the local
+/// `ssh` client (PRD #741 M2) — so one that predates it cannot be stopped from
+/// here. The sentence says what to do instead and leaves the verb's name out,
+/// as [`new_agent_reason`] does (CLAUDE.md rule 21).
+pub(crate) fn stop_daemon_reason(endpoint: &Endpoint, wire_stop: bool) -> Option<String> {
+    if wire_stop || endpoint.as_local().is_some() {
+        return None;
+    }
+    Some(
+        "This daemon is too old to be stopped from this app. Stop it from a terminal on its machine with `dot-agent-deck daemon stop`, or upgrade it."
+            .to_string(),
+    )
+}
+
 /// Whether the build-stamp comparison is being relaxed, and by what.
 ///
 /// The handshake refuses a daemon whose git-describe stamp differs from the
@@ -1315,6 +1338,9 @@ fn classify_handshake(
             .flatten(),
         new_agent_reason: response.ok.then(|| new_agent_reason(response)).flatten(),
         listing_options: response.ok && listing_options(response),
+        wire_stop: response.ok
+            && dot_agent_deck::daemon_client::DaemonCapabilities::from_hello(response)
+                .supports(dot_agent_deck::daemon_protocol::CAP_STOP_DAEMON),
         hook_binary_notices: hook_binary_notices(response),
     }
 }
@@ -1392,6 +1418,7 @@ fn connection_from_handshake(endpoint: &Endpoint, handshake: HandshakeInfo) -> D
         deck_id: deck_wire_id(endpoint),
         deck_kind,
         local_only_reason,
+        stop_daemon_reason: stop_daemon_reason(endpoint, handshake.wire_stop),
         selection_fallback,
         error: handshake.error,
         error_detail: handshake.error_detail,
@@ -3987,6 +4014,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    wire_stop: false,
                     hook_binary_notices: Vec::new(),
                 },
             );
@@ -4095,6 +4123,7 @@ mod tests {
                     project_actions_reason: None,
                     new_agent_reason: None,
                     listing_options: false,
+                    wire_stop: false,
                     hook_binary_notices: Vec::new(),
                 },
             ),
@@ -6028,6 +6057,185 @@ mod tests {
             .into_iter()
             .map(|record| (record.id, record.display_name))
             .collect()
+    }
+
+    /// Scenario (issue #1073): under **All daemons**, with the local deck
+    /// selected and a remote row routed to a second real daemon, Stop daemon
+    /// names the REMOTE deck. While it runs an agent the stop is refused with
+    /// the app's own sentence (no CLI `--force` advice), and both decks keep
+    /// their agents. Once that deck is idle the same stop goes over the wire
+    /// verb and the deck drains and stops, while the local deck — the selected
+    /// one — is untouched and still answering. A deck id this app does not
+    /// observe is refused before any deck is contacted.
+    ///
+    /// **What it fails against.** The arm this replaced read the selection and
+    /// refused anything but the local deck, so the remote deck could not be
+    /// stopped at all, and a stop meant for it would have reached `local`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stop_daemon_stops_the_deck_it_names_not_the_selected_one() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("1073-stop-local");
+        let remote = RealDeck::start("1073-stop-remote");
+        let local_agent = local.spawn_agent("pane-local");
+        let remote_agent = remote.spawn_agent("pane-remote");
+        let (settings, remote_endpoint) = all_decks_with_one_remote_row("build-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                remote.endpoint.as_local().expect("local socket").path(),
+            )
+            .await;
+        let remote_wire = deck_wire_id(&remote_endpoint);
+
+        let unknown = crate::stop_daemon_action(&state, "deck-00000000000000ff", false).await;
+        let handshakes_for_unknown = state.daemon.handshake_count();
+        let busy = crate::stop_daemon_action(&state, &remote_wire, false).await;
+        let remote_after_refusal = named_records(&remote);
+
+        // The same remote row, now routed to an idle daemon. The production
+        // daemon exits once its drain notifies it; a `RealDeck` has no such
+        // hook, so the test stops answering at that point, which is what lets
+        // the stop confirm rather than run out its confirmation budget.
+        let idle_remote = RealDeck::start("1073-stop-remote-idle");
+        state
+            .tunnels
+            .insert_route(
+                &remote_endpoint,
+                idle_remote
+                    .endpoint
+                    .as_local()
+                    .expect("local socket")
+                    .path(),
+            )
+            .await;
+        state.daemon.invalidate(&remote_endpoint).await;
+        let exits = {
+            let registry = Arc::clone(&idle_remote.registry);
+            let server = idle_remote.server.abort_handle();
+            tokio::spawn(async move {
+                while !registry.is_shutting_down() {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+                server.abort();
+            })
+        };
+        let stopped = crate::stop_daemon_action(&state, &remote_wire, false).await;
+        let drained = idle_remote.registry.is_shutting_down();
+        exits.abort();
+        let local_snapshot = snapshot_of(&local.endpoint, &DaemonLinks::default()).await;
+        let on_local = named_records(&local);
+        local.shutdown();
+        remote.shutdown();
+        idle_remote.shutdown();
+
+        let unknown = unknown.expect_err("a deck this app does not observe is refused");
+        assert!(
+            unknown.contains("not one this app is observing"),
+            "{unknown}"
+        );
+        assert_eq!(handshakes_for_unknown, 0, "no deck was contacted for it");
+
+        let busy = busy.expect_err("a deck running an agent refuses the stop");
+        assert!(
+            busy.contains("1 agent is still running"),
+            "the app's own sentence: {busy}"
+        );
+        assert!(
+            !busy.contains("--force"),
+            "no CLI advice in the app: {busy}"
+        );
+        assert_eq!(
+            remote_after_refusal,
+            vec![(remote_agent, None)],
+            "a refused stop takes nothing down"
+        );
+
+        let (scope, message) = stopped.expect("an idle remote deck stops over the wire");
+        assert_eq!(
+            scope.identity(),
+            remote_endpoint.identity(),
+            "the deck it named"
+        );
+        assert_eq!(message, "Daemon stopped gracefully.");
+        assert!(drained, "the remote daemon drained itself on the wire stop");
+
+        assert_eq!(
+            local_snapshot.connection.status,
+            ConnectionStatus::Connected,
+            "the selected local deck is still answering"
+        );
+        assert_eq!(on_local, vec![(local_agent, None)], "and keeps its agent");
+    }
+
+    /// Scenario (issue #1073): which decks say Stop daemon cannot act on them.
+    /// The local deck never does — the pid stop reaches a daemon of any
+    /// version. A remote deck does only when its `Hello` did not advertise the
+    /// wire stop, and the classifier reads that off the reply.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_remote_deck_without_the_wire_stop_says_it_cannot_be_stopped() {
+        let (_, remote) = all_decks_with_one_remote_row("build-box.example.com");
+        let local = Endpoint::Local(LocalEndpoint::at("/tmp/attach.sock"));
+        assert_eq!(stop_daemon_reason(&local, false), None);
+        assert_eq!(stop_daemon_reason(&local, true), None);
+        assert_eq!(stop_daemon_reason(&remote, true), None);
+        let reason = stop_daemon_reason(&remote, false).expect("an older remote deck says why");
+        assert!(reason.contains("dot-agent-deck daemon stop"), "{reason}");
+
+        let mut hello = AttachResponse::hello(PROTOCOL_VERSION);
+        hello.capabilities = Some(vec![
+            dot_agent_deck::daemon_protocol::CAP_STOP_DAEMON.to_string(),
+        ]);
+        assert!(
+            classify_handshake_for_test(&hello, "test-build").wire_stop,
+            "a daemon that advertises the wire stop"
+        );
+        hello.capabilities = None;
+        assert!(
+            !classify_handshake_for_test(&hello, "test-build").wire_stop,
+            "a daemon that advertises nothing withholds it"
+        );
+    }
+
+    /// Scenario (issue #1073): the wire stop's outcomes in the app's words. A
+    /// stop the daemon accepted but was not seen to finish is never reported as
+    /// stopped, and a refusal names what is running without the CLI's
+    /// `--force` advice.
+    #[test]
+    fn the_wire_stop_reports_what_it_saw() {
+        use dot_agent_deck::daemon_protocol::{StopDaemonRefusal, StopRefusalReason};
+        use dot_agent_deck::daemon_stop::{StopError, WireStopOutcome};
+        assert_eq!(
+            crate::wire_stop_message(Ok(WireStopOutcome::Stopped)).unwrap(),
+            "Daemon stopped gracefully."
+        );
+        let pending = crate::wire_stop_message(Ok(WireStopOutcome::AcceptedNotConfirmed)).unwrap();
+        assert!(!pending.contains("stopped"), "{pending}");
+        assert!(pending.contains("still shutting down"), "{pending}");
+        let refusal = |reason, agent_ids: Vec<&str>| {
+            StopError::Refused(StopDaemonRefusal {
+                reason,
+                roles: Vec::new(),
+                agent_ids: agent_ids.into_iter().map(str::to_string).collect(),
+                message: "pass --force".into(),
+                summary: "pass --force".into(),
+            })
+        };
+        let agents =
+            crate::wire_stop_message(Err(refusal(StopRefusalReason::LiveAgents, vec!["1", "2"])))
+                .unwrap_err();
+        assert!(agents.contains("2 agents are still running"), "{agents}");
+        assert!(!agents.contains("--force"), "{agents}");
+        let roles = crate::wire_stop_message(Err(refusal(
+            StopRefusalReason::LiveOrchestrations,
+            vec!["1"],
+        )))
+        .unwrap_err();
+        assert!(roles.contains("Close the orchestration first"), "{roles}");
     }
 
     /// Scenario: two real daemons — the local deck and a remote row routed to

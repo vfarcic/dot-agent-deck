@@ -886,6 +886,15 @@ mod tests {
         /// Far above `DEADLINE`, far below "forever": an unbounded run fails
         /// the test instead of hanging the tier.
         const MUST_RETURN_WITHIN: Duration = Duration::from_secs(30);
+        /// For a test whose expected outcome is NOT the deadline: room for a
+        /// starved box to start the stand-in's shell and let it write, so the
+        /// 2 s `DEADLINE` cannot pre-empt the outcome under test. Measured at
+        /// a load average of ~11 (issue #2107's gate runs): the cap and parse
+        /// tests below failed with "did not finish within 2s" before `yes` or
+        /// `printf` had produced anything, and passed alone. Each test still
+        /// fails if its defect is present: an uncapped flood or a blocked
+        /// writer runs into this deadline and returns an error instead.
+        const LOADED_BOX_DEADLINE: Duration = Duration::from_secs(20);
 
         fn port_running(
             dir: &std::path::Path,
@@ -1028,7 +1037,7 @@ mod tests {
                 count = count.display(),
                 report = d.join("report.json").display()
             );
-            let p = port_running(d, &body);
+            let p = port_running(d, &body).with_deadlines(LOADED_BOX_DEADLINE, LOADED_BOX_DEADLINE);
             p.confirm_stdin.set(true);
             let set = crate::daemon_restart::stop_set_over_the_argument_limit();
             let payload = serde_json::to_vec(&set).unwrap().len();
@@ -1038,7 +1047,7 @@ mod tests {
                 report
             );
             assert!(
-                started.elapsed() < DEADLINE,
+                started.elapsed() < LOADED_BOX_DEADLINE,
                 "the unread payload held the call: {:?}",
                 started.elapsed()
             );
@@ -1063,7 +1072,8 @@ mod tests {
         #[test]
         fn an_endless_stdout_reply_is_capped_and_stopped() {
             let dir = crate::test_temp::tempdir().unwrap();
-            let p = port_running(dir.path(), "exec yes");
+            let p = port_running(dir.path(), "exec yes")
+                .with_deadlines(LOADED_BOX_DEADLINE, LOADED_BOX_DEADLINE);
             let started = Instant::now();
             assert_refused_at_cap(started, p.probe());
         }
@@ -1073,7 +1083,8 @@ mod tests {
         #[test]
         fn an_endless_stderr_reply_is_capped_and_stopped() {
             let dir = crate::test_temp::tempdir().unwrap();
-            let p = port_running(dir.path(), "exec yes >&2");
+            let p = port_running(dir.path(), "exec yes >&2")
+                .with_deadlines(LOADED_BOX_DEADLINE, LOADED_BOX_DEADLINE);
             let started = Instant::now();
             assert_refused_at_cap(started, p.restart_installed(None, None));
         }
@@ -1172,7 +1183,8 @@ mod tests {
                 confirm_stdin: false,
             })
             .unwrap();
-            let p = port_running(dir.path(), &format!("printf '%s\\n' '{line}'"));
+            let p = port_running(dir.path(), &format!("printf '%s\\n' '{line}'"))
+                .with_deadlines(LOADED_BOX_DEADLINE, LOADED_BOX_DEADLINE);
             assert!(!p.probe().unwrap().running);
         }
 
@@ -1238,7 +1250,8 @@ mod tests {
                     "sleep 600 &\necho $! > '{}'\nprintf '%s\\n' '{line}'",
                     pidfile.display()
                 ),
-            );
+            )
+            .with_deadlines(LOADED_BOX_DEADLINE, LOADED_BOX_DEADLINE);
             let started = Instant::now();
             let probe = p.probe();
             let elapsed = started.elapsed();
@@ -1258,20 +1271,45 @@ mod tests {
         /// case).
         #[test]
         fn a_quiet_descendant_holding_the_streams_is_killed_with_a_stopped_command() {
-            let dir = crate::test_temp::tempdir().unwrap();
-            let pidfile = dir.path().join("descendant.pid");
-            let p = port_running(
-                dir.path(),
-                &format!(
-                    "sleep 600 &\necho $! > '{}'\nexec sleep 600",
-                    pidfile.display()
-                ),
+            // The outcome under test IS the deadline, so it cannot be
+            // widened like `LOADED_BOX_DEADLINE`'s tests. On a starved box the
+            // deadline can kill the stand-in before it records the
+            // descendant's pid (measured at a load average of ~30, issue
+            // #2107's gate run: `recorded_pid` then waited out its budget for
+            // a file nothing would write). That run says nothing about the
+            // descendant, so it is repeated; the cleanup assertion only runs on
+            // a run whose stand-in recorded the pid.
+            const ATTEMPTS: usize = 5;
+            for attempt in 1..=ATTEMPTS {
+                let dir = crate::test_temp::tempdir().unwrap();
+                let pidfile = dir.path().join("descendant.pid");
+                let p = port_running(
+                    dir.path(),
+                    &format!(
+                        "sleep 600 &\necho $! > '{}'\nexec sleep 600",
+                        pidfile.display()
+                    ),
+                );
+                let started = Instant::now();
+                let result = p.restart_installed(Some("0.46.0"), None);
+                assert_stopped_at_deadline(started, result);
+                // The call returned after killing the stand-in's group, so the
+                // pid is either recorded already or never will be.
+                let Some(pid) = std::fs::read_to_string(&pidfile)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<libc::pid_t>().ok())
+                else {
+                    eprintln!(
+                        "attempt {attempt}: the stand-in was stopped before it recorded the pid"
+                    );
+                    continue;
+                };
+                assert_cleaned_up(pid);
+                return;
+            }
+            panic!(
+                "the stand-in never recorded the pid before the deadline in {ATTEMPTS} attempts"
             );
-            let started = Instant::now();
-            let result = p.restart_installed(Some("0.46.0"), None);
-            let pid = recorded_pid(&pidfile);
-            assert_cleaned_up(pid);
-            assert_stopped_at_deadline(started, result);
         }
 
         /// Scenario: a descendant that leaves the session's process group

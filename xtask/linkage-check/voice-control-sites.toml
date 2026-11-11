@@ -199,8 +199,20 @@ reason = "Dismisses the dashboard's new-agent notice: a dismissal."
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
+code = "() => setDaemonNotice(undefined)"
+reason = "Dismisses the dashboard's Stop daemon result notice (issue #1073): a dismissal."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
 code = "onUpgrade"
 reason = "A daemon card's Upgrade: the daemon upgrade flow, kept off voice because it restarts a daemon and its agents."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onStopDaemon"
+reason = "A daemon card's Stop daemon (issue #1073): stops a whole daemon, which may be on another machine. Kept off voice like the deck toolbar's Stop daemon (`requestStop`): a misheard daemon name would stop the wrong machine's daemon, and a stop cannot be undone from the app when that daemon is remote. Voice closes agents with `stop_agent`, which has its own confirmation."
 
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
@@ -249,6 +261,12 @@ file = "desktop/src/components/AgentOverview.tsx"
 handler = "onClick"
 code = "onConnectAnyway"
 reason = "Dashboard note's Connect anyway: overrides a compatibility refusal, a risk the user takes by hand."
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onReplaceDaemon"
+reason = "Dashboard note's Replace daemon (issue #1073): the deck toolbar's Replace daemon (`requestRestartDaemon`) on the local daemon's card; replaces an incompatible daemon, stopping its agents, so it is kept off voice for the same reason."
 
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"

@@ -109,6 +109,21 @@ The section shows why, under its message; **Technical details** under it holds w
 | `Could not start the daemon on this machine.` or `The daemon was started on this machine but did not answer at <socket> in time.` | Open **Technical details** for the error. To see everything the daemon prints, start one from a terminal with `dot-agent-deck daemon serve`; [Troubleshooting](../troubleshooting.md) covers the common causes. |
 | `The daemon is running on <host>, but the app could not connect to it: …` | Press **Reconnect**. If it keeps happening, press **Test connection** and follow what it says. |
 
+## Stop a daemon
+
+Each daemon's section on the Dashboard has a **Stop daemon** button while that daemon answers, whichever daemon the **Daemon** selector shows. It stops that daemon, on this machine or on a remote host. You do not need the `experimental` flag for this.
+
+1. On the Dashboard, press **Stop daemon** on the daemon's section header.
+2. The app asks first, naming where the daemon runs (`Stop the daemon on this machine?`, or the remote's name) and how many agents it reports running. Press **Stop daemon** in that dialog; **Cancel** stops nothing.
+
+The stop is refused while agents are running on that daemon: the app says how many are still running, and the daemon and its agents keep running. Close them first ([Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations)), then press **Stop daemon** again.
+
+**Check it worked:** the section shows **Daemon disconnected**, with **Start daemon** to start it again ([Start a daemon from the app](#start-a-daemon-from-the-app)). A remote daemon that is still closing after a few seconds is reported as still shutting down; its section turns to **Daemon disconnected** once it has gone.
+
+A remote daemon whose release is too old to be stopped from the app shows **Stop daemon** greyed out, and hovering it says so. Stop it from a terminal on its machine with `dot-agent-deck daemon stop`, or [upgrade it](#upgrade-a-remote-daemon).
+
+The TUI works with one daemon at a time, so it has no control for a daemon on another machine. Quitting it with **Stop** stops the daemon it is attached to ([Session Management](../session-management.md)), and `dot-agent-deck daemon stop` stops the one on this machine.
+
 ## Upgrade a remote daemon
 
 When a remote daemon runs an older release than the app, the app offers **Upgrade** for it. It installs the app's version on that machine and restarts the daemon onto it, without leaving the app. It is the same upgrade as `dot-agent-deck remote upgrade <name>` in a terminal ([Remote Environments → Upgrade a remote](../remote-environments.md#upgrade-a-remote)): the same question when agents are running, and the same results.
@@ -197,7 +212,7 @@ The app does this once for each daemon version while it is open, so after **Keep
 
 The restarted daemon sets up the agent hooks again, as every daemon start does.
 
-The daemon's restart applies only while the app is connected to the daemon on this machine, and **Upgrade** appears only while the **Local daemon** section is on the Dashboard, so the **Daemon** selector must show **This machine** or **All daemons**. Nothing happens when the daemon runs the same release as the app or a newer one. A daemon the app cannot work with shows **Incompatible daemon** with **Replace daemon** instead, which restarts it the same way ([Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)).
+The daemon's restart applies only while the app is connected to the daemon on this machine, and **Upgrade** appears only while the **Local daemon** section is on the Dashboard, so the **Daemon** selector must show **This machine** or **All daemons**. Nothing happens when the daemon runs the same release as the app or a newer one. A daemon on this machine that the app cannot work with shows **Incompatible daemon** on its Dashboard section with **Replace daemon** instead, which restarts it the same way, whichever daemon the **Daemon** selector shows ([Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)).
 
 A daemon from a release before 0.46.0 cannot be asked to restart. The app restarts it only when nothing is running on it; otherwise the dialog ends with **Daemon kept running** and lists what is running. Stop those agents, or let them finish, then press **Upgrade**.
 

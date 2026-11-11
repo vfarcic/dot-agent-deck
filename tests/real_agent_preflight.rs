@@ -13,6 +13,10 @@
 //! ASYMMETRIC ones — a set carrying only one of the two tokens. Each expiry must
 //! be bound to the presence of its own token, or the absent half's "no expiry
 //! information" silently votes "live" for a token that is not there.
+//!
+//! Issue #1731 narrowed the rule: a test HOME gets an ACCESS-ONLY copy of the
+//! login, so a refresh token no longer rescues an expired access token, and the
+//! access token must outlast the harness's run margin (one hour).
 
 use serde_json::{Value, json};
 
@@ -21,7 +25,10 @@ dot_agent_deck_test_harness::link!();
 /// Fixed clock for every case below; nothing here reads the wall clock.
 const NOW_MS: i64 = 1_700_000_000_000;
 const PAST_MS: i64 = NOW_MS - 60_000;
-const FUTURE_MS: i64 = NOW_MS + 60_000;
+/// Two hours ahead: past the harness's one-hour run margin.
+const FUTURE_MS: i64 = NOW_MS + 2 * 3_600_000;
+/// Ten minutes ahead: live, but inside the run margin.
+const SOON_MS: i64 = NOW_MS + 600_000;
 
 fn usable(oauth: &Value) -> Result<(), String> {
     common::claude_oauth_usable(oauth, NOW_MS)
@@ -38,39 +45,82 @@ fn live_access_token_alone_is_usable() {
     );
 }
 
+/// Issue #1731: a refresh token beside a lasting access token changes nothing —
+/// it is not copied, so it is not consulted.
 #[test]
-fn tokens_without_expiry_fields_are_usable() {
+fn a_lasting_access_token_with_a_refresh_token_is_usable() {
+    let oauth = json!({
+        "accessToken": "at",
+        "expiresAt": FUTURE_MS,
+        "refreshToken": "rt",
+        "refreshTokenExpiresAt": FUTURE_MS,
+    });
+    assert_eq!(usable(&oauth), Ok(()));
+}
+
+/// Issue #1731: with no `expiresAt` the harness cannot tell whether the
+/// access-only copy lasts the run, so it refuses rather than guess (the rule
+/// PRD #1666 gave the Pi login). It used to read as "no expiry information,
+/// never expired".
+#[test]
+fn an_access_token_without_an_expiry_is_rejected() {
     let oauth = json!({ "accessToken": "at", "refreshToken": "rt" });
-    assert_eq!(
-        usable(&oauth),
-        Ok(()),
-        "an absent expiry means NO EXPIRY INFORMATION, never expired"
+    let error = usable(&oauth).expect_err("an access token of unknown lifetime is refused");
+    assert!(error.contains("no `expiresAt`"), "{error}");
+    assert!(
+        error.contains("claude login"),
+        "the refusal names the remedy: {error}"
     );
 }
 
-/// The deliberate decision this check preserves: Claude Code itself refreshes an
-/// expired access token from a live refresh token, so that shape is usable.
+/// Issue #1731 removed PRD #126's deliberate acceptance of this shape. Claude
+/// Code on the host refreshes from it; the access-only copy a test HOME gets
+/// cannot, so it would fail at its first request.
 #[test]
-fn expired_access_token_with_a_live_refresh_token_is_usable() {
+fn expired_access_token_with_a_live_refresh_token_is_rejected() {
     let oauth = json!({
         "accessToken": "at",
         "expiresAt": PAST_MS,
         "refreshToken": "rt",
         "refreshTokenExpiresAt": FUTURE_MS,
     });
-    assert_eq!(
-        usable(&oauth),
-        Ok(()),
-        "an expired access token backed by a LIVE refresh token still works, \
-         because the CLI refreshes it"
+    let error = usable(&oauth)
+        .expect_err("the test copy carries no refresh token, so an expired access token is spent");
+    assert!(error.contains("has expired"), "{error}");
+    assert!(
+        error.contains("claude login"),
+        "the refusal names the remedy: {error}"
+    );
+}
+
+/// Issue #1731: a token that is live now but would expire during the run is
+/// refused with how long it has left and the remedy, quoting no token.
+#[test]
+fn an_access_token_expiring_within_the_run_margin_is_rejected() {
+    let oauth = json!({
+        "accessToken": "secret-at",
+        "expiresAt": SOON_MS,
+        "refreshToken": "secret-rt",
+        "refreshTokenExpiresAt": FUTURE_MS,
+    });
+    let error = usable(&oauth).expect_err("ten minutes does not last a test run");
+    assert!(error.contains("expires in 10 min"), "{error}");
+    assert!(
+        error.contains("60 min"),
+        "the refusal names the margin: {error}"
+    );
+    assert!(
+        error.contains("claude login"),
+        "the refusal names the remedy: {error}"
+    );
+    assert!(
+        !error.contains("secret"),
+        "the refusal quotes no token: {error}"
     );
 }
 
 /// Asymmetric shape A (PRD #126 audit): the sole token is an EXPIRED access
-/// token and there is no refresh token to renew it. Before each expiry was bound
-/// to its own token this passed, because the absent `refreshTokenExpiresAt`
-/// counted as "no expiry information" — i.e. as a live refresh token that did
-/// not exist.
+/// token and there is no refresh token to renew it.
 #[test]
 fn expired_sole_access_token_with_no_refresh_token_is_rejected() {
     let oauth = json!({ "accessToken": "at", "expiresAt": PAST_MS });
@@ -78,41 +128,35 @@ fn expired_sole_access_token_with_no_refresh_token_is_rejected() {
         "an expired access token with NO refresh token cannot be refreshed and must be rejected",
     );
     assert!(
-        error.contains("expired and cannot be refreshed"),
+        error.contains("has expired"),
         "the rejection must name expiry, not a missing token: {error}"
     );
 }
 
-/// Asymmetric shape B (PRD #126 audit): the converse — no access token at all,
-/// and the refresh token that would have to produce one is itself spent. The
-/// absent `expiresAt` used to vote "live" for the access token that is missing.
+/// Asymmetric shape B (PRD #126 audit): no access token at all. Since issue
+/// #1731 a refresh token alone is never enough, live or spent: the copy does
+/// not carry it.
 #[test]
-fn expired_sole_refresh_token_with_no_access_token_is_rejected() {
-    let oauth = json!({ "refreshToken": "rt", "refreshTokenExpiresAt": PAST_MS });
-    let error = usable(&oauth).expect_err(
-        "an expired refresh token with no access token leaves nothing usable and must be rejected",
-    );
-    assert!(
-        error.contains("expired and cannot be refreshed"),
-        "the rejection must name expiry, not a missing token: {error}"
-    );
+fn a_sole_refresh_token_with_no_access_token_is_rejected() {
+    for expiry in [PAST_MS, FUTURE_MS] {
+        let oauth = json!({ "refreshToken": "rt", "refreshTokenExpiresAt": expiry });
+        let error = usable(&oauth).expect_err("a refresh token alone leaves the copy nothing");
+        assert!(
+            error.contains("carry no access token, only a refresh token"),
+            "the rejection must name the missing access token: {error}"
+        );
+    }
 }
 
 /// The same asymmetry through the EMPTY-STRING door: a present-but-empty token
 /// is no token, so its own live expiry must not rescue the set.
 #[test]
 fn an_empty_token_string_does_not_borrow_its_own_live_expiry() {
-    let oauth = json!({
-        "accessToken": "at",
-        "expiresAt": PAST_MS,
-        "refreshToken": "",
-        "refreshTokenExpiresAt": FUTURE_MS,
-    });
-    let error = usable(&oauth)
-        .expect_err("an empty refresh token cannot refresh anything, however live its expiry is");
+    let oauth = json!({ "accessToken": "", "expiresAt": FUTURE_MS });
+    let error = usable(&oauth).expect_err("an empty access token is no access token");
     assert!(
-        error.contains("expired and cannot be refreshed"),
-        "the rejection must name expiry, not a missing token: {error}"
+        error.contains("no access or refresh token"),
+        "an empty token must count as missing: {error}"
     );
 }
 
@@ -127,7 +171,7 @@ fn both_tokens_expired_is_rejected() {
     let error =
         usable(&oauth).expect_err("a fully spent credential set must be reported as unusable");
     assert!(
-        error.contains("expired and cannot be refreshed"),
+        error.contains("has expired"),
         "the rejection must name expiry: {error}"
     );
 }

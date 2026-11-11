@@ -45,7 +45,8 @@ export function disconnectedDetails(connection: ConnectionView, options: { messa
 /**
  * Which recovery buttons a screen actually renders beside an incompatible
  * daemon's message. Each screen offers a different set — the Daemons screen's
- * banner can replace a local daemon, the dashboard can only point there — so
+ * banner and, since issue #1073, the dashboard's local card can replace a local
+ * daemon — so
  * the sentence that explains them is composed here, per screen, rather than in
  * the desktop crate, which cannot know which screen will show it.
  */
@@ -79,7 +80,9 @@ export function incompatibleRemedy(connection: ConnectionView, offered: OfferedR
     sentences.push("Connect anyway uses this daemon as it is until you quit the app, though some of what it shows may be wrong.");
   }
   if (offered.openDaemons) {
-    sentences.push("Open daemons goes to the Daemons screen, where a daemon on this machine can be replaced.");
+    // Issue #1073: when Replace daemon is on this screen already, the Daemons
+    // screen is not where it is.
+    sentences.push(offered.replaceDaemon ? "Open daemons goes to the Daemons screen." : "Open daemons goes to the Daemons screen, where a daemon on this machine can be replaced.");
   }
   if (offered.reconnect) {
     sentences.push("Reconnect tries again once the app and the daemon are on the same version.");
