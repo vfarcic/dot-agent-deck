@@ -1291,7 +1291,8 @@ fn env_operands_move_codex(operands: &[String]) -> bool {
 /// script given on its command line (`-c` alone or in a cluster such as `-lc`,
 /// fish's `-C`, `--command`, `--init-command`), every argument that is not an
 /// option is read as a script, which covers the script, an option's value and
-/// the positional arguments after it alike. A shell that runs a file or reads
+/// the positional arguments after it alike, and so is a script attached to its
+/// short option (`-Ccd /x`). A shell that runs a file or reads
 /// standard input is opaque here.
 fn shell_may_move_codex(args: &[String]) -> bool {
     const SCRIPT_OPTIONS: [&str; 2] = ["--command", "--init-command"];
@@ -1310,13 +1311,25 @@ fn shell_may_move_codex(args: &[String]) -> bool {
             let script = SCRIPT_OPTIONS
                 .iter()
                 .find_map(|option| arg.strip_prefix(option)?.strip_prefix('='));
-            match script {
+            match script.or_else(|| attached_script(arg)) {
                 Some(script) => script_may_move_codex(script),
                 None => {
                     !arg.starts_with('-') && !arg.starts_with('+') && script_may_move_codex(arg)
                 }
             }
         })
+}
+
+/// The script attached to a short `-c`/`-C` option in the same argument, as
+/// fish's `-Ccd /elsewhere` passes it: whatever follows the first `c` or `C`
+/// in a `-`/`+` option cluster. `None` when nothing follows it.
+fn attached_script(arg: &str) -> Option<&str> {
+    if arg.starts_with("--") {
+        return None;
+    }
+    let cluster = arg.strip_prefix('-').or_else(|| arg.strip_prefix('+'))?;
+    let at = cluster.find(['c', 'C'])?;
+    Some(&cluster[at + 1..]).filter(|script| !script.is_empty())
 }
 
 /// [`command_may_move_codex`] for a shell's `-c` script.
@@ -4031,6 +4044,9 @@ mod tests {
             &["fish", "--command", "cd /x; codex"],
             &["fish", "--init-command=set -x CODEX_HOME /x", "-c", "codex"],
             &["fish", "-C", "cd /x", "-c", "codex"],
+            // A script attached to the short option, in the same argument.
+            &["fish", "-Ccd /x", "-c", "codex"],
+            &["fish", "-iCset -x CODEX_HOME /x", "-c", "codex"],
         ] {
             let (program, args) = argv(moves);
             assert!(command_may_move_codex(&program, &args), "{moves:?}");
@@ -4049,6 +4065,8 @@ mod tests {
             &["env", "-u", "FOO", "codex"],
             &["env", "--", "FOO=1", "codex"],
             &["fish", "--command=codex"],
+            &["fish", "-Ccodex"],
+            &["bash", "-lc", "codex"],
             &["bash", "-l", "launcher.sh"],
             &["env"],
             // A launcher script or a shell running a file is opaque here.
