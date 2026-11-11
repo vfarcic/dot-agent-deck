@@ -27,6 +27,9 @@ Files beside `base` (argv[1]) steer it, each read on every loop:
   .redraw         redraw once now (removed when done)
   .noheader       draw no start-up header box, as a resumed session's
                   screen does not show the one the deck reads
+  .nohook         a submitted line runs no hook, as for a Codex whose deck
+                  hooks are switched off: the ring's only proof is the
+                  transcript
 At 24 rows or fewer it draws no logo before the first prompt, as Codex does
 at 24 x 80, so that frame has no width witness.
 It writes .pid, .bytes (every byte read), .inputs (each read with its
@@ -260,8 +263,17 @@ def redraw():
     if extra:
         rows_shown.append(extra.encode())
     for line in rows_shown:
-        out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + line
-        row += 2
+        # Issue #1730: a submitted line longer than the row (the doorbell line
+        # naming the deck's absolute path) continues at the indent, wrapped as
+        # the composer wraps it.
+        lines = wrapped(line, cols - 2)
+        if len(lines) == 1:
+            out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + line
+        else:
+            out += at(row, 0) + b'\x1b[2m\xe2\x80\xba\x1b[0m ' + lines[0].encode()
+            for i, cont in enumerate(lines[1:], 1):
+                out += at(row + i, 0) + b'  ' + cont.encode()
+        row += len(lines) + 1
     if external_edit and external_edit.error:
         out += at(row, 0) + external_edit.error
         row += 2
@@ -305,7 +317,10 @@ def run_hook(event, extra):
 
 def hook(line):
     # The prompt hook hands the agent its mail; with no model, the turn ends
-    # at once with Codex's Stop hook.
+    # at once with Codex's Stop hook. Under `.nohook` neither runs, as for a
+    # Codex whose deck hooks are switched off.
+    if flag('.nohook'):
+        return
     run_hook('UserPromptSubmit', {'prompt': line.decode('utf-8', 'replace')})
     run_hook('Stop', {})
 
