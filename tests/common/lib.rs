@@ -7512,6 +7512,66 @@ pub const OPENCODE_TEST_BIN_V1: &str = "v1";
 /// owns `~/.opencode/bin/opencode`, so the 1.x half lives here.
 pub const OPENCODE_PINNED_V1: &str = ".local/share/dot-agent-deck/opencode-1/bin/opencode";
 
+/// The [`OPENCODE_TEST_BIN_ENV`] value naming the pinned OpenCode 2.x
+/// ([`OPENCODE_PINNED_V2`]), as [`OPENCODE_TEST_BIN_V1`] names the 1.x (issue
+/// #2051).
+pub const OPENCODE_TEST_BIN_V2: &str = "v2";
+
+/// Where `scripts/box/bootstrap.sh` installs the pinned OpenCode 2.x, relative
+/// to the home directory: npm's own link under its prefix, which bootstrap
+/// then links `~/.opencode/bin/opencode` to (issue #2051).
+pub const OPENCODE_PINNED_V2: &str =
+    ".local/share/dot-agent-deck/opencode-2/node_modules/.bin/opencode";
+
+/// Set (non-empty) where the pinned OpenCode binaries are known to be
+/// installed, as CI's lane-1 shards are (`scripts/install-pinned-opencode.sh`
+/// runs before them on both backends): [`pinned_opencode_bin`] then fails a
+/// test whose binary is missing instead of letting it skip (issue #2051).
+pub const REQUIRE_PINNED_OPENCODE_ENV: &str = "DAD_E2E_REQUIRE_PINNED_OPENCODE";
+
+/// The pinned real OpenCode `major`.x (1 or 2) under the host's home — the
+/// [`OPENCODE_TEST_BIN_V1`] / [`OPENCODE_TEST_BIN_V2`] choice of
+/// [`OPENCODE_TEST_BIN_ENV`], resolved directly so one test can run both — once
+/// its `--version` reports that major (issue #2051). `Err` says what is
+/// missing, for [`skip_unless!`]; with [`REQUIRE_PINNED_OPENCODE_ENV`] set it
+/// panics instead, so a CI shard missing its install goes red rather than
+/// green.
+pub fn pinned_opencode_bin(major: u32) -> Result<PathBuf, String> {
+    let (choice, rel) = match major {
+        1 => (OPENCODE_TEST_BIN_V1, OPENCODE_PINNED_V1),
+        2 => (OPENCODE_TEST_BIN_V2, OPENCODE_PINNED_V2),
+        _ => panic!("no pinned OpenCode {major}.x"),
+    };
+    let found = resolve_opencode_test_bin(choice, &host_home(), std::ffi::OsStr::new(""))
+        .ok_or_else(|| {
+            format!(
+                "the pinned OpenCode {major}.x is not installed at ~/{rel}; install it with \
+                 scripts/install-pinned-opencode.sh (or scripts/box/bootstrap.sh)"
+            )
+        })
+        .and_then(|bin| {
+            let output = std::process::Command::new(&bin)
+                .arg("--version")
+                .current_dir(std::env::temp_dir())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("could not run `{} --version`: {e}", bin.display()))?;
+            match parse_opencode_version(&String::from_utf8_lossy(&output.stdout)) {
+                Some((found, _, _)) if found == major => Ok(bin),
+                other => Err(format!(
+                    "`{} --version` reports {other:?}, not OpenCode {major}.x",
+                    bin.display()
+                )),
+            }
+        });
+    if let Err(why) = &found
+        && std::env::var(REQUIRE_PINNED_OPENCODE_ENV).is_ok_and(|v| !v.trim().is_empty())
+    {
+        panic!("{REQUIRE_PINNED_OPENCODE_ENV} is set, so this is a failure, not a skip: {why}");
+    }
+    found
+}
+
 /// The OpenCode binary [`OPENCODE_TEST_BIN_ENV`] selects, resolved to a path:
 /// the variable's value (looked up on `PATH` when it has no `/`), else the
 /// first `opencode` on `PATH`. `None` when nothing resolves, which the
@@ -7537,17 +7597,23 @@ fn opencode_test_bin_choice() -> String {
         .unwrap_or_else(|| "opencode".to_string())
 }
 
-/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` is the
-/// pinned 1.x under `home`, a value with a `/` is a path, and anything else is
-/// a name looked up on `path`. Only an existing file resolves.
+/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` and `v2`
+/// are the pinned 1.x and 2.x under `home`, a value with a `/` is a path, and
+/// anything else is a name looked up on `path`. Only an existing file
+/// resolves.
 pub(crate) fn resolve_opencode_test_bin(
     chosen: &str,
     home: &Path,
     path: &std::ffi::OsStr,
 ) -> Option<PathBuf> {
-    if chosen == OPENCODE_TEST_BIN_V1 {
-        let pinned = home.join(OPENCODE_PINNED_V1);
-        return pinned.is_file().then_some(pinned);
+    for (name, rel) in [
+        (OPENCODE_TEST_BIN_V1, OPENCODE_PINNED_V1),
+        (OPENCODE_TEST_BIN_V2, OPENCODE_PINNED_V2),
+    ] {
+        if chosen == name {
+            let pinned = home.join(rel);
+            return pinned.is_file().then_some(pinned);
+        }
     }
     if chosen.contains('/') {
         let path = PathBuf::from(chosen);
@@ -7561,10 +7627,16 @@ pub(crate) fn resolve_opencode_test_bin(
 /// Why [`opencode_test_bin`] found nothing, for a preflight's `SKIP:`: for
 /// `v1`, where the pinned 1.x belongs and the script that installs it.
 pub fn opencode_test_bin_missing() -> String {
-    if opencode_test_bin_choice() == OPENCODE_TEST_BIN_V1 {
+    let choice = opencode_test_bin_choice();
+    if choice == OPENCODE_TEST_BIN_V1 || choice == OPENCODE_TEST_BIN_V2 {
+        let rel = if choice == OPENCODE_TEST_BIN_V1 {
+            OPENCODE_PINNED_V1
+        } else {
+            OPENCODE_PINNED_V2
+        };
         format!(
-            "the pinned OpenCode 1.x that {OPENCODE_TEST_BIN_ENV}={OPENCODE_TEST_BIN_V1} names is \
-             not installed at ~/{OPENCODE_PINNED_V1}; install it with scripts/box/bootstrap.sh"
+            "the pinned OpenCode that {OPENCODE_TEST_BIN_ENV}={choice} names is not installed at \
+             ~/{rel}; install it with scripts/box/bootstrap.sh"
         )
     } else {
         format!(

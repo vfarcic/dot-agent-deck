@@ -123,7 +123,7 @@ Run these from a terminal **outside** the deck, on the machine the daemon runs o
 
 ## Restoring a saved workspace
 
-When the TUI starts and recreates orchestration tabs from your saved workspace because their agents are gone ([Session Management → Resuming Sessions](session-management.md#resuming-sessions)), it shows the review for each saved orchestration that is not approved as its file now reads, one after the other, with the footer `a approve and restore · Esc cancel · ↑↓ scroll`. The rest of the workspace is restored first. Approving restores that tab; cancelling leaves it out. An orchestration that is approved and unchanged comes back without asking.
+When the TUI starts and recreates orchestration tabs from your saved workspace because their agents are gone ([Session Management → Resuming Sessions](session-management.md#resuming-sessions)), it shows the review for each saved orchestration that is not approved as its file now reads, one after the other, with the footer `a approve and restore · Esc cancel · ↑↓ scroll`. The rest of the workspace is restored first. Approving restores that tab, starting the same roles a restore that needed no approval would: those that had a pane when the workspace was saved. Cancelling leaves it out. An orchestration that is approved and unchanged comes back without asking.
 
 An orchestration you cancel, or have not answered yet when you quit, stays in your saved workspace and is offered again the next time the TUI restores it. To drop it for good, clear the saved workspace with `dot-agent-deck snapshot clear` ([Session Management → Starting Fresh](session-management.md#starting-fresh)).
 

@@ -1546,10 +1546,14 @@ fn delegate_verdict(
     // nobody — the first cause alone sent the user to a file that looked right.
     // Issue #524 added the fifth: a worker that exited on its own is still in
     // the role maps, and only a `clear = true` role is respawned by a delegate.
+    // Issue #929 named the way back from the third: a cold restore brings a role
+    // whose pane was closed back as an empty card, and only `pane spawn` starts
+    // it.
     let causes = "(A role reaches no worker when it is absent from \
                   .dot-agent-deck.toml, when it is the delegating orchestrator \
                   itself — an orchestrator cannot delegate to itself — when \
-                  its worker pane has been closed, when its worker has exited \
+                  its worker pane has been closed — `dot-agent-deck pane spawn \
+                  <role>` starts it — when its worker has exited \
                   and the role is not `clear = true` — `dot-agent-deck pane \
                   restart <role>` starts it again — or when the role was renamed \
                   or added in .dot-agent-deck.toml after this orchestration \
@@ -5356,6 +5360,15 @@ mod tests {
                     "renamed or added in .dot-agent-deck.toml after this orchestration started"
                 ),
             "the message must state all five causes, not assert one: {msg}"
+        );
+        // Issue #929: a role whose pane was closed, which a cold restore now
+        // brings back as an empty card, has its own way back, and the message
+        // names it (Qodo on PR #2267).
+        assert!(
+            msg.contains(
+                "its worker pane has been closed — `dot-agent-deck pane spawn <role>` starts it"
+            ),
+            "the closed-pane cause must name `pane spawn <role>`: {msg}"
         );
     }
 

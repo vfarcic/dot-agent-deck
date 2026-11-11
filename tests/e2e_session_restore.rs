@@ -169,6 +169,20 @@ fn stage_orchestration_snapshot(
     std::fs::write(session_file, s).expect("write staged orchestration session.toml");
 }
 
+/// The `version` and `started_role_indices` of the single orchestration block in
+/// the saved session at `session_file`, read through the deck's own schema.
+fn saved_started_roles(session_file: &Path) -> (u32, Vec<usize>) {
+    let text = std::fs::read_to_string(session_file).expect("read the saved session");
+    let session: dot_agent_deck::config::SavedSession =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("parse the saved session: {e}\n{text}"));
+    let block = session
+        .panes
+        .iter()
+        .find_map(|pane| pane.orchestration.clone())
+        .unwrap_or_else(|| panic!("the saved session carries no orchestration block:\n{text}"));
+    (block.version, block.started_role_indices)
+}
+
 /// Write an orchestration `.dot-agent-deck.toml` into `project_dir`: a single
 /// `[[orchestrations]]` named `config_name` whose roles are `(name, command)`
 /// pairs in order, with the role at `start_idx` flagged `start = true`. The
@@ -368,10 +382,10 @@ fn restore_006_empty_daemon_and_no_snapshot_lands_on_clean_dashboard() {
 /// The daemon-empty restore must rebuild the orchestration tab: the `coder` and
 /// `reviewer` role panes appear as deck cards in their saved order, and — unlike
 /// warm hydration — the saved `orchestrator_prompt` is replayed to the start
-/// (orchestrator) role, posted to its inbox. RED before PRD #89 M2b.3:
-/// there is no snapshot-fallback orchestration restore branch, so the saved pane
-/// comes back as a single plain dashboard card and neither the role panes nor
-/// the prompt replay ever materialize.
+/// (orchestrator) role, posted to its inbox. The snapshot is an old (`version =
+/// 1`) one, whose `started_role_indices` was never an honest record, so every
+/// declared role runs again (issue #929), and a clean detach re-saves it as
+/// `version = 2` listing all three roles as started.
 #[spec("session/restore/008")]
 #[test]
 fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
@@ -409,7 +423,7 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
 
     // No `--continue` flag; the lazy-spawned daemon is brand new (empty), so the
     // disk snapshot is the only possible source — the snapshot-fallback path.
-    let deck = TuiDeck::builder()
+    let mut deck = TuiDeck::builder()
         .trusting_project(project_dir.path())
         .with_env(
             "DOT_AGENT_DECK_SESSION",
@@ -460,6 +474,138 @@ fn restore_008_daemon_empty_snapshot_rebuilds_orchestration_tab() {
          inbox ({:?}).\nFinal grid:\n{}",
         role_pane(attach, "orchestrator").map(|pane| inbox_view::messages(attach, &pane)),
         deck.snapshot_grid()
+    );
+
+    // Issue #929: a `version = 1` snapshot's `started_role_indices` was always
+    // `[start_role_index]`, whatever had been running, so it is no record of
+    // what was live (this one even says `[0, 1]`). Every declared role must run
+    // again, as it did before the field was read: the reviewer, which the list
+    // leaves out, included.
+    let roles = ["orchestrator", "coder", "reviewer"];
+    let every_role_running =
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            roles.iter().all(|role| role_pane(attach, role).is_some())
+        });
+    assert!(
+        every_role_running,
+        "issue #929: an old (`version = 1`) snapshot must restore EVERY declared role, whatever \
+         its `started_role_indices` says, but these roles have no agent on the daemon: {:?}",
+        roles
+            .iter()
+            .filter(|role| role_pane(attach, role).is_none())
+            .collect::<Vec<_>>()
+    );
+
+    // And the next save records what is live now, honestly: all three roles,
+    // under the version that says the list can be believed.
+    detach_and_collect_output(&mut deck);
+    assert_eq!(
+        saved_started_roles(&session_file),
+        (2, vec![0, 1, 2]),
+        "issue #929: re-saving a restored orchestration must record every live role in \
+         `started_role_indices` under `version = 2`."
+    );
+}
+
+/// Scenario: Stage `session/restore/008`'s three-role orchestration (each role a
+/// recorder script that logs its own start) and hand-stage a current (`version =
+/// 2`) snapshot recording only the orchestrator and `coder` as started, as a deck
+/// writes once the `reviewer` pane was closed. Launch against a fresh (empty)
+/// daemon: the tab comes back with the `reviewer` card on it but nothing running
+/// behind it, while the orchestrator and `coder` run again, and a clean detach
+/// re-saves the same `[0, 1]`, so the slot stays empty across another restart.
+/// The orchestration is pre-approved, so no trust prompt holds the restore.
+#[spec("session/restore/025")]
+#[test]
+fn restore_025_current_snapshot_restores_only_the_roles_that_were_running() {
+    let project_dir = common::race_safe_tempdir();
+    let orchestrator_cmd = write_recorder_agent(project_dir.path(), "orchestrator");
+    let coder_cmd = write_recorder_agent(project_dir.path(), "coder");
+    let reviewer_cmd = write_recorder_agent(project_dir.path(), "reviewer");
+    write_orchestration_config(
+        project_dir.path(),
+        "tdd-cycle",
+        &[
+            ("orchestrator", orchestrator_cmd.as_str()),
+            ("coder", coder_cmd.as_str()),
+            ("reviewer", reviewer_cmd.as_str()),
+        ],
+        0,
+    );
+
+    let session_dir = common::race_safe_tempdir();
+    let session_file = session_dir.path().join("session.toml");
+    stage_orchestration_snapshot(
+        &session_file,
+        project_dir.path(),
+        "orchestrator",
+        &orchestrator_cmd,
+        &["orchestrator", "coder", "reviewer"],
+        0,
+        "",
+        "tdd-cycle",
+        project_dir.path(),
+        &[0, 1],
+        None,
+    );
+    let staged = std::fs::read_to_string(&session_file).expect("read the staged snapshot");
+    std::fs::write(
+        &session_file,
+        staged.replacen("version = 1\n", "version = 2\n", 1),
+    )
+    .expect("mark the staged snapshot as the current version");
+
+    // PRD #1885: pre-approved, so the restore under test is not held back for
+    // a trust prompt (`config-trust/restore/005` covers the held one).
+    let mut deck = TuiDeck::builder()
+        .trusting_project(project_dir.path())
+        .with_pty_size(160, 45)
+        .with_env(
+            "DOT_AGENT_DECK_SESSION",
+            session_file.to_str().expect("session path is UTF-8"),
+        )
+        .launch_with_fixture("minimal");
+
+    // The tab is rebuilt with all three role cards, the empty one included, and
+    // the two roles the snapshot lists are running.
+    let attach = deck.attach_socket_path().to_path_buf();
+    let rebuilt = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        let grid = deck.snapshot_grid();
+        grid.contains("coder")
+            && grid.contains("reviewer")
+            && role_pane(&attach, "orchestrator").is_some()
+            && role_pane(&attach, "coder").is_some()
+            && project_dir.path().join("started-coder.log").exists()
+    });
+    assert!(
+        rebuilt,
+        "issue #929: the orchestration tab must be rebuilt with the orchestrator and `coder` \
+         running and a `reviewer` card on screen.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    // The reviewer was not running when the snapshot was taken, so restore must
+    // not start it. Read after the coder's start, which the same pass spawns.
+    assert_eq!(
+        role_pane(&attach, "reviewer"),
+        None,
+        "issue #929: a role the current snapshot does not list as started must come back as \
+         an empty slot, but the daemon is running an agent for `reviewer`.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        !project_dir.path().join("started-reviewer.log").exists(),
+        "issue #929: restore ran the `reviewer` role's command although the snapshot recorded \
+         it as not started."
+    );
+
+    // The empty slot stays empty across the next save.
+    detach_and_collect_output(&mut deck);
+    assert_eq!(
+        saved_started_roles(&session_file),
+        (2, vec![0, 1]),
+        "issue #929: re-saving must record the same two started roles, so the empty slot \
+         stays empty across another restart."
     );
 }
 

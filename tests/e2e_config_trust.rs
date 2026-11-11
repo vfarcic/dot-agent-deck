@@ -1262,6 +1262,135 @@ fn restore_004_quitting_with_the_restore_prompt_open_keeps_the_orchestration_sav
     staged.assert_kept_and_asked_again("quitting with the prompt unanswered");
 }
 
+/// The saved orchestration block's snapshot `version` and
+/// `started_role_indices` in `session_file`.
+fn saved_started_roles(session_file: &Path) -> (u32, Vec<usize>) {
+    let text = std::fs::read_to_string(session_file).expect("read the saved session");
+    let session: dot_agent_deck::config::SavedSession =
+        toml::from_str(&text).unwrap_or_else(|e| panic!("parse the saved session: {e}\n{text}"));
+    let block = session
+        .panes
+        .iter()
+        .find_map(|pane| pane.orchestration.clone())
+        .unwrap_or_else(|| panic!("the saved session carries no orchestration block:\n{text}"));
+    (block.version, block.started_role_indices)
+}
+
+/// Scenario: Approve `restore-orch`, change one character of its `coder`
+/// command, and stage a current (`version = 2`) saved snapshot recording only
+/// the orchestrator and `coder` as running. Launch to the restore prompt and
+/// quit with it unanswered: the saved block keeps `[0, 1]`. Launch again and
+/// press `a`: the orchestrator and `coder` start and the `reviewer` does not,
+/// as for a snapshot that needed no approval.
+#[spec("config-trust/restore/005")]
+#[test]
+fn restore_005_an_approved_held_restore_starts_only_the_roles_that_were_running() {
+    let scratch = common::race_safe_tempdir();
+    let project = scratch.path().join("restore-project");
+    let state = scratch.path().join("state");
+    let home = scratch.path().join("approve-home");
+    std::fs::create_dir_all(&project).expect("create project");
+    std::fs::create_dir_all(&home).expect("create approve HOME");
+    write_restore_config(&project, "sleep 600");
+    let approved = restore_trust_cli(
+        &project,
+        &state,
+        &home,
+        &["approve", &project.to_string_lossy(), "--yes"],
+    );
+    assert!(
+        approved.status.success(),
+        "precondition approve: {}",
+        describe(&approved)
+    );
+    write_restore_config(&project, "sleep 601"); // one character changed
+
+    let session_file = scratch.path().join("session.toml");
+    stage_orchestration_session(
+        &session_file,
+        &project,
+        &["orchestrator", "coder", "reviewer"],
+    );
+    let staged = std::fs::read_to_string(&session_file).expect("read the staged session");
+    let current = staged
+        .replacen("version = 1\n", "version = 2\n", 1)
+        .replacen(
+            "started_role_indices = [0, 1, 2]\n",
+            "started_role_indices = [0, 1]\n",
+            1,
+        );
+    std::fs::write(&session_file, current).expect("stage a current snapshot");
+    assert_eq!(
+        saved_started_roles(&session_file),
+        (2, vec![0, 1]),
+        "precondition: the staged snapshot is current and lists two roles"
+    );
+    let launch = || {
+        let deck = TuiDeck::builder()
+            .with_pty_size(140, 50)
+            .with_env("DOT_AGENT_DECK_SESSION", session_file.to_string_lossy())
+            .with_env("DOT_AGENT_DECK_STATE_DIR", state.to_string_lossy())
+            .launch_with_fixture("plain-project");
+        let grid = wait_for_prompt(&deck);
+        assert!(
+            grid.contains("a approve and restore") && grid.contains("restore-orch"),
+            "precondition: the restore prompt for `restore-orch`.\nGrid:\n{grid}"
+        );
+        deck
+    };
+
+    // Held: quitting with the prompt unanswered keeps the block as it was
+    // saved, which roles were running included.
+    let mut first = launch();
+    first.send_keys(b"\x03");
+    first.wait_for_string("Quit dot-agent-deck?");
+    first.send_keys(b"\r"); // Enter -> Detach (default)
+    assert_eq!(
+        first.wait_for_exit_within(common::load_scaled(Duration::from_secs(30))),
+        Some(true),
+        "the deck must detach-quit cleanly from the restore prompt.\nGrid:\n{}",
+        first.snapshot_grid()
+    );
+    assert_eq!(
+        saved_started_roles(&session_file),
+        (2, vec![0, 1]),
+        "a held restore must stay saved with the roles that were running, not every role"
+    );
+
+    // Approved: only the roles that were running start.
+    let second = launch();
+    let attach = second.attach_socket_path().to_path_buf();
+    second.send_keys(b"a");
+    let restored = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "orchestrator").is_some() && role_record(&attach, "coder").is_some()
+    });
+    assert!(
+        restored,
+        "`a` must approve and restore the orchestrator and `coder`; roles = {:?}\nGrid:\n{}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        second.snapshot_grid()
+    );
+    assert!(
+        !common::wait_until(Duration::from_secs(2), || role_record(&attach, "reviewer")
+            .is_some()),
+        "the `reviewer` was not running when the session was saved, so approving the restore \
+         must not start it; roles = {:?}\nGrid:\n{}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        second.snapshot_grid()
+    );
+    assert!(
+        second.snapshot_grid().contains("reviewer"),
+        "the `reviewer` keeps its card on the restored tab.\nGrid:\n{}",
+        second.snapshot_grid()
+    );
+}
+
 /// How the project config has drifted from a saved orchestration snapshot
 /// before the TUI restores it (`config-trust/restore/003`).
 enum RestoreDrift {

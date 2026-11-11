@@ -1914,7 +1914,7 @@ describe("voice control panel", () => {
     const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
     render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(voiceButton().closest("[inert]")).toBeNull();
     await turnVoiceOn(voice);
@@ -2864,7 +2864,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     });
     const view = render(<DeckShell runtime={deck} />);
     await flush();
-    if (openPane) fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    if (openPane) fireEvent.click(screen.getByRole("button", { name: /^Open (prd-1401 \/ )?(Planner|Plan \/ architecture) agent$/ }));
     await turnVoiceOn(voice);
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
     await flush();
@@ -2964,7 +2964,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
   /** Scenario (decision 3): with Reading on, opening an agent's pane and then Settings neither ends reading nor says "Reading off."; the indicator stays on every screen. */
   it("keeps reading through panes and Settings", async () => {
     const h = await mount({ reading: "on", notice: "shown" });
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     await flush();
     expect(screen.getByTestId("voice-reading-indicator")).toBeInTheDocument();
     await h.say("open settings");
