@@ -84,22 +84,24 @@ static DELIVERY: LazyLock<Regex> = LazyLock::new(|| {
 
 static DOORBELL: LazyLock<Regex> = LazyLock::new(|| {
     let prefix = regex::escape(crate::doorbell::LINE_PREFIX.trim());
-    let suffix = regex::escape(
-        crate::doorbell::LINE_SUFFIX
+    let waiting = regex::escape(
+        crate::doorbell::LINE_WAITING
             .split(',')
             .next()
-            .unwrap_or(crate::doorbell::LINE_SUFFIX),
+            .unwrap_or(crate::doorbell::LINE_WAITING),
     );
-    Regex::new(&format!("{prefix} {ID_PATTERN}{suffix}")).expect("the doorbell pattern is valid")
+    Regex::new(&format!("{prefix} {ID_PATTERN}{waiting}")).expect("the doorbell pattern is valid")
 });
 
 /// PRD #1666 part 3, round 5-wake (plan §1.2): a token-led doorbell line,
-/// `(token) dot-agent-deck: message <id> waiting, run: dot-agent-deck inbox
-/// fetch`, the token six lowercase letters.
+/// `(token) dot-agent-deck: message <id> waiting, run: <deck> inbox fetch`,
+/// the token six lowercase letters and `<deck>` any command word — the
+/// absolute path a deck since issue #1730 types, or an older deck's bare
+/// `dot-agent-deck` ([`crate::doorbell::line_tail_pattern`]).
 static RING: LazyLock<Regex> = LazyLock::new(|| {
     let prefix = regex::escape(crate::doorbell::LINE_PREFIX);
-    let suffix = regex::escape(crate::doorbell::LINE_SUFFIX);
-    Regex::new(&format!(r"\(([a-z]{{6}})\){prefix}{ID_PATTERN}{suffix}"))
+    let tail = crate::doorbell::line_tail_pattern();
+    Regex::new(&format!(r"\(([a-z]{{6}})\){prefix}{ID_PATTERN}{tail}"))
         .expect("the ring pattern is valid")
 });
 

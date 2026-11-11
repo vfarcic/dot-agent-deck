@@ -795,6 +795,7 @@ impl AgentPtyRegistry {
             settling,
             submit_route: caps.hook_route || caps.transcript_route,
             still_admitted: still,
+            command: crate::platform::paths::binary_name(),
         };
         let draw = || {
             let mut byte = [0u8; 1];

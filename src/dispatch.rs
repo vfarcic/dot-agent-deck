@@ -871,7 +871,13 @@ fn dispatch_prompt(
          signal still reports success with the words missing.\n\n\
          That report is delivered straight into the conversation that dispatched you, so \
          write it for someone who cannot see this pane: what you did, what the outcome was, \
-         and anything they have to act on. Run it exactly once, when you are done."
+         and anything they have to act on. Run it once, when you are done.\n\n\
+         If that report later turns out to be wrong or stale — a test run finished after you \
+         sent it, or the outcome changed — run the same command again with a corrected report \
+         in a fresh file. It is delivered as an update to your report: the first report still \
+         stands and is not replaced, so say what changed. A unit may send {max_updates} updates, \
+         and running the command again with the same report sends nothing new.",
+        max_updates = crate::report_recovery::MAX_REPORT_UPDATES
     ));
     // Issue #550: the report above travels back over the wire and is deleted, so
     // it needs nowhere durable. Anything BIGGER than that does — the return edge

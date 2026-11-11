@@ -220,6 +220,7 @@ impl World {
             settling: false,
             submit_route: true,
             still_admitted: true,
+            command: dot_agent_deck::platform::paths::binary_name(),
         }
     }
 
