@@ -3838,6 +3838,36 @@ timeout_secs = 600
         );
     }
 
+    /// Issue #2085: `config get` answers each of these keys with its field's
+    /// value, moved off the default first; a key without its arm is refused.
+    #[test]
+    fn get_field_reads_each_bell_doorbell_and_command_key() {
+        let mut dc = DashboardConfig {
+            default_command: "my-agent --flag".into(),
+            ..Default::default()
+        };
+        dc.bell.enabled = !dc.bell.enabled;
+        dc.bell.on_waiting_for_input = !dc.bell.on_waiting_for_input;
+        dc.bell.on_idle = !dc.bell.on_idle;
+        dc.bell.on_error = !dc.bell.on_error;
+        dc.doorbell.claude = !dc.doorbell.claude;
+        dc.doorbell.codex = !dc.doorbell.codex;
+        for (key, expected) in [
+            ("default_command", dc.default_command.clone()),
+            ("bell.enabled", dc.bell.enabled.to_string()),
+            (
+                "bell.on_waiting_for_input",
+                dc.bell.on_waiting_for_input.to_string(),
+            ),
+            ("bell.on_idle", dc.bell.on_idle.to_string()),
+            ("bell.on_error", dc.bell.on_error.to_string()),
+            ("doorbell.claude", dc.doorbell.claude.to_string()),
+            ("doorbell.codex", dc.doorbell.codex.to_string()),
+        ] {
+            assert_eq!(dc.get_field(key), Ok(expected), "{key}");
+        }
+    }
+
     /// PRD #1223: `config set default_dir` takes an absolute path, refuses a
     /// relative one, unsets on empty, and an unset key is not written back.
     #[test]
