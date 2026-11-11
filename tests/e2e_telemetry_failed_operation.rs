@@ -162,7 +162,7 @@ fn unix_nanos_now() -> u64 {
         .as_nanos() as u64
 }
 
-/// Scenario: Send a Bash start hook to an attached stand-in pane, press Escape in the TUI as a person interrupting the call would, then send only the `UserPromptSubmit` and `Stop` hooks of the next turn — the hooks Claude Code fires when Escape interrupts a running Bash call, which fires no end of its own. The operation must export when that turn ends, while the run is still open, marked `interrupted` and ending at the Escape rather than at the `Stop`; a second call left open with no Escape ends at its turn's `Stop`, marked `turn_end`.
+/// Scenario: Send a Bash start hook to an attached stand-in pane, press Escape in the TUI as a person interrupting the call would, then send the next turn's `UserPromptSubmit`, a short call that starts and ends, and its `Stop` — the hooks Claude Code fires when Escape interrupts a running Bash call, which fires no end of its own. The operation must export when that turn ends, while the run is still open, marked `interrupted` and ending at the Escape rather than at the `Stop`; a second call left open with no Escape ends at its turn's `Stop`, marked `turn_end`.
 #[spec("telemetry/otlp/049")]
 #[test]
 fn telemetry_otlp_049_interrupted_call_ends_with_its_turn() {
@@ -221,7 +221,23 @@ fn telemetry_otlp_049_interrupted_call_ends_with_its_turn() {
         "UserPromptSubmit",
         json!({"prompt": "go on"}),
     );
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    // A barrier rather than a wait: a call (`ls`) that starts and ends after the
+    // prompt exports after anything the prompt had ended, since spans leave
+    // in the order they end, so once it is out the `make` call would be too.
+    send_hook(&deck, &agent, "barrier-call", "ls", "PreToolUse", json!({}));
+    send_hook(
+        &deck,
+        &agent,
+        "barrier-call",
+        "ls",
+        "PostToolUse",
+        json!({}),
+    );
+    assert!(
+        common::wait_until(EXPORT_WAIT, || end_of("ls").is_some()),
+        "the barrier call never exported: {:?}",
+        receiver.operations(&pane)
+    );
     assert!(
         end_of("make").is_none(),
         "a prompt must not end a call: {:?}",

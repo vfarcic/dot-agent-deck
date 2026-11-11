@@ -278,6 +278,15 @@ struct OpenOperation {
     /// A subagent's call: the main thread's turn ending does not end it, since
     /// a background subagent runs on past that (issue #2093).
     from_subagent: bool,
+    /// The agent session that started the call: only that session's turn end
+    /// ends it (issue #2093). An OpenCode child session whose parent the
+    /// plugin has not learned yet reports its idle as its own session's.
+    session_id: String,
+    /// The first interrupt key (Escape or Ctrl+C) pressed in the pane while
+    /// the call was open, for a main-thread call (issue #2093). A later key
+    /// does not move it: an interrupted Claude Code turn fires no `Stop`, so
+    /// the call can stay open across further turns and keys.
+    interrupted_at: Option<u64>,
 }
 
 /// A run whose agent is starting: see [`RunTracker::prepare_run`].
@@ -394,10 +403,6 @@ struct ActiveRun {
     interventions: u64,
     status_changes: u64,
     last_human_input: Option<u64>,
-    /// When a person last pressed an interrupt key (Escape or Ctrl+C) in the
-    /// pane: a call open then that the agent never reports the end of ends
-    /// there (issue #2093).
-    last_interrupt: Option<u64>,
     /// The kind of the current burst of input, and where its
     /// `deck.intervention` event is in `events` — `None` when the event was
     /// not kept ([`MAX_EVENTS_PER_RUN`]).
@@ -674,7 +679,13 @@ impl ActiveRun {
         };
         let now = self.last_human_input.map_or(now, |last| now.max(last));
         if kind == InterventionKind::Interrupt {
-            self.last_interrupt = Some(now);
+            for op in self
+                .operations
+                .iter_mut()
+                .filter(|op| !op.from_subagent && op.interrupted_at.is_none())
+            {
+                op.interrupted_at = Some(now);
+            }
         }
         let new_burst = self
             .last_human_input
@@ -701,14 +712,6 @@ impl ActiveRun {
                 *attribute = Attribute::str(AttrKey::InterventionKind, kind.as_str());
             }
         }
-    }
-
-    /// Issue #2093: when `op`, a main-thread call, was interrupted: the last
-    /// interrupt key pressed in the pane since it started, if any.
-    fn interrupted(&self, op: &OpenOperation) -> Option<(OperationEnd, u64)> {
-        self.last_interrupt
-            .filter(|&at| !op.from_subagent && at >= op.start)
-            .map(|at| (OperationEnd::Interrupted, at))
     }
 
     /// Remember whether the deck answers `question` by typing keys into the
@@ -1095,7 +1098,6 @@ impl RunTracker {
                 interventions: 0,
                 status_changes: 0,
                 last_human_input: None,
-                last_interrupt: None,
                 burst: None,
                 idle_wait: false,
                 operations: Vec::new(),
@@ -1332,7 +1334,7 @@ impl RunTracker {
         if is_shell_tool(event.tool_name.as_deref()) {
             observe_operation(run, &kept, now, &mut self.finished);
         } else if ends_main_turn(event) {
-            end_turn_operations(run, now, &mut self.finished);
+            end_turn_operations(run, &event.session_id, now, &mut self.finished);
         }
         let status = run
             .cards
@@ -1736,9 +1738,7 @@ impl RunTracker {
             self.finished.push(status_span(&run, open, now));
         }
         for open in std::mem::take(&mut run.operations) {
-            let (end, at) = run
-                .interrupted(&open)
-                .unwrap_or((OperationEnd::RunEnd, now));
+            let (end, at) = interrupted(&open).unwrap_or((OperationEnd::RunEnd, now));
             self.finished.push(operation_span(&run, open, at, end));
         }
         if let Some(key) = run.ci_pr.take() {
@@ -2108,34 +2108,52 @@ impl FinishingRun {
 
 /// Whether `event` is the agent's main thread ending its turn: `Idle` from
 /// its own hook (Claude Code's or Devin's `Stop`, Codex's `Stop` or
-/// `Interrupt`, OpenCode's idle session, Pi's idle). Not a subagent's, whose
-/// turn is not the main thread's, and not the wrapper's Idle read from the
-/// agent's output, which can fire while a command runs quietly. A prompt is
-/// not a turn's end: Claude Code fires `UserPromptSubmit` for a prompt typed
-/// while a command runs, before that call's end (issue #2093).
+/// `Interrupt`, OpenCode's idle session, Pi's idle), or Claude Code's
+/// `StopFailure`, which fires instead of `Stop` when an API error ends the
+/// turn and arrives as an `Error` or a `QuotaBlocked` naming no tool (a failed
+/// tool call's `Error` names its tool). Not a subagent's, whose turn is not
+/// the main thread's, and not the wrapper's Idle read from the agent's
+/// output, which can fire while a command runs quietly. A prompt is not a
+/// turn's end: Claude Code fires `UserPromptSubmit` for a prompt typed while
+/// a command runs, before that call's end (issue #2093).
 fn ends_main_turn(event: &AgentEvent) -> bool {
-    event.event_type == EventType::Idle
+    let stop_failure = event.agent_type == AgentType::ClaudeCode
+        && matches!(event.event_type, EventType::Error | EventType::QuotaBlocked)
+        && event.tool_name.is_none();
+    (event.event_type == EventType::Idle || stop_failure)
         && !event.is_from_subagent()
         && !event
             .metadata
             .contains_key(crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
 }
 
-/// The main thread's turn ended at `now` (issue #2093): every call the main
-/// thread started that is still open is over, since the agent ends a turn
-/// only once its calls are done, so end each — at the interrupt key pressed
-/// while it was open ([`OperationEnd::Interrupted`]), else here
-/// ([`OperationEnd::TurnEnd`]). A subagent's call stays open: a background
-/// subagent runs on past the main thread's turn.
-fn end_turn_operations(run: &mut ActiveRun, now: u64, finished: &mut Vec<SpanRecord>) {
+/// The main thread of agent session `session_id` ended its turn at `now`
+/// (issue #2093): every call that thread started that is still open is over,
+/// since the agent ends a turn only once its calls are done, so end each — at
+/// the first interrupt key pressed while it was open
+/// ([`OperationEnd::Interrupted`]), else here ([`OperationEnd::TurnEnd`]). A
+/// subagent's call stays open, since a background subagent runs on past the
+/// main thread's turn, and so does another session's.
+fn end_turn_operations(
+    run: &mut ActiveRun,
+    session_id: &str,
+    now: u64,
+    finished: &mut Vec<SpanRecord>,
+) {
     let (ended, open): (Vec<_>, Vec<_>) = std::mem::take(&mut run.operations)
         .into_iter()
-        .partition(|op| !op.from_subagent);
+        .partition(|op| !op.from_subagent && op.session_id == session_id);
     run.operations = open;
     for op in ended {
-        let (end, at) = run.interrupted(&op).unwrap_or((OperationEnd::TurnEnd, now));
+        let (end, at) = interrupted(&op).unwrap_or((OperationEnd::TurnEnd, now));
         finished.push(operation_span(run, op, at, end));
     }
+}
+
+/// Issue #2093: when `op` was interrupted — the first interrupt key pressed
+/// in the pane while it was open — if it was.
+fn interrupted(op: &OpenOperation) -> Option<(OperationEnd, u64)> {
+    op.interrupted_at.map(|at| (OperationEnd::Interrupted, at))
 }
 
 /// A shell tool's start or end reached `run`: open an operation, or end the
@@ -2176,6 +2194,8 @@ fn observe_operation(
                     .unwrap_or_else(|| describe_tool(event.tool_name.as_deref(), None)),
                 call_id: call_id.cloned(),
                 from_subagent: event.is_from_subagent(),
+                session_id: event.session_id.clone(),
+                interrupted_at: None,
             });
         }
         EventType::ToolEnd | EventType::Error => {
@@ -4520,6 +4540,91 @@ pub(crate) mod tests {
             ends,
             vec![None, None, Some(AttrValue::Str("run_end".into()))]
         );
+    }
+
+    /// Issue #2093 review (Greptile, Qodo): a later interrupt key does not
+    /// move an earlier call's end. An interrupted Claude Code turn fires no
+    /// `Stop`, so a call it killed stays open into the next turn, where the
+    /// person may press Escape again: each call ends at the first key pressed
+    /// while it was open.
+    #[test]
+    fn each_interrupted_call_keeps_the_first_key_pressed_while_it_ran() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c1")),
+            10,
+        );
+        tracker.observe_human_input("p1", 20, InterventionKind::Interrupt);
+        tracker.observe_event(
+            &shell(
+                "p1",
+                EventType::ToolStart,
+                "Bash",
+                Some("cargo"),
+                Some("c2"),
+            ),
+            30,
+        );
+        tracker.observe_human_input("p1", 40, InterventionKind::Interrupt);
+        tracker.observe_human_input("p1", 45, InterventionKind::Interrupt);
+        tracker.observe_event(&event("p1", EventType::Idle), 50);
+        let mut ends = tracker
+            .take_finished()
+            .into_iter()
+            .filter(|s| s.name == SPAN_AGENT_OPERATION)
+            .map(|s| {
+                (
+                    attr(&s, AttrKey::OperationEnd).cloned(),
+                    s.start_unix_nanos,
+                    s.end_unix_nanos,
+                )
+            })
+            .collect::<Vec<_>>();
+        ends.sort_by_key(|(_, start, _)| *start);
+        let interrupted = Some(AttrValue::Str("interrupted".into()));
+        assert_eq!(
+            ends,
+            vec![(interrupted.clone(), 10, 20), (interrupted, 30, 40)]
+        );
+    }
+
+    /// Issue #2093 review (Qodo): Claude Code's `StopFailure` ends a turn
+    /// instead of `Stop`, as an `Error` or a `QuotaBlocked` naming no tool,
+    /// so it ends the turn's open calls too. A failed call's `Error` names
+    /// its tool and ends no other call; another session's idle (an OpenCode
+    /// child the plugin has not placed yet) ends none of this session's.
+    #[test]
+    fn a_failed_turn_ends_its_calls_and_other_sessions_do_not() {
+        let open_ops = |tracker: &RunTracker| tracker.runs["p1"].operations.len();
+        for failure in [EventType::Error, EventType::QuotaBlocked] {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            tracker.observe_event(
+                &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c1")),
+                10,
+            );
+            let mut read_failed = event("p1", EventType::Error);
+            read_failed.tool_name = Some("Read".into());
+            tracker.observe_event(&read_failed, 15);
+            let mut child_idle = event("p1", EventType::Idle);
+            child_idle.session_id = "child-session".into();
+            tracker.observe_event(&child_idle, 16);
+            assert_eq!(open_ops(&tracker), 1, "{failure:?}");
+            tracker.observe_event(&event("p1", failure.clone()), 20);
+            assert_eq!(open_ops(&tracker), 0, "{failure:?}");
+            let op = tracker
+                .take_finished()
+                .into_iter()
+                .find(|s| s.name == SPAN_AGENT_OPERATION)
+                .unwrap();
+            assert_eq!(
+                attr(&op, AttrKey::OperationEnd),
+                Some(&AttrValue::Str("turn_end".into())),
+                "{failure:?}"
+            );
+            assert_eq!((op.start_unix_nanos, op.end_unix_nanos), (10, 20));
+        }
     }
 
     /// Issue #2093: an interrupted call whose run ends before another turn

@@ -141,6 +141,14 @@ fn type_into_pane(deck: &TuiDeck, agent_id: &str, chunks: &[&[u8]]) {
         });
 }
 
+/// How long the probe command runs before the test presses Escape.
+const RUN_BEFORE_ESCAPE: Duration = Duration::from_secs(2);
+
+/// From the probe script's start marker to past the moment its `sleep 20`
+/// would have let it write the finish marker, with 10 s of slack for a loaded
+/// machine: an absent marker after this means the script was stopped.
+const SCRIPT_FINISH_WINDOW: Duration = Duration::from_secs(30);
+
 fn unix_nanos_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -195,22 +203,15 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
     )
     .expect("real Claude must start the script, which writes the unique start marker");
     let started_at = Instant::now();
-    std::thread::sleep(Duration::from_secs(2));
+    // Pacing, not a wait on anything: let the command run a moment before it
+    // is interrupted, so the span has a start well before the key.
+    std::thread::sleep(RUN_BEFORE_ESCAPE);
 
     // Escape through the attach input path, the way a client forwards a key a
     // person presses in the pane.
     let before_escape = unix_nanos_now();
     type_into_pane(&deck, &agent.id, &[b"\x1b"]);
     let after_escape = unix_nanos_now();
-    std::thread::sleep(Duration::from_secs(3));
-    assert!(
-        receiver
-            .operations(&pane)
-            .iter()
-            .all(|op| attribute(op, "deck.operation.end").is_none()),
-        "nothing may end the interrupted call before a turn does: {:?}",
-        receiver.operations(&pane)
-    );
 
     // Typed, as the person who interrupted would: the deck holds its own
     // messages for a card still Working, and an interrupted turn leaves the
@@ -223,16 +224,27 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
             b"\r",
         ],
     );
-    let interrupted = || {
+    // The probe script's own operation, however Haiku spelled the command
+    // (`./interrupt_probe_2093.sh`, `sh interrupt_probe_2093.sh`, …).
+    let is_probe = |op: &serde_json::Value| {
+        [
+            "deck.operation.program",
+            "deck.operation.word",
+            "deck.operation.commands",
+        ]
+        .iter()
+        .any(|key| attribute(op, key).is_some_and(|v| v.contains("interrupt_probe_2093")))
+    };
+    let probe = || {
         receiver
             .operations(&pane)
             .into_iter()
-            .find(|op| attribute(op, "deck.operation.end") == Some("interrupted"))
+            .find(|op| is_probe(op))
     };
     assert!(
-        common::wait_until(Duration::from_secs(120), || interrupted().is_some()),
-        "the interrupted script's operation must export, marked `interrupted`, once Claude's \
-         next turn ends (issue #2093); exported: {:?}\n{}",
+        common::wait_until(Duration::from_secs(120), || probe().is_some()),
+        "the interrupted script's operation must export once Claude's next turn ends (issue \
+         #2093); exported: {:?}\n{}",
         receiver.operations(&pane),
         deck.snapshot_grid()
     );
@@ -240,7 +252,12 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
         receiver.run(&pane).is_none(),
         "the operation must finish while the run is open"
     );
-    let interrupted = interrupted().unwrap();
+    let interrupted = probe().unwrap();
+    assert_eq!(
+        attribute(&interrupted, "deck.operation.end"),
+        Some("interrupted"),
+        "{interrupted}"
+    );
     let end = nanos(&interrupted, "endTimeUnixNano");
     assert!(
         (before_escape..=after_escape + 5_000_000_000).contains(&end),
@@ -254,10 +271,9 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
         "no operation may wait for the run's end: {:?}",
         receiver.operations(&pane)
     );
-    // The script would have finished 20 s after it started; give it that and
-    // more, and confirm the Escape really stopped it.
-    let finish_window = Duration::from_secs(25);
-    if let Some(left) = finish_window.checked_sub(started_at.elapsed()) {
+    // The script writes its finish marker 20 s after it starts; past that
+    // window an absent marker means the Escape stopped it.
+    if let Some(left) = SCRIPT_FINISH_WINDOW.checked_sub(started_at.elapsed()) {
         std::thread::sleep(left);
     }
     assert!(
