@@ -222,6 +222,9 @@ pub fn tab_team(endpoint: &impl Endpoint, tab: &str) -> (Pane, Pane) {
         serde_json::to_string(&cmd).unwrap()
     );
     std::fs::write(endpoint.cwd().join(".dot-agent-deck.toml"), cfg).unwrap();
+    // PRD #1885: the team under test is approved, as the user's is. Every
+    // tab writes the same config, so approving it again is idempotent.
+    endpoint.approve_project_trust(endpoint.cwd());
     let membership = |role: &str, index, start| {
         json!({"tab_membership": {
         "kind":"orchestration", "name":"route", "role_name":role,
