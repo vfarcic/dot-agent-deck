@@ -387,19 +387,28 @@ pub struct DesktopConnection {
     /// webview branches on it to disable **Stop daemon** and **Replace daemon**,
     /// and an absent field must not read as "local".
     pub deck_kind: &'static str,
-    /// Why the daemon-lifecycle controls are unavailable, when they are
-    /// (PRD #741 M7).
+    /// Why **Replace daemon** is unavailable, when it is (PRD #741 M7).
     ///
     /// `Some` exactly when [`Self::deck_kind`] is `"remote"`. The sentence is
-    /// `Endpoint::require_local("Stop daemon")`'s own — M2 made the operation
-    /// unreachable by type and wrote the refusal at the same time, so this is
-    /// rendering an error that already exists rather than inventing one. Stop
-    /// and Replace act on a process on *this* machine; against a deck on
-    /// another one they would either do nothing or, over a forwarded socket,
-    /// SIGTERM the local `ssh` client and report that a daemon had stopped
-    /// gracefully.
+    /// `Endpoint::require_local("Replace daemon")`'s own. Replace starts the
+    /// daemon bundled with this app, on *this* machine, so it has nothing to
+    /// offer a deck on another one — Upgrade is that deck's remedy. It named
+    /// Stop daemon too until issue #1073, which stops a remote deck over the
+    /// wire verb instead; [`Self::stop_daemon_reason`] is Stop's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_only_reason: Option<String>,
+    /// Why **Stop daemon** cannot act on this deck while it answers, or `None`
+    /// when it can (issue #1073).
+    ///
+    /// The local deck can always be stopped: the pid stop reaches a daemon of
+    /// any version. A remote deck can be stopped only over the wire verb
+    /// (`AttachRequest::StopDaemon`, issue #1049), so this is `Some` for a
+    /// remote deck whose `Hello` did not advertise it — read from the same
+    /// capture as [`Self::project_actions_reason`]. `None` on a deck that is
+    /// not answering, where no Stop is offered at all. Omitted from the wire
+    /// when `None`, for that field's reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_daemon_reason: Option<String>,
     /// Why the app is talking to the local deck when the stored selection named
     /// another one (PRD #741 M7).
     ///
@@ -613,7 +622,7 @@ pub(crate) fn selection_fields(
         Endpoint::Remote(_) => "remote",
     };
     let local_only = endpoint
-        .require_local("Stop daemon")
+        .require_local("Replace daemon")
         .err()
         .map(|error| safe_display_text(error.to_string()));
     (kind, local_only, selected_deck().fallback)
@@ -1416,7 +1425,13 @@ pub enum DesktopAction {
         deck_id: String,
         roles: Vec<StopOrchestrationRole>,
     },
+    /// Stop the daemon of the deck `deck_id` names (issue #1073). It read the
+    /// applied selection until then, so the overview could not stop a deck it
+    /// was not on, and a remote deck could not be stopped at all. Required, for
+    /// [`Self::StopAgent`]'s reason: a stop with no deck is refused at decode
+    /// rather than defaulted to the selection.
     StopDaemon {
+        deck_id: String,
         #[serde(default)]
         force: bool,
     },
@@ -3337,6 +3352,8 @@ pub(crate) fn disconnected_snapshot(
             build_stamp_mismatch_only: false,
             deck_kind,
             local_only_reason,
+            // Issue #1073: no Stop is offered on a deck that is not answering.
+            stop_daemon_reason: None,
             selection_fallback,
             // Nothing was advertised because nothing answered. A disconnected
             // screen is already saying the only thing there is to say.
@@ -3989,7 +4006,7 @@ mod tests {
         );
         let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
         assert!(
-            reason.contains("Stop daemon") && reason.contains("deploy@build-box"),
+            reason.contains("Replace daemon") && reason.contains("deploy@build-box"),
             "the explanation must name the operation and the deck: {reason}"
         );
         assert!(

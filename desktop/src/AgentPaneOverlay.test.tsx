@@ -148,7 +148,7 @@ describe("agent pane overlay", () => {
     const before = screen.getByTestId("terminal-planner");
     expect(buildsFor("planner")).toBe(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(screen.getAllByTestId("terminal-planner")).toHaveLength(1);
     expect(screen.getByTestId("terminal-planner")).toBe(before);
@@ -180,7 +180,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(screen.getByTestId("reader-open-planner"));
     expect(screen.getByTestId("reader-planner")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     const overlay = screen.getByTestId("agent-pane-overlay");
     // Both halves, because hiding the button while still rendering the panel
     // would leave two `window` `keydown` listeners answering one `Escape`, and
@@ -208,7 +208,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(screen.getByTestId("reader-open-planner"));
     expect(screen.getByTestId("reader-planner")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Desktop implementation agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     // The discriminating assertion: dismissed on OPEN, not left mounted for
     // `Escape` to find.
@@ -232,7 +232,7 @@ describe("agent pane overlay", () => {
     const tile = screen.getByTestId("agent-tile-planner");
     expect(within(tile).getAllByRole("tab")).toHaveLength(5);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     const overlay = screen.getByTestId("agent-pane-overlay");
     expect(within(overlay).getAllByRole("tab")).toHaveLength(5);
     expect(within(overlay).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
@@ -252,7 +252,7 @@ describe("agent pane overlay", () => {
     render(<DeckShell runtime={runtime()} />);
     expect(screen.getByTestId("agent-tile-planner")).toHaveAttribute("data-presentation", "tile");
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-tile-planner")).toHaveAttribute("data-presentation", "overlay");
     expect(screen.getByTestId("agent-tile-builder")).toHaveAttribute("data-presentation", "tile");
     // Opening SELECTS as well, which makes the pane's `selected` true rather
@@ -270,11 +270,11 @@ describe("agent pane overlay", () => {
     render(<DeckShell runtime={runtime()} />);
     expect(screen.queryByRole("button", { name: "Back to dashboard" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
-    expect(screen.queryByRole("button", { name: "Open Planner agent" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    expect(screen.queryByRole("button", { name: "Open Plan / architecture agent" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     // The tiles underneath keep theirs — the deck is mounted, not frozen.
-    expect(screen.getByRole("button", { name: "Open Builder agent" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Desktop implementation agent" })).toBeInTheDocument();
   });
 
   /**
@@ -290,7 +290,7 @@ describe("agent pane overlay", () => {
     expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "builder" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
     setShownTerminals.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(setShownTerminals).not.toHaveBeenCalled();
 
@@ -391,7 +391,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     if (differentPane) {
       fireEvent.keyDown(window, { key: "Escape" });
-      fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
+      fireEvent.click(screen.getByRole("button", { name: "Open Desktop implementation agent" }));
     }
     ask();
     expect(screen.getByRole("alertdialog")).toBeVisible();

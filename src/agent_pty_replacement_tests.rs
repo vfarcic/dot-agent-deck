@@ -941,6 +941,7 @@ async fn work_done_056_a_dispatch_unwinding_through_registration_leaves_a_live_d
     let task = tokio::spawn(async move {
         let _room = registry.inbox().reserve_reply().expect("room");
         let req = crate::spawn::SpawnRequest {
+            work_id: None,
             task_name: "dispatch-w056".to_string(),
             working_dir: dir.to_string_lossy().into_owned(),
             command: None,

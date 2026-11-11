@@ -39,7 +39,7 @@ function tile(agent: AgentSession, onInboxAction = vi.fn(async () => ({ outcome:
     onTabChange={vi.fn()} onTerminalInput={vi.fn(async () => {})}
     onTerminalResize={vi.fn(async () => {})} onEvidenceSelect={vi.fn()}
     onInboxAction={onInboxAction} />);
-  return within(screen.getByRole("article", { name: "Coder" }));
+  return within(screen.getByRole("article", { name: "test / Coder" }));
 }
 
 describe("deck messages that need a decision (PRD #1666 §6)", () => {

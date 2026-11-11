@@ -269,12 +269,23 @@ tasks:
       cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' \
         | while read -r pkg; do cargo clean -q -p "$pkg"; done
 
+  # Issue #2051: the pinned real OpenCode 1.x and 2.x that
+  # tests/e2e_opencode_real_binary.rs starts in a deck pane with NO model,
+  # provider or credential (that file's header says how each is checked, which
+  # is what keeps it in lane 1 under CLAUDE.md rule 5), installed with `npm ci`
+  # against scripts/opencode-pins/'s lockfiles into this task's $HOME, which
+  # the `e2e` partitions use. ci.yml's `e2e` job installs the same.
+  - key: opencode
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, node]
+    run: scripts/install-pinned-opencode.sh
+
   # Five runners the size of a GitHub `ubuntu-latest` (4 vCPU / 16 GB), so the
   # timing-sensitive e2e tests see the per-runner load they see in ci.yml, and
   # the speed-up comes from partitioning rather than from bigger machines.
   - key: e2e
     if: ${{ tasks.backend.values.rust == 'true' }}
-    use: e2e-build
+    use: [e2e-build, opencode]
     parallel:
       values:
         - shard: "1"
@@ -286,6 +297,9 @@ tasks:
       disk: 150gb
     env:
       SHARD: ${{ parallel.shard }}
+      # Issue #2051: a missing pinned OpenCode fails its tests instead of
+      # skipping them (see the `opencode` task).
+      DAD_E2E_REQUIRE_PINNED_OPENCODE: "1"
     run: |
       # `scripts/e2e-shard.sh` holds what each shard selects, for ci.yml too:
       # the `tests/e2e_*.rs` binaries and the `e2e_only…` modules, not the
@@ -360,10 +374,37 @@ tasks:
       test-results:
         - path: desktop/junit/vitest.xml
 
+  # Chromium, WebKit and the ~195 MB of Ubuntu packages they need, for
+  # `desktop-browser`. Installing them inside that task made every run download
+  # the packages from the Ubuntu mirror: 12 minutes of a 20-minute budget on a
+  # passing run, and on a slow-mirror day (2026-11-10) enough to fail it in 12
+  # of 100 runs, on seven branches. As its own task, filtered to
+  # desktop/package.json, no other file in the repository moves its cache key,
+  # so every run, a pull request's included, reuses one install until that file,
+  # this definition or the `pnpm` layer changes.
+  # It is a content-keyed cache, not a tool cache: an entry is reached only by
+  # this task's exact inputs, so a pull request's run cannot leave files that a
+  # run with other inputs restores. The version comes from package.json's exact
+  # pin, the version `pnpm install` resolves in `desktop-browser`, so the
+  # browsers installed here are the ones that task's Playwright looks for.
+  - key: playwright-browsers
+    if: ${{ tasks.backend.values.rust == 'true' }}
+    use: [code, pnpm]
+    filter: [desktop/package.json]
+    # A cache miss pays the whole download, on whatever mirror speed it gets.
+    timeout: 45m
+    run: |
+      version=$(node -p "require('./desktop/package.json').devDependencies['@playwright/test']")
+      # A range would let `pnpm install` resolve a Playwright whose browsers are
+      # not the ones installed here.
+      [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "desktop/package.json must pin @playwright/test exactly, not '$version'" >&2; exit 1; }
+      npx --yes "playwright@$version" install --with-deps chromium webkit
+      sudo apt-get clean
+
   # desktop/: the Playwright suite in Chromium and WebKit (`desktop-browser`).
   - key: desktop-browser
     if: ${{ tasks.backend.values.rust == 'true' }}
-    use: [code, pnpm]
+    use: [code, pnpm, playwright-browsers]
     timeout: 20m
     run: |
       cd desktop
@@ -371,7 +412,10 @@ tasks:
       # $RWX_ARTIFACTS, whatever the exit status.
       trap 'for d in playwright-report test-results; do [ -e "$d" ] && cp -r "$d" "$RWX_ARTIFACTS/"; done; true' EXIT
       pnpm install --frozen-lockfile
-      pnpm exec playwright install --with-deps chromium webkit
+      # The browsers and their packages come from `playwright-browsers`, so this
+      # downloads nothing; with no `--with-deps` it cannot fall back to the
+      # Ubuntu mirror either.
+      pnpm exec playwright install chromium webkit
       pnpm test:browser:types
       pnpm test:browser
     outputs:

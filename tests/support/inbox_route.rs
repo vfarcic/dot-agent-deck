@@ -48,6 +48,8 @@ pub fn command(dir: &Path) -> String {
     std::fs::write(&script, r#"import os, sys, tty, termios, json, subprocess, time, re
 tty.setraw(0, termios.TCSANOW)
 base = os.path.join(os.getcwd(), '.route-' + os.environ['DOT_AGENT_DECK_AGENT_ID'])
+# PRD #1889: the work id the deck gave this generation, empty when none.
+with open(base + '.work', 'w') as f: f.write(os.environ.get('DOT_AGENT_DECK_WORK_ID', ''))
 with open(base + '.pid', 'w') as f: f.write(str(os.getpid()))
 capture = open(base + '.bytes', 'ab', buffering=0)
 ring = re.compile(r'^\([a-z]{6}\) dot-agent-deck: message ')
@@ -202,6 +204,40 @@ pub fn team(endpoint: &impl Endpoint, clear: bool) -> (Pane, Pane) {
         membership("orchestrator", 0, true),
     );
     let worker = start(endpoint, "route-coder", membership("coder", 1, false));
+    (orch, worker)
+}
+
+/// Issue #545: one tab of the `route` orchestration among several in the same
+/// daemon and directory — an orchestrator and a `coder`, the same role names
+/// every other tab has, told apart only by the per-tab `orchestration_id`.
+/// `tab` names the panes, the token and the run title, so the tabs' titles do
+/// not collide (issue #555).
+pub fn tab_team(endpoint: &impl Endpoint, tab: &str) -> (Pane, Pane) {
+    let cmd = command(endpoint.cwd());
+    let cfg = format!(
+        "[[orchestrations]]\nname = 'route'\n[[orchestrations.roles]]\nname = 'orchestrator'\ncommand = {}\nstart = true\n[[orchestrations.roles]]\nname = 'coder'\ncommand = {}\nclear = false\n",
+        serde_json::to_string(&cmd).unwrap(),
+        serde_json::to_string(&cmd).unwrap()
+    );
+    std::fs::write(endpoint.cwd().join(".dot-agent-deck.toml"), cfg).unwrap();
+    let membership = |role: &str, index, start| {
+        json!({"tab_membership": {
+        "kind":"orchestration", "name":"route", "role_name":role,
+        "role_index":index, "is_start_role":start,
+        "orchestration_id":format!("route-fixture-{tab}"),
+        "display_title":format!("route {tab}"),
+        "orchestration_cwd":endpoint.cwd()}})
+    };
+    let orch = start(
+        endpoint,
+        &format!("route-{tab}-orchestrator"),
+        membership("orchestrator", 0, true),
+    );
+    let worker = start(
+        endpoint,
+        &format!("route-{tab}-coder"),
+        membership("coder", 1, false),
+    );
     (orch, worker)
 }
 

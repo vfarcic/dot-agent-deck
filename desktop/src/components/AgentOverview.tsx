@@ -17,6 +17,7 @@ import { HostMetricsButton } from "./HostMetricsPanel";
 import { chooseHostDeck } from "../lib/hostMetrics";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
 import { StartDaemonError } from "../lib/actionError";
+import { stopDaemonConfirmCopy, stopDaemonOffer } from "../lib/stopDaemon";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
@@ -1061,6 +1062,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   const newAgentClose = useRef<(() => string | undefined) | undefined>(undefined);
   /** What the flow could not finish on screen: an agent the deck accepted and has not listed. */
   const [newAgentNotice, setNewAgentNotice] = useState<string>();
+  /** Issue #1073 — what the last Stop daemon did, in the crate's own sentence, naming the daemon. */
+  const [daemonNotice, setDaemonNotice] = useState<string>();
+  /** The stop whose result the notice may show: a stop that settles after a later one was confirmed writes nothing. */
+  const latestDaemonStop = useRef(0);
   /**
    * Issue #1247 — the form the dialog handed back when it was last closed,
    * replayed by the next open. Here rather than in the dialog because closing
@@ -1554,6 +1559,62 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     });
   };
 
+  /**
+   * Issue #1073 — Stop daemon on THIS deck's card, local or remote, which need
+   * not be the selected deck. The request names the deck it was pressed on, and
+   * the crate resolves that deck and refuses one it does not observe. A refusal
+   * (agents still running) lands in the runtime's error, as a refused agent
+   * close does; a stopped deck's card turns into the disconnected deck on its
+   * own.
+   */
+  const requestStopDaemon = (target: ConnectionView) => {
+    const offer = stopDaemonOffer(target);
+    const deckId = target.deckId;
+    if (mode !== "live" || !offer.offered || offer.reason !== undefined || deckId === undefined) return;
+    setConfirm({
+      ...stopDaemonConfirmCopy(target),
+      label: "Stop daemon",
+      busyLabel: "Stopping…",
+      action: async () => {
+        const stop = ++latestDaemonStop.current;
+        setDaemonNotice(undefined);
+        try {
+          // The crate's own sentence: "stopped" only for a daemon it saw go,
+          // and "still shutting down" for one that accepted and had not gone
+          // when it stopped waiting, whose card may still read connected.
+          const result = await runtime.runAction({ type: "stop_daemon", deckId });
+          if (stop === latestDaemonStop.current) setDaemonNotice(`${deckName(target)}: ${result.message ?? "Daemon stopped."}`);
+        } catch {
+          // The runtime files the refusal under its global error.
+        }
+      },
+    });
+  };
+
+  /** What a deck's card offers for Stop daemon: the handler, or a disabled control with the reason. */
+  const deckStop = (target: ConnectionView): { onStopDaemon?: () => void; stopDaemonReason?: string } => {
+    const offer = stopDaemonOffer(target);
+    if (mode !== "live" || !offer.offered) return {};
+    if (offer.reason !== undefined) return { stopDaemonReason: offer.reason };
+    return { onStopDaemon: () => requestStopDaemon(target) };
+  };
+
+  /**
+   * Issue #1073 — Replace daemon on the LOCAL deck's card when its daemon
+   * answered and was refused, whichever deck is selected. It is the deck
+   * screen's Replace daemon (PRD #1487 D10): the shared upgrade procedure,
+   * which asks before stopping anything. Only the local deck: Replace starts
+   * the daemon that came with this app, on this machine, and a remote deck's
+   * remedy is Upgrade.
+   */
+  const replaceOffered = (target: ConnectionView) => mode === "live" && Boolean(runtime.upgradeDaemon) && target.deckKind !== "remote"
+    && target.status === "error" && target.daemonDetected === true && target.deckId !== undefined;
+  const requestReplaceDaemon = (target: ConnectionView) => {
+    const deckId = target.deckId;
+    if (!replaceOffered(target) || deckId === undefined) return;
+    setUpgrade({ deckId, deckName: deckName(target), kind: "replace" });
+  };
+
   /* Issue #1496 — the daemons the filter can name, and the line stating it. */
   const filterDaemons = useMemo(() => decks.flatMap((deck) => {
     const id = deck.snapshot.connection.deckId;
@@ -1651,6 +1712,12 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               <button type="button" aria-label="Dismiss" onClick={() => setNewAgentNotice(undefined)}><X size={13} /></button>
             </div>
           )}
+          {daemonNotice && (
+            <div className="overview-banner" role="status" data-testid="overview-daemon-notice">
+              <span>{displayText(daemonNotice, DISPLAY_LIMITS.message)}</span>
+              <button type="button" aria-label="Dismiss" onClick={() => setDaemonNotice(undefined)}><X size={13} /></button>
+            </div>
+          )}
           {/*
             One `daemon-group` per observed deck (PRD #742 M4). The section was
             already the outer unit when there was exactly one, and the comment
@@ -1692,6 +1759,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
                 this machine's CLI is behind, whatever the daemon runs.
               */
               {...deckUpgrade(deck.snapshot.connection)}
+              {...deckStop(deck.snapshot.connection)}
+              onReplaceDaemon={replaceOffered(deck.snapshot.connection) ? () => requestReplaceDaemon(deck.snapshot.connection) : undefined}
               onNewAgent={newAgentAvailable && deck.connected && deck.snapshot.connection.deckId !== undefined && deckUnavailableReason(deck.snapshot.connection) === undefined ? () => VOICE_ACTIONS.openNewAgent.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId }) : undefined}
               hostOpen={deck.snapshot.connection.deckId !== undefined && hostOpen === deck.snapshot.connection.deckId}
               onOpenHost={() => VOICE_ACTIONS.showHostMetrics.run(voiceContext, { preselectDeckId: deck.snapshot.connection.deckId })}
@@ -1799,7 +1868,7 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
@@ -1822,6 +1891,12 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
   upgradeLabel?: string;
   /** What hovering Upgrade shows: what is behind. */
   upgradeTitle?: string;
+  /** Issue #1073 — Stop this deck's daemon. Absent unless the deck answers and can be stopped. */
+  onStopDaemon?: () => void;
+  /** Issue #1073 — why Stop daemon cannot act on this deck; renders the control disabled with it. */
+  stopDaemonReason?: string;
+  /** Issue #1073 — Replace this (local) deck's refused daemon. */
+  onReplaceDaemon?: () => void;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
   /** PR #1672 — whether THIS deck's Host popover is the open one, and the two ways to change that. */
@@ -1938,6 +2013,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
         */}
         {!deck.connected && <span className="daemon-unknown" data-testid="daemon-unknown" title={unknownPipsTitle(connection)}>—</span>}
         {onUpgrade && !upgradeInNote && <button type="button" className="button primary compact daemon-upgrade" data-testid="daemon-upgrade" aria-label={upgradeLabel ?? `Upgrade the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={upgradeTitle} onClick={onUpgrade}><CircleArrowUp size={13} /><span>Upgrade</span></button>}
+        {(onStopDaemon || stopDaemonReason) && <button type="button" className="button secondary compact daemon-stop" data-testid="daemon-stop" aria-label={`Stop the daemon on ${connection.deckKind === "remote" ? deckName(connection) : "this machine"}`} title={stopDaemonReason ? displayTitle(stopDaemonReason) : undefined} disabled={!onStopDaemon} onClick={onStopDaemon}><CircleStop size={13} /><span>Stop daemon</span></button>}
         {onNewAgent && <button type="button" className="button secondary compact daemon-new-agent" data-testid="daemon-new-agent" aria-label={`New agent on ${deckName(connection)}`} onClick={onNewAgent}><Plus size={13} /><span>New agent</span></button>}
       </header>
 
@@ -1961,6 +2037,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           onStartDaemon={onStartDaemon}
           onConnectAnyway={onConnectAnyway}
           onUpgrade={upgradeInNote ? onUpgrade : undefined}
+          onReplaceDaemon={onReplaceDaemon}
           onNewAgent={onNewAgent}
         />
       </div>
@@ -1983,7 +2060,7 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onNewAgent }: {
+function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent }: {
   agents: OverviewAgent[];
   sections: OverviewSection[];
   filtering: boolean;
@@ -2012,6 +2089,8 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
   onConnectAnyway?: () => void;
   /** PRD #1487 — Upgrade, in the incompatible note. Absent unless offered. */
   onUpgrade?: () => void;
+  /** Issue #1073 — Replace daemon, in the local deck's incompatible note. Absent unless offered. */
+  onReplaceDaemon?: () => void;
   /** The New agent flow on this deck (PRD #1223 M4) — what the first-run note offers. */
   onNewAgent?: () => void;
 }) {
@@ -2134,13 +2213,14 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
             : `The daemon reports ${connection.runningAgentCount} running ${connection.runningAgentCount === 1 ? "agent" : "agents"}, but this app cannot show ${connection.runningAgentCount === 1 ? "it" : "them"} until the two match, so nothing is listed rather than guessed.`}
           {" "}
           {/* Names exactly the buttons rendered below, with what each does (CLAUDE.md rule 21). */}
-          {incompatibleRemedy(connection, { upgrade: Boolean(onUpgrade), openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
+          {incompatibleRemedy(connection, { upgrade: Boolean(onUpgrade), replaceDaemon: Boolean(onReplaceDaemon), openDaemons: Boolean(onOpenDeck), connectAnyway: Boolean(onConnectAnyway), reconnect: true })}
         </p>
         <ConnectionDetail detail={connection.detail} />
         {overrideError && <p className="overview-note-hint" data-testid="overview-connect-anyway-error">{overrideError}</p>}
         <div>
           {onOpenDeck && <button className="button secondary" onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
           {onUpgrade && <button className="button primary" data-testid="overview-upgrade" onClick={onUpgrade}><CircleArrowUp size={14} /> Upgrade</button>}
+          {onReplaceDaemon && <button className="button primary" data-testid="overview-replace" onClick={onReplaceDaemon}><RefreshCw size={14} /> Replace daemon</button>}
           {onConnectAnyway && <button className="button primary" data-testid="overview-connect-anyway" onClick={onConnectAnyway}><ShieldAlert size={14} /> Connect anyway</button>}
           <button className="button primary" onClick={onReconnect}><RefreshCw size={14} /> Reconnect</button>
         </div>

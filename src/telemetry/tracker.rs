@@ -203,6 +203,8 @@ pub struct RunStart {
     pub model: Option<String>,
     pub invoking_skill: Option<String>,
     pub issue_number: Option<u64>,
+    /// PRD #1889: `deck.work.id`, the work this run's attempt serves.
+    pub work_id: Option<String>,
 }
 
 impl RunStart {
@@ -245,6 +247,7 @@ impl RunStart {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 }
@@ -2405,6 +2408,10 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         AttrKey::DispatchName,
         run.dispatch_name.as_deref(),
     ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::WorkId,
+        start.work_id.as_deref(),
+    ));
     attributes.push(Attribute::str(AttrKey::EndReason, reason.as_str()));
     if let Some(code) = exit_code {
         attributes.push(Attribute::int(AttrKey::ExitCode, i64::from(code)));
@@ -2529,6 +2536,7 @@ pub(crate) mod tests {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 
@@ -4757,6 +4765,24 @@ pub(crate) mod tests {
             attr(run, AttrKey::AgentSource),
             Some(&AttrValue::Str("hook".into()))
         );
+    }
+
+    /// PRD #1889: a run's `agent.run` span carries the work its attempt
+    /// serves as `deck.work.id`, and a run with none carries no attribute.
+    #[test]
+    fn a_run_span_carries_its_work_id() {
+        let mut tracker = RunTracker::new();
+        let mut with = start("p1");
+        with.work_id = Some("w-deck-0123456789abcdef".into());
+        tracker.begin_run(with, 0);
+        tracker.begin_run(start("p2"), 0);
+        tracker.end_all(EndReason::Exited, 1);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            attr(run_span_on(&spans, "p1"), AttrKey::WorkId),
+            Some(&AttrValue::Str("w-deck-0123456789abcdef".into()))
+        );
+        assert_eq!(attr(run_span_on(&spans, "p2"), AttrKey::WorkId), None);
     }
 
     /// Issue #1981 M6: the open runs not yet named list their generations,
