@@ -7876,6 +7876,24 @@ async fn run_hook_loop_with_limits(
                                 presented.as_deref(),
                                 &*pty_registry,
                             );
+                            // Issue #2104: whether a refusal is a dying
+                            // generation's last report, decided while the token
+                            // is still in hand. Read for the log level only.
+                            let retired_token = matches!(
+                                provenance,
+                                crate::hook_provenance::Provenance::Refused(
+                                    crate::hook_provenance::Refusal::UnknownToken
+                                )
+                            ) && presented
+                                .as_deref()
+                                .is_some_and(|token| {
+                                    pty_registry
+                                        .hook_token_was_retired(
+                                            token,
+                                            event.pane_id.as_deref(),
+                                            event.agent_id.as_deref(),
+                                        )
+                                });
                             drop(presented);
                             match crate::hook_provenance::admits(
                                 &provenance,
@@ -7887,6 +7905,27 @@ async fn run_hook_loop_with_limits(
                                     // never the token. No reply line — a raw
                                     // event is fire-and-forget, and a hook's
                                     // output is what its agent reads.
+                                    //
+                                    // Issue #2104: a dying generation's own last
+                                    // report — its token retired at close or
+                                    // respawn — is expected, so it is logged at
+                                    // debug; every other refusal stays a warning.
+                                    // The `warn!` below is pinned verbatim by
+                                    // `xtask/cross-version`'s `KNOWN_EFFECTS`.
+                                    if retired_token {
+                                        debug!(
+                                            verb = "agent_event",
+                                            event_type = ?event.event_type,
+                                            claimed_pane = %escape_id_for_log(
+                                                event.pane_id.as_deref().unwrap_or("<none>")
+                                            ),
+                                            reason = refusal.code(),
+                                            "hook socket: refused a status event from an \
+                                             agent this deck already closed or replaced (its \
+                                             token was retired at teardown); expected"
+                                        );
+                                        continue;
+                                    }
                                     warn!(
                                         verb = "agent_event",
                                         event_type = ?event.event_type,
@@ -14443,11 +14482,28 @@ mod hook_ingestion_tests {
         /// returns, so absence assertions need no arbitrary sleep. Raw events
         /// remain fire-and-forget and must produce no response bytes.
         async fn agent_event(&self, pane: &str, session: &str, kind: &str, token: Option<&str>) {
+            let agent = if pane == PROV_ORCH_PANE {
+                self.orchestrator_agent.as_str()
+            } else {
+                "foreign-agent"
+            };
+            self.agent_event_as(pane, agent, session, kind, token).await;
+        }
+
+        /// [`Self::agent_event`], naming `agent` as the sender's agent id.
+        async fn agent_event_as(
+            &self,
+            pane: &str,
+            agent: &str,
+            session: &str,
+            kind: &str,
+            token: Option<&str>,
+        ) {
             use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let mut payload = serde_json::json!({
                 "session_id": session,
                 "pane_id": pane,
-                "agent_id": if pane == PROV_ORCH_PANE { self.orchestrator_agent.as_str() } else { "foreign-agent" },
+                "agent_id": agent,
                 "agent_type": "pi",
                 "event_type": kind,
                 "timestamp": chrono::Utc::now(),
@@ -15055,6 +15111,132 @@ mod hook_ingestion_tests {
     #[tokio::test]
     async fn hook_provenance_agent_event_refuses_malformed_token() {
         assert_agent_event_refused("thinking", "malformed", "enforce").await;
+    }
+
+    /// Scenario: The deck closes a worker, and the dying worker's own SessionEnd arrives afterwards carrying its now-retired token; then the same retired token is replayed naming another agent on the worker's pane, and claiming the orchestrator's pane, and a well-formed token the daemon never minted is presented. All are refused and change no card; only the worker's own teardown report is logged at debug, the others still as warnings (issue #2104).
+    #[tokio::test]
+    async fn hook_provenance_agent_event_retired_token_is_refused_quietly() {
+        use std::sync::Mutex;
+
+        #[derive(Clone, Default)]
+        struct CapturedLog(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for CapturedLog {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLog {
+            type Writer = CapturedLog;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let captured = CapturedLog::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing_subscriber::filter::LevelFilter::DEBUG)
+            .with_ansi(false)
+            .finish();
+        let _guard = crate::test_isolation::capture_tracing_on_this_thread(subscriber);
+
+        let _lock = HOOK_PROVENANCE_ENV_LOCK.lock().await;
+        let _policy = HookProvenanceEnv::set("enforce");
+        let mut fx = ProvenanceFixture::start().await;
+        let retired = fx.worker_token.clone();
+        let worker = fx.worker_agent.clone();
+        fx.registry
+            .close_agent(&fx.worker_agent)
+            .expect("close the worker");
+        assert!(
+            fx.registry.owner_of_hook_token(&retired).is_none(),
+            "a closed generation's token resolves to nobody"
+        );
+        assert!(fx.registry.hook_token_was_retired(
+            &retired,
+            Some(PROV_WORKER_PANE),
+            Some(&worker)
+        ));
+        let never_minted = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        assert!(
+            !fx.registry
+                .hook_token_was_retired(never_minted, Some(PROV_ORCH_PANE), None)
+        );
+
+        let before = format!("{:?}", fx.state.read().await.sessions);
+        fx.agent_event_as(
+            PROV_WORKER_PANE,
+            &worker,
+            "dying-worker",
+            "session_end",
+            Some(&retired),
+        )
+        .await;
+        // The same retired token on its own pane but naming another agent is
+        // not that generation's teardown either (Qodo on PR #2257).
+        fx.agent_event(PROV_WORKER_PANE, "other-agent", "thinking", Some(&retired))
+            .await;
+        // The same retired token claiming a pane its generation never held
+        // is not that generation's teardown (Qodo on PR #2257).
+        fx.agent_event(
+            PROV_ORCH_PANE,
+            "replayed-card",
+            "session_end",
+            Some(&retired),
+        )
+        .await;
+        fx.agent_event(
+            PROV_ORCH_PANE,
+            "forged-card",
+            "thinking",
+            Some(never_minted),
+        )
+        .await;
+        let after = format!("{:?}", fx.state.read().await.sessions);
+        let broadcast = fx.events.try_recv().ok();
+        fx.stop().await;
+        assert!(
+            before == after && broadcast.is_none(),
+            "all refused: changed={} broadcast={broadcast:?}",
+            before != after
+        );
+
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("hook socket: refused a status event"))
+            .collect();
+        let on_worker: Vec<&&str> = refusals
+            .iter()
+            .filter(|line| line.contains(PROV_WORKER_PANE))
+            .collect();
+        assert_eq!(on_worker.len(), 2, "{log}");
+        let dying = on_worker
+            .iter()
+            .find(|line| line.contains("SessionEnd"))
+            .unwrap_or_else(|| panic!("the retired token's refusal is logged: {log}"));
+        assert!(dying.contains("DEBUG"), "{dying}");
+        assert!(dying.contains("reason=\"unknown_token\""), "{dying}");
+        let other_agent = on_worker
+            .iter()
+            .find(|line| line.contains("Thinking"))
+            .unwrap_or_else(|| panic!("the other agent's refusal is logged: {log}"));
+        assert!(other_agent.contains("WARN"), "{other_agent}");
+        // The replayed retired token and the never-minted one, both on a pane
+        // neither generation held: each still a warning.
+        let elsewhere: Vec<&&str> = refusals
+            .iter()
+            .filter(|line| line.contains(PROV_ORCH_PANE))
+            .collect();
+        assert_eq!(elsewhere.len(), 2, "{log}");
+        for line in elsewhere {
+            assert!(line.contains("WARN"), "{line}");
+            assert!(line.contains("reason=\"unknown_token\""), "{line}");
+        }
+        assert!(!log.contains(&retired), "the token is never logged");
     }
 
     /// Scenario: Enable the older-CLI warn policy and send a token-less status for a spawned pane. It must update the card and reach attach clients.
