@@ -15563,3 +15563,19 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Asserts:** Haiku runs one plain Bash command, `cp <sentinel> <proof>; exit 3`, which copies a unique sentinel and fails; the turn visibly goes Working/Bash → Idle; that command's operation (`deck.operation.program=cp`) exports while the run is open, without `deck.operation.end`, and ends before the run; the grid shows no Error. Skips, with the reason, when the installed Claude Code is below the hook's 2.1.78 floor.
 - **Does not assert:** that Claude Code fired `PostToolUseFailure` rather than another end (the hook is the only end it sends for a failed call, measured by hand on 2.1.314), other operations Haiku might run, or Claude Code's own success flag on its tool-result event.
 - **Platform coverage:** linux (lane 2 runs on a developer's machine).
+
+##### telemetry/otlp/049 — A call interrupted with Escape ends when the agent's next turn does, at the Escape (issue #2093).
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_failed_operation.rs`); real hook CLI, the TUI's own input path and a local OTLP/JSON receiver.
+- **Agent:** none; a raw-mode `cat` stand-in receives synthetic Claude Code hooks, in the sequence Claude Code 2.1.322 fires for a Bash call interrupted with Escape (`PreToolUse`, then nothing until the next turn's `UserPromptSubmit` and `Stop`).
+- **Asserts:** after a Bash `PreToolUse` and an Escape typed through the TUI, the next `UserPromptSubmit` exports nothing; the following `Stop` exports the call's operation while the run is open, with `deck.operation.end=interrupted` and an end at the Escape, before the `Stop`. A second call left open with no Escape exports at its turn's `Stop` with `deck.operation.end=turn_end`.
+- **Does not assert:** a real agent's hooks (`telemetry/otlp/050`), subagent calls or the wrapper's output-derived Idle (unit tests `a_running_call_outlives_prompts_siblings_and_other_threads` in `src/telemetry/tracker.rs`), or Codex's, OpenCode's, Devin's or Pi's turn ends, which reach the same tracker path as `Idle`.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/050 — A command interrupted with Escape in real interactive Claude Code ends its operation at the Escape. [reel]
+
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_failed_operation_live.rs`); local OTLP/JSON receiver.
+- **Agent:** real interactive Claude Code on Haiku, with the hooks the deck installs.
+- **Asserts:** Haiku runs a script in the foreground that writes a unique start marker and sleeps 20 s; once the marker appears, an Escape written through the attach input path interrupts it, and no operation is ended in the next 3 s; a reply request typed into the pane starts the next turn, after which the script's operation exports while the run is open, marked `deck.operation.end=interrupted`, ending within 5 s of the Escape; no operation is marked `run_end`; the script's finish marker never appears.
+- **Does not assert:** which hooks Claude Code fired (measured by hand on 2.1.322: none for the interrupted call), the card's status after the interrupt (it stays Working until the next turn, since Claude Code fires no `Stop` for an interrupted turn), or a deck message delivered after the interrupt (the deck holds it while the card is Working).
+- **Platform coverage:** linux (lane 2 runs on a developer's machine).

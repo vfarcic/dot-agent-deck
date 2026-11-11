@@ -290,7 +290,7 @@ mod tests {
         assert_eq!(get("host.name"), vec![AttrValue::Str("studio".into())]);
         assert_eq!(
             get("deck.telemetry.schema_version"),
-            vec![AttrValue::Str("4".into())]
+            vec![AttrValue::Str("5".into())]
         );
         assert_eq!(get("team"), vec![AttrValue::Str("platform".into())]);
         assert_eq!(get("service.version").len(), 1);
