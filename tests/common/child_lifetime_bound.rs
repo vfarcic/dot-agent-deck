@@ -33,27 +33,28 @@
 //! environment is sound without a proof about every thread in the process.
 //! [`arm`] writes nothing; it checks the constructor ran.
 //!
-//! # Why this is its own file rather than a function in `common/mod.rs`
+//! # Why this is its own file rather than a function in the harness's `lib.rs`
 //!
-//! It started as one, and a function in `common/mod.rs` can only be called by a
-//! file that links `common`. Three of the files that reach a bare
-//! `AgentPtyRegistry` do not, and not by oversight — `tests/rehydration.rs`,
-//! `tests/daemon_protocol.rs` and `tests/shell_activity.rs` avoid `mod common;`
-//! deliberately, because `tests/common/mod.rs` is ~420 KB of PTY/vt100 harness
-//! and pulling it into a fast-tier crate to reach one variable is a real
-//! compile cost for no coverage. (`tests/rehydration.rs` and
-//! `tests/daemon_protocol.rs` already `#[path]`-include `src/test_temp.rs` for
-//! exactly the same reason.) So the arming lives here, in a file small enough
-//! for any test binary to include on its own:
+//! It started as one, and a function in the harness can only be called by a
+//! file that links it. Three of the files that reach a bare `AgentPtyRegistry`
+//! do not — `tests/rehydration.rs`, `tests/daemon_protocol.rs` and
+//! `tests/shell_activity.rs` — a choice made while the harness was a module
+//! every including binary compiled for itself (~420 KB of PTY/vt100 code), so
+//! linking it to reach one variable was a real compile cost. Since issue #2083
+//! the harness is a crate compiled once per build, which removes most of that
+//! cost; those files still include this file on its own:
 //!
 //! ```ignore
 //! #[path = "common/child_lifetime_bound.rs"]
 //! mod child_lifetime_bound;
 //! ```
 //!
-//! and `tests/common/mod.rs` declares it as a module too — so every test binary that
-//! links either one gets the same constructor, one implementation and one SAFETY
-//! argument rather than one copy per spawn-owning crate.
+//! and the harness crate (`tests/common/lib.rs`) declares it as a module too,
+//! so every test binary that includes this file or links the harness gets the
+//! same arming: one implementation and one SAFETY argument rather than one copy
+//! per spawn-owning crate. A binary that includes this file runs the
+//! constructor below; one that links the harness runs [`pin_before_main`] from
+//! the constructor the harness's `link!` macro defines in it.
 //!
 //! **Self-contained, for the same reason `src/test_temp.rs` is** (issue #474):
 //! this file is compiled into every crate that `#[path]`-includes it, where
@@ -181,9 +182,10 @@ ctor::declarative::ctor! {
     /// race. That is the same guarantee `common::detach_before_main` relies on
     /// for the deck endpoint variables (issue #1473).
     ///
-    /// Every test binary that links `tests/common/mod.rs` or `#[path]`-includes
-    /// this file runs it, whether or not a test calls [`arm`] — so arming no
-    /// longer depends on call ordering inside the test at all.
+    /// Every test binary that `#[path]`-includes this file runs it, and every
+    /// one that links the test harness crate runs [`pin_before_main`] from the
+    /// constructor `link!` defines, whether or not a test calls [`arm`] — so
+    /// arming no longer depends on call ordering inside the test at all.
     ///
     /// Deliberately NOT done through `.cargo/config.toml`'s `[env]`: that has
     /// no per-subcommand scoping, so it would apply to `cargo run` as well and
@@ -197,17 +199,35 @@ ctor::declarative::ctor! {
     /// Prints nothing: stderr is not promised to be usable before `main`.
     #[ctor(unsafe)]
     fn arm_before_main() {
-        let var = dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS;
-        if let Some(value) = clamped(std::env::var(var).ok().as_deref()) {
-            // SAFETY: a constructor runs before `main`, so before libtest or
-            // any code in this binary has started a thread, and nothing can
-            // read the environment while it is being written. (Measured on
-            // Linux: a test binary links only libc, libm and libgcc_s, none of
-            // which starts a thread from a constructor of its own.)
-            unsafe { std::env::set_var(var, value) };
-        }
-        let _ = ARMED_BEFORE_MAIN.set(());
+        // SAFETY: a constructor runs before `main`, so before any thread.
+        unsafe { pin_before_main() };
     }
+}
+
+/// The body of [`arm_before_main`]: pin the cap, then record that it ran.
+///
+/// Its own function so that the test harness crate's `link!` macro can call
+/// it from a constructor defined inside each test binary (issue #2083). In a
+/// library crate the constructor above runs only if the linker happens to pull
+/// in the object file holding it; the harness's `lib.rs` has the detail.
+/// Running it twice in one process is harmless: the second call finds the cap
+/// already in range and writes nothing.
+///
+/// # Safety
+///
+/// Call it only from a pre-main constructor, before any thread exists: it
+/// writes the process environment.
+pub unsafe fn pin_before_main() {
+    let var = dot_agent_deck::agent_pty::DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS;
+    if let Some(value) = clamped(std::env::var(var).ok().as_deref()) {
+        // SAFETY: the caller is a constructor running before `main`, so before
+        // libtest or any code in this binary has started a thread, and nothing
+        // can read the environment while it is being written. (Measured on
+        // Linux: a test binary links only libc, libm and libgcc_s, none of
+        // which starts a thread from a constructor of its own.)
+        unsafe { std::env::set_var(var, value) };
+    }
+    let _ = ARMED_BEFORE_MAIN.set(());
 }
 
 /// Check that the cap was pinned before `main`. Writes nothing.

@@ -13,7 +13,7 @@
 //! profile's declared time (M41), or anything about continuing activity, which
 //! can keep moving the estimate (A2 §6): every case here is a finite history
 //! followed by quiescence.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

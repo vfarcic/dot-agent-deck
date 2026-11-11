@@ -8,7 +8,7 @@
 //! keep-alive condition so the daemon does not idle-GC itself between fires;
 //! once the last enabled schedule is gone the normal idle shutdown resumes.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

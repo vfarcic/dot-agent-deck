@@ -70,7 +70,7 @@ use tempfile::TempDir;
 use dot_agent_deck::agent_pty::{DOT_AGENT_DECK_AGENT_ID, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
 use dot_agent_deck::event::{AgentType, EventType};
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use spec::spec;
 

@@ -27,7 +27,7 @@
 //! match: the forged card is asserted CLEAN while nothing on screen says
 //! `orphaned` at all, and only then does the real orphan make it appear.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 //! Trusted offer → real interactive Haiku → sentinel → completion notice.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 

@@ -10,7 +10,7 @@
 //! via `TuiDeck::click` / `scroll` / `find_in_grid` / `send_bytes` /
 //! `write_hook_line`. Decision 6: gated behind the `e2e` feature.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{TuiDeck, write_hook_line};
 use spec::spec;

@@ -8,7 +8,7 @@
 //! way the deck reads its pane (`tests/support/codex_head_echo.rs`). The
 //! captures recorded on 0.164.0 stay committed and replayed in the fast tier
 //! (`tests/codex_head_echo_evidence.rs`).
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/codex_head_echo.rs"]
 mod head_echo;
 #[path = "support/inbox_doorbell.rs"]

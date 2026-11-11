@@ -19,7 +19,7 @@
 //! (the schema description in Claude Code 2.1.283), and `SubagentStop` is only
 //! ever emitted from a context that has one.
 //!
-//! Fast tier, and deliberately not linking `tests/common/mod.rs`: the
+//! Fast tier, and deliberately not linking `tests/common/lib.rs`: the
 //! crate-internal temp-dir resolver is `#[path]`-included, the same shape as
 //! `tests/codex_hook_ingestion.rs`. The rendered-grid half of this lives in
 //! `tests/e2e_hook_delivery.rs` (`hooks/delivery/008`).

@@ -3,7 +3,7 @@
 //! them on a named release (`src/composer_probe/mod.rs`,
 //! `src/doorbell_activation.rs`).
 #[cfg(all(not(feature = "e2e"), target_os = "linux"))]
-mod common;
+dot_agent_deck_test_harness::link!();
 #[cfg(all(not(feature = "e2e"), target_os = "linux"))]
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;

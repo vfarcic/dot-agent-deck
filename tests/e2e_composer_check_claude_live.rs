@@ -12,7 +12,7 @@
 //! editor probe isn't verified, reports `SKIP:`.
 //!
 //! `040` needs no model turn (nothing is submitted); `042` delivers tasks.
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/helper_pause.rs"]
 mod helper_pause;
 #[path = "support/inbox_doorbell.rs"]

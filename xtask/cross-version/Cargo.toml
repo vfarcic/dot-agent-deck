@@ -19,7 +19,7 @@ path = "src/main.rs"
 [target.'cfg(target_os = "linux")'.dependencies]
 # Both already root-package dependencies at these versions, so this member
 # pulls no new crate into Cargo.lock. They are the same PTY + terminal-emulator
-# pair the L2 e2e harness (`tests/common/mod.rs`) drives the real binary with.
+# pair the L2 e2e harness (`tests/common/lib.rs`) drives the real binary with.
 portable-pty = "=0.8.1"
 vt100 = "0.18"
 # Already a root dependency. `daemon status --json` and `daemon hello` are the

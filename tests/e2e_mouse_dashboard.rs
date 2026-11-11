@@ -18,7 +18,7 @@
 //! corrected j/k linear-cycling selection semantics — clicking card N
 //! selects exactly card N, the same card a sequence of j/k would land on.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{TuiDeck, write_hook_line};
 use spec::spec;

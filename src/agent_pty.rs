@@ -8975,6 +8975,9 @@ struct WaitingNoticeRecord {
     /// and settling a record the close sweep already removed finds nothing, so
     /// no cooldown outlives the pane (Qodo, #1347).
     settled: bool,
+    /// Issue #2099: the episode is about a turn that ended on an error, not a
+    /// wait ([`AgentPtyRegistry::open_failure_episode_slot`]).
+    failure: bool,
     /// The live end of the task's cancellation channel, `None` once settled.
     /// Never sent on: the task selects on it and exits as soon as it drops.
     _cancel: Option<oneshot::Sender<()>>,
@@ -11616,6 +11619,7 @@ impl AgentPtyRegistry {
                 seq,
                 worker_agent_id: worker_agent_id.to_string(),
                 settled: false,
+                failure: false,
                 _cancel: Some(cancel_tx),
             },
         );
@@ -11628,6 +11632,36 @@ impl AgentPtyRegistry {
             cancel: cancel_rx,
             not_before,
         })
+    }
+
+    /// Issue #2099: make room for a failure episode of `worker_agent_id` on
+    /// `worker_pane_id`. A wait episode of that agent, pending or settled, is
+    /// dropped (its task with it): the failure is what the orchestrator has to
+    /// hear. A failure episode of that agent is kept, pending or settled, and
+    /// `false` is answered: a repeated error neither restarts its debounce nor
+    /// earns a second notice before the worker works again, which closes the
+    /// episode. The cooldown record is left as it is.
+    pub fn open_failure_episode_slot(&self, worker_pane_id: &str, worker_agent_id: &str) -> bool {
+        let mut tracker = self.delegations.lock();
+        match tracker.waiting_notices.get(worker_pane_id) {
+            Some(open) if open.worker_agent_id == worker_agent_id && open.failure => false,
+            Some(open) if open.worker_agent_id == worker_agent_id => {
+                tracker.waiting_notices.remove(worker_pane_id);
+                true
+            }
+            _ => true,
+        }
+    }
+
+    /// Issue #2099: mark the episode `seq` on `worker_pane_id`, just armed,
+    /// as a failure episode.
+    pub fn mark_failure_episode(&self, worker_pane_id: &str, seq: u64) {
+        let mut tracker = self.delegations.lock();
+        if let Some(open) = tracker.waiting_notices.get_mut(worker_pane_id)
+            && open.seq == seq
+        {
+            open.failure = true;
+        }
     }
 
     /// Issue #447: close `worker_pane_id`'s waiting episode, if one is open
@@ -17944,6 +17978,11 @@ impl AgentPtyRegistry {
             );
             return released;
         }
+        // Issue #2099: the tasks this report is about, read before it is
+        // posted, so a task delegated meanwhile is not ended by it.
+        let stopped_tasks = self
+            .inbox()
+            .tasks_awaiting_report(worker_pane_id, worker_agent_id);
         // PRD #1666 S5: a daemon notice in the orchestrator generation's inbox.
         match crate::inbox_hub::post_notice_to_live(
             self,
@@ -17951,12 +17990,21 @@ impl AgentPtyRegistry {
             "worker blocked by a usage limit",
             text,
         ) {
-            Ok(_) => tracing::info!(
-                worker_pane_id = %worker_pane_id,
-                role = %notice.role,
-                "quota: reported a delegated worker blocked by a provider usage limit to the \
-                 orchestrator"
-            ),
+            Ok(_) => {
+                tracing::info!(
+                    worker_pane_id = %worker_pane_id,
+                    role = %notice.role,
+                    "quota: reported a delegated worker blocked by a provider usage limit to the \
+                     orchestrator"
+                );
+                // Issue #2099: the orchestrator has been told its task will
+                // likely not complete, which ends the task's hand-off.
+                crate::telemetry::observe_worker_stopped(
+                    self.telemetry(),
+                    &stopped_tasks,
+                    crate::telemetry::handoff::Stopped::Blocked,
+                );
+            }
             Err(error) => tracing::warn!(
                 pane_id = %orchestrator_pane_id,
                 role = %notice.role,
@@ -29594,7 +29642,24 @@ mod spawn_tests {
             RingOutcome::Txn(Outcome::Unresolved(Cause::WriteStalled)),
             "{report:?}"
         );
-        assert!(started.elapsed() < TXN_MAX + Duration::from_millis(500));
+        // The ring holds until TXN_MAX by design, so the slack is all scheduling: 500 ms
+        // was overrun on a loaded macOS runner (main run 42720481204). One second is the
+        // scheduling slack the sibling deadline check in this module also allows (it adds a
+        // 50 ms tick on top).
+        assert!(
+            started.elapsed() < TXN_MAX + Duration::from_secs(1),
+            "the writer was held past its deadline: {:?}",
+            started.elapsed()
+        );
+        // The bound times the ring; this is the property the test is named for.
+        assert!(
+            registry
+                .agent_writer(&editor.id)
+                .unwrap()
+                .try_lock()
+                .is_ok(),
+            "the ring released the writer"
+        );
         assert!(matches!(editor.cell(), Latch::Suspended(..)));
         reached
             .recv_timeout(Duration::from_secs(1))
@@ -33166,6 +33231,49 @@ mod spawn_tests {
             !reg.cancel_waiting_notice("worker", "agent-2"),
             "nothing left to cancel"
         );
+    }
+
+    /// Issue #2099 (PR #2239 review): a failure replaces the same agent's wait
+    /// episode, pending or settled, but never its own failure episode, so a
+    /// repeated error keeps the first one's deadline and buys no second
+    /// notice; another agent's episode is not touched.
+    #[test]
+    fn a_failure_replaces_a_wait_but_keeps_its_own_episode() {
+        let reg = Arc::new(AgentPtyRegistry::new());
+        let cooldown = Duration::from_secs(120);
+        let wait = reg
+            .arm_waiting_notice("worker", "agent", cooldown, false)
+            .unwrap();
+        assert!(reg.open_failure_episode_slot("worker", "agent"));
+        assert!(
+            !reg.waiting_notice_is_current("worker", wait.seq),
+            "the pending wait is gone"
+        );
+        let failure = reg
+            .arm_waiting_notice("worker", "agent", cooldown, true)
+            .unwrap();
+        reg.mark_failure_episode("worker", failure.seq);
+        assert!(
+            !reg.open_failure_episode_slot("worker", "agent"),
+            "a repeated error keeps the pending failure episode"
+        );
+        assert!(reg.waiting_notice_is_current("worker", failure.seq));
+        reg.settle_waiting_notice("worker", failure.seq, true);
+        assert!(
+            !reg.open_failure_episode_slot("worker", "agent"),
+            "and buys no second notice once it is reported"
+        );
+        assert!(
+            reg.cancel_waiting_notice("worker", "agent"),
+            "work closes the failure episode"
+        );
+        assert!(reg.open_failure_episode_slot("worker", "agent"));
+        // Control: another agent's episode is left to its own agent.
+        let other = reg
+            .arm_waiting_notice("worker", "successor", cooldown, false)
+            .unwrap();
+        assert!(reg.open_failure_episode_slot("worker", "agent"));
+        assert!(reg.waiting_notice_is_current("worker", other.seq));
     }
 
     /// Issue #447: a settled episode stays open, so the same agent's repeated

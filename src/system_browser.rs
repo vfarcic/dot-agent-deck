@@ -708,6 +708,20 @@ mod tests {
         }
     }
 
+    /// Run a freshly written script once and wait for it, so its first
+    /// launch happens here rather than inside a launch the test times. On
+    /// macOS the first launch of a new executable waits on the system's
+    /// assessment of it, which took 8-10 s on a loaded box (PR #2177) and
+    /// so outlasts `LAUNCH_GRACE`; a test that pins how a launch settles
+    /// would then read "still running" for a browser that exited at once.
+    #[cfg(unix)]
+    fn prime(script: &std::path::Path) {
+        let _ = std::process::Command::new(script)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+    }
+
     /// A shell-valued `BROWSER` and a hostile URL execute nothing: the payload
     /// would create `pwned`, and it never appears — neither for the hostile URL
     /// nor for a valid one substituted into the shell's `-c` source.
@@ -752,6 +766,8 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prime(&script);
+        std::fs::remove_file(&record).unwrap();
         let env = BrowserEnv {
             browser: Some(script.display().to_string()),
             display: false,
@@ -778,6 +794,7 @@ mod tests {
         let script = dir.path().join("browser");
         crate::test_isolation::write_script(&script, "#!/bin/sh\nexit 1\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        prime(&script);
         let env = BrowserEnv {
             browser: Some(script.display().to_string()),
             display: false,
@@ -901,9 +918,16 @@ mod tests {
             shown,
             "Opening https://github.com/o/r/pull/5 in the browser"
         );
-        assert_eq!(
-            rx.recv_timeout(Duration::from_secs(30)).unwrap(),
-            "Opened https://github.com/o/r/pull/5"
+        // Either settled outcome of a launch that went through: on a loaded
+        // macOS box the first launch of a freshly written script can outlast
+        // `LAUNCH_GRACE` (its first-launch assessment took 8-10 s, PR #2177),
+        // and the watch then settles as still running. What this test is
+        // about is that the launch was allowed and its watch freed the slot.
+        let settled = rx.recv_timeout(Duration::from_secs(30)).unwrap();
+        assert!(
+            settled == "Opened https://github.com/o/r/pull/5"
+                || settled == "Opening https://github.com/o/r/pull/5 in the browser",
+            "the launch after a freed slot went through: {settled}"
         );
         assert!(
             SLOTS.claim().is_some(),

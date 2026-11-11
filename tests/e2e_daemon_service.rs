@@ -12,7 +12,7 @@
 //! write-and-enable decisions without a daemon are `tests/daemon_service.rs`;
 //! the unit under a real systemd is the PRD's recorded verification.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
