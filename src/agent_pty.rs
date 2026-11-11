@@ -3997,8 +3997,8 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
 }
 
 /// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
-/// under, whose nested sessions the scan counts as one command
-/// ([`crate::platform::proc::qualifying_command_sessions_in_pane`]). Only
+/// under, whose nested sessions a card displays as one command
+/// ([`crate::platform::proc::command_sessions_in_pane`]). Only
 /// Codex's was measured, so only a pane the registry knows as Codex selects
 /// one; every other kind (and a pane whose kind is not known yet) selects none
 /// and counts every qualifying session as it always has. Keyed off the same
@@ -18936,18 +18936,23 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #1678 D4: [`Self::classify_shell_activity`] with the distinct
-    /// qualifying POSIX sessions behind each busy reading — the count a card
-    /// shows as background commands — paired with the candidate (and so the
-    /// spawn) it was classified for. A candidate the table cannot answer for is
-    /// dropped, never reported as zero.
+    /// qualifying POSIX sessions behind each busy reading — raw, each with its
+    /// own first-seen age downstream, plus the pairs the pane's wrapper says
+    /// are one command in the count a card shows (issue #1757,
+    /// [`crate::platform::proc::CommandSessions`]) — paired with the candidate
+    /// (and so the spawn) it was classified for. A candidate the table cannot
+    /// answer for is dropped, never reported as zero.
     pub fn classify_command_sessions<'c>(
         candidates: &'c [ShellActivityCandidate],
         table: &[crate::platform::proc::ProcessInfo],
-    ) -> Vec<(&'c ShellActivityCandidate, std::collections::HashSet<i32>)> {
+    ) -> Vec<(
+        &'c ShellActivityCandidate,
+        crate::platform::proc::CommandSessions,
+    )> {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let sessions = crate::platform::proc::qualifying_command_sessions_in_pane(
+                let sessions = crate::platform::proc::command_sessions_in_pane(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,

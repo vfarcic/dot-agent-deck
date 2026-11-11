@@ -3871,8 +3871,9 @@ impl ShellActivityKey {
 #[derive(Debug, Clone)]
 struct ShellActivityReading {
     busy: bool,
-    /// The qualifying POSIX sessions of the last valid sample (issue #1678 D4).
-    sessions: std::collections::HashSet<i32>,
+    /// The qualifying POSIX sessions of the last valid sample (issue #1678 D4),
+    /// raw, with the wrapper pairs the displayed count merges (issue #1757).
+    sessions: crate::platform::proc::CommandSessions,
     /// Whether the spawn's turn had ended when it was last read, so the
     /// monitor emits once when a turn ends with a command still running.
     turn_ended: bool,
@@ -3884,7 +3885,7 @@ fn classify_owned(
     table: &[crate::platform::proc::ProcessInfo],
 ) -> Vec<(
     crate::agent_pty::ShellActivityCandidate,
-    std::collections::HashSet<i32>,
+    crate::platform::proc::CommandSessions,
 )> {
     AgentPtyRegistry::classify_command_sessions(candidates, table)
         .into_iter()
@@ -4511,7 +4512,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                 if sessions_changed {
                     let mut guard = state.write().await;
                     if pty_registry.shell_activity_candidate_current(&candidate) {
-                        guard.observe_command_sessions(
+                        guard.observe_paired_command_sessions(
                             &candidate.pane_id,
                             &candidate.agent_id,
                             &sessions,
@@ -4584,7 +4585,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                     if !pty_registry.shell_activity_candidate_current(&candidate) {
                         return true;
                     }
-                    state.observe_command_sessions(
+                    state.observe_paired_command_sessions(
                         &candidate.pane_id,
                         &candidate.agent_id,
                         &sessions,

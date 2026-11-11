@@ -195,7 +195,14 @@ struct BackgroundTrack {
     /// D3: subagent id → daemon receipt time of its `SubagentStart` (epoch ms).
     subagents: HashMap<String, i64>,
     /// D4/D5: qualifying POSIX session id → when the daemon first sampled it.
+    /// Raw: every qualifying session keeps its own first-seen age, so a
+    /// session that started this turn is awaited whatever it is paired with.
     commands: HashMap<i32, i64>,
+    /// Issue #1757: the last sample's wrapper pairs, inner session → outer
+    /// session ([`crate::platform::proc::CommandSessions::same_command`]),
+    /// consulted only to count [`Self::commands`] one per command for
+    /// display.
+    same_command: HashMap<i32, i32>,
     /// The checked monotonic revision of [`Self::published`].
     revision: u64,
     /// The aggregate last published; `None` when there is nothing to show.
@@ -216,8 +223,23 @@ impl BackgroundTrack {
         if !(self.reports_turn_boundaries && self.turn_ended) {
             return None;
         }
+        // Issue #1757: the displayed counts are one per command — a wrapper
+        // pair's two sessions are one — while every raw session's own age
+        // decides whether its command was started this turn, so a pair never
+        // hides a session that started this turn behind an older one.
+        let commands: HashSet<i32> = self
+            .commands
+            .keys()
+            .map(|session| self.command_of(*session))
+            .collect();
+        let awaited: HashSet<i32> = self
+            .commands
+            .iter()
+            .filter(|(_, first_seen)| self.started_this_turn(**first_seen))
+            .map(|(session, _)| self.command_of(*session))
+            .collect();
         let work = BackgroundWork {
-            commands: u32::try_from(self.commands.len()).unwrap_or(u32::MAX),
+            commands: u32::try_from(commands.len()).unwrap_or(u32::MAX),
             subagents: u32::try_from(self.subagents.len()).unwrap_or(u32::MAX),
             since_ms: self
                 .commands
@@ -225,15 +247,20 @@ impl BackgroundTrack {
                 .chain(self.subagents.values())
                 .min()
                 .copied(),
-            awaited: u32::try_from(
-                self.commands
-                    .values()
-                    .filter(|first_seen| self.started_this_turn(**first_seen))
-                    .count(),
-            )
-            .unwrap_or(u32::MAX),
+            awaited: u32::try_from(awaited.len()).unwrap_or(u32::MAX),
         };
         (!work.is_empty()).then_some(work)
+    }
+
+    /// Issue #1757: the session that stands for `session`'s command in the
+    /// displayed counts: its paired outer session while that one is still
+    /// counted, else itself.
+    fn command_of(&self, session: i32) -> i32 {
+        self.same_command
+            .get(&session)
+            .copied()
+            .filter(|outer| self.commands.contains_key(outer))
+            .unwrap_or(session)
     }
 
     /// Issue #1757: was a command first sampled at `first_seen` started in the
@@ -283,12 +310,28 @@ impl BackgroundTrack {
     }
 
     /// D4/D5: replace the sampled command set with `sessions`, keeping the
-    /// first-seen time of every session still present.
+    /// first-seen time of every session still present. No wrapper pairs: each
+    /// session is a command of its own.
+    #[cfg(test)]
     fn observe_commands(&mut self, sessions: &HashSet<i32>, now_ms: i64) {
+        self.observe_paired_commands(sessions, &HashMap::new(), now_ms);
+    }
+
+    /// D4/D5: [`Self::observe_commands`] with the sample's wrapper pairs
+    /// (issue #1757), which replace the last sample's. The raw `sessions` are
+    /// what the ages are kept for; the pairs only merge two of them in the
+    /// displayed counts.
+    fn observe_paired_commands(
+        &mut self,
+        sessions: &HashSet<i32>,
+        same_command: &HashMap<i32, i32>,
+        now_ms: i64,
+    ) {
         self.commands.retain(|sid, _| sessions.contains(sid));
         for sid in sessions {
             self.commands.entry(*sid).or_insert(now_ms);
         }
+        self.same_command.clone_from(same_command);
     }
 
     /// D2/D3: what a genuine agent report says about the turn and its
@@ -12895,15 +12938,49 @@ impl AppState {
 
     /// Issue #1678 D4/D5: record the qualifying command sessions a valid sample
     /// found below `agent_id`'s pane, keeping the first-seen time of each one
-    /// still present. Called by the monitor under the state write lock, before
-    /// the event that publishes the change is applied (or on its own when the
-    /// change cannot move the aggregate). Records nothing for a pane with no
-    /// card of that agent, or where this state is not the daemon's.
+    /// still present, each session a command of its own. The monitor records
+    /// through [`Self::observe_paired_command_sessions`]; this unpaired form
+    /// is the tests'. Records nothing for a pane with no card of that agent,
+    /// or where this state is not the daemon's.
+    #[cfg(test)]
     pub(crate) fn observe_command_sessions(
         &mut self,
         pane_id: &str,
         agent_id: &str,
         sessions: &HashSet<i32>,
+    ) {
+        self.observe_sessions_with_pairs(pane_id, agent_id, sessions, &HashMap::new());
+    }
+
+    /// Issue #1678 D4/D5, #1757: record a valid sample's qualifying command
+    /// sessions below `agent_id`'s pane with the pane's wrapper pairs
+    /// ([`crate::platform::proc::CommandSessions`]). Called by the
+    /// shell-activity monitor under the state write lock, before the event that
+    /// publishes the change is applied (or on its own when the change cannot
+    /// move the aggregate). Records nothing for a pane with no card of that
+    /// agent, or where this state is not the daemon's. Every raw session keeps its own
+    /// first-seen age (the busy reading and the Waiting decision); the pairs
+    /// only count a matched chain once in the displayed command count.
+    pub(crate) fn observe_paired_command_sessions(
+        &mut self,
+        pane_id: &str,
+        agent_id: &str,
+        sessions: &crate::platform::proc::CommandSessions,
+    ) {
+        self.observe_sessions_with_pairs(
+            pane_id,
+            agent_id,
+            &sessions.sessions,
+            &sessions.same_command,
+        );
+    }
+
+    fn observe_sessions_with_pairs(
+        &mut self,
+        pane_id: &str,
+        agent_id: &str,
+        sessions: &HashSet<i32>,
+        same_command: &HashMap<i32, i32>,
     ) {
         if self.agent_ownership.is_none() {
             return;
@@ -12918,7 +12995,7 @@ impl AppState {
         if track.agent_id.as_deref() != Some(agent_id) {
             *track = BackgroundTrack::for_agent(Some(agent_id.to_string()));
         }
-        track.observe_commands(sessions, Utc::now().timestamp_millis());
+        track.observe_paired_commands(sessions, same_command, Utc::now().timestamp_millis());
     }
 
     /// Issue #1678 D3/D5 (A3): the `(pane, agent)` identities of every card
@@ -20787,6 +20864,129 @@ mod tests {
             (2, HashSet::from([SERVER, TOOL_SID])),
             "the tool's command is a session of its own, not part of the server's count"
         );
+    }
+
+    /// Scenario: A Codex pane runs a process shaped like the outer stage of Codex's Linux sandbox, with a long-lived child of its own, sampled before a turn so it counts as an earlier turn's command. The next turn has that child start a session shaped like the sandbox's inner stage, and the turn ends while it runs. The scan pairs the two sessions, so the card shows one command, but the new session keeps its own first-seen age, so the card reads Waiting rather than Idle.
+    #[spec("status/waiting/028")]
+    #[test]
+    fn status_waiting_028_a_paired_inner_session_started_this_turn_is_awaited() {
+        use crate::platform::proc::{CommandLine, CommandWrapper, ProcessInfo};
+
+        const AGENT: i32 = 81100;
+        const OUTER: i32 = 81200;
+        const MIDDLE: i32 = 81204;
+        const INNER: i32 = 81206;
+        let row = |pid: i32, ppid: i32, sid: i32, argv: CommandLine| ProcessInfo {
+            pid,
+            ppid,
+            session_id: sid,
+            has_controlling_tty: sid == AGENT,
+            session_leader: pid == sid,
+            command_line: argv,
+        };
+        let read = |argv: &str| CommandLine::Read(argv.to_string());
+        // Both wrapper stages' command lines, as any process can title itself;
+        // the sole child between them is an arbitrary supervisor whose
+        // command line is never read.
+        let before = vec![
+            row(AGENT, 1, AGENT, CommandLine::NotSampled),
+            row(
+                OUTER,
+                AGENT,
+                OUTER,
+                read("codex-linux-sandbox --sandbox-policy-cwd /w -- worker"),
+            ),
+            row(MIDDLE, OUTER, OUTER, CommandLine::NotSampled),
+        ];
+        let mut during = before.clone();
+        during.push(row(
+            INNER,
+            MIDDLE,
+            INNER,
+            read("codex-linux-sandbox --sandbox-policy-cwd /w --apply-seccomp-then-exec -- worker"),
+        ));
+        during.push(row(81207, INNER, INNER, CommandLine::NotSampled));
+        // What the registry selects for a Codex pane.
+        let scan = |table: &[ProcessInfo]| {
+            crate::platform::proc::command_sessions_in_pane(
+                table,
+                AGENT,
+                &[],
+                None,
+                Some(CommandWrapper::CodexLinuxSandbox),
+            )
+            .expect("the agent is in the table")
+        };
+
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        let frame = |event_type: &str| {
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "codex", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Turn 1 ends; the outer session is sampled after it.
+        state.apply_event(frame("session_start"));
+        state.apply_event(frame("thinking"));
+        state.apply_event(frame("idle"));
+        tick();
+        state.observe_paired_command_sessions(CLI_PANE, CLI_AGENT_ID, &scan(&before));
+
+        // Turn 2 has the supervisor start the inner session, and ends while it
+        // runs.
+        tick();
+        state.apply_event(frame("thinking"));
+        tick();
+        let sessions = scan(&during);
+        assert_eq!(
+            (
+                sessions.sessions.clone(),
+                sessions.same_command.clone(),
+                sessions.commands()
+            ),
+            (
+                HashSet::from([OUTER, INNER]),
+                HashMap::from([(INNER, OUTER)]),
+                HashSet::from([OUTER])
+            ),
+            "both sessions stay raw; the pair merges them for the displayed count only"
+        );
+        state.observe_paired_command_sessions(CLI_PANE, CLI_AGENT_ID, &sessions);
+        state.apply_event(frame("idle"));
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(waiting_status_1757()),
+            "a session first seen this turn is awaited even when paired with an older one"
+        );
+        let work = state
+            .pane_background_of(CLI_PANE)
+            .expect("the paired command");
+        assert_eq!(
+            (work.commands, awaited_of(Some(work))),
+            (1, 1),
+            "one command displayed, and it is awaited"
+        );
+
+        // The measured chain, both stages first seen in one turn, is one
+        // command and one awaited.
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        state.apply_event(frame("session_start"));
+        state.apply_event(frame("thinking"));
+        tick();
+        state.observe_paired_command_sessions(CLI_PANE, CLI_AGENT_ID, &scan(&during));
+        state.apply_event(frame("idle"));
+        assert_eq!(state.pane_status_of(CLI_PANE), Some(waiting_status_1757()));
+        let work = state.pane_background_of(CLI_PANE).expect("one command");
+        assert_eq!((work.commands, awaited_of(Some(work))), (1, 1));
     }
 
     /// Scenario: A pane's turn starts a command and ends while it runs, so the card reads Waiting; then the agent starts a new conversation (a SessionStart under a new session id, with no SessionEnd) and that conversation's first report is an Idle with no prompt before it. The old conversation's command keeps its age but reads as an earlier turn's — Idle with the Background line, on the SessionStart and on the Idle — and a command started in a real turn of the new conversation makes the card Waiting again.
