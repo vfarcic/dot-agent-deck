@@ -714,6 +714,12 @@ handler = "onClick"
 code = "confirm"
 reason = "Confirmation dialog Confirm button: runs the destructive action the opener staged. Kept manual by design: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user confirms it by hand."
 
+[[site]]
+file = "desktop/src/components/ConfirmDialog.tsx"
+handler = "onClick"
+code = "() => run(\"keep\", keep.action)"
+reason = "Confirmation dialog's second confirm, the close that keeps the dispatched worktree (`Close agent, keep worktree` / `Close all N roles, keep worktree`, issue #1958): runs the destructive close the opener staged, like the Confirm button. Kept manual by design for the same reason: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user picks which close by hand."
+
 # --- desktop/src/components/DeckSelector.tsx ---
 
 [[site]]

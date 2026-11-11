@@ -1978,6 +1978,8 @@ Issues [#823](https://github.com/vfarcic/dot-agent-deck/issues/823) and [#836](h
 - **Keyboard reach, and the narrow breakpoint almost everywhere.** One file tabs through a screen, and it is not about that screen: `agent-pane-modal.spec.ts` presses Tab to prove the agent pane CONTAINS focus, so what it enumerates is the pane's own tab order and not the deck's. No spec walks a screen's controls in order, checks that every one is reachable, or checks that any of them carries a visible focus ring. Every spec but one stays at or above 900px — deliberately, since below 680px the padding and the status pips change. The exception is `agent-pane-narrow.spec.ts` at 400x780, and it asserts two things about the agent pane at that width and nothing about any other surface there.
 - **Non-Linux runners.** The CI job runs on `ubuntu-latest` only, so nothing here has ever run against a macOS or Windows browser build.
 
+**Run it on Linux; on a macOS host 13 specs fail.** The suite is written for a Linux host, the one CI uses. Measured on 2026-11-10 on macOS with `main`'s specs, the same 13 tests failed at one worker and at four, while all 442 passed on `ubuntu-latest`. Four are the paste-shortcut tests in `agent-terminal-input.spec.ts` (in both engines), which assume the host does not paste on Cmd+V. Five are WebKit keyboard-focus tests in `column-picker`, `new-agent`, `scroll-indicators` and `voice-control`, consistent with macOS WebKit not moving focus to buttons on Tab. On a Mac, read those as the host, not as a regression. [#2277](https://github.com/vfarcic/dot-agent-deck/issues/2277) tracks making them independent of the host or skipping them off Linux.
+
 **Running it locally.** From `desktop/`:
 
 ```sh

@@ -271,6 +271,229 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
 - **Platform coverage:** mac+linux.
 
+### Project config trust (PRD #1885)
+
+#### config-trust/cli
+
+##### config-trust/cli/001 — `trust approve --yes` prints what it approves and `trust list` shows it `current`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`): the real binary against an isolated HOME and state dir; no daemon.
+- **Agent:** none.
+- **Asserts:** with no approvals `list` exits 0 and names nothing; `approve <dir> --yes` exits 0 and prints each role's command, description and prompt text; `list` then shows one line for the project (canonical path) and orchestration whose state word is `current`.
+- **Does not assert:** the y/N question on a terminal (the `trust_cli` unit tests own it); the list line's exact layout.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/002 — Changing one character of a role's command reads as `changed`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** after an approval, a one-character edit to a role `command` makes `list` show `changed`; restoring the text shows `current` again.
+- **Does not assert:** which other keys void an approval (unit tests own the field list).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/003 — `trust revoke` removes an approval and fails when there is nothing to revoke.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `revoke <dir>` exits 0 and the project leaves `list`; a second `revoke` exits non-zero with a message.
+- **Does not assert:** `--orchestration`-scoped revoke.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/004 — `trust approve` without a terminal and without `--yes` refuses.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** non-zero exit, a message naming `--yes`, and nothing stored.
+- **Does not assert:** the terminal question itself.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/005 — `trust approve` inside a deck pane refuses; `list` and `revoke` still run.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none; the pane identity is `DOT_AGENT_DECK_PANE_ID` in the CLI's environment.
+- **Asserts:** `approve --yes` with the pane identity exits non-zero with `run it from a terminal outside the deck` and stores nothing; `list` exits 0 and `revoke` removes an approval with the same identity present.
+- **Does not assert:** the other pane-identity variables, or a run from a real pane's shell.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/006 — A linked git worktree shares its main checkout's approval.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `approve <linked worktree> --yes` stores the approval under the main checkout (the list line names the main path, never the worktree's) as `current`, and `revoke <main checkout>` finds it.
+- **Does not assert:** a non-git project's identity (the canonical config directory).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/prompt
+
+##### config-trust/prompt/001 — The New Agent form asks before starting a never-approved orchestration.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), launched with `without_trust_preapproval`.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`).
+- **Asserts:** Ctrl+n + choosing the orchestration shows `Review project commands` with the project, the orchestration, `not approved before`, every role's command, description and prompt text and the footer `a approve and start · Esc cancel · ↑↓ scroll`, and no role is on the daemon; `Esc` closes it with nothing spawned; choosing again and pressing `a` starts both roles and `trust list` shows the approval `current`.
+- **Does not assert:** scrolling; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/002 — A changed role is marked `changed`, and Enter does not approve.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** after a one-character edit to an approved role's command, the prompt shows that role marked `changed` with its new command; Enter leaves the prompt open, spawns nothing, and the stored approval still reads `changed`.
+- **Does not assert:** the no-prompt open of an approved, unchanged orchestration (every other orchestration test opens one under the harness pre-approval).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/003 — The trust prompt's layout: state, role marks, removed roles, the restore footer and scrolling under a fixed footer.
+- **Layer:** L1 (`trust_prompt::render_to_buffer` + ratatui `TestBackend` + `insta`, `tests/render_trust_prompt.rs`), views built by `TrustCheck::evaluate(..).view()` against an in-memory `ApprovalStore`.
+- **Agent:** none.
+- **Asserts:** a never-approved orchestration shows `Review project commands`, the project, `not approved before`, every role's command, description and prompt with no mark, and the footer `a approve and start · Esc cancel · ↑↓ scroll`; a changed one shows `changed since you approved it`, the edited role marked `changed`, the added one `new`, the untouched one unmarked and `Removed since you approved it: <role>`; the restore variant's footer is `a approve and restore`; a long prompt in a short terminal keeps the footer on screen and shows `(more below)`, `(more above and below)` and `(more above)` at the top, middle and end; a first role whose prompt runs to 70,000 lines either leaves a later role's command reachable at the end or offers no `a approve`. Five snapshots pin the layout.
+- **Does not assert:** keys, approving or the spawned binary (`config-trust/prompt/001`/`002`, the `ui.rs` `prompt_004`–`006` unit tests); escaping of hostile config text (`trust_prompt` unit tests); the desktop dialog.
+- **Platform coverage:** mac+linux+windows.
+
+##### config-trust/prompt/004 — The trust prompt works with the mouse: clicking `a approve and start`/`a approve and restore` approves, clicking `Esc cancel` cancels, the wheel scrolls, and other clicks do nothing.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, four tests), SGR mouse reports through `TuiDeck::click`/`scroll_n`, each label located on the rendered grid; the restore test stages the `config-trust/restore/002` saved session.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`, `sleep 600`).
+- **Asserts:** clicks on the prompt's title, on a role's description, on the deck left of the popup and on the dashboard's `[Quit Ctrl+C]` and `[New Agent Ctrl+N]` buttons behind it, and Enter, leave the prompt open, open no quit dialog and spawn nothing; a click on `a approve and start` starts both roles and `trust list` reads `current`; a click on `Esc cancel` closes the prompt, spawns nothing and stores nothing; the wheel over a review longer than the popup scrolls it to `(more above and below)`, to its last line and `(more above)`, and back to `(more below)`, without approving; on the restore prompt a click on `a approve and restore` restores the roles and `trust list` reads `current`.
+- **Does not assert:** that a click on the approve label before the prompt's first frame is refused (the `ui.rs` unit tests own that guard: the prompt opens on a daemon reply, so a PTY cannot order a click between its opening and its first frame); clicking `Esc cancel` on the restore prompt; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/restore
+
+##### config-trust/restore/001 — A restored orchestration whose command changed asks before restoring.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** on a daemon-empty start the prompt shows the orchestration, the changed command, `coder` marked `changed` and `a approve and restore`, with no role spawned; `a` restores the roles.
+- **Does not assert:** cancelling a restore prompt (restore/002 does); several restored orchestrations.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/002 — Cancelling the restore prompt leaves the orchestration unrestored and restores the rest of the session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session holding the changed orchestration followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing; after a detach-quit the saved `session.toml` still holds the `restore-orch` snapshot, and the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** that the orchestration can be reopened from the New Agent form afterwards; several restored orchestrations; a periodic (mid-session) save while the prompt is open.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/003 — A saved orchestration that can no longer be trust-checked does not fall through to a plain-pane restore.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, three tests): saved session holding a never-approved orchestration whose saved orchestrator command writes a sentinel file, followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION` with an empty approval store.
+- **Agent:** stand-ins (`sh -c 'touch <sentinel>; exec sleep 600'`, `sleep 600`).
+- **Asserts:** after (a) a worker role is removed from the config, (b) the orchestration is renamed, or (c) the config file is deleted, launching the TUI never writes the sentinel, restores no `orchestrator` pane and no pane in the project, starts no role, and still restores the plain pane (a trust prompt, if one appears, is cancelled first).
+- **Does not assert:** what the warning says; role reorder or role rename drift.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/004 — Quitting while a restore prompt is unanswered keeps the orchestration in the saved session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): the `config-trust/restore/002` saved session (a changed orchestration, then a plain pane) staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** with the restore prompt open and unanswered (the plain pane already restored), `Ctrl+C` and Detach quit the deck cleanly; the saved `session.toml` still holds the `restore-orch` orchestration snapshot; the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** a terminal hang-up (SIGHUP) rather than a detach; a periodic (mid-session) save while the prompt is open; the order in which several held-back restores are asked.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/005 — Approving a held-back restore starts only the roles that were running when the session was saved (issue #929).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): a changed orchestration's current (`version = 2`) snapshot listing `started_role_indices = [0, 1]`, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** quitting (`Ctrl+C`, Detach) with the restore prompt unanswered leaves the saved block at `version = 2` with `[0, 1]`, so a held restore keeps which roles were running; on the next start, `a` restores the orchestrator and `coder` on the daemon, no `reviewer` agent appears, and the restored tab still shows a `reviewer` card.
+- **Does not assert:** a restore that needed no approval (`session/restore/025`); an old (`version = 1`) snapshot, which starts every role (`config-trust/restore/001`, `session/restore/008`); a declined (`Esc`) restore's saved block; a periodic (mid-session) save while the prompt is open.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/respawn
+
+##### config-trust/respawn/001 — A delegate to a `clear = true` role refuses after its config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** the delegate exits non-zero with the refusal (orchestration, project, `changed since you approved it`, `dot-agent-deck trust approve … --orchestration trust-orch`), and coder keeps its agent id.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/002 — `pane restart` refuses after the role's config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane restart coder --force` exits non-zero with the refusal text, and coder keeps its agent id.
+- **Does not assert:** a restart of a crashed pane.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/003 — `pane spawn` refuses after a role was added to the config.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane spawn reviewer` exits non-zero with the refusal text, and no reviewer appears on the daemon.
+- **Does not assert:** spawning a role whose text is unchanged.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/004 — A delegate to a non-clear role refuses after only its prompt changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** with an approved orchestration open, changing only a non-clear `reviewer` role's `prompt_template` makes `delegate --to reviewer` exit non-zero with the refusal text (`changed since you approved it`, the approve command), and the task never reaches the reviewer's inbox.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/schedule
+
+##### config-trust/schedule/001 — A scheduled fire into a never-approved orchestration is refused and reported.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins.
+- **Asserts:** run-now spawns nothing and `schedule list` shows the refusal (`never approved`, the project, the approve command); after `trust approve`, the same run-now opens the orchestration.
+- **Does not assert:** the TUI schedule manager's rendering of the refusal (a `ui.rs` unit test owns it); a cron-driven fire.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/002 — An issue dispatch whose default branch changed a role is refused before the devbox warm-up.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins; a `devbox` stub on `PATH` records each warm-up.
+- **Asserts:** the first fire is refused `never approved` with no worktree and no warm-up; after approving the clone, a fire dispatches issue 7 and warms its worktree once; after the remote's default branch changes the role command by one character, the next fire is refused `changed since you approved it`, creates no worktree for issue 8, runs no further warm-up and spawns nothing.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/003 — A forged `.git` file does not borrow another checkout's approval.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`sh ./agent.sh`, `cat`).
+- **Asserts:** with repository A's `team` approved, a directory B holding byte-identical TOML, a different `agent.sh` and a `.git` file copied from A's legitimate linked worktree is refused on run-now: B's marker file is never written, `schedule list` reports the refusal with the approve command naming B, and nothing spawns in B; a run-now in A's real linked worktree still opens the orchestration.
+- **Does not assert:** the wording of the refusal reason; other forged geometries (a `.git` directory, a symlinked `.git`).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/004 — A reattached issue branch with different role text is refused with a remedy that works.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the clone's default branch approved and a local `agent/issue-7` branch changing the role command, a fire for issue 7 is refused `changed since you approved it` and spawns nothing; every directory a printed `dot-agent-deck trust approve` command names exists after the fire; running each printed approve command (with `--yes`) succeeds, and a later fire for issue 8 on the default branch still dispatches.
+- **Does not assert:** the remedy's wording, or whether it prints an approve command at all; that issue 7 itself can be dispatched afterwards; a branch pushed to the remote rather than left in the clone.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/005 — A linked worktree shares its main checkout's approval of an unnamed orchestration.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with a repository whose one orchestration has no `name` approved by `trust approve <main checkout> --yes`, a run-now schedule in the main checkout opens the orchestration, and one in a `git worktree add` linked worktree opens it too.
+- **Does not assert:** the approval's stored name; `trust list` output for an unnamed orchestration; a non-git project.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/006 — An issue dispatch of an unnamed orchestration runs once its clone is approved.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the fixture remote's one orchestration unnamed and the scheduler's clone approved, a fire for issue 7 opens the orchestration in `<clone>/.worktrees/issue-7`.
+- **Does not assert:** the refusal for an unapproved unnamed orchestration; a reattached `agent/issue-<n>` branch (`config-trust/schedule/004`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/dispatch
+
+##### config-trust/dispatch/001 — `dispatch --orchestration` refuses until approved, then runs in a worktree that shares the approval.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane.
+- **Agent:** stand-ins.
+- **Asserts:** from a never-approved project the refusal reaches the caller's inbox (where `dispatch` posts its outcome), no worktree is created and nothing spawns; after `trust approve` of the main checkout a second dispatch succeeds and the roles run in the unit's linked worktree.
+- **Does not assert:** `dispatch --single` or `--command` (not gated).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/rearm
+
+##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.
+- **Layer:** L2 headless `daemon serve` + `RunNow` with a PTY-attached TUI warm-reattaching to it, lane 1 (`tests/e2e_config_trust.rs`); synthetic `Compacting` and `/clear` `SessionStart` hook events under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** after a schedule opens an approved orchestration and only its start role's `prompt_template` is edited to carry a sentinel (`trust list` reads `changed`), a TUI attaching to the warm daemon and then a compaction and a `/clear` on the start role publish no `.dot-agent-deck/orchestrator-context*` file and post no start-role inbox message containing the sentinel.
+- **Does not assert:** how the user is told (a prompt or a refusal); the re-arm of an unchanged orchestration (`orchestration/remit/*`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/escape
+
+##### config-trust/escape/001 — Refusals carry no raw terminal control characters from project-chosen names.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), with `DOT_AGENT_DECK_LOG` pointed into the test's tempdir and real agent-verb CLIs from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** an orchestration named with an ESC clear-screen sequence and a right-to-left override is refused on run-now with no raw ESC or U+202E in the daemon's stderr and no raw ESC, BEL or bidi control in its log; after approving, opening it, changing a command and adding a role with an OSC-8/bidi name, the refused `delegate` and `pane restart` print no raw ESC, BEL or bidi control.
+- **Does not assert:** the escaped spelling; `schedule list` (already escaped) or the TUI schedule manager.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/live
+
+##### config-trust/live/001 — A real agent starts only after the trust prompt is approved. [reel]
+- **Layer:** L2 PTY-attached, **lane 2** (`tests/e2e_config_trust_live.rs`).
+- **Agent:** real interactive Claude Code on Haiku (`--allowedTools Bash Read`), credentials imported, work dir trusted.
+- **Asserts:** Ctrl+n on a never-approved project shows `Review project commands` with the role's `claude …` command and nothing running; `a` starts the agent, which creates the uniquely named sentinel `config_trust_live_5e81c3.txt` its prompt asks for.
+- **Does not assert:** the agent's wording.
+- **Platform coverage:** mac+linux.
+
 ### Work journal (PRD #1889)
 
 The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
@@ -2085,7 +2308,7 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 ##### prompt/close-confirm/001 — Command-mode Ctrl+W opens a Cancel-default close confirmation.
 - **Layer:** L1 (in-process key mapper + close-confirm state + ratatui `TestBackend`).
 - **Agent:** none.
-- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default.
+- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default; with no keep-worktree choice armed (nothing dispatched in the selection, or a daemon without the keep capability) neither scope draws a `keep worktree` choice, and Down twice from Cancel stops on Close, whose Enter is `ConfirmCloseSelected` (issue #1958).
 - **Does not assert:** daemon teardown after confirmation (covered by `lifecycle/stop/*` and `dashboard/pane/002`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -2146,6 +2369,27 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Asserts:** after Ctrl+W arms a card whose session id is `{pane_id}-session`, a second `SessionStart` under that SAME id differing ONLY in `agent_id` takes the pane; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than tearing down the replacement generation.
 - **Why it exists:** `prompt/close-confirm/005` proves the vanishing case through a session id that goes away, which is the easy half — the key stops resolving and the close cannot land anywhere. Pi's producer key is derived from the pane and is stable across respawns, so it never stops resolving, and an armed target keyed on the id alone resolved straight onto whichever generation currently occupied the pane. The fix arms on the generation (session id plus `agent_id`), which is only detectable because #284 refreshes `agent_id` in place on the surviving entry.
 - **Does not assert:** the state seam's own supersession rule (`status/supersede/005`); tab identity binding (`mouse/tabstrip/003`); that a `None` → `Some` identity transition is treated as the same card (a deliberate agreement with the state seam, unit-tested at `resolve_close_plan`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/011 — A close whose selection has a dispatched worktree the daemon can keep offers `Close, keep worktree` as a third choice (issue #1958).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`, plus `handle_close_confirm_key`).
+- **Agent:** none.
+- **Asserts:** a `CloseConfirmState` armed with `dispatched_worktree: Some(path)` draws Cancel, Close and `Close, keep worktree` top to bottom in both the pane scope and the tab scope (each with its own header and Close description), Cancel stays the default, and the keyboard hint is still inside the popup — also with the dirty-tree warning drawn above the choices; Down twice from Cancel reaches the keep choice and stops there, Enter on it returns `Action::ConfirmCloseKeepWorktree`, Enter on Close still returns `Action::ConfirmCloseSelected` and Enter on Cancel `Action::DismissModal`.
+- **Does not assert:** how the TUI decides to arm it (the daemon's `CAP_KEEP_WORKTREE` and the close preview's `dispatched_worktree`, unit-tested in `daemon_client`), the keep row's description, mouse buttons, or the close itself (`prompt/close-confirm/012`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/012 — Ctrl+W's `Close, keep worktree` closes a clean dispatched unit and keeps its worktree, saying so on the status line (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
+- **Agent:** none — identity-recording `cat` probe.
+- **Asserts:** with a clean dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its card selected, Ctrl+W draws Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes the agent, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk.
+- **Does not assert:** the tab/orchestration scope in the TUI (`prompt/close-confirm/013`), a daemon without the keep capability, or a real agent.
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/013 — Ctrl+W's `Close, keep worktree` on a dispatched team's tab stops both roles and keeps their shared worktree (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --orchestration`).
+- **Agent:** none — identity-recording `cat` probes for both roles.
+- **Asserts:** with a clean two-role dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its tab active, Ctrl+W draws `Close this tab and all its agents?` with Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes both roles and the tab, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk. Fails if `TabManager::close_tab_with` drops the keep on its fan-out.
+- **Does not assert:** a keep on one role of a team followed by an ordinary close of the other (the daemon-level `close_agents::tests::keeping_on_one_role_survives_an_ordinary_close_of_the_last`), a daemon without the keep capability, or a real agent.
 - **Platform coverage:** mac+linux.
 
 #### prompt/pane-input
@@ -3434,6 +3678,20 @@ Issue #2051: the deck's OpenCode plugin under the real, pinned OpenCode binaries
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
 - **Platform coverage:** mac+linux.
 
+##### lifecycle/stop/020 — "Close, keep worktree" carries the keep on the retry and on the replacement's stop (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon that answers a follow-on `Hello` and records each StopAgent's `keep_worktree`).
+- **Agent:** none (the original agent answers exact NotFound twice and ListAgents reports replacement B, which stops).
+- **Asserts:** an ordinary close sends its three stops (first try, retry, replacement) with no keep; `close_pane_keeping_worktree` sends the same three stops, each with `keep_worktree: true`.
+- **Does not assert:** what the daemon does with the keep (`close_agents::tests`), the tab fan-out (`prompt/close-confirm/013`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/021 — "Close, keep worktree" carries the keep on every stop of a chained slot handover (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (replacement B loses its slot to C while its stop is in flight; C stops).
+- **Asserts:** the keeping close chases the handover to C and every StopAgent it sends carries `keep_worktree: true`.
+- **Does not assert:** the slot-churn bounds (`lifecycle/stop/013`, `lifecycle/stop/014`).
+- **Platform coverage:** mac+linux.
+
 #### lifecycle/wire-restart
 
 ##### lifecycle/wire-restart/001 — An idle daemon restarts onto its installed target without confirmation.
@@ -3995,6 +4253,27 @@ note).
 - **Agent:** none.
 - **Asserts:** a vt100 screen at exactly the 4096-col cap — the widest a child PTY can be given — rendered with `contract_guaranteed(true)` into an inner area 2 columns WIDER completes without panicking, which in a debug build is the whole assertion: the PRD #84 invariant-3 `debug_assert!` is live there and compares the parser against the inner area, so it must expect the *capped* inner area or a legitimately over-cap pane becomes a debug-build crash. The child's content still renders from the top-left and the columns past the cap stay blank.
 - **Does not assert:** the release-mode log-once line; the upstream sizing that produces the capped parser (covered by `resize/layout/002`); the general area-larger-than-screen `min` fallback with the guard OFF (covered by `render/widget/002`).
+- **Platform coverage:** mac+linux+windows.
+
+##### render/widget/004 — Every screen cell is drawn in its own column: a wide (two-column) glyph takes the two columns it has on the screen, and a cell is never joined with its neighbour (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** with `你好AB` on a vt100 screen's first row, the inner area shows `你` in column 0, `好` in column 2, `A` in column 4 and `B` in column 5, the screen's own columns; for `👩‍💻AB` (a zero-width-joiner emoji the screen keeps as two two-column cells), `🇺🇸AB` (a flag kept as two one-column cells) and `你好AB`, every screen cell's own text is drawn in that cell's column.
+- **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag; colours.
+- **Platform coverage:** mac+linux+windows.
+
+##### render/widget/005 — A cell that changes width between two frames is redrawn where a fresh render draws it, whether the host terminal draws an emoji-presentation (VS16) symbol two columns wide or one: a glyph turning wide does not shift the rest of its row or leave its second column stale (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` → ratatui's `Buffer::diff` → the deck's backend, `WideGlyphBackend` over `CrosstermBackend<Vec<u8>>` → a vt100 parser standing in for the host terminal, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** on a host that draws `☀️` two columns wide (vt100) and on one that draws it one column wide (vt100 reading the output without its VS16 characters, as xterm.js's Unicode 6/11 width tables draw it): after drawing `☀︎AB` and then `☀️AB`, and after `xZAB` is rewritten as `☀️AB`, `❤️AB` or `1️⃣AB`, the display is cell for cell (contents, wide continuation, inverse, underline, colours) the same as a fresh render of the second frame, so `A` and `B` are not shifted and the symbol's second column keeps nothing of the first frame; the same holds for CJK, zero-width-joiner and VS16 glyphs replaced by narrow text, styled wide glyphs replaced by narrow ones (the trailing column's colour is cleared), `ｶﾞ` and `⌚︎`/`🙂︎` (widths the screen and ratatui measure differently), the sun turning narrow again, and wide-to-wide replacements.
+- **Does not assert:** how a real host terminal or font draws these sequences (both displays are models built on vt100); transitions in rows other than the first; scrolled-back screens.
+- **Platform coverage:** mac+linux+windows.
+
+##### render/widget/006 — A selection made after a row turned wide highlights exactly the text it copied, whether the host terminal draws an emoji-presentation (VS16) symbol two columns wide or one (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam` frames → ratatui's `Buffer::diff` → `WideGlyphBackend` over `CrosstermBackend<Vec<u8>>` → the two vt100-based host displays of `render/widget/005`, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** a pane shows `xZAB`, a drag over `xZ` copies `xZ`, the row is rewritten as `☀️AB`, a click on a blank row, then a drag over `A` and `B` copies `AB`; after every frame of that sequence is drawn incrementally, the cells drawn with the selection's background on each host show `AB`, and the display matches a fresh render of the last frame.
+- **Does not assert:** a real host terminal or font; keyboard copy mode; selections spanning the wide glyph itself.
 - **Platform coverage:** mac+linux+windows.
 
 #### render/layout
@@ -5901,6 +6180,13 @@ without depending on the config struct API.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close/004 — A real dispatched agent closed with `Close, keep worktree` leaves its clean worktree on disk, and the status line says it was kept on request and where (issue #1958). [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatcher_mode.rs`; `TuiDeck` on the `minimal` fixture driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → Down, Down, Enter path).
+- **Agent:** claude/haiku — a REAL interactive Claude Code (`claude --model claude-haiku-4-5-20251001`, no `-p`) as the dispatched unit; the caller pane is a shell, so the unit starts the deck's `default_command` (issue #1602).
+- **Asserts:** the agent does one directive, deterministic operation in its own worktree — writing a uniquely named sentinel file into the git-ignored `.dot-agent-deck/` — and goes Idle with the worktree clean (the premise: an ordinary Close would remove it, `dispatch/close/003`); the close confirmation offers `Close, keep worktree`; choosing it puts `Worktree kept on request:` and the worktree's path on the status line, removes the agent from the daemon, and leaves the worktree and the agent's sentinel on disk.
+- **Does not assert:** the tab/orchestration scope (the CLI's is `dispatch/close-verb/013`), a daemon without the keep capability, the desktop dialogs (`AgentOverviewStop.test.tsx`, `AgentPaneOverlay.test.tsx`), or `worktree reclaim` afterwards. The stand-in twin with no agent is `prompt/close-confirm/012`.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/close-verb
 
 ##### dispatch/close-verb/001 — A completed single unit closes from its dispatcher's environment; its worktree is removed and its branch kept.
@@ -5972,6 +6258,20 @@ without depending on the config struct API.
 - **Does not assert:** selector conflicts, ambiguous names or stale ids, which belong to CLI/daemon regression tests.
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close-verb/012 — `close <unit> --keep-worktree` keeps a clean unit's worktree and reports it kept on request (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** two completed clean single units (each with a file in its ignored `.dot-agent-deck/`) closed by name with `--keep-worktree` both exit 0 and lose their agents but keep their worktrees and `.dot-agent-deck/` contents; the human report reads `<path>: kept on request` and names `dot-agent-deck worktree reclaim`, and the `--json` report carries one `kept-on-request` verdict for that path.
+- **Does not assert:** `--dry-run` wording, a dirty tree with keep, or the refusal against a daemon without the capability (unit-tested in `close_cli` / `daemon_client`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/013 — `close --orchestration-of <pane> --keep-worktree` keeps the worktree a team shared (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes in a two-role orchestration.
+- **Asserts:** closing a completed clean two-role unit through a worker's pane with `--keep-worktree --json` exits 0, removes both roles, keeps the shared worktree and its `.dot-agent-deck/` file, and reports one `kept-on-request` verdict for that path.
+- **Does not assert:** the TUI's tab-scope keep or a keep on a non-last role's StopAgent.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/single
 
 ##### dispatch/single/001 — A `--single` unit runs the command its dispatcher was started with, as its dispatcher's agent, instead of the deck's `default_command` (issue #1602).
@@ -5997,8 +6297,8 @@ without depending on the config struct API.
 
 ##### dispatch/single/004 — A real dispatcher told to dispatch with `--command <launcher> --agent claude` gets a real unit that runs that launcher and does its task (issue #2172).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatch_single_live.rs`, `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]`): a real interactive dispatcher opened through the new-pane form, which runs the real `dispatch` CLI itself.
-- **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree. Not marked `[reel]`.
-- **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's record is Claude Code.
+- **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>|<CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree. Not marked `[reel]`.
+- **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's Claude started with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` and the dispatcher's with the variable unset (issue #2094); the unit's record is Claude Code.
 - **Does not assert:** a unit on a different agent from its dispatcher (that is `dispatch/single/002`, with stand-ins, because the harness runs only Claude Code headless); the dispatcher choosing the flags from a request in plain words (the directive gives it the command line); the completion report back to the dispatcher (`dispatch/return/006`).
 - **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
 
@@ -6153,21 +6453,21 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens; since PRD #1666 the replay is read from the role's inbox, not the recorder).
 - **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`. The staged snapshot is an old (`version = 1`) one listing `started_role_indices = [0, 1]`, and every declared role, the unlisted `reviewer` included, still gets a daemon agent, because a version-1 list was always `[start_role_index]` and is no record of what ran (issue #929); a clean detach then re-saves the block as `version = 2` with `started_role_indices = [0, 1, 2]`.
-- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); a current (`version = 2`) snapshot that leaves a role out (`session/restore/025`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); a current (`version = 2`) snapshot that leaves a role out (`session/restore/025`); the on-disk capture that produces the snapshot (`session/save/004`); a snapshot whose config no longer resolves, which is left unrestored (`session/restore/009`); a project whose orchestration is not approved (`config-trust/restore/*`) — this test pre-approves it through the harness's `trusting_project`; the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
-##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
+##### session/restore/009 — An orchestration snapshot whose config no longer resolves is left unrestored, with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift; PRD #1885 removed the plain-pane fallback).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon restores the saved pane as a plain dashboard card and emits a warning naming the missing orchestration.
+- **Agent:** none (the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon lands on the empty dashboard (`No active agents`), no `orchestrator` card appears, the saved command's sentinel file is never written, and the teardown flushes a warning naming the missing orchestration and saying it `was not restored`. A plain-pane fallback would run the saved command with no trust check (PRD #1885).
 - **Does not assert:** the exact warning wording (only that it names the missing orchestration); the successful rebuild path (`session/restore/008`); which other panes survive when multiple are staged (only one is here).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration falls back to a plain dashboard pane with a warning, never panicking at startup (PRD #89 review-fix F2).
+##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration is left unrestored with a warning, never panicking at startup (PRD #89 review-fix F2).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the saved pane restores as a PLAIN dashboard card (`orchestrator`) and a `session_warnings` message naming the orchestration (`tdd-cycle`) is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
-- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift fallback (`session/restore/009`).
+- **Agent:** none (the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the deck reaches its empty dashboard, no `orchestrator` card appears, the saved command's sentinel file is never written, and a `session_warnings` message naming the orchestration (`tdd-cycle`) and saying it `was not restored` is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
+- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift (`session/restore/009`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/011 — A saved `start_role_index` that differs from the config default is honored on restore: the orchestrator prompt is posted to the role at the saved index (PRD #89 review-fix F3).
@@ -6179,16 +6479,16 @@ without depending on the config struct API.
 
 ##### session/restore/012 — A snapshot whose `project_path` diverges from the saved pane `dir` does not auto-run the config planted at `project_path` (PRD #89 review-fix F1).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — while the saved pane still restores as a PLAIN card (`orchestrator`). Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
-- **Does not assert:** which fix shape the coder chooses (drift fallback vs. re-resolving from `saved_pane.dir`) — only that the divergent config is not executed; path canonicalization edge cases (symlinks, `..`).
+- **Agent:** none (the planted config's roles run `sleep 600`; the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — and, since PRD #1885, the saved pane is not restored as a plain `orchestrator` card either, and its saved command's sentinel file is never written; the teardown warning names `tdd-cycle` as `was not restored`, which proves the restore ran and refused. Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
+- **Does not assert:** whether the refusal comes from re-resolving against `saved_pane.dir` or from cross-checking it against `project_path` — only that neither the divergent config nor the saved command runs; the exact warning wording; path canonicalization edge cases (symlinks, `..`).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4, RED-pending-schema).
+##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. RED-pending-schema: `OrchestrationSnapshot` has no `display_title` field yet (the staged key parses but is dropped on load, since the struct sets no `deny_unknown_fields`) and restore passes `None` to `open_orchestration_tab`, so the tab comes back titled `tdd-cycle`; goes GREEN once the coder adds the field + capture + restore threading.
-- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
+- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. It was written RED, before `OrchestrationSnapshot` carried a `display_title` field, when the staged key was dropped on load and the tab came back titled `tdd-cycle`.
+- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the field in isolation (`src/config.rs` unit tests); an unapproved project (this test pre-approves it through the harness's `trusting_project`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/014 — A restored pane whose command identifies a supported agent immediately shows that agent as Idle.
@@ -6270,7 +6570,7 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (all three roles run `session/restore/008`'s recorder shell script, which logs its own start to `started-<role>.log`, self-posts `SessionStart` and records its stdin; no LLM).
 - **Asserts:** with a hand-staged `version = 2` snapshot of a three-role orchestration listing `started_role_indices = [0, 1]`, the rebuilt tab shows the `coder` and `reviewer` cards, the daemon runs agents for the orchestrator and `coder`, there is no daemon agent for `reviewer` and its command never ran (`started-reviewer.log` absent, read after the `coder`'s start, which the same pass spawns); a clean detach then re-saves `version = 2` with the same `[0, 1]`, so the empty slot stays empty across another restart. Seen red before the fix at the `reviewer` agent assertion, with the rebuilt-tab precondition passing.
-- **Does not assert:** that `dot-agent-deck pane spawn reviewer` starts the empty role afterwards (`pane/spawn/*` covers spawning into a dead slot); the old-snapshot path (`session/restore/008`); the periodic flush's capture, which runs the same `record_started_roles` as the detach save but is not separately driven here; the empty card's styling.
+- **Does not assert:** that `dot-agent-deck pane spawn reviewer` starts the empty role afterwards (`pane/spawn/*` covers spawning into a dead slot); the old-snapshot path (`session/restore/008`); an orchestration that is not approved, held for its trust prompt and then approved (`config-trust/restore/005`) — this test pre-approves it through the harness's `trusting_project`; the periodic flush's capture, which runs the same `record_started_roles` as the detach save but is not separately driven here; the empty card's styling.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -7635,7 +7935,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009`).
 - **Agent:** none.
 - **Asserts:** two legs on the same fixture tab shape (`[orchestrator, coder]`). Leg 1 — with the current config reading `[orchestrator, coder, reviewer]`, growing with `reviewer` still lands it last (returned index 2, vectors `[orchestrator, coder, reviewer]`, `start_role_index` unmoved): the case that was accidentally correct before placement existed must stay correct. Leg 2 — with a current config that does not mention `reviewer` at all, the growth still succeeds and appends (returned index 2), so placement degrades to the pre-#1096 behaviour rather than panicking or picking an arbitrary slot.
-- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement and still falls back to a plain pane.
+- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement, and since PRD #1885 the snapshot is left unrestored with a warning rather than restored as a plain pane (`config-trust/restore/003`).
 - **Platform coverage:** mac+linux (unix-only).
 
 ##### pane/spawn/016 — A role inserted BEFORE the start role carries `start_role_index` along with it (issue #1096).
@@ -7871,9 +8171,233 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/help/001 — The `?` help overlay documents the canonical post-button-bar shortcut set.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively.
+- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively; its Mouse column has a `Drag` row reading `Select & copy` and a `Mouse click` row reading `Focus pane` (PRD #385 M7); the copy-mode row shows `v` by default and `x` once `[dashboard] copy_mode = "x"` is bound.
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
+
+#### mouse/capture
+
+##### mouse/capture/001 — The deck does not ask its terminal for any-motion mouse tracking (PRD #385 M4).
+- **Layer:** L1 (pure byte output of the terminal-mode guard, `ui::tests`).
+- **Agent:** none.
+- **Asserts:** turning the deck's terminal modes on writes `?1000h`, `?1002h` and `?1006h` and nothing containing `1003`; turning them off writes `?1000l`, `?1002l`, `?1003l` and `?1006l`.
+- **Does not assert:** what a real terminal reports in each mode; the Windows console path, which sets mouse input through the console API rather than these sequences.
+- **Platform coverage:** mac+linux.
+
+#### mouse/select
+
+##### mouse/select/001 — A drag in a pane that is not focused focuses it and copies its text in one gesture (PRD #385 M2).
+- **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (two `bash` panes stand in for agents: one restored with `--continue`, one opened from the new-pane form with no command; each prints a shell-computed sentinel).
+- **Asserts:** with both panes tiled on the dashboard in command mode and the second one focused (thick `┃` border), one drag across the first pane's sentinel writes an OSC 52 sequence whose payload is exactly that sentinel and never the focused pane's, moves the thick border to the dragged pane, and shows the OSC 52-only status (`Sent to terminal clipboard (OSC 52)`), since the harness turns the native clipboard off.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); the native clipboard write or its status wording (`clipboard/*`); orchestration-tab panes; a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/002 — A press in a pane that is not focused focuses it, and the drag highlights that pane (PRD #385 M2).
+- **Layer:** L1 (`PaneSelectionSeam`: inert panes tiled over a `TestBackend` frame, driven through the live loop's mouse functions; `insta` snapshot of the frame with the highlighted cells marked).
+- **Agent:** none.
+- **Asserts:** with pane `a` focused, a left press on pane `b`'s first cell focuses `b`; dragging four cells right highlights exactly `bravo` inside `b`'s content area and no cell of `a`.
+- **Does not assert:** copy delivery (`mouse/select/001`, `clipboard/*`); multi-click word/paragraph selection; the stacked layout, which draws only the focused pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/003 — A drag selection stays after the release and is cleared by a press, typing into its pane, a tab switch or its pane closing (PRD #385 M3).
+- **Layer:** L1 (`PaneSelectionSeam`).
+- **Agent:** none.
+- **Asserts:** after a drag over `bravo` is released, `bravo` is copied once and stays highlighted; the next press (in another pane) removes it, and the plain click that press makes leaves no highlight; a lone `Esc` typed into the pane leaves it, while a typed `x` removes it; switching tab and back leaves none; closing the pane that owns it leaves none on the pane that remains.
+- **Does not assert:** the tab switch through the real tab manager and key path (`mouse/select/006`; the seam switches its own deck); paste, which goes through the same clearing function as typing; a press on a button, card or dialog (the seam draws none).
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/004 — A kept highlight never shows text other than what was copied (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, output fed straight into the panes' vt100 parsers).
+- **Agent:** none.
+- **Asserts:** after `bravo` is copied from pane `b`, output in pane `a` and output on another line of `b` keep the `bravo` highlight; after output that scrolls `b`, overwrites the selected cells, or clears the screen, the highlighted cells show either nothing or exactly `bravo`.
+- **Does not assert:** that the selection follows its text as it scrolls (the deck clears it instead: vt100 keeps no position for a scrolled line); a resize (`mouse/select/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/005 — A drag that starts in a pane and is released over a button or a card still copies, and fires nothing (PRD #385 M3).
+- **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent; it blanks itself and leaves a shell-computed sentinel on its bottom row, held there by `sleep`).
+- **Asserts:** in command mode, a drag from the end of the sentinel released over the bottom bar's `[New Agent n/Ctrl+N]` button writes an OSC 52 sequence whose payload is exactly the sentinel (the drag's end clamps to the pane's bottom row and first column), shows the OSC 52-only status, and opens no directory picker; after a plain click on a blank pane cell (so the next press is not a double-click), a second drag from the sentinel released over the pane's dashboard card writes an OSC 52 sequence carrying the blank rows from the card's row (or the pane's top) down to the sentinel, then the sentinel, and the deck stays in command mode.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); a release over a tab header; a dialog opened mid-drag, which cancels the selection instead (`mouse/select/011`); a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/006 — A real tab switch clears the selection even when the user is back before the next frame (PRD #385 M3).
+- **Layer:** L1 (`ui::tests`: a real `TabManager` with a dashboard and an orchestration tab, keys through the live loop's `handle_key_event`).
+- **Agent:** none.
+- **Asserts:** with a copied selection kept on a dashboard pane in pane input, Ctrl+PageDown then Ctrl+PageUp, handled with no frame drawn between them, leave no selection; Ctrl+PageUp on the first tab, and selecting the tab already active, keep it.
+- **Does not assert:** the highlight's cells (`mouse/select/003`); tab moves that do not go through `switch_tab_with_focus` (opening or closing a tab), which the check made before every frame still covers.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/007 — A pane whose screen is larger than the pane copies exactly what the highlight is drawn over (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam::tiled_with_screen`: the pane's vt100 screen sized apart from its pane, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** with a 28 x 6 pane over a 20 x 50 screen (cursor on row 19), a drag on the first drawn row and a drag across three drawn rows copy the text the pane shows at the top-left of its screen, and the kept highlight shows that same text; with a 6 x 50 screen, the three-row drag, a double-click on a word that runs past the pane's right edge and a triple-click on the paragraph each copy only the drawn columns, matching the highlight; the triple-click on the 20 x 50 screen copies the drawn rows only.
+- **Does not assert:** a screen smaller than its pane (the cells past it are blank and trimmed from the copy); an orchestration tab, which draws panes through the same function.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/008 — A selection through the COMMAND MODE banner or a cannot-scroll notice shows the pane's text, not the overlay's (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, command mode with the banner expanded, or the pane's cannot-scroll notice armed).
+- **Agent:** none.
+- **Asserts:** the overlay covers some of the pane's text before the drag; while a drag across the whole pane is held, and after its release, the highlighted cells show the pane's seven lines, and the release copies exactly those lines.
+- **Does not assert:** that the banner comes back once the selection is cleared (it decays on its own timer); dialogs, which take every click while they are open.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/009 — The stacked layout copies what is drawn, and a resize never leaves a highlight over other text (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, stacked layout and frame resizes with the panes' screens left at their size).
+- **Agent:** none.
+- **Asserts:** in the stacked layout, a drag on the first drawn row of a pane whose screen is larger than the pane copies `r00-ab` and the highlight shows the same; after `bravo` is copied, resizing the frame to 50 x 14, 30 x 8 or its own 40 x 12 leaves either no highlight or one showing exactly `bravo`.
+- **Does not assert:** that a selection survives a resize (it is cleared when its pane moves); the zoomed layout, which draws through the stacked one.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/010 — A drag over wide (two-column) glyphs copies exactly what its highlight shows (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) drags copy `AB` and `💻A`, and on `🇺🇸AB` they copy `🇸AB` and `AB`, each matching its highlight; whichever end the press is on, a drag whose leftmost cell is a glyph's second column leaves that glyph out of both the highlight and the copy (`AB`, `AB 漢`, `AB 漢字`, `💻A`, `💻`), and one whose rightmost cell is either column of a glyph highlights and copies the whole glyph (`AB 漢`, `AB 漢字`, `💻`).
+- **Does not assert:** double- and triple-click word and paragraph selection over wide glyphs; a glyph cut by the pane's edge.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/011 — An overlay opened, or the terminal losing focus, mid-drag cancels the pane selection (PRD #385 decision 6).
+- **Layer:** L2 lane 1 (real-binary PTY, SGR press / held-button motion / release sent apart, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel).
+- **Asserts:** in command mode, a press and drag across the sentinel, then `?` with the button held and the release over the drawn Help overlay, write no OSC 52 sequence and show no copy status, and Help stays open; after Help closes, a click on `[New Agent n/Ctrl+N]` opens the directory picker; a press and drag followed by a terminal focus-out report (`CSI O`) and then the release write no OSC 52 sequence and show no copy status.
+- **Does not assert:** each other overlay and modal one by one (they share the check `overlay_blocks_mouse` decides); the unfinished highlight's cells while Help is open; a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/012 — A frame that draws no pane leaves nothing to select: a drag where a hidden pane was drawn copies nothing (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam::render_frame`: the run loop's `draw_frame` with the production layout of the active tab, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** two orchestration role panes are drawn on their tab; after a switch to the dashboard, whose whole frame draws no pane while both keep running, a press, drag and release over the second pane's former cells copy nothing, leave the first pane focused and highlight nothing; a drag under way in a dashboard pane when the panes move to an orchestration (so the next frame draws none) copies nothing on release.
+- **Does not assert:** the real binary; a pane hidden while other panes are still drawn (the same post-frame check covers it).
+- **Platform coverage:** mac+linux+windows.
+
+#### clipboard/deliver
+
+##### clipboard/deliver/001 — A copied selection goes to the native clipboard and as OSC 52, and the status line says only what happened (PRD #385 M1).
+- **Layer:** L1 pure data (`clipboard::tests`), against a fake `ClipboardBackend` and a fake `NativeSink`; no test writes a real clipboard.
+- **Agent:** none.
+- **Asserts:** a copy attempts the native write and always sends OSC 52; the status line reads "Copied to clipboard" only for a confirmed native write, the OSC 52 wording (pointing at Troubleshooting, never "Copied") when the native write was unavailable or failed, a not-copied line when neither went out, and for a native write that has not answered yet a pending wording (with OSC 52 sent) or a not-confirmed-yet wording (without), neither of which says "Copied" or "Not copied", and nothing for an empty selection; the native clipboard is opened lazily and once, a failed open is not retried, a refused write reports failed, a blocked write returns unconfirmed after the bounded wait without holding the caller and later writes land once it unblocks; `DOT_AGENT_DECK_NATIVE_CLIPBOARD` set to `0`/`false`/`off`/`no` turns the native write off.
+- **Does not assert:** that `arboard` reaches a real X11, Wayland or macOS clipboard; the mouse gesture that triggers a copy (that is the pane selection's own tests); an agent's own OSC 52 copy, which is `embed/clipboard/001`.
+- **Platform coverage:** mac+linux+windows.
+
+#### clipboard/native
+
+##### clipboard/native/001 — Copies made while the native write is stuck do not land out of order: the newest one wins (PRD #385).
+- **Layer:** L1 pure data (`clipboard::tests`), a fake `NativeSink` whose write blocks until released.
+- **Agent:** none.
+- **Asserts:** with a write of `A` in progress and blocked, copies `B` and then `C` return unconfirmed without waiting; once the sink is released the clipboard receives `A` then `C`, and `B` is never written.
+- **Does not assert:** that the in-progress write can be stopped (it cannot); a real X11, Wayland or macOS clipboard.
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/002 — Exit waits a bounded time for the native clipboard's handoff (PRD #385).
+- **Layer:** L1 pure data (`clipboard::tests`), a fake `NativeSink` whose `Drop` stands in for arboard's X11 clipboard-manager handoff.
+- **Agent:** none.
+- **Asserts:** shutting the native clipboard down waits for a handoff that finishes, which has finished when the shutdown returns; a handoff that never finishes makes the shutdown return `false` after its deadline instead of hanging; the exit wait constant is at most 300 ms.
+- **Does not assert:** that a real clipboard manager takes the copy; that `run_tui` calls the shutdown (it does so at its ordinary exit; the clipboard's `Drop` is the backstop).
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/003 — A panic on the native clipboard thread does not tear the terminal down (PRD #385).
+- **Layer:** L1 (`clipboard::tests`), the deck's own `ui::tui_panic_hook` installed with a recording teardown, and fake openers/sinks that panic.
+- **Agent:** none.
+- **Asserts:** a panic while opening the clipboard and a panic while writing to it each settle the native clipboard as unavailable (that copy and the next report it so) and do not reach the hook's teardown, and the warning the worker logs for a caught panic, built on a thread marked as the worker under that hook, carries the panic's message, the source location the hook noted and that native clipboard writes are disabled for the session; a control panic on an ordinary thread does reach the teardown.
+- **Does not assert:** a panic on a thread arboard starts for itself; the `panic = "abort"` build, where nothing is contained and the hook tears down; the hooks `run_tui` installs around this one (`clipboard/native/004` covers the assembled stack); that the warning reaches a log (no subscriber captures the worker thread).
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/004 — A contained panic leaves the terminal set up under the deck's whole panic-hook stack, and any other panic hands it back (PRD #385).
+- **Layer:** L1 (`ui::panic_teardown_tests`, `src/ui_panic_teardown_tests.rs`): the test binary re-executed on a fresh pseudo-terminal in a session of its own, setting the terminal up with `ui::enter_tui_terminal`, the function `run_tui` calls (its panic hook, the terminal modes, then `wide_glyph_backend::init`); a fake clipboard opener that panics.
+- **Agent:** none.
+- **Asserts:** after a panic on the native clipboard's worker (opening the clipboard) and after a panic inside a guarded parser feed, the terminal is still in raw mode (no canonical input, no echo) and nothing written before the check left the alternate screen (`ESC [ ? 1049 l`); after a panic on an ordinary thread, the control, the alternate screen was left and raw mode is off.
+- **Does not assert:** the event loop or a real agent's output; the `panic = "abort"` build; a real clipboard (none is opened).
+- **Platform coverage:** mac+linux.
+
+#### copymode/keys
+
+##### copymode/keys/001 — `v` in command mode opens copy mode, which pages back to a line in the pane's history, selects it and yanks it (PRD #385 M5).
+- **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel, then 120 lines).
+- **Asserts:** with the sentinel scrolled out of view, `v` in command mode shows the ` COPY ` mode chip and a copy-mode cursor; `PageUp` pages back until the sentinel is on screen; moving the cursor onto it, `v`, moving across it and `y` writes exactly one OSC 52 sequence, whose payload is exactly the sentinel; the status line then reports the OSC 52-only send and the chip reads ` COMMAND ` again.
+- **Does not assert:** the native clipboard (the harness turns it off); the keys' L1 edge cases (`copymode/keys/002`); a real agent, so it carries no ` [reel]` marker (`copymode/live/001` does).
+- **Platform coverage:** mac+linux.
+
+##### copymode/keys/002 — Leaving copy mode without a yank copies nothing and leaves the pane where it was; live output does not move copy mode's view; an empty pane and the alternate screen behave (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`: one inert pane and the bottom bar over a `TestBackend` frame, keys through the live loop's `handle_key_event`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** after paging and setting a selection, `Esc`, and `q` after the pane was first scrolled back in command mode, return to command mode with no copy and no status message, the pane at the scroll offset it had before and showing what it showed before; forty lines of output while copy mode is open leave its view unchanged, its bottom shows no new line and a yank copies none, and after leaving the pane shows the new output; on an empty pane copy mode opens with the cursor at the first cell, `PageUp` and `g` leave it there (no history) and `G` moves it to the last row, `y` with no selection keeps copy mode open, and an empty selection leaves it without a copy or a status; on a full-screen program's alternate screen copy mode has no history to page into and copies that screen's text; and copy mode closes, copying nothing, once the pane it is open on closes, the very first frame after the close already in command mode.
+- **Does not assert:** the real binary (`copymode/keys/001`); a pane that stays open but leaves the screen (the stacked layout giving its slot to another pane), which closes copy mode through the same not-drawn check.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/003 — Copy mode on a pane whose screen is larger than the pane keeps its cursor on drawn cells and yanks what is highlighted (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam::with_screen`: the pane's vt100 screen sized apart from its pane, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with a 28 x 9 pane over a 20 x 50 screen whose cursor is on row 19, `v` opens copy mode with exactly one cursor cell drawn; after moving and selecting across two lines with the cursor pushed far right, the cursor is still inside the pane, and `y` copies exactly the highlighted text, `abcdefghijklmnopqrstuvwx` and the next line's first 28 columns. With an 8 x 20 screen shown in a 3 x 8 content area (`VISIBLE0` to `VISIBLE2`), the cursor opens on a drawn row, `G` puts it on the last drawn row, and a two-row selection yanks `VISIBLE0` and `V` with no hidden suffix. With the frame shrunk while a selection is open, the very first frame after the shrink draws the cursor inside the smaller pane and the yank is exactly that frame's highlighted text. With a 4-row screen in a taller pane and the view scrolled into the history, a selection ending on the last drawn row yanks exactly the highlighted `L10-text` to `L13-text`, and a selection running on below the drawn rows marks no cell on the blank rows under the screen, its highlighted text being the part of the yank the pane draws.
+- **Does not assert:** a screen narrower than its pane; a grow while copy mode is open.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/004 — Copy mode closes when another client closes the last pane, and a pane reusing that id does not inherit it (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam::render_frame`: the run loop's `draw_frame` with the production layout over the dashboard tab, and the daemon's pane-closure report applied through `apply_pane_closure`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with copy mode open and a selection made on the dashboard's only pane, after the pane is closed externally the first whole frame shows the ` COMMAND ` chip, no copy-mode cursor and no selection, and a later `y` copies nothing (no OSC 52 send); when a new pane is attached under the closed pane's id before any frame is drawn, `y` copies nothing and the UI is in command mode; when the pane is only forgotten, with no closure handler leaving copy mode, the very first whole frame is still in command mode with no chip, cursor or selection, and `y` copies nothing, which pins the frame's own pre-draw check.
+- **Does not assert:** the real binary or a second client (the closure report is applied as the run loop applies it); an orchestration tab closing under copy mode, which leaves the pane undrawn and closes copy mode through the same pre-frame check.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/005 — Copy mode highlights and copies a wide (two-column) glyph whole (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** the row `你AB` is drawn with no gap after the glyph; `g l l`, select, yank copies `B` with `B` highlighted; a forward selection from the glyph copies `你A`, a backward one onto it `你AB`; a copy-mode cursor that opens on, or moves up onto, a glyph's right half is put on the glyph, so the selection copies `你A` and `你b`; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) `g l l l` then yank copies `B`, and a selection over both emoji cells copies `👩‍💻A`; on `🇺🇸AB` a selection from the flag's second indicator copies `🇸A`; each time the highlighted text, read as a terminal draws it, is the copied text.
+- **Does not assert:** a glyph cut by the pane's right edge (it is not drawn and copies as nothing); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/006 — A remapped key that leaves copy mode is not also taken as a jump, and copy mode's entry key can be remapped (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam` with a card for the pane and keybindings parsed from TOML, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with `[global] jump_1 = "y"`, a yank copies once and leaves the deck in command mode with the card selection unchanged and no byte sent to the pane; with `jump_1 = "q"`, `q` leaves the same way without a copy; with `[dashboard] copy_mode = "x"`, `v` does not open copy mode and `x` does; binding `copy_mode` to the key `jump_1` has is reported as a conflict naming `copy_mode`, and then neither key opens copy mode.
+- **Does not assert:** the real binary; remapping copy mode's own keys, which are fixed.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/007 — A yank drops only the cells nothing was written to (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** a no-break space selected alone is copied; spaces the program wrote are kept on the row the selection ends on, `ab   `; a row the selection runs through to its end loses its trailing spaces, `ab` then `c`; a selection running into never-written cells copies the written text only, `cd`.
+- **Does not assert:** the mouse path's own cases (it shares the row extraction); tabs, which vt100 stores as cursor movement over unwritten cells.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/008 — Nothing typed or pasted while copy mode is open reaches the pane's program, and Ctrl+C opens the quit dialog (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`, keys through `handle_key_event` and a paste through the run loop's `forward_paste`, with the pane's child-input recorder, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** while copy mode is open, unbound printable keys, a digit, `Ctrl+D`, `Ctrl+W`, the movement and selection keys, `Tab`, `Backspace`, `PageUp` and a paste send no byte to the pane and copy mode stays open; `Ctrl+C` then puts the UI in the quit dialog with no byte sent and nothing copied.
+- **Does not assert:** mouse reports and the real binary's event loop (`copymode/keys/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/009 — Keys, a paste and mouse reports sent while copy mode is open reach no program, end to end (PRD #385 M5).
+- **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` runs `cat -v` with mouse reporting and bracketed paste turned on, so any byte it receives is shown).
+- **Asserts:** after copy mode receives printable keys, a digit, `Ctrl+D`, `Ctrl+W`, movement keys, `PageUp`, a bracketed paste and a mouse press, drag, release and wheel report, `q` returns to command mode and `Ctrl+D` to typing; `ENDMARK` typed then appears alone on its line in the program's output, no pasted text or escape sequence appears, and no OSC 52 copy was written.
+- **Does not assert:** the native clipboard (the harness turns it off); a real agent, so it carries no ` [reel]` marker.
+- **Platform coverage:** mac+linux.
+
+##### copymode/keys/010 — A resize never lets a yank copy what the first frame after it did not highlight (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`: the frame resized with the pane's screen left at its size, one frame drawn, then the key, as the run loop draws on a resize before it handles a queued key, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with columns 20 to 25 of one line selected and the pane narrowed to 10 content columns, the first frame highlights no cell, `y` copies nothing, sets no status and leaves copy mode open with its cursor on a drawn cell, and a selection made afterwards copies exactly what it highlights (`bcd`); a selection whose first line starts right of the new edge keeps its drawn part, so the frame highlights and the yank copies `row1`; after paging back and selecting on the view's last row, a height shrink that moves copy mode's view highlights and yanks exactly `row19-`.
+- **Does not assert:** the real binary's resize path; a grow while copy mode is open.
+- **Platform coverage:** mac+linux+windows.
+
+#### copymode/render
+
+##### copymode/render/001 — Copy mode shows its mode chip, its cursor and its selection on the focused pane (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`, `insta` snapshot of the frame with the cursor and selected cells marked, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** `v` in command mode turns the bottom bar's chip from ` COMMAND ` to ` COPY ` and draws the cursor where the pane's own cursor is; after moving and selecting, exactly `line-28` is marked, with one cursor cell at its end; `y` copies `line-28`, sets the OSC 52 status message and removes the cursor and highlight.
+- **Does not assert:** exact colours beyond the cursor's yellow and the selection's light-cyan backgrounds; the stacked layout or an orchestration tab, which draw the focused pane through the same function.
+- **Platform coverage:** mac+linux+windows.
+
+#### copymode/live
+
+##### copymode/live/001 — Copy mode yanks what a live Claude Code agent printed (PRD #385 M5). [reel]
+- **Layer:** L2 lane 2 (`tests/e2e_copy_mode_live.rs`, `#![cfg(all(unix, feature = "e2e", feature = "e2e-live"))]`), attached PTY. Imported isolated credentials and pre-seeded project trust, as `scheduler/dispatch/013`; `--allowedTools Bash Read`.
+- **Agent:** interactive Claude Code on Haiku, started through the attach socket in a fixture directory whose one file is the sentinel.
+- **Asserts:** after the agent lists the directory and the sentinel file name is on screen, `Ctrl+D`, `v`, moving the copy-mode cursor onto the name, `v`, moving across it and `y` write an OSC 52 sequence carrying exactly the name; the status line reports the OSC 52-only send and the chip reads ` COMMAND `.
+- **Does not assert:** the native clipboard (the harness turns it off); paging, which `copymode/keys/001` covers.
+- **Platform coverage:** mac+linux.
 
 
 ### Theme contrast
@@ -14838,7 +15362,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
 - **Agent:** two shell/cat stand-ins in one worktree with offline gh rollups.
-- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each; the receiver gets two CI intervals and four change events in total.
+- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each, and each run's `deck.pr.numbers` names the PR (issue #2096); the receiver gets two CI intervals and four change events in total.
 - **Does not assert:** deduplication across daemons, different repositories with the same PR number or ownership handoff while checks are pending.
 - **Platform coverage:** mac+linux.
 

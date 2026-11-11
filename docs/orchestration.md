@@ -85,6 +85,8 @@ A new tab opens with one pane per role. The role cards are in the left sidebar, 
 3. Under **Mode**, pick the `Orch: team` chip. There is no **Command** field: each role runs its own `command`.
 4. Optionally type a **Name** for the run, then press **Activate orchestration**.
 
+The first time you start an orchestration, and again after its roles' commands, descriptions or prompts change, both clients show **Review project commands** before anything starts: read what each role will run and be told, then press `a` in the TUI or **Approve and start** in the desktop app. Schedules and dispatched units can start it only after you have approved it. See [Approving Project Commands](project-trust.md).
+
 The Dashboard shows an **ORCHESTRATION** group with a numbered row per role and an **ORCHESTRATOR** badge on the orchestrator. Click a row to open that role's terminal. See [Desktop app → Dashboard](desktop/dashboard.md) and [New agent](desktop/new-agent.md).
 
 ![The desktop app's Dashboard with an activated orchestration: below the standalone agents, an ORCHESTRATION group named demo-loop with a Close button and a numbered row per role, 01 planner carrying the ORCHESTRATOR badge and 02 builder](/img/orchestration-desktop.png)
@@ -397,6 +399,10 @@ With the flag on, keystrokes aimed at a worker pane in the TUI are dropped until
 
 While the TUI is **locked**, it moves focus within the active orchestration tab: to a role pane as soon as that role starts waiting for input (the lowest-numbered one first when several are waiting), and back to the orchestrator once none is waiting. It does not switch tabs to follow a waiting pane elsewhere; that tab's label colour shows it instead. While **unlocked**, focus stays where you put it.
 
+### Prompt suggestions are off in workers
+
+Claude Code suggests your next prompt after each turn, and each suggestion costs a model request. A worker takes its tasks from the orchestrator rather than from you, so the deck starts Claude Code workers with suggestions off. You can still type into a worker; you just get no suggestion there. The orchestrator keeps them, as you configured Claude Code. See [Configuration](configuration.md#set-by-the-deck).
+
 ### Closing an orchestration
 
 **TUI:** `Ctrl+w` on the orchestration tab, after a confirmation. **Desktop:** the group's **Close** button, after a confirmation that lists the roles (**Close all N roles**). Either stops every role's agent.
@@ -414,7 +420,7 @@ The orchestrator can delegate one task to several roles at once (`--to reviewer 
 
 ### Commands
 
-These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane.
+These commands work only from a pane the deck started, which sets `DOT_AGENT_DECK_PANE_ID` and the other variables they need. Run anywhere else, `delegate`, `work-done`, `pane restart` and `pane spawn` print `Error: DOT_AGENT_DECK_PANE_ID environment variable not set.` and exit non-zero; `ack` prints a message and exits 0. `delegate`, `pane restart` and `pane spawn` are further limited to the orchestrator's pane, and are refused, starting nothing, when the orchestration's roles changed in `.dot-agent-deck.toml` since you approved them; the message names the `dot-agent-deck trust approve` command to run from a terminal outside the deck ([Approving Project Commands](project-trust.md#work-that-runs-while-you-are-away)).
 
 | Command | Who runs it | What it does |
 |---|---|---|
@@ -718,7 +724,7 @@ The deck keeps its hand-off files in `.dot-agent-deck/` inside the orchestration
 
 | File | Written when | Contents |
 |---|---|---|
-| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI (the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
+| `orchestrator-context-<id>.md` | when an orchestration starts, and again each time the orchestrator's conversation is compacted or cleared while the orchestration is open in the TUI and approved as its file now reads ([Approving Project Commands](project-trust.md#an-orchestrators-instructions-after-compaction-or-clear); the desktop app does not rewrite it) | What the orchestrator is told: its `prompt_template`, the available workers, how to delegate, and its task if it was given one. |
 | `orchestrator-context.md` | when an orchestration starts | A copy of a recent orchestrator context, kept for compatibility. |
 | `worker-task-<role>.md` | each delegation | The task for that role, overwritten by the next one. |
 | `work-done-<role>.md` | each `work-done` for a delegated task | The worker's last report. |

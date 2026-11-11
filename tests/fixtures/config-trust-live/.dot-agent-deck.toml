@@ -1,0 +1,16 @@
+# Fixture for `config-trust/live/001` (PRD #1885), lane 2: ONE role, a real
+# interactive Claude Code on Haiku. The trust prompt must show this exact
+# `command` before anything runs; once approved, the role's `prompt_template`
+# (composed into the coordinator context) directs it to create a uniquely named
+# sentinel file, which the test waits for. One role keeps the run to a single
+# cheap turn with nobody to delegate to. `--allowedTools Bash Read` lets it read
+# its context and run `touch` without stopping at a permission prompt.
+[[orchestrations]]
+name = "trust-live"
+
+[[orchestrations.roles]]
+name = "coordinator"
+command = "claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read"
+start = true
+description = "Creates the trust sentinel file"
+prompt_template = "Do this yourself and do not delegate - no other agents are running. Use the Bash tool to run `touch config_trust_live_5e81c3.txt` in the current directory, then reply DONE. Do not ask what to do, offer numbered choices, or wait for further instructions - this IS the task."

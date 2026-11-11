@@ -287,7 +287,7 @@ async fn handle_connection(
                 .expect("reply to SubscribeEvents");
             while read_frame(&mut stream).await.ok().flatten().is_some() {}
         }
-        AttachRequest::StopAgent { id } => {
+        AttachRequest::StopAgent { id, .. } => {
             stop_requests.lock().unwrap().push(id.clone());
             let fail_this_attempt = matches!(
                 &stop_script,

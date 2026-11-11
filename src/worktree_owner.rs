@@ -309,6 +309,85 @@ pub fn main_worktree_if_linked(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// The worktree a directory is in and the main checkout it belongs to, read
+/// once from git and then checked against the filesystem (PRD #1885).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedGeometry {
+    /// The canonical root of the worktree the directory is in.
+    pub toplevel: PathBuf,
+    /// The canonical root of the repository's main checkout. Equal to
+    /// `toplevel` when the directory is in the main checkout itself.
+    pub main: PathBuf,
+}
+
+/// Where `dir`'s worktree and its main checkout are, for keying a project
+/// approval — `None` whenever the answer cannot be verified, which a caller
+/// turns into "key the directory on itself".
+///
+/// [`main_worktree_of`] trusts what git answers, and git answers from the
+/// `.git` FILE in the directory: a `.git` file copied out of someone else's
+/// linked worktree makes git report that worktree's repository as this
+/// directory's. That is harmless for naming a durable checkout to an agent,
+/// but an approval keyed that way would let an unrelated directory borrow
+/// another project's consent. So a linked worktree is accepted here only when:
+///
+/// - its administrative directory sits in `<common>/worktrees/` (the
+///   repository registered it — `git worktree list` reads exactly there);
+/// - that directory's `gitdir` back-pointer canonicalises to THIS worktree's
+///   `.git` file, which is a regular file;
+/// - the main checkout (`<common>`'s parent) holds `<common>` as its `.git`
+///   directory.
+///
+/// Three git answers (`--show-toplevel`, `--git-dir`, `--git-common-dir`) are
+/// read once and every fact returned is derived from them and those checks.
+pub fn verified_geometry_of(dir: &Path) -> Option<VerifiedGeometry> {
+    let toplevel = std::fs::canonicalize(rev_parse_path(dir, "--show-toplevel")?).ok()?;
+    let git_dir = std::fs::canonicalize(rev_parse_path(dir, "--git-dir")?).ok()?;
+    let common = std::fs::canonicalize(rev_parse_path(dir, "--git-common-dir")?).ok()?;
+
+    if git_dir == common {
+        // The main checkout, or one git treats as such (a relocated store, a
+        // `.git` file naming a repository's own store): its own toplevel is
+        // the identity, so nothing is borrowed.
+        return Some(VerifiedGeometry {
+            main: toplevel.clone(),
+            toplevel,
+        });
+    }
+
+    // Registered: the administrative directory is `<common>/worktrees/<name>`.
+    if git_dir.parent()? != common.join("worktrees") {
+        return None;
+    }
+    // This worktree's `.git` is a regular file, and the administrative
+    // directory points back at it.
+    let dot_git = toplevel.join(".git");
+    if !std::fs::symlink_metadata(&dot_git).ok()?.is_file() {
+        return None;
+    }
+    let raw = std::fs::read(git_dir.join("gitdir")).ok()?;
+    let pointer = path_from_bytes(trim_trailing_newline(&raw));
+    // `worktree.useRelativePaths` writes the back-pointer relative to the
+    // administrative directory.
+    let pointer = if pointer.is_absolute() {
+        pointer
+    } else {
+        git_dir.join(pointer)
+    };
+    if std::fs::canonicalize(pointer).ok()? != std::fs::canonicalize(&dot_git).ok()? {
+        return None;
+    }
+    // The main checkout holds the common directory as its own `.git`.
+    let main = common.parent()?.to_path_buf();
+    let main_git = main.join(".git");
+    if !std::fs::symlink_metadata(&main_git).ok()?.is_dir()
+        || std::fs::canonicalize(&main_git).ok()? != common
+    {
+        return None;
+    }
+    Some(VerifiedGeometry { toplevel, main })
+}
+
 /// Where `dir` sits relative to the repository's main worktree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Placement {

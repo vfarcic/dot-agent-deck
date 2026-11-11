@@ -719,6 +719,9 @@ fn run_mid_attach_start_attempt(attempt: usize) {
 /// covered by `project/launch/*`. Its dimensions are the desktop
 /// orchestration defaults (32×120), distinct from the plain action's 24×80.
 fn start_orchestration_from_desktop(daemon: &DaemonProc, project_path: &str) {
+    // PRD #1885: the daemon prepares only an approved orchestration; these
+    // tests are about where its tab surfaces, not the gate.
+    daemon.approve_project_trust(Path::new(project_path));
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -803,6 +806,7 @@ fn stop_agent_from_desktop(daemon: &DaemonProc, agent_id: &str) {
     let response = daemon
         .send_attach_request(&AttachRequest::StopAgent {
             id: agent_id.into(),
+            keep_worktree: false,
         })
         .expect("desktop-shaped StopAgent over the attach socket");
     assert!(
@@ -828,6 +832,7 @@ fn stop_orchestration_from_desktop(daemon: &DaemonProc, role_agents: &[(String, 
                         &attach_socket,
                         &AttachRequest::StopAgent {
                             id: agent_id.clone(),
+                            keep_worktree: false,
                         },
                     );
                     (role, agent_id, response)

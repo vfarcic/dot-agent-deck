@@ -1,0 +1,23 @@
+---
+source: tests/render_trust_prompt.rs
+expression: middle
+---
+
+  ┌ Review project commands ─────────────────────────────────────────────────┐
+  │     Step 03: do the next thing carefully.                                │
+  │     Step 04: do the next thing carefully.                                │
+  │     Step 05: do the next thing carefully.                                │
+  │     Step 06: do the next thing carefully.                                │
+  │     Step 07: do the next thing carefully.                                │
+  │     Step 08: do the next thing carefully.                                │
+  │     Step 09: do the next thing carefully.                                │
+  │     Step 10: do the next thing carefully.                                │
+  │     Step 11: do the next thing carefully.                                │
+  │     Step 12: do the next thing carefully.                                │
+  │     Step 13: do the next thing carefully.                                │
+  │     Step 14: do the next thing carefully.                                │
+  │     Step 15: do the next thing carefully.                                │
+  │     Step 16: do the next thing carefully.                                │
+  │                                                                          │
+  │ a approve and start · Esc cancel · ↑↓ scroll   (more above and below)    │
+  └──────────────────────────────────────────────────────────────────────────┘

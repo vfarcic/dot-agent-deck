@@ -27,6 +27,9 @@ use spec::spec;
 const DISPATCHER_SEED_OPENING: &str = "You are an ordinary assistant";
 const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
 const SENTINEL: &str = "chosen-launch-live-sentinel-9d41.txt";
+/// Issue #2094: Claude Code's prompt-suggestion switch, which the deck turns
+/// off in a dispatched unit's pane and leaves alone in the dispatcher's.
+const PROMPT_SUGGESTION: &str = "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION";
 
 /// Removes a dispatch worktree on drop, including while a RED assertion is
 /// unwinding. Dispatch worktrees are siblings of the harness tempdir, so the
@@ -71,16 +74,16 @@ fn real_claude_path() -> PathBuf {
         .expect("`claude` on PATH — `check_claude_available` already passed")
 }
 
-/// A launcher that records `<which>|<cwd>` in `log` and then execs an
-/// interactive Haiku Claude Code with the tools the two short turns need. Its
-/// name reveals no agent, as `devbox run <script>` does not.
+/// A launcher that records `<which>|<cwd>|<prompt-suggestion env>` in `log`
+/// and then execs an interactive Haiku Claude Code with the tools the two short
+/// turns need. Its name reveals no agent, as `devbox run <script>` does not.
 fn write_launcher(dir: &Path, which: &str, log: &Path) -> String {
     let script = dir.join(format!("{which}-launcher.sh"));
     std::fs::write(
         &script,
         format!(
             "#!/bin/sh\n\
-             printf '{which}|%s\\n' \"$PWD\" >> {log}\n\
+             printf '{which}|%s|%s\\n' \"$PWD\" \"${{{PROMPT_SUGGESTION}:-<unset>}}\" >> {log}\n\
              exec {claude} --ax-screen-reader --model {HAIKU_MODEL} \
              --allowedTools Bash Read Write\n",
             log = shell_quote(&log.to_string_lossy()),
@@ -108,7 +111,9 @@ fn seed_is_acknowledged(deck: &TuiDeck) -> bool {
 /// launcher that hides its agent and `--agent claude`, giving the unit a task
 /// that writes a uniquely named sentinel file. The second launcher must start
 /// in the unit's worktree and the dispatcher's must not, the unit must be
-/// registered as Claude Code, and the real unit must write the sentinel there.
+/// registered as Claude Code, the unit's Claude must start with prompt
+/// suggestions off and the dispatcher's must not, and the real unit must write
+/// the sentinel there.
 #[spec("dispatch/single/004")]
 #[test]
 fn dispatch_single_004_a_real_unit_runs_the_chosen_command_and_does_its_task() {
@@ -243,11 +248,16 @@ fn dispatch_single_004_a_real_unit_runs_the_chosen_command_and_does_its_task() {
         WORK_WAIT.as_secs(),
         deck.snapshot_grid()
     );
-    let started_in_worktree = |which: &str| {
+    // `<which>|<cwd>|<prompt-suggestion env>` per launch.
+    let launches = |which: &str| -> Vec<(String, String)> {
         launch_log
             .lines()
-            .any(|l| l.strip_prefix(which).is_some_and(in_worktree))
+            .filter_map(|l| l.strip_prefix(which))
+            .filter_map(|rest| rest.rsplit_once('|'))
+            .map(|(cwd, suggestion)| (cwd.to_string(), suggestion.to_string()))
+            .collect()
     };
+    let started_in_worktree = |which: &str| launches(which).iter().any(|(cwd, _)| in_worktree(cwd));
     assert!(
         started_in_worktree("unit|"),
         "the chosen command must start in the unit's worktree.\nLaunch log:\n{launch_log}"
@@ -255,6 +265,21 @@ fn dispatch_single_004_a_real_unit_runs_the_chosen_command_and_does_its_task() {
     assert!(
         !started_in_worktree("dispatcher|"),
         "the dispatcher's own command must not start in the unit.\nLaunch log:\n{launch_log}"
+    );
+    // Issue #2094: the unit's real Claude was started with prompt suggestions
+    // off, and the dispatcher, where a person types, was not.
+    assert!(
+        launches("unit|")
+            .iter()
+            .all(|(_, suggestion)| suggestion == "false"),
+        "the unit's Claude must start with {PROMPT_SUGGESTION}=false.\nLaunch log:\n{launch_log}"
+    );
+    assert!(
+        !launches("dispatcher|").is_empty()
+            && launches("dispatcher|")
+                .iter()
+                .all(|(_, suggestion)| suggestion == "<unset>"),
+        "the dispatcher's Claude must keep its prompt suggestions.\nLaunch log:\n{launch_log}"
     );
     assert!(
         records.iter().any(|(name, cwd, agent_type)| {

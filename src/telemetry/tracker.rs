@@ -343,6 +343,24 @@ impl Drop for LiveWitness {
     }
 }
 
+/// The most pull requests one run's `deck.pr.numbers` names; later ones are
+/// left out of it, while `deck.pr.number` still names the last.
+const MAX_PR_NUMBERS_PER_RUN: usize = 32;
+
+/// `deck.pr.numbers`'s value: each number with a `,` before and after it,
+/// `,2054,2056,`, so a backend's plain `contains ,2054,` filter matches one
+/// pull request exactly. A string rather than an OTLP array, which the
+/// deck's attribute model does not carry and backends do not all query
+/// alike.
+fn pr_numbers_value(numbers: &[u64]) -> String {
+    let mut value = String::from(",");
+    for number in numbers {
+        value.push_str(&number.to_string());
+        value.push(',');
+    }
+    value
+}
+
 struct ActiveRun {
     start_info: RunStart,
     trace_id: TraceId,
@@ -355,6 +373,10 @@ struct ActiveRun {
     /// report of no pull request leaves it, so the run stays joinable to the
     /// pull request it worked on.
     pr_number: Option<u64>,
+    /// `deck.pr.numbers` (issue #2096): every pull request the run's card
+    /// held, each once, in the order first seen, at most
+    /// [`MAX_PR_NUMBERS_PER_RUN`].
+    pr_numbers: Vec<u64>,
     status: Option<OpenStatus>,
     events: Vec<SpanEventRecord>,
     interventions: u64,
@@ -1056,6 +1078,7 @@ impl RunTracker {
                 context: RunContext::default(),
                 cards,
                 pr_number: None,
+                pr_numbers: Vec::new(),
                 status: None,
                 events: Vec::new(),
                 interventions: 0,
@@ -1283,6 +1306,11 @@ impl RunTracker {
         if let Some((pr, revision)) = pull_request {
             if let Some(pr) = &pr {
                 run.pr_number = Some(pr.number);
+                if !run.pr_numbers.contains(&pr.number)
+                    && run.pr_numbers.len() < MAX_PR_NUMBERS_PER_RUN
+                {
+                    run.pr_numbers.push(pr.number);
+                }
             }
             let key = pr.as_ref().map(PrKey::of);
             self.observe_ci(pane_id, key, pr.and_then(|pr| pr.checks), revision, now);
@@ -2437,6 +2465,12 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
     }
     if let Some(pr) = run.pr_number {
         attributes.push(Attribute::int(AttrKey::PrNumber, saturating_i64(pr)));
+    }
+    if !run.pr_numbers.is_empty() {
+        attributes.push(Attribute::str(
+            AttrKey::PrNumbers,
+            pr_numbers_value(&run.pr_numbers),
+        ));
     }
     attributes.extend(Attribute::opt_str(
         AttrKey::DispatchName,
@@ -4692,6 +4726,61 @@ pub(crate) mod tests {
             attr(run_span_of(&spans), AttrKey::PrNumber),
             Some(&AttrValue::Int(9))
         );
+    }
+
+    /// Issue #2096: a run that opens two pull requests names both, so each
+    /// of them joins to the run; `deck.pr.number` still names the last.
+    #[test]
+    fn a_run_that_opens_two_pull_requests_names_both() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&pr_report("p1", Some(2054), Some(1)), 10);
+        tracker.observe_event(&pr_report("p1", None, Some(2)), 20);
+        tracker.observe_event(&pr_report("p1", Some(2056), Some(3)), 30);
+        tracker.observe_event(&pr_report("p1", Some(2054), Some(4)), 35);
+        tracker.end_run("p1", EndReason::Exited, None, 40);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let names_2054 = run.attributes.iter().any(|a| match &a.value {
+            AttrValue::Int(n) => *n == 2054,
+            AttrValue::Str(s) => s.split(',').any(|n| n == "2054"),
+            AttrValue::Bool(_) => false,
+        });
+        assert!(names_2054, "the first pull request is lost: {run:?}");
+        assert_eq!(
+            attr(run, AttrKey::PrNumbers),
+            Some(&AttrValue::Str(",2054,2056,".into())),
+            "each pull request once, in the order the run first saw it"
+        );
+        assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(2054)));
+    }
+
+    /// Issue #2096: `deck.pr.numbers` keeps the first
+    /// [`MAX_PR_NUMBERS_PER_RUN`] pull requests, while `deck.pr.number`
+    /// still follows the latest one past the cap.
+    #[test]
+    fn the_list_of_pull_requests_stops_at_its_cap() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        assert_eq!(
+            MAX_PR_NUMBERS_PER_RUN, 32,
+            "docs/telemetry.md and the changelog promise 32"
+        );
+        let count = 33;
+        for n in 1..=count {
+            tracker.observe_event(&pr_report("p1", Some(n), Some(n)), 10 + n);
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let kept: String = (1..=32).map(|n| format!("{n},")).collect();
+        assert_eq!(
+            attr(run, AttrKey::PrNumbers),
+            Some(&AttrValue::Str(format!(",{kept}")))
+        );
+        assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(33)));
     }
 
     fn agent_identity_of(attributes: &[Attribute]) -> Vec<Attribute> {

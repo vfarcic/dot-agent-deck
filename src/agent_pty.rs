@@ -14413,6 +14413,9 @@ impl AgentPtyRegistry {
             }),
             _ => None,
         };
+        // Issue #2094: a worker role or a dispatched single agent is driven by
+        // another agent, so Claude Code's prompt suggestions are turned off.
+        crate::unattended_pane::apply(&mut opts.env, tab_membership.as_ref(), opts.origin);
         // PRD #1889: the work this generation serves, decided before the fork
         // so the child is handed it, and pinned on its reservation so a
         // respawn keeps it. Taken with no registry lock held. The guard lives
@@ -25461,6 +25464,102 @@ mod spawn_tests {
         panic!("child never reported its DOT_AGENT_DECK_SOCKET");
     }
 
+    /// What a child spawned with `membership` and `origin` sees as
+    /// `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION`, `<unset>` when absent.
+    fn child_observed_prompt_suggestion(
+        registry: &Arc<AgentPtyRegistry>,
+        pane_id: &str,
+        membership: Option<TabMembership>,
+        origin: Option<crate::hook_provenance::InstanceOrigin>,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("suggestion.txt");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s\" \"${{{}:-<unset>}}\" > {}'",
+                    crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION,
+                    out.display()
+                )),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: membership,
+                origin,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its prompt-suggestion setting");
+    }
+
+    /// Scenario: issue #2094. An orchestration worker role and a dispatched
+    /// single-agent pane are spawned with Claude Code's prompt suggestions off;
+    /// the orchestrator seat and a plain pane get nothing from the deck, so they
+    /// see whatever the daemon itself inherited.
+    #[test]
+    fn spawn_agent_turns_prompt_suggestions_off_only_in_unattended_panes() {
+        use crate::hook_provenance::InstanceOrigin;
+        let role = |is_start_role: bool| TabMembership::Orchestration {
+            name: "team".to_string(),
+            role_index: if is_start_role { 0 } else { 1 },
+            role_name: if is_start_role {
+                "orchestrator"
+            } else {
+                "coder"
+            }
+            .to_string(),
+            is_start_role,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("o-2094".to_string()),
+        };
+        let inherited = std::env::var(crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION)
+            .ok()
+            // The child's `${VAR:-<unset>}` reads an empty value as unset too.
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "<unset>".to_string());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let worker = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-worker",
+            Some(role(false)),
+            Some(InstanceOrigin::Direct),
+        );
+        let dispatched = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-dispatched",
+            None,
+            Some(InstanceOrigin::Dispatched),
+        );
+        let orchestrator = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-orchestrator",
+            Some(role(true)),
+            Some(InstanceOrigin::Dispatched),
+        );
+        let plain = child_observed_prompt_suggestion(&registry, "pane-2094-plain", None, None);
+        registry.shutdown_all();
+        assert_eq!(
+            worker, "false",
+            "a worker role is driven by its orchestrator"
+        );
+        assert_eq!(
+            dispatched, "false",
+            "a dispatched unit is driven by its task"
+        );
+        assert_eq!(
+            orchestrator, inherited,
+            "the orchestrator seat is left alone"
+        );
+        assert_eq!(plain, inherited, "a plain pane is left alone");
+    }
+
     #[test]
     fn spawn_agent_injects_the_daemons_hook_socket_into_the_child() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -29934,7 +30033,12 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let editor = ModelEditor::spawn(&registry, "pane-ring-resize", OnEnter::Submit);
         let repaint = Arc::new(std::sync::Mutex::new(None));
-        const NARROWER: u16 = EDITOR_COLS - 10;
+        // Narrower by the least that is still a resize. Since issue #1730 the
+        // doorbell line names the deck by its absolute path, here the test
+        // binary's, so its length follows the checkout's path: ten columns
+        // less wrapped it in a long-named worktree, where the echo it waits
+        // for no longer matched.
+        const NARROWER: u16 = EDITOR_COLS - 1;
         editor.control.lock().unwrap().cols = NARROWER as usize;
         {
             let pusher = Arc::clone(&editor.bus);

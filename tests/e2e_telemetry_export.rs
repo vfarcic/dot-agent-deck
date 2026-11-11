@@ -296,6 +296,7 @@ fn close(deck: &TuiDeck, agent: &AgentRecord) {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .expect("close stand-in pane");
@@ -471,6 +472,8 @@ fn telemetry_otlp_002_respawned_pi_reports_export_status_intervals() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-pi\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");
@@ -1188,6 +1191,8 @@ fn telemetry_otlp_011_respawn_mints_a_new_run_id() {
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), format!(
         "[[orchestrations]]\nname = \"telemetry-respawn\"\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"cat\"\nstart = true\n[[orchestrations.roles]]\nname = \"coder\"\ncommand = {command:?}\nclear = true\n"
     )).unwrap();
+    // PRD #1885: the orchestration under test is approved, as the user's is.
+    deck.approve_project_trust(deck.workdir());
     deck.send_keys(b"\x0e");
     deck.wait_for_string("Select Directory");
     deck.send_keys(b" ");

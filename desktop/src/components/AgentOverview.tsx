@@ -1,7 +1,7 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
 import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
-import { worktreePreview } from "../lib/worktreeClose";
+import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
 import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
 import { modeScopedKey, type DesktopAgentDto } from "../lib/bridge";
 import { buildDashboardFilterHeader, clearDashboardFilter, DASHBOARD_AGENT_TYPES, DASHBOARD_FILTER_TEXT_MAX, DASHBOARD_KINDS, DASHBOARD_STATUSES, dashboardFilterActive, filterDashboardAgents, removeDashboardFilterFacet, setDashboardFilter, useDashboardFilter, type DashboardFilter, type DashboardFilterFacts } from "../lib/dashboardFilter";
@@ -825,20 +825,24 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
   const roleWarning = agent.tab.kind === "orchestration"
     ? " This closes only this role, leaving the orchestration one role short. Other roles keep running."
     : "";
+  const stop = async (keepWorktree: boolean) => {
+    try {
+      const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation, ...(keepWorktree ? { keepWorktree: true } : {}) });
+      if (result.ok) onStopped?.();
+    } catch {
+      // The runtime files the refusal under its global error; keep the agent's view.
+    }
+  };
+  const label = "Close agent";
   return {
     title: `Close ${name}?`,
     body: `This sends a stop request to ${name} on ${deckName(connection)}. Unsaved terminal work may be interrupted.${roleWarning}`,
-    label: "Close agent",
+    label,
     busyLabel: "Stopping…",
     worktreePreview: worktreePreview({ previewWorktreeClose }, agent.daemonId, [agent]),
-    action: async () => {
-      try {
-        const result = await runAction({ type: "stop_agent", deckId: agent.daemonId, agentId: agent.id, incarnation: agent.incarnation });
-        if (result.ok) onStopped?.();
-      } catch {
-        // The runtime files the refusal under its global error; keep the agent's view.
-      }
-    },
+    action: () => stop(false),
+    // Issue #1958: offered by the dialog only when the preview names a worktree the deck can keep.
+    keepWorktree: { label: `${label}${KEEP_WORKTREE_SUFFIX}`, action: () => stop(true) },
   };
 }
 
@@ -1050,9 +1054,13 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         newAgentOptions: runtime.newAgentOptions,
         // PRD #1223 M6 — optional: a runtime without it offers no orchestration chips.
         ...(runtime.newAgentOrchestrations ? { newAgentOrchestrations: runtime.newAgentOrchestrations } : {}),
+        // PRD #1885 — the review before an orchestration starts. A runtime
+        // without them starts no orchestration: the dialog says why.
+        ...(runtime.projectTrustState ? { projectTrustState: runtime.projectTrustState } : {}),
+        ...(runtime.approveProjectTrust ? { approveProjectTrust: runtime.approveProjectTrust } : {}),
       }
       : undefined
-  ), [runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.runAction]);
+  ), [runtime.approveProjectTrust, runtime.clearError, runtime.fleet, runtime.listDirectories, runtime.newAgentOptions, runtime.newAgentOrchestrations, runtime.projectTrustState, runtime.runAction]);
   /** The open flow and the deck it preselects; `undefined` while it is closed. */
   const [newAgent, setNewAgent] = useState<{ deckId?: string }>();
   /** The open dialog's own close — every route it has, blocked while a start is in flight — published by the dialog (PRD #1223 U5). */
@@ -1454,13 +1462,16 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         const roles = group.agents.map((agent) => ({ agentId: agent.id, name: stopTargetName(agent), ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) }));
         const title = displayIdentity(group.title, DISPLAY_LIMITS.name, unnamedGroupLabel(group));
         const count = roles.length === 1 ? "its 1 role" : `all ${roles.length} of its roles`;
+        const label = roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`;
         setConfirm({
           title: `Close ${title}?`,
           body: `This stops every role of this orchestration on ${deckName(deck.connection)} — ${count}: ${roles.map((role) => role.name).join(", ")}. Unsaved terminal work in any of them may be interrupted.`,
-          label: roles.length === 1 ? "Close 1 role" : `Close all ${roles.length} roles`,
+          label,
           busyLabel: "Stopping…",
           worktreePreview: worktreePreview(runtime, deckId, group.agents),
           action: () => run({ type: "stop_orchestration", deckId, roles }),
+          // Issue #1958: the keep goes on every role's stop; the crate fans it out.
+          keepWorktree: { label: `${label}${KEEP_WORKTREE_SUFFIX}`, action: () => run({ type: "stop_orchestration", deckId, roles, keepWorktree: true }) },
         });
       },
     };

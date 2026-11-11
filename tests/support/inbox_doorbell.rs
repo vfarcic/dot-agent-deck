@@ -17,6 +17,8 @@ pub trait Endpoint {
     fn cwd(&self) -> &Path;
     fn attach_socket(&self) -> &Path;
     fn hook_socket(&self) -> &Path;
+    /// PRD #1885: approve the project at `dir` into this endpoint's store.
+    fn approve_project_trust(&self, dir: &Path);
 }
 impl Endpoint for DaemonProc {
     fn home(&self) -> &Path {
@@ -31,6 +33,9 @@ impl Endpoint for DaemonProc {
     fn hook_socket(&self) -> &Path {
         &self.hook_socket
     }
+    fn approve_project_trust(&self, dir: &Path) {
+        DaemonProc::approve_project_trust(self, dir);
+    }
 }
 impl Endpoint for common::TuiDeck {
     fn home(&self) -> &Path {
@@ -44,6 +49,9 @@ impl Endpoint for common::TuiDeck {
     }
     fn hook_socket(&self) -> &Path {
         self.hook_socket_path()
+    }
+    fn approve_project_trust(&self, dir: &Path) {
+        common::TuiDeck::approve_project_trust(self, dir);
     }
 }
 
@@ -195,6 +203,7 @@ impl Drop for Pane {
             &self.attach_socket,
             &dot_agent_deck::daemon_protocol::AttachRequest::StopAgent {
                 id: self.agent.clone(),
+                keep_worktree: false,
             },
         );
     }

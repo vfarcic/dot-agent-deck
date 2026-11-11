@@ -33,7 +33,7 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
-import { worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
+import { KEEP_WORKTREE_SUFFIX, worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
 import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
@@ -92,6 +92,8 @@ import { selectsAllDecks } from "./lib/endpoints";
 import { deckScreenSnapshot } from "./lib/deckScreen";
 import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
+import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
+import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
@@ -934,11 +936,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
     const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, runtime.previewWorktreeClose);
-    setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
+    const tracked = (stop: () => Promise<void>) => async () => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
-      try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
-    } });
+      try { await stop(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
+    };
+    // Issue #1958: the keep-worktree close is the same stop, tracked the same way.
+    setAgentStopConfirm({ ...question, ownerView: agentView, action: tracked(question.action), ...(question.keepWorktree ? { keepWorktree: { ...question.keepWorktree, action: tracked(question.keepWorktree.action) } } : {}) });
     return undefined;
   }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
   const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
@@ -1087,7 +1091,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const readPager = useCallback((): VoicePager | undefined => (
     dialogLayerUp() ? pagerLayers.current.dialog : pagerLayers.current.screen
   ), [dialogLayerUp]);
-  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto) => {
+  const dispatchVoice = useCallback((outcome: Extract<VoiceOutcomeDto, { kind: "dispatch" }>, declaredDirectories?: VoiceDirectoriesDto, declaredNewAgent?: VoiceNewAgentDto, declaredTrustReview?: string) => {
     const previous = view;
     /*
       One target for every entry, built from the outcome's own resolved params —
@@ -1190,6 +1194,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* The shell's, so Settings opens from the overview as from the deck (#1197). */
       openOverlay: railContext.openOverlay,
       closeOverlays: railContext.closeOverlays,
+      /* PRD #1885 — the review dialog's Approve and start, wherever it is open:
+         over the New agent dialog or over the Runs screen. With none open it
+         answers that there is nothing to approve. Bound to the review that
+         was on screen when the words were DECLARED (its token): one cancelled
+         and replaced, or re-shown with new text, while the words were being
+         worked out is not approved (PRD #1885 review, auditor 3). */
+      approveProjectCommands: () => approveShownReview(declaredTrustReview),
       /* Only while Settings is open and nothing is drawn over it, so `close`
          reads its presence as "Settings is on top" (#1197, PR #1680 review). */
       ...(overlaysOpen.settings && !overlayAbove(document.querySelector(SETTINGS_PANEL)) ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
@@ -1817,6 +1828,10 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
   const notice = noticeState?.message;
   const setNotice = (message: string | undefined, detail?: string) => setNoticeState(message === undefined ? undefined : { message, ...(detail === undefined ? {} : { detail }) });
   const [confirm, setConfirm] = useState<ConfirmState>(); // voice-registry-exempt: the confirmation an action that starts or stops agents asks first — opened by the action it guards, never on its own
+  /* PRD #1885 — the Runs screen's review of a project's commands before Activate. */
+  const trustReview = useProjectTrustReview(runtime);
+  const approveTrustReview = trustReview.approve;
+  const approveReviewed = useCallback((token: string) => { void approveTrustReview(token); }, [approveTrustReview]);
   const [upgrade, setUpgrade] = useState<UpgradeTarget>(); // voice-registry-exempt: the Upgrade / Replace daemon dialog (PRD #1487) — opened only by those two buttons, and it asks before stopping anything
   /* PRD #1260 review, round 5 — told whenever this screen's confirmation opens
      or closes, exactly as the overview reports its own: the voice panel's gate
@@ -2262,6 +2277,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       busyLabel: "Stopping…",
       worktreePreview: worktreePreview(runtime, snapshot.connection.deckId ?? "", [selectedAgent]),
       action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
+      // Issue #1958: shown only when the preview names a worktree the deck can keep.
+      keepWorktree: { label: `Close agent${KEEP_WORKTREE_SUFFIX}`, action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation, keepWorktree: true }, `${selectedAgent.role} close requested.`); } },
     });
   };
 
@@ -2348,7 +2365,29 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
     });
   };
 
+  /*
+   * PRD #1885 review (auditor 4, reviewer 5) — a Runs review is bound to the
+   * deck it was asked of. Its query, its approval and the activation all name
+   * that deck (below), and when the selected deck changes while it is open
+   * the review closes: the user is no longer looking at the deck they would be
+   * approving on. Identical project paths and config text on two decks do not
+   * carry consent from one deck's approvals to the other's.
+   */
+  const shownTrustReview = trustReview.shown;
+  const cancelTrustReview = trustReview.cancel;
+  useEffect(() => {
+    if (shownTrustReview === undefined || shownTrustReview.target.deckId === orchestrationDeckId) return;
+    cancelTrustReview();
+    /* Pressed Approve and start already? Then the approval may be recorded on
+       the deck it went to, and the notice says so and how to undo it. */
+    const said = reviewDeckChangedNotice(shownTrustReview);
+    setNotice(said.message, said.detail);
+  }, [shownTrustReview, orchestrationDeckId, cancelTrustReview]);
+
   const requestLaunch = (config: OrchestrationLaunchConfig) => {
+    /* The deck this launch is for: the one selected when Activate is pressed. */
+    const deckId = orchestrationDeckId;
+    const launchDeckName = deckName(snapshot.connection);
     const generatedCount = config.roles.length - config.customCommandCount;
     const commandCopy = config.customCommandCount > 0
       ? `${generatedCount} commands are generated from their current profile fields; ${config.customCommandCount} explicit custom command override${config.customCommandCount === 1 ? " bypasses" : "s bypass"} those fields. Custom commands may carry arbitrary permissions and are not covered by structured permission claims.`
@@ -2364,100 +2403,148 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       label: "Activate orchestration",
       busyLabel: "Activating…",
       action: async () => {
-        try {
-          // The display twins come off with the two counts: they exist for the
-          // dialog and the notice, and the daemon gets the identities alone
-          // (PRD #819 audit fix).
-          const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
-          // `displayTitle` is NOT a display twin: it rides along as the run's
-          // title (issue #1044), absent when the Name was left empty. The
-          // sheet's collision check ran when Activate was pressed; it runs again
-          // here, against the titles live now, with the same refusal.
-          if (orchestrationLiveTitlesRef.current.includes(config.displayTitle ?? config.name)) {
-            setNotice(`Nothing was started: ${ORCHESTRATION_TITLE_TAKEN}`);
-            return;
-          }
-          await runtime.runAction({ type: "activate_orchestration", ...launch });
-          setOverlay("orchestration", false);
-          await runtime.reconnect();
-          setNotice(`${config.displayName} activated with ${config.roles.length} configured roles.`);
-        } catch (cause) {
-          /*
-           * PRD #1223 audit V2 — FIRST, ahead of every refusal-code translation
-           * below. Each of those says "Nothing was started", and a launch whose
-           * rollback could not confirm a role stopped can carry one of their
-           * codes too: a `stale-preparation` refusal of a later role after an
-           * earlier one had started is exactly that composite. The roles arrive
-           * as data (`LaunchCleanupError`) and the runtime has already queued
-           * them as a warning of their own (issue #1234), so this only has to
-           * keep the untranslated sentence — the sentence itself stays the
-           * runtime's error, which takes the toast's place once this is
-           * dismissed.
-           */
-          if (cause instanceof LaunchCleanupError) {
-            setNotice(cause.message);
-            return;
-          }
-          const message = cause instanceof Error ? cause.message : String(cause);
-          /*
-           * PRD #819 M6, state 2. The daemon re-resolves on launch, and
-           * enumeration is derived from live state — so a project can stop
-           * being known between the moment it was drawn and the moment Launch
-           * is pressed, when its last agent exits. That is an ORDINARY outcome,
-           * so it is presented the way the empty state is: the picker reopens
-           * saying the project is no longer known, rather than a red failure
-           * naming a refusal code.
-           */
-          if (message.includes(PROJECT_UNRESOLVED_CODE)) {
-            projectState.clearSelection();
-            void projectState.refresh();
-            setOverlay("orchestration", false);
-            VOICE_ACTIONS.openProjects.run(voiceContext);
-            setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
-            return;
-          }
-          /*
-           * The other ordinary refusal: the project is fine and its config
-           * changed under the picker. The remedy the daemon's own sentence
-           * names is "resolve again", so do exactly that rather than leaving
-           * the user a dead end, and say what happened.
-           */
-          if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
-            void projectState.select(activeProject.path);
-            setNotice("This project's .dot-agent-deck.toml changed since the orchestrations were listed, so nothing was started. It has been re-read — check the orchestration and activate it again.");
-            return;
-          }
-          /*
-           * The two token-time refusals. Both mean the daemon started nothing,
-           * and both have the same remedy — prepare again — so both re-resolve
-           * the project to pick up its current revision and say what happened
-           * in the words that are true of each. `stale-preparation` is the one
-           * an ordinary second launch in the same project produces, because the
-           * coordinator context lives at a path fixed per project and the later
-           * preparation is the one that survives.
-           */
-          if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
-            void projectState.select(activeProject.path);
-            setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
-              ? "This launch's prepared orchestrator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; activate again to prepare a fresh one."
-              : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; activate again to prepare a fresh one.");
-            return;
-          }
-          /*
-           * Not retryable, and the only one of these that is not: the daemon's
-           * platform cannot give the published context an owner-only guarantee,
-           * so it withholds the verb rather than publishing without one. Its own
-           * sentence already names what to do instead, so pass it through.
-           */
-          if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
-            setOverlay("orchestration", false);
-            setNotice(message);
-            return;
-          }
-          setNotice(message);
-        }
+        /*
+         * PRD #1885 — ask the deck first. An approved, unchanged orchestration
+         * activates exactly as before; otherwise the review dialog shows what
+         * it would run, and nothing starts until the user approves that text.
+         * The review, its approval and the activation name the deck selected
+         * when Activate was pressed, and the dialog says which deck that is.
+         */
+        const trustTarget = { ...(deckId === undefined ? {} : { deckId }), path: config.cwd, orchestration: config.name };
+        const checked = await trustReview.check(trustTarget, (approved) => activateLaunch(approvedConfig(config, approved), true, deckId), { deckName: launchDeckName });
+        if (checked.kind === "approved") await activateLaunch(config, false, deckId);
+        else if (checked.kind === "refused") setNotice(checked.reason);
       },
     });
+  };
+
+  /**
+   * PRD #1885 review — after the user approved the text the review showed,
+   * activate with the config revision of THAT text (the deck's read when it
+   * answered the approval), not the one the project was resolved at: after a
+   * `trust-text-changed` refresh the two differ and the old one is refused as
+   * stale. A config that moves again afterwards is still refused.
+   */
+  const approvedConfig = (config: OrchestrationLaunchConfig, approved: ProjectTrustView): OrchestrationLaunchConfig => (
+    approved.configRevision === undefined ? config : { ...config, configRevision: approved.configRevision }
+  );
+
+  /**
+   * The Runs screen's activation itself, once the deck has said the
+   * orchestration is approved. `afterReview` is true when it runs from the
+   * review dialog's Approve and start: a `not-approved` refusal then (the
+   * config changed again in between) is said rather than reviewed a second
+   * time, so the two can never loop.
+   */
+  const activateLaunch = async (config: OrchestrationLaunchConfig, afterReview: boolean, deckId: string | undefined) => {
+    // `displayTitle` is NOT a display twin: it rides along as the run's
+    // title (issue #1044), absent when the Name was left empty. The
+    // sheet's collision check ran when Activate was pressed; it runs again
+    // here, against the titles live now — after a review too, which can take
+    // a while — with the same refusal.
+    if (orchestrationLiveTitlesRef.current.includes(config.displayTitle ?? config.name)) {
+      setNotice(`Nothing was started: ${ORCHESTRATION_TITLE_TAKEN}`);
+      return;
+    }
+    try {
+      // The display twins come off with the two counts: they exist for the
+      // dialog and the notice, and the daemon gets the identities alone
+      // (PRD #819 audit fix).
+      const { customCommandCount: _customCommandCount, generatedFullAccessCount: _generatedFullAccessCount, displayName: _displayName, displayPath: _displayPath, ...launch } = config;
+      await runtime.runAction({ type: "activate_orchestration", ...launch, ...(deckId === undefined ? {} : { deckId }) });
+      setOverlay("orchestration", false);
+      await runtime.reconnect();
+      setNotice(`${config.displayName} activated with ${config.roles.length} configured roles.`);
+    } catch (cause) {
+      /*
+       * PRD #1223 audit V2 — FIRST, ahead of every refusal-code translation
+       * below. Each of those says "Nothing was started", and a launch whose
+       * rollback could not confirm a role stopped can carry one of their
+       * codes too: a `stale-preparation` refusal of a later role after an
+       * earlier one had started is exactly that composite. The roles arrive
+       * as data (`LaunchCleanupError`) and the runtime has already queued
+       * them as a warning of their own (issue #1234), so this only has to
+       * keep the untranslated sentence — the sentence itself stays the
+       * runtime's error, which takes the toast's place once this is
+       * dismissed.
+       */
+      if (cause instanceof LaunchCleanupError) {
+        setNotice(cause.message);
+        return;
+      }
+      const message = cause instanceof Error ? cause.message : String(cause);
+      /*
+       * PRD #819 M6, state 2. The daemon re-resolves on launch, and
+       * enumeration is derived from live state — so a project can stop
+       * being known between the moment it was drawn and the moment Launch
+       * is pressed, when its last agent exits. That is an ORDINARY outcome,
+       * so it is presented the way the empty state is: the picker reopens
+       * saying the project is no longer known, rather than a red failure
+       * naming a refusal code.
+       */
+      if (message.includes(PROJECT_UNRESOLVED_CODE)) {
+        projectState.clearSelection();
+        void projectState.refresh();
+        setOverlay("orchestration", false);
+        VOICE_ACTIONS.openProjects.run(voiceContext);
+        setNotice("That project is no longer one this daemon knows — nothing is running there any more. Choose another, or paste its path again.");
+        return;
+      }
+      /*
+       * The other ordinary refusal: the project is fine and its config
+       * changed under the picker. The remedy the daemon's own sentence
+       * names is "resolve again", so do exactly that rather than leaving
+       * the user a dead end, and say what happened.
+       */
+      if (message.includes(PROJECT_STALE_REVISION_CODE) && activeProject) {
+        void projectState.select(activeProject.path);
+        setNotice("This project's .dot-agent-deck.toml changed since the orchestrations were listed, so nothing was started. It has been re-read — check the orchestration and activate it again.");
+        return;
+      }
+      /*
+       * The two token-time refusals. Both mean the daemon started nothing,
+       * and both have the same remedy — prepare again — so both re-resolve
+       * the project to pick up its current revision and say what happened
+       * in the words that are true of each. `stale-preparation` is the one
+       * an ordinary second launch in the same project produces, because the
+       * coordinator context lives at a path fixed per project and the later
+       * preparation is the one that survives.
+       */
+      if ((message.includes(PROJECT_STALE_PREPARATION_CODE) || message.includes(PROJECT_STALE_TOKEN_CODE)) && activeProject) {
+        void projectState.select(activeProject.path);
+        setNotice(message.includes(PROJECT_STALE_PREPARATION_CODE)
+          ? "This launch's prepared orchestrator context no longer matches what the daemon approved — another launch in this project replaced it, or the project moved. Nothing was started. The project has been re-read; activate again to prepare a fresh one."
+          : "The daemon no longer holds this launch's preparation — it expired, or the daemon was replaced. Nothing was started. The project has been re-read; activate again to prepare a fresh one.");
+        return;
+      }
+      /*
+       * Not retryable, and the only one of these that is not: the daemon's
+       * platform cannot give the published context an owner-only guarantee,
+       * so it withholds the verb rather than publishing without one. Its own
+       * sentence already names what to do instead, so pass it through.
+       */
+      if (message.includes(PROJECT_UNSUPPORTED_PLATFORM_CODE)) {
+        setOverlay("orchestration", false);
+        setNotice(message);
+        return;
+      }
+      /*
+       * PRD #1885 — the deck refused it as not approved: its config changed
+       * after the check above. Review the text it now has; nothing started.
+       */
+      if (!afterReview && isNotApproved(message)) {
+        const checked = await trustReview.check({ ...(deckId === undefined ? {} : { deckId }), path: config.cwd, orchestration: config.name }, (approved) => activateLaunch(approvedConfig(config, approved), true, deckId), { deckName: deckName(snapshot.connection) });
+        if (checked.kind === "review") {
+          runtime.clearError();
+          return;
+        }
+        if (checked.kind === "refused") {
+          setNotice(checked.reason);
+          return;
+        }
+      }
+      setNotice(message);
+    }
   };
 
   /*
@@ -2721,6 +2808,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       {paletteOpen && <CommandPalette commands={commandItems} onClose={() => setPaletteOpen(false)} />}
       {helpOpen && <ShortcutHelp onClose={() => setHelpOpen(false)} />}
       {confirm && <ConfirmDialog state={confirm} onClose={() => setConfirm(undefined)} />}
+      {trustReview.shown && <ProjectTrustDialog review={trustReview.shown} onApprove={approveReviewed} onCancel={trustReview.cancel} />}
       {upgrade && <UpgradeDialog target={upgrade} runtime={runtime} onClose={() => setUpgrade(undefined)} />}
       {/* PRD #1223 audit V7: the roles a rollback could not confirm are shown
           above the sentence — since issue #1234 from the runtime's own queue,

@@ -546,6 +546,8 @@ fn project_launch_001_publishes_the_context_and_a_failed_preparation_starts_no_r
         "prepared-project",
         Some(NAMED_PROJECT_TOML),
     ));
+    // PRD #1885: the project under test is approved, as the user's is.
+    daemon.approve_project_trust(&project);
     let doomed = canonical(&make_dir(
         workspace.path(),
         "unlaunchable-project",
@@ -696,6 +698,8 @@ fn project_launch_002_the_canonical_path_resolve_returns_is_the_string_the_launc
         "canonical-project",
         Some(UNNAMED_PROJECT_TOML),
     ));
+    // PRD #1885: the project under test is approved, as the user's is.
+    daemon.approve_project_trust(&project);
 
     // The alias differs from the project in its BASENAME, which is the whole
     // point: an unnamed orchestration is named after the directory basename, so
@@ -788,6 +792,8 @@ fn project_launch_004_empty_task_omits_the_task_section_and_preserves_the_run_ti
         "empty-task-project",
         Some(NAMED_PROJECT_TOML),
     ));
+    // PRD #1885: the project under test is approved, as the user's is.
+    daemon.approve_project_trust(&project);
     let project_wire = wire_path(&project);
 
     let empty_response = daemon
@@ -957,6 +963,8 @@ fn project_launch_005_prepared_roles_use_their_daemon_configured_commands() {
         "configured-command-project",
         Some(CONFIGURED_COMMAND_PROJECT_TOML),
     ));
+    // PRD #1885: the project under test is approved, as the user's is.
+    daemon.approve_project_trust(&project);
     let project_wire = wire_path(&project);
     let config_path = project.join(".dot-agent-deck.toml");
     let configured_log = project.join("configured-commands.log");
@@ -1228,6 +1236,8 @@ fn project_launch_006_a_later_prepare_does_not_replace_a_started_launchs_context
         "interleaved-project",
         Some(NAMED_PROJECT_TOML),
     ));
+    // PRD #1885: the project under test is approved, as the user's is.
+    daemon.approve_project_trust(&project);
     let project_wire = wire_path(&project);
     let prepare = |task: &str| {
         let reply = daemon
@@ -1335,6 +1345,8 @@ fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
         "cleanup-project",
         Some(NAMED_PROJECT_TOML),
     ));
+    // PRD #1885: the project under test is approved, as the user's is.
+    daemon.approve_project_trust(&project);
     let project_wire = wire_path(&project);
     let prepare = |task: &str| {
         let reply = daemon
@@ -1397,7 +1409,10 @@ fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
     assert_eq!(daemon.agent_records().len(), 2, "both runs are live");
 
     let stopped = daemon
-        .send_attach_request(&AttachRequest::StopAgent { id: first_id })
+        .send_attach_request(&AttachRequest::StopAgent {
+            id: first_id,
+            keep_worktree: false,
+        })
         .expect("stop first orchestration's only pane");
     assert!(stopped.ok, "stop failed: {:?}", stopped.error);
     assert!(

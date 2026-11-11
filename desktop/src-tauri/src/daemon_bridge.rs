@@ -6399,6 +6399,7 @@ mod tests {
     #[cfg(unix)]
     fn runs_launch(cwd: &std::path::Path) -> crate::ActivateOrchestrationRequest {
         crate::ActivateOrchestrationRequest {
+            deck_id: None,
             name: "review".into(),
             display_title: None,
             cwd: cwd.to_string_lossy().into_owned(),
@@ -6435,6 +6436,58 @@ mod tests {
             );
         }
         assert_eq!(state.daemon.handshake_count(), 0, "no deck was contacted");
+    }
+
+    /// PRD #1885 review (auditor 4, reviewer 5). Scenario: the local deck is a
+    /// real daemon and is the selected deck, and a Runs launch names the deck
+    /// its project-commands review was approved on — one this app no longer
+    /// observes. The launch is refused with the unobserved-deck sentence and
+    /// contacts no deck: a launch that names its deck never falls back to the
+    /// selection. As a control, the same launch naming no deck reaches the
+    /// selected deck, which is what makes "no handshake" mean something.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_runs_launch_naming_its_deck_never_falls_back_to_the_selected_deck() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let local = RealDeck::start("1885-runs-named-deck");
+        let (settings, _remote) = all_decks_with_one_remote_row("build-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let mut only_local = settings.clone();
+        only_local
+            .endpoints
+            .as_mut()
+            .expect("built with an [endpoints] section")
+            .selection = crate::settings::Selection::Local;
+        crate::dto::apply_settings_selection(&only_local);
+        let state = crate::terminal::DesktopState::default();
+
+        let mut named = runs_launch(&local.dir);
+        named.deck_id = Some("deck-00000000000000ff".into());
+        let refused = crate::activate_orchestration_action(&state, named).await;
+        let handshakes_named = state.daemon.handshake_count();
+        let control = crate::activate_orchestration_action(&state, runs_launch(&local.dir)).await;
+        let handshakes_control = state.daemon.handshake_count();
+        local.shutdown();
+
+        let Err(refused) = refused else {
+            panic!("a launch naming a deck this app does not observe is refused");
+        };
+        assert!(
+            refused
+                .message()
+                .contains("that daemon is not one this app is observing"),
+            "{}",
+            refused.message()
+        );
+        assert_eq!(
+            handshakes_named, 0,
+            "no deck was contacted for the named one"
+        );
+        assert!(
+            handshakes_control > 0,
+            "the control launch, naming no deck, reached the selected deck: {:?}",
+            control.err().map(|e| e.message().to_string())
+        );
     }
 
     /// Scenario (#1083): the local deck is a real daemon running one agent,
@@ -6571,12 +6624,18 @@ mod tests {
         let remote_wire = deck_wire_id(&remote_endpoint);
 
         let incarnation = remote.incarnation();
-        let unknown =
-            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent, &incarnation)
-                .await;
+        let unknown = crate::stop_agent_action(
+            &state,
+            "deck-ffffffffffffffff",
+            &remote_agent,
+            &incarnation,
+            false,
+        )
+        .await;
         let after_unknown = (live_ids(&local), live_ids(&remote));
         let stopped =
-            crate::stop_agent_action(&state, &remote_wire, &remote_agent, &incarnation).await;
+            crate::stop_agent_action(&state, &remote_wire, &remote_agent, &incarnation, false)
+                .await;
         let on_local = live_ids(&local);
         let on_remote = live_ids(&remote);
         local.shutdown();
@@ -6647,9 +6706,10 @@ mod tests {
         ];
 
         let (unknown_scope, unknown) =
-            crate::stop_orchestration_action(&state, "deck-ffffffffffffffff", &roles).await;
+            crate::stop_orchestration_action(&state, "deck-ffffffffffffffff", &roles, false).await;
         let after_unknown = live_ids(&remote).len();
-        let (scope, closed) = crate::stop_orchestration_action(&state, &remote_wire, &roles).await;
+        let (scope, closed) =
+            crate::stop_orchestration_action(&state, &remote_wire, &roles, false).await;
         let on_local = live_ids(&local);
         let on_remote = live_ids(&remote);
         local.shutdown();
@@ -7757,6 +7817,145 @@ mod tests {
     // PRD #1223 M6 — orchestrations from the New agent dialog
     // -----------------------------------------------------------------------
 
+    /// PRD #1885: approve every orchestration of the config in `project`,
+    /// through the real store API, in a store private to this test process —
+    /// the daemon these tests run in-process prepares only an approved
+    /// orchestration, and they are about the launch, not the approval.
+    #[cfg(unix)]
+    fn approve_project(project: &std::path::Path) {
+        use dot_agent_deck::project_trust::{TrustStore, approve_all};
+        use_test_trust_store();
+        approve_all(&TrustStore::default_location(), project).expect("approve the fixture config");
+    }
+
+    /// Point this test process's approval store at a private directory, once,
+    /// so no test reads or writes the user's own approvals.
+    #[cfg(unix)]
+    fn use_test_trust_store() {
+        use dot_agent_deck::project_trust::TrustStore;
+        static STORE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+        let store = STORE.get_or_init(|| tempfile::tempdir().expect("mint the trust store dir"));
+        let _ = TrustStore::use_state_dir_for_this_process(store.path().to_path_buf());
+    }
+
+    /// Scenario (PRD #1885): a real deck and a project whose orchestration
+    /// `m6` nobody approved. The review query answers it `never_approved` with
+    /// every role's command and prompt (a control character in the prompt
+    /// shown escaped, line by line), and launching it is refused with
+    /// `not-approved` and starts nothing. An approval carrying a digest of
+    /// other text is refused with `trust-text-changed` and records nothing;
+    /// one carrying the shown digest records it, the query then answers
+    /// `approved`, and the same launch starts both roles.
+    ///
+    /// **What it fails against.** A bridge that approved without the digest,
+    /// or a daemon that started an unapproved orchestration.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unapproved_orchestration_is_reviewed_approved_with_the_shown_digest_then_started() {
+        use crate::trust_review::{
+            DesktopProjectTrust, approve_project_trust_on, project_trust_state_on,
+        };
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        use_test_trust_store();
+        let local = RealDeck::start("trust-review");
+        let project = local.dir.join("trust-project");
+        std::fs::create_dir_all(&project).expect("create the project");
+        std::fs::write(
+            project.join(".dot-agent-deck.toml"),
+            "[[orchestrations]]\nname = \"m6\"\n\n[[orchestrations.roles]]\nname = \"planner\"\ncommand = \"sh -c 'echo planner-configured >> configured.log; sleep 600'\"\nstart = true\nprompt_template = \"plan it\\u001b[2J\\nsecond line\"\n\n[[orchestrations.roles]]\nname = \"builder\"\ncommand = \"sh -c 'echo builder-configured >> configured.log; sleep 600'\"\ndescription = \"builds\"\n",
+        )
+        .expect("write the project config");
+        let project = std::fs::canonicalize(&project).expect("canonicalize the project");
+        let project_wire = project.to_str().expect("a UTF-8 path").to_string();
+        let (settings, _unused_remote) = all_decks_with_one_remote_row("trust-box.example.com");
+        let _local_deck = apply_all_decks_over(&local, &settings);
+        let state = crate::terminal::DesktopState::default();
+        let local_wire = deck_wire_id(&local.endpoint);
+
+        let first = project_trust_state_on(&state, Some(&local_wire), &project_wire, "m6").await;
+        let Ok(DesktopProjectTrust::Review(shown)) = first else {
+            panic!("the deck answers a review: {first:?}");
+        };
+        assert_eq!(shown.state, "never_approved");
+        assert_eq!(shown.orchestration, "m6");
+        let names: Vec<_> = shown.roles.iter().map(|role| role.name.as_str()).collect();
+        assert_eq!(names, ["planner", "builder"]);
+        assert!(shown.roles[0].command.contains("planner-configured"));
+        assert_eq!(
+            shown.roles[0].prompt.as_deref(),
+            Some(&["plan it\\u{1b}[2J".to_string(), "second line".to_string()][..]),
+            "the prompt arrives escaped, one string per line"
+        );
+        assert_eq!(
+            shown.roles[1].description.as_deref(),
+            Some(&["builds".to_string()][..])
+        );
+
+        let refused = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            orchestration_start(&project_wire, Some("trust-review-1"), None),
+        )
+        .await;
+        let refusal = refused
+            .err()
+            .map(|error| format!("{error:?}"))
+            .unwrap_or_default();
+        assert!(
+            refusal.contains("not-approved"),
+            "an unapproved launch is refused: {refusal}"
+        );
+        assert!(
+            named_records(&local).is_empty(),
+            "nothing started while unapproved"
+        );
+
+        let stale = approve_project_trust_on(
+            &state,
+            Some(&local_wire),
+            &project_wire,
+            "m6",
+            &"0".repeat(64),
+        )
+        .await;
+        assert!(
+            stale
+                .as_ref()
+                .is_err_and(|error| error.contains("trust-text-changed")),
+            "a digest of other text approves nothing: {stale:?}"
+        );
+
+        let approved = approve_project_trust_on(
+            &state,
+            Some(&local_wire),
+            &project_wire,
+            "m6",
+            &shown.digest,
+        )
+        .await;
+        assert!(
+            matches!(&approved, Ok(DesktopProjectTrust::Review(view)) if view.state == "approved"),
+            "the shown digest approves it: {approved:?}"
+        );
+        let again = project_trust_state_on(&state, Some(&local_wire), &project_wire, "m6").await;
+        assert!(
+            matches!(&again, Ok(DesktopProjectTrust::Review(view)) if view.state == "approved"),
+            "{again:?}"
+        );
+
+        let started = crate::start_orchestration_action(
+            &state,
+            &local_wire,
+            orchestration_start(&project_wire, Some("trust-review-2"), None),
+        )
+        .await;
+        assert!(
+            started.is_ok(),
+            "the approved orchestration starts: {:?}",
+            started.err()
+        );
+    }
+
     /// A project under `root` whose one orchestration, `m6`, has a Pi start
     /// role and an OpenCode worker — both DECLARED on `sh` stand-ins, so the
     /// deck's use of the declaration is observable — and whose commands each
@@ -7785,7 +7984,9 @@ agent = "opencode"
 "#,
         )
         .expect("write the project config");
-        std::fs::canonicalize(&project).expect("canonicalize the project")
+        let project = std::fs::canonicalize(&project).expect("canonicalize the project");
+        approve_project(&project);
+        project
     }
 
     /// PRD #1223 audit V4: the same project with the orchestration name
@@ -7825,7 +8026,9 @@ start = true
 "#,
         )
         .expect("write the project config");
-        std::fs::canonicalize(&project).expect("canonicalize the project")
+        let project = std::fs::canonicalize(&project).expect("canonicalize the project");
+        approve_project(&project);
+        project
     }
 
     #[cfg(unix)]

@@ -1,0 +1,17 @@
+---
+source: tests/copy_mode.rs
+expression: frame_with_marks(&buf)
+---
+┏copy-pane━━━━━━━━━━━━━━━━━━━┓
+┃line-22                     ┃
+┃line-23                     ┃
+┃line-24                     ┃
+┃line-25                     ┃
+┃line-26                     ┃
+┃line-27                     ┃
+┃line-28                     ┃
+ ^^^^^^C
+┃line-29                     ┃
+┃line-30                     ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+ COPY  move h/j/k/l · page PgU

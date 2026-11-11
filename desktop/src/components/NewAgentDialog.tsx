@@ -2,6 +2,8 @@ import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, typ
 import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
+import { ProjectTrustDialog } from "./ProjectTrustDialog";
+import { isNotApproved, REVIEW_FIRST, useProjectTrustReview, type ProjectTrustView } from "../lib/projectTrust";
 import { DISPLAY_LIMITS, displayText, displayTitle } from "../lib/displayText";
 import { OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
@@ -43,7 +45,7 @@ import { draftHasEdits, draftWorthKeeping, type NO_MODE_ID, type NewAgentDraft }
  * although they are optional on `DeckRuntimeState`: the overview renders no
  * entry point into this dialog for a runtime without them.
  */
-export type NewAgentRuntime = Pick<DeckRuntimeState, "fleet" | "runAction" | "clearError"> & Required<Pick<DeckRuntimeState, "listDirectories" | "newAgentOptions">> & Pick<DeckRuntimeState, "newAgentOrchestrations">;
+export type NewAgentRuntime = Pick<DeckRuntimeState, "fleet" | "runAction" | "clearError"> & Required<Pick<DeckRuntimeState, "listDirectories" | "newAgentOptions">> & Pick<DeckRuntimeState, "newAgentOrchestrations" | "projectTrustState" | "approveProjectTrust">;
 
 export interface NewAgentDialogProps {
   runtime: NewAgentRuntime;
@@ -564,6 +566,11 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     };
   }, []);
 
+  /** PRD #1885 — the review of an orchestration's commands and prompts before it starts. */
+  const trust = useProjectTrustReview(runtime);
+  const approveTrust = trust.approve;
+  const approveReviewed = useCallback((token: string) => { void approveTrust(token); }, [approveTrust]);
+
   /**
    * Every way out of the dialog — the header's close button, Esc, a backdrop
    * click, the directory panel's `q` and, through `closeRequest`, voice's
@@ -621,6 +628,12 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const requestClose = (): string | undefined => {
     if (starting) return STARTING_CLOSE_BLOCKED;
+    // PRD #1885: the review of a project's commands is on top of the form, so
+    // voice's `close` ("cancel") closes the review and leaves the form open.
+    if (trust.shown) {
+      trust.cancel();
+      return undefined;
+    }
     onClose(snapshot());
     return undefined;
   };
@@ -1498,24 +1511,88 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     setFormError(undefined);
     setFormCleanup(undefined);
     setPhase("starting");
-    const title = orchestrationRunTitle(name, orchestration.name);
+    /*
+     * PRD #1885 — ask the deck first. An approved, unchanged orchestration
+     * starts exactly as before; otherwise the review dialog shows what it would
+     * run, the form goes back to idle behind it, and nothing starts until the
+     * user approves that text.
+     */
+    const launch = { deck, path: orchestrations.path, configRevision: orchestrations.configRevision, name };
+    const checked = await trust.check({ deckId: deck.deckId, path: launch.path, orchestration: orchestration.name }, (approved) => launchOrchestration(orchestration, approvedLaunch(launch, approved), true), { deckName: deck.name });
+    if (checked.kind === "approved") {
+      await launchOrchestration(orchestration, launch, false);
+      return;
+    }
+    if (!mounted.current) return;
+    if (checked.kind === "refused") {
+      failStart(new Error(checked.reason));
+      return;
+    }
+    setPhase("idle");
+  };
+
+  /**
+   * PRD #1885 review — the launch after the user approved the text the review
+   * showed: with the config revision of THAT text, which the deck read when it
+   * answered the approval, rather than the one the orchestrations were listed
+   * at. After a `trust-text-changed` refresh those differ, and the listed one
+   * would be refused as stale although the user approved the current text. A
+   * config that moves again after the approval is still refused by the deck's
+   * revision check.
+   */
+  const approvedLaunch = <T extends { configRevision?: string }>(launch: T, approved: ProjectTrustView): T => (
+    approved.configRevision === undefined ? launch : { ...launch, configRevision: approved.configRevision }
+  );
+
+  /**
+   * The launch itself, once the deck has said the orchestration is approved.
+   * `afterReview` is true when it runs from the review's Approve and start: a
+   * `not-approved` refusal then (the config changed yet again) is said rather
+   * than reviewed once more, so the two can never loop.
+   */
+  const launchOrchestration = async (
+    orchestration: DaemonOrchestration,
+    launch: { deck: DeckChoice; path: string; configRevision?: string; name: string },
+    afterReview: boolean,
+  ) => {
+    const { deck: chosen } = launch;
+    if (mounted.current) {
+      setFormError(undefined);
+      setFormCleanup(undefined);
+      setPhase("starting");
+    }
+    const title = orchestrationRunTitle(launch.name, orchestration.name);
     try {
       const result = await runtime.runAction({
         type: "start_orchestration",
-        deckId: deck.deckId,
-        path: orchestrations.path,
+        deckId: chosen.deckId,
+        path: launch.path,
         orchestration: orchestration.name,
-        ...(name !== "" ? { displayTitle: name } : {}),
-        ...(orchestrations.configRevision ? { configRevision: orchestrations.configRevision } : {}),
+        ...(launch.name !== "" ? { displayTitle: launch.name } : {}),
+        ...(launch.configRevision ? { configRevision: launch.configRevision } : {}),
       });
       if (result.agentId === undefined) {
-        onNotAppeared({ deckName: deck.name, agentName: title });
+        onNotAppeared({ deckName: chosen.name, agentName: title });
         return;
       }
       if (!mounted.current) return;
       setPhase("waiting");
-      setAwaiting({ deckId: deck.deckId, agentId: result.agentId, incarnation: result.agentIncarnation, deckName: deck.name, agentName: title });
+      setAwaiting({ deckId: chosen.deckId, agentId: result.agentId, incarnation: result.agentIncarnation, deckName: chosen.name, agentName: title });
     } catch (cause) {
+      // PRD #1885: the deck refused it as not approved — its config changed
+      // after the check. Show the text it has now; nothing was started.
+      if (!afterReview && mounted.current && isNotApproved(messageOf(cause))) {
+        const checked = await trust.check({ deckId: chosen.deckId, path: launch.path, orchestration: orchestration.name }, (approved) => launchOrchestration(orchestration, approvedLaunch(launch, approved), true), { deckName: chosen.name });
+        if (checked.kind === "review") {
+          runtime.clearError();
+          setPhase("idle");
+          return;
+        }
+        if (checked.kind === "refused") {
+          failStart(new Error(checked.reason));
+          return;
+        }
+      }
       failStart(cause);
     }
   };
@@ -1585,6 +1662,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    */
   const voiceStart = (dispatch: VoiceDispatchTarget): string | undefined => {
     if (phase !== "idle") return START_IN_FLIGHT;
+    if (trust.shown) return REVIEW_FIRST;
     if (dispatch.saysCommand) return START_SAID_A_COMMAND;
     if (!deck) return START_NEEDS_DECK;
     if (!target) return START_NEEDS_DIRECTORY;
@@ -2184,6 +2262,7 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           </button>
         </footer>
       </section>
+      {trust.shown && <ProjectTrustDialog review={trust.shown} onApprove={approveReviewed} onCancel={trust.cancel} />}
     </div>
   );
 }

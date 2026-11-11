@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::agent_pty::TabMembership;
 use crate::event::AgentType;
 use crate::pane::{
-    AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError, close_panes_concurrently,
+    AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError, close_panes_concurrently_with,
 };
 use crate::project_config::{
     OrchestrationConfig, OrchestrationRoleConfig, resolve_orchestration_name,
@@ -1609,7 +1609,7 @@ impl TabManager {
     /// can retry" — with nothing left to press `Ctrl+W` on. Now:
     ///
     /// * every pane closes first (concurrently — see
-    ///   [`close_panes_concurrently`]);
+    ///   [`close_panes_concurrently`](crate::pane::close_panes_concurrently));
     /// * `outcome.is_clean()` removes the tab, exactly as before;
     /// * any failure keeps the tab, and the panes that DID close are
     ///   forgotten from it via [`Self::forget_closed_panes`].
@@ -1619,6 +1619,18 @@ impl TabManager {
     /// only what could not be stopped, which is both the honest state
     /// and the one where a retry re-attempts exactly the failures.
     pub fn close_tab(&mut self, index: usize) -> Result<CloseTabOutcome, TabError> {
+        self.close_tab_with(index, false)
+    }
+
+    /// Issue #1958: [`Self::close_tab`], keeping the dispatched worktree the
+    /// tab's roles share when `keep_worktree` is set — every role pane's stop
+    /// carries the keep, because the daemon keeps the tree at the first stop
+    /// that carries it, whichever one it handles first.
+    pub fn close_tab_with(
+        &mut self,
+        index: usize,
+        keep_worktree: bool,
+    ) -> Result<CloseTabOutcome, TabError> {
         if index == 0 {
             return Err(TabError::CannotCloseDashboard);
         }
@@ -1647,7 +1659,8 @@ impl TabManager {
             Tab::Dashboard { .. } => Vec::new(),
         };
 
-        let outcome = close_panes_concurrently(self.pane_controller.as_ref(), &pane_ids);
+        let outcome =
+            close_panes_concurrently_with(self.pane_controller.as_ref(), &pane_ids, keep_worktree);
 
         if !outcome.is_clean() {
             // At least one agent is still alive on the daemon. Keep the tab so

@@ -381,6 +381,16 @@ pub enum UiMode {
     /// names, opened by the `restart_notice` key (default `a`) or the footer's
     /// `[Agents]` button. Its state lives in `UiState::restart_notice`.
     RestartNotice,
+    /// PRD #385 M5: keyboard copy mode on the focused pane, opened by the
+    /// `copy_mode` key (default `v`) in command mode. Its state lives in
+    /// `UiState::copy_mode`; its keys are [`handle_copy_mode_key`]'s.
+    CopyMode,
+    /// PRD #1885: `Review project commands` — the trust prompt shown before an
+    /// orchestration whose commands and prompts are not approved as they now
+    /// read is opened from the New Agent form or restored from the saved
+    /// session. Nothing of it is spawned while this is open. Its state lives in
+    /// `UiState::trust_prompt`.
+    TrustPrompt,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -696,9 +706,51 @@ fn build_dispatcher_seed(working_dir: &std::path::Path) -> String {
 /// Status of a schedule as shown in the manager dialog. "disabled" when
 /// `enabled = false`; "live" when the task currently has a live reused
 /// tab/agent; "idle" otherwise.
-fn schedule_status_label(enabled: bool, is_live: bool) -> &'static str {
+/// PRD #1885: the schedules whose last fire was refused as not approved.
+fn schedule_refusals() -> crate::schedule_outcome::Outcomes {
+    crate::schedule_outcome::OutcomeStore::default_location().load()
+}
+
+/// PRD #1885: how often the open Schedules manager re-reads the refusal
+/// records, so a fire refused after the manager opened shows up without
+/// reopening it.
+const SCHEDULE_REFUSALS_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Read the refusal records into the manager now.
+fn reload_schedule_refusals(ui: &mut UiState) {
+    ui.scheduled_refusals = schedule_refusals();
+    ui.scheduled_refusals_read_at = Some(std::time::Instant::now());
+}
+
+/// PRD #1885: while the Schedules manager is open, re-read the refusal records
+/// through `load` once [`SCHEDULE_REFUSALS_REFRESH`] has passed since the last
+/// read. Called every main-loop iteration; outside the manager it reads
+/// nothing.
+fn refresh_schedule_refusals_if_due(
+    ui: &mut UiState,
+    now: std::time::Instant,
+    load: impl FnOnce() -> crate::schedule_outcome::Outcomes,
+) {
+    if ui.mode != UiMode::ScheduledTasks {
+        return;
+    }
+    if ui
+        .scheduled_refusals_read_at
+        .is_some_and(|read| now.saturating_duration_since(read) < SCHEDULE_REFUSALS_REFRESH)
+    {
+        return;
+    }
+    ui.scheduled_refusals = load();
+    ui.scheduled_refusals_read_at = Some(now);
+}
+
+/// The manager's STATUS cell. PRD #1885: `refused` when the task's last fire
+/// was refused as not approved, so a schedule that stopped working says so.
+fn schedule_status_label_with(enabled: bool, is_live: bool, refused: bool) -> &'static str {
     if !enabled {
         "disabled"
+    } else if refused {
+        "refused"
     } else if is_live {
         "live"
     } else {
@@ -804,6 +856,20 @@ fn send_daemon_request_blocking_at(
     req: &crate::daemon_protocol::AttachRequest,
     timeout: std::time::Duration,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
+    send_daemon_request_blocking_with_hello_at(path, req, timeout).map(|(_, resp)| resp)
+}
+
+/// [`send_daemon_request_blocking_at`], also answering the `Hello` reply that
+/// admitted the request — so a caller can read the capabilities of the very
+/// daemon process that answered it (issue #1958's close preview).
+fn send_daemon_request_blocking_with_hello_at(
+    path: &Path,
+    req: &crate::daemon_protocol::AttachRequest,
+    timeout: std::time::Duration,
+) -> std::io::Result<(
+    crate::daemon_protocol::AttachResponse,
+    crate::daemon_protocol::AttachResponse,
+)> {
     // Issue #435: `timeout` is a per-operation deadline, and connect is one of
     // the operations. Connecting through the bare `IpcClient::connect` left it
     // outside the budget entirely — on Unix that call blocks uninterruptibly
@@ -847,7 +913,7 @@ fn send_daemon_request_blocking_at(
     }
 
     write_req_frame_blocking(&mut stream, req)?;
-    read_resp_frame_blocking(&mut stream)
+    read_resp_frame_blocking(&mut stream).map(|resp| (hello, resp))
 }
 
 /// Write one `KIND_REQ` frame carrying `req` to a synchronous writer.
@@ -1780,6 +1846,50 @@ fn submit_debounce_duration(
 /// bound a persistent-failure retry rate.
 const CLEAR_REASSERT_RETRY_FLOOR: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// PRD #1885: what the open trust prompt is for, and what answering it opens.
+enum TrustPromptPurpose {
+    /// The New Agent form chose this orchestration. `a` approves and then opens
+    /// it through the same `Action::SpawnPane` the form sent, with the form
+    /// kept for issue #555's title refusal.
+    Open {
+        req: Box<NewPaneRequest>,
+        form: Option<NewPaneFormState>,
+    },
+    /// The startup restore held this saved orchestration back.
+    Restore(PendingTrustRestore),
+}
+
+/// PRD #1885: the open `Review project commands` prompt.
+struct TrustPromptState {
+    /// The daemon's view: the text shown, and the digest an approval carries.
+    view: crate::project_trust::ProjectTrustView,
+    /// How many body rows are scrolled off the top (clamped when drawn). A
+    /// `usize`, so a body longer than 65,535 rows scrolls to its end.
+    scroll: usize,
+    /// The furthest the last frame could scroll, so the keys clamp too.
+    max_scroll: usize,
+    /// The popup inside its border as the last frame drew it: the wheel over
+    /// it scrolls the review. `None` until a frame has drawn it.
+    drawn_inner: Option<Rect>,
+    purpose: TrustPromptPurpose,
+}
+
+impl TrustPromptState {
+    fn action(&self) -> crate::trust_prompt::PromptAction {
+        match self.purpose {
+            TrustPromptPurpose::Open { .. } => crate::trust_prompt::PromptAction::Start,
+            TrustPromptPurpose::Restore(_) => crate::trust_prompt::PromptAction::Restore,
+        }
+    }
+}
+
+/// PRD #1885: a saved orchestration pane the startup restore held back.
+#[derive(Clone)]
+struct PendingTrustRestore {
+    saved_pane: config::SavedPane,
+    view: crate::project_trust::ProjectTrustView,
+}
+
 struct UiState {
     mode: UiMode,
     /// PRD #113: the Dashboard's selection is active/inactive. `Some(i)` paints
@@ -1802,6 +1912,18 @@ struct UiState {
     /// room for them, until the user dismisses it — agents later drops take
     /// join it meanwhile.
     restart_notice: Option<RestartNotice>,
+    /// PRD #1885: the open trust prompt (`UiMode::TrustPrompt`).
+    trust_prompt: Option<TrustPromptState>,
+    /// PRD #1885: saved orchestrations the startup restore held back because
+    /// they are not approved as they now read, each waiting for its own trust
+    /// prompt ([`open_next_trust_restore`]). Nothing of one is spawned until it
+    /// is approved.
+    pending_trust_restores: std::collections::VecDeque<PendingTrustRestore>,
+    /// PRD #1885: saved orchestrations whose restore prompt was cancelled.
+    /// Like [`Self::pending_trust_restores`] and the one an open prompt holds,
+    /// each stays in the saved session unchanged ([`keep_held_trust_restores`]),
+    /// so the next start asks about it again.
+    declined_trust_restores: Vec<config::SavedPane>,
     /// PRD #1666 part 2 (G-fix7e): where this frame drew the restart notice's
     /// rows, if it drew them ([`render_bottom_bar`]), so a modal overlay is
     /// laid out above them rather than over them ([`overlay_area`]).
@@ -2008,8 +2130,21 @@ struct UiState {
     session_snapshot_write_failed: bool,
     /// Mouse text selection state for copy support.
     selection: Option<TextSelection>,
+    /// PRD #385: a left-button press landed in a pane and its release has not
+    /// arrived yet, so the drag and release are the pane's
+    /// ([`pane_owns_gesture`]).
+    pane_drag: bool,
+    /// PRD #385 M5: text a key handler copied, waiting for the run loop to
+    /// deliver it ([`deliver_copy`]), which owns the clipboard. Key handlers
+    /// have no clipboard of their own.
+    pending_copy: Option<String>,
+    /// PRD #385 M5: the open copy mode, while `mode` is [`UiMode::CopyMode`].
+    copy_mode: Option<crate::copy_mode::CopyMode>,
     /// Screen rect of the focused pane (set during render, used for mouse mapping).
     focused_pane_rect: Option<Rect>,
+    /// PRD #385 M2: every pane the last frame drew, with its outer rect, so a
+    /// press selects in the pane under the pointer (set during render).
+    drawn_pane_rects: Vec<(String, Rect)>,
     /// Tracks last click time and position for double/triple-click detection.
     last_click: Option<LastClick>, // PRD #80 review FIX 4: region-aware multi-click state
     /// PRD #80: screen rects of the clickable buttons rendered this frame,
@@ -2180,6 +2315,15 @@ struct UiState {
     /// Schedule names with a live tab/agent, snapshotted when the dialog opens
     /// (drives the live/idle status indicator).
     scheduled_live_names: HashSet<String>,
+    /// PRD #1885: each schedule whose last fire was refused because its
+    /// orchestration is not approved, snapshotted with
+    /// [`Self::scheduled_live_names`].
+    scheduled_refusals: crate::schedule_outcome::Outcomes,
+    /// PRD #1885: when [`Self::scheduled_refusals`] was last read from disk, so
+    /// the open manager re-reads it on [`SCHEDULE_REFUSALS_REFRESH`]'s cadence
+    /// and picks up a refusal recorded after it opened (a fire runs after its
+    /// `RunNow` returns).
+    scheduled_refusals_read_at: Option<std::time::Instant>,
     /// PRD #76 M2.20: timestamp of the most recent keystroke forwarded to a
     /// pane via `ForwardToPane`. Drives the submit-debounce in `PaneInput` mode
     /// so an Enter keystroke arriving fused to preceding typed bytes is
@@ -2434,6 +2578,9 @@ impl LastClick {
 /// Tracks an in-progress or completed mouse text selection within a pane.
 #[derive(Debug, Clone)]
 struct TextSelection {
+    /// PRD #385 M2: the pane the selection was made in. The text is copied
+    /// from it and the highlight drawn over it, whichever pane is focused.
+    pane_id: String,
     /// Pane-relative start column (0-based, within inner area).
     start_col: u16,
     /// Pane-relative start row.
@@ -2442,8 +2589,14 @@ struct TextSelection {
     end_col: u16,
     /// Pane-relative end row.
     end_row: u16,
-    /// The focused pane's Rect at selection start (screen coordinates).
+    /// The selection's pane's Rect at selection start (screen coordinates).
     pane_rect: Rect,
+    /// PRD #385 M3: the tab the selection was made on; switching away clears it.
+    deck: Option<DeckKey>,
+    /// PRD #385 M3: what the release copied, once it has. The selection then
+    /// stays on screen for as long as the cells under it still show this text
+    /// ([`selection_still_shows_copy`]).
+    copied: Option<String>,
 }
 
 impl UiState {
@@ -2455,6 +2608,9 @@ impl UiState {
             selected_index: Some(0),
             last_focused_pane_id: None,
             restart_notice: None,
+            trust_prompt: None,
+            pending_trust_restores: std::collections::VecDeque::new(),
+            declined_trust_restores: Vec::new(),
             restart_notice_area: None,
             confirm_choices_drawn: None,
             confirm_drawing: None,
@@ -2501,7 +2657,11 @@ impl UiState {
             legacy_modes_warned_dirs: HashSet::new(),
             session_snapshot_write_failed: false,
             selection: None,
+            pane_drag: false,
+            pending_copy: None,
+            copy_mode: None,
             focused_pane_rect: None,
+            drawn_pane_rects: Vec::new(),
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             config_gen_state: config::ConfigGenState::load(),
@@ -2524,6 +2684,8 @@ impl UiState {
             scheduled_selected: 0,
             scheduled_delete_confirm: false,
             scheduled_live_names: HashSet::new(),
+            scheduled_refusals: Default::default(),
+            scheduled_refusals_read_at: None,
             last_pane_keystroke_at: None,
             session_coalescer: config::SnapshotCoalescer::new(SNAPSHOT_COALESCE_INTERVAL),
             session_epoch: std::time::Instant::now(),
@@ -4203,6 +4365,7 @@ fn apply_pane_closure(
     ui.pane_declared_agent.remove(pane_id);
     ui.pane_display_names.remove(pane_id);
     ui.pane_names.remove(pane_id);
+    leave_copy_mode_on_pane(ui, pane_id);
     let left_active_tab = tab_outcome
         .as_ref()
         .is_some_and(|o| o.tab_removed && o.was_active);
@@ -4375,6 +4538,7 @@ fn process_restart_drops(
     for pane_id in &panes {
         left_focused_pane |= focused.as_deref() == Some(pane_id.as_str());
         pane.forget_pane(pane_id);
+        leave_copy_mode_on_pane(ui, pane_id);
         // G-fix7f: named here, so a placeholder its attachment handed in is not
         // drawn, or named again, when the stream next opens.
         state.blocking_write().retire_held_placeholders(pane_id);
@@ -4891,8 +5055,8 @@ fn surface_one_orchestration(
                 // `resolve_orchestration_for_restore` rebuild this tab on
                 // restore. That snapshot otherwise freezes at tab-open time —
                 // grow it here too, so a role added via `pane spawn` survives
-                // the next session flush instead of drift-triggering the
-                // restore fallback to a plain pane. Conditional on the entry
+                // the next session flush instead of drift-leaving the tab
+                // unrestored. Conditional on the entry
                 // existing: a tab opened via the batch daemon-surfacing path
                 // never captures `pane_metadata` at all (a separate,
                 // pre-existing gap out of scope here) and must not have one
@@ -5306,8 +5470,15 @@ pub enum Action {
     CloseSelected,
     /// PRD #241 M3: the user explicitly picked **Close** in the confirmation
     /// dialog. This is the only action that performs the destructive
-    /// close-pane / close-tab teardown.
+    /// close-pane / close-tab teardown — with
+    /// [`Action::ConfirmCloseKeepWorktree`], its keep-the-worktree twin.
     ConfirmCloseSelected,
+    /// Issue #1958: the user picked **Close, keep worktree** in a confirmation
+    /// armed with a dispatched worktree. The same teardown as
+    /// [`Action::ConfirmCloseSelected`], with every stop it sends asking the
+    /// daemon to keep the worktree; a daemon that cannot keep it refuses and
+    /// nothing is closed.
+    ConfirmCloseKeepWorktree,
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
@@ -5485,9 +5656,19 @@ pub enum Action {
     /// daemon for its host sample. Reached from the dashboard `host_metrics`
     /// binding (default `m`).
     OpenHostMetrics,
+    /// PRD #385 M5: open copy mode on the focused pane (command-mode
+    /// `copy_mode` key, default `v`).
+    EnterCopyMode,
     /// PRD #1258 M3: close the host overlay — its Escape key and its `[Close]`
     /// button share this arm.
     CloseHostMetrics,
+    /// PRD #1885: `a` in the trust prompt — approve the text it shows, through
+    /// the daemon, then open (or restore) what it was shown for. A click on
+    /// the prompt's drawn approve label sends it too.
+    ApproveProjectTrust,
+    /// PRD #1885: a click on the trust prompt's drawn `Esc cancel` label —
+    /// close it as `Esc` does, approving and starting nothing.
+    CancelTrustPrompt,
     /// PRD #1666 §6.4: open the deck-messages picker on the selected card.
     OpenInboxAttention,
     /// PRD #1666 §6.4: close it — Escape and its `[Close]` button.
@@ -5918,15 +6099,14 @@ pub(crate) fn keyevent_to_bytes_for_test(key: &KeyEvent) -> Option<Vec<u8>> {
     keyevent_to_bytes(key)
 }
 
-/// Compute the row offset between widget-relative coordinates and vt100 screen
-/// coordinates. Must match the viewport calculation in `terminal_widget.rs`.
-fn screen_row_offset(screen: &vt100::Screen, pane_rect: Rect) -> u16 {
-    let inner_h = pane_rect.height.saturating_sub(2) as usize;
-    let screen_rows = crate::vt_grid::size(screen).0 as usize;
-    let cursor_row = screen.cursor_position().0 as usize;
-    let anchor = (cursor_row + 1).min(screen_rows);
-    let effective_rows = anchor.max(inner_h);
-    effective_rows.saturating_sub(inner_h) as u16
+/// PRD #385 decision 6: the rows and columns of `screen` that a pane drawn at
+/// `pane_rect` shows, from the screen's top-left cell, through the one mapping
+/// [`crate::terminal_widget::drawn_screen_size`] that the pane widget draws
+/// with. A content-area cell `(row, col)` shows screen cell `(row, col)` when
+/// it is inside this size and nothing otherwise, so selection, extraction,
+/// the highlight and its check all address what is drawn.
+fn pane_viewport(screen: &vt100::Screen, pane_rect: Rect) -> (u16, u16) {
+    crate::terminal_widget::drawn_screen_size(screen, pane_inner_rect(pane_rect))
 }
 
 /// The status line a Ctrl+click on an OSC-8 hyperlink leaves behind, with the
@@ -5949,47 +6129,578 @@ pub fn opened_link_status(url: &str) -> String {
     format!("Opened: {display}")
 }
 
-/// Extract text from a vt100 screen for the given selection region.
-/// Selection coordinates are widget-relative; `row_offset` maps them to screen rows.
-fn extract_selection_text(screen: &vt100::Screen, sel: &TextSelection, row_offset: u16) -> String {
+/// Extract the text a selection covers from a vt100 screen. Selection
+/// coordinates are content-area cells, which are screen cells
+/// ([`pane_viewport`]); `shown` is the `(rows, cols)` the pane draws, and a
+/// cell outside it is not copied, as it is not highlighted.
+fn extract_selection_text(
+    screen: &vt100::Screen,
+    sel: &TextSelection,
+    shown: (u16, u16),
+) -> String {
     let (sr, sc, er, ec) = if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
         (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
     } else {
         (sel.end_row, sel.end_col, sel.start_row, sel.start_col)
     };
+    let (shown_rows, shown_cols) = shown;
+    if shown_rows == 0 || shown_cols == 0 {
+        return String::new();
+    }
     let mut result = String::new();
-    let (screen_rows, screen_cols) = crate::vt_grid::size(screen);
     for widget_row in sr..=er {
-        let screen_row = widget_row + row_offset;
-        if screen_row >= screen_rows {
+        // Content-area row r shows screen row r.
+        let screen_row = widget_row;
+        if screen_row >= shown_rows {
             break;
         }
         let col_start = if widget_row == sr { sc } else { 0 };
-        let col_end = if widget_row == er {
-            ec
-        } else {
-            screen_cols.saturating_sub(1)
-        };
-        for col in col_start..=col_end.min(screen_cols.saturating_sub(1)) {
-            if let Some(cell) = screen.cell(screen_row, col) {
-                let ch = cell.contents();
-                if ch.is_empty() {
-                    result.push(' ');
-                } else {
-                    result.push_str(ch);
-                }
-            }
-        }
-        // Trim trailing spaces per line and add newline between lines.
+        let col_end = if widget_row == er { ec } else { shown_cols - 1 };
+        // Each row cut as copy mode cuts it: a row the selection runs
+        // through loses its trailing spaces, the row it ends on keeps what
+        // was written there.
+        result.push_str(&crate::copy_mode::row_text(
+            screen,
+            screen_row,
+            col_start,
+            col_end.min(shown_cols - 1),
+            shown_cols,
+            widget_row == er,
+        ));
         if widget_row < er {
-            let trimmed = result.trim_end_matches(' ');
-            let trimmed_len = trimmed.len();
-            result.truncate(trimmed_len);
             result.push('\n');
         }
     }
-    let trimmed = result.trim_end_matches(' ');
-    trimmed.to_string()
+    result
+}
+
+/// What a left-button press, drag or release over the pane area did that the
+/// caller has to finish ([`pane_selection_mouse`]).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PaneMouseOutcome {
+    /// The pane the press focused, because it was under the pointer and not
+    /// focused. The caller records it as the tab's focus.
+    focused: Option<String>,
+    /// Text a release copied, for the caller to deliver.
+    copy: Option<String>,
+}
+
+/// The pane whose content area is under a screen cell, among the panes the
+/// last frame drew, with the cell's position inside that content area.
+fn pane_under_pointer(
+    drawn: &[(String, Rect)],
+    column: u16,
+    row: u16,
+) -> Option<(&str, Rect, u16, u16)> {
+    drawn.iter().find_map(|(id, rect)| {
+        pane_inner_coords(*rect, column, row).map(|(col, row)| (id.as_str(), *rect, col, row))
+    })
+}
+
+/// PRD #385: a left-button press, drag or release over the pane area, the
+/// mouse half of text selection. Out of `run_tui` so the L1 seam
+/// ([`PaneSelectionSeam`]) drives the code the live loop runs.
+///
+/// M2: the press is hit-tested against every pane the last frame drew, not the
+/// focused one. A press in a pane that is not focused focuses it and starts the
+/// selection there in the same gesture, and the selection, the copied text and
+/// the highlight all belong to that pane.
+///
+/// M3: a drag or multi-click selection stays after the release that copied it;
+/// a plain click leaves none. What clears a kept one is elsewhere: the next
+/// press ([`clear_selection_on_press`]), typing into its pane
+/// ([`clear_selection_on_pane_input`]), a tab switch
+/// ([`clear_selection_on_tab_switch`]), and its pane closing or its text moving
+/// ([`selection_still_shows_copy`], checked as each frame draws).
+fn pane_selection_mouse(
+    ui: &mut UiState,
+    embedded: &EmbeddedPaneController,
+    mouse: &crossterm::event::MouseEvent,
+    deck: Option<DeckKey>,
+    now: std::time::Instant,
+) -> PaneMouseOutcome {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let mut outcome = PaneMouseOutcome::default();
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            let Some((pane_id, rect, col, row)) =
+                pane_under_pointer(&ui.drawn_pane_rects, mouse.column, mouse.row)
+                    .map(|(id, rect, col, row)| (id.to_string(), rect, col, row))
+            else {
+                return outcome;
+            };
+            if embedded.focused_pane_id().as_deref() != Some(pane_id.as_str())
+                && embedded.focus_pane(&pane_id).is_ok()
+            {
+                outcome.focused = Some(pane_id.clone());
+            }
+            // A press in a pane starts a gesture the pane owns until the
+            // release, wherever that lands ([`pane_owns_gesture`]).
+            ui.pane_drag = true;
+            // Detect multi-click (double/triple). Require same row and nearby
+            // column (within 3 cells) to handle slight mouse movement between
+            // clicks, AND the same click region (PRD #80 review FIX 4) so a
+            // card/picker click can't seed a pane double-click. Screen
+            // coordinates, so two clicks at the same spot of two different
+            // panes are two single clicks.
+            let click_count = LastClick::next_count(
+                ui.last_click,
+                now,
+                mouse.column,
+                mouse.row,
+                ClickRegion::Pane,
+            );
+            ui.last_click = Some(LastClick {
+                at: now,
+                col: mouse.column,
+                row: mouse.row,
+                count: click_count,
+                region: ClickRegion::Pane,
+            });
+            let selection = |start_col, start_row, end_col, end_row| TextSelection {
+                pane_id: pane_id.clone(),
+                start_col,
+                start_row,
+                end_col,
+                end_row,
+                pane_rect: rect,
+                deck,
+                copied: None,
+            };
+
+            match click_count {
+                2 => {
+                    // Double-click: select word.
+                    if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                        && let Ok(parser) = screen_arc.lock()
+                    {
+                        let shown = pane_viewport(parser.screen(), rect);
+                        let (wstart, wend) = word_bounds_at(parser.screen(), row, col, shown);
+                        ui.selection = Some(selection(wstart, row, wend, row));
+                    }
+                }
+                3 => {
+                    // Triple-click: select paragraph (contiguous non-blank
+                    // lines around the clicked row).
+                    if let Some(screen_arc) = embedded.get_screen(&pane_id)
+                        && let Ok(parser) = screen_arc.lock()
+                    {
+                        let screen = parser.screen();
+                        let (shown_rows, shown_cols) = pane_viewport(screen, rect);
+                        let is_blank_row = |wr: u16| -> bool {
+                            if wr >= shown_rows {
+                                return true;
+                            }
+                            (0..shown_cols).all(|c| {
+                                screen
+                                    .cell(wr, c)
+                                    .map(|cell| {
+                                        let ch = cell.contents();
+                                        ch.is_empty() || ch.trim().is_empty()
+                                    })
+                                    .unwrap_or(true)
+                            })
+                        };
+                        let mut start_r = row;
+                        while start_r > 0 && !is_blank_row(start_r - 1) {
+                            start_r -= 1;
+                        }
+                        let mut end_r = row;
+                        while end_r + 1 < shown_rows && !is_blank_row(end_r + 1) {
+                            end_r += 1;
+                        }
+                        ui.selection =
+                            Some(selection(0, start_r, shown_cols.saturating_sub(1), end_r));
+                    }
+                }
+                _ => {
+                    // Single click: start drag selection.
+                    ui.selection = Some(selection(col, row, col, row));
+                }
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            // Extend the selection the press started; one a release already
+            // copied is finished.
+            if let Some(ref mut sel) = ui.selection
+                && sel.copied.is_none()
+            {
+                let inner_x = sel.pane_rect.x + 1;
+                let inner_y = sel.pane_rect.y + 1;
+                let inner_w = sel.pane_rect.width.saturating_sub(2);
+                let inner_h = sel.pane_rect.height.saturating_sub(2);
+                sel.end_col = mouse
+                    .column
+                    .saturating_sub(inner_x)
+                    .min(inner_w.saturating_sub(1));
+                sel.end_row = mouse
+                    .row
+                    .saturating_sub(inner_y)
+                    .min(inner_h.saturating_sub(1));
+            }
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            ui.pane_drag = false;
+            let was_multiclick = ui.last_click.map(|l| l.count >= 2).unwrap_or(false);
+            let Some(sel) = ui.selection.as_mut().filter(|sel| sel.copied.is_none()) else {
+                return outcome;
+            };
+            // Only copy when the selection is a real drag or multi-click, not
+            // a plain single click, and from the pane the selection is in.
+            let text =
+                if was_multiclick || sel.start_col != sel.end_col || sel.start_row != sel.end_row {
+                    embedded.get_screen(&sel.pane_id).and_then(|screen_arc| {
+                        let parser = screen_arc.lock().ok()?;
+                        let shown = pane_viewport(parser.screen(), sel.pane_rect);
+                        Some(extract_selection_text(parser.screen(), sel, shown))
+                    })
+                } else {
+                    None
+                };
+            match text {
+                // Kept on screen, showing what was copied.
+                Some(text) if !text.is_empty() => {
+                    sel.copied = Some(text.clone());
+                    outcome.copy = Some(text);
+                }
+                // A plain click, or nothing to copy: nothing to keep showing.
+                _ => ui.selection = None,
+            }
+        }
+        _ => {}
+    }
+    outcome
+}
+
+/// PRD #385 M3: a mouse press clears the selection a drag or multi-click left
+/// on screen, wherever it lands. Called before anything else the press does,
+/// so a press that starts a new selection replaces the old one and a press on a
+/// button, a card or a dialog clears it too.
+///
+/// A press also ends any pane gesture still open (its release never arrived,
+/// e.g. it happened outside the terminal window); a press in a pane opens a new
+/// one ([`pane_selection_mouse`]).
+fn clear_selection_on_press(ui: &mut UiState, mouse: &crossterm::event::MouseEvent) {
+    if matches!(mouse.kind, crossterm::event::MouseEventKind::Down(_)) {
+        ui.selection = None;
+        ui.pane_drag = false;
+    }
+}
+
+/// PRD #385: end a pane gesture that has not been released, and drop the
+/// selection it was making. A selection a release already copied is kept.
+///
+/// Called while a blocking overlay, a modal or copy mode is the input surface
+/// ([`cancel_pane_gesture_under_overlay`]) and when the terminal loses focus:
+/// the surface the drag started on no longer owns the pointer, so its release
+/// must not copy.
+fn cancel_pane_gesture(ui: &mut UiState) {
+    if !ui.pane_drag {
+        return;
+    }
+    ui.pane_drag = false;
+    if ui
+        .selection
+        .as_ref()
+        .is_some_and(|sel| sel.copied.is_none())
+    {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385: [`cancel_pane_gesture`] when the UI is in a mode whose overlay
+/// takes the mouse ([`overlay_blocks_mouse`]): Help, a dialog, the directory
+/// picker, the new-pane form, copy mode and the other modals. Checked for each
+/// mouse event before the pane's gesture route, and before each frame draws,
+/// so it holds whichever path opened the overlay.
+fn cancel_pane_gesture_under_overlay(ui: &mut UiState) {
+    if overlay_blocks_mouse(&ui.mode) {
+        cancel_pane_gesture(ui);
+    }
+}
+
+/// PRD #385: whether `mouse` is the drag or release of a left-button gesture
+/// that started with a press in a pane. Such a gesture is the pane's to finish
+/// wherever the pointer is: a release over a card, a button or a tab header
+/// copies the selection like a release inside the pane, and no affordance
+/// under the pointer acts on it.
+fn pane_owns_gesture(ui: &UiState, mouse: &crossterm::event::MouseEvent) -> bool {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    ui.pane_drag
+        && matches!(
+            mouse.kind,
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+        )
+}
+
+/// [`pane_selection_mouse`] as the live loop finishes it: record the focus a
+/// press moved, and deliver what a release copied.
+fn pane_selection_mouse_live(
+    ui: &mut UiState,
+    embedded: &EmbeddedPaneController,
+    mouse: &crossterm::event::MouseEvent,
+    tab_manager: &mut TabManager,
+    clipboard: &mut dyn crate::clipboard::ClipboardBackend,
+) {
+    let outcome = pane_selection_mouse(
+        ui,
+        embedded,
+        mouse,
+        deck_key(tab_manager.active_tab()),
+        std::time::Instant::now(),
+    );
+    if let Some(focused) = &outcome.focused {
+        tab_manager.record_focus(focused);
+    }
+    if let Some(text) = outcome.copy {
+        // PRD #385: native clipboard and OSC 52, and a status line that says
+        // which of them went out.
+        deliver_copy(ui, clipboard, &text);
+    }
+}
+
+/// PRD #385 M3: input reaching the pane a selection belongs to clears it.
+///
+/// A lone `Esc` does not: in pane input it belongs to the pane's program
+/// (decision 5 of the PRD), and an `Esc` that also dropped the selection would
+/// make dismissing something in the agent cost the user their highlight.
+fn clear_selection_on_pane_input(ui: &mut UiState, pane_id: &str, bytes: &[u8]) {
+    if bytes != b"\x1b"
+        && ui
+            .selection
+            .as_ref()
+            .is_some_and(|sel| sel.pane_id == pane_id)
+    {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385 M3: a selection belongs to the tab it was made on, and a tab
+/// switch clears it rather than hiding it until the user comes back.
+fn clear_selection_on_tab_switch(ui: &mut UiState, deck: Option<DeckKey>) {
+    if ui.selection.as_ref().is_some_and(|sel| sel.deck != deck) {
+        ui.selection = None;
+    }
+}
+
+/// PRD #385 M5: open copy mode on the focused pane, from what its screen
+/// shows now ([`crate::copy_mode`]). With no focused pane, nothing happens. A
+/// mouse selection is dropped, so only copy mode's highlight is on screen.
+fn enter_copy_mode(ui: &mut UiState, pane: &dyn PaneController) {
+    let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() else {
+        return;
+    };
+    let Some(pane_id) = embedded.focused_pane_id() else {
+        return;
+    };
+    let Some(screen) = embedded.get_screen(&pane_id) else {
+        return;
+    };
+    let Ok(parser) = screen.lock() else {
+        return;
+    };
+    // Copy mode's view is what the pane draws, as a mouse selection's is.
+    let shown = ui
+        .drawn_pane_rects
+        .iter()
+        .find(|(id, _)| *id == pane_id)
+        .map(|(_, rect)| pane_viewport(parser.screen(), *rect))
+        .unwrap_or_else(|| crate::vt_grid::size(parser.screen()));
+    let copy = crate::copy_mode::CopyMode::open(pane_id, parser.screen(), shown);
+    drop(parser);
+    ui.selection = None;
+    ui.copy_mode = Some(copy);
+    ui.mode = UiMode::CopyMode;
+}
+
+/// PRD #385 M5: close copy mode and return to command mode. The pane was
+/// never scrolled by copy mode, so it is where it was.
+fn leave_copy_mode(ui: &mut UiState) {
+    ui.copy_mode = None;
+    if ui.mode == UiMode::CopyMode {
+        ui.mode = UiMode::Normal;
+    }
+}
+
+/// PRD #385 M5: close copy mode when it is open on `pane_id`, which has just
+/// closed, so a pane attached later under the same id never inherits its
+/// frozen screen or selection.
+fn leave_copy_mode_on_pane(ui: &mut UiState, pane_id: &str) {
+    if ui
+        .copy_mode
+        .as_ref()
+        .is_some_and(|copy| copy.pane_id() == pane_id)
+    {
+        leave_copy_mode(ui);
+    }
+}
+
+/// PRD #385 M5: settle copy mode against the panes a frame is about to draw,
+/// before anything in it is drawn, so the frame (its mode chip included)
+/// shows the outcome. Copy mode closes when its pane is not among `panes` (it
+/// closed, or no pane is drawn at all) or has no content area to draw in;
+/// otherwise its cursor and selection are brought onto the cells this frame
+/// draws of its screen.
+fn reconcile_copy_mode(
+    ui: &mut UiState,
+    embedded: Option<&EmbeddedPaneController>,
+    panes: &[(String, Rect)],
+) {
+    let Some(copy) = ui.copy_mode.as_mut() else {
+        return;
+    };
+    if ui.mode != UiMode::CopyMode {
+        ui.copy_mode = None;
+        return;
+    }
+    let live = embedded.is_some_and(|ctrl| ctrl.get_screen(copy.pane_id()).is_some());
+    let rect = panes
+        .iter()
+        .find(|(id, _)| id == copy.pane_id())
+        .map(|(_, rect)| *rect)
+        .filter(|rect| {
+            let inner = pane_inner_rect(*rect);
+            inner.width > 0 && inner.height > 0
+        });
+    let Some(rect) = rect.filter(|_| live) else {
+        leave_copy_mode(ui);
+        return;
+    };
+    let frozen = copy.frozen();
+    let shown = frozen
+        .lock()
+        .ok()
+        .map(|parser| pane_viewport(parser.screen(), rect));
+    if let Some(shown) = shown {
+        copy.set_shown(shown);
+    }
+}
+
+/// PRD #385 M5 (decision 7): copy mode's keys, select-and-yank only. Arrows
+/// or `h`/`j`/`k`/`l` move, `PageUp`/`PageDown` page through the history,
+/// `g`/`G` go to its top and bottom, `v` or `Space` starts the selection (or
+/// drops it), `y` or `Enter` copies it and leaves (with nothing selected they
+/// do nothing), `Esc` or `q` leave without copying. The copy is left in
+/// [`UiState::pending_copy`] for the run loop to deliver.
+fn handle_copy_mode_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    use crate::copy_mode::Move;
+    let Some(copy) = ui.copy_mode.as_mut() else {
+        leave_copy_mode(ui);
+        return Action::Continue;
+    };
+    // A Ctrl or Alt chord is not one of copy mode's keys.
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return Action::Continue;
+    }
+    let movement = match key.code {
+        KeyCode::Left | KeyCode::Char('h') => Some(Move::Left),
+        KeyCode::Right | KeyCode::Char('l') => Some(Move::Right),
+        KeyCode::Up | KeyCode::Char('k') => Some(Move::Up),
+        KeyCode::Down | KeyCode::Char('j') => Some(Move::Down),
+        KeyCode::PageUp => Some(Move::PageUp),
+        KeyCode::PageDown => Some(Move::PageDown),
+        KeyCode::Char('g') => Some(Move::Top),
+        KeyCode::Char('G') => Some(Move::Bottom),
+        _ => None,
+    };
+    if let Some(movement) = movement {
+        copy.apply(movement);
+        return Action::Continue;
+    }
+    match key.code {
+        KeyCode::Char('v' | ' ') => copy.toggle_anchor(),
+        KeyCode::Char('y') | KeyCode::Enter => {
+            if let Some(text) = copy.yank() {
+                ui.pending_copy = Some(text);
+                leave_copy_mode(ui);
+            }
+        }
+        KeyCode::Esc | KeyCode::Char('q') => leave_copy_mode(ui),
+        _ => {}
+    }
+    Action::Continue
+}
+
+/// Handle a paste from the terminal: in pane input it goes to the focused
+/// pane, wrapped in bracketed-paste markers when the pane's program turned
+/// them on; in any other mode (command mode, copy mode, a dialog) it goes
+/// nowhere.
+fn forward_paste(ui: &mut UiState, pane: &dyn PaneController, text: &str) {
+    if ui.mode == UiMode::PaneInput
+        && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+        && let Some(pane_id) = embedded.focused_pane_id()
+    {
+        embedded.reset_scrollback(&pane_id);
+        let use_bracketed = embedded
+            .get_screen(&pane_id)
+            .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
+            .unwrap_or(false);
+        let mut payload = Vec::new();
+        if use_bracketed {
+            payload.extend_from_slice(b"\x1b[200~");
+        }
+        payload.extend_from_slice(text.as_bytes());
+        if use_bracketed {
+            payload.extend_from_slice(b"\x1b[201~");
+        }
+        // PRD #385 M3: a paste is typing into the pane too.
+        clear_selection_on_pane_input(ui, &pane_id, &payload);
+        let _ = embedded.write_raw_bytes(&pane_id, &payload);
+        // PRD #76 M2.20: a paste is a forwarded keystroke event
+        // too — mark the timestamp so a following Enter
+        // (`Action::ForwardToPane(b"\r")`) is debounced and
+        // arrives at the agent as a standalone submit, not fused
+        // with the paste tail.
+        ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+    }
+}
+
+/// PRD #385: put `text` on the clipboard by both routes and set the status
+/// line from what went out ([`crate::clipboard::status_message`]). The one
+/// path a copy takes, from a mouse release or from copy mode's yank.
+fn deliver_copy(
+    ui: &mut UiState,
+    clipboard: &mut dyn crate::clipboard::ClipboardBackend,
+    text: &str,
+) {
+    let outcome = crate::clipboard::deliver(clipboard, text);
+    if let Some(message) = crate::clipboard::status_message(outcome) {
+        ui.status_message = Some((message.to_string(), std::time::Instant::now()));
+    }
+}
+
+/// PRD #385 M5: deliver the copy a key handler left in
+/// [`UiState::pending_copy`], if any. The run loop calls it after every key.
+fn deliver_pending_copy(ui: &mut UiState, clipboard: &mut dyn crate::clipboard::ClipboardBackend) {
+    if let Some(text) = ui.pending_copy.take() {
+        deliver_copy(ui, clipboard, &text);
+    }
+}
+
+/// PRD #385 decision 6: whether `sel`, drawn over a pane drawn at `rect` whose
+/// screen is `screen`, would show exactly what was copied.
+///
+/// vt100 keeps no position for a line that survives it scrolling, only how
+/// many lines its scrollback holds, and that count stops growing once the
+/// scrollback is full; so the selection cannot follow its text up the screen.
+/// What can be checked is the invariant itself: the pane is still where the
+/// selection was made, and the cells under it still hold the copied text. Any
+/// output, scroll, clear or resize that changes either is content moving under
+/// the selection, and the caller clears it. A live drag has copied nothing
+/// yet; it shows what a release would copy, by construction.
+fn selection_still_shows_copy(sel: &TextSelection, screen: &vt100::Screen, rect: Rect) -> bool {
+    if rect != sel.pane_rect {
+        return false;
+    }
+    match &sel.copied {
+        None => true,
+        Some(copied) => {
+            extract_selection_text(screen, sel, pane_viewport(screen, sel.pane_rect)) == *copied
+        }
+    }
 }
 
 /// Build the OSC 52 "set clipboard" escape sequence carrying `text`.
@@ -6007,7 +6718,11 @@ fn osc52_clipboard_sequence(text: &str) -> String {
 /// Copy text to the system clipboard using the OSC 52 escape sequence.
 /// Writes directly to the controlling terminal to bypass ratatui's buffered
 /// terminal output.
-fn copy_to_clipboard_osc52(text: &str) {
+///
+/// Returns whether the sequence was written to the terminal — that it was
+/// sent, not that the terminal honoured it (PRD #385: the status line reports
+/// what [`crate::clipboard::deliver`] saw, and this is its OSC 52 half).
+fn copy_to_clipboard_osc52(text: &str) -> bool {
     use std::io::Write;
     let seq = osc52_clipboard_sequence(text);
     // Write to the controlling terminal directly so the escape sequence reaches
@@ -6020,9 +6735,12 @@ fn copy_to_clipboard_osc52(text: &str) {
     let terminal = std::fs::OpenOptions::new().write(true).open("/dev/tty");
     #[cfg(windows)]
     let terminal = open_console_output();
-    if let Ok(mut tty) = terminal {
-        let _ = tty.write_all(seq.as_bytes());
-        let _ = tty.flush();
+    match terminal {
+        Ok(mut tty) => tty
+            .write_all(seq.as_bytes())
+            .and_then(|()| tty.flush())
+            .is_ok(),
+        Err(_) => false,
     }
 }
 
@@ -6098,9 +6816,12 @@ pub(crate) fn base64_encode(input: &[u8]) -> String {
 /// Find the word boundaries around (row, col) in a vt100 screen.
 /// `row` is widget-relative; `row_offset` maps it to screen coordinates.
 /// Returns (start_col, end_col) for the word at the given position.
-fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -> (u16, u16) {
-    let (_rows, cols) = crate::vt_grid::size(screen);
-    let screen_row = row + row_offset;
+fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, shown: (u16, u16)) -> (u16, u16) {
+    let (rows, cols) = shown;
+    if row >= rows || col >= cols {
+        return (col, col);
+    }
+    let screen_row = row;
     let is_word_char = |c: u16| -> bool {
         screen
             .cell(screen_row, c)
@@ -6123,6 +6844,44 @@ fn word_bounds_at(screen: &vt100::Screen, row: u16, col: u16, row_offset: u16) -
         end += 1;
     }
     (start, end)
+}
+
+/// [`Action::ForwardToPane`]: write a keystroke's bytes to the focused pane.
+/// Out of `dispatch_action` so the L1 selection seam ([`PaneSelectionSeam`])
+/// types through the code the live loop runs.
+fn forward_to_focused_pane(ui: &mut UiState, embedded: &EmbeddedPaneController, bytes: &[u8]) {
+    let Some(pane_id) = embedded.focused_pane_id() else {
+        return;
+    };
+    clear_selection_on_pane_input(ui, &pane_id, bytes);
+    // Reset scrollback to live output on any keystroke.
+    embedded.reset_scrollback(&pane_id);
+    // PRD #76 M2.20: separate a CR-bearing keystroke from
+    // the preceding typed bytes so the agent TUI treats it
+    // as a standalone submit, not newline-in-input.
+    let sleep =
+        submit_debounce_duration(std::time::Instant::now(), ui.last_pane_keystroke_at, bytes);
+    if !sleep.is_zero() {
+        std::thread::sleep(sleep);
+    }
+    if let Err(e) = embedded.write_raw_bytes(&pane_id, bytes) {
+        // `write_raw_bytes` already phrases the disconnected cases in
+        // the user's terms, so surface it as-is rather than prefixing
+        // it with a second, internal-sounding failure label.
+        //
+        // PRD #1666 part 2 (G-fix7c): except a pane lost to a deck
+        // restart, which the next frame drops and names in the one
+        // restart notice (`process_restart_drops`), not in a
+        // sentence per pane. The submit debounce above can hold an
+        // Enter typed during the disconnect until after the reattach
+        // found the restarted deck.
+        if embedded.pane_lost_reason(&pane_id)
+            != Some(crate::embedded_pane::PaneLostReason::DeckRestarted)
+        {
+            ui.status_message = Some((e.to_string(), std::time::Instant::now()));
+        }
+    }
+    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
 }
 
 fn handle_pane_input_key(key: KeyEvent, application_cursor: bool) -> Action {
@@ -6236,7 +6995,8 @@ fn gate_pane_input_key(
 /// resolved close the dialog has to be able to say out loud.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseConfirmState {
-    /// 0 = Cancel (default), 1 = Close.
+    /// 0 = Cancel (default), 1 = Close, 2 = Close, keep worktree (only when
+    /// [`Self::dispatched_worktree`] arms it).
     pub selected: usize,
     /// What the confirmed close will actually tear down, decided by
     /// [`resolve_close_plan`] — the same function the confirmed close itself
@@ -6248,7 +7008,7 @@ pub struct CloseConfirmState {
     /// The second thing (after `scope`) the dialog has to be able to say out
     /// loud, and the reason this type is no longer `Copy`: it carries a path,
     /// because recovering the work means going to it. Resolved once at arm time
-    /// by [`kept_worktree_for_plan`] — the dialog describes what was armed, and
+    /// by [`close_preview_for_plan`] — the dialog describes what was armed, and
     /// re-probing every frame would put a `git status` in the render loop.
     ///
     /// It is a PREDICTION, and deliberately used only where a prediction is the
@@ -6259,6 +7019,14 @@ pub struct CloseConfirmState {
     /// about what happened. The post-close report comes from the daemon's own
     /// verdict instead; see [`drain_worktree_kept`].
     pub kept_worktree: Option<KeptWorktree>,
+    /// Issue #1958: the dispatched worktree this close may keep on request —
+    /// `Some` arms the third choice, `Close, keep worktree`
+    /// ([`Action::ConfirmCloseKeepWorktree`]). Filled at arm time only when the
+    /// daemon advertises [`crate::daemon_protocol::CAP_KEEP_WORKTREE`] and its
+    /// close preview names the selection's dispatched worktree, whatever that
+    /// tree's state ([`close_preview_for_plan`]). `None` offers Cancel and
+    /// Close only, as before.
+    pub dispatched_worktree: Option<String>,
 }
 
 /// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
@@ -6385,20 +7153,41 @@ fn tab_id_of(tab: &Tab) -> Option<TabId> {
 }
 
 /// The dialog's options, in render/selection order. Index 0 is the
-/// non-destructive default. Only the confirm option's description changes with
+/// non-destructive default. Only the confirm options' descriptions change with
 /// the scope — Cancel means the same thing either way.
-fn close_confirm_options(scope: CloseScope) -> [(&'static str, &'static str); 2] {
-    match scope {
-        CloseScope::Pane => [
+///
+/// Issue #1958: a dialog armed with a dispatched worktree
+/// ([`CloseConfirmState::dispatched_worktree`]) offers a third option, the
+/// Close label plus `, keep worktree` — the suffix the desktop's close dialogs
+/// use too (CLAUDE.md rule 22).
+fn close_confirm_options(state: &CloseConfirmState) -> Vec<(&'static str, &'static str)> {
+    let mut options = match state.scope {
+        CloseScope::Pane => vec![
             ("Cancel", "keep it open"),
             ("Close", "stop the agent and remove it"),
         ],
-        CloseScope::Tab => [
+        CloseScope::Tab => vec![
             ("Cancel", "keep it open"),
             ("Close", "stop all agents and remove the tab"),
         ],
+    };
+    if state.dispatched_worktree.is_some() {
+        options.push(match state.scope {
+            CloseScope::Pane => (
+                CLOSE_KEEP_WORKTREE_LABEL,
+                "stop the agent, keep its worktree",
+            ),
+            CloseScope::Tab => (
+                CLOSE_KEEP_WORKTREE_LABEL,
+                "stop all agents, keep the worktree",
+            ),
+        });
     }
+    options
 }
+
+/// Issue #1958: the third choice's label, in both scopes.
+const CLOSE_KEEP_WORKTREE_LABEL: &str = "Close, keep worktree";
 
 /// The dialog's question, phrased for what the close will actually take.
 fn close_confirm_header(scope: CloseScope) -> &'static str {
@@ -6409,8 +7198,15 @@ fn close_confirm_header(scope: CloseScope) -> &'static str {
 }
 
 /// How many options the dialog offers — the same for every scope, so the key
-/// handler does not need to know which one is on screen.
-const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
+/// handler does not need to know which one is on screen. Issue #1958: three
+/// when the dialog was armed with a dispatched worktree it may keep.
+fn close_confirm_option_count(state: &CloseConfirmState) -> usize {
+    if state.dispatched_worktree.is_some() {
+        3
+    } else {
+        2
+    }
+}
 
 /// PRD #241 M3: decide whether a dispatched action needs the close
 /// confirmation, and seed the dialog when it does.
@@ -6449,11 +7245,12 @@ fn arm_close_confirmation(
     prompt: CloseConfirmState,
     target: CloseTarget,
     scope: CloseScope,
-    kept_worktree: Option<KeptWorktree>,
+    preview: ClosePreview,
 ) {
     ui.close_confirm = CloseConfirmState {
         scope,
-        kept_worktree,
+        kept_worktree: preview.kept_worktree,
+        dispatched_worktree: preview.dispatched_worktree,
         ..prompt
     };
     ui.close_confirm_target = Some(target);
@@ -6559,26 +7356,58 @@ fn close_plan_pane_ids(plan: &ClosePlan, tab_manager: &TabManager) -> Vec<String
     }
 }
 
+/// What the close preview told the dialog at arm time: the two things
+/// [`CloseConfirmState`] can say about a dispatched worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClosePreview {
+    /// Issue #717: the worktree a plain close would leave behind holding
+    /// uncommitted work.
+    kept_worktree: Option<KeptWorktree>,
+    /// Issue #1958: the worktree the close may keep on request.
+    dispatched_worktree: Option<String>,
+}
+
 /// Issue #717: ask the daemon whether confirming `plan` would leave a
-/// dispatched worktree on disk holding uncommitted work.
+/// dispatched worktree on disk holding uncommitted work — and, issue #1958,
+/// which dispatched worktree the close may keep on request.
 ///
 /// The daemon is asked rather than the local filesystem because it owns both
 /// halves of the answer: the removal POLICY lives only in its in-memory
 /// worktree registry, and under a remote deck the worktree is not on this
 /// machine at all. Best-effort throughout — a down daemon, a blown deadline or
-/// an older daemon that does not know the request all resolve to `None`, and
+/// an older daemon that does not know the request all resolve to nothing, and
 /// the dialog then reads exactly as it did before this existed.
-fn kept_worktree_for_plan(plan: &ClosePlan, tab_manager: &TabManager) -> Option<KeptWorktree> {
+///
+/// The keep choice is offered only through
+/// [`crate::daemon_client::WorktreeClosePreview::keep_worktree_choice`], read
+/// against the capabilities of the same daemon process that answered the
+/// preview (its `Hello` on this connection): an older daemon would ignore the
+/// keep and remove a clean worktree, so against it the choice is hidden.
+fn close_preview_for_plan(plan: &ClosePlan, tab_manager: &TabManager) -> ClosePreview {
     let pane_ids = close_plan_pane_ids(plan, tab_manager);
     if pane_ids.is_empty() {
-        return None;
+        return ClosePreview::default();
     }
-    send_daemon_request_blocking_with_timeout(
+    let path = crate::endpoint_resolve::client_attach_socket_path();
+    let Ok((hello, resp)) = send_daemon_request_blocking_with_hello_at(
+        &path,
         &crate::daemon_protocol::AttachRequest::DispatchWorktreeClosePreview { pane_ids },
         CLOSE_PREVIEW_TIMEOUT,
-    )
-    .ok()?
-    .kept_worktree
+    ) else {
+        return ClosePreview::default();
+    };
+    let preview = crate::daemon_client::WorktreeClosePreview {
+        kept_worktree: resp.kept_worktree,
+        dispatched_worktree: resp.dispatched_worktree,
+    };
+    let capabilities = crate::daemon_client::DaemonCapabilities::from_hello(&hello);
+    let dispatched_worktree = preview
+        .keep_worktree_choice(&capabilities)
+        .map(str::to_string);
+    ClosePreview {
+        kept_worktree: preview.kept_worktree,
+        dispatched_worktree,
+    }
 }
 
 /// Issue #717: fit a filesystem path into `max_width` columns by dropping
@@ -6669,7 +7498,11 @@ fn drain_pull_request_launch(state: &SharedState, ui: &mut UiState) {
 /// about a worktree that will be kept. Two sentences, because the probe has two
 /// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
 fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
-    if kept.confirmed_dirty {
+    if kept.on_request {
+        // Issue #1958: the user chose `Close, keep worktree` — the same words
+        // as the desktop's notice.
+        "Worktree kept on request:"
+    } else if kept.confirmed_dirty {
         "! Uncommitted work here is KEPT, not deleted:"
     } else {
         "! Uncommitted work here, if any, is KEPT:"
@@ -6740,8 +7573,10 @@ fn resolve_close_target(
 /// PRD #241 M3: key handling for the close confirmation, modelled on
 /// [`handle_quit_confirm_key`]. Up/Down (or k/j) move the highlight, Enter
 /// commits the highlighted option, and Esc cancels. Only an explicit **Close**
-/// selection returns [`Action::ConfirmCloseSelected`]; everything else that
-/// leaves the dialog returns [`Action::DismissModal`], which is a pure
+/// selection returns [`Action::ConfirmCloseSelected`], and only an explicit
+/// **Close, keep worktree** selection on a dialog armed with one (issue #1958)
+/// returns [`Action::ConfirmCloseKeepWorktree`]; everything else that leaves
+/// the dialog returns [`Action::DismissModal`], which is a pure
 /// return-to-Normal.
 ///
 /// PRD #241 review F5: there is deliberately **no `y` shortcut**. An earlier
@@ -6761,18 +7596,17 @@ pub fn handle_close_confirm_key(state: &mut CloseConfirmState, key: KeyEvent) ->
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.selected + 1 < CLOSE_CONFIRM_OPTION_COUNT {
+            if state.selected + 1 < close_confirm_option_count(state) {
                 state.selected += 1;
             }
             Action::Continue
         }
-        KeyCode::Enter => {
-            if state.selected == 1 {
-                Action::ConfirmCloseSelected
-            } else {
-                Action::DismissModal
-            }
-        }
+        KeyCode::Enter => match state.selected {
+            1 => Action::ConfirmCloseSelected,
+            // Issue #1958: only reachable on a dialog armed with a worktree.
+            2 if state.dispatched_worktree.is_some() => Action::ConfirmCloseKeepWorktree,
+            _ => Action::DismissModal,
+        },
         KeyCode::Esc => Action::DismissModal,
         _ => Action::Continue,
     }
@@ -7055,6 +7889,101 @@ fn star_message(opened: bool) -> String {
     } else {
         format!("Visit {} to star ⭐", repo_identity::DISPLAY)
     }
+}
+
+/// PRD #1885: open the trust prompt for `view`. Nothing it was opened for is
+/// spawned until it is answered; typed-ahead input never answers it, since it
+/// is a confirmation that waits for its own frame ([`confirmation_awaits_frame`]).
+fn open_trust_prompt(
+    ui: &mut UiState,
+    view: crate::project_trust::ProjectTrustView,
+    purpose: TrustPromptPurpose,
+) {
+    ui.trust_prompt = Some(TrustPromptState {
+        view,
+        scroll: 0,
+        max_scroll: 0,
+        drawn_inner: None,
+        purpose,
+    });
+    ui.confirm_choices_drawn = None;
+    // Its approve and cancel labels become click targets only once a flushed
+    // frame shows them (`record_flushed_confirmation`), never from what an
+    // earlier dialog left here.
+    ui.modal_button_rects.clear();
+    ui.mode = UiMode::TrustPrompt;
+}
+
+/// PRD #1885: close the trust prompt without approving: nothing is spawned and
+/// nothing is stored. A restore it was shown for stays unrestored, and stays in
+/// the saved session so the next start asks again.
+fn cancel_trust_prompt(ui: &mut UiState) {
+    ui.mode = UiMode::Normal;
+    let Some(prompt) = ui.trust_prompt.take() else {
+        return;
+    };
+    let name = crate::untrusted_text::escape_control_and_bidi(&prompt.view.orchestration);
+    let message = match prompt.purpose {
+        TrustPromptPurpose::Open { .. } => {
+            format!("Orchestration '{name}' not started: its commands were not approved.")
+        }
+        TrustPromptPurpose::Restore(pending) => {
+            ui.declined_trust_restores.push(pending.saved_pane);
+            format!("Orchestration '{name}' not restored: its commands were not approved.")
+        }
+    };
+    ui.status_message = Some((message, std::time::Instant::now()));
+}
+
+/// PRD #1885: the wheel over the trust prompt's popup scrolls the review one
+/// row a notch, as `↑`/`↓` do; a wheel elsewhere, or before a frame has drawn
+/// the popup, does nothing.
+fn scroll_trust_prompt(ui: &mut UiState, up: bool, col: u16, row: u16) {
+    let Some(prompt) = ui.trust_prompt.as_mut() else {
+        return;
+    };
+    if !prompt
+        .drawn_inner
+        .is_some_and(|inner| point_in_rect(&inner, col, row))
+    {
+        return;
+    }
+    prompt.scroll = if up {
+        prompt.scroll.saturating_sub(1)
+    } else {
+        prompt.scroll.saturating_add(1).min(prompt.max_scroll)
+    };
+}
+
+/// PRD #1885: the trust prompt's keys. `a` approves and starts (or restores);
+/// `Esc` cancels; `↑`/`↓`/`PgUp`/`PgDn` (and `Home`/`End`) scroll. Enter does
+/// NOT approve: a key that confirms every other dialog must not approve
+/// commands by habit.
+fn handle_trust_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
+    let Some(prompt) = ui.trust_prompt.as_mut() else {
+        ui.mode = UiMode::Normal;
+        return Action::Continue;
+    };
+    const PAGE: usize = 10;
+    let plain = !key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('a') if plain => return Action::ApproveProjectTrust,
+        KeyCode::Esc => cancel_trust_prompt(ui),
+        KeyCode::Up | KeyCode::Char('k') => prompt.scroll = prompt.scroll.saturating_sub(1),
+        KeyCode::Down | KeyCode::Char('j') => {
+            prompt.scroll = prompt.scroll.saturating_add(1).min(prompt.max_scroll);
+        }
+        KeyCode::PageUp => prompt.scroll = prompt.scroll.saturating_sub(PAGE),
+        KeyCode::PageDown => {
+            prompt.scroll = prompt.scroll.saturating_add(PAGE).min(prompt.max_scroll);
+        }
+        KeyCode::Home => prompt.scroll = 0,
+        KeyCode::End => prompt.scroll = prompt.max_scroll,
+        _ => {}
+    }
+    Action::Continue
 }
 
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
@@ -8121,6 +9050,13 @@ fn switch_tab_with_focus(
     }
     tab_manager.capture_focus_on_switch_out();
     let switched = tab_manager.switch_to(target_index);
+    // PRD #385 M3 (decision 5): a selection belongs to the tab it was made on,
+    // so a real move to another tab clears it here, where the move happens. A
+    // check before each frame alone misses a switch away and back handled in
+    // one input drain. A switch to the tab already active is no move.
+    if switched && will_move {
+        ui.selection = None;
+    }
     if switched {
         // The pane focus is restored to on switch-in becomes the new focus
         // baseline (see the PR #151 pre-seed below).
@@ -8317,6 +9253,11 @@ fn handle_normal_key(
     // `u`), shared with a click on the badge.
     if pressed(KbAction::OpenUpgrade) {
         return Action::OpenUpgrade;
+    }
+    // PRD #385 M5: copy mode on the focused pane (default `v`). The
+    // dispatcher resolves the pane and does nothing when none is focused.
+    if kb.matches(KbAction::CopyMode, &key) {
+        return Action::EnterCopyMode;
     }
     if kb.matches(KbAction::ClearFilter, &key) {
         if !ui.filter_text.is_empty() {
@@ -9601,7 +10542,9 @@ pub fn global_action(kb: &KeybindingConfig, key: &KeyEvent) -> Option<Action> {
 fn global_action_for_mode(kb: &KeybindingConfig, mode: UiMode, key: &KeyEvent) -> Option<Action> {
     // Issue #1635: the upgrade dialog owns the keyboard the same way, so a
     // tab switch or a new pane cannot slip in under an upgrade's question.
-    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade {
+    // PRD #1885: so does the trust prompt: nothing may open, switch or spawn
+    // under a question about what is about to run.
+    if mode == UiMode::CloseConfirm || mode == UiMode::Upgrade || mode == UiMode::TrustPrompt {
         return None;
     }
     let resolved = global_action(kb, key).or_else(|| {
@@ -9945,6 +10888,10 @@ fn modal_owns_clicks(mode: &UiMode) -> bool {
             // Issue #1635: the upgrade dialog's buttons live in
             // `modal_button_rects` too.
             | UiMode::Upgrade
+            // PRD #1885: the trust prompt's approve and cancel labels live in
+            // `modal_button_rects` once a frame shows them; a click anywhere
+            // else is consumed rather than reaching what is behind it.
+            | UiMode::TrustPrompt
     )
 }
 
@@ -9983,7 +10930,13 @@ fn overlay_blocks_mouse(mode: &UiMode) -> bool {
         // PRD #1666 §6.4: the deck-messages picker is a topmost modal too.
         | UiMode::InboxAttention
         // PRD #1666 part 2 (G-fix7d): so is the restart notice's list.
-        | UiMode::RestartNotice => true,
+        | UiMode::RestartNotice
+        // PRD #385 M5: copy mode's pane shows a frozen screen, so the wheel
+        // must not scroll the live one behind it (the run loop ignores the
+        // mouse in copy mode altogether).
+        | UiMode::CopyMode
+        // PRD #1885: and the trust prompt.
+        | UiMode::TrustPrompt => true,
         UiMode::Normal | UiMode::Filter | UiMode::Rename | UiMode::PaneInput => false,
     }
 }
@@ -10072,13 +11025,17 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
 /// and a confirmed close on a dashboard card whose pane lives inside such a tab
 /// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
 /// in what they remove or what they report.
+///
+/// Issue #1958: `keep_worktree` asks the daemon, on every role's stop, to keep
+/// the dispatched worktree the tab's roles share.
 fn close_tab_by_index(
     idx: usize,
     ui: &mut UiState,
     state: &SharedState,
     tab_manager: &mut TabManager,
+    keep_worktree: bool,
 ) {
-    match tab_manager.close_tab(idx) {
+    match tab_manager.close_tab_with(idx, keep_worktree) {
         Ok(outcome) => {
             let mut st = state.blocking_write();
             for id in &outcome.closed {
@@ -10103,6 +11060,19 @@ fn close_tab_by_index(
             }
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
+            } else if outcome.closed.is_empty()
+                && outcome
+                    .failed
+                    .iter()
+                    .all(|(_, e)| e == crate::daemon_client::KEEP_WORKTREE_UNSUPPORTED)
+            {
+                // Issue #1958: the daemon cannot keep the worktree, so no role
+                // was stopped — a refusal, said as one (the sentence says
+                // nothing was closed), not a partial close to retry.
+                ui.status_message = Some((
+                    crate::daemon_client::KEEP_WORKTREE_UNSUPPORTED.to_string(),
+                    std::time::Instant::now(),
+                ));
             } else {
                 let first_err = outcome
                     .failed
@@ -10485,11 +11455,13 @@ fn dispatch_action(
                 let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
                 // Issue #717: and the SAME plan decides whether this close
                 // would leave a dispatched worktree behind, so the sentence and
-                // the warning describe one resolution rather than two.
-                let kept = plan
+                // the warning describe one resolution rather than two. Issue
+                // #1958: and whether it may keep that worktree on request.
+                let preview = plan
                     .as_ref()
-                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
-                arm_close_confirmation(ui, prompt, target, scope, kept);
+                    .map(|plan| close_preview_for_plan(plan, tab_manager))
+                    .unwrap_or_default();
+                arm_close_confirmation(ui, prompt, target, scope, preview);
             }
             // No target (PRD #113 finding 2: an inactive dashboard selection
             // means nothing is armed) — stay exactly as silent as before, and
@@ -10501,7 +11473,15 @@ fn dispatch_action(
         //
         // PRD #92 F4: inspect each close result and preserve the card / session
         // on failure so the user can see the error and retry.
-        Action::ConfirmCloseSelected => {
+        action @ (Action::ConfirmCloseSelected | Action::ConfirmCloseKeepWorktree) => {
+            // Issue #1958: the keep rides on every stop of this close — only
+            // when the dialog was armed with a worktree to keep, so no other
+            // door can send a keep the daemon never offered.
+            let keep_worktree = matches!(action, Action::ConfirmCloseKeepWorktree);
+            if keep_worktree && ui.close_confirm.dispatched_worktree.is_none() {
+                return Flow::Continue;
+            }
+            ui.close_confirm.dispatched_worktree = None;
             // Leaving the modal is unconditional — whether the teardown
             // succeeds or is preserved for retry, the dialog is done. Taking
             // the target also disarms it, so a second confirmation cannot
@@ -10545,7 +11525,7 @@ fn dispatch_action(
                 // live in such a tab — which is why the dialog said "this tab
                 // and all its panes" either way.
                 Some(ClosePlan::Tab { index }) => {
-                    close_tab_by_index(index, ui, state, tab_manager);
+                    close_tab_by_index(index, ui, state, tab_manager, keep_worktree);
                 }
                 // Plain dashboard pane — close just this one and inspect the
                 // result. PRD #92 F4: preserve the card / session on failure so
@@ -10566,7 +11546,12 @@ fn dispatch_action(
                             .map(|card| card.incarnation.clone())
                             .unwrap_or_default(),
                     );
-                    match pane.close_card(&card) {
+                    let closed = if keep_worktree {
+                        pane.close_card_keeping_worktree(&card)
+                    } else {
+                        pane.close_card(&card)
+                    };
+                    match closed {
                         Ok(()) => {
                             let mut st = state.blocking_write();
                             st.sessions.remove(&session_id);
@@ -10688,10 +11673,11 @@ fn dispatch_action(
                 let target = CloseTarget::Tab(id);
                 let plan = resolve_close_plan(&target, tab_manager, snapshot);
                 let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
-                let kept = plan
+                let preview = plan
                     .as_ref()
-                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
-                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope, kept);
+                    .map(|plan| close_preview_for_plan(plan, tab_manager))
+                    .unwrap_or_default();
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope, preview);
             }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
@@ -10957,12 +11943,54 @@ fn dispatch_action(
                 }
             }
         }
-        Action::SpawnPane(req) => {
+        Action::SpawnPane(mut req) => {
             // Issue #555: whatever this spawn does, the form it came from is
             // restored at most once, and only from the orchestration arm below.
             let submitted_orchestration_form = ui.submitted_orchestration_form.take();
             if pane.is_available() {
                 let dir_str = req.dir.display().to_string();
+
+                // PRD #1885: an orchestration opens only when the daemon says its
+                // commands and prompts are approved as they now read, and what
+                // opens is exactly that text. Otherwise the trust prompt asks
+                // first, and nothing is spawned while it is open.
+                if let Some(chosen) = req.orchestration_config.as_ref() {
+                    let answer = pane.project_trust_state(&dir_str, &chosen.name);
+                    let reread = || {
+                        load_project_config(&req.dir).ok().flatten().and_then(|c| {
+                            c.orchestrations.into_iter().find(|o| o.name == chosen.name)
+                        })
+                    };
+                    let gate =
+                        crate::trust_prompt::decide_for_dir(answer, &req.dir, chosen, reread);
+                    match gate {
+                        crate::trust_prompt::Gate::Open(config) => {
+                            req.orchestration_config = Some(config);
+                        }
+                        crate::trust_prompt::Gate::Prompt(view) => {
+                            ui.pending_last_command = None;
+                            open_trust_prompt(
+                                ui,
+                                view,
+                                TrustPromptPurpose::Open {
+                                    req,
+                                    form: submitted_orchestration_form,
+                                },
+                            );
+                            return Flow::Continue;
+                        }
+                        crate::trust_prompt::Gate::Refuse(message) => {
+                            ui.pending_last_command = None;
+                            // Names a project path and orchestration from the
+                            // config: shown, never obeyed.
+                            ui.status_message = Some((
+                                crate::untrusted_text::escape_control_and_bidi(&message),
+                                std::time::Instant::now(),
+                            ));
+                            return Flow::Continue;
+                        }
+                    }
+                }
 
                 // Orchestration path — manage own panes, no agent pane.
                 if let Some(orch_config) = req.orchestration_config {
@@ -11619,40 +12647,8 @@ fn dispatch_action(
             cancel_new_pane_form(ui);
         }
         Action::ForwardToPane(bytes) => {
-            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                && let Some(pane_id) = embedded.focused_pane_id()
-            {
-                // Reset scrollback to live output on any keystroke.
-                embedded.reset_scrollback(&pane_id);
-                // PRD #76 M2.20: separate a CR-bearing keystroke from
-                // the preceding typed bytes so the agent TUI treats it
-                // as a standalone submit, not newline-in-input.
-                let sleep = submit_debounce_duration(
-                    std::time::Instant::now(),
-                    ui.last_pane_keystroke_at,
-                    &bytes,
-                );
-                if !sleep.is_zero() {
-                    std::thread::sleep(sleep);
-                }
-                if let Err(e) = embedded.write_raw_bytes(&pane_id, &bytes) {
-                    // `write_raw_bytes` already phrases the disconnected cases in
-                    // the user's terms, so surface it as-is rather than prefixing
-                    // it with a second, internal-sounding failure label.
-                    //
-                    // PRD #1666 part 2 (G-fix7c): except a pane lost to a deck
-                    // restart, which the next frame drops and names in the one
-                    // restart notice (`process_restart_drops`), not in a
-                    // sentence per pane. The submit debounce above can hold an
-                    // Enter typed during the disconnect until after the reattach
-                    // found the restarted deck.
-                    if embedded.pane_lost_reason(&pane_id)
-                        != Some(crate::embedded_pane::PaneLostReason::DeckRestarted)
-                    {
-                        ui.status_message = Some((e.to_string(), std::time::Instant::now()));
-                    }
-                }
-                ui.last_pane_keystroke_at = Some(std::time::Instant::now());
+            if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                forward_to_focused_pane(ui, embedded, &bytes);
             }
         }
         // PRD #127 finding #4: open the manager dialog. Shared by the dashboard
@@ -11663,6 +12659,7 @@ fn dispatch_action(
         // the view starts at "Reading…" and the request goes out off the TUI
         // thread; `poll_host_metrics` puts the answer on screen when it lands.
         // Without one (the render seams) the overlay shows what it was given.
+        Action::EnterCopyMode => enter_copy_mode(ui, pane),
         Action::OpenHostMetrics => {
             ui.mode = UiMode::HostMetrics;
             if let Some(reader) = ui.host_metrics_reader.clone() {
@@ -11787,6 +12784,7 @@ fn dispatch_action(
             ui.scheduled_selected = 0;
             ui.scheduled_delete_confirm = false;
             ui.scheduled_live_names = live_schedule_names();
+            reload_schedule_refusals(ui);
             ui.mode = UiMode::ScheduledTasks;
         }
         // PRD #127 finding #4: `[Add]` button parity for the `a` key. PRD #170
@@ -11812,6 +12810,88 @@ fn dispatch_action(
                 ui.scheduled_delete_confirm = true;
                 // Issue #1799: this question waits for its own frame.
                 ui.confirm_choices_drawn = None;
+            }
+        }
+        // PRD #1885: `a` in the trust prompt. The daemon approves exactly the
+        // text the prompt showed (its digest), then what the prompt was shown
+        // for goes through its own gate again — which opens it now that it is
+        // approved, or, when the file changed in the meantime, shows the new
+        // text instead.
+        Action::CancelTrustPrompt => {
+            cancel_trust_prompt(ui);
+        }
+        Action::ApproveProjectTrust => {
+            let Some(prompt) = ui.trust_prompt.take() else {
+                ui.mode = UiMode::Normal;
+                return Flow::Continue;
+            };
+            ui.mode = UiMode::Normal;
+            let view = &prompt.view;
+            let name = crate::untrusted_text::escape_control_and_bidi(&view.orchestration);
+            let proceed = match pane.approve_project_trust(
+                &view.config_dir,
+                &view.orchestration,
+                &view.digest,
+            ) {
+                Ok(crate::daemon_client::GatedQuery::Answered(_)) => true,
+                Err(e) if crate::trust_prompt::is_text_changed(&e) => {
+                    ui.status_message = Some((
+                        format!(
+                            "Orchestration '{name}' changed while it was shown, so nothing was \
+                             approved. Review the new text."
+                        ),
+                        std::time::Instant::now(),
+                    ));
+                    true
+                }
+                Ok(crate::daemon_client::GatedQuery::Unsupported) => {
+                    // The command names the config's path and orchestration:
+                    // shown, never obeyed.
+                    ui.status_message = Some((
+                        crate::untrusted_text::escape_control_and_bidi(&format!(
+                            "{} Not approved: run `{}` from a terminal outside the deck.",
+                            crate::trust_prompt::OLDER_DAEMON_NOTE,
+                            crate::project_trust::approve_command(
+                                std::path::Path::new(&view.config_dir),
+                                &view.orchestration
+                            )
+                        )),
+                        std::time::Instant::now(),
+                    ));
+                    false
+                }
+                Err(e) => {
+                    // The daemon's error can quote the config: shown, never
+                    // obeyed.
+                    let e = crate::untrusted_text::escape_control_and_bidi(&e);
+                    ui.status_message = Some((
+                        format!("Orchestration '{name}' not approved: {e}"),
+                        std::time::Instant::now(),
+                    ));
+                    false
+                }
+            };
+            if !proceed {
+                return Flow::Continue;
+            }
+            match prompt.purpose {
+                TrustPromptPurpose::Open { req, form } => {
+                    ui.submitted_orchestration_form = form;
+                    return dispatch_action(
+                        Action::SpawnPane(req),
+                        ui,
+                        pane,
+                        state,
+                        tab_manager,
+                        snapshot,
+                        filtered,
+                        selected_id,
+                        frame_area,
+                    );
+                }
+                TrustPromptPurpose::Restore(pending) => {
+                    restore_held_orchestration(ui, pane, state, tab_manager, frame_area, pending);
+                }
             }
         }
         Action::ScheduleRunNow(name) => {
@@ -11848,6 +12928,7 @@ fn dispatch_action(
             // PRD #127 N2: dialog stays open after run-now; refresh live-status snapshot.
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_live_names = live_schedule_names();
+                reload_schedule_refusals(ui);
             }
         }
         Action::ScheduleDelete(name) => {
@@ -11880,6 +12961,7 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
+                reload_schedule_refusals(ui);
                 if ui.scheduled_selected >= ui.scheduled_tasks.len() {
                     ui.scheduled_selected = ui.scheduled_tasks.len().saturating_sub(1);
                 }
@@ -11926,11 +13008,47 @@ fn dispatch_action(
             if ui.mode == UiMode::ScheduledTasks {
                 ui.scheduled_tasks = config::LoadedSchedules::load().tasks;
                 ui.scheduled_live_names = live_schedule_names();
+                reload_schedule_refusals(ui);
             }
         }
         Action::Continue => {}
     }
     Flow::Continue
+}
+
+/// PRD #1885: add to `session` every saved orchestration the startup restore
+/// held back for approval — still waiting for its prompt, open in it, or
+/// declined — exactly as it was saved, so a save made before it is approved
+/// does not drop it and the next start asks about it again. One whose
+/// orchestration (the same project and config name) is open in a live tab, and
+/// so is already saved from that tab, is left out rather than restored twice.
+fn keep_held_trust_restores(ui: &UiState, session: &mut config::SavedSession) {
+    let open = ui
+        .trust_prompt
+        .as_ref()
+        .and_then(|prompt| match &prompt.purpose {
+            TrustPromptPurpose::Restore(pending) => Some(&pending.saved_pane),
+            TrustPromptPurpose::Open { .. } => None,
+        });
+    let held: Vec<config::SavedPane> = ui
+        .pending_trust_restores
+        .iter()
+        .map(|pending| &pending.saved_pane)
+        .chain(open)
+        .chain(&ui.declined_trust_restores)
+        .filter(|held| {
+            let Some(orch) = held.orchestration.as_ref() else {
+                return true;
+            };
+            !session.panes.iter().any(|live| {
+                live.orchestration.as_ref().is_some_and(|o| {
+                    o.project_path == orch.project_path && o.config_name == orch.config_name
+                })
+            })
+        })
+        .cloned()
+        .collect();
+    session.panes.extend(held);
 }
 
 /// PRD #89 M1.2 — flush the saved-session snapshot to disk when the coalescer
@@ -11957,6 +13075,7 @@ fn flush_session_snapshot_if_due(ui: &mut UiState, state: &SharedState, tab_mana
     // pane-derived snapshot builder cannot know. `track_session_focus` keeps
     // `ui.session_focus` current and is what marked this write dirty.
     session.focus = ui.session_focus.clone();
+    keep_held_trust_restores(ui, &mut session);
     // PRD #89 review-fix F10: only mark the write as done (clearing the dirty
     // flag via `record_write`) when the persist actually SUCCEEDED. On a
     // transient disk error we leave the coalescer dirty so the next loop
@@ -12038,6 +13157,299 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
     state.managed_pane_ids.is_empty()
 }
 
+/// PRD #89 M2b.3 — rebuild one saved orchestration tab on the daemon-empty
+/// restore path: the orchestrator and role panes in saved order, the saved
+/// prompt replayed to the start role, the start cursor. Answers the tab's
+/// index, or why it could not be opened (the caller leaves it unrestored
+/// then).
+///
+/// PRD #1885: called only for an orchestration whose commands and prompts are
+/// approved as `orch_config` holds them — at startup, and again once a trust
+/// prompt the startup restore held it back for is approved
+/// ([`restore_held_orchestration`]).
+#[allow(clippy::too_many_arguments)]
+fn restore_orchestration_tab(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    frame_area: Rect,
+    saved_pane: &config::SavedPane,
+    orch_snap: &config::OrchestrationSnapshot,
+    orch_config: &OrchestrationConfig,
+    saved_start_idx: usize,
+) -> Result<usize, String> {
+    // All roles share spawn dims (Tiled); role_index=0 so the
+    // helper falls back to "role 0 expanded" — the per-frame
+    // `resize_panes_to_layout` reconciles the exact rects once
+    // the tab is active. Mirrors the live new-pane path.
+    let spawn_dims = orchestration_role_pane_dims(
+        frame_area,
+        orch_config.roles.len(),
+        0,
+        PaneLayout::Tiled,
+        true,
+        // PRD #336: a restored tab adopts the current
+        // global split, like any other tab. The global is
+        // not persisted across launches, so a restore at
+        // startup lands on the 34/66 default.
+        tab_manager.orchestration_split_narrow(),
+    );
+    // Empty saved prompt → `None` so nothing is posted
+    // (matching the live path's "no prompt" semantics); a
+    // non-empty prompt is posted to the start role's inbox
+    // again.
+    let replay_prompt =
+        (!orch_snap.orchestrator_prompt.is_empty()).then(|| orch_snap.orchestrator_prompt.clone());
+    // PRD #89 review-fix F3: honor the SAVED start cursor,
+    // even when it differs from the role the config seats
+    // now, so the prompt's post and the landing focus
+    // target the role the user left as start. Issue #523
+    // review: passed as the tab's SEAT rather than patched
+    // onto `start_role_index` afterwards, so the membership
+    // the daemon registers (who may `delegate`) and the Pi
+    // seed name that same role — one orchestrator, not a
+    // prompt on one pane and delegate rights on another.
+    let (tab_idx, role_pane_ids) = tab_manager
+        .open_orchestration_tab_restoring(
+            orch_config,
+            &saved_pane.dir,
+            replay_prompt,
+            // PRD #89 review-fix F4: thread the saved user title
+            // so the rebuilt tab comes back under the user's name
+            // rather than the canonical config/cwd name. `None`
+            // when unset falls back to the canonical name.
+            orch_snap.display_title.as_deref(),
+            spawn_dims,
+            Some(saved_start_idx),
+            // Issue #929: only the roles that were running when
+            // the snapshot was saved; an old snapshot, every role.
+            &orch_snap.roles_to_start_on_restore(orch_config.roles.len()),
+        )
+        .map_err(|e| e.to_string())?;
+    // Snapshot each role pane's daemon agent_id before
+    // the placeholder insert so the strict-equality
+    // reuse guard accepts each role agent's first
+    // `SessionStart` (mirrors the live path).
+    let role_agent_ids: Vec<Option<String>> = role_pane_ids
+        .iter()
+        .map(|id| pane.pane_agent_id(id))
+        .collect();
+    // PRD #1666 part 2 (G-fix7): each card stamped
+    // from the attach that produced its pane.
+    let role_attached_on: Vec<_> = role_pane_ids
+        .iter()
+        .map(|id| pane.pane_incarnation(id))
+        .collect();
+    {
+        let mut st = state.blocking_write();
+        for ((id, agent_id), attached_on) in role_pane_ids
+            .iter()
+            .zip(role_agent_ids.iter())
+            .zip(role_attached_on)
+        {
+            // Issue #929: a role restore did not start keeps its
+            // card through a placeholder on its dead-slot id, as
+            // on a tab rebuilt from a daemon; it is no pane, so it
+            // is not registered.
+            if is_dead_slot_pane_id(id) {
+                st.insert_placeholder_session(id.clone(), Some(saved_pane.dir.clone()), None, None);
+                continue;
+            }
+            st.register_pane(id.clone());
+            let learned_from = attached_on.unwrap_or_else(|| st.stream_incarnation.clone());
+            st.insert_placeholder_session_learned(
+                id.clone(),
+                Some(saved_pane.dir.clone()),
+                None,
+                agent_id.clone(),
+                learned_from,
+            );
+        }
+        // Issue #462: `pane_orchestration_map` is
+        // deliberately omitted here too — the
+        // daemon-empty snapshot restore runs in the
+        // TUI process, which never routes. The full
+        // reasoning, including the `None == None`
+        // degeneracy in `delegate_targets` that a
+        // TUI-side router would silently hit, is on
+        // the first of these registrations in
+        // `surface_one_orchestration`.
+        // The tab's seat — the saved cursor (above).
+        for (i, role) in orch_config.roles.iter().enumerate() {
+            if is_dead_slot_pane_id(&role_pane_ids[i]) {
+                continue;
+            }
+            st.pane_role_map
+                .insert(role_pane_ids[i].clone(), role.name.clone());
+            st.pane_cwd_map
+                .insert(role_pane_ids[i].clone(), saved_pane.dir.clone());
+            if i == saved_start_idx {
+                st.orchestrator_pane_ids.insert(role_pane_ids[i].clone());
+            }
+        }
+    }
+    for (i, role) in orch_config.roles.iter().enumerate() {
+        ui.pane_display_names
+            .insert(role_pane_ids[i].clone(), role.name.clone());
+        ui.pane_names
+            .insert(role_pane_ids[i].clone(), role.name.clone());
+        // Issue #308: a restored role keeps its
+        // declared badge, so a session restore looks
+        // like the tab that was saved rather than
+        // reverting every launcher role to
+        // "No agent".
+        if let Some(declared) = role.declared_agent_type() {
+            ui.pane_declared_agent
+                .insert(role_pane_ids[i].clone(), declared);
+        }
+    }
+    // Re-capture the orchestration metadata onto the
+    // start role pane so a later snapshot keeps the
+    // tab (only the start role carries the block).
+    // PRD #89 review-fix F3: key it under the SAVED
+    // (validated) start cursor — consistent with the
+    // honored start role above — not the config
+    // default, so a re-save preserves the saved
+    // cursor on the same pane that carries the block.
+    ui.pane_metadata
+        .insert(role_pane_ids[saved_start_idx].clone(), saved_pane.clone());
+    Ok(tab_idx)
+}
+
+/// PRD #1885: what restoring `orch_config` — resolved from `orch_snap` — does:
+/// open it when the daemon says it is approved as it now reads, hold it back
+/// for a trust prompt when it is not, or leave it unrestored.
+fn restore_trust_gate(
+    pane: &dyn PaneController,
+    saved_pane: &config::SavedPane,
+    orch_snap: &config::OrchestrationSnapshot,
+    orch_config: &OrchestrationConfig,
+) -> crate::trust_prompt::Gate {
+    let answer = pane.project_trust_state(&saved_pane.dir, &orch_config.name);
+    crate::trust_prompt::decide_for_dir(
+        answer,
+        std::path::Path::new(&saved_pane.dir),
+        orch_config,
+        || {
+            resolve_orchestration_for_restore(orch_snap, &saved_pane.dir)
+                .ok()
+                .map(|(config, _)| config)
+        },
+    )
+}
+
+/// PRD #1885: whether a remit re-arm (compaction or `/clear` on the start
+/// role) may publish `config`, the text the running tab holds — which a warm
+/// reattach read from the config without a trust check. Answers `true` when it
+/// is the approved text (adopting the config as it now reads when that is the
+/// approved text with the same roles); otherwise reports why nothing was sent,
+/// in the status line and the log, and answers `false`. Never prompts.
+fn rearm_trust_gate(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    config: &mut OrchestrationConfig,
+    cwd: &str,
+) -> bool {
+    let name = config.name.clone();
+    let dir = std::path::Path::new(cwd);
+    let answer = pane.project_trust_state(cwd, &name);
+    let reread = || {
+        load_project_config(dir)
+            .ok()
+            .flatten()
+            .and_then(|c| c.orchestrations.into_iter().find(|o| o.name == name))
+    };
+    match crate::trust_prompt::decide_rearm_for_dir(answer, dir, config, reread) {
+        crate::trust_prompt::Rearm::Publish => true,
+        crate::trust_prompt::Rearm::PublishApproved(fresh) => {
+            *config = fresh;
+            true
+        }
+        crate::trust_prompt::Rearm::Refuse(message) => {
+            // Names a project path and orchestration from the config: shown,
+            // never obeyed.
+            let shown = crate::untrusted_text::escape_control_and_bidi(&message);
+            tracing::warn!(cwd = %crate::untrusted_text::escape_control_and_bidi(cwd), "{shown}");
+            ui.status_message = Some((shown, std::time::Instant::now()));
+            false
+        }
+    }
+}
+
+/// PRD #1885: restore a saved orchestration the startup restore held back,
+/// once its trust prompt was approved: re-resolved from the saved session and
+/// gated again, so what opens is exactly the approved text (and a config that
+/// changed meanwhile asks again instead). Lands on the restored tab.
+fn restore_held_orchestration(
+    ui: &mut UiState,
+    pane: &dyn PaneController,
+    state: &SharedState,
+    tab_manager: &mut TabManager,
+    frame_area: Rect,
+    pending: PendingTrustRestore,
+) {
+    let saved_pane = &pending.saved_pane;
+    let Some(orch_snap) = saved_pane.orchestration.as_ref() else {
+        return;
+    };
+    let name = crate::untrusted_text::escape_control_and_bidi(&orch_snap.config_name);
+    let not_restored = |ui: &mut UiState, why: String| {
+        ui.status_message = Some((
+            format!(
+                "Orchestration '{name}' not restored: {}",
+                crate::untrusted_text::escape_control_and_bidi(&why)
+            ),
+            std::time::Instant::now(),
+        ));
+    };
+    let (orch_config, saved_start_idx) =
+        match resolve_orchestration_for_restore(orch_snap, &saved_pane.dir) {
+            Ok(resolved) => resolved,
+            Err(reason) => return not_restored(ui, reason),
+        };
+    match restore_trust_gate(pane, saved_pane, orch_snap, &orch_config) {
+        crate::trust_prompt::Gate::Open(config) => match restore_orchestration_tab(
+            ui,
+            pane,
+            state,
+            tab_manager,
+            frame_area,
+            saved_pane,
+            orch_snap,
+            &config,
+            saved_start_idx,
+        ) {
+            Ok(tab_idx) => {
+                tab_manager.switch_to(tab_idx);
+            }
+            Err(e) => not_restored(ui, e),
+        },
+        crate::trust_prompt::Gate::Prompt(view) => {
+            let held = PendingTrustRestore {
+                saved_pane: saved_pane.clone(),
+                view: view.clone(),
+            };
+            open_trust_prompt(ui, view, TrustPromptPurpose::Restore(held));
+        }
+        crate::trust_prompt::Gate::Refuse(why) => not_restored(ui, why),
+    }
+}
+
+/// PRD #1885: show the next held-back restore's trust prompt once the deck is
+/// free for it — on the dashboard or in a pane, with no other dialog open — so
+/// each one is asked about in turn and none of them blocks the rest of the
+/// session from restoring first.
+fn open_next_trust_restore(ui: &mut UiState) {
+    if ui.trust_prompt.is_some() || !matches!(ui.mode, UiMode::Normal | UiMode::PaneInput) {
+        return;
+    }
+    if let Some(pending) = ui.pending_trust_restores.pop_front() {
+        let view = pending.view.clone();
+        open_trust_prompt(ui, view, TrustPromptPurpose::Restore(pending));
+    }
+}
+
 /// PRD #89 M2b.3 — re-resolve the `OrchestrationConfig` for a snapshot's
 /// orchestration metadata on the daemon-empty restore path.
 ///
@@ -12050,8 +13462,9 @@ pub fn should_apply_snapshot(state: &AppState) -> bool {
 ///   added/removed/renamed/reordered) — the tab the user saved no longer
 ///   exists as saved.
 ///
-/// On `Err`, the caller surfaces the reason via `session_warnings` and falls
-/// back to a PLAIN dashboard pane (never a half-broken orchestration tab).
+/// On `Err`, the caller surfaces the reason via `session_warnings` and leaves
+/// the orchestration unrestored (never a half-broken orchestration tab, and,
+/// since PRD #1885, never a plain pane running its saved command unchecked).
 ///
 /// On `Ok`, returns the resolved config AND the validated start-role index to
 /// honor (the SAVED cursor, bounds-checked — PRD #89 review-fix F2/F3), so the
@@ -12067,7 +13480,7 @@ fn resolve_orchestration_for_restore(
     // config at a divergent `project_path` would execute a `.dot-agent-deck.toml`
     // an attacker controls. Canonicalize both and refuse to re-resolve unless
     // they name the same directory; a divergence (or a `project_path` that no
-    // longer resolves) is treated as drift -> plain-pane fallback, so the
+    // longer resolves) is treated as drift -> left unrestored, so the
     // planted config is never executed.
     let project_dir = std::path::Path::new(&snap.project_path);
     let canon_project = project_dir.canonicalize().map_err(|e| {
@@ -12137,11 +13550,11 @@ fn resolve_orchestration_for_restore(
     // is structurally valid yet role-less, and a tampered cursor could point
     // past the end. Either would index an empty/short `role_pane_ids` and panic
     // at startup (crash-loop). Treat an out-of-range cursor — which includes
-    // every index of an empty role set — as drift, so the caller falls back to
-    // a plain pane instead of panicking.
+    // every index of an empty role set — as drift, so the caller leaves it
+    // unrestored instead of panicking.
     if snap.start_role_index >= orch.roles.len() {
         return Err(format!(
-            "orchestration '{}' has no role at saved start index {} (role count {}) — falling back",
+            "orchestration '{}' has no role at saved start index {} (role count {})",
             snap.config_name,
             snap.start_role_index,
             orch.roles.len()
@@ -12302,6 +13715,44 @@ struct TerminalModes {
     restore: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// The mouse reporting the deck asks its terminal for: presses, releases,
+/// motion **while a button is held** (drags) and the wheel, in SGR encoding
+/// (`?1000h ?1002h ?1015h ?1006h`).
+///
+/// PRD #385 M4: this is crossterm's [`crossterm::event::EnableMouseCapture`]
+/// without its `?1003h` (any-event tracking), which made the terminal report
+/// every pointer movement over the window, button or not. The deck has no use
+/// for those reports: the pane mouse arm ignores bare motion, the focus claim
+/// excludes it (`focus_report::focus_signal`), and a child pane is forwarded
+/// the wheel only (`EmbeddedPaneController::forward_mouse_scroll`), never
+/// motion. The disable side keeps crossterm's
+/// [`crossterm::event::DisableMouseCapture`], whose `?1003l` is harmless and
+/// turns off a stale any-event mode another program may have left on.
+///
+/// On a Windows console without ANSI support it falls back to crossterm's
+/// console-mode call, which has no per-mode switch to drop.
+#[derive(Debug, Clone, Copy)]
+struct EnableButtonMouseCapture;
+
+/// The bytes [`EnableButtonMouseCapture`] writes, in crossterm's order.
+const BUTTON_MOUSE_CAPTURE_ON: &str = "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
+
+impl crossterm::Command for EnableButtonMouseCapture {
+    fn write_ansi(&self, f: &mut impl std::fmt::Write) -> std::fmt::Result {
+        f.write_str(BUTTON_MOUSE_CAPTURE_ON)
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> std::io::Result<()> {
+        crossterm::Command::execute_winapi(&crossterm::event::EnableMouseCapture)
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
 impl Default for TerminalModes {
     fn default() -> Self {
         Self {
@@ -12327,7 +13778,7 @@ impl TerminalModes {
         // On an error the `?` drops `guard`, which writes the disables.
         crossterm::execute!(
             guard.out,
-            crossterm::event::EnableMouseCapture,
+            EnableButtonMouseCapture,
             crossterm::event::EnableBracketedPaste,
             crossterm::event::EnableFocusChange,
         )?;
@@ -12473,9 +13924,25 @@ fn handle_key_event(
     let kb = ui.keybindings.clone();
     let is_ctrl_c = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
 
+    // PRD #385 M5: copy mode takes every key while it is open, ahead of the
+    // global shortcuts, except `Ctrl+C`, which leaves it for the quit dialog
+    // as every other modal's handler does.
+    if ui.mode == UiMode::CopyMode {
+        action = Some(if is_ctrl_c {
+            leave_copy_mode(ui);
+            ui.quit_confirm_selected = 0;
+            ui.mode = UiMode::QuitConfirm;
+            Action::Continue
+        } else {
+            handle_copy_mode_key(key, ui)
+        });
+    }
+
     // Jump-to-card in Normal mode (defaults 1..9): focus card N. PRD #40
-    // resolves the digits from config so they can be remapped.
-    if !is_ctrl_c && ui.mode == UiMode::Normal {
+    // resolves the digits from config so they can be remapped. PRD #385: only
+    // for a key nothing above took, so a copy-mode key that has just left
+    // copy mode for command mode (`y`, `q`, ...) is not also a jump.
+    if action.is_none() && !is_ctrl_c && ui.mode == UiMode::Normal {
         const JUMP_ACTIONS: [KbAction; 9] = [
             KbAction::Jump1,
             KbAction::Jump2,
@@ -12703,6 +14170,17 @@ fn handle_key_event(
                 Action::Continue
             }
             UiMode::Upgrade => handle_upgrade_key(key, ui),
+            // Resolved before the shortcuts above, so never reached here.
+            UiMode::CopyMode => Action::Continue,
+            // PRD #1885: `Ctrl+C` keeps its PRD #40 safety net; leaving for
+            // the quit flow cancels the prompt, approving and spawning nothing.
+            UiMode::TrustPrompt if is_ctrl_c => {
+                cancel_trust_prompt(ui);
+                ui.quit_confirm_selected = 0;
+                ui.mode = UiMode::QuitConfirm;
+                Action::Continue
+            }
+            UiMode::TrustPrompt => handle_trust_prompt_key(key, ui),
         });
     }
 
@@ -12739,43 +14217,82 @@ fn handle_key_event(
     flow
 }
 
-pub fn run_tui(
-    state: SharedState,
-    pane: Arc<dyn PaneController>,
-    config: DashboardConfig,
-    keybindings: KeybindingConfig,
-    startup_hooks: Option<crate::hooks_refresh::StartupNote>,
-) -> std::io::Result<()> {
+/// The `run_tui` panic hook: `teardown` (restore the terminal, then report)
+/// runs for every panic except one the deck contains and recovers from.
+///
+/// A panic inside a guarded vt100 feed (see
+/// `embedded_pane::guarded_parser_feed`) is caught by the caller and must
+/// NOT tear down the live terminal — doing so would yank the alternate
+/// screen out from under the render loop and exit the TUI, exactly the
+/// crash this guard exists to prevent. Leave the terminal untouched and
+/// let `catch_unwind` swallow it (the caller logs and drops the chunk).
+///
+/// PRD #227 audit item C: gated on `panic = "unwind"`, which is every
+/// official build (`Cargo.toml` defines no `panic = "abort"` profile).
+/// The early return is only correct BECAUSE the panic is recoverable:
+/// under `panic = "abort"` nothing can catch it, `catch_unwind` never
+/// runs, `KeyboardEnhancementGuard::drop` never runs, and the process
+/// dies moments later — so returning here would leak the enhanced
+/// keyboard mode into the user's shell, the single failure mode this
+/// milestone exists to prevent. In an abort build the whole `if` is
+/// compiled out and the guarded case falls through to `teardown`, which is the right trade when the deck is dying anyway.
+///
+/// NOT solvable by simply moving the pop above this return: under unwind
+/// that would pop on every RECOVERED guarded-parser panic and silently
+/// disable Shift+Enter (and every other modifier-bearing key) for the
+/// rest of a session that keeps running perfectly well.
+///
+/// PRD #385: a panic on the native clipboard's worker thread is contained the
+/// same way. That thread runs under `catch_unwind` for its whole life
+/// (`clipboard::in_clipboard_worker`) and settles the native clipboard as
+/// unavailable, so copies go on as OSC 52 only; tearing the terminal down
+/// for it would leave a running TUI drawing on a restored shell. The hook
+/// notes that panic's location instead, for the warning the worker logs when
+/// it catches it. A panic on a thread arboard starts for itself is not on
+/// that thread and is not covered.
+pub(crate) fn tui_panic_hook<F>(
+    teardown: F,
+) -> impl Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static
+where
+    F: Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static,
+{
+    move |info| {
+        #[cfg(panic = "unwind")]
+        {
+            if crate::clipboard::in_clipboard_worker() {
+                // The worker catches this panic and logs it; the location is
+                // only available here.
+                crate::clipboard::note_clipboard_worker_panic(info);
+                return;
+            }
+            if crate::embedded_pane::in_guarded_parser_feed() {
+                return;
+            }
+        }
+        teardown(info);
+    }
+}
+
+/// Set the terminal up for the TUI, in the order its teardown relies on: the
+/// panic hook, then mouse capture, bracketed paste and focus reporting, then
+/// raw mode and the alternate screen ([`crate::wide_glyph_backend::init`]).
+///
+/// The hook installed here is the one that hands the terminal back on a
+/// panic, and it asks [`tui_panic_hook`]'s contained-panic policy first, so a
+/// panic the deck recovers from (a guarded parser feed, the native clipboard's
+/// worker) leaves raw mode and the alternate screen on for the TUI that keeps
+/// running. `wide_glyph_backend::init` installs no hook of its own for that
+/// reason: ratatui's `init` puts an unconditional restore in front of every
+/// hook installed before it (PRD #385). `clipboard/native/004` runs this
+/// function in a pseudo-terminal and checks both outcomes.
+fn enter_tui_terminal() -> std::io::Result<(
+    TerminalModesGuard<std::io::Stdout>,
+    crate::wide_glyph_backend::DeckTerminal,
+)> {
     let terminal_modes = TerminalModes::default();
     let hook_terminal_modes = terminal_modes.clone();
     let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        // A panic inside a guarded vt100 feed (see
-        // `embedded_pane::guarded_parser_feed`) is caught by the caller and must
-        // NOT tear down the live terminal — doing so would yank the alternate
-        // screen out from under the render loop and exit the TUI, exactly the
-        // crash this guard exists to prevent. Leave the terminal untouched and
-        // let `catch_unwind` swallow it (the caller logs and drops the chunk).
-        //
-        // PRD #227 audit item C: gated on `panic = "unwind"`, which is every
-        // official build (`Cargo.toml` defines no `panic = "abort"` profile).
-        // The early return is only correct BECAUSE the panic is recoverable:
-        // under `panic = "abort"` nothing can catch it, `catch_unwind` never
-        // runs, `KeyboardEnhancementGuard::drop` never runs, and the process
-        // dies moments later — so returning here would leak the enhanced
-        // keyboard mode into the user's shell, the single failure mode this
-        // milestone exists to prevent. In an abort build the whole `if` is
-        // compiled out and the guarded case falls through to the full teardown
-        // below, which is the right trade when the deck is dying anyway.
-        //
-        // NOT solvable by simply moving the pop above this return: under unwind
-        // that would pop on every RECOVERED guarded-parser panic and silently
-        // disable Shift+Enter (and every other modifier-bearing key) for the
-        // rest of a session that keeps running perfectly well.
-        #[cfg(panic = "unwind")]
-        if crate::embedded_pane::in_guarded_parser_feed() {
-            return;
-        }
+    std::panic::set_hook(Box::new(tui_panic_hook(move |info| {
         // PRD #227 M2: pop the keyboard-enhancement flag on the crash path too.
         // Unlike mouse capture, a leaked push is not merely cosmetic — it
         // survives the process and corrupts key delivery in the shell the user
@@ -12788,7 +14305,7 @@ pub fn run_tui(
         // property the modes always had.
         hook_terminal_modes.disable(&mut std::io::stdout());
         original_hook(info);
-    }));
+    })));
 
     // Enable mouse capture and bracketed paste so events reach our event loop.
     //
@@ -12797,14 +14314,26 @@ pub fn run_tui(
     // signal the focus claim in `crate::focus_report` is built on. Where the
     // terminal does not report focus, input stands in.
     //
-    // Held as an RAII guard, for the reason `_keyboard_enhancement` is below:
-    // the event loop returns early via `?` on any terminal I/O error, which
-    // would skip the explicit teardown and leave all three modes on in the
-    // user's shell. Declared before `_keyboard_enhancement`, so on those
-    // returns it drops after it — the same order as the explicit teardown.
-    let mut terminal_modes = terminal_modes.enable(std::io::stdout())?;
+    // Returned as an RAII guard, for the reason `run_tui` holds
+    // `_keyboard_enhancement` as one: the event loop returns early via `?` on
+    // any terminal I/O error, which would skip the explicit teardown and leave
+    // all three modes on in the user's shell. `run_tui` binds it before
+    // `_keyboard_enhancement`, so on those returns it drops after it — the
+    // same order as the explicit teardown.
+    let terminal_modes = terminal_modes.enable(std::io::stdout())?;
 
-    let mut terminal = ratatui::init();
+    let terminal = crate::wide_glyph_backend::init();
+    Ok((terminal_modes, terminal))
+}
+
+pub fn run_tui(
+    state: SharedState,
+    pane: Arc<dyn PaneController>,
+    config: DashboardConfig,
+    keybindings: KeybindingConfig,
+    startup_hooks: Option<crate::hooks_refresh::StartupNote>,
+) -> std::io::Result<()> {
+    let (mut terminal_modes, mut terminal) = enter_tui_terminal()?;
 
     // PRD #227 M2: raw mode and the alternate screen are up, so negotiate the
     // enhanced keyboard protocol now — before the event loop starts polling,
@@ -12867,6 +14396,10 @@ pub fn run_tui(
 
     let mut tick: u64 = 0;
     let mut ui = UiState::new(config, keybindings);
+    // PRD #385: where a pane selection is copied to. Created here so the
+    // native clipboard, once opened at the first copy, lives as long as the
+    // deck does (X11/Wayland serve a copy from the process that made it).
+    let mut clipboard = crate::clipboard::SystemClipboard::new(copy_to_clipboard_osc52);
     let startup_hook_status = surface_startup_hook_note(&mut ui, startup_hooks);
     // PRD #196: restore the persisted global last-command so the new-pane form
     // can seed from it from the very first spawn of the session. Loaded
@@ -13386,180 +14919,81 @@ pub fn run_tui(
             // `OrchestrationConfig` from `project_path` + `config_name`. On
             // success we `continue`; on drift (config gone, orchestration
             // renamed/removed, role set changed) we push a clear warning NAMING
-            // the orchestration and fall through to the plain-pane restore below
-            // — never a half-broken tab. Unlike warm-daemon hydration (session/restore/007), this
+            // the orchestration and leave it unrestored — never a half-broken
+            // tab, and (PRD #1885) never a plain pane running its saved command
+            // without a trust check. Unlike warm-daemon hydration (session/restore/007), this
             // path REPLAYS the saved `orchestrator_prompt` to the start role —
             // there is no live agent with the prompt already in scrollback.
             if let Some(ref orch_snap) = saved_pane.orchestration {
                 match resolve_orchestration_for_restore(orch_snap, &saved_pane.dir) {
                     Ok((orch_config, saved_start_idx)) => {
                         let frame_area = terminal.get_frame().area();
-                        // All roles share spawn dims (Tiled); role_index=0 so the
-                        // helper falls back to "role 0 expanded" — the per-frame
-                        // `resize_panes_to_layout` reconciles the exact rects once
-                        // the tab is active. Mirrors the live new-pane path.
-                        let spawn_dims = orchestration_role_pane_dims(
+                        // PRD #1885: a saved orchestration restores only when its
+                        // commands and prompts are approved as they now read.
+                        // One that is not is held back for its own trust prompt
+                        // once the deck is up, and nothing of it spawns until
+                        // then; it is not restored as a plain pane either.
+                        let orch_config =
+                            match restore_trust_gate(&*pane, saved_pane, orch_snap, &orch_config) {
+                                crate::trust_prompt::Gate::Open(config) => config,
+                                crate::trust_prompt::Gate::Prompt(view) => {
+                                    ui.pending_trust_restores.push_back(PendingTrustRestore {
+                                        saved_pane: saved_pane.clone(),
+                                        view,
+                                    });
+                                    continue;
+                                }
+                                crate::trust_prompt::Gate::Refuse(reason) => {
+                                    ui.session_warnings.push(
+                                        crate::untrusted_text::escape_control_and_bidi(&format!(
+                                            "Warning: orchestration '{}' was not restored: \
+                                             {reason}",
+                                            orch_snap.config_name
+                                        )),
+                                    );
+                                    continue;
+                                }
+                            };
+                        match restore_orchestration_tab(
+                            &mut ui,
+                            &*pane,
+                            &state,
+                            &mut tab_manager,
                             frame_area,
-                            orch_config.roles.len(),
-                            0,
-                            PaneLayout::Tiled,
-                            true,
-                            // PRD #336: a restored tab adopts the current
-                            // global split, like any other tab. The global is
-                            // not persisted across launches, so a restore at
-                            // startup lands on the 34/66 default.
-                            tab_manager.orchestration_split_narrow(),
-                        );
-                        // Empty saved prompt → `None` so nothing is posted
-                        // (matching the live path's "no prompt" semantics); a
-                        // non-empty prompt is posted to the start role's inbox
-                        // again.
-                        let replay_prompt = (!orch_snap.orchestrator_prompt.is_empty())
-                            .then(|| orch_snap.orchestrator_prompt.clone());
-                        // PRD #89 review-fix F3: honor the SAVED start cursor,
-                        // even when it differs from the role the config seats
-                        // now, so the prompt's post and the landing focus
-                        // target the role the user left as start. Issue #523
-                        // review: passed as the tab's SEAT rather than patched
-                        // onto `start_role_index` afterwards, so the membership
-                        // the daemon registers (who may `delegate`) and the Pi
-                        // seed name that same role — one orchestrator, not a
-                        // prompt on one pane and delegate rights on another.
-                        match tab_manager.open_orchestration_tab_restoring(
+                            saved_pane,
+                            orch_snap,
                             &orch_config,
-                            &saved_pane.dir,
-                            replay_prompt,
-                            // PRD #89 review-fix F4: thread the saved user title
-                            // so the rebuilt tab comes back under the user's name
-                            // rather than the canonical config/cwd name. `None`
-                            // when unset falls back to the canonical name.
-                            orch_snap.display_title.as_deref(),
-                            spawn_dims,
-                            Some(saved_start_idx),
-                            // Issue #929: only the roles that were running when
-                            // the snapshot was saved; an old snapshot, every role.
-                            &orch_snap.roles_to_start_on_restore(orch_config.roles.len()),
+                            saved_start_idx,
                         ) {
-                            Ok((tab_idx, role_pane_ids)) => {
-                                // Snapshot each role pane's daemon agent_id before
-                                // the placeholder insert so the strict-equality
-                                // reuse guard accepts each role agent's first
-                                // `SessionStart` (mirrors the live path).
-                                let role_agent_ids: Vec<Option<String>> = role_pane_ids
-                                    .iter()
-                                    .map(|id| pane.pane_agent_id(id))
-                                    .collect();
-                                // PRD #1666 part 2 (G-fix7): each card stamped
-                                // from the attach that produced its pane.
-                                let role_attached_on: Vec<_> = role_pane_ids
-                                    .iter()
-                                    .map(|id| pane.pane_incarnation(id))
-                                    .collect();
-                                {
-                                    let mut st = state.blocking_write();
-                                    for ((id, agent_id), attached_on) in role_pane_ids
-                                        .iter()
-                                        .zip(role_agent_ids.iter())
-                                        .zip(role_attached_on)
-                                    {
-                                        // Issue #929: a role restore did not
-                                        // start keeps its card through a
-                                        // placeholder on its dead-slot id, as
-                                        // on a tab rebuilt from a daemon; it is
-                                        // no pane, so it is not registered.
-                                        if is_dead_slot_pane_id(id) {
-                                            st.insert_placeholder_session(
-                                                id.clone(),
-                                                Some(saved_pane.dir.clone()),
-                                                None,
-                                                None,
-                                            );
-                                            continue;
-                                        }
-                                        st.register_pane(id.clone());
-                                        let learned_from = attached_on
-                                            .unwrap_or_else(|| st.stream_incarnation.clone());
-                                        st.insert_placeholder_session_learned(
-                                            id.clone(),
-                                            Some(saved_pane.dir.clone()),
-                                            None,
-                                            agent_id.clone(),
-                                            learned_from,
-                                        );
-                                    }
-                                    // Issue #462: `pane_orchestration_map` is
-                                    // deliberately omitted here too — the
-                                    // daemon-empty snapshot restore runs in the
-                                    // TUI process, which never routes. The full
-                                    // reasoning, including the `None == None`
-                                    // degeneracy in `delegate_targets` that a
-                                    // TUI-side router would silently hit, is on
-                                    // the first of these registrations in
-                                    // `surface_one_orchestration`.
-                                    // The tab's seat — the saved cursor (above).
-                                    for (i, role) in orch_config.roles.iter().enumerate() {
-                                        if is_dead_slot_pane_id(&role_pane_ids[i]) {
-                                            continue;
-                                        }
-                                        st.pane_role_map
-                                            .insert(role_pane_ids[i].clone(), role.name.clone());
-                                        st.pane_cwd_map.insert(
-                                            role_pane_ids[i].clone(),
-                                            saved_pane.dir.clone(),
-                                        );
-                                        if i == saved_start_idx {
-                                            st.orchestrator_pane_ids
-                                                .insert(role_pane_ids[i].clone());
-                                        }
-                                    }
-                                }
-                                for (i, role) in orch_config.roles.iter().enumerate() {
-                                    ui.pane_display_names
-                                        .insert(role_pane_ids[i].clone(), role.name.clone());
-                                    ui.pane_names
-                                        .insert(role_pane_ids[i].clone(), role.name.clone());
-                                    // Issue #308: a restored role keeps its
-                                    // declared badge, so a session restore looks
-                                    // like the tab that was saved rather than
-                                    // reverting every launcher role to
-                                    // "No agent".
-                                    if let Some(declared) = role.declared_agent_type() {
-                                        ui.pane_declared_agent
-                                            .insert(role_pane_ids[i].clone(), declared);
-                                    }
-                                }
-                                // Re-capture the orchestration metadata onto the
-                                // start role pane so a later snapshot keeps the
-                                // tab (only the start role carries the block).
-                                // PRD #89 review-fix F3: key it under the SAVED
-                                // (validated) start cursor — consistent with the
-                                // honored start role above — not the config
-                                // default, so a re-save preserves the saved
-                                // cursor on the same pane that carries the block.
-                                ui.pane_metadata.insert(
-                                    role_pane_ids[saved_start_idx].clone(),
-                                    saved_pane.clone(),
-                                );
+                            Ok(tab_idx) => {
                                 if first_restored_orch_tab.is_none() {
                                     first_restored_orch_tab = Some(tab_idx);
                                 }
                                 continue;
                             }
                             Err(e) => {
-                                ui.session_warnings.push(format!(
-                                    "Warning: failed to rebuild orchestration '{}': {e}; restoring '{}' as a plain pane",
-                                    orch_snap.config_name, saved_pane.name
-                                ));
-                                // Fall through to the plain-pane restore below.
+                                ui.session_warnings.push(
+                                    crate::untrusted_text::escape_control_and_bidi(&format!(
+                                        "Warning: failed to rebuild orchestration '{}': {e}; \
+                                         it was not restored",
+                                        orch_snap.config_name
+                                    )),
+                                );
+                                continue;
                             }
                         }
                     }
                     Err(reason) => {
-                        ui.session_warnings.push(format!(
-                            "Warning: {reason}; restoring '{}' as a plain pane",
-                            saved_pane.name
-                        ));
-                        // Fall through to the plain-pane restore below.
+                        // PRD #1885: a snapshot that no longer resolves cannot
+                        // be trust-checked, so it stays unrestored. Restoring
+                        // it as a plain pane would run its saved command — the
+                        // start role's, as captured — with no approval.
+                        ui.session_warnings
+                            .push(crate::untrusted_text::escape_control_and_bidi(&format!(
+                                "Warning: {reason}; orchestration '{}' was not restored",
+                                orch_snap.config_name
+                            )));
+                        continue;
                     }
                 }
             }
@@ -13759,6 +15193,8 @@ pub fn run_tui(
             ui.status_message = None;
         }
 
+        refresh_schedule_refusals_if_due(&mut ui, std::time::Instant::now(), schedule_refusals);
+
         // Issue #949 — notice a moved position (active tab / focused pane) and
         // mark the snapshot dirty, so the flush below has something to write.
         // Before the flush, not after: otherwise the move is a frame late every
@@ -13874,6 +15310,8 @@ pub fn run_tui(
         // last pass is on screen in this one, not a 16 ms input poll later,
         // and its shown age starts from what the daemon reported.
         poll_host_metrics(&mut ui, std::time::Instant::now());
+        // PRD #1885: a saved orchestration held back for approval asks now.
+        open_next_trust_restore(&mut ui);
         // PRD #1666 §6.4: the picker shows the daemon's current rows.
         poll_inbox_attention(&mut ui, &snapshot);
 
@@ -14042,6 +15480,7 @@ pub fn run_tui(
                 let _ = event::read()?;
             }
         }
+        clear_selection_on_tab_switch(&mut ui, deck_key(tab_manager.active_tab()));
         draw_frame(
             &mut terminal,
             &mut ui,
@@ -14183,6 +15622,12 @@ pub fn run_tui(
                         // The former reads that section back off the existing
                         // file first and carries it forward, falling back to
                         // today's no-task behavior when there is none.
+                        //
+                        // PRD #1885: and only the approved text. A warm
+                        // reattach adopted `config` from the file without a
+                        // trust check, so it is checked here, before anything
+                        // is published from it.
+                        && rearm_trust_gate(&mut ui, &*pane, config, cwd)
                         && let Some(published) =
                             reassert_orchestrator_prompt(config, cwd, context_path.as_deref())
                     {
@@ -14309,7 +15754,18 @@ pub fn run_tui(
                                     >= CLEAR_REASSERT_RETRY_FLOOR
                             });
 
-                    if no_delivery_pending && !permanently_excluded && retry_floor_ok {
+                    if no_delivery_pending
+                        && !permanently_excluded
+                        && retry_floor_ok
+                        && !rearm_trust_gate(&mut ui, &*pane, config, cwd)
+                    {
+                        // PRD #1885: not the approved text, and the gate said
+                        // why. This `/clear` is settled — retrying it every
+                        // frame would only repeat the refusal.
+                        ui.orchestration_remit_clear_reasserted_at
+                            .insert(*id, latest_clear);
+                        ui.orchestration_remit_clear_retry_at.remove(id);
+                    } else if no_delivery_pending && !permanently_excluded && retry_floor_ok {
                         ui.orchestration_remit_clear_retry_at.insert(*id, orch_now);
                         // See the compaction re-arm's identical comment above:
                         // `reassert_orchestrator_prompt` reads any existing
@@ -14400,8 +15856,12 @@ pub fn run_tui(
             // the user's own terminal — write-only, validated by
             // `osc52::osc52_copy_text`, and only the newest when several
             // arrived in one frame, since each would replace the last.
+            //
+            // PRD #385 left this OSC 52-only on purpose: giving an agent's
+            // escape sequence write access to the native clipboard is a
+            // separate decision, so it does not go through `clipboard`.
             if let Some(text) = embedded.take_clipboard_copy() {
-                copy_to_clipboard_osc52(&text);
+                let _ = copy_to_clipboard_osc52(&text);
             }
             let rejections = embedded.take_stream_rejections();
             if !rejections.is_empty() {
@@ -14508,6 +15968,12 @@ pub fn run_tui(
                 break; // re-render; layout-driven resize handles PTY sizing
             }
 
+            // PRD #385: a pane drag held while the terminal loses focus is
+            // over; a release reported later must not copy.
+            if matches!(ev, Event::FocusLost) {
+                cancel_pane_gesture(&mut ui);
+            }
+
             // PRD #20 R20-007: input rejection with VISIBLE feedback. A focused
             // pane can go non-live (a wrapped Codex session that declared
             // history-only, or a view-only target) WHILE the user is in
@@ -14561,8 +16027,46 @@ pub fn run_tui(
                 break;
             }
 
+            // PRD #385 M5: copy mode is keyboard-only. Its pane shows a frozen
+            // screen, so a mouse selection or a wheel scroll there would act on
+            // text other than what is shown; the mouse is ignored until it
+            // closes.
+            if matches!(ev, Event::Mouse(_)) && ui.mode == UiMode::CopyMode {
+                if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                    break;
+                }
+                continue;
+            }
+
             // Handle mouse events: scroll, text selection, and copy.
             if let Event::Mouse(mouse) = ev {
+                // PRD #385 M3: a press clears a kept selection before anything
+                // else handles it.
+                clear_selection_on_press(&mut ui, &mouse);
+                // PRD #385: an overlay opened since the press (a key in the
+                // same burst can open one before any frame) owns the pointer
+                // now, so the pane's gesture ends here and its release falls
+                // to the overlay's handling below.
+                cancel_pane_gesture_under_overlay(&mut ui);
+                // PRD #385: the drag and release of a gesture that started in a
+                // pane are the pane's, before any card, button or tab under the
+                // pointer sees them: the release copies wherever it lands.
+                if pane_owns_gesture(&ui, &mouse) {
+                    match pane.as_any().downcast_ref::<EmbeddedPaneController>() {
+                        Some(embedded) => pane_selection_mouse_live(
+                            &mut ui,
+                            embedded,
+                            &mouse,
+                            &mut tab_manager,
+                            &mut clipboard,
+                        ),
+                        None => ui.pane_drag = false,
+                    }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
                 // PRD #80 M2/M3: clickable affordances take precedence. A
                 // left-button Down on a recorded rect fires its Action through
                 // the SAME `dispatch_action` funnel as the keystroke, then
@@ -14626,6 +16130,17 @@ pub fn run_tui(
                         let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
                         dialog.scroll_by(if up { -1 } else { 1 });
                     }
+                    if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
+                        break;
+                    }
+                    continue;
+                }
+
+                // PRD #1885: the wheel over the trust prompt scrolls its review,
+                // as ↑/↓ do; anywhere else it is swallowed below.
+                if is_scroll && ui.mode == UiMode::TrustPrompt {
+                    let up = matches!(mouse.kind, crossterm::event::MouseEventKind::ScrollUp);
+                    scroll_trust_prompt(&mut ui, up, mouse.column, mouse.row);
                     if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                         break;
                     }
@@ -15016,201 +16531,67 @@ pub fn run_tui(
                                 std::time::Instant::now(),
                             );
                         }
+                        // Ctrl+click opens hyperlinks.
                         crossterm::event::MouseEventKind::Down(
                             crossterm::event::MouseButton::Left,
-                        ) => {
-                            // Ctrl+click opens hyperlinks.
-                            let has_modifier = mouse
-                                .modifiers
-                                .contains(crossterm::event::KeyModifiers::CONTROL);
-                            if has_modifier {
-                                // Issue #362: the same content-area hit test the
-                                // wheel arm above now uses.
-                                if let Some(rect) = ui.focused_pane_rect
-                                    && let Some((_, row)) =
-                                        pane_inner_coords(rect, mouse.column, mouse.row)
-                                    && let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
-                                    && let Ok(hmap) = hmap_arc.lock()
-                                    && let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                    && let Ok(parser) = screen_arc.lock()
-                                {
-                                    let offset = screen_row_offset(parser.screen(), rect);
-                                    let screen_row = row + offset;
-                                    if let Some(url) = hmap.get_row(screen_row) {
-                                        let url = url.to_string();
-                                        drop(parser);
-                                        drop(hmap);
-                                        if open::that(&url).is_ok() {
-                                            ui.status_message = Some((
-                                                opened_link_status(&url),
-                                                std::time::Instant::now(),
-                                            ));
-                                        }
-                                    }
-                                }
-                            } else if let Some(rect) = ui.focused_pane_rect {
-                                // Issue #362: same content-area hit test as above.
-                                let inner = pane_inner_rect(rect);
-                                let (inner_w, inner_h) = (inner.width, inner.height);
-                                if let Some((col, row)) =
+                        ) if mouse
+                            .modifiers
+                            .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                        {
+                            // Issue #362: the same content-area hit test the
+                            // wheel arm above now uses.
+                            if let Some(rect) = ui.focused_pane_rect
+                                && let Some((_, row)) =
                                     pane_inner_coords(rect, mouse.column, mouse.row)
-                                {
-                                    // Detect multi-click (double/triple).
-                                    // Require same row and nearby column (within 3 cells)
-                                    // to handle slight mouse movement between clicks, AND
-                                    // the same click region (PRD #80 review FIX 4) so a
-                                    // card/picker click can't seed a pane double-click.
-                                    // These coords are pane-relative — a distinct region
-                                    // from the screen-coord card/picker clicks.
-                                    let now = std::time::Instant::now();
-                                    let click_count = LastClick::next_count(
-                                        ui.last_click,
-                                        now,
-                                        col,
-                                        row,
-                                        ClickRegion::Pane,
-                                    );
-                                    ui.last_click = Some(LastClick {
-                                        at: now,
-                                        col,
-                                        row,
-                                        count: click_count,
-                                        region: ClickRegion::Pane,
-                                    });
-
-                                    match click_count {
-                                        2 => {
-                                            // Double-click: select word.
-                                            if let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                                && let Ok(parser) = screen_arc.lock()
-                                            {
-                                                let offset =
-                                                    screen_row_offset(parser.screen(), rect);
-                                                let (wstart, wend) = word_bounds_at(
-                                                    parser.screen(),
-                                                    row,
-                                                    col,
-                                                    offset,
-                                                );
-                                                ui.selection = Some(TextSelection {
-                                                    start_col: wstart,
-                                                    start_row: row,
-                                                    end_col: wend,
-                                                    end_row: row,
-                                                    pane_rect: rect,
-                                                });
-                                            }
-                                        }
-                                        3 => {
-                                            // Triple-click: select paragraph (contiguous
-                                            // non-blank lines around the clicked row).
-                                            if let Some(screen_arc) = embedded.get_screen(&pane_id)
-                                                && let Ok(parser) = screen_arc.lock()
-                                            {
-                                                let offset =
-                                                    screen_row_offset(parser.screen(), rect);
-                                                let screen = parser.screen();
-                                                let screen_rows = crate::vt_grid::size(screen).0;
-                                                let is_blank_row = |wr: u16| -> bool {
-                                                    let sr = wr + offset;
-                                                    if sr >= screen_rows {
-                                                        return true;
-                                                    }
-                                                    let cols = crate::vt_grid::size(screen).1;
-                                                    (0..cols).all(|c| {
-                                                        screen
-                                                            .cell(sr, c)
-                                                            .map(|cell| {
-                                                                let ch = cell.contents();
-                                                                ch.is_empty()
-                                                                    || ch.trim().is_empty()
-                                                            })
-                                                            .unwrap_or(true)
-                                                    })
-                                                };
-                                                let mut start_r = row;
-                                                while start_r > 0 && !is_blank_row(start_r - 1) {
-                                                    start_r -= 1;
-                                                }
-                                                let mut end_r = row;
-                                                while end_r + 1 < inner_h
-                                                    && !is_blank_row(end_r + 1)
-                                                {
-                                                    end_r += 1;
-                                                }
-                                                ui.selection = Some(TextSelection {
-                                                    start_col: 0,
-                                                    start_row: start_r,
-                                                    end_col: inner_w.saturating_sub(1),
-                                                    end_row: end_r,
-                                                    pane_rect: rect,
-                                                });
-                                            }
-                                        }
-                                        _ => {
-                                            // Single click: start drag selection.
-                                            ui.selection = Some(TextSelection {
-                                                start_col: col,
-                                                start_row: row,
-                                                end_col: col,
-                                                end_row: row,
-                                                pane_rect: rect,
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        crossterm::event::MouseEventKind::Drag(
-                            crossterm::event::MouseButton::Left,
-                        ) => {
-                            // Extend selection.
-                            if let Some(ref mut sel) = ui.selection {
-                                let inner_x = sel.pane_rect.x + 1;
-                                let inner_y = sel.pane_rect.y + 1;
-                                let inner_w = sel.pane_rect.width.saturating_sub(2);
-                                let inner_h = sel.pane_rect.height.saturating_sub(2);
-                                sel.end_col = mouse
-                                    .column
-                                    .saturating_sub(inner_x)
-                                    .min(inner_w.saturating_sub(1));
-                                sel.end_row = mouse
-                                    .row
-                                    .saturating_sub(inner_y)
-                                    .min(inner_h.saturating_sub(1));
-                            }
-                        }
-                        crossterm::event::MouseEventKind::Up(
-                            crossterm::event::MouseButton::Left,
-                        ) => {
-                            let was_multiclick =
-                                ui.last_click.map(|l| l.count >= 2).unwrap_or(false);
-                            // Only copy when the selection is a real drag or multi-click,
-                            // not a plain single click.
-                            if let Some(ref sel) = ui.selection
-                                && (was_multiclick
-                                    || sel.start_col != sel.end_col
-                                    || sel.start_row != sel.end_row)
+                                && let Some(hmap_arc) = embedded.get_hyperlinks(&pane_id)
+                                && let Ok(hmap) = hmap_arc.lock()
                                 && let Some(screen_arc) = embedded.get_screen(&pane_id)
                                 && let Ok(parser) = screen_arc.lock()
                             {
-                                let offset = screen_row_offset(parser.screen(), sel.pane_rect);
-                                let text = extract_selection_text(parser.screen(), sel, offset);
-                                if !text.is_empty() {
-                                    copy_to_clipboard_osc52(&text);
-                                    ui.status_message = Some((
-                                        "Copied to clipboard".to_string(),
-                                        std::time::Instant::now(),
-                                    ));
+                                let (shown_rows, _) = pane_viewport(parser.screen(), rect);
+                                if row < shown_rows
+                                    && let Some(url) = hmap.get_row(row)
+                                {
+                                    let url = url.to_string();
+                                    drop(parser);
+                                    drop(hmap);
+                                    if open::that(&url).is_ok() {
+                                        ui.status_message = Some((
+                                            opened_link_status(&url),
+                                            std::time::Instant::now(),
+                                        ));
+                                    }
                                 }
-                            }
-                            // Keep selection visible after multi-click; clear on single-click.
-                            if !was_multiclick {
-                                ui.selection = None;
                             }
                         }
                         _ => {}
                     }
+                }
+                // PRD #385 M2: a left press, drag or release selects in the pane
+                // under the pointer, focused or not; the pane focus above is
+                // only for the wheel and Ctrl+click.
+                if let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
+                    && matches!(
+                        mouse.kind,
+                        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                            | crossterm::event::MouseEventKind::Drag(
+                                crossterm::event::MouseButton::Left
+                            )
+                            | crossterm::event::MouseEventKind::Up(
+                                crossterm::event::MouseButton::Left
+                            )
+                    )
+                    && !mouse
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                {
+                    pane_selection_mouse_live(
+                        &mut ui,
+                        embedded,
+                        &mouse,
+                        &mut tab_manager,
+                        &mut clipboard,
+                    );
                 }
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
@@ -15220,31 +16601,7 @@ pub fn run_tui(
 
             // Handle paste: wrap in bracketed paste sequences if the child app enabled it.
             if let Event::Paste(text) = ev {
-                if ui.mode == UiMode::PaneInput
-                    && let Some(embedded) = pane.as_any().downcast_ref::<EmbeddedPaneController>()
-                    && let Some(pane_id) = embedded.focused_pane_id()
-                {
-                    embedded.reset_scrollback(&pane_id);
-                    let use_bracketed = embedded
-                        .get_screen(&pane_id)
-                        .and_then(|s| s.lock().ok().map(|p| p.screen().bracketed_paste()))
-                        .unwrap_or(false);
-                    let mut payload = Vec::new();
-                    if use_bracketed {
-                        payload.extend_from_slice(b"\x1b[200~");
-                    }
-                    payload.extend_from_slice(text.as_bytes());
-                    if use_bracketed {
-                        payload.extend_from_slice(b"\x1b[201~");
-                    }
-                    let _ = embedded.write_raw_bytes(&pane_id, &payload);
-                    // PRD #76 M2.20: a paste is a forwarded keystroke event
-                    // too — mark the timestamp so a following Enter
-                    // (`Action::ForwardToPane(b"\r")`) is debounced and
-                    // arrives at the agent as a standalone submit, not fused
-                    // with the paste tail.
-                    ui.last_pane_keystroke_at = Some(std::time::Instant::now());
-                }
+                forward_paste(&mut ui, &*pane, &text);
                 if !crossterm::event::poll(std::time::Duration::from_millis(0))? {
                     break;
                 }
@@ -15281,6 +16638,9 @@ pub fn run_tui(
                 &filtered,
                 frame_area,
             );
+            // PRD #385 M5: a yank in copy mode leaves its text for this loop,
+            // which owns the clipboard.
+            deliver_pending_copy(&mut ui, &mut clipboard);
             if flow == Flow::Break {
                 break 'outer;
             }
@@ -15333,6 +16693,7 @@ pub fn run_tui(
         // move behind.
         track_session_focus(&mut ui, &tab_manager);
         session.focus = ui.session_focus.clone();
+        keep_held_trust_restores(&ui, &mut session);
         if session.panes.is_empty() && session.last_command.is_none() && session.focus.is_none() {
             if let Err(e) = config::SavedSession::clear() {
                 ui.session_warnings
@@ -15361,6 +16722,13 @@ pub fn run_tui(
     // Sanitised on the way out — see `flush_session_warnings` for why that
     // happens HERE and not at the fifteen `session_warnings.push` sites.
     flush_session_warnings(&ui.session_warnings, &mut std::io::stderr().lock());
+
+    // PRD #385: let the native clipboard hand what the deck copied to a
+    // clipboard manager (arboard does this on X11 when it is dropped) before
+    // the process exits, bounded so an X server that stopped answering cannot
+    // hold the exit. Best effort; the clipboard's `Drop` is the backstop on
+    // the other ways out of this function.
+    clipboard.shutdown();
 
     Ok(())
 }
@@ -16938,6 +18306,36 @@ fn render_frame(
     // once. This call is what covers a mode change made anywhere outside the
     // drain — the per-frame `reconcile_pane_input_scrollback` drop out of
     // `PaneInput`, a daemon-driven state change, the startup focus.
+    //
+    // PRD #385 M5: copy mode is settled against the panes this frame draws
+    // first, so a copy mode whose pane is gone (including when no pane is
+    // drawn at all) is already closed in this frame's mode and chip.
+    let embedded = pane_controller
+        .as_any()
+        .downcast_ref::<EmbeddedPaneController>();
+    {
+        let FrameContent::Cards {
+            panes_area,
+            pane_rects,
+            ..
+        } = &layout.content;
+        let drawn: &[(String, Rect)] = if panes_area.is_some() {
+            pane_rects
+        } else {
+            &[]
+        };
+        reconcile_copy_mode(ui, embedded, drawn);
+        // PRD #385: a frame that draws no pane leaves no pane to hit-test or
+        // to finish a drag in. Without this the last frame's rects outlive
+        // it, and a drag over blank space where a now-hidden pane was drawn
+        // would select, focus and copy that pane.
+        if panes_area.is_none() {
+            record_drawn_panes(ui, DrawnPanes::default());
+        }
+    }
+    // PRD #385: an overlay opened mid-drag takes the gesture and its
+    // unfinished highlight, before this frame draws either.
+    cancel_pane_gesture_under_overlay(ui);
     let now = std::time::Instant::now();
     observe_command_mode_edge(ui, now);
     let banner_visibility = ui.command_banner.visibility(now);
@@ -16945,11 +18343,6 @@ fn render_frame(
     // PRD #13: the canvas is left unpainted so the terminal's own background
     // shows through (`Color::Reset`). Filling it with an absolute color was
     // the original light-terminal bug — a black slab over a light theme.
-
-    // Determine if we have embedded terminal panes to show on the right.
-    let embedded = pane_controller
-        .as_any()
-        .downcast_ref::<EmbeddedPaneController>();
 
     // PRD #84 M3/M4 — one layout pass per frame (invariant 1). The single
     // `FrameLayout` is computed once by the caller from the live frame area and
@@ -17114,7 +18507,7 @@ fn render_frame(
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
 
         if let Some(right) = panes_area {
-            ui.focused_pane_rect = render_terminal_panes(
+            let drawn = render_terminal_panes(
                 frame,
                 embedded,
                 right,
@@ -17123,6 +18516,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &pane_status,
                 &ui.selection,
+                copy_mode_shown(ui),
                 None,
                 ui.mode,
                 banner_visibility,
@@ -17130,6 +18524,7 @@ fn render_frame(
                 now,
                 zoomed,
             );
+            record_drawn_panes(ui, drawn);
         }
 
         render_overlays(frame, ui);
@@ -17179,7 +18574,7 @@ fn render_frame(
         render_bottom_bar(frame, ui, hints_area, has_pane_control, &ctx_buttons);
         // Still render live terminal panes even when filter matches zero sessions.
         if let Some(right) = panes_area {
-            ui.focused_pane_rect = render_terminal_panes(
+            let drawn = render_terminal_panes(
                 frame,
                 embedded,
                 right,
@@ -17188,6 +18583,7 @@ fn render_frame(
                 &ui.pane_display_names,
                 &pane_status,
                 &ui.selection,
+                copy_mode_shown(ui),
                 None,
                 ui.mode,
                 banner_visibility,
@@ -17195,6 +18591,7 @@ fn render_frame(
                 now,
                 zoomed,
             );
+            record_drawn_panes(ui, drawn);
         }
         render_overlays(frame, ui);
         return;
@@ -17221,7 +18618,7 @@ fn render_frame(
 
     // Render terminal panes on the right side
     if let Some(right) = panes_area {
-        ui.focused_pane_rect = render_terminal_panes(
+        let drawn = render_terminal_panes(
             frame,
             embedded,
             right,
@@ -17230,6 +18627,7 @@ fn render_frame(
             &ui.pane_display_names,
             &pane_status,
             &ui.selection,
+            copy_mode_shown(ui),
             None,
             ui.mode,
             banner_visibility,
@@ -17237,6 +18635,7 @@ fn render_frame(
             now,
             zoomed,
         );
+        record_drawn_panes(ui, drawn);
     }
 
     render_overlays(frame, ui);
@@ -17420,6 +18819,44 @@ fn draw_modal(frame: &mut Frame, area: Rect, ui: &mut UiState) {
             .into_iter()
             .map(|(choice, rect)| (Action::UpgradeChoose(choice), rect))
             .collect();
+    }
+    if ui.mode == UiMode::TrustPrompt
+        && let Some(prompt) = ui.trust_prompt.as_mut()
+    {
+        let action = prompt.action();
+        let layout = crate::trust_prompt::render(frame, area, &prompt.view, action, prompt.scroll);
+        prompt.max_scroll = layout.max_scroll;
+        prompt.scroll = prompt.scroll.min(layout.max_scroll);
+        prompt.drawn_inner = Some(layout.inner);
+        // The approve key's label is the one choice: `a` counts only once a
+        // flushed frame shows it (`refuse_undrawn_choice`). The approve and
+        // cancel labels are its buttons: a click on either counts only where a
+        // flushed frame shows the whole label (`record_flushed_confirmation`).
+        let buttons = [
+            (
+                Action::ApproveProjectTrust,
+                layout.approve,
+                action.approve_label(),
+            ),
+            (
+                Action::CancelTrustPrompt,
+                layout.cancel,
+                crate::trust_prompt::CANCEL_LABEL,
+            ),
+        ]
+        .into_iter()
+        .filter_map(|(target, rect, label)| rect.map(|rect| (target, rect, label.to_string())))
+        .collect();
+        confirmation = Some(ConfirmDrawing {
+            buttons,
+            choices: ConfirmChoices {
+                inner: layout.inner,
+                cells: vec![match layout.footer {
+                    Some((x, y)) => (x, Some(y), action.approve_label().to_string()),
+                    None => (layout.inner.x, None, action.approve_label().to_string()),
+                }],
+            },
+        });
     }
     if ui.mode == UiMode::StopConfirm {
         // M5 adds no buttons to the secondary Stop-confirm dialog (not in the
@@ -18024,6 +19461,47 @@ fn scroll_notice_visible(
         .is_some_and(|armed| now.saturating_duration_since(armed) < COMMAND_BANNER_TTL)
 }
 
+/// What [`render_terminal_panes`] drew, for the mouse and the selection.
+#[derive(Debug, Default)]
+struct DrawnPanes {
+    /// The focused pane's outer rect, when it was drawn.
+    focused: Option<Rect>,
+    /// Every pane drawn, with its outer rect, in drawing order.
+    panes: Vec<(String, Rect)>,
+    /// PRD #385: the selection can no longer be shown as it was copied (its
+    /// pane closed, moved, or its text changed), so it is to be cleared.
+    selection_stale: bool,
+    /// PRD #385 M5: the pane copy mode is open on was not drawn (it closed,
+    /// or is no longer on screen), so copy mode is to be closed.
+    copy_mode_gone: bool,
+}
+
+/// Keep what a frame drew on [`UiState`]: the rects the mouse is hit-tested
+/// against next, and the selection only while it is still showable.
+fn record_drawn_panes(ui: &mut UiState, drawn: DrawnPanes) {
+    ui.focused_pane_rect = drawn.focused;
+    ui.drawn_pane_rects = drawn.panes;
+    if drawn.selection_stale {
+        ui.selection = None;
+    }
+    // PRD #385: a drag still under way in a pane this frame did not draw has
+    // nothing on screen to finish over, so its release must not copy.
+    let drag_pane_hidden = ui.selection.as_ref().is_some_and(|sel| {
+        sel.copied.is_none() && !ui.drawn_pane_rects.iter().any(|(id, _)| *id == sel.pane_id)
+    });
+    if drag_pane_hidden {
+        cancel_pane_gesture(ui);
+    }
+    // PRD #385 M5: copy mode ends with its pane, and its frozen screen is let
+    // go once the UI has left copy mode by any path.
+    if drawn.copy_mode_gone {
+        leave_copy_mode(ui);
+    }
+    if ui.mode != UiMode::CopyMode {
+        ui.copy_mode = None;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn render_terminal_panes(
     frame: &mut Frame,
@@ -18040,6 +19518,10 @@ fn render_terminal_panes(
     // keeps the legacy focus-only border (the `TerminalWidget::new` default).
     pane_status: &HashMap<&str, SessionStatus>,
     selection: &Option<TextSelection>,
+    // PRD #385 M5: the open copy mode, when there is one ([`copy_mode_shown`]).
+    // Its pane is drawn from copy mode's frozen screen, with its cursor and
+    // selection on top.
+    copy_mode: Option<&crate::copy_mode::CopyMode>,
     visual_focus_id: Option<&str>,
     // Issue #88 follow-up / PRD #341 M1+M3: the live `UiState::mode`. Two
     // different questions are asked of it here, and they are NOT complements:
@@ -18079,10 +19561,21 @@ fn render_terminal_panes(
     // nothing else. Every caller that cannot be on a zoomed orchestration tab
     // passes `false`.
     zoomed: bool,
-) -> Option<Rect> {
-    let ctrl = embedded?;
+) -> DrawnPanes {
+    let mut drawn = DrawnPanes::default();
+    let Some(ctrl) = embedded else {
+        return drawn;
+    };
+    // PRD #385 M3: the pane a kept selection belongs to has closed.
+    if let Some(sel) = selection
+        && ctrl.get_screen(&sel.pane_id).is_none()
+    {
+        drawn.selection_stale = true;
+    }
     if pane_ids.is_empty() {
-        return None;
+        // PRD #385 M5: no pane is drawn, so neither is copy mode's.
+        drawn.copy_mode_gone = copy_mode.is_some();
+        return drawn;
     }
     let input_active = mode == UiMode::PaneInput;
     let command_mode = mode == UiMode::Normal;
@@ -18173,10 +19666,14 @@ fn render_terminal_panes(
                     let title = pane_name(pane_id);
                     // PRD #84 M5: this pane was sized to `chunks[i]` by
                     // `resize_panes_to_layout` this frame, so attest the contract.
-                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, focused)
-                        .contract_guaranteed(true)
-                        .with_input_active(input_active)
-                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
+                    let mut widget = TerminalWidget::new(
+                        pane_screen_to_draw(copy_mode, pane_id, &screen),
+                        title,
+                        focused,
+                    )
+                    .contract_guaranteed(true)
+                    .with_input_active(input_active)
+                    .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): supply the pane's status so a non-focused
                     // pane renders its status-colored border via the palette (the
                     // focus override stays inside TerminalWidget). Panes without a
@@ -18184,6 +19681,7 @@ fn render_terminal_panes(
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
                     }
+                    drawn.panes.push((pane_id.clone(), chunks[i]));
                     if focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -18208,14 +19706,19 @@ fn render_terminal_panes(
                     let is_focused = focused_id.as_deref() == Some(pane_id.as_str());
                     // PRD #84 M5: the expanded pane was sized to `chunks[i]`
                     // by `resize_panes_to_layout` this frame — attest it.
-                    let mut widget = TerminalWidget::new(Arc::clone(&screen), title, is_focused)
-                        .contract_guaranteed(true)
-                        .with_input_active(input_active)
-                        .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
+                    let mut widget = TerminalWidget::new(
+                        pane_screen_to_draw(copy_mode, pane_id, &screen),
+                        title,
+                        is_focused,
+                    )
+                    .contract_guaranteed(true)
+                    .with_input_active(input_active)
+                    .with_zoom_marker(is_zoom_marked(pane_id.as_str()));
                     // PRD #155 (M3): same status threading as the Tiled arm.
                     if let Some(status) = pane_status.get(pane_id.as_str()) {
                         widget = widget.with_status(status.clone());
                     }
+                    drawn.panes.push((pane_id.clone(), chunks[i]));
                     if is_focused {
                         focused_pane_rect = Some(chunks[i]);
                         focused_screen = Some(screen);
@@ -18266,6 +19769,39 @@ fn render_terminal_panes(
     // banner decays. Drawn AFTER the panes (so it lands on real content) and
     // BEFORE the selection highlight (so an active text selection stays crisp
     // rather than being dimmed along with everything else).
+    // PRD #385: the selection to draw, decided before the overlays below so
+    // they can yield to it: draw the highlight over the pane the selection
+    // belongs to (M2), and only while its cells still show what was copied
+    // (decision 6). One whose text moved is reported stale, so the caller
+    // clears it rather than leaving it to reappear.
+    let shown_selection = selection.as_ref().and_then(|sel| {
+        let (_, rect) = drawn.panes.iter().find(|(id, _)| *id == sel.pane_id)?;
+        let screen_arc = ctrl.get_screen(&sel.pane_id)?;
+        let parser = screen_arc.lock().ok()?;
+        if selection_still_shows_copy(sel, parser.screen(), *rect) {
+            Some((sel, *rect, pane_viewport(parser.screen(), *rect)))
+        } else {
+            drawn.selection_stale = true;
+            None
+        }
+    });
+    // PRD #385 decision 6: the highlight must show what is copied, which is
+    // the pane's own text. An overlay drawn over the pane would put other
+    // symbols under the highlight, so the overlays yield on the pane a
+    // selection or copy mode is on: the COMMAND MODE banner collapses (the
+    // pane stays dimmed and the bottom bar's mode chip still says command
+    // mode) and the cannot-scroll notice is not drawn there. Keeping the
+    // overlay and excluding the cells it covers would instead copy a
+    // selection with holes the user cannot see.
+    let selecting_on = |rect: Rect| {
+        shown_selection.as_ref().is_some_and(|(_, r, _)| *r == rect)
+            || copy_mode.is_some_and(|copy| {
+                drawn
+                    .panes
+                    .iter()
+                    .any(|(id, r)| *r == rect && id == copy.pane_id())
+            })
+    };
     if command_mode && let Some(rect) = focused_pane_rect {
         // PRD #611 (review finding 5): a live cannot-scroll notice on THIS pane
         // suppresses the banner outright, rather than being drawn on top of it.
@@ -18282,9 +19818,10 @@ fn render_terminal_panes(
         // Dimming is deliberately untouched: it is gated on mode and focus
         // alone and tells the user typing does not reach the agent, which stays
         // true while the notice is up.
-        let banner = if focused_id
-            .as_deref()
-            .is_some_and(|id| scroll_notice_visible(ctrl, id, now))
+        let banner = if selecting_on(rect)
+            || focused_id
+                .as_deref()
+                .is_some_and(|id| scroll_notice_visible(ctrl, id, now))
         {
             CommandBannerVisibility::Collapsed
         } else {
@@ -18300,18 +19837,19 @@ fn render_terminal_panes(
     // COMMAND MODE banner is still up. The notice wins, because it answers a
     // question the user asked a moment ago while the banner announces a state
     // they can already see in the border and the bottom bar.
-    for rect in &notice_rects {
+    for rect in notice_rects.iter().filter(|rect| !selecting_on(**rect)) {
         render_cannot_scroll_notice(frame.buffer_mut(), *rect);
     }
 
-    // Render selection highlight over the focused pane.
-    if let Some(sel) = selection
-        && let Some(rect) = focused_pane_rect
+    // The highlight covers the same cells the copy reads: the selection
+    // clipped to what the pane draws ([`pane_viewport`]).
+    if let Some((sel, rect, (shown_rows, shown_cols))) = shown_selection
+        && shown_rows > 0
+        && shown_cols > 0
     {
         let inner_x = rect.x + 1;
         let inner_y = rect.y + 1;
-        let inner_w = rect.width.saturating_sub(2);
-        let inner_h = rect.height.saturating_sub(2);
+        let (inner_w, inner_h) = (shown_cols, shown_rows);
         // Normalize so start <= end.
         let (sr, sc, er, ec) = if (sel.start_row, sel.start_col) <= (sel.end_row, sel.end_col) {
             (sel.start_row, sel.start_col, sel.end_row, sel.end_col)
@@ -18330,19 +19868,86 @@ fn render_terminal_panes(
                 let x = inner_x + col;
                 let y = inner_y + row;
                 if let Some(cell) = buf.cell_mut((x, y)) {
-                    // Invert colors for selection highlight.
-                    cell.set_style(
-                        Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::LightCyan)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    cell.set_style(selection_highlight_style());
                 }
             }
         }
     }
 
-    focused_pane_rect
+    // PRD #385 M5: copy mode's selection and cursor, over the frozen screen
+    // its pane was drawn from above, so the highlight shows exactly what a
+    // yank copies. A copy mode whose pane this frame did not draw (it closed,
+    // or another pane took the stacked layout's one slot) has nothing left to
+    // show, so it is reported for the caller to close.
+    if let Some(copy) = copy_mode {
+        match drawn.panes.iter().find(|(id, _)| id == copy.pane_id()) {
+            Some((_, rect)) => render_copy_mode_marks(frame.buffer_mut(), copy, *rect),
+            None => drawn.copy_mode_gone = true,
+        }
+    }
+
+    drawn.focused = focused_pane_rect;
+    drawn
+}
+
+/// PRD #385 M5: the screen a pane is drawn from — copy mode's frozen copy for
+/// the pane copy mode is open on, the live screen otherwise.
+fn pane_screen_to_draw(
+    copy_mode: Option<&crate::copy_mode::CopyMode>,
+    pane_id: &str,
+    live: &Arc<std::sync::Mutex<vt100::Parser>>,
+) -> Arc<std::sync::Mutex<vt100::Parser>> {
+    match copy_mode {
+        Some(copy) if copy.pane_id() == pane_id => copy.frozen(),
+        _ => Arc::clone(live),
+    }
+}
+
+/// PRD #385 M5: the copy mode to draw this frame: the open one, while the UI
+/// is in copy mode.
+fn copy_mode_shown(ui: &UiState) -> Option<&crate::copy_mode::CopyMode> {
+    ui.copy_mode
+        .as_ref()
+        .filter(|_| ui.mode == UiMode::CopyMode)
+}
+
+/// The style of a selected cell, shared by a mouse selection and copy mode.
+fn selection_highlight_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::LightCyan)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// The style of copy mode's cursor cell.
+fn copy_mode_cursor_style() -> Style {
+    Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// PRD #385 M5: draw copy mode's selection, then its cursor, over the pane
+/// drawn at `rect`.
+fn render_copy_mode_marks(buf: &mut Buffer, copy: &crate::copy_mode::CopyMode, rect: Rect) {
+    let inner = pane_inner_rect(rect);
+    for row in 0..inner.height {
+        let marks = copy.row_marks(row);
+        let y = inner.y + row;
+        if let Some((first, last)) = marks.selected {
+            for col in first..=last.min(inner.width.saturating_sub(1)) {
+                if let Some(cell) = buf.cell_mut((inner.x + col, y)) {
+                    cell.set_style(selection_highlight_style());
+                }
+            }
+        }
+        if let Some(col) = marks.cursor
+            && col < inner.width
+            && let Some(cell) = buf.cell_mut((inner.x + col, y))
+        {
+            cell.set_style(copy_mode_cursor_style());
+        }
+    }
 }
 
 fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
@@ -18753,6 +20358,7 @@ fn render_button_bar(
 fn mode_chip_label(mode: UiMode) -> Option<&'static str> {
     match mode {
         UiMode::PaneInput => Some(CHIP_TYPING),
+        UiMode::CopyMode => Some(CHIP_COPY),
         UiMode::Filter | UiMode::Rename => None,
         _ => Some(CHIP_COMMAND),
     }
@@ -18762,6 +20368,13 @@ fn mode_chip_label(mode: UiMode) -> Option<&'static str> {
 const CHIP_COMMAND: &str = " COMMAND ";
 /// The chip for `UiMode::PaneInput`.
 const CHIP_TYPING: &str = " TYPING ";
+/// The chip for `UiMode::CopyMode` (PRD #385 M5).
+const CHIP_COPY: &str = " COPY ";
+
+/// PRD #385 M5: what copy mode's bottom bar shows beside its chip while no
+/// status message is up — its keys.
+const COPY_MODE_HINTS: &str =
+    "move h/j/k/l · page PgUp/PgDn · top/bottom g/G · select v · copy y · exit Esc/q";
 
 /// The one space between the chip and the bar content, part of the band
 /// [`mode_chip_bar_split`] reserves.
@@ -18776,7 +20389,7 @@ const GAP_AFTER_CHIP: u16 = 1;
 /// finding 2's defect in miniature. Above this width every mode gets its own
 /// (differently sized) chip; below it, all of them lose it together.
 fn mode_chip_min_width() -> u16 {
-    [CHIP_COMMAND, CHIP_TYPING]
+    [CHIP_COMMAND, CHIP_TYPING, CHIP_COPY]
         .into_iter()
         .map(|label| label.chars().count() as u16)
         .max()
@@ -18876,7 +20489,7 @@ fn render_mode_chip(frame: &mut Frame, mode: UiMode, area: Rect) -> Rect {
 /// is a usability bug).
 fn bottom_bar_rows(ui: &UiState, width: u16, frame_height: u16) -> u16 {
     let rows = match ui.mode {
-        UiMode::Filter | UiMode::Rename | UiMode::PaneInput => 1,
+        UiMode::Filter | UiMode::Rename | UiMode::PaneInput | UiMode::CopyMode => 1,
         _ if ui.status_message.is_some() => 1,
         _ => {
             let mut buttons = global_bar_buttons(&ui.keybindings, ui.mode, true);
@@ -19029,6 +20642,18 @@ fn render_bottom_bar_below_notice(
                 true,
             )];
             ui.button_rects = render_right_aligned_buttons(frame, &buttons, area);
+        }
+        // PRD #385 M5: copy mode's keys beside its chip, or a status message
+        // while one is up. No buttons: copy mode is keyboard-only.
+        UiMode::CopyMode => {
+            let line = match ui.status_message {
+                Some((ref msg, _)) => {
+                    Line::styled(msg.as_str(), Style::default().fg(Color::Yellow))
+                }
+                None => Line::styled(COPY_MODE_HINTS, text_primary()),
+            };
+            frame.render_widget(Paragraph::new(line), area);
+            ui.button_rects.clear();
         }
         _ => {
             if let Some((ref msg, _)) = ui.status_message {
@@ -19400,6 +21025,9 @@ fn confirmation_awaits_frame(ui: &UiState) -> bool {
             | UiMode::StopConfirm
             | UiMode::ConfigGenPrompt
             | UiMode::StarPrompt
+            // PRD #1885: input typed before the trust prompt was on screen
+            // never approves it.
+            | UiMode::TrustPrompt
     ) || (ui.mode == UiMode::ScheduledTasks && ui.scheduled_delete_confirm))
         && !ui
             .confirm_choices_drawn
@@ -19440,6 +21068,11 @@ fn refuse_undrawn_choice(key: &KeyEvent, ui: &UiState) -> Option<Action> {
             return (!shown.contains(choice)).then_some(Action::Continue);
         }
         UiMode::DirPicker => return refuse_undrawn_pick(key, ui),
+        // PRD #1885: `a` approves only once a frame showed its label.
+        UiMode::TrustPrompt => {
+            let refused = key.code == KeyCode::Char('a') && !shown.contains(0);
+            return refused.then_some(Action::Continue);
+        }
         _ => {}
     }
     let selected = match mode {
@@ -19604,7 +21237,11 @@ fn render_close_confirm(
         .try_into()
         .unwrap_or(u16::MAX);
     let popup_width = want_width.max(64).min(area.width.saturating_sub(4));
-    let popup_height = CLOSE_CONFIRM.popup_height(kept_lines, area);
+    // Issue #1958: the keep choice is one more option row, below the first
+    // choice, so it grows the popup without moving the choices.
+    let options = close_confirm_options(state);
+    let extra_options: u16 = (options.len() - 2).try_into().unwrap_or(0);
+    let popup_height = CLOSE_CONFIRM.popup_height(kept_lines + extra_options, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -19641,7 +21278,15 @@ fn render_close_confirm(
         text.push(Line::from(""));
     }
 
-    for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
+    // The labels share one column; seven wide, as always, unless a longer
+    // label (issue #1958's keep choice) is drawn.
+    let label_width = options
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    for (i, (label, desc)) in options.iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
         let style = if i == selected {
             Style::default()
@@ -19651,7 +21296,7 @@ fn render_close_confirm(
             text_primary()
         };
         text.push(Line::styled(
-            format!("  {cursor} {label:<7} \u{2014} {desc}"),
+            format!("  {cursor} {label:<label_width$} \u{2014} {desc}"),
             style,
         ));
     }
@@ -19673,12 +21318,20 @@ fn render_close_confirm(
         .border_style(Style::default().fg(Color::Yellow));
     frame.render_widget(Paragraph::new(text).block(block), popup_area);
 
-    // Clickable equivalents of the two options, on the blank row above the
+    // Clickable equivalents of the options, on the blank row above the
     // keyboard hint (same placement as the quit dialog's button row).
-    let buttons = [
+    let mut buttons = vec![
         Button::new("Cancel", "", Action::DismissModal, true),
         Button::new("Close", "", Action::ConfirmCloseSelected, true),
     ];
+    if state.dispatched_worktree.is_some() {
+        buttons.push(Button::new(
+            CLOSE_KEEP_WORKTREE_LABEL,
+            "",
+            Action::ConfirmCloseKeepWorktree,
+            true,
+        ));
+    }
     let btn_row = Rect {
         x: popup_area.x + 1,
         y: popup_area.y + popup_area.height.saturating_sub(3),
@@ -19690,7 +21343,7 @@ fn render_close_confirm(
         choices: CLOSE_CONFIRM.choices(
             popup_area,
             kept_lines,
-            close_confirm_options(state.scope).map(|(label, _)| label),
+            options.iter().map(|(label, _)| *label),
             selected,
         ),
     }
@@ -20283,14 +21936,18 @@ fn render_help_overlay(
             // says which way each one goes.
             "Scroll focused pane",
         ),
+        // PRD #385 M5/M7: from the binding table, so a remapped key shows.
+        help_key_line(&n(KbAction::CopyMode), "Copy mode (select & copy)"),
         help_key_line(&n(KbAction::Help), "Toggle this help"),
     ];
 
     let right: Vec<Line> = vec![
-        // These two lines describe every pane.
+        // These lines describe every pane.
         Line::styled("  Mouse", cyan),
         Line::from(""),
         Line::from("  Mouse click     Focus pane"),
+        // PRD #385: in the pane under the pointer, copied on release.
+        Line::from("  Drag            Select & copy"),
         Line::from("  Ctrl+click      Open hyperlink"),
         Line::from(""),
         Line::styled("  New Agent Form", cyan),
@@ -21565,6 +23222,38 @@ fn render_scheduled_tasks(
     let status_col = 11usize; // widest status ("disabled") + padding
     let row_count = ui.scheduled_tasks.len().max(1) as u16;
 
+    // PRD #1885: the selected task's last fire, when it was refused as not
+    // approved — the refusal names the command that approves it — wrapped to
+    // the list's width beneath the rows.
+    let refusal_lines: Vec<String> = if ui.scheduled_delete_confirm {
+        Vec::new()
+    } else {
+        ui.scheduled_tasks
+            .get(ui.scheduled_selected)
+            .and_then(|t| ui.scheduled_refusals.get(&t.name))
+            .map(|refusal| {
+                let width = (2 + name_col + status_col + next_col).max(56);
+                let mut lines = vec![format!(
+                    "  Last fire refused at {}:",
+                    crate::untrusted_text::strip_control_and_bidi(&refusal.at, false)
+                )];
+                let text = crate::untrusted_text::strip_control_and_bidi(&refusal.message, false);
+                let mut line = String::from("   ");
+                for word in text.split_whitespace() {
+                    if line.chars().count() + 1 + word.chars().count() > width && line.len() > 3 {
+                        lines.push(std::mem::replace(&mut line, String::from("   ")));
+                    }
+                    line.push(' ');
+                    line.push_str(word);
+                }
+                if line.len() > 3 {
+                    lines.push(line);
+                }
+                lines
+            })
+            .unwrap_or_default()
+    };
+
     // PRD #144: the delete confirmation renders on its natural lines (the name
     // on its own line, the fixed `… (y/n)` trailer on the next). The modal is
     // sized to contain them below, so the trailer is never pushed past the
@@ -21597,7 +23286,7 @@ fn render_scheduled_tasks(
     } else {
         2
     };
-    let chrome_lines = 3 + footer_lines;
+    let chrome_lines = 3 + footer_lines + refusal_lines.len();
 
     // Widest content line drives the modal width. The padded field rows fill to
     // the inner width, so they don't drive it — the list columns, the header,
@@ -21623,9 +23312,15 @@ fn render_scheduled_tasks(
     } else {
         0
     };
+    let refusal_w = refusal_lines
+        .iter()
+        .map(|l| count_chars(l))
+        .max()
+        .unwrap_or(0);
     let content_w = [
         list_w,
         header_w,
+        refusal_w,
         confirm_w,
         BUTTON_ROW_W,
         count_chars("  Esc close"),
@@ -21692,7 +23387,8 @@ fn render_scheduled_tasks(
             .take(win_end - win_start)
         {
             let is_live = ui.scheduled_live_names.contains(&task.name);
-            let status = schedule_status_label(task.enabled, is_live);
+            let refused = ui.scheduled_refusals.contains_key(&task.name);
+            let status = schedule_status_label_with(task.enabled, is_live, refused);
             let next = schedule_next_fire_display(task);
             let selected = i == ui.scheduled_selected;
             let marker = if selected { "\u{25b6} " } else { "  " };
@@ -21721,6 +23417,12 @@ fn render_scheduled_tasks(
                 },
             ));
             lines.push(Line::styled(row, style));
+        }
+        for line in &refusal_lines {
+            lines.push(Line::styled(
+                line.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
         }
     }
 
@@ -24862,6 +26564,7 @@ pub fn render_focused_pane_cursor_for_mode_to_position(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 Some(PANE_ID),
                 // The one input the seam varies: exactly what `render_frame`
                 // passes (`ui.mode`).
@@ -24948,6 +26651,7 @@ pub fn render_command_banner_pane_to_buffer(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 Some(if focused { PANE_ID } else { NO_PANE }),
                 mode,
                 visibility,
@@ -24958,6 +26662,658 @@ pub fn render_command_banner_pane_to_buffer(
         })
         .expect("TestBackend draw should succeed");
     terminal.backend().buffer().clone()
+}
+
+/// PRD #385 M2/M3 L1 seam: panes tiled over a `TestBackend` frame, driven by
+/// the mouse and the keyboard through the functions the live loop calls, so a
+/// test sees the selection, its highlight and its copies the way a user does.
+///
+/// The panes are inert seam panes (no daemon, no agent); each is sized to the
+/// inner area of its tiled rect, as `resize_panes_to_layout` sizes a live one.
+/// Copies are collected rather than delivered, so no test reaches a clipboard.
+#[doc(hidden)]
+pub struct PaneSelectionSeam {
+    ui: UiState,
+    ctrl: EmbeddedPaneController,
+    _inputs: Vec<crate::embedded_pane::SeamChildInput>,
+    pane_ids: Vec<String>,
+    area: Rect,
+    deck: DeckKey,
+    copies: Vec<String>,
+    layout: PaneLayout,
+    banner: CommandBannerVisibility,
+    /// The panes belong to an orchestration tab: that tab draws them and the
+    /// dashboard does not ([`Self::on_orchestration_tab`]).
+    orchestration_owned: bool,
+}
+
+#[doc(hidden)]
+impl PaneSelectionSeam {
+    /// `panes` are `(pane id, bytes already on its screen)`, tiled over a
+    /// `width` x `height` frame, with `focused` focused and keys reaching it
+    /// (`UiMode::PaneInput`).
+    pub fn tiled(width: u16, height: u16, panes: &[(&str, &[u8])], focused: &str) -> Self {
+        Self::build(width, height, panes, focused, None)
+    }
+
+    /// As [`Self::tiled`], but every pane's terminal screen is `rows` x
+    /// `cols` whatever the size of the pane it is drawn in: what a client sees
+    /// while another attached client decides the size, or while a resize it
+    /// asked for has not been applied yet.
+    pub fn tiled_with_screen(
+        width: u16,
+        height: u16,
+        panes: &[(&str, &[u8])],
+        focused: &str,
+        rows: u16,
+        cols: u16,
+    ) -> Self {
+        Self::build(width, height, panes, focused, Some((rows, cols)))
+    }
+
+    fn build(
+        width: u16,
+        height: u16,
+        panes: &[(&str, &[u8])],
+        focused: &str,
+        screen: Option<(u16, u16)>,
+    ) -> Self {
+        let area = Rect::new(0, 0, width, height);
+        let pane_ids: Vec<String> = panes.iter().map(|(id, _)| (*id).to_string()).collect();
+        let rects = pane_stack_rects(area, &pane_ids, PaneLayout::Tiled, Some(focused));
+        let inner = |rect: Rect| {
+            screen.unwrap_or_else(|| {
+                let inner = pane_inner_rect(rect);
+                (inner.height.max(1), inner.width.max(1))
+            })
+        };
+        let (first_id, first_bytes) = panes[0];
+        let (rows, cols) = inner(rects[0]);
+        let (ctrl, first_input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+            first_id,
+            rows,
+            cols,
+            first_bytes,
+            false,
+        );
+        let mut inputs = vec![first_input];
+        for (i, (id, bytes)) in panes.iter().enumerate().skip(1) {
+            let (rows, cols) = inner(rects[i]);
+            inputs.push(ctrl.add_scroll_seam_pane(id, rows, cols, bytes));
+        }
+        ctrl.focus_pane(focused)
+            .expect("the focused pane is one of the panes");
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.mode = UiMode::PaneInput;
+        Self {
+            ui,
+            ctrl,
+            _inputs: inputs,
+            pane_ids,
+            area,
+            deck: DeckKey::Dashboard,
+            copies: Vec::new(),
+            layout: PaneLayout::Tiled,
+            banner: CommandBannerVisibility::Hidden,
+            orchestration_owned: false,
+        }
+    }
+
+    /// The panes are an orchestration's role panes, and that orchestration's
+    /// tab is the active one: the dashboard leaves them out.
+    pub fn on_orchestration_tab(mut self) -> Self {
+        self.orchestration_owned = true;
+        self.deck = DeckKey::Orchestration(1);
+        self
+    }
+
+    /// The panes move to an orchestration, whose tab is not the active one:
+    /// the dashboard stops drawing them, though they keep running.
+    pub fn move_panes_to_orchestration(&mut self) {
+        self.orchestration_owned = true;
+    }
+
+    /// Command mode, with the COMMAND MODE banner over the focused pane when
+    /// `banner` is set (it has not decayed yet), as `run_tui` draws it.
+    pub fn command_mode(&mut self, banner: bool) {
+        self.ui.mode = UiMode::Normal;
+        self.banner = if banner {
+            CommandBannerVisibility::Expanded
+        } else {
+            CommandBannerVisibility::Collapsed
+        };
+    }
+
+    /// A scroll the pane could not take: its cannot-scroll notice is drawn
+    /// over it for a while.
+    pub fn arm_scroll_notice(&self, pane_id: &str) {
+        self.ctrl
+            .arm_scroll_notice(pane_id, std::time::Instant::now());
+    }
+
+    /// The stacked layout: only the focused pane is drawn, over the whole area.
+    pub fn stack(&mut self) {
+        self.layout = PaneLayout::Stacked;
+    }
+
+    /// The frame becomes `width` x `height`; the panes' screens keep their
+    /// size, as they do until the resize reaches them.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.area = Rect::new(0, 0, width, height);
+    }
+
+    /// The panes drawn on the current tab: every seam pane on the tab that
+    /// owns them (the dashboard, unless [`Self::on_orchestration_tab`] or
+    /// [`Self::move_panes_to_orchestration`] gave them to an orchestration),
+    /// none on the other tab.
+    fn drawn_ids(&self) -> Vec<String> {
+        match (self.deck, self.orchestration_owned) {
+            (DeckKey::Dashboard, false) | (DeckKey::Orchestration(_), true) => {
+                self.pane_ids.clone()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// Draw a whole frame the way the run loop does ([`draw_frame`]): the
+    /// production layout of the active tab, its cards, panes and bottom bar.
+    /// Unlike [`Self::render`], a tab with no pane to draw takes the layout's
+    /// own no-pane path.
+    pub fn render_frame(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // As `run_tui` does right before it draws.
+        clear_selection_on_tab_switch(&mut self.ui, Some(self.deck));
+        self.ui.pane_layout = self.layout;
+        let mut terminal = Terminal::new(TestBackend::new(self.area.width, self.area.height))
+            .expect("TestBackend should construct");
+        let snapshot = AppState::default();
+        let filtered = filter_sessions(&snapshot, &self.ui);
+        let owned = |owned: bool| {
+            if owned {
+                self.pane_ids.clone()
+            } else {
+                Vec::new()
+            }
+        };
+        let (tab_view, active_index) = match self.deck {
+            DeckKey::Dashboard => (
+                ActiveTabView::Dashboard {
+                    exclude_pane_ids: owned(self.orchestration_owned),
+                    zoomed: false,
+                },
+                0,
+            ),
+            DeckKey::Orchestration(_) => (
+                ActiveTabView::Orchestration {
+                    role_pane_ids: owned(self.orchestration_owned),
+                    split_narrow: false,
+                    zoomed: false,
+                },
+                1,
+            ),
+        };
+        let tab_bar = TabBarInfo {
+            show: true,
+            labels: vec!["Dashboard".into(), "orchestration".into()],
+            active_index,
+            orchestration_statuses: vec![None, Some(Vec::new())],
+        };
+        let sources = FrameSources {
+            snapshot: &snapshot,
+            filtered: &filtered,
+            tick: 0,
+            has_pane_control: true,
+            pane: &self.ctrl,
+            tab_view: &tab_view,
+            tab_bar: &tab_bar,
+            features: Features::test_with(false),
+            show_hook_notice: false,
+            wall_now: Utc::now(),
+        };
+        draw_frame(&mut terminal, &mut self.ui, &sources).expect("the frame draws");
+        terminal.backend().buffer().clone()
+    }
+
+    /// Draw a frame the way `render_frame` draws the pane column.
+    pub fn render(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        // As `run_tui` does right before it draws.
+        clear_selection_on_tab_switch(&mut self.ui, Some(self.deck));
+        let ids = self.drawn_ids();
+        let mut terminal = Terminal::new(TestBackend::new(self.area.width, self.area.height))
+            .expect("TestBackend should construct");
+        let mut drawn = DrawnPanes::default();
+        terminal
+            .draw(|frame| {
+                drawn = render_terminal_panes(
+                    frame,
+                    Some(&self.ctrl),
+                    self.area,
+                    &ids,
+                    self.layout,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &self.ui.selection,
+                    copy_mode_shown(&self.ui),
+                    None,
+                    self.ui.mode,
+                    self.banner,
+                    None,
+                    std::time::Instant::now(),
+                    false,
+                );
+            })
+            .expect("TestBackend draw should succeed");
+        record_drawn_panes(&mut self.ui, drawn);
+        terminal.backend().buffer().clone()
+    }
+
+    /// The outer rect `pane_id` is drawn in.
+    pub fn pane_rect(&self, pane_id: &str) -> Rect {
+        let ids = self.drawn_ids();
+        let focused = self.ctrl.focused_pane_id();
+        let rects = pane_stack_rects(self.area, &ids, self.layout, focused.as_deref());
+        let i = ids
+            .iter()
+            .position(|id| id == pane_id)
+            .expect("the pane is drawn");
+        rects[i]
+    }
+
+    pub fn focused_pane_id(&self) -> Option<String> {
+        self.ctrl.focused_pane_id()
+    }
+
+    /// The outer rect the last frame drew `pane_id` in, if it drew it.
+    pub fn drawn_pane_rect(&self, pane_id: &str) -> Option<Rect> {
+        self.ui
+            .drawn_pane_rects
+            .iter()
+            .find(|(id, _)| id == pane_id)
+            .map(|(_, rect)| *rect)
+    }
+
+    /// One mouse report at a screen cell, as the live mouse arm receives it.
+    pub fn mouse(&mut self, kind: crossterm::event::MouseEventKind, column: u16, row: u16) {
+        let event = crossterm::event::MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // The live mouse arm's order: the press clears first, then the
+        // selection half (no button, card or dialog is drawn in the seam).
+        clear_selection_on_press(&mut self.ui, &event);
+        let outcome = pane_selection_mouse(
+            &mut self.ui,
+            &self.ctrl,
+            &event,
+            Some(self.deck),
+            std::time::Instant::now(),
+        );
+        if let Some(text) = outcome.copy {
+            self.copies.push(text);
+        }
+    }
+
+    /// A key typed while the focused pane takes input.
+    pub fn key(&mut self, key: KeyEvent) {
+        if let Action::ForwardToPane(bytes) = handle_pane_input_key(key, false) {
+            forward_to_focused_pane(&mut self.ui, &self.ctrl, &bytes);
+        }
+    }
+
+    /// Switch from the dashboard to another tab, or back.
+    pub fn switch_tab(&mut self) {
+        self.deck = match self.deck {
+            DeckKey::Dashboard => DeckKey::Orchestration(1),
+            DeckKey::Orchestration(_) => DeckKey::Dashboard,
+        };
+    }
+
+    /// The pane goes away, as it does when it is closed.
+    pub fn close_pane(&mut self, pane_id: &str) {
+        self.ctrl.forget_pane(pane_id);
+        self.pane_ids.retain(|id| id != pane_id);
+    }
+
+    /// New output from the pane's program.
+    pub fn feed(&self, pane_id: &str, bytes: &[u8]) {
+        let screen = self.ctrl.get_screen(pane_id).expect("the pane exists");
+        screen.lock().unwrap().process(bytes);
+    }
+
+    /// Every copy a release delivered, oldest first.
+    pub fn copies(&self) -> &[String] {
+        &self.copies
+    }
+}
+
+/// A clipboard for the L1 seams: no native clipboard, and OSC 52 "sent" to a
+/// list, so no test reaches a real clipboard or terminal.
+#[derive(Default)]
+struct SeamClipboard {
+    copies: Vec<String>,
+}
+
+impl crate::clipboard::ClipboardBackend for SeamClipboard {
+    fn write_native(&mut self, _text: &str) -> crate::clipboard::NativeWrite {
+        crate::clipboard::NativeWrite::Unavailable
+    }
+
+    fn send_osc52(&mut self, text: &str) -> bool {
+        self.copies.push(text.to_owned());
+        true
+    }
+}
+
+/// PRD #385 M5 L1 seam: one pane over a `TestBackend` frame with the bottom bar
+/// on its last row, in command mode, driven key by key through
+/// [`handle_key_event`] and drawn through [`render_terminal_panes`] and
+/// [`render_bottom_bar`], as the live loop does. A copy goes through
+/// [`deliver_pending_copy`] into a recording clipboard, as the live loop's goes
+/// into the deck's.
+#[doc(hidden)]
+pub struct CopyModeSeam {
+    ui: UiState,
+    ctrl: Arc<EmbeddedPaneController>,
+    input: crate::embedded_pane::SeamChildInput,
+    tab_manager: TabManager,
+    state: SharedState,
+    /// The cards the key handler resolves against (none unless
+    /// [`Self::with_card`] added one).
+    snapshot: AppState,
+    width: u16,
+    height: u16,
+    clipboard: SeamClipboard,
+}
+
+#[doc(hidden)]
+impl CopyModeSeam {
+    /// The seam's one pane id.
+    pub const PANE_ID: &'static str = "copy-pane";
+
+    /// A `width` x `height` frame: the pane over every row but the last, which
+    /// is the bottom bar, with `bytes` already on the pane's screen.
+    pub fn new(width: u16, height: u16, bytes: &[u8]) -> Self {
+        let inner = pane_inner_rect(Self::pane_rect_for(width, height));
+        Self::with_screen(
+            width,
+            height,
+            bytes,
+            inner.height.max(1),
+            inner.width.max(1),
+        )
+    }
+
+    /// As [`Self::new`], but the pane's terminal screen is `rows` x `cols`
+    /// whatever the size of the pane it is drawn in, as it is while another
+    /// attached client decides the size.
+    pub fn with_screen(width: u16, height: u16, bytes: &[u8], rows: u16, cols: u16) -> Self {
+        let (ctrl, input) = EmbeddedPaneController::for_scroll_seam_with_focused_pane(
+            Self::PANE_ID,
+            rows,
+            cols,
+            bytes,
+            false,
+        );
+        let ctrl = Arc::new(ctrl);
+        let tab_manager = TabManager::new(Arc::clone(&ctrl) as Arc<dyn PaneController>);
+        let mut ui = UiState::new(DashboardConfig::default(), KeybindingConfig::default());
+        ui.mode = UiMode::Normal;
+        Self {
+            ui,
+            ctrl,
+            input,
+            tab_manager,
+            state: Arc::new(tokio::sync::RwLock::new(AppState::default())),
+            snapshot: AppState::default(),
+            width,
+            height,
+            clipboard: SeamClipboard::default(),
+        }
+    }
+
+    /// Bind keys from a keybindings TOML, as `.dot-agent-deck.toml`'s
+    /// sections do; returns the warnings it raised (conflicts among them).
+    pub fn bind(&mut self, toml: &str) -> Vec<String> {
+        let (config, warnings) =
+            KeybindingConfig::from_toml_str(toml).expect("the keybindings TOML parses");
+        self.ui.keybindings = config;
+        warnings
+    }
+
+    /// Give the pane a dashboard card, card 1, so a jump key can focus it.
+    pub fn with_card(mut self) -> Self {
+        let now = Utc::now();
+        let session = SessionState {
+            session_id: "copy-card".to_string(),
+            agent_type: crate::event::AgentType::ClaudeCode,
+            cwd: None,
+            status: SessionStatus::Idle,
+            blocked: None,
+            active_tool: None,
+            started_at: now,
+            last_activity: now,
+            recent_events: std::collections::VecDeque::new(),
+            tool_count: 0,
+            last_user_prompt: None,
+            first_prompts: Vec::new(),
+            pane_id: Some(Self::PANE_ID.to_string()),
+            agent_id: None,
+            display_name: None,
+            shell_synthetic_working: false,
+            native_hooks_reported: false,
+            last_native_hook_at: None,
+            orchestration_orphaned: false,
+            subagent_wait: None,
+            output_set_status: false,
+            pending_question: None,
+            pull_request: None,
+            pull_request_revision: 0,
+            incarnation: Default::default(),
+        };
+        self.snapshot
+            .sessions
+            .insert(session.session_id.clone(), session.clone());
+        self.state
+            .blocking_write()
+            .sessions
+            .insert(session.session_id.clone(), session);
+        self
+    }
+
+    /// Every byte the pane's program has been sent since the last call.
+    pub fn forwarded(&mut self) -> Vec<u8> {
+        self.input.drain_bytes()
+    }
+
+    /// The highlighted card, if a key selected one.
+    pub fn selected_index(&self) -> Option<usize> {
+        self.ui.selected_index
+    }
+
+    /// The UI mode, by name (`Normal` is command mode).
+    pub fn mode(&self) -> String {
+        format!("{:?}", self.ui.mode)
+    }
+
+    /// A paste from the terminal, as the live loop handles it.
+    pub fn paste(&mut self, text: &str) {
+        forward_paste(&mut self.ui, &*self.ctrl, text);
+    }
+
+    /// The frame becomes `width` x `height`; the pane's screen keeps its size,
+    /// as it does until the resize reaches it.
+    pub fn resize(&mut self, width: u16, height: u16) {
+        self.width = width;
+        self.height = height;
+    }
+
+    /// The daemon reports the pane closed (another client stopped its agent),
+    /// as the live loop applies that report.
+    pub fn close_pane_externally(&mut self) {
+        let closure = crate::state::PaneClosure {
+            pane_id: Self::PANE_ID.to_string(),
+            agent_id: None,
+            queued_at: Utc::now(),
+        };
+        apply_pane_closure(
+            &self.state,
+            &*self.ctrl,
+            &mut self.tab_manager,
+            &mut self.ui,
+            &closure,
+        );
+    }
+
+    /// A new pane is attached under the seam pane's id, showing `bytes`, as
+    /// the daemon can reuse a closed pane's id.
+    pub fn reattach_pane(&mut self, bytes: &[u8]) {
+        self.input = self.ctrl.add_scroll_seam_pane(
+            Self::PANE_ID,
+            self.height.saturating_sub(3).max(1),
+            self.width.saturating_sub(2).max(1),
+            bytes,
+        );
+    }
+
+    /// Draw a whole frame the way the run loop does ([`draw_frame`]): the
+    /// production layout over the dashboard tab, cards, panes and bottom bar.
+    pub fn render_frame(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(self.width, self.height))
+            .expect("TestBackend should construct");
+        let filtered = filter_sessions(&self.snapshot, &self.ui);
+        let tab_view = ActiveTabView::Dashboard {
+            exclude_pane_ids: vec![],
+            zoomed: false,
+        };
+        let tab_bar = TabBarInfo {
+            show: false,
+            labels: vec!["Dashboard".into()],
+            active_index: 0,
+            orchestration_statuses: vec![],
+        };
+        let sources = FrameSources {
+            snapshot: &self.snapshot,
+            filtered: &filtered,
+            tick: 0,
+            has_pane_control: true,
+            pane: &*self.ctrl,
+            tab_view: &tab_view,
+            tab_bar: &tab_bar,
+            features: Features::test_with(false),
+            show_hook_notice: false,
+            wall_now: Utc::now(),
+        };
+        draw_frame(&mut terminal, &mut self.ui, &sources).expect("the frame draws");
+        terminal.backend().buffer().clone()
+    }
+
+    fn pane_rect_for(width: u16, height: u16) -> Rect {
+        Rect::new(0, 0, width, height.saturating_sub(1))
+    }
+
+    /// The outer rect the pane is drawn in.
+    pub fn pane_rect(&self) -> Rect {
+        Self::pane_rect_for(self.width, self.height)
+    }
+
+    /// One key, as the live loop handles it: resolved and dispatched, then any
+    /// copy it made delivered.
+    pub fn key(&mut self, key: KeyEvent) {
+        let filtered = filter_sessions(&self.snapshot, &self.ui);
+        let _ = handle_key_event(
+            key,
+            &mut self.ui,
+            &*self.ctrl,
+            &self.state,
+            &mut self.tab_manager,
+            &self.snapshot,
+            &filtered,
+            Rect::new(0, 0, self.width, self.height),
+        );
+        deliver_pending_copy(&mut self.ui, &mut self.clipboard);
+    }
+
+    /// Draw a frame: the pane, then the bottom bar.
+    pub fn render(&mut self) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let pane = self.pane_rect();
+        let bar = Rect::new(0, self.height.saturating_sub(1), self.width, 1);
+        let ids = [Self::PANE_ID.to_string()];
+        // As `render_frame` does before it draws.
+        reconcile_copy_mode(
+            &mut self.ui,
+            Some(&*self.ctrl),
+            &[(Self::PANE_ID.to_string(), pane)],
+        );
+        let mut terminal = Terminal::new(TestBackend::new(self.width, self.height))
+            .expect("TestBackend should construct");
+        let mut drawn = DrawnPanes::default();
+        terminal
+            .draw(|frame| {
+                drawn = render_terminal_panes(
+                    frame,
+                    Some(&*self.ctrl),
+                    pane,
+                    &ids,
+                    PaneLayout::Tiled,
+                    &HashMap::new(),
+                    &HashMap::new(),
+                    &self.ui.selection,
+                    copy_mode_shown(&self.ui),
+                    None,
+                    self.ui.mode,
+                    CommandBannerVisibility::Hidden,
+                    None,
+                    std::time::Instant::now(),
+                    false,
+                );
+                render_bottom_bar(frame, &mut self.ui, bar, true, &[]);
+            })
+            .expect("TestBackend draw should succeed");
+        record_drawn_panes(&mut self.ui, drawn);
+        terminal.backend().buffer().clone()
+    }
+
+    /// New output from the pane's program.
+    pub fn feed(&self, bytes: &[u8]) {
+        let screen = self
+            .ctrl
+            .get_screen(Self::PANE_ID)
+            .expect("the pane exists");
+        screen.lock().unwrap().process(bytes);
+    }
+
+    /// The pane goes away, as it does when it is closed.
+    pub fn close_pane(&self) {
+        self.ctrl.forget_pane(Self::PANE_ID);
+    }
+
+    /// The pane's own scrollback offset (0 = following live output).
+    pub fn scrollback(&self) -> usize {
+        let screen = self
+            .ctrl
+            .get_screen(Self::PANE_ID)
+            .expect("the pane exists");
+        screen.lock().unwrap().screen().scrollback()
+    }
+
+    /// Every copy delivered, oldest first.
+    pub fn copies(&self) -> &[String] {
+        &self.clipboard.copies
+    }
+
+    /// The status line's message, if one is set.
+    pub fn status(&self) -> Option<&str> {
+        self.ui.status_message.as_ref().map(|(m, _)| m.as_str())
+    }
 }
 
 /// What one scroll input did to the focused agent pane, including the observable
@@ -25199,6 +27555,7 @@ fn render_sized_scroll_seam_pane_to_buffer(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 Some(SCROLL_SEAM_PANE_ID),
                 mode,
                 banner,
@@ -25757,6 +28114,7 @@ fn observe_scroll_notice_pane_affinity(
                 &HashMap::new(),
                 &HashMap::new(),
                 &None,
+                None,
                 None,
                 UiMode::PaneInput,
                 CommandBannerVisibility::Hidden,
@@ -28493,6 +30851,8 @@ mod tests {
         };
 
         let open = |tm: &mut TabManager, ui: &mut UiState, name: &str| {
+            // PRD #1885: approved, so the tab opens without the trust prompt.
+            crate::project_trust::approve_orchestration_for_test(tmp.path(), &cfg(name));
             let req = NewPaneRequest {
                 dir: tmp.path().to_path_buf(),
                 name: name.to_string(),
@@ -34907,6 +37267,75 @@ mod tests {
         );
     }
 
+    /// Scenario: With a dashboard and an orchestration tab open and a copied selection kept on a dashboard pane, Ctrl+PageDown then Ctrl+PageUp are handled one after the other with no frame drawn between them, as one input drain handles them. The selection is gone on return; a tab key that moves nowhere (Ctrl+PageUp on the first tab, or selecting the tab already active) keeps it.
+    #[spec("mouse/select/006")]
+    #[test]
+    fn select_006_a_real_tab_switch_clears_the_selection_before_any_frame() {
+        use tokio::sync::RwLock;
+
+        let kept = |deck| TextSelection {
+            pane_id: "p0".to_string(),
+            start_col: 0,
+            start_row: 0,
+            end_col: 4,
+            end_row: 0,
+            pane_rect: Rect::new(0, 0, 20, 10),
+            deck,
+            copied: Some("bravo".to_string()),
+        };
+        let pc = Arc::new(OpenTabPC::new());
+        let mut tab_manager = TabManager::new(pc.clone());
+        tab_manager
+            .open_orchestration_tab(&orch_config_local("m"), "/work", None, None, (24, 80))
+            .expect("open a second (orchestration) tab");
+        assert!(tab_manager.switch_to(0));
+        let snapshot = dashboard_snapshot(1);
+        let state: SharedState = Arc::new(RwLock::new(snapshot.clone()));
+        let filtered: Vec<(&String, &SessionState)> = Vec::new();
+        let frame_area = Rect::new(0, 0, 120, 40);
+        let key = |code, ui: &mut UiState, tab_manager: &mut TabManager| {
+            let _ = handle_key_event(
+                KeyEvent::new(code, KeyModifiers::CONTROL),
+                ui,
+                &*pc,
+                &state,
+                tab_manager,
+                &snapshot,
+                &filtered,
+                frame_area,
+            );
+        };
+
+        // Away and back in one drain: no render, so no per-frame check runs.
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        ui.selection = Some(kept(deck_key(tab_manager.active_tab())));
+        key(KeyCode::PageDown, &mut ui, &mut tab_manager);
+        assert_ne!(tab_manager.active_index(), 0, "Ctrl+PageDown moved away");
+        key(KeyCode::PageUp, &mut ui, &mut tab_manager);
+        assert_eq!(tab_manager.active_index(), 0, "Ctrl+PageUp came back");
+        assert!(
+            ui.selection.is_none(),
+            "a real tab switch must clear the selection, even when the user is back before a frame"
+        );
+
+        // A switch that goes nowhere is not a tab switch.
+        let mut ui = default_ui();
+        ui.mode = UiMode::PaneInput;
+        ui.selection = Some(kept(deck_key(tab_manager.active_tab())));
+        key(KeyCode::PageUp, &mut ui, &mut tab_manager);
+        assert_eq!(tab_manager.active_index(), 0);
+        assert!(
+            ui.selection.is_some(),
+            "Ctrl+PageUp on the first tab moves nowhere and must keep the selection"
+        );
+        switch_tab_with_focus(&mut tab_manager, 0, &*pc, &snapshot, &mut ui);
+        assert!(
+            ui.selection.is_some(),
+            "selecting the tab already active must keep the selection"
+        );
+    }
+
     /// Scenario: A digit jump (`1`-`9` → `focus_deck`) must select card N,
     /// focus its embedded pane, and ACTIVATE the highlight — even when the
     /// selection started inactive. Here the selection begins inactive (`None`);
@@ -37325,7 +39754,7 @@ mod tests {
     }
 
     fn terminal_modes_on() -> String {
-        ansi(crossterm::event::EnableMouseCapture)
+        ansi(EnableButtonMouseCapture)
             + &ansi(crossterm::event::EnableBracketedPaste)
             + &ansi(crossterm::event::EnableFocusChange)
     }
@@ -37373,6 +39802,35 @@ mod tests {
         event_loop_step()?;
         guard.disable();
         Ok(())
+    }
+
+    /// Scenario: The deck turns its terminal modes on and then off. Turning them on asks for presses, releases, drags and the wheel in SGR encoding but not any-motion tracking (`?1003h`), and turning them off still sends `?1003l` along with every other mouse disable.
+    #[cfg(unix)]
+    #[spec("mouse/capture/001")]
+    #[test]
+    fn capture_001_the_deck_does_not_ask_for_any_motion_tracking() {
+        let (modes, _restores) = counting_modes();
+        let out = SharedTerminalOutput::default();
+        let mut guard = modes.enable(out.clone()).expect("enable writes to memory");
+        let on = out.text();
+        for mode in ["?1000h", "?1002h", "?1006h"] {
+            assert!(
+                on.contains(&format!("\x1b[{mode}")),
+                "{mode} missing: {on:?}"
+            );
+        }
+        assert!(
+            !on.contains("1003"),
+            "the deck must not request any-motion tracking: {on:?}"
+        );
+        guard.disable();
+        let off = out.text()[on.len()..].to_string();
+        for mode in ["?1000l", "?1002l", "?1003l", "?1006l"] {
+            assert!(
+                off.contains(&format!("\x1b[{mode}")),
+                "{mode} missing: {off:?}"
+            );
+        }
     }
 
     /// PRD #1105 M11 audit — the terminal I/O error returns `run_tui`'s event
@@ -39228,12 +41686,127 @@ mod tests {
         }
     }
 
+    /// PRD #1885 (Greptile P2 / Qodo finding 3 on PR #2256): the open manager
+    /// picks up a refusal recorded after it opened — a fire runs after its
+    /// `RunNow` returns — on its refresh cadence, and reads nothing before that
+    /// cadence is due or while it is closed.
+    #[test]
+    fn the_open_schedule_manager_picks_up_a_refusal_recorded_after_it_opened() {
+        let refused = || {
+            let mut outcomes = crate::schedule_outcome::Outcomes::new();
+            outcomes.insert(
+                "nightly".to_string(),
+                crate::schedule_outcome::Refusal {
+                    at: "2026-11-10T09:00:00Z".to_string(),
+                    message: "orchestration 'team' was never approved".to_string(),
+                },
+            );
+            outcomes
+        };
+        let opened = std::time::Instant::now();
+        let mut ui = default_ui();
+        ui.scheduled_tasks = vec![make_scheduled_task("nightly", true)];
+        ui.mode = UiMode::ScheduledTasks;
+        ui.scheduled_refusals_read_at = Some(opened);
+
+        refresh_schedule_refusals_if_due(&mut ui, opened, || panic!("not due yet"));
+        assert!(ui.scheduled_refusals.is_empty());
+
+        let later = opened + SCHEDULE_REFUSALS_REFRESH;
+        refresh_schedule_refusals_if_due(&mut ui, later, refused);
+        assert!(
+            ui.scheduled_refusals.contains_key("nightly"),
+            "the refusal recorded after the manager opened is shown"
+        );
+        assert_eq!(ui.scheduled_refusals_read_at, Some(later));
+
+        ui.mode = UiMode::Normal;
+        refresh_schedule_refusals_if_due(&mut ui, later + SCHEDULE_REFUSALS_REFRESH * 10, || {
+            panic!("a closed manager reads nothing")
+        });
+    }
+
+    /// PRD #1885: a schedule whose last fire was refused as not approved reads
+    /// `refused`, and the selected one shows the refusal — with the command that
+    /// approves it — beneath the rows.
+    #[test]
+    fn schedule_manager_shows_a_refused_last_fire() {
+        let mut ui = default_ui();
+        ui.scheduled_tasks = vec![
+            make_scheduled_task("nightly", true),
+            make_scheduled_task("weekly", true),
+        ];
+        ui.scheduled_refusals.insert(
+            "nightly".to_string(),
+            crate::schedule_outcome::Refusal {
+                at: "2026-11-10T09:00:00Z".to_string(),
+                message: "orchestration 'team' of project /work/p was never approved, so \
+                          nothing from it was started. Review and approve it from a terminal \
+                          outside the deck with: dot-agent-deck trust approve /work/p \
+                          --orchestration team"
+                    .to_string(),
+            },
+        );
+        let render = |ui: &UiState| {
+            let buffer = draw_to_buffer(100, 30, |frame| {
+                let frame_area = frame.area();
+                render_scheduled_tasks(frame, frame_area, ui);
+            });
+            let area = buffer.area();
+            (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<String>>()
+        };
+        let lines = render(&ui);
+        let screen = lines.join("\n");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("nightly") && l.contains("refused")),
+            "{screen}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("weekly") && l.contains("idle")),
+            "{screen}"
+        );
+        let flat = screen
+            .split_whitespace()
+            .filter(|w| !w.chars().all(|c| "│─┌┐└┘".contains(c)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains("Last fire refused at 2026-11-10T09:00:00Z"),
+            "{screen}"
+        );
+        assert!(flat.contains("never approved"), "{screen}");
+        assert!(
+            flat.contains("dot-agent-deck trust approve /work/p --orchestration team"),
+            "{screen}"
+        );
+
+        ui.scheduled_selected = 1;
+        let screen = render(&ui).join("\n");
+        assert!(
+            !screen.contains("Last fire refused"),
+            "only the selected task's refusal is shown:\n{screen}"
+        );
+    }
+
     #[test]
     fn manager_status_label_derivation() {
-        assert_eq!(schedule_status_label(false, false), "disabled");
-        assert_eq!(schedule_status_label(false, true), "disabled"); // disabled wins
-        assert_eq!(schedule_status_label(true, true), "live");
-        assert_eq!(schedule_status_label(true, false), "idle");
+        assert_eq!(schedule_status_label_with(false, false, false), "disabled");
+        assert_eq!(schedule_status_label_with(false, true, false), "disabled"); // disabled wins
+        assert_eq!(schedule_status_label_with(true, true, false), "live");
+        assert_eq!(schedule_status_label_with(true, false, false), "idle");
+        // PRD #1885: a refused last fire reads `refused`, under `disabled`.
+        assert_eq!(schedule_status_label_with(true, true, true), "refused");
+        assert_eq!(schedule_status_label_with(false, false, true), "disabled");
     }
 
     #[test]
@@ -40638,6 +43211,8 @@ mod tests {
             ],
         };
 
+        // PRD #1885: approved, so the tab opens without the trust prompt.
+        crate::project_trust::approve_orchestration_for_test(&cwd, &config);
         // The submitted new-pane form: its Name field defaults to the dir
         // basename (transition_after_dir_pick), so req.name = FORM_TITLE while
         // orchestration_config still carries the canonical CONFIG_NAME.
@@ -41163,6 +43738,9 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("project dir");
         let mut ui = default_ui();
         ui.mode = UiMode::NewPaneForm;
+        // PRD #1885: approved, so the start reaches the daemon whose refusal
+        // these tests are about.
+        crate::project_trust::approve_orchestration_for_test(&dir, &make_orchestration("review"));
         ui.new_pane_form = Some(NewPaneFormState::new(
             dir,
             "myproj".to_string(),
@@ -41279,6 +43857,510 @@ mod tests {
         assert!(
             status.is_some_and(|m| m.starts_with("Orchestration failed:")),
             "any other failure is reported as before, got {status:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // PRD #1885 — the New Agent form's trust prompt
+    // -----------------------------------------------------------------------
+
+    /// PRD #1885: a [`PaneController`] whose daemon answers trust requests with
+    /// `view` — `approved` once an approval carrying `view`'s digest landed —
+    /// and records every approval's digest. Pane creation is a
+    /// [`CapturingPaneController`]'s.
+    struct TrustingPaneController {
+        view: crate::project_trust::ProjectTrustView,
+        approved: std::sync::Mutex<bool>,
+        approvals: std::sync::Mutex<Vec<String>>,
+        /// When set, what the next approval answers instead of approving.
+        approve_answer: std::sync::Mutex<
+            Option<
+                Result<
+                    crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>,
+                    String,
+                >,
+            >,
+        >,
+        inner: CapturingPaneController,
+    }
+
+    impl TrustingPaneController {
+        fn new(dir: &std::path::Path, orchestration: &OrchestrationConfig) -> Self {
+            let check = crate::project_trust::TrustCheck::evaluate(
+                &crate::project_trust::ApprovalStore::default(),
+                dir.to_path_buf(),
+                dir,
+                orchestration,
+            );
+            Self {
+                view: check.view(),
+                approved: std::sync::Mutex::new(false),
+                approvals: std::sync::Mutex::new(Vec::new()),
+                approve_answer: std::sync::Mutex::new(None),
+                inner: CapturingPaneController::new(),
+            }
+        }
+    }
+
+    impl PaneController for TrustingPaneController {
+        fn create_pane_with_options(
+            &self,
+            command: Option<&str>,
+            cwd: Option<&str>,
+            opts: AgentSpawnOptions<'_>,
+        ) -> Result<(String, String), PaneError> {
+            self.inner.create_pane_with_options(command, cwd, opts)
+        }
+        fn focus_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.focus_pane(pane_id)
+        }
+        fn pane_agent_id(&self, pane_id: &str) -> Option<String> {
+            self.inner.pane_agent_id(pane_id)
+        }
+        fn close_pane(&self, pane_id: &str) -> Result<(), PaneError> {
+            self.inner.close_pane(pane_id)
+        }
+        fn list_panes(&self) -> Result<Vec<crate::pane::PaneInfo>, PaneError> {
+            self.inner.list_panes()
+        }
+        fn resize_pane(
+            &self,
+            pane_id: &str,
+            direction: crate::pane::PaneDirection,
+            amount: u16,
+        ) -> Result<(), PaneError> {
+            self.inner.resize_pane(pane_id, direction, amount)
+        }
+        fn rename_pane(&self, pane_id: &str, name: &str) -> Result<RenameOutcome, PaneError> {
+            self.inner.rename_pane(pane_id, name)
+        }
+        fn toggle_layout(&self) -> Result<(), PaneError> {
+            self.inner.toggle_layout()
+        }
+        fn write_to_pane(&self, pane_id: &str, text: &str) -> Result<(), PaneError> {
+            self.inner.write_to_pane(pane_id, text)
+        }
+        fn project_trust_state(
+            &self,
+            _dir: &str,
+            _orchestration: &str,
+        ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+        {
+            let mut view = self.view.clone();
+            if *self.approved.lock().unwrap() {
+                view.state = "approved".to_string();
+                for role in &mut view.roles {
+                    role.change = None;
+                }
+            }
+            Ok(crate::daemon_client::GatedQuery::Answered(view))
+        }
+        fn approve_project_trust(
+            &self,
+            dir: &str,
+            orchestration: &str,
+            digest: &str,
+        ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+        {
+            self.approvals.lock().unwrap().push(digest.to_string());
+            if let Some(answer) = self.approve_answer.lock().unwrap().take() {
+                return answer;
+            }
+            if digest != self.view.digest {
+                return Err(format!(
+                    "{}: changed",
+                    crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED
+                ));
+            }
+            *self.approved.lock().unwrap() = true;
+            self.project_trust_state(dir, orchestration)
+        }
+        fn name(&self) -> &str {
+            "trusting"
+        }
+        fn is_available(&self) -> bool {
+            true
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    fn dispatch_against(
+        action: Action,
+        ui: &mut UiState,
+        pane: &dyn PaneController,
+        tm: &mut TabManager,
+    ) {
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(AppState::default()));
+        let snapshot = AppState::default();
+        let _ = dispatch_action(
+            action,
+            ui,
+            pane,
+            &state,
+            tm,
+            &snapshot,
+            &[],
+            None,
+            Rect::new(0, 0, 200, 50),
+        );
+    }
+
+    fn open_request(dir: &std::path::Path, config: &OrchestrationConfig) -> Action {
+        Action::SpawnPane(Box::new(NewPaneRequest {
+            dir: dir.to_path_buf(),
+            name: config.name.clone(),
+            command: String::new(),
+            orchestration_config: Some(config.clone()),
+            seed_prompt: None,
+            authoring_kind: None,
+        }))
+    }
+
+    /// Scenario: Choose a never-approved orchestration from the New Agent form
+    /// against a daemon that answers trust requests. The trust prompt opens
+    /// and nothing is spawned; Enter neither approves nor closes it, and Esc
+    /// closes it with nothing spawned and nothing approved. Choosing it again
+    /// and pressing `a` once the prompt is drawn approves the digest the prompt
+    /// showed and opens every role.
+    #[test]
+    fn prompt_004_the_form_asks_before_opening_and_a_approves_the_shown_digest() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_trust_prompt_key(enter, &mut ui),
+            Action::Continue
+        ));
+        assert_eq!(ui.mode, UiMode::TrustPrompt, "Enter does not approve");
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        handle_trust_prompt_key(esc, &mut ui);
+        assert_eq!(ui.mode, UiMode::Normal);
+        assert!(ui.trust_prompt.is_none());
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
+        assert!(
+            pc.approvals.lock().unwrap().is_empty(),
+            "Esc stores nothing"
+        );
+
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        let a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE);
+        assert!(
+            refuse_undrawn_choice(&a, &ui).is_some(),
+            "`a` typed before the prompt was drawn approves nothing"
+        );
+        let mut shown = ChoicesShown::default();
+        shown.insert(0);
+        ui.confirm_choices_drawn = Some((UiMode::TrustPrompt, shown));
+        assert!(refuse_undrawn_choice(&a, &ui).is_none());
+        let action = handle_trust_prompt_key(a, &mut ui);
+        assert!(matches!(action, Action::ApproveProjectTrust));
+        dispatch_against(action, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(*pc.approvals.lock().unwrap(), vec![pc.view.digest.clone()]);
+        assert_eq!(
+            pc.inner.recorded_orchestration_names(),
+            vec!["review".to_string(), "review".to_string()],
+            "approving opens every role"
+        );
+        assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: Open the trust prompt from the New Agent form and draw it.
+    /// A click on the drawn `a approve and start` label resolves to the
+    /// approval and on `Esc cancel` to the cancel, while clicks on the title,
+    /// the body, the footer's scroll hint and the deck beside the popup resolve
+    /// to nothing. Reopened, the prompt takes no click on the approve label
+    /// until a frame has shown it again; after that frame the click approves
+    /// the shown digest and opens every role, and a click on `Esc cancel`
+    /// closes a fresh prompt with nothing stored.
+    #[test]
+    fn prompt_004_a_click_answers_only_a_drawn_label() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        let open = |ui: &mut UiState, tm: &mut TabManager| {
+            dispatch_against(open_request(tmp.path(), &config), ui, pc.as_ref(), tm);
+            assert_eq!(ui.mode, UiMode::TrustPrompt);
+        };
+
+        open(&mut ui, &mut tm);
+        let rows = draw_sized(&mut ui, 100, 30);
+        let shown = rows.join("\n");
+        let approve = find_in_rows(&rows, "a approve and start").expect(&shown);
+        let cancel = find_in_rows(&rows, "Esc cancel").expect(&shown);
+        let scroll_hint = find_in_rows(&rows, "↑↓ scroll").expect(&shown);
+        let title = find_in_rows(&rows, crate::trust_prompt::TITLE).expect(&shown);
+        let body = find_in_rows(&rows, "coder").expect(&shown);
+        let middle = |(col, row): (u16, u16), len: u16| (col + len / 2, row);
+        assert!(matches!(
+            modal_click(&ui, middle(approve, 19)),
+            Some(Action::ApproveProjectTrust)
+        ));
+        assert!(matches!(
+            modal_click(&ui, middle(cancel, 10)),
+            Some(Action::CancelTrustPrompt)
+        ));
+        for (what, at) in [
+            ("the title", title),
+            ("the body", body),
+            ("the scroll hint", scroll_hint),
+            ("the deck beside the popup", (1, approve.1)),
+            ("the separator", (approve.0 + 20, approve.1)),
+        ] {
+            assert!(
+                modal_click(&ui, at).is_none(),
+                "a click on {what} at {at:?} answered the prompt:\n{shown}"
+            );
+        }
+
+        // Reopened: the last frame's targets are gone until a frame shows it.
+        dispatch_against(Action::CancelTrustPrompt, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(ui.mode, UiMode::Normal);
+        open(&mut ui, &mut tm);
+        assert!(confirmation_awaits_frame(&ui));
+        assert!(
+            modal_click(&ui, middle(approve, 19)).is_none(),
+            "a click on the approve label before its frame approved"
+        );
+        assert!(pc.approvals.lock().unwrap().is_empty());
+        draw_sized(&mut ui, 100, 30);
+        let action = modal_click(&ui, middle(approve, 19)).expect("the drawn approve label");
+        assert!(matches!(action, Action::ApproveProjectTrust));
+        dispatch_against(action, &mut ui, pc.as_ref(), &mut tm);
+        assert_eq!(*pc.approvals.lock().unwrap(), vec![pc.view.digest.clone()]);
+        assert_eq!(
+            pc.inner.recorded_orchestration_names(),
+            vec!["review".to_string(), "review".to_string()],
+            "a click on approve opens every role, as `a` does"
+        );
+        assert!(ui.trust_prompt.is_none());
+    }
+
+    /// Scenario: Open the trust prompt on a terminal too short for its whole
+    /// review. Before a frame the wheel does nothing; once drawn, the wheel
+    /// down over the popup scrolls one row a notch and stops at the end, the
+    /// wheel up scrolls back, and a wheel beside the popup scrolls nothing.
+    #[test]
+    fn prompt_004_the_wheel_over_the_review_scrolls_it() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        let scroll = |ui: &UiState| ui.trust_prompt.as_ref().map(|p| p.scroll);
+
+        scroll_trust_prompt(&mut ui, false, 50, 5);
+        assert_eq!(scroll(&ui), Some(0), "a wheel before the first frame");
+
+        let rows = draw_sized(&mut ui, 100, 10);
+        let max = ui.trust_prompt.as_ref().unwrap().max_scroll;
+        assert!(
+            max > 0,
+            "precondition: the review overflows:\n{}",
+            rows.join("\n")
+        );
+        let inner = ui.trust_prompt.as_ref().unwrap().drawn_inner.unwrap();
+        let (col, row) = (inner.x + 2, inner.y + 1);
+
+        scroll_trust_prompt(&mut ui, false, 0, row);
+        assert_eq!(scroll(&ui), Some(0), "a wheel beside the popup");
+        scroll_trust_prompt(&mut ui, false, col, row);
+        assert_eq!(scroll(&ui), Some(1));
+        for _ in 0..max + 5 {
+            scroll_trust_prompt(&mut ui, false, col, row);
+        }
+        assert_eq!(scroll(&ui), Some(max), "the wheel stops at the end");
+        scroll_trust_prompt(&mut ui, true, col, row);
+        assert_eq!(scroll(&ui), Some(max - 1));
+        assert_eq!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.inner.recorded_orchestration_names().is_empty());
+    }
+
+    /// Scenario: approve, with `a`, an orchestration whose config name
+    /// carries ESC, BEL and RIGHT-TO-LEFT OVERRIDE, against a daemon too old to
+    /// approve and against one whose refusal carries the same characters. The
+    /// status line shows every one of them escaped (Qodo #8 on PR #2256).
+    #[test]
+    fn prompt_007_an_approval_refusal_shows_hostile_text_escaped() {
+        const HOSTILE: &str = "\u{1b}[2J\u{7}\u{202e}";
+        let answers = [
+            Ok(crate::daemon_client::GatedQuery::Unsupported),
+            Err(format!("daemon returned error: boom {HOSTILE}")),
+        ];
+        for answer in answers {
+            let tmp = tempdir().expect("tempdir");
+            let config = make_orchestration(&format!("review{HOSTILE}"));
+            let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+            let mut tm = TabManager::new(pc.clone());
+            let mut ui = default_ui();
+            dispatch_against(
+                open_request(tmp.path(), &config),
+                &mut ui,
+                pc.as_ref(),
+                &mut tm,
+            );
+            assert_eq!(ui.mode, UiMode::TrustPrompt);
+            let label = format!("{answer:?}");
+            *pc.approve_answer.lock().unwrap() = Some(answer);
+            dispatch_against(Action::ApproveProjectTrust, &mut ui, pc.as_ref(), &mut tm);
+            assert!(
+                pc.inner.recorded_orchestration_names().is_empty(),
+                "{label}"
+            );
+            let status = ui
+                .status_message
+                .as_ref()
+                .map(|(m, _)| m.clone())
+                .unwrap_or_default();
+            assert!(
+                !status
+                    .chars()
+                    .any(|c| c.is_control() || crate::untrusted_text::is_bidi_format_char(c)),
+                "{label}: a raw control or bidi character reached the status line: {status:?}"
+            );
+            assert!(
+                status.contains("review\\u{1b}") && status.contains("\\u{202e}"),
+                "{label}: the hostile text is shown escaped, not dropped: {status:?}"
+            );
+        }
+    }
+
+    /// Scenario: three saved orchestrations are held back by the startup
+    /// restore. One is cancelled with Esc, one is open in the trust prompt and
+    /// one still waits; a session save keeps all three exactly as saved, except
+    /// one whose orchestration a live tab already saves (Greptile P1 on PR
+    /// #2256).
+    #[test]
+    fn a_session_save_keeps_every_restore_awaiting_approval() {
+        let held = |project: &str, name: &str| {
+            let config = make_orchestration(name);
+            let view = crate::project_trust::TrustCheck::evaluate(
+                &crate::project_trust::ApprovalStore::default(),
+                std::path::PathBuf::from(project),
+                std::path::Path::new(project),
+                &config,
+            )
+            .view();
+            PendingTrustRestore {
+                saved_pane: config::SavedPane {
+                    dir: project.to_string(),
+                    name: name.to_string(),
+                    command: String::new(),
+                    mode: None,
+                    orchestration: Some(config::OrchestrationSnapshot {
+                        version: 1,
+                        roles: vec!["orchestrator".to_string()],
+                        start_role_index: 0,
+                        orchestrator_prompt: String::new(),
+                        config_name: name.to_string(),
+                        project_path: project.to_string(),
+                        started_role_indices: Vec::new(),
+                        display_title: None,
+                    }),
+                },
+                view,
+            }
+        };
+        let mut ui = default_ui();
+        let declined = held("/p/declined", "declined");
+        let open = held("/p/open", "open");
+        ui.pending_trust_restores
+            .push_back(held("/p/waiting", "waiting"));
+        ui.pending_trust_restores.push_back(held("/p/live", "live"));
+        open_trust_prompt(
+            &mut ui,
+            declined.view.clone(),
+            TrustPromptPurpose::Restore(declined),
+        );
+        cancel_trust_prompt(&mut ui);
+        open_trust_prompt(
+            &mut ui,
+            open.view.clone(),
+            TrustPromptPurpose::Restore(open),
+        );
+
+        let mut session = config::SavedSession {
+            panes: vec![held("/p/live", "live").saved_pane],
+            ..Default::default()
+        };
+        keep_held_trust_restores(&ui, &mut session);
+        let names: Vec<&str> = session.panes.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["live", "waiting", "open", "declined"]);
+    }
+
+    /// Scenario: Choose an approved orchestration whose config is unchanged:
+    /// it opens straight away, with no prompt and no approval request.
+    #[test]
+    fn prompt_005_an_approved_orchestration_opens_with_no_prompt() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("review");
+        let pc = Arc::new(TrustingPaneController::new(tmp.path(), &config));
+        *pc.approved.lock().unwrap() = true;
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_ne!(ui.mode, UiMode::TrustPrompt);
+        assert!(ui.trust_prompt.is_none());
+        assert_eq!(pc.inner.recorded_orchestration_names().len(), 2);
+        assert!(pc.approvals.lock().unwrap().is_empty());
+    }
+
+    /// Scenario: Against a daemon too old to answer trust requests, choosing a
+    /// never-approved orchestration opens no prompt and spawns nothing: the
+    /// status line names `dot-agent-deck trust approve`.
+    #[test]
+    fn prompt_006_an_older_daemon_refuses_an_unapproved_orchestration() {
+        let tmp = tempdir().expect("tempdir");
+        let config = make_orchestration("never-approved-here");
+        let pc = Arc::new(CapturingPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_against(
+            open_request(tmp.path(), &config),
+            &mut ui,
+            pc.as_ref(),
+            &mut tm,
+        );
+        assert_ne!(ui.mode, UiMode::TrustPrompt);
+        assert!(pc.recorded_orchestration_names().is_empty());
+        let status = ui.status_message.as_ref().map(|(m, _)| m.as_str());
+        assert!(
+            status.is_some_and(|m| m.starts_with(crate::trust_prompt::OLDER_DAEMON_NOTE)
+                && m.contains("dot-agent-deck trust approve")),
+            "{status:?}"
         );
     }
 
@@ -41637,7 +44719,9 @@ mod tests {
             | UiMode::HostMetrics
             | UiMode::Upgrade
             | UiMode::InboxAttention
-            | UiMode::RestartNotice => mode,
+            | UiMode::RestartNotice
+            | UiMode::CopyMode
+            | UiMode::TrustPrompt => mode,
         }
     }
 
@@ -41662,6 +44746,8 @@ mod tests {
             UiMode::Upgrade,
             UiMode::InboxAttention,
             UiMode::RestartNotice,
+            UiMode::CopyMode,
+            UiMode::TrustPrompt,
         ]
         .into_iter()
         .map(assert_exhaustive_ui_mode)
@@ -41711,6 +44797,8 @@ mod tests {
         tmp_dir: &std::path::Path,
         name: &str,
     ) {
+        // PRD #1885: approved, so the tab opens without the trust prompt.
+        crate::project_trust::approve_orchestration_for_test(tmp_dir, &lock_test_orch_config(name));
         let req = NewPaneRequest {
             dir: tmp_dir.to_path_buf(),
             name: name.to_string(),
@@ -47732,6 +50820,12 @@ mod one_shot_protocol_gate_tests {
         assert_eq!(daemon.recorded(), vec!["0:list-agents".to_string()]);
     }
 }
+
+/// PRD #385: a contained panic leaves the terminal set up, under the whole
+/// panic-hook stack `run_tui` installs.
+#[cfg(all(test, unix))]
+#[path = "ui_panic_teardown_tests.rs"]
+mod panic_teardown_tests;
 
 /// Issue #1913: a deck restart that reuses an orchestration tab's pane ids.
 #[cfg(all(test, unix))]

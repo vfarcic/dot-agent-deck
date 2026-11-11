@@ -468,6 +468,8 @@ async fn fixture_with_orchestrator(
         config(&worker_command),
     )
     .expect("write orchestration config");
+    // PRD #1885: a `clear = true` delegate runs only an approved orchestration.
+    common::approve_project_fixture(dir.path());
     let cwd = dir.path().to_string_lossy().into_owned();
 
     let client = DaemonClient::new(daemon.attach_path.clone());
@@ -1597,6 +1599,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
         config(&dispatch_recorder.to_string_lossy()),
     )
     .expect("write dispatched orchestration config");
+    common::approve_project_fixture(dispatch_dir.path());
 
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
@@ -1951,6 +1954,7 @@ async fn send_addendum_with_supersede(clear: bool) -> SupersededWorker {
         )
         .await
         .expect("rewrite the orchestration config with a clear = false worker");
+        common::approve_project_fixture(fx._dir.path());
     }
     let budget = common::load_scaled(Duration::from_secs(20));
 

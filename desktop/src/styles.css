@@ -1122,7 +1122,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .danger-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--red); background: var(--red-soft); }
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
-.confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* `flex-wrap`: a close that can keep its worktree adds a third, longer button (issue #1958), which wraps rather than overflowing the card. */
+.confirm-dialog > div:last-child { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; }
 .confirm-dialog.has-worktree-preview { display: flex; flex-direction: column; max-height: 100%; overflow-y: auto; }
 .confirm-dialog.has-worktree-preview > * { flex-shrink: 0; }
 .confirm-dialog .worktree-close-preview { min-height: 0; flex-shrink: 1; overflow-y: auto; }
@@ -1160,6 +1161,22 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .self-upgrade-actions > div { display: flex; justify-content: center; gap: 7px; }
 /* The actions block is the dialog's last child, so `.confirm-dialog > div:last-child` would lay its question and buttons out side by side. */
 .confirm-dialog.self-upgrade-dialog > div.self-upgrade-actions { display: block; }
+
+/* PRD #1885 — `Review project commands`: the confirm card, wider, with the
+   project's commands and prompts in a scrolling body that is read as text. */
+.trust-dialog { width: min(620px, 100%); max-height: calc(100vh - 11vh - 40px); display: flex; flex-direction: column; }
+.trust-dialog > * { flex-shrink: 0; }
+.confirm-dialog.trust-dialog .trust-body { min-height: 0; flex-shrink: 1; margin: 10px 0 12px; padding: 9px 11px; overflow: auto; text-align: left; font-size: 10px; line-height: 1.5; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.trust-body .trust-field { overflow-wrap: anywhere; }
+.trust-body .trust-label { color: var(--muted); }
+.trust-body .trust-value { color: var(--ink); }
+.trust-body .trust-mark { color: var(--red); }
+.trust-body code.trust-value { font-size: 9.5px; white-space: pre-wrap; }
+.trust-body .trust-text { margin: 2px 0 0 12px; padding: 0; color: var(--ink); font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
+.confirm-dialog.trust-dialog .trust-intro { margin: 8px 0; max-width: none; color: var(--ink); }
+.trust-body .trust-role { margin-top: 9px; padding-top: 7px; border-top: 1px solid var(--line); }
+.confirm-dialog.trust-dialog .trust-notice, .confirm-dialog.trust-dialog .trust-error { margin: 0 auto 10px; max-width: none; }
+.confirm-dialog.trust-dialog .trust-error { color: var(--red); }
 
 /* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
    scrim, as the palette and the confirmation are: a deck step, a directory step

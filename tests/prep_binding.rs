@@ -74,7 +74,19 @@ fn project() -> (tempfile::TempDir, PathBuf) {
     std::fs::write(dir.path().join(".dot-agent-deck.toml"), LAUNCHABLE_PROJECT)
         .expect("seed the project config");
     let canonical = std::fs::canonicalize(dir.path()).expect("canonicalize the project sandbox");
+    approve(&canonical);
     (dir, canonical)
+}
+
+/// PRD #1885: approve every orchestration of the config in `dir`, through the
+/// real store API, in a store private to this test process — a prepared start
+/// runs only an approved orchestration, and these tests are about the binding.
+fn approve(dir: &Path) {
+    use dot_agent_deck::project_trust::{TrustStore, approve_all};
+    static STORE: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    let store = STORE.get_or_init(|| test_temp::tempdir().expect("mint the trust store dir"));
+    let _ = TrustStore::use_state_dir_for_this_process(store.path().to_path_buf());
+    approve_all(&TrustStore::default_location(), dir).expect("approve the fixture config");
 }
 
 fn context_file(binding: &PrepBinding) -> PathBuf {
@@ -764,6 +776,7 @@ command = "cat"
     )
     .expect("seed the project config");
     let project = std::fs::canonicalize(dir.path()).expect("canonicalize the project sandbox");
+    approve(&project);
     let (_token, binding) = prepare(&project, "A brief.");
 
     let request = |role: &str, is_start_role: bool| {
