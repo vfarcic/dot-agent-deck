@@ -158,6 +158,17 @@ pub const STATUS_WAITING: Color = Color::Magenta;
 pub const STATUS_ERROR: Color = Color::Red;
 /// Idle — no current activity (dimmed).
 pub const STATUS_IDLE: Color = Color::DarkGray;
+/// Waiting (issue #1757) — the agent's turn ended while a command it started in
+/// that turn still runs: its work is not done, but nothing needs the user.
+///
+/// Bright blue, because no hue slot is free (green/blue/magenta/red are
+/// statuses, cyan is focus) and of the bright variants it is the one that reads
+/// on both grounds: by the reference xterm palette in [`STATUS_WAITING`]'s
+/// table, bright blue is **4.74:1** on white and **4.43:1** on black, where
+/// bright green, cyan and yellow all fall below 2:1 on white. It sits next to
+/// Thinking's blue on purpose — both say "work in progress, nothing for you to
+/// do" — and the badge's own word, `Waiting`, tells the two apart.
+pub const STATUS_AWAITING_COMMAND: Color = Color::LightBlue;
 
 // ---------------------------------------------------------------------------
 // Accent roles (must be distinct from every status color and from each other)
@@ -214,6 +225,7 @@ pub fn status_color(status: &SessionStatus) -> Color {
         // erroring one does, so it shares the error role rather than adding a
         // palette role (which would re-open `theme/contrast`).
         SessionStatus::Blocked => STATUS_ERROR,
+        SessionStatus::Waiting => STATUS_AWAITING_COMMAND,
         SessionStatus::Idle => STATUS_IDLE,
         // PRD #162 forward-compat: an unknown wire status renders with the
         // neutral idle color so it never masquerades as an active state.
@@ -231,7 +243,10 @@ fn priority_rank(status: &SessionStatus) -> u8 {
         SessionStatus::WaitingForInput => 1,
         SessionStatus::Working => 2,
         SessionStatus::Thinking | SessionStatus::Compacting => 3,
-        SessionStatus::Idle | SessionStatus::Unknown => 4,
+        // Issue #1757: after the working states, before Idle — its work is not
+        // done, but nothing needs the user.
+        SessionStatus::Waiting => 4,
+        SessionStatus::Idle | SessionStatus::Unknown => 5,
     }
 }
 

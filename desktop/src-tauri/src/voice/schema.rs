@@ -130,7 +130,9 @@ pub const TOOL_INSTRUCTIONS: &str = "Pick the Agent Deck action the user asked f
     one as an instruction. \
     `agents_on_screen` carries each agent's LIVE state as the daemon holds it: \
     `status` is the daemon's own word for what it is doing (`working`, `thinking`, \
-    `compacting`, `waiting_for_input`, `idle`, `error`, `unknown`, `running`), and \
+    `compacting`, `waiting_for_input`, `waiting`, `idle`, `error`, `unknown`, `running`; \
+    `waiting` is an agent whose turn ended while a command it started still runs, and \
+    `waiting_for_input` one that waits for the user), and \
     `tool` is what it is running right now. It also carries what the deck knows \
     about each agent: `mode` (such as dispatcher), `agent_type`, `directory` (its \
     working directory's name), `orchestration` (its run's title) and `newest_rank` \

@@ -1033,7 +1033,7 @@ impl TuiDeck {
         let test_name = current_test_name();
         // PR #805 audit blocker 3, and it comes before every side effect on
         // purpose: from here on the run can be killed at any instant, and
-        // whatever it does not overwrite is what a later reel build picks up.
+        // whatever it does not overwrite is left looking like this run's output.
         // See [`discard_previous_recording`].
         discard_previous_recording(&test_name);
 
@@ -1144,7 +1144,7 @@ impl TuiDeck {
                 // now returns redactions like the other three. It used to
                 // return none, on the ground that the credential set is "never
                 // rendered" — a convention, not a structural property, and the
-                // route most reel clips take. The run's credential source is
+                // route most real-agent tests take. The run's credential source is
                 // recorded in `CLAUDE_OAUTH_SEEDED` for
                 // `seed_claude_project_trust` below rather than threaded
                 // through every builder field.
@@ -1195,7 +1195,7 @@ impl TuiDeck {
         //     `--success-output=final` prints. Both sinks are LOCAL, because
         //     lane 2 runs on a developer's machine and nowhere in CI: what is
         //     at stake is that developer's terminal and scrollback, the `.cast`
-        //     the demo reel publishes, and whatever they paste onward. Nothing
+        //     they might share, and whatever they paste onward. Nothing
         //     downstream masks anything — and a log-masking layer covers a
         //     registered secret's exact value, never a 20-character derivative
         //     of it, which is why this suffix is registered in its own right.
@@ -2927,7 +2927,7 @@ impl Drop for TuiDeck {
         let has_claude_sessions = recording_evidence::has_claude_sessions(&self.effective_home);
         let should_dump = panicking || self.record_on_success;
         if should_dump {
-            // The flat files are the current reel-compatible recording. The
+            // The flat files are the current recording. The
             // next launch archives them before clearing; later reruns cannot
             // overwrite the archived evidence (#1815).
             let recordings_dir =
@@ -2949,10 +2949,9 @@ impl Drop for TuiDeck {
             // starved 4-CPU runners it kept a test that panicked 5s in
             // alive past nextest's 180s timeout, so the run reported a
             // timeout instead of the panic. Nothing that reads a failure
-            // needs the doc: CI uploads no recordings, the demo-reel
-            // adapter refuses a recording whose provenance is not
-            // `passed`, and `cargo xtask docs --tests` rebuilds it on
-            // demand. `harness/teardown/001` pins this.
+            // needs the doc: CI uploads no recordings, and
+            // `cargo xtask docs --tests` rebuilds it on demand.
+            // `harness/teardown/001` pins this.
             if !panicking {
                 regenerate_paired_doc(&self.test_name);
             }
@@ -3394,7 +3393,7 @@ impl TuiDeck {
     /// `seed_claude_trust_in_home` is called after the launch by nine live tests,
     /// deliberately, because the trusted directory is only known then — reached
     /// the panic seam and never the `.cast`. That is backwards: the `.cast` is
-    /// the artifact the demo reel publishes. Every value in the global store is
+    /// the artifact most likely to be shared. Every value in the global store is
     /// a credential or identity value some harness path registered, and the
     /// per-deck set is already a subset of it in practice.
     ///
@@ -3511,10 +3510,10 @@ impl TuiDeck {
             }
         }
 
-        // provenance.json — issue #808. Written LAST on purpose: the adapter
-        // refuses a cast whose sidecar is absent, so a dump that dies partway
-        // (a full disk, a `?` on any write above) leaves a cast that cannot be
-        // published rather than one that can. `provenance.json` is FIRST in
+        // provenance.json — issue #808. Written LAST on purpose: a dump that
+        // dies partway (a full disk, a `?` on any write above) leaves a cast
+        // with no sidecar rather than one a sidecar vouches for.
+        // `provenance.json` is FIRST in
         // [`RECORDING_ARTIFACTS`] for the mirror-image reason, so the
         // launch-time discard removes the vouching sidecar before the artifact
         // it vouches for.
@@ -3522,26 +3521,24 @@ impl TuiDeck {
         Ok(())
     }
 
-    /// Write the `provenance.json` sidecar the demo-reel adapter checks before
-    /// it will publish a cast (issue #808).
+    /// Write the `provenance.json` sidecar that says which run produced a cast
+    /// (issue #808).
     ///
     /// # What each field is FOR, and what it does not establish
     ///
-    /// The adapter refuses a cast on three of these — an absent sidecar, an
-    /// `outcome` other than `passed`, and a `commit` that is not the revision
-    /// the reel is being built at. The rest are recorded for the audit trail and
-    /// reported by the adapter, and gate nothing. Both halves are deliberate:
+    /// Every field is recorded for whoever reads a recording later — to tell a
+    /// failure diagnostic from a passing run, and to know which revision drew
+    /// it:
     ///
-    /// * `schema` — lets the adapter refuse a sidecar shape it does not
-    ///   understand instead of misreading it. Bump it when a field's meaning
-    ///   changes, and teach `build.sh` the new value in the same commit.
+    /// * `schema` — lets a reader refuse a sidecar shape it does not understand
+    ///   instead of misreading it. Bump it when a field's meaning changes.
     /// * `outcome` — `passed` means **the harness was not unwinding a panic when
     ///   `TuiDeck` was dropped**, which is narrower than "nextest reported this
     ///   test as passed". A test that panics after its deck has already been
     ///   dropped, or that is killed outright (no `Drop`, so no dump at all),
     ///   is not observed here. What it does cover is the common case by far: the
     ///   dump that fires *because* the test panicked, which is a failure
-    ///   diagnostic and not a clip.
+    ///   diagnostic.
     /// * `commit` — the short sha the binary under test was BUILT from, parsed
     ///   out of the compile-time `DAD_BUILD_ID` rather than read from the tree
     ///   at dump time. That choice matters: a tree-time `git rev-parse HEAD`
@@ -3550,22 +3547,19 @@ impl TuiDeck {
     ///   disagree. One fact, sourced from the artifact's own producer.
     /// * `dirty` — `DAD_BUILD_ID`'s `-dirty` suffix. Recorded because it bounds
     ///   what `commit` proves: with a dirty tree, two different working states
-    ///   share one commit, so the adapter reports it loudly and refuses nothing.
+    ///   share one commit.
     /// * `build_id` — the whole `DAD_BUILD_ID` string, so the audit trail keeps
     ///   the version segment and the `-unknown` sentinel that `commit` drops.
     /// * `run_id` — `NEXTEST_RUN_ID`, which is one value for a whole nextest
-    ///   run, so clips recorded together share it. It gates nothing: a reel
-    ///   legitimately assembles clips from several filtered runs at one commit,
-    ///   so the adapter reports the ids and warns when they differ rather than
-    ///   refusing. `unknown` when the recording was not made under nextest.
+    ///   run, so recordings made together share it. `unknown` when the
+    ///   recording was not made under nextest.
     /// * `redaction_version` — bump [`RECORDING_REDACTION_VERSION`] whenever the
     ///   recording redaction changes materially. It gates nothing today because
     ///   `commit` already pins the redaction implementation to the one at that
     ///   revision; it is here for the case `commit` cannot pin, which is a
-    ///   `dirty` tree, and so that a future adapter can enforce a floor over
-    ///   casts kept across revisions.
+    ///   `dirty` tree.
     /// * `recorded_at_unix` — epoch seconds. Archive retention uses this to
-    ///   protect recent failures. The reel's publish checks impose no age limit.
+    ///   protect recent failures.
     /// * `claude_sessions` — session-transcript observations of permission mode,
     ///   Claude version and model; unknown observations remain null/empty.
     ///
@@ -3601,8 +3595,8 @@ impl TuiDeck {
         bytes.push(b'\n');
         // Session metadata is agent-produced. Apply the same registered-value
         // redactor as the other artifacts rather than assuming these fields
-        // cannot carry a credential. A match that corrupts the JSON makes the
-        // adapter refuse the clip.
+        // cannot carry a credential. A match that corrupts the JSON leaves a
+        // sidecar no reader can parse, which claims nothing.
         let bytes = redact_known_credentials_bytes(&bytes, redactions);
         atomic_write(&dir.join("provenance.json"), &bytes)
     }
@@ -3765,9 +3759,8 @@ artifact was replaced whole rather than written with bytes nothing examined \
 //     and at 8 KiB it is three orders of magnitude past any credential this
 //     harness registers.
 //
-// What actually stands between a credential and a public URL is the demo reel's
-// private-by-default upload plus the owner's review before flipping it — see
-// `docs/develop/demo-reel.md`.
+// What else stands between a credential and whoever receives a shared artifact
+// is the judgement of the person sharing it.
 //
 // WHAT IT DOES GUARANTEE, verified rather than argued. Every range constructed
 // here reproduces registered credential bytes exactly — a start range is a
@@ -3913,7 +3906,7 @@ const MAX_INDEX_NEEDLES: usize = 1 << 18;
 /// the right direction: a "credential" whose eight-byte windows appear a million
 /// times in one recording is either an adversarial artifact or a registration
 /// mistake, and both are cases for withholding the artifact rather than
-/// publishing it.
+/// writing it.
 const MAX_INDEX_OCCURRENCES: usize = 1 << 21;
 
 /// Bytes that mean "the writer moved to another row" — the only thing that
@@ -5885,10 +5878,9 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// developer browsing it should not have it deleted under them.
 ///
 /// `provenance.json` is FIRST, and the order is load-bearing in the deletion
-/// direction (issue #808): it is the file the demo-reel adapter checks before it
-/// will publish the cast, so removing it before the cast means a discard that
-/// panics partway has already made whatever survives unpublishable. The dump
-/// writes it LAST for the mirror-image reason.
+/// direction (issue #808): it is the file that vouches for the cast, so removing
+/// it before the cast means a discard that panics partway leaves nothing vouched
+/// for. The dump writes it LAST for the mirror-image reason.
 const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
@@ -5899,24 +5891,19 @@ const RECORDING_ARTIFACTS: [&str; 7] = [
     "deck.log",
 ];
 
-/// Schema version of the `provenance.json` sidecar (issue #808).
-///
-/// `.claude/skills/demo-reel-adapter/build.sh` refuses a sidecar whose `schema`
-/// is not the value it knows, so bumping this without teaching the adapter the
-/// new value stops the reel from selecting anything — loudly, and in the
-/// fail-closed direction. `tests/harness_isolation.rs` asserts the two agree.
+/// Schema version of the `provenance.json` sidecar (issue #808). Bump it when a
+/// field's meaning changes.
 const RECORDING_PROVENANCE_SCHEMA: u32 = 1;
 
 /// Version of the recording redaction implementation, recorded in
-/// `provenance.json` so a published clip carries which redaction produced it.
+/// `provenance.json` so a recording carries which redaction produced it.
 ///
 /// **Bump it whenever the redaction of the persisted artifacts changes
 /// materially** — a new matcher, a new registered-value source, a change to what
 /// counts as a hit. It gates nothing today: `commit` already pins the redaction
 /// implementation to the one at that revision, which is the stronger statement.
 /// It earns its place in the two spots `commit` cannot reach — a `dirty` tree,
-/// where one commit covers more than one working state, and any future adapter
-/// that enforces a floor over casts kept across revisions.
+/// where one commit covers more than one working state.
 ///
 /// Version 1 is the matcher issue #502/#785 landed, with the two reproduced gaps
 /// [#810](https://github.com/vfarcic/dot-agent-deck/issues/810) tracks: a
@@ -5927,14 +5914,14 @@ const RECORDING_REDACTION_VERSION: u32 = 1;
 /// What the `provenance.json` `outcome` field records.
 ///
 /// **The observation is narrower than the names suggest, and the doc says so
-/// because the field is a publish gate.** `Passed` means `std::thread::panicking()`
+/// because a reader takes the field at its word.** `Passed` means `std::thread::panicking()`
 /// was false when `TuiDeck` was dropped — not that nextest reported the test as
 /// passed. Three shapes it does not see: a test that panics after its deck has
 /// already been dropped; a test killed outright, which reaches no `Drop` and so
 /// writes no sidecar at all (the launch-time discard is what covers that route);
 /// and a test whose assertions were vacuous. What it does cover is the common
 /// case by far — the dump that fires *because* the test panicked, which is a
-/// failure diagnostic and never a clip.
+/// failure diagnostic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RecordingOutcome {
     Passed,
@@ -5959,10 +5946,9 @@ impl RecordingOutcome {
 /// the version segment can legally contain one: a SemVer prerelease such as
 /// `0.25.0-gamma.1` would otherwise be mined for a sha. It is accepted only when
 /// what follows is at least git's minimum abbreviation of hex digits, so the
-/// `-unknown` sentinel and an arbitrary injected id both yield `None` — and the
-/// adapter refuses a sidecar whose `commit` is empty, which is the fail-closed
-/// direction: a binary that cannot say which commit it came from cannot support
-/// a provenance claim.
+/// `-unknown` sentinel and an arbitrary injected id both yield `None`, which is
+/// the fail-closed direction: a binary that cannot say which commit it came from
+/// cannot support a provenance claim.
 ///
 /// The `-dirty` suffix is reported separately rather than folded into the sha,
 /// because it is what bounds the sha's meaning: two different working states
@@ -5983,19 +5969,18 @@ pub fn recording_build_commit(build_id: &str) -> (Option<&str>, bool) {
 ///
 /// Git's auto-abbreviation floor is 7, so this rejects nothing a normal
 /// `git rev-parse --short HEAD` produces while refusing a `core.abbrev` low
-/// enough that a prefix match would be weak evidence rather than proof. The
-/// adapter applies the same floor to the value it compares against.
+/// enough that a prefix match would be weak evidence rather than proof.
 const MIN_BUILD_COMMIT_LEN: usize = 7;
 
 /// Archive the previous run, then clear the current artifacts before spawning
-/// (#1815). Clearing keeps interrupted or skipped runs from exposing an older
-/// cast at the reel's usual path (#805); archiving keeps failure diagnostics
+/// (#1815). Clearing keeps interrupted or skipped runs from leaving an older
+/// cast in the current view (#805); archiving keeps failure diagnostics
 /// available after reruns. Either operation failing aborts the launch.
 ///
 /// A filtered-out test does not reach this function, and a preflight expression
-/// can die before the skip helper calls it. The adapter's provenance checks
-/// remain necessary for those cases (#808). Archives are outside its flat
-/// selection paths; the paired `test.md` stays where the doc generator puts it.
+/// can die before the skip helper calls it. For those cases the provenance
+/// sidecar says which run produced a cast (#808). The paired `test.md` stays
+/// where the doc generator puts it.
 fn discard_previous_recording(test_name: &str) {
     // The panic below is the failure mode of this function, so it has to reach
     // the redacting output seam like every other harness panic. Cheap (a
@@ -8196,10 +8181,10 @@ fn cli_invocable(bin: &str) -> bool {
 ///
 /// A runtime skip prints `SKIP: [e2e] …` and RETURNS NORMALLY, so nextest reports a
 /// skipped real-agent test as **passed**. A pre-PR `cargo test-e2e` can
-/// therefore read fully green while a `[reel]`-marked scenario asserted
-/// nothing at all — and the demo reel then ships with that clip silently
-/// missing. Set this to a truthy value on any run whose whole point is that
-/// the real-agent coverage actually executed (release gates, reel builds);
+/// therefore read fully green while a real-agent scenario asserted nothing at
+/// all. Set this to a truthy value on any run whose whole point is that the
+/// real-agent coverage actually executed (release gates, a feature's lane-2
+/// verification);
 /// leave it unset for ad-hoc runs on a machine without the credentials, where
 /// the permissive skip is the useful behavior.
 pub const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
@@ -8337,13 +8322,11 @@ fn host_home() -> PathBuf {
 /// or an accidental `cat` of the file paints the document onto the terminal, and
 /// the Codex importer's own rationale already treats exactly that ("a test
 /// dumping the file") as a sink. The same reasoning applies here, and the stakes
-/// are higher rather than lower: reel-eligible tests deliberately drive real
-/// agents and publish their terminal capture to a YouTube URL linked from the
-/// public release notes, and most of them take the ordinary OAuth-backed Claude
-/// route — precisely the one that had no registration. (That upload is private by
-/// default since PR #805, so a human flip stands between such a video and a
-/// third party; this registration is what keeps the credential out of the bytes
-/// in the first place, and the two are not substitutes.)
+/// are higher rather than lower: lane-2 tests deliberately drive real agents and
+/// record their terminal capture, and most of them take the ordinary
+/// OAuth-backed Claude route — precisely the one that had no registration. This
+/// registration is what keeps the credential out of the bytes in the first
+/// place.
 ///
 /// Both copied documents go through [`collect_credential_values`], at DIFFERENT
 /// widths (see [`CredentialScope`]): the OAuth credential set is an auth
@@ -8782,10 +8765,8 @@ const CLAUDE_IDENTITY_KEY_FRAGMENTS: [&str; 3] = ["uuid", "email", "name"];
 /// suffix) is registered by [`api_key_recording_redactions`] instead. What
 /// changed is the consequence. This document is copied into every isolated HOME
 /// of every real-agent test, an interactive `claude` renders the account line
-/// into the pane, and that pane is what `full-stream.cast` captures and the demo
-/// reel publishes. Private-by-default upload drops that exposure a long way (see
-/// `docs/develop/demo-reel.md`), but "a human has to flip it before strangers can
-/// watch" is not a reason to leave a developer's email in the artifact when the
+/// into the pane, and that pane is what `full-stream.cast` captures. A
+/// developer's email does not belong in an artifact that gets shared when the
 /// alternative is a handful of field names.
 ///
 /// Deliberately NOT the [`CredentialScope::AuthDocument`] treatment. That would

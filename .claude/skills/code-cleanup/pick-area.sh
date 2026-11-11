@@ -205,7 +205,7 @@ case "$mode" in
   instructions)
     # Skill Markdown one level down only (a SKILL.md and its siblings), the
     # same rule --check applies: nested Markdown under a skill is a test
-    # fixture, not an instruction (demo-reel-adapter/tests/fixtures/...).
+    # fixture, not an instruction.
     git ls-files -- CLAUDE.md .claude/skills docs/develop \
       | grep -E '^CLAUDE\.md$|^docs/develop/.*\.md$|^\.claude/skills/[^/]+/[^/]+\.md$' >"$tmp/owned"
     ;;

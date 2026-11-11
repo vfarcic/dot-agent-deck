@@ -232,7 +232,7 @@ The OpenCode and Pi figures arrive through the plugin and extension the deck ins
 
 ### `agent.status`
 
-One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id`, `deck.pane.id`, `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, so you can query status time without the parent. They have the run's values; a span that ended before a run learned its agent from its hooks says `none`. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting`, `idle`, `error`, `blocked` and `unknown`.
+One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id`, `deck.pane.id`, `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, so you can query status time without the parent. They have the run's values; a span that ended before a run learned its agent from its hooks says `none`. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting` (**Needs Input**), `awaiting_command` (**Waiting**: the turn ended while a command the agent started in it still runs), `idle`, `error`, `blocked` and `unknown`.
 
 ### `agent.operation`
 

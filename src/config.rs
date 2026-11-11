@@ -139,6 +139,9 @@ impl BellConfig {
             // Issue #714: a quota-blocked agent needs a person just like an
             // erroring one, so it rings under the same switch.
             SessionStatus::Error | SessionStatus::Blocked => self.on_error,
+            // Issue #1757: Waiting's work is not done, so it never rings, even
+            // under `on_idle`; the bell rings on its later step to Idle.
+            SessionStatus::Waiting => false,
             _ => false,
         }
     }

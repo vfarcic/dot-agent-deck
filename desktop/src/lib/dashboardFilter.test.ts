@@ -1,8 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { DesktopAgentDto } from "./bridge";
+import { statusFromDaemon } from "./bridge";
+import { statusLabel } from "../types";
 import {
   buildDashboardFilterHeader,
   clearDashboardFilter,
+  DASHBOARD_STATUSES,
   dashboardFilterFromParams,
   filterDashboardAgents,
   removeDashboardFilterFacet,
@@ -188,5 +191,60 @@ describe("dashboard filter statuses follow the status columns", () => {
   it("agrees with the columns for a voice status param", () => {
     const spoken = dashboardFilterFromParams([{ name: "status", value: "working" }]);
     expect(ids(spoken, fleet)).toEqual(["hookless", "compacting", "shouting"]);
+  });
+});
+
+describe("Waiting is its own status, never Idle or Needs input (issue #1757)", () => {
+  // `waiting` is the daemon's word for an agent whose turn ended while a
+  // command it started in that turn still runs. It is a status the filter
+  // offers by name, so neither Idle nor Needs input may take it.
+  const fleet: FilterAgent[] = [
+    agent("waiting", { status: "waiting" as FilterAgent["status"] }),
+    agent("needs-input", { status: "waiting_for_input" }),
+    agent("idle"),
+    agent("working", { status: "working" }),
+  ];
+
+  /// Scenario: read the daemon's `waiting` word the way the dashboard does. It gets a column of its own, labelled `waiting` like the TUI card's Waiting, which is neither Idle nor Needs input.
+  it("maps the daemon's word to its own column and label", () => {
+    expect(statusFromDaemon("waiting")).toBe("waiting");
+    expect(statusFromDaemon("WAITING")).toBe("waiting");
+    expect(statusLabel(statusFromDaemon("waiting"))).toBe("waiting");
+    expect(statusFromDaemon("waiting_for_input")).toBe("needs_input");
+  });
+
+  /// Scenario: open the status filter. It offers Waiting by that name, apart from Needs input and Idle.
+  it("offers Waiting in the status filter", () => {
+    const labels = DASHBOARD_STATUSES.map((status) => status.label);
+    expect(DASHBOARD_STATUSES).toContainEqual({ id: "waiting", label: "Waiting" });
+    expect(labels).toContain("Needs input");
+    expect(labels).toContain("Idle");
+    expect(new Set(labels).size).toBe(labels.length);
+  });
+
+  /// Scenario: filter a fleet holding a Waiting, a Needs input, an Idle and a Working agent by each of the first three in turn. Each filter shows exactly its own agent.
+  it.each([
+    ["waiting", ["waiting"]],
+    ["waiting_for_input", ["needs-input"]],
+    ["idle", ["idle"]],
+  ] as const)("shows only the %s agent", (status, expected) => {
+    expect(ids(filter({ statuses: [status as DashboardFilter["statuses"][number]] }), fleet)).toEqual(expected);
+  });
+
+  /// Scenario: say "show only busy agents", which reaches the dashboard as `status` = `busy`. Busy is every agent whose work is not done, so the Working and the Waiting agent stay and the Idle and Needs input agents go; the header names each status it covers.
+  it("reads a voice busy param as the busy statuses, Waiting included", () => {
+    const spoken = dashboardFilterFromParams([{ name: "status", value: "busy" }]);
+    expect(spoken.statuses).toEqual(["working", "thinking", "waiting"]);
+    expect(ids(spoken, fleet)).toEqual(["waiting", "working"]);
+    expect(buildDashboardFilterHeader(spoken, 2, 4).summary).toBe("Showing 2 of 4 agents · Working or Thinking or Waiting");
+    // An inherited property name is no status set.
+    expect(dashboardFilterFromParams([{ name: "status", value: "constructor" }]).statuses).toEqual([]);
+  });
+
+  /// Scenario: say "show only the agents that are waiting", which reaches the dashboard as `status` = `waiting`. The voice filter shows the Waiting agent alone, and the header names it.
+  it("agrees for a voice status param and names it in the header", () => {
+    const spoken = dashboardFilterFromParams([{ name: "status", value: "waiting" }]);
+    expect(ids(spoken, fleet)).toEqual(["waiting"]);
+    expect(buildDashboardFilterHeader(spoken, 1, 4).summary).toBe("Showing 1 of 4 agents · Waiting");
   });
 });
