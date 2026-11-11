@@ -852,15 +852,18 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     );
 
     // A server whose command line was not read is not recognised, so it
-    // counts as it did before rather than hiding what runs below it — and a
-    // readable `serve --stdio` a tool starts below it counts too.
+    // counts as it did before rather than hiding what runs below it. A
+    // `serve --stdio` a tool starts below it is in a session nested inside
+    // that counted one, so it is part of that count rather than a second one
+    // (`status/waiting/025`: a session nested in a detached session is the
+    // same command).
     let mut table = standalone();
     table[1].command_line = CommandLine::Unavailable;
     table.push(row(80130, SERVER, TOOL_SERVER_SID, Some(SERVER_ARGV)));
     assert_eq!(
         count(&table, CLIENT, identified),
-        Some(HashSet::from([SERVER, TOOL_SERVER_SID])),
-        "an unread server counts, and so does the tool server below it"
+        Some(HashSet::from([SERVER])),
+        "an unread server counts, and the tool server below it is inside that count"
     );
 
     // The identified pid, reused since the watch looked by a process whose
@@ -1204,6 +1207,98 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
                 server_pid: 102,
             }
         )]
+    );
+}
+
+/// Scenario: Classify a Codex pane's process table as measured on Linux, where one command started through Codex's exec tool runs under `codex-linux-sandbox` in a session of its own and the bubblewrap inside it starts a second session for the command. The two nested sessions count as one command; a second command beside it counts as a second, and the agent's own children in its session count as none.
+#[spec("status/waiting/025")]
+#[test]
+fn status_waiting_025_a_session_nested_in_a_detached_one_is_the_same_command() {
+    use dot_agent_deck::platform::proc::{descendant_shell_activity, qualifying_command_sessions};
+    use std::collections::HashSet;
+
+    let row = |pid: i32, ppid: i32, session_id: i32, argv: &str| ProcessInfo {
+        pid,
+        ppid,
+        session_id,
+        has_controlling_tty: false,
+        session_leader: pid == session_id,
+        command_line: CommandLine::Read(argv.to_string()),
+    };
+    // The tree `status/waiting/024` printed (Codex 0.164.0, workspace-write
+    // sandbox, 2026-11-11), pids kept: codex (in the agent's session) →
+    // `codex-linux-sandbox` (setsid: session 538581) → `bwrap` (same session)
+    // → `codex-linux-sandbox --apply-seccomp-then-exec` (bwrap's
+    // `--new-session`: session 538586) → `bash -c` → `sleep`.
+    const CODEX: i32 = 538240;
+    const CODEX_SID: i32 = 537924;
+    let mut table = vec![
+        row(CODEX, 538226, CODEX_SID, "codex --model gpt-5.6-luna"),
+        row(538558, CODEX, CODEX_SID, "codex-code-mode-host"),
+        row(
+            538581,
+            CODEX,
+            538581,
+            "codex-linux-sandbox -- /bin/bash -c …",
+        ),
+        row(538585, 538581, 538581, "bwrap --new-session …"),
+        row(
+            538586,
+            538585,
+            538586,
+            "codex-linux-sandbox --apply-seccomp-then-exec -- /bin/bash -c …",
+        ),
+        row(
+            538587,
+            538586,
+            538586,
+            "/bin/bash -c sleep 60 && touch done",
+        ),
+        row(538588, 538587, 538586, "sleep 60"),
+    ];
+    assert_eq!(
+        qualifying_command_sessions(&table, CODEX, &[]),
+        Some(HashSet::from([538581])),
+        "the sandbox's inner session is part of the command its outer session runs — one \
+         command, not two"
+    );
+    assert_eq!(descendant_shell_activity(&table, CODEX, &[]), Some(true));
+    // A second command through the same tool is a second outer session.
+    table.extend([
+        row(
+            538681,
+            CODEX,
+            538681,
+            "codex-linux-sandbox -- /bin/bash -c …",
+        ),
+        row(538685, 538681, 538681, "bwrap --new-session …"),
+        row(
+            538686,
+            538685,
+            538686,
+            "codex-linux-sandbox --apply-seccomp-then-exec",
+        ),
+    ]);
+    assert_eq!(
+        qualifying_command_sessions(&table, CODEX, &[]),
+        Some(HashSet::from([538581, 538681]))
+    );
+    // A parent whose session could not be read keeps its child counted: that
+    // is the direction that cannot lose a command.
+    table
+        .iter_mut()
+        .find(|r| r.pid == 538685)
+        .unwrap()
+        .session_id = 0;
+    assert_eq!(
+        qualifying_command_sessions(&table, CODEX, &[]),
+        Some(HashSet::from([538581, 538681, 538686]))
+    );
+    // With both commands gone only the agent's own children remain: none.
+    table.retain(|r| r.session_id == CODEX_SID);
+    assert_eq!(
+        qualifying_command_sessions(&table, CODEX, &[]),
+        Some(HashSet::new())
     );
 }
 

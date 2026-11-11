@@ -1739,7 +1739,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### status/waiting/016 — An identified OpenCode 2 private server is not a background command, so it cannot make a card read Waiting (issue #1757).
 - **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
 - **Agent:** none; process-table fixtures shaped as measured on OpenCode 2.2.5 (`<path>/opencode serve --stdio --port 0` as the client's direct child in a session of its own, the deck's inbox watcher in the server's session), with the client/server pair the OpenCode watch identifies passed in.
-- **Asserts:** with the identified pair the server and everything in its session yield no qualifying session (without it, the server's session counts, the defect `status/waiting/009` found); a backgrounded command below the server counts once; a `serve --stdio` a tool starts below the server, a sibling `serve --stdio` of the client, and a forged one a wrapper shell starts all count; an identity naming a pid whose parent is not the client, a server whose command line was not read (and a readable tool server below it), and a pid whose command line no longer reads as a server all count; with no identity (OpenCode 1.x, an unknown version) a shell command quoting `opencode serve --stdio` and a `serve --stdio` child of the client count exactly as before; the command-line re-check takes words in place (program, then `serve --stdio`), not substrings.
+- **Asserts:** with the identified pair the server and everything in its session yield no qualifying session (without it, the server's session counts, the defect `status/waiting/009` found); a backgrounded command below the server counts once; a `serve --stdio` a tool starts below the server, a sibling `serve --stdio` of the client, and a forged one a wrapper shell starts all count; an identity naming a pid whose parent is not the client, a server whose command line was not read (a readable tool server below it is inside that count, `status/waiting/025`), and a pid whose command line no longer reads as a server all count; with no identity (OpenCode 1.x, an unknown version) a shell command quoting `opencode serve --stdio` and a `serve --stdio` child of the client count exactly as before; the command-line re-check takes words in place (program, then `serve --stdio`), not substrings.
 - **Does not assert:** the watch's identification (`status/waiting/017`), the sampler reading the server's command line (`status/shell-activity/008` pins that session-boundary rows are read), a live OpenCode (`status/waiting/009`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1796,6 +1796,23 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** a close sent after the settle window (the existing background-work close tests).
 - **Verified load-bearing:** red (the close answers at the cap) with each wait running to the cap instead of to the end of the window.
 - **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/024 — A real interactive Codex's own background command reads Waiting after its turn ends, and Idle once it exits on its own (issue #1757).
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Codex on the harness's cheap test model (`codex_test_model`), `--sandbox workspace-write --ask-for-approval never`, spawned through Ctrl+N; developer credentials required.
+- **Asserts:** a directive prompt starts one command with Codex's exec tool and a 1 s `yield_time_ms` (`sleep 60 && touch <unique sentinel>`), which leaves it running in a Codex background terminal past the turn, and the turn ends; after Codex's Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not Codex starts a turn to report the finished command. It prints every detached session below it at the Waiting check, and the events after the exit.
+- **Does not assert:** a command carried over from an earlier turn (`status/waiting/007`), Codex without a sandbox, macOS's sandbox, desktop.
+- **Found and fixed (Codex 0.164.0, 2026-11-11):** the card first read Waiting with `Background: 2 commands` for the one command: on Linux Codex runs it under `codex-linux-sandbox` in a session of its own, and the bubblewrap inside that starts a second session for the command. The scan now counts only the outermost detached session on a branch (`status/waiting/025`); the test passes locally.
+- **Observed (Codex 0.164.0, `gpt-5.6-luna`, 2026-11-11):** Codex does not start a turn when the background command finishes: the only event after the exit is the daemon's `ShellIdle` with an empty aggregate, and no Thinking or tool call followed within 45 s of the card settling on Idle.
+- **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
+
+##### status/waiting/025 — A session nested inside a detached session is the same command, so Codex's two-session Linux sandbox counts once (issue #1757).
+- **Layer:** pure-data unit (`tests/shell_activity.rs`, fast tier).
+- **Agent:** none; a process table shaped like the Codex tree `status/waiting/024` printed.
+- **Asserts:** `codex-linux-sandbox` in a session of its own, `bwrap` in that session and the command in bubblewrap's nested session count as one qualifying session (the outer one), and the pane still reads busy; a second such command counts as a second; a nested session whose parent's session could not be read still counts; the agent's own children in its session count as none.
+- **Does not assert:** a live Codex (`status/waiting/024`), the argv cross-check path (`status/background/005`).
+- **Verified load-bearing:** red (`{538581, 538586}`) with the outermost-session condition removed from `qualifying_command_sessions_with_server`.
+- **Platform coverage:** mac+linux+windows.
 
 ### Agent protocol
 

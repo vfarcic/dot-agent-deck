@@ -368,9 +368,10 @@ pub fn descendant_shell_activity(
 /// with `shapes`, each session-boundary candidate ([`shell_tool_candidates`])
 /// whose command line carries one of them — the cross-check applied to EVERY
 /// candidate, so a matched session never admits an unmatched one beside it.
-/// A process tree inside one session counts once, and the walk re-roots at a
-/// nested terminal session as [`detached_descendants`] does, so a wrapped
-/// agent's inner PTY is never itself a command.
+/// A process tree inside one session counts once, and so does a session nested
+/// inside a detached one (issue #1757: Codex's Linux sandbox is two); the walk
+/// re-roots at a nested terminal session as [`detached_descendants`] does, so
+/// a wrapped agent's inner PTY is never itself a command.
 ///
 /// `None` has [`descendant_shell_activity`]'s meaning — no answer — and must not
 /// be read as zero. Same table, same columns: it reads no command line or
@@ -403,12 +404,29 @@ pub fn qualifying_command_sessions_with_server(
     server: Option<AgentServer>,
 ) -> Option<HashSet<i32>> {
     let walk = walk_with_reference_session(table, root_pid, server)?;
+    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     // A row whose session id could not be read is unclassifiable, not
     // "different" — counting it as different would turn an exit racing the
     // sample into a false `Working`.
+    //
+    // Issue #1757: only the OUTERMOST detached session on a branch is a
+    // command. A session started inside one that is already detached belongs
+    // to that command: Codex on Linux runs each command under
+    // `codex-linux-sandbox`, which is a session of its own, and the bubblewrap
+    // inside it starts a second one (`--new-session`), so counting both showed
+    // `Background: 2 commands` for one (`status/waiting/024`). So a row counts
+    // only when its parent is in the session it is compared against; a parent
+    // missing from the table or with an unreadable session is the direction
+    // that cannot lose a command.
     let detached = walk
         .into_iter()
-        .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+        .filter(|(row, reference)| {
+            row.session_id > 0
+                && row.session_id != *reference
+                && session_of
+                    .get(&row.ppid)
+                    .is_none_or(|parent| *parent == *reference || *parent <= 0)
+        })
         .map(|(row, _)| row);
     // The structural test has already answered. `shapes` is the optional argv
     // cross-check on top of it, and an empty `shapes` means the caller asked for
@@ -418,7 +436,6 @@ pub fn qualifying_command_sessions_with_server(
     if shapes.is_empty() {
         return Some(detached.map(|row| row.session_id).collect());
     }
-    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     let mut sessions = HashSet::new();
     // The cross-check consults the SESSION-BOUNDARY subset, not every detached
     // descendant — see [`shell_tool_candidates`] for why that is both correct

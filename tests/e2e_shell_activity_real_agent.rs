@@ -1385,3 +1385,154 @@ fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_ex
     );
     settle_after_exit(&deck, &events, &agent_id, "status-waiting-009", running_at);
 }
+
+/// Codex's empty-composer placeholder — see `CODEX_COMPOSER_READY` in
+/// `tests/e2e_codex_hooks.rs` for why it is a sound readiness gate.
+const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
+
+/// The footer Codex shows while it holds a submit for its own startup — see
+/// `CODEX_STARTUP_HOLD` in `tests/e2e_codex_hooks.rs`.
+const CODEX_STARTUP_HOLD: &str = "Waiting for startup";
+
+/// Scenario: Start real interactive Codex on the harness's cheap test model through Ctrl+N and ask it to start one command with its exec tool and a short yield, so the command keeps running in a Codex background terminal — a minute of sleep, then touching a uniquely named sentinel — and to end its turn at once. After Codex's Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn Codex starts to report the finished command).
+#[spec("status/waiting/024")]
+#[test]
+fn status_waiting_024_real_codex_background_command_reads_waiting_until_it_exits() {
+    use dot_agent_deck::event::AgentType;
+
+    skip_unless!(common::check_codex_available());
+    const NAME: &str = "waiting-024-codex";
+    const SENTINEL: &str = "waiting-024-done-3f9a6e17.txt";
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 45)
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_imported_codex_credentials()
+        .launch_with_fixture("codex-live");
+    assert!(deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)));
+    let sentinel_path = deck.workdir().join(SENTINEL);
+    let events = deck.subscribe_events();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(NAME.as_bytes());
+    deck.send_keys(b"\t");
+    deck.send_keys(
+        format!(
+            "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
+            common::codex_test_model()
+        )
+        .as_bytes(),
+    );
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    assert!(
+        deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(90)),
+        "interactive Codex not ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let agent_id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.display_name.as_deref().is_some_and(|n| n.ends_with(NAME)))
+        .expect("the Codex agent's record")
+        .id;
+    // `sleep`, not `ping`: Codex does not block a long `sleep` (Claude Code
+    // does, hence `ping` in status/waiting/008), and `ping` needs a raw or
+    // ICMP socket the workspace-write sandbox may refuse. The yield is what
+    // backgrounds it: Codex's exec tool returns once the yield passes and
+    // keeps the process running in a background terminal of its own, past
+    // the end of the turn. The sentinel is relative: the command runs in the
+    // fixture directory, which the sandbox lets it write.
+    let prompt = format!(
+        "Use your exec_command tool exactly once as your first action, with yield_time_ms set to 1000, to run exactly: sleep 60 && touch {SENTINEL} . It keeps running in the background after the tool returns. Do not wait for it, poll it, write to it, read its output or stop it. As soon as the tool returns, finish your turn by replying with the single word STARTED."
+    );
+    deck.send_keys(prompt.as_bytes());
+    assert!(
+        deck.wait_for_grid_string_within(SENTINEL, Duration::from_secs(20)),
+        "the prompt never rendered in Codex's composer:\n{}",
+        deck.snapshot_grid()
+    );
+    let typed_at = chrono::Utc::now();
+    // Codex can hold a submit while its startup finishes and say so in its
+    // footer; an Enter is re-sent only when it shows neither the empty
+    // composer nor that hold (`codex_hooks_001` measured both).
+    let submit_deadline = std::time::Instant::now() + common::load_scaled(Duration::from_secs(60));
+    let mut enters = 0_usize;
+    let submitted = loop {
+        if enters == 0 || !deck.snapshot_grid().contains(CODEX_STARTUP_HOLD) {
+            deck.send_keys(b"\r");
+            enters += 1;
+        }
+        if deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(2)) {
+            break true;
+        }
+        if std::time::Instant::now() >= submit_deadline {
+            break false;
+        }
+    };
+    assert!(
+        submitted,
+        "PROMPT NOT DELIVERED: after {enters} Enter(s) the prompt is still in Codex's \
+         composer:\n{}",
+        deck.snapshot_grid()
+    );
+    let started = events
+        .try_wait_for(
+            |event| {
+                event.agent_id.as_deref() == Some(&agent_id)
+                    && event.agent_type == AgentType::Codex
+                    && event.event_type == EventType::ToolStart
+                    && event.timestamp >= typed_at
+            },
+            Duration::from_secs(120),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "Codex made no tool call; events: {:#?}\n{}",
+                describe_events_since(&events, &agent_id, typed_at),
+                deck.snapshot_grid()
+            )
+        });
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= started.timestamp
+        },
+        Duration::from_secs(120),
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    let waiting = deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| {
+        grid.contains("Waiting") && grid.contains("Background: 1 command")
+    });
+    let sessions = detached_sessions_report();
+    eprintln!(
+        "status-waiting-024: detached sessions at the Waiting check ({}):\n{}",
+        sessions.len(),
+        sessions.join("\n")
+    );
+    assert!(
+        waiting,
+        "the turn that started the command ended while it runs, so the card must read Waiting \
+         with its background line; detached sessions: {sessions:#?}; events: {:#?}\n{}",
+        describe_events_since(&events, &agent_id, typed_at),
+        deck.snapshot_grid()
+    );
+    // The watermark the completion-wake observation keeps events from, taken
+    // before the sentinel is found absent below, so it precedes the exit.
+    let running_at = chrono::Utc::now();
+    assert!(
+        !sentinel_path.exists(),
+        "the Waiting card was only checked once the command had already finished — the run \
+         proves nothing about Waiting while it runs"
+    );
+
+    assert!(
+        common::wait_for_path(&sentinel_path, Duration::from_secs(120)),
+        "the background command never finished on its own:\n{}",
+        deck.snapshot_grid()
+    );
+    settle_after_exit(&deck, &events, &agent_id, "status-waiting-024", running_at);
+}
