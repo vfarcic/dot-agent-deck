@@ -8,10 +8,11 @@
 //! 5-wake, plan §1.2):
 //!
 //! ```text
-//! (abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+//! (abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: /home/me/.local/bin/dot-agent-deck inbox fetch
 //! ```
 //!
-//! The content itself is never typed.
+//! The command names the deck the daemon runs from, as an absolute path
+//! ([`doorbell_line`], issue #1730). The content itself is never typed.
 //!
 //! **When it rings** — every condition below, re-checked on each tick:
 //!
@@ -99,12 +100,52 @@ pub const DEFAULT_WAKE_STALL_AFTER: Duration = Duration::from_secs(120);
 /// The fixed line, before its id.
 pub const LINE_PREFIX: &str = " dot-agent-deck: message ";
 
-/// The fixed line, after its id.
-pub const LINE_SUFFIX: &str = " waiting, run: dot-agent-deck inbox fetch";
+/// The fixed line, between its id and the command word that names the deck.
+pub const LINE_WAITING: &str = " waiting, run: ";
 
-/// The doorbell line naming message `id`.
+/// The fixed line, after the command word: the subcommand the agent runs.
+pub const LINE_FETCH: &str = " inbox fetch";
+
+/// The doorbell line naming message `id`, telling the agent to run `inbox
+/// fetch` with the deck this daemon runs from
+/// ([`crate::platform::paths::binary_name`]).
+///
+/// Issue #1730: a bare `dot-agent-deck` here was resolved by the agent's own
+/// tool shell, whose `$PATH` can reach a different (older) copy than the one
+/// the daemon runs — one without `inbox fetch` at all, so the message stayed
+/// waiting and the deck kept ringing. The footers, orchestrator context and
+/// inbox instructions already name the deck by the same word.
 pub fn doorbell_line(id: &str) -> String {
-    format!("{LINE_PREFIX}{id}{LINE_SUFFIX}")
+    doorbell_line_naming(id, &crate::platform::paths::binary_name())
+}
+
+/// The doorbell line naming message `id`, with `command` as the command word.
+/// [`doorbell_line`] passes the running deck's; a deck before issue #1730
+/// typed the bare `dot-agent-deck`, which every recogniser still accepts.
+pub fn doorbell_line_naming(id: &str, command: &str) -> String {
+    format!("{LINE_PREFIX}{id}{LINE_WAITING}{command}{LINE_FETCH}")
+}
+
+/// A regular expression, in the syntax both Rust's `regex` and JavaScript
+/// share, matching one POSIX shell word as
+/// [`crate::platform::paths::binary_name`] spells it: unquoted characters
+/// other than whitespace, `'` and `\`, single-quoted runs, and
+/// backslash-escaped characters, so `/opt/deck/dot-agent-deck`,
+/// `'/Users/me/My Apps/dot-agent-deck'` and an older deck's bare
+/// `dot-agent-deck` all match, and a run of words does not.
+pub const COMMAND_WORD_PATTERN: &str = r"(?:'[^'\r\n]*'|\\.|[^\s'\\])+";
+
+/// A regular-expression fragment matching the doorbell line after its id:
+/// [`LINE_WAITING`], one command word ([`COMMAND_WORD_PATTERN`]), then
+/// [`LINE_FETCH`]. The command word is whatever deck the line's author named
+/// — the absolute path a deck since issue #1730 types, or an older deck's
+/// bare name — so a recogniser built on it takes both.
+pub fn line_tail_pattern() -> String {
+    format!(
+        "{}{COMMAND_WORD_PATTERN}{}",
+        regex::escape(LINE_WAITING),
+        regex::escape(LINE_FETCH)
+    )
 }
 
 /// The doorbell's timings.
@@ -1791,8 +1832,17 @@ mod tests {
         ]));
         assert_eq!(bad, DoorbellConfig::default());
         assert_eq!(
+            doorbell_line_naming("m-k3xzq2ab-0f3c9a71d2e4b850", "/opt/deck/dot-agent-deck"),
+            " dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: /opt/deck/dot-agent-deck inbox fetch"
+        );
+        // Issue #1730: the line names the deck this daemon runs from, the
+        // word every other instruction to an agent uses, never a bare name
+        // the agent's own `$PATH` resolves.
+        let bin = crate::platform::paths::binary_name();
+        assert!(bin.contains('/'), "{bin}");
+        assert_eq!(
             doorbell_line("m-k3xzq2ab-0f3c9a71d2e4b850"),
-            " dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch"
+            doorbell_line_naming("m-k3xzq2ab-0f3c9a71d2e4b850", &bin)
         );
     }
 }

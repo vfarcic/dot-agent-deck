@@ -1627,6 +1627,281 @@ fn close_verb_008_real_dispatcher_closes_its_reported_single_unit() {
     real_single_dispatch_round_trip(true);
 }
 
+/// Scenario: A real interactive Haiku dispatcher dispatches a real single Haiku unit that reports one committed sentinel. Once that report is in the dispatcher's inbox, the user selects the unit's pane and types that its report is out of date: record the current Unix time and send an update giving it. Without a test-issued work-done call, the dispatcher holds the completion carrying the sentinel and not the stamp and, as a separate acknowledged turn opening with the update wording, the update carrying the stamp; the dispatcher visibly relays the stamp.
+#[spec("dispatch/return/030")]
+#[test]
+fn dispatch_return_030_real_single_unit_sends_an_update_to_its_report() {
+    // Decision 26 runtime-skip: missing CLI / credentials is environmental.
+    skip_unless!(common::check_claude_available());
+
+    let unit = "live-update-probe";
+    const FIRST_PREFIX: &str = "dispatch-update-live-first-";
+    const FIRST: &str = "dispatch-update-live-first-3a1d.txt";
+    const STAMP_FILE: &str = "dispatch-update-live-stamp.txt";
+    const HAIKU_MODEL: &str = "claude-haiku-4-5-20251001";
+
+    let agent_command =
+        format!("claude --ax-screen-reader --model {HAIKU_MODEL} --allowedTools Bash Read Write");
+    let config = write_default_command_config(&agent_command);
+    let deck = TuiDeck::builder()
+        .impersonating_pane_signals()
+        .with_pty_size(220, 60)
+        .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "900")
+        .with_imported_claude_credentials()
+        .with_claude_trust_workdir()
+        .with_env(
+            "DOT_AGENT_DECK_CONFIG",
+            config.path().join("config.toml").to_string_lossy(),
+        )
+        .with_env("PATH", common::path_with_binary_dir())
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+
+    // The sentinel is committed and the task names only its prefix, so its
+    // full name in the report comes from the unit inspecting its worktree.
+    // The update's content, a Unix time the unit records only after
+    // reporting, cannot be in the first report.
+    std::fs::write(
+        deck.workdir().join(FIRST),
+        "The dispatched unit reports this file first.\n",
+    )
+    .expect("write the first fixture sentinel");
+    common::commit_fixture_repo(deck.workdir());
+
+    let expected_worktree = dispatch_worktree_of(&deck, unit);
+    let _worktree_guard = SiblingWorktreeGuard(expected_worktree.clone());
+    let mut worktree_trust = vec![expected_worktree.to_string_lossy().into_owned()];
+    if let (Some(parent), Some(name)) = (expected_worktree.parent(), expected_worktree.file_name())
+        && let Ok(canonical_parent) = parent.canonicalize()
+    {
+        let canonical = canonical_parent.join(name).to_string_lossy().into_owned();
+        if !worktree_trust.contains(&canonical) {
+            worktree_trust.push(canonical);
+        }
+    }
+    common::seed_claude_trust_in_home(deck.home_dir(), &worktree_trust)
+        .expect("seed Claude trust for the dispatched worktree");
+
+    // Open a real dispatcher through the user-facing new-pane form.
+    deck.send_keys(b"\x0e");
+    deck.send_keys(b" ");
+    deck.wait_for_string("No mode");
+    deck.send_keys(b"\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C\x1b[C");
+    deck.wait_for_string("dispatcher mode");
+    let (submit_col, submit_row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(submit_col, submit_row);
+    deck.wait_for_absence("[Submit]");
+    assert!(
+        common::wait_until(Duration::from_secs(120), || {
+            let grid = deck.snapshot_grid();
+            grid.contains("1 agent(s)")
+                && grid.contains("ClaudeCode")
+                && seed_is_acknowledged(&deck)
+        }),
+        "a real seeded dispatcher never became ready.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let dispatcher_ids: Vec<String> = inbox_view::all_messages(deck.attach_socket_path())
+        .into_iter()
+        .filter(|message| {
+            message
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains(DISPATCHER_SEED_OPENING))
+        })
+        .filter_map(|message| message.bind_agent)
+        .collect();
+    if !common::wait_until_panes_settled(
+        deck.attach_socket_path(),
+        &dispatcher_ids,
+        Duration::from_millis(1500),
+        Duration::from_secs(8),
+        Duration::from_secs(90),
+    ) {
+        eprintln!("warning: the dispatcher pane did not settle within 90s; proceeding anyway");
+    }
+
+    // The unit's task asks for the report and then the update in its own
+    // words; how to send either comes only from the production
+    // `dispatch_prompt` appended to it.
+    let directive = format!(
+        "Use Bash to run exactly this command now, then wait for its result: \
+         dot-agent-deck dispatch {unit} --single --task \"Use Bash to list the repo root, \
+         find the only filename beginning {FIRST_PREFIX}, and report that full filename. \
+         Do not ask questions.\" \
+         Do not inspect the files or do the unit's work yourself, and do not ask me anything first. \
+         When its report arrives, relay the filename to me, and if it later sends an update to \
+         that report, relay what the update says too."
+    );
+    deck.send_keys(directive.as_bytes());
+    deck.send_keys(b"\r");
+    assert!(
+        common::wait_until(Duration::from_secs(90), || {
+            common::agent_records_on(deck.attach_socket_path())
+                .iter()
+                .any(|record| {
+                    record.display_name.as_deref() == Some(format!("dispatch-{unit}").as_str())
+                })
+        }),
+        "the real dispatcher must start its unit"
+    );
+    let dispatcher_title = deck.workdir().file_name().unwrap().to_string_lossy();
+    let (col, row) = deck.wait_for_in_grid(&dispatcher_title);
+    deck.click(col, row);
+
+    let completion_stem = common::search_key("dispatch: a unit you dispatched has completed");
+    let update_stem = common::search_key(dot_agent_deck::dispatch_return::UPDATE_OPENING);
+    let report_open = common::search_key("[UNTRUSTED-WORKER-REPORT:");
+    let report_close = common::search_key(":END-UNTRUSTED-WORKER-REPORT]");
+    let framed = |key: &str, stem: &str| -> Option<String> {
+        let rest = &key[key.rfind(stem)? + stem.len()..];
+        let end = rest.find(&report_close)?;
+        let start = rest[..end].rfind(&report_open)?;
+        Some(rest[start + report_open.len()..end].to_string())
+    };
+    let from_unit = |message: &dot_agent_deck::inbox::MessageSummary| {
+        matches!(&message.from, dot_agent_deck::inbox::Sender::Deck { reason } if reason == &format!("dispatch:{unit}"))
+            && message.body_trust == dot_agent_deck::inbox::BodyTrust::Untrusted
+            && message.state == dot_agent_deck::inbox::StateName::Acknowledged
+            && message.deliveries == 1
+    };
+    let reports = || {
+        let messages = inbox_view::all_messages(deck.attach_socket_path());
+        let mut completions = Vec::new();
+        let mut updates = Vec::new();
+        for message in messages.iter().filter(|m| from_unit(m)) {
+            let key = common::search_key(message.text.as_deref().unwrap_or_default());
+            if key.contains(&update_stem) {
+                updates.push(framed(&key, &update_stem));
+            } else if key.contains(&completion_stem) {
+                completions.push(framed(&key, &completion_stem));
+            }
+        }
+        (completions, updates)
+    };
+    let first_key = common::search_key(FIRST);
+    let stamp_path = expected_worktree.join(STAMP_FILE);
+    let stamp = || {
+        std::fs::read_to_string(&stamp_path)
+            .ok()
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()))
+    };
+    // Phase 1: the report, naming the sentinel.
+    const REPORT_WAIT: Duration = Duration::from_secs(210);
+    assert!(
+        common::wait_until(REPORT_WAIT, || {
+            let (completions, _) = reports();
+            completions.len() == 1
+                && completions[0]
+                    .as_deref()
+                    .is_some_and(|report| report.contains(&first_key))
+        }),
+        "the real unit never delivered its report naming {FIRST:?} within {}s. No test code \
+         invoked `work-done`.\n(completions, updates): {:?}\nworktree_exists={}\nFinal grid:\n{}",
+        REPORT_WAIT.as_secs(),
+        reports(),
+        expected_worktree.exists(),
+        deck.snapshot_grid()
+    );
+    assert_eq!(stamp(), None, "the stamp must not exist before the report");
+
+    // Phase 2: the user tells the unit its report is out of date, in the
+    // unit's own pane, as a user of the deck would. How to send an update is
+    // left to the production `dispatch_prompt`.
+    let unit_ids: Vec<String> = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .filter(|record| {
+            record.display_name.as_deref() == Some(format!("dispatch-{unit}").as_str())
+        })
+        .map(|record| record.id)
+        .collect();
+    if !common::wait_until_panes_settled(
+        deck.attach_socket_path(),
+        &unit_ids,
+        Duration::from_millis(1500),
+        Duration::from_secs(8),
+        Duration::from_secs(60),
+    ) {
+        eprintln!("warning: the unit pane did not settle within 60s; proceeding anyway");
+    }
+    // Command mode and the unit's card digit (it is card 2, the dispatcher
+    // card 1) jump to it and focus its pane, as `focus_role_card` does in
+    // `e2e_pane_verbs_real_agent.rs`. A mouse click on the name does not: the
+    // name also appears in the dispatcher's own pane.
+    let unit_card = card_label(&format!("dispatch-{unit}"));
+    jump_to_card(&deck, b'2');
+    assert!(
+        common::wait_until(Duration::from_secs(10), || {
+            deck.snapshot_grid()
+                .lines()
+                .any(|line| line.contains(&unit_card) && line.contains('▸'))
+        }),
+        "clicking the unit's card did not select it.\nFinal grid:\n{}",
+        deck.snapshot_grid()
+    );
+    let nudge = format!(
+        "Your report is now out of date. Use Bash to run: date +%s > {STAMP_FILE} \
+         then send an update to your report giving the number in that file. \
+         Do not ask questions."
+    );
+    deck.send_keys(nudge.as_bytes());
+    deck.send_keys(b"\r");
+    assert!(
+        common::wait_until(Duration::from_secs(60), || stamp().is_some()),
+        "the unit never wrote {STAMP_FILE} after being told its report was out of date.\n\
+         Final grid:\n{}",
+        deck.snapshot_grid()
+    );
+    // Back to the dispatcher, whose relay of the update is the visible half.
+    jump_to_card(&deck, b'1');
+    const UPDATE_WAIT: Duration = Duration::from_secs(210);
+    assert!(
+        common::wait_until(UPDATE_WAIT, || {
+            let (_, updates) = reports();
+            let Some(stamp) = stamp() else {
+                return false;
+            };
+            deck.snapshot_grid().contains(&stamp)
+                && updates
+                    .iter()
+                    .any(|u| u.as_deref().is_some_and(|u| u.contains(&stamp)))
+        }),
+        "the real unit never sent an update giving the number in {STAMP_FILE} ({:?}) that the \
+         dispatcher relayed, within {}s. No test code invoked `work-done`.\n\
+         (completions, updates): {:?}\nFinal grid:\n{}",
+        stamp(),
+        UPDATE_WAIT.as_secs(),
+        reports(),
+        deck.snapshot_grid()
+    );
+    let second_key = stamp().expect("the stamp the update gave");
+    // The first report stands as it was sent: one completion, still carrying
+    // only what the unit reported first.
+    let (completions, updates) = reports();
+    assert_eq!(completions.len(), 1, "{completions:?}");
+    assert!(
+        !completions[0]
+            .as_deref()
+            .is_some_and(|report| report.contains(&second_key)),
+        "the first report was sent before the stamp existed and was not replaced: {completions:?}"
+    );
+    assert!(
+        (1..=dot_agent_deck::report_recovery::MAX_REPORT_UPDATES).contains(&updates.len()),
+        "{updates:?}"
+    );
+}
+
+/// Command mode, then a digit: jump to that dashboard card and focus its pane.
+/// Only the first digit after `Ctrl+D` is a jump, because a successful focus
+/// returns to PaneInput, where a second digit would be typed into the agent.
+fn jump_to_card(deck: &TuiDeck, digit: u8) {
+    deck.send_bytes(b"\x04");
+    deck.wait_for_absence("[Command Mode Ctrl+D]");
+    deck.send_bytes(&[digit]);
+    deck.wait_for_string("[Command Mode Ctrl+D]");
+}
+
 fn real_single_dispatch_round_trip(close_after_report: bool) {
     // Decision 26 runtime-skip: missing CLI / credentials is environmental.
     skip_unless!(common::check_claude_available());

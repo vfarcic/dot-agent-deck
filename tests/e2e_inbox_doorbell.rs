@@ -11,7 +11,7 @@ use serde_json::json;
 use spec::spec;
 use std::time::Duration;
 
-/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must receive exactly one doorbell line, led by its ring token, and one submission, while the task body remains only in the inbox; an empty inbox never rings.
+/// Scenario: Queue a task for an Idle synthetic agent with no armed component. Its pane must receive exactly one doorbell line, led by its ring token, and one submission, while the task body remains only in the inbox; an empty inbox never rings. Then run the line's command word through `/bin/sh` with an older stand-in `dot-agent-deck` first on `PATH`: it must run the deck the daemon runs and never the stand-in.
 #[spec("inbox/doorbell/001")]
 #[test]
 fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
@@ -30,6 +30,43 @@ fn doorbell_001_idle_unarmed_gets_only_fixed_submitted_line() {
     );
     assert_eq!(rings(&pane).len(), 1);
     state(&daemon, &pane, &id, "queued");
+    // Issue #1730: the line's command reaches the binary the daemon runs, even
+    // when an older `dot-agent-deck` comes first on the agent's PATH.
+    let line = rung_line(&pane, &id).unwrap();
+    let word = command_word(&line).unwrap_or_else(|| panic!("a command word in {line:?}"));
+    let shadow = common::harness_tempdir().expect("a stand-in directory");
+    let marker = shadow.path().join("stand-in-ran");
+    let standin = shadow.path().join("dot-agent-deck");
+    std::fs::write(
+        &standin,
+        format!("#!/bin/sh\ntouch '{}'\necho stand-in\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(
+        &standin,
+        <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+    )
+    .unwrap();
+    let path = format!(
+        "{}:{}",
+        shadow.path().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("{word} --version"))
+        .env("PATH", path)
+        .output()
+        .unwrap();
+    assert!(
+        !marker.exists(),
+        "the doorbell's command {word:?} reached the older dot-agent-deck first on PATH, \
+         not the deck the daemon runs: {line:?}"
+    );
+    assert!(
+        out.status.success() && String::from_utf8_lossy(&out.stdout).contains("dot-agent-deck"),
+        "{word:?} --version runs the deck: {out:?}"
+    );
 }
 
 /// Scenario: Queue one task before any status is reported, then report each busy or dialog status from each supported agent type. The pane must receive nothing until an Idle hook permits the token-led doorbell.

@@ -4711,6 +4711,11 @@ pub struct WorkDoneTaskReply {
     /// A repeat whose body differs from the report already taken.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub differs: bool,
+    /// Issue #2260: an accepted terminal report that was delivered as update
+    /// number `update` (from 1) to the unit's earlier report, which stands.
+    /// An older daemon never sets it, and an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4726,6 +4731,7 @@ impl WorkDoneTaskReply {
             report_id: None,
             destination: None,
             differs: false,
+            update: None,
             code: Some(code.to_string()),
             message: Some(message.to_string()),
         }

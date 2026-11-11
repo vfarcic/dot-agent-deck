@@ -27829,7 +27829,9 @@ mod spawn_tests {
         let typed = editor.typed();
         let line = typed_line(&typed).expect("the line was typed");
         assert!(
-            line.ends_with(" dot-agent-deck: message m-abcdefgh-0123456789abcdef waiting, run: dot-agent-deck inbox fetch"),
+            line.ends_with(&crate::doorbell::doorbell_line(
+                "m-abcdefgh-0123456789abcdef"
+            )),
             "{line}"
         );
         assert_eq!(

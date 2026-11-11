@@ -3634,6 +3634,12 @@ pub(crate) enum ReportPost {
         unit_name: String,
         unit_cwd: Option<String>,
     },
+    /// Issue #2260: update number `update` to a dispatched unit's report.
+    TerminalUpdate {
+        unit_name: String,
+        unit_cwd: Option<String>,
+        update: u32,
+    },
 }
 
 /// PRD #1666 part 3, round 5 (plan §2 step 4): compose the post a kept report
@@ -3717,6 +3723,24 @@ pub(crate) async fn compose_report_post(
                 None
             };
             crate::dispatch_return::compose_completion_message(&unit_name, report, full.as_deref())
+        }
+        ReportPost::TerminalUpdate {
+            unit_name,
+            unit_cwd,
+            update,
+        } => {
+            let full = if report_exceeds_inline_bound(report) {
+                save_full_report_off_runtime(unit_cwd, "dispatch".to_string(), report.to_string())
+                    .await
+            } else {
+                None
+            };
+            crate::dispatch_return::compose_update_message(
+                &unit_name,
+                report,
+                full.as_deref(),
+                update,
+            )
         }
     }
 }
