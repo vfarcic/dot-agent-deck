@@ -368,10 +368,11 @@ pub fn descendant_shell_activity(
 /// with `shapes`, each session-boundary candidate ([`shell_tool_candidates`])
 /// whose command line carries one of them — the cross-check applied to EVERY
 /// candidate, so a matched session never admits an unmatched one beside it.
-/// A process tree inside one session counts once, and so does a session nested
-/// inside a detached one (issue #1757: Codex's Linux sandbox is two); the walk
-/// re-roots at a nested terminal session as [`detached_descendants`] does, so
-/// a wrapped agent's inner PTY is never itself a command.
+/// A process tree inside one session counts once, and the walk re-roots at a
+/// nested terminal session as [`detached_descendants`] does, so a wrapped
+/// agent's inner PTY is never itself a command. A session nested inside a
+/// detached one counts as a session of its own; the one exception is selected
+/// per pane ([`qualifying_command_sessions_in_pane`]).
 ///
 /// `None` has [`descendant_shell_activity`]'s meaning — no answer — and must not
 /// be read as zero. Same table, same columns: it reads no command line or
@@ -403,39 +404,208 @@ pub fn qualifying_command_sessions_with_server(
     shapes: &[ShellToolShape],
     server: Option<AgentServer>,
 ) -> Option<HashSet<i32>> {
+    qualifying_command_sessions_in_pane(table, root_pid, shapes, server, None)
+}
+
+/// Issue #1757: a sandbox wrapper an agent runs each command under, whose
+/// nested sessions are one command ([`qualifying_command_sessions_in_pane`]).
+/// Selected per pane from the agent kind the registry holds for it, never
+/// inferred from the process table, so only a pane the registry knows as that
+/// agent collapses anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandWrapper {
+    /// Codex's Linux sandbox, as measured on codex-cli 0.164.0 (Linux,
+    /// 2026-11-11: the tree `status/waiting/024` printed, and a re-measure with
+    /// `codex sandbox -- /bin/bash -c 'sleep 20'`). Codex's exec tool starts
+    /// each command as `codex-linux-sandbox --sandbox-policy-cwd <dir> …
+    /// --permission-profile <json> -- <command>` in a session of its own (its
+    /// pid is that session's id) as a direct child of the agent; its one child
+    /// is `bwrap … --new-session … --argv0 codex-linux-sandbox -- …` in the
+    /// same session; and bubblewrap's one child is `codex-linux-sandbox …
+    /// --apply-seccomp-then-exec -- <command>`, leader of a second session that
+    /// `--new-session` created, which runs the command. Two sessions, one
+    /// command: counting both read `Background: 2 commands`.
+    CodexLinuxSandbox,
+}
+
+/// Issue #1757: the program word both stages of Codex's Linux sandbox carry
+/// (Codex sets it as argv\[0\], and bubblewrap's `--argv0` sets it on the
+/// inner stage), as measured: the bare name, no path.
+const CODEX_LINUX_SANDBOX_PROGRAM: &str = "codex-linux-sandbox";
+
+/// Issue #1757: the option that marks the inner stage of Codex's Linux
+/// sandbox — measured as the last word before the `--` that starts the command.
+const CODEX_APPLY_SECCOMP_THEN_EXEC: &str = "--apply-seccomp-then-exec";
+
+/// Which stage of Codex's Linux sandbox a sampled command line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSandboxStage {
+    /// The wrapper Codex's exec tool starts, in a session of its own.
+    Outer,
+    /// The wrapper bubblewrap starts in the session `--new-session` created.
+    Inner,
+}
+
+/// Issue #1757: read `command_line` (a sampled command line, `ps` joining argv
+/// with spaces) as a stage of Codex's Linux sandbox, by words in fixed
+/// positions, never substrings: the program word exactly
+/// [`CODEX_LINUX_SANDBOX_PROGRAM`], the next word `--sandbox-policy-cwd`, and a
+/// standalone `--` with a command after it. The inner stage is the one whose
+/// last word before that `--` is [`CODEX_APPLY_SECCOMP_THEN_EXEC`]; the outer
+/// stage carries that word nowhere before it. Anything else — unread, another
+/// program, the word somewhere else — is neither. A path with a space in it
+/// can shift the words; such a misreading can only fail to recognise a chain,
+/// which leaves its sessions counted (visible) rather than hiding one.
+fn codex_sandbox_stage(command_line: &CommandLine) -> Option<CodexSandboxStage> {
+    let words: Vec<&str> = command_line.read()?.split_whitespace().collect();
+    if words.first() != Some(&CODEX_LINUX_SANDBOX_PROGRAM)
+        || words.get(1) != Some(&"--sandbox-policy-cwd")
+    {
+        return None;
+    }
+    let separator = words.iter().position(|word| *word == "--")?;
+    if separator + 1 >= words.len() {
+        return None;
+    }
+    let options = &words[..separator];
+    if options.last() == Some(&CODEX_APPLY_SECCOMP_THEN_EXEC) {
+        Some(CodexSandboxStage::Inner)
+    } else if options.contains(&CODEX_APPLY_SECCOMP_THEN_EXEC) {
+        None
+    } else {
+        Some(CodexSandboxStage::Outer)
+    }
+}
+
+/// Issue #1757: [`qualifying_command_sessions_with_server`] for a pane whose
+/// agent runs each command under `wrapper` ([`CommandWrapper`], chosen by the
+/// pane's agent kind). With `None` it is exactly that function.
+///
+/// With [`CommandWrapper::CodexLinuxSandbox`], the qualifying sessions are
+/// first computed exactly as for any other pane, and only then is one session
+/// dropped from them: the inner sandbox session of a chain that matches the
+/// measured wrapper in every link, which is the same command as the outer
+/// session that stays counted ([`collapse_codex_linux_sandbox`]). Qualification
+/// comes first, so a session that does not itself qualify never hides one that
+/// does, and nothing outside the wrapper chain is collapsed: a session a
+/// command starts below the inner stage, or a nested session below any other
+/// detached process, counts as it always has.
+///
+/// It reads no command line [`command_line_targets`] did not already have
+/// sampled (issue #862): both wrapper stages it reads are session boundaries
+/// of the plain walk — the outer's parent is the agent, in another session,
+/// and the inner's parent is bubblewrap, in the outer session — and bubblewrap,
+/// which is not a boundary and whose command line is not read, is checked by
+/// its position in the tree alone.
+pub fn qualifying_command_sessions_in_pane(
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+    server: Option<AgentServer>,
+    wrapper: Option<CommandWrapper>,
+) -> Option<HashSet<i32>> {
     let walk = walk_with_reference_session(table, root_pid, server)?;
-    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
+    let mut sessions = qualifying_sessions_of_walk(&walk, table, root_pid, shapes);
+    match wrapper {
+        Some(CommandWrapper::CodexLinuxSandbox) => {
+            collapse_codex_linux_sandbox(&walk, table, &mut sessions);
+        }
+        None => {}
+    }
+    Some(sessions)
+}
+
+/// Issue #1757: drop from `sessions` (already qualified) the inner session of
+/// each chain shaped exactly like Codex's Linux sandbox
+/// ([`CommandWrapper::CodexLinuxSandbox`]), in every link:
+///
+/// - the **outer** wrapper: a walked row whose command line reads as the outer
+///   stage ([`codex_sandbox_stage`]), the leader of its own session (pid equal
+///   to session id), that session qualifying, and its parent in the session it
+///   is compared against — the outermost detached session on its branch, as
+///   the agent starts it;
+/// - **bubblewrap**: the outer wrapper's only child in the table, in the outer
+///   session and not a leader;
+/// - the **inner** wrapper: bubblewrap's only child in the table, whose command
+///   line reads as the inner stage, the leader of a session of its own that
+///   qualifies.
+///
+/// Any link missing, extra, unread or unreadable (a session id of 0 or less)
+/// leaves both sessions counted: an over-count the user can see, never a
+/// hidden command. One wrapper chain is one command, so a chain never absorbs
+/// a session started anywhere but at its one inner stage.
+fn collapse_codex_linux_sandbox(
+    walk: &[(&ProcessInfo, i32)],
+    table: &[ProcessInfo],
+    sessions: &mut HashSet<i32>,
+) {
+    let row_of: HashMap<i32, &ProcessInfo> = table.iter().map(|row| (row.pid, row)).collect();
+    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
+    let only_child = |pid: i32| match children.get(&pid).map(Vec::as_slice) {
+        Some([child]) => Some(*child),
+        _ => None,
+    };
+    let mut nested = Vec::new();
+    for (outer, reference) in walk {
+        if outer.session_id <= 0
+            || outer.pid != outer.session_id
+            || !sessions.contains(&outer.session_id)
+            || row_of.get(&outer.ppid).map(|parent| parent.session_id) != Some(*reference)
+            || codex_sandbox_stage(&outer.command_line) != Some(CodexSandboxStage::Outer)
+        {
+            continue;
+        }
+        let Some(bwrap) = only_child(outer.pid) else {
+            continue;
+        };
+        if bwrap.session_id != outer.session_id || bwrap.pid == bwrap.session_id {
+            continue;
+        }
+        let Some(inner) = only_child(bwrap.pid) else {
+            continue;
+        };
+        if inner.session_id > 0
+            && inner.pid == inner.session_id
+            && inner.session_id != outer.session_id
+            && sessions.contains(&inner.session_id)
+            && codex_sandbox_stage(&inner.command_line) == Some(CodexSandboxStage::Inner)
+        {
+            nested.push(inner.session_id);
+        }
+    }
+    for session in nested {
+        sessions.remove(&session);
+    }
+}
+
+/// The qualifying sessions of an already-walked pane
+/// ([`walk_with_reference_session`]): the body of
+/// [`qualifying_command_sessions_with_server`].
+fn qualifying_sessions_of_walk(
+    walk: &[(&ProcessInfo, i32)],
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+) -> HashSet<i32> {
     // A row whose session id could not be read is unclassifiable, not
     // "different" — counting it as different would turn an exit racing the
     // sample into a false `Working`.
-    //
-    // Issue #1757: only the OUTERMOST detached session on a branch is a
-    // command. A session started inside one that is already detached belongs
-    // to that command: Codex on Linux runs each command under
-    // `codex-linux-sandbox`, which is a session of its own, and the bubblewrap
-    // inside it starts a second one (`--new-session`), so counting both showed
-    // `Background: 2 commands` for one (`status/waiting/024`). So a row counts
-    // only when its parent is in the session it is compared against; a parent
-    // missing from the table or with an unreadable session is the direction
-    // that cannot lose a command.
     let detached = walk
-        .into_iter()
-        .filter(|(row, reference)| {
-            row.session_id > 0
-                && row.session_id != *reference
-                && session_of
-                    .get(&row.ppid)
-                    .is_none_or(|parent| *parent == *reference || *parent <= 0)
-        })
-        .map(|(row, _)| row);
+        .iter()
+        .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
+        .map(|(row, _)| *row);
     // The structural test has already answered. `shapes` is the optional argv
     // cross-check on top of it, and an empty `shapes` means the caller asked for
     // the structural test alone — in which case no command line is consulted at
     // all, which is why a pane whose agent kind has never been measured costs no
     // argv read even while it is busy.
     if shapes.is_empty() {
-        return Some(detached.map(|row| row.session_id).collect());
+        return detached.map(|row| row.session_id).collect();
     }
+    let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     let mut sessions = HashSet::new();
     // The cross-check consults the SESSION-BOUNDARY subset, not every detached
     // descendant — see [`shell_tool_candidates`] for why that is both correct
@@ -479,7 +649,7 @@ pub fn qualifying_command_sessions_with_server(
             }
         }
     }
-    Some(sessions)
+    sessions
 }
 
 /// The **structural half** of [`descendant_shell_activity`] on its own: the pids

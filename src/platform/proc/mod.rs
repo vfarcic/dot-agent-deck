@@ -45,10 +45,11 @@ mod unix;
 mod windows;
 
 pub use scan::{
-    AgentServer, CLAUDE_BASH_TOOL_SHAPE, CommandLine, MEASURED_SHELL_TOOL_SHAPES, ProcessInfo,
-    ShellToolShape, command_line_targets, descendant_shell_activity, descendants,
+    AgentServer, CLAUDE_BASH_TOOL_SHAPE, CommandLine, CommandWrapper, MEASURED_SHELL_TOOL_SHAPES,
+    ProcessInfo, ShellToolShape, command_line_targets, descendant_shell_activity, descendants,
     detached_descendants, fill_command_lines, is_opencode_private_server_command,
-    qualifying_command_sessions, qualifying_command_sessions_with_server, shell_tool_candidates,
+    qualifying_command_sessions, qualifying_command_sessions_in_pane,
+    qualifying_command_sessions_with_server, shell_tool_candidates,
 };
 
 /// What a single-agent teardown learned about the direct child's exit.

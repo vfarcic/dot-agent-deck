@@ -3996,6 +3996,22 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
     }
 }
 
+/// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
+/// under, whose nested sessions the scan counts as one command
+/// ([`crate::platform::proc::qualifying_command_sessions_in_pane`]). Only
+/// Codex's was measured, so only a pane the registry knows as Codex selects
+/// one; every other kind (and a pane whose kind is not known yet) selects none
+/// and counts every qualifying session as it always has. Keyed off the same
+/// observed agent kind as [`shell_tool_shape_key`].
+fn command_wrapper_of(
+    agent_type: Option<&AgentType>,
+) -> Option<crate::platform::proc::CommandWrapper> {
+    match agent_type {
+        Some(AgentType::Codex) => Some(crate::platform::proc::CommandWrapper::CodexLinuxSandbox),
+        _ => None,
+    }
+}
+
 /// One live pane a shell-activity sample could classify, resolved under the
 /// registry lock by [`AgentPtyRegistry::shell_activity_candidates`] and then
 /// classified without it by [`AgentPtyRegistry::classify_shell_activity`].
@@ -4027,6 +4043,9 @@ pub struct ShellActivityCandidate {
     /// the scan re-roots at instead of counting as a background command. `None`
     /// for every pane but an OpenCode 2 one whose server the watch identified.
     pub server: Option<crate::platform::proc::AgentServer>,
+    /// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
+    /// under ([`command_wrapper_of`]). `None` for every pane but a Codex one.
+    pub wrapper: Option<crate::platform::proc::CommandWrapper>,
 }
 
 impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
@@ -18879,6 +18898,7 @@ impl AgentPtyRegistry {
                     shell_pid,
                     shapes,
                     server: agent.opencode_private_server,
+                    wrapper: command_wrapper_of(agent.agent_type.as_ref()),
                 })
             })
             .collect()
@@ -18927,11 +18947,12 @@ impl AgentPtyRegistry {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let sessions = crate::platform::proc::qualifying_command_sessions_with_server(
+                let sessions = crate::platform::proc::qualifying_command_sessions_in_pane(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,
                     candidate.server,
+                    candidate.wrapper,
                 )?;
                 Some((candidate, sessions))
             })
@@ -21358,6 +21379,27 @@ mod tests {
     /// statement here, which is what made a paneless daemon fork `ps -A` at 2Hz
     /// forever. `shell_activity_candidates` is asserted directly because it is
     /// the guard the early return is keyed off.
+    /// Issue #1757: only a pane the registry knows as Codex selects Codex's
+    /// sandbox wrapper; every other kind, and an unknown one, selects none, so
+    /// its nested sessions count exactly as before.
+    #[test]
+    fn only_a_codex_pane_selects_the_codex_sandbox_wrapper() {
+        assert_eq!(
+            command_wrapper_of(Some(&AgentType::Codex)),
+            Some(crate::platform::proc::CommandWrapper::CodexLinuxSandbox)
+        );
+        for other in [
+            AgentType::ClaudeCode,
+            AgentType::OpenCode,
+            AgentType::Pi,
+            AgentType::Devin,
+            AgentType::None,
+        ] {
+            assert_eq!(command_wrapper_of(Some(&other)), None, "{other:?}");
+        }
+        assert_eq!(command_wrapper_of(None), None);
+    }
+
     #[test]
     fn an_empty_registry_reports_no_shell_activity_without_sampling() {
         let registry = Arc::new(AgentPtyRegistry::new());

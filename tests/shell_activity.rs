@@ -852,18 +852,15 @@ fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
     );
 
     // A server whose command line was not read is not recognised, so it
-    // counts as it did before rather than hiding what runs below it. A
-    // `serve --stdio` a tool starts below it is in a session nested inside
-    // that counted one, so it is part of that count rather than a second one
-    // (`status/waiting/025`: a session nested in a detached session is the
-    // same command).
+    // counts as it did before rather than hiding what runs below it — and a
+    // readable `serve --stdio` a tool starts below it counts too.
     let mut table = standalone();
     table[1].command_line = CommandLine::Unavailable;
     table.push(row(80130, SERVER, TOOL_SERVER_SID, Some(SERVER_ARGV)));
     assert_eq!(
         count(&table, CLIENT, identified),
-        Some(HashSet::from([SERVER])),
-        "an unread server counts, and the tool server below it is inside that count"
+        Some(HashSet::from([SERVER, TOOL_SERVER_SID])),
+        "an unread server counts, and so does the tool server below it"
     );
 
     // The identified pid, reused since the watch looked by a process whose
@@ -1210,95 +1207,274 @@ fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version()
     );
 }
 
-/// Scenario: Classify a Codex pane's process table as measured on Linux, where one command started through Codex's exec tool runs under `codex-linux-sandbox` in a session of its own and the bubblewrap inside it starts a second session for the command. The two nested sessions count as one command; a second command beside it counts as a second, and the agent's own children in its session count as none.
+/// Scenario: Classify a Codex pane's process table as measured on Linux (codex-cli 0.164.0), where one command started through Codex's exec tool runs under `codex-linux-sandbox` in a session of its own, `bwrap` sits in that session, and the inner `codex-linux-sandbox --apply-seccomp-then-exec` leads a second session that runs the command. On a Codex pane that chain counts as one command and a second chain as a second; the same table on any other pane counts both sessions, and a Codex pane counts every session whose chain differs from the measured one in any link.
 #[spec("status/waiting/025")]
 #[test]
-fn status_waiting_025_a_session_nested_in_a_detached_one_is_the_same_command() {
-    use dot_agent_deck::platform::proc::{descendant_shell_activity, qualifying_command_sessions};
+fn status_waiting_025_codex_linux_sandbox_counts_one_command() {
+    use dot_agent_deck::platform::proc::{
+        CommandWrapper, command_line_targets, qualifying_command_sessions,
+        qualifying_command_sessions_in_pane,
+    };
     use std::collections::HashSet;
 
-    let row = |pid: i32, ppid: i32, session_id: i32, argv: &str| ProcessInfo {
+    // Words as measured (the JSON permission profile shortened; it has no
+    // spaces in the measured run either).
+    const OUTER_ARGV: &str = "codex-linux-sandbox --sandbox-policy-cwd /work --command-cwd /work \
+         --permission-profile {\"type\":\"managed\",\"network\":\"restricted\"} -- /bin/bash -c \
+         sleep 60 && touch done";
+    const INNER_ARGV: &str = "codex-linux-sandbox --sandbox-policy-cwd /work --command-cwd /work \
+         --permission-profile {\"type\":\"managed\",\"network\":\"restricted\"} \
+         --apply-seccomp-then-exec -- /bin/bash -c sleep 60 && touch done";
+    // The agent, pids kept from the tree `status/waiting/024` printed.
+    const CODEX: i32 = 538240;
+    const CODEX_SID: i32 = 537924;
+    const CODEX_PANE: Option<CommandWrapper> = Some(CommandWrapper::CodexLinuxSandbox);
+    let row = |pid: i32, ppid: i32, session_id: i32, argv: Option<&str>| ProcessInfo {
         pid,
         ppid,
         session_id,
         has_controlling_tty: false,
         session_leader: pid == session_id,
-        command_line: CommandLine::Read(argv.to_string()),
+        command_line: argv.map_or(CommandLine::NotSampled, |argv| {
+            CommandLine::Read(argv.to_string())
+        }),
     };
-    // The tree `status/waiting/024` printed (Codex 0.164.0, workspace-write
-    // sandbox, 2026-11-11), pids kept: codex (in the agent's session) →
-    // `codex-linux-sandbox` (setsid: session 538581) → `bwrap` (same session)
-    // → `codex-linux-sandbox --apply-seccomp-then-exec` (bwrap's
-    // `--new-session`: session 538586) → `bash -c` → `sleep`.
-    const CODEX: i32 = 538240;
-    const CODEX_SID: i32 = 537924;
-    let mut table = vec![
-        row(CODEX, 538226, CODEX_SID, "codex --model gpt-5.6-luna"),
-        row(538558, CODEX, CODEX_SID, "codex-code-mode-host"),
-        row(
-            538581,
-            CODEX,
-            538581,
-            "codex-linux-sandbox -- /bin/bash -c …",
-        ),
-        row(538585, 538581, 538581, "bwrap --new-session …"),
-        row(
-            538586,
-            538585,
-            538586,
-            "codex-linux-sandbox --apply-seccomp-then-exec -- /bin/bash -c …",
-        ),
-        row(
-            538587,
-            538586,
-            538586,
-            "/bin/bash -c sleep 60 && touch done",
-        ),
-        row(538588, 538587, 538586, "sleep 60"),
-    ];
+    // One command through the exec tool: outer wrapper (setsid) → bwrap (same
+    // session, command line never read: not a session boundary) → inner
+    // wrapper (bwrap's `--new-session`) → bash → sleep.
+    let command = |outer: i32, inner: i32| {
+        vec![
+            row(outer, CODEX, outer, Some(OUTER_ARGV)),
+            row(outer + 4, outer, outer, None),
+            row(inner, outer + 4, inner, Some(INNER_ARGV)),
+            row(inner + 1, inner, inner, None),
+            row(inner + 2, inner + 1, inner, None),
+        ]
+    };
+    let agent = || {
+        vec![
+            row(CODEX, 538226, CODEX_SID, None),
+            row(538558, CODEX, CODEX_SID, None),
+        ]
+    };
+    let codex = |table: &[ProcessInfo]| {
+        qualifying_command_sessions_in_pane(table, CODEX, &[], None, CODEX_PANE)
+    };
+
+    let mut table = agent();
+    table.extend(command(538581, 538586));
+    // Issue #862: the two wrappers are the only command lines the sampler
+    // reads, and the rule needs no other.
+    assert_eq!(command_line_targets(&table, &[CODEX]), vec![538581, 538586]);
+    assert_eq!(
+        codex(&table),
+        Some(HashSet::from([538581])),
+        "the sandbox's inner session is the command its outer session runs — one command, not two"
+    );
     assert_eq!(
         qualifying_command_sessions(&table, CODEX, &[]),
-        Some(HashSet::from([538581])),
-        "the sandbox's inner session is part of the command its outer session runs — one \
-         command, not two"
+        Some(HashSet::from([538581, 538586])),
+        "on any pane but a Codex one the same nesting counts as it always has"
     );
-    assert_eq!(descendant_shell_activity(&table, CODEX, &[]), Some(true));
-    // A second command through the same tool is a second outer session.
+    assert_eq!(
+        qualifying_command_sessions_in_pane(&table, CODEX, &[], None, None),
+        Some(HashSet::from([538581, 538586]))
+    );
+
+    // A second command through the same tool is a second chain.
+    table.extend(command(538681, 538686));
+    assert_eq!(codex(&table), Some(HashSet::from([538581, 538681])));
+
+    // A session the command starts below the inner wrapper is outside the
+    // chain: it counts.
+    let mut nested = table.clone();
+    nested.push(row(538700, 538587, 538700, Some("setsid sleep 600")));
+    assert_eq!(
+        codex(&nested),
+        Some(HashSet::from([538581, 538681, 538700]))
+    );
+
+    // Every link is checked; a chain that differs in one counts both sessions.
+    let one_command = || {
+        let mut table = agent();
+        table.extend(command(538581, 538586));
+        table
+    };
+    let both = Some(HashSet::from([538581, 538586]));
+    let mut changed = one_command();
+    changed[3].session_id = 0;
+    assert_eq!(
+        codex(&changed),
+        both,
+        "bubblewrap's session could not be read"
+    );
+    let mut changed = one_command();
+    changed[3].session_id = changed[3].pid;
+    changed[3].session_leader = true;
+    let mut sessions = both.clone().unwrap();
+    sessions.insert(changed[3].pid);
+    assert_eq!(
+        codex(&changed),
+        Some(sessions),
+        "bubblewrap in a session of its own is an extra session"
+    );
+    let mut changed = one_command();
+    changed[4].ppid = 538581;
+    changed.remove(3);
+    assert_eq!(
+        codex(&changed),
+        both,
+        "no bubblewrap: the inner wrapper is the outer's child"
+    );
+    let mut changed = one_command();
+    changed[4].ppid = 538590;
+    changed.push(row(538590, 538585, 538590, Some("setsid bash")));
+    assert_eq!(
+        codex(&changed),
+        Some(HashSet::from([538581, 538586, 538590])),
+        "an extra session between bubblewrap and the inner wrapper"
+    );
+    let mut changed = one_command();
+    changed.push(row(538595, 538585, 538595, Some(INNER_ARGV)));
+    assert_eq!(
+        codex(&changed),
+        Some(HashSet::from([538581, 538586, 538595])),
+        "bubblewrap with a second child is not the measured chain"
+    );
+    let mut changed = one_command();
+    changed[4].command_line = CommandLine::Unavailable;
+    assert_eq!(codex(&changed), both, "an inner wrapper not read");
+    let mut changed = one_command();
+    changed[2].command_line = CommandLine::Unavailable;
+    assert_eq!(codex(&changed), both, "an outer wrapper not read");
+    let mut changed = one_command();
+    changed[4].command_line = CommandLine::Read(
+        "codex-linux-sandbox --sandbox-policy-cwd /work -- /bin/bash -c x \
+         --apply-seccomp-then-exec"
+            .to_string(),
+    );
+    assert_eq!(
+        codex(&changed),
+        both,
+        "the inner stage's option is read before the `--`, not in the command"
+    );
+    let mut changed = one_command();
+    changed[2].command_line = CommandLine::Read(INNER_ARGV.to_string());
+    assert_eq!(codex(&changed), both, "an inner stage where the outer is");
+    let mut changed = one_command();
+    changed[2].command_line =
+        CommandLine::Read("/usr/bin/codex-linux-sandbox-x --sandbox-policy-cwd /w -- a".into());
+    assert_eq!(codex(&changed), both, "another program");
+
+    // The outer session is not the wrapper: a user's `setsid` launcher whose
+    // child starts a session shaped like the inner wrapper counts both.
+    let mut table = agent();
     table.extend([
-        row(
-            538681,
-            CODEX,
-            538681,
-            "codex-linux-sandbox -- /bin/bash -c …",
-        ),
-        row(538685, 538681, 538681, "bwrap --new-session …"),
-        row(
-            538686,
-            538685,
-            538686,
-            "codex-linux-sandbox --apply-seccomp-then-exec",
-        ),
+        row(538800, CODEX, 538800, Some("setsid --wait bash -c run")),
+        row(538804, 538800, 538800, None),
+        row(538806, 538804, 538806, Some(INNER_ARGV)),
     ]);
     assert_eq!(
-        qualifying_command_sessions(&table, CODEX, &[]),
-        Some(HashSet::from([538581, 538681]))
+        codex(&table),
+        Some(HashSet::from([538800, 538806])),
+        "a session nested below anything but the measured wrapper counts"
     );
-    // A parent whose session could not be read keeps its child counted: that
-    // is the direction that cannot lose a command.
-    table
-        .iter_mut()
-        .find(|r| r.pid == 538685)
-        .unwrap()
-        .session_id = 0;
-    assert_eq!(
-        qualifying_command_sessions(&table, CODEX, &[]),
-        Some(HashSet::from([538581, 538681, 538686]))
-    );
+    // A whole wrapper chain below such a launcher is not the outermost
+    // session on its branch, as the agent starts it: all three count.
+    let mut table = agent();
+    table.push(row(
+        538800,
+        CODEX,
+        538800,
+        Some("setsid --wait bash -c run"),
+    ));
+    let mut chain = command(538581, 538586);
+    chain[0].ppid = 538800;
+    table.extend(chain);
+    assert_eq!(codex(&table), Some(HashSet::from([538800, 538581, 538586])));
+
     // With both commands gone only the agent's own children remain: none.
-    table.retain(|r| r.session_id == CODEX_SID);
+    assert_eq!(codex(&agent()), Some(HashSet::new()));
+}
+
+/// Scenario: Classify a Claude pane whose Claude runs below a detached launcher of its own, so the measured Bash-tool session sits inside a detached session whose command line does not match the shape, or was not read. The Bash-tool session counts and the pane reads busy; on a Codex pane, a wrapper chain whose outer session does not itself qualify leaves the inner session counted.
+#[spec("status/waiting/026")]
+#[test]
+fn status_waiting_026_an_unqualified_outer_session_hides_no_command() {
+    use dot_agent_deck::platform::proc::{
+        CommandWrapper, ShellToolShape, descendant_shell_activity, qualifying_command_sessions,
+        qualifying_command_sessions_in_pane,
+    };
+    use std::collections::HashSet;
+
+    let row = |pid: i32, ppid: i32, session_id: i32, argv: CommandLine| ProcessInfo {
+        pid,
+        ppid,
+        session_id,
+        has_controlling_tty: pid == 100,
+        session_leader: pid == session_id,
+        command_line: argv,
+    };
+    let read = |argv: &str| CommandLine::Read(argv.to_string());
+    // Pane shell (the walk's root) → a detached launcher's Claude (session
+    // 200) → Claude's Bash tool (session 300), with the measured shape.
+    let bash_tool = read(
+        "/bin/bash -c source /home/u/.claude/shell-snapshots/snapshot-bash-1.sh && eval 'sleep 60'",
+    );
+    for outer in [read("claude --model haiku"), CommandLine::Unavailable] {
+        let table = vec![
+            row(100, 1, 100, CommandLine::NotSampled),
+            row(200, 100, 200, outer.clone()),
+            row(300, 200, 300, bash_tool.clone()),
+            row(301, 300, 300, CommandLine::NotSampled),
+        ];
+        assert_eq!(
+            qualifying_command_sessions(&table, 100, &[CLAUDE_BASH_TOOL_SHAPE]),
+            Some(HashSet::from([300])),
+            "the Bash-tool session counts below an outer session of {outer:?}"
+        );
+        assert_eq!(
+            descendant_shell_activity(&table, 100, &[CLAUDE_BASH_TOOL_SHAPE]),
+            Some(true),
+            "the pane is busy below an outer session of {outer:?}"
+        );
+    }
+
+    // On a Codex pane the collapse runs only after qualification: with a
+    // cross-check that the inner session carries and the outer does not, the
+    // outer is not counted and so does not take the inner with it.
+    const INNER_ONLY: ShellToolShape = ShellToolShape {
+        agent: "test",
+        alternatives: &[&["--apply-seccomp-then-exec"]],
+    };
+    let table = vec![
+        row(100, 1, 100, CommandLine::NotSampled),
+        row(
+            200,
+            100,
+            200,
+            read("codex-linux-sandbox --sandbox-policy-cwd /w --command-cwd /w -- bash -c x"),
+        ),
+        row(204, 200, 200, CommandLine::NotSampled),
+        row(
+            206,
+            204,
+            206,
+            read(
+                "codex-linux-sandbox --sandbox-policy-cwd /w --command-cwd /w \
+                 --apply-seccomp-then-exec -- bash -c x",
+            ),
+        ),
+    ];
     assert_eq!(
-        qualifying_command_sessions(&table, CODEX, &[]),
-        Some(HashSet::new())
+        qualifying_command_sessions_in_pane(
+            &table,
+            100,
+            &[INNER_ONLY],
+            None,
+            Some(CommandWrapper::CodexLinuxSandbox)
+        ),
+        Some(HashSet::from([206]))
     );
 }
 

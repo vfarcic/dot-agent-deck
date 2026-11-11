@@ -20671,6 +20671,100 @@ mod tests {
         assert_eq!((work.commands, awaited_of(Some(work))), (1, 0));
     }
 
+    /// Scenario: An OpenCode pane whose private server the deck could not recognise (its command line was not read) is sampled before a turn, so the server counts as a command from an earlier turn. The next turn's tool starts a command in a session of its own below that server, and the turn ends while it runs. The scan counts the new command as a session of its own, so the card reads Waiting with two commands, one of them awaited.
+    #[spec("status/waiting/027")]
+    #[test]
+    fn status_waiting_027_a_command_below_an_older_detached_session_is_awaited() {
+        use crate::platform::proc::{AgentServer, CommandLine, ProcessInfo};
+
+        const CLIENT: i32 = 80100;
+        const SERVER: i32 = 80110;
+        const TOOL_SID: i32 = 80130;
+        let row = |pid: i32, ppid: i32, sid: i32, argv: CommandLine| ProcessInfo {
+            pid,
+            ppid,
+            session_id: sid,
+            has_controlling_tty: sid == CLIENT,
+            session_leader: pid == sid,
+            command_line: argv,
+        };
+        // The server's command line was not read, so the identified pair is
+        // not borne out and the server counts (`status/waiting/016`).
+        let identified = Some(AgentServer {
+            client_pid: CLIENT,
+            server_pid: SERVER,
+        });
+        let before = vec![
+            row(CLIENT, 1, CLIENT, CommandLine::NotSampled),
+            row(SERVER, CLIENT, SERVER, CommandLine::Unavailable),
+            row(80111, SERVER, SERVER, CommandLine::NotSampled),
+        ];
+        let mut during = before.clone();
+        during.push(row(
+            TOOL_SID,
+            SERVER,
+            TOOL_SID,
+            CommandLine::Read("/bin/bash -c sleep 60 && touch sentinel".into()),
+        ));
+        during.push(row(80131, TOOL_SID, TOOL_SID, CommandLine::NotSampled));
+        // What the registry selects for an OpenCode pane: no sandbox wrapper.
+        let scan = |table: &[ProcessInfo]| {
+            crate::platform::proc::qualifying_command_sessions_in_pane(
+                table,
+                CLIENT,
+                &[],
+                identified,
+                None,
+            )
+            .expect("the client is in the table")
+        };
+
+        let mut state = AppState::default();
+        let _ownership =
+            install_ownership(&mut state, StubOwnership::owning(CLI_PANE, CLI_AGENT_ID));
+        state.register_pane(CLI_PANE.into());
+        let frame = |event_type: &str| {
+            serde_json::from_value::<AgentEvent>(serde_json::json!({
+                "session_id": "conversation", "pane_id": CLI_PANE, "agent_id": CLI_AGENT_ID,
+                "agent_type": "opencode", "event_type": event_type, "timestamp": Utc::now()
+            }))
+            .unwrap()
+        };
+        let tick = || std::thread::sleep(std::time::Duration::from_millis(5));
+
+        // Turn 1 ends; the unrecognised server is sampled after it.
+        state.apply_event(frame("session_start"));
+        state.apply_event(frame("thinking"));
+        state.apply_event(frame("idle"));
+        tick();
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &scan(&before));
+
+        // Turn 2 starts a command below the server and ends while it runs.
+        tick();
+        state.apply_event(frame("thinking"));
+        tick();
+        let sessions = scan(&during);
+        state.observe_command_sessions(CLI_PANE, CLI_AGENT_ID, &sessions);
+        state.apply_event(frame("idle"));
+        assert_eq!(
+            state.pane_status_of(CLI_PANE),
+            Some(waiting_status_1757()),
+            "a turn that ended while its own command runs is Waiting; sampled: {sessions:?}"
+        );
+        let work = state
+            .pane_background_of(CLI_PANE)
+            .expect("the server and the command");
+        assert!(
+            awaited_of(Some(work)) >= 1,
+            "the command turn 2 started is awaited"
+        );
+        assert_eq!(
+            (work.commands, sessions),
+            (2, HashSet::from([SERVER, TOOL_SID])),
+            "the tool's command is a session of its own, not part of the server's count"
+        );
+    }
+
     /// Scenario: A pane's turn starts a command and ends while it runs, so the card reads Waiting; then the agent starts a new conversation (a SessionStart under a new session id, with no SessionEnd) and that conversation's first report is an Idle with no prompt before it. The old conversation's command keeps its age but reads as an earlier turn's — Idle with the Background line, on the SessionStart and on the Idle — and a command started in a real turn of the new conversation makes the card Waiting again.
     #[spec("status/waiting/014")]
     #[test]
