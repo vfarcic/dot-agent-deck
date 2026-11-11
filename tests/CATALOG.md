@@ -340,6 +340,13 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** keys, approving or the spawned binary (`config-trust/prompt/001`/`002`, the `ui.rs` `prompt_004`–`006` unit tests); escaping of hostile config text (`trust_prompt` unit tests); the desktop dialog.
 - **Platform coverage:** mac+linux+windows.
 
+##### config-trust/prompt/004 — The trust prompt works with the mouse: clicking `a approve and start`/`a approve and restore` approves, clicking `Esc cancel` cancels, the wheel scrolls, and other clicks do nothing.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, four tests), SGR mouse reports through `TuiDeck::click`/`scroll_n`, each label located on the rendered grid; the restore test stages the `config-trust/restore/002` saved session.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`, `sleep 600`).
+- **Asserts:** clicks on the prompt's title, on a role's description, on the deck left of the popup and on the dashboard's `[Quit Ctrl+C]` and `[New Agent Ctrl+N]` buttons behind it, and Enter, leave the prompt open, open no quit dialog and spawn nothing; a click on `a approve and start` starts both roles and `trust list` reads `current`; a click on `Esc cancel` closes the prompt, spawns nothing and stores nothing; the wheel over a review longer than the popup scrolls it to `(more above and below)`, to its last line and `(more above)`, and back to `(more below)`, without approving; on the restore prompt a click on `a approve and restore` restores the roles and `trust list` reads `current`.
+- **Does not assert:** that a click on the approve label before the prompt's first frame is refused (the `ui.rs` unit tests own that guard: the prompt opens on a daemon reply, so a PTY cannot order a click between its opening and its first frame); clicking `Esc cancel` on the restore prompt; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
 #### config-trust/restore
 
 ##### config-trust/restore/001 — A restored orchestration whose command changed asks before restoring.

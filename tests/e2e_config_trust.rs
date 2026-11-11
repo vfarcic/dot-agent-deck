@@ -634,6 +634,248 @@ fn prompt_002_a_changed_role_is_marked_and_enter_does_not_approve() {
 }
 
 // ---------------------------------------------------------------------------
+// config-trust/prompt/004: the trust prompt by mouse
+// ---------------------------------------------------------------------------
+
+/// The footer's approve label on the New Agent form's prompt and on the
+/// restore prompt, and its cancel label (the spec's binding text).
+const APPROVE_START: &str = "a approve and start";
+const APPROVE_RESTORE: &str = "a approve and restore";
+const CANCEL_LABEL: &str = "Esc cancel";
+
+/// Left-click the middle of `label` where the current grid shows it.
+fn click_label(deck: &TuiDeck, label: &str) {
+    let (col, row) = deck.wait_for_in_grid(label);
+    let half = u16::try_from(label.chars().count() / 2).expect("a short label");
+    deck.click(col + half, row);
+}
+
+/// Whether the trust prompt is still on screen after `window`, sampled the
+/// whole time (it must not close and reopen in between).
+fn prompt_stays_open(deck: &TuiDeck, window: Duration) -> bool {
+    !common::wait_until(window, || !deck.snapshot_grid().contains(PROMPT_TITLE))
+}
+
+/// Scenario: Open the trust prompt for a never-approved orchestration, then
+/// click its title, a role's description, the deck left of the popup and the
+/// dashboard's `[Quit Ctrl+C]` and `[New Agent Ctrl+N]` behind it, and press
+/// Enter. The prompt must stay open, no quit dialog opens and nothing spawns. Clicking the footer's `a approve and start` must then
+/// approve and start both roles, and `trust list` shows the approval `current`.
+#[spec("config-trust/prompt/004")]
+#[test]
+fn prompt_004_clicking_approve_starts_and_clicks_elsewhere_do_nothing() {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    choose_orchestration(&deck);
+    let grid = wait_for_prompt(&deck);
+    assert!(
+        grid.contains(APPROVE_START) && grid.contains(CANCEL_LABEL),
+        "precondition: the footer shows {APPROVE_START:?} and {CANCEL_LABEL:?}.\nGrid:\n{grid}"
+    );
+
+    // Clicks that are not on a footer label: on the review itself, and on the
+    // deck around it. The popup is at most 120 columns wide and centred, so
+    // at 140 columns the first ten are the deck behind it; the short review
+    // leaves the dashboard's own buttons uncovered below it.
+    let (title_col, title_row) = deck.wait_for_in_grid(PROMPT_TITLE);
+    deck.click(title_col + 3, title_row);
+    click_label(&deck, "TRUST-DESC-CODER");
+    deck.click(2, title_row + 3);
+    click_label(&deck, "[Quit Ctrl+C]");
+    click_label(&deck, "[New Agent Ctrl+N]");
+    deck.send_keys(b"\r"); // Enter still does not approve
+    assert!(
+        prompt_stays_open(&deck, Duration::from_secs(2)),
+        "a click off the footer's labels, or Enter, must leave the prompt open.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        !deck.snapshot_grid().contains("Quit dot-agent-deck?"),
+        "a click on the deck's buttons behind the prompt must not reach them.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(1)),
+        "a click off the footer's labels, or Enter, must spawn nothing: {:?}",
+        role_records(&attach)
+    );
+
+    click_label(&deck, APPROVE_START);
+    let started = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "orchestrator").is_some() && role_record(&attach, "coder").is_some()
+    });
+    assert!(
+        started,
+        "clicking {APPROVE_START:?} must approve and start both roles, as `a` does; roles = {:?}\nGrid:\n{}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    let listed = text(&deck.run_deck_cli(deck.workdir(), &["trust", "list"]));
+    assert!(
+        listed
+            .lines()
+            .any(|l| l.contains(ORCH) && state_word(l) == Some("current")),
+        "approving by click must store the approval:\n{listed}"
+    );
+}
+
+/// Scenario: Open the trust prompt for a never-approved orchestration and
+/// click the footer's `Esc cancel`. The prompt must close, no role may start,
+/// and `trust list` must store nothing for the orchestration.
+#[spec("config-trust/prompt/004")]
+#[test]
+fn prompt_004_clicking_cancel_closes_and_stores_nothing() {
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    choose_orchestration(&deck);
+    wait_for_prompt(&deck);
+    click_label(&deck, CANCEL_LABEL);
+    let closed = common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+        !deck.snapshot_grid().contains(PROMPT_TITLE)
+    });
+    assert!(
+        closed,
+        "clicking {CANCEL_LABEL:?} must close the prompt, as `Esc` does.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(2)),
+        "a cancelled prompt must spawn nothing: {:?}",
+        role_records(&attach)
+    );
+    let listed = text(&deck.run_deck_cli(deck.workdir(), &["trust", "list"]));
+    assert!(
+        !listed.lines().any(|l| l.contains(ORCH)),
+        "cancelling by click must store nothing:\n{listed}"
+    );
+}
+
+/// Scenario: Give the orchestration a third role whose prompt runs to many
+/// rows and ends in a sentinel, and open its trust prompt. Turning the mouse
+/// wheel down over the review must scroll it like `↓` (`(more above and
+/// below)`, then the sentinel and `(more above)` at the end), wheeling up must
+/// return to the top, and nothing may be approved or spawned.
+#[spec("config-trust/prompt/004")]
+#[test]
+fn prompt_004_the_mouse_wheel_scrolls_the_review() {
+    const TAIL: &str = "TRUST-PROMPT-TAIL";
+    let deck = TuiDeck::builder()
+        .without_trust_preapproval()
+        .with_pty_size(140, 50)
+        .launch_with_fixture("config-trust");
+    deck.wait_for_string("No active agents");
+    let attach = deck.attach_socket_path().to_path_buf();
+    let long_prompt = format!(
+        "TRUST-PROMPT-REVIEWER {}{TAIL}",
+        "scroll-filler ".repeat(700)
+    );
+    write_trust_config_with_reviewer_prompt(deck.workdir(), &long_prompt);
+
+    choose_orchestration(&deck);
+    let grid = wait_for_prompt(&deck);
+    assert!(
+        grid.contains("(more below)") && !grid.contains(TAIL),
+        "precondition: the review is longer than the popup and opens at the top.\nGrid:\n{grid}"
+    );
+    let (title_col, title_row) = deck.wait_for_in_grid(PROMPT_TITLE);
+    let (wheel_col, wheel_row) = (title_col + 3, title_row + 3);
+
+    deck.scroll_n(wheel_col, wheel_row, true, 3);
+    let moved = common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+        deck.snapshot_grid().contains("(more above and below)")
+    });
+    assert!(
+        moved,
+        "the wheel down over the review must scroll it, as `↓` does.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    deck.scroll_n(wheel_col, wheel_row, true, 400);
+    let at_end = common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+        let grid = deck.snapshot_grid();
+        grid.contains(TAIL) && grid.contains("(more above)") && !grid.contains("and below")
+    });
+    assert!(
+        at_end,
+        "wheeling down must reach the end of the review ({TAIL:?}).\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+
+    deck.scroll_n(wheel_col, wheel_row, false, 400);
+    let at_top = common::wait_until(common::load_scaled(Duration::from_secs(5)), || {
+        let grid = deck.snapshot_grid();
+        grid.contains("(more below)") && !grid.contains("above") && !grid.contains(TAIL)
+    });
+    assert!(
+        at_top,
+        "wheeling up must return to the top of the review.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        deck.snapshot_grid().contains(PROMPT_TITLE),
+        "the wheel must not close the prompt.\nGrid:\n{}",
+        deck.snapshot_grid()
+    );
+    assert!(
+        no_roles_for(&attach, Duration::from_secs(1)),
+        "the wheel must not approve or spawn anything: {:?}",
+        role_records(&attach)
+    );
+}
+
+/// Scenario: Stage the `config-trust/restore/002` saved session (an approved
+/// orchestration whose `coder` command then changed, and a plain pane) and
+/// launch the TUI to its restore prompt. Clicking the footer's `a approve and
+/// restore` must restore the orchestration's roles, as `a` does, and `trust
+/// list` then reads `current`.
+#[spec("config-trust/prompt/004")]
+#[test]
+fn prompt_004_clicking_approve_on_the_restore_prompt_restores() {
+    let staged = ChangedRestore::stage();
+    let deck = staged.launch_to_prompt();
+    let attach = deck.attach_socket_path().to_path_buf();
+
+    click_label(&deck, APPROVE_RESTORE);
+    let restored = common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+        role_record(&attach, "coder").is_some() && role_record(&attach, "reviewer").is_some()
+    });
+    assert!(
+        restored,
+        "clicking {APPROVE_RESTORE:?} must approve and restore the orchestration; roles = {:?}\nGrid:\n{}",
+        role_records(&attach)
+            .iter()
+            .map(|r| &r.tab_membership)
+            .collect::<Vec<_>>(),
+        deck.snapshot_grid()
+    );
+    let listed = restore_trust_cli(&staged.project, &staged.state, &staged.home, &["list"]);
+    let project_canonical = canonical(&staged.project);
+    let line = text(&listed)
+        .lines()
+        .find(|l| l.contains(&project_canonical) && l.contains("restore-orch"))
+        .map(str::to_string);
+    assert_eq!(
+        line.as_deref().and_then(state_word),
+        Some("current"),
+        "approving the restore by click must store the approval.\n{}",
+        describe(&listed)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // config-trust/restore/001: session restore
 // ---------------------------------------------------------------------------
 
