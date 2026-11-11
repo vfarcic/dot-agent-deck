@@ -485,7 +485,7 @@ Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `
 
 #### config-trust/live
 
-##### config-trust/live/001 — A real agent starts only after the trust prompt is approved. [reel]
+##### config-trust/live/001 — A real agent starts only after the trust prompt is approved.
 - **Layer:** L2 PTY-attached, **lane 2** (`tests/e2e_config_trust_live.rs`).
 - **Agent:** real interactive Claude Code on Haiku (`--allowedTools Bash Read`), credentials imported, work dir trusted.
 - **Asserts:** Ctrl+n on a never-approved project shows `Review project commands` with the role's `claude …` command and nothing running; `a` starts the agent, which creates the uniquely named sentinel `config_trust_live_5e81c3.txt` its prompt asks for.
@@ -6391,7 +6391,7 @@ without depending on the config struct API.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux.
 
-##### dispatch/close/004 — A real dispatched agent closed with `Close, keep worktree` leaves its clean worktree on disk, and the status line says it was kept on request and where (issue #1958). [reel]
+##### dispatch/close/004 — A real dispatched agent closed with `Close, keep worktree` leaves its clean worktree on disk, and the status line says it was kept on request and where (issue #1958).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatcher_mode.rs`; `TuiDeck` on the `minimal` fixture driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → Down, Down, Enter path).
 - **Agent:** claude/haiku — a REAL interactive Claude Code (`claude --model claude-haiku-4-5-20251001`, no `-p`) as the dispatched unit; the caller pane is a shell, so the unit starts the deck's `default_command` (issue #1602).
 - **Asserts:** the agent does one directive, deterministic operation in its own worktree — writing a uniquely named sentinel file into the git-ignored `.dot-agent-deck/` — and goes Idle with the worktree clean (the premise: an ordinary Close would remove it, `dispatch/close/003`); the close confirmation offers `Close, keep worktree`; choosing it puts `Worktree kept on request:` and the worktree's path on the status line, removes the agent from the daemon, and leaves the worktree and the agent's sentinel on disk.
@@ -8401,7 +8401,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
 - **Agent:** none (two `bash` panes stand in for agents: one restored with `--continue`, one opened from the new-pane form with no command; each prints a shell-computed sentinel).
 - **Asserts:** with both panes tiled on the dashboard in command mode and the second one focused (thick `┃` border), one drag across the first pane's sentinel writes an OSC 52 sequence whose payload is exactly that sentinel and never the focused pane's, moves the thick border to the dragged pane, and shows the OSC 52-only status (`Sent to terminal clipboard (OSC 52)`), since the harness turns the native clipboard off.
-- **Does not assert:** the highlight's cells (`mouse/select/002`); the native clipboard write or its status wording (`clipboard/*`); orchestration-tab panes; a real agent, so it carries no ` [reel]` marker.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); the native clipboard write or its status wording (`clipboard/*`); orchestration-tab panes; a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### mouse/select/002 — A press in a pane that is not focused focuses it, and the drag highlights that pane (PRD #385 M2).
@@ -8429,7 +8429,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
 - **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent; it blanks itself and leaves a shell-computed sentinel on its bottom row, held there by `sleep`).
 - **Asserts:** in command mode, a drag from the end of the sentinel released over the bottom bar's `[New Agent n/Ctrl+N]` button writes an OSC 52 sequence whose payload is exactly the sentinel (the drag's end clamps to the pane's bottom row and first column), shows the OSC 52-only status, and opens no directory picker; after a plain click on a blank pane cell (so the next press is not a double-click), a second drag from the sentinel released over the pane's dashboard card writes an OSC 52 sequence carrying the blank rows from the card's row (or the pane's top) down to the sentinel, then the sentinel, and the deck stays in command mode.
-- **Does not assert:** the highlight's cells (`mouse/select/002`); a release over a tab header; a dialog opened mid-drag, which cancels the selection instead (`mouse/select/011`); a real agent, so it carries no ` [reel]` marker.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); a release over a tab header; a dialog opened mid-drag, which cancels the selection instead (`mouse/select/011`); a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### mouse/select/006 — A real tab switch clears the selection even when the user is back before the next frame (PRD #385 M3).
@@ -8471,7 +8471,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L2 lane 1 (real-binary PTY, SGR press / held-button motion / release sent apart, `tests/e2e_mouse_select.rs`).
 - **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel).
 - **Asserts:** in command mode, a press and drag across the sentinel, then `?` with the button held and the release over the drawn Help overlay, write no OSC 52 sequence and show no copy status, and Help stays open; after Help closes, a click on `[New Agent n/Ctrl+N]` opens the directory picker; a press and drag followed by a terminal focus-out report (`CSI O`) and then the release write no OSC 52 sequence and show no copy status.
-- **Does not assert:** each other overlay and modal one by one (they share the check `overlay_blocks_mouse` decides); the unfinished highlight's cells while Help is open; a real agent, so it carries no ` [reel]` marker.
+- **Does not assert:** each other overlay and modal one by one (they share the check `overlay_blocks_mouse` decides); the unfinished highlight's cells while Help is open; a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### mouse/select/012 — A frame that draws no pane leaves nothing to select: a drag where a hidden pane was drawn copies nothing (PRD #385 decision 6).
@@ -8526,7 +8526,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
 - **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel, then 120 lines).
 - **Asserts:** with the sentinel scrolled out of view, `v` in command mode shows the ` COPY ` mode chip and a copy-mode cursor; `PageUp` pages back until the sentinel is on screen; moving the cursor onto it, `v`, moving across it and `y` writes exactly one OSC 52 sequence, whose payload is exactly the sentinel; the status line then reports the OSC 52-only send and the chip reads ` COMMAND ` again.
-- **Does not assert:** the native clipboard (the harness turns it off); the keys' L1 edge cases (`copymode/keys/002`); a real agent, so it carries no ` [reel]` marker (`copymode/live/001` does).
+- **Does not assert:** the native clipboard (the harness turns it off); the keys' L1 edge cases (`copymode/keys/002`); a real agent (`copymode/live/001` drives one).
 - **Platform coverage:** mac+linux.
 
 ##### copymode/keys/002 — Leaving copy mode without a yank copies nothing and leaves the pane where it was; live output does not move copy mode's view; an empty pane and the alternate screen behave (PRD #385 M5).
@@ -8582,7 +8582,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 - **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
 - **Agent:** none (a `bash` pane restored with `--continue` runs `cat -v` with mouse reporting and bracketed paste turned on, so any byte it receives is shown).
 - **Asserts:** after copy mode receives printable keys, a digit, `Ctrl+D`, `Ctrl+W`, movement keys, `PageUp`, a bracketed paste and a mouse press, drag, release and wheel report, `q` returns to command mode and `Ctrl+D` to typing; `ENDMARK` typed then appears alone on its line in the program's output, no pasted text or escape sequence appears, and no OSC 52 copy was written.
-- **Does not assert:** the native clipboard (the harness turns it off); a real agent, so it carries no ` [reel]` marker.
+- **Does not assert:** the native clipboard (the harness turns it off); a real agent.
 - **Platform coverage:** mac+linux.
 
 ##### copymode/keys/010 — A resize never lets a yank copy what the first frame after it did not highlight (PRD #385 decision 6).
@@ -8603,7 +8603,7 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 
 #### copymode/live
 
-##### copymode/live/001 — Copy mode yanks what a live Claude Code agent printed (PRD #385 M5). [reel]
+##### copymode/live/001 — Copy mode yanks what a live Claude Code agent printed (PRD #385 M5).
 - **Layer:** L2 lane 2 (`tests/e2e_copy_mode_live.rs`, `#![cfg(all(unix, feature = "e2e", feature = "e2e-live"))]`), attached PTY. Imported isolated credentials and pre-seeded project trust, as `scheduler/dispatch/013`; `--allowedTools Bash Read`.
 - **Agent:** interactive Claude Code on Haiku, started through the attach socket in a fixture directory whose one file is the sentinel.
 - **Asserts:** after the agent lists the directory and the sentinel file name is on screen, `Ctrl+D`, `v`, moving the copy-mode cursor onto the name, `v`, moving across it and `y` write an OSC 52 sequence carrying exactly the name; the status line reports the OSC 52-only send and the chip reads ` COMMAND `.
