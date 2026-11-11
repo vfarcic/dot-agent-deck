@@ -223,7 +223,7 @@ pub fn deck_attention_count(held: usize) -> Option<String> {
 }
 
 /// The card notice for a message handed to the agent the most times allowed,
-/// none acknowledged. Fixed text, as every delivery notice is
+/// none acknowledged. Daemon-authored, as every delivery notice is
 /// ([`crate::agent_pty::DeliveryNotice::detail`]).
 pub const NOTICE_MAX_DELIVER: &str =
     "not delivered: a deck message was handed to this agent repeatedly and never acknowledged";
@@ -232,19 +232,6 @@ pub const NOTICE_MAX_DELIVER: &str =
 /// not shown: the card returns to the agent's own status.
 pub const NOTICE_DELIVERED_LATE: &str =
     "delivered after all: a deck message reported not delivered reached this agent";
-/// The card notice for a message whose agent's pane ended while it was still
-/// owed, when the deck can't say how ([`PaneTermination::Unknown`]). PRD #1666
-/// part 3, round 5-wake (plan rev 2 §6): the deck sees its own child and the
-/// pane's terminal, never the agent below them, so no notice says the agent
-/// exited.
-pub const NOTICE_AGENT_EXITED: &str =
-    "not delivered: this agent's pane ended before a deck message reached it";
-/// The card notice when the command the deck started in the pane exited.
-pub const NOTICE_PANE_COMMAND_EXITED: &str = "not delivered: the command started in this agent's pane exited before a deck message reached it";
-/// The card notice when the deck's connection to the pane ended while the
-/// command it started there still ran, or its exit could not be read.
-pub const NOTICE_CONNECTION_ENDED: &str = "not delivered: the deck's connection to this agent's pane ended before a deck message reached it";
-
 /// PRD #1666 part 3, round 5-wake (plan rev 2 §6): what the deck observed
 /// ending an agent generation's pane, on the notice of a message that became
 /// undeliverable because of it (`agent_exited`). It names the process the deck
@@ -306,13 +293,15 @@ impl PaneTermination {
         }
     }
 
-    /// The exited generation's card notice.
-    pub fn card_notice(&self) -> &'static str {
-        match self {
-            PaneTermination::PaneCommandExited { .. } => NOTICE_PANE_COMMAND_EXITED,
-            PaneTermination::ConnectionEnded { .. } => NOTICE_CONNECTION_ENDED,
-            _ => NOTICE_AGENT_EXITED,
-        }
+    /// The card notice of a message the generation never took: `not
+    /// delivered: ` and [`Self::words`], so the TUI's card and the desktop's
+    /// tile say how the pane ended, its exit code included, in the words the
+    /// orchestrator's notice and the events drawer use (issue #1933). The
+    /// PRD #1666 part 3 rule holds: the deck sees its own child and the pane's
+    /// terminal, never the agent below them, so no notice says the agent
+    /// exited.
+    pub fn card_notice(&self) -> String {
+        format!("{NOT_DELIVERED}: {}", self.words())
     }
 }
 
@@ -1580,7 +1569,7 @@ mod tests {
             PaneTermination::Closed,
             PaneTermination::Unknown,
         ] {
-            for text in [termination.words(), termination.card_notice().to_string()] {
+            for text in [termination.words(), termination.card_notice()] {
                 assert!(!text.contains("agent exited"), "{text}");
                 assert!(!text.contains("agent's process"), "{text}");
             }
@@ -1840,14 +1829,7 @@ mod tests {
             words["terminations"].as_object().map(|kinds| kinds.len()),
             Some(5)
         );
-        for notice in [
-            NOTICE_MAX_DELIVER,
-            NOTICE_AGENT_EXITED,
-            NOTICE_PANE_COMMAND_EXITED,
-            NOTICE_CONNECTION_ENDED,
-        ] {
-            assert!(notice.starts_with(NOT_DELIVERED), "{notice}");
-        }
+        assert!(NOTICE_MAX_DELIVER.starts_with(NOT_DELIVERED));
     }
 
     #[test]

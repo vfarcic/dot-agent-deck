@@ -1161,7 +1161,6 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 ##### status/blocked/019 — OpenCode's plugin blocks on a marker, not a bare 429 (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
-- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1664"]` (CLAUDE.md rule 6). Under load the daemon's hook listener can apply the marker session's QuotaBlocked before its own SessionStart, so the card stays Idle; #1664 has the evidence, the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** two synthetic OpenCode panes loading the installed plugin under Node; no provider credential.
 - **Asserts:** the marked error yields Blocked and the bare 429 yields Error.
 - **Does not assert:** a real OpenCode API request.
@@ -11834,11 +11833,11 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** desktop CSS layout.
 - **Platform coverage:** all.
 
-##### inbox/status/008 — TUI Error card explains an undeliverable inbox message.
-- **Layer:** L1 (`tests/render_dashboard.rs`), delivery_notice event + TestBackend + insta.
+##### inbox/status/008 — Error cards and tiles say how a worker's pane ended.
+- **Layer:** L1 (`tests/render_dashboard.rs`), in-memory InboxHub card-notice sink → delivery_notice event → TestBackend + insta; desktop component (`desktop/src/components/InboxSurfaces.test.tsx`), subscribed bridge and hydrated snapshot → real AgentTile.
 - **Agent:** none.
-- **Asserts:** Error and the not-delivered notice are visible on the card; wording shares the desktop fixture.
-- **Does not assert:** daemon generation of the notice.
+- **Asserts:** for each case in `tests/fixtures/inbox-termination-cards.json` (the pane's command exited with code 0, 7, or 23 reported by the wrapper; the connection ended; the pane was replaced, closed, or ended some unknown way), the real hub's card notice turns the TUI card to Error and the card shows `not delivered: ` plus that kind's words from `tests/fixtures/inbox-display.json`'s `terminations`, exit code included (issue #1933), whole on a 180-column card and wrapped over a 60-column one. The desktop tile shows Error and that same notice, streamed through the bridge and hydrated from a snapshot.
+- **Does not assert:** real PTY exit capture or wrapper attribution (`inbox/status/032`); that a real daemon delivers the notice to a card (measured on PR #2245: in `inbox/status/032`'s setup the exited worker's agent record is already gone, so no attached client receives it); CSS layout (the desktop wrap is `e2e/agent-tile-long-name.spec.ts`'s). The desktop half alone proves only that the tile prints the daemon's notice; that the daemon sends these words is the TUI half's assertion.
 - **Platform coverage:** all.
 
 ##### inbox/status/009 — TUI prompt line labels deck messages without replacing the last human prompt.

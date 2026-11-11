@@ -5407,14 +5407,16 @@ fn kind_sender_label(kind: &str, from: &Sender, trust: BodyTrust) -> String {
 /// message was replaced, and a shut inbox is the daemon going away; neither is
 /// the agent's to explain.
 fn owe_card_notice(st: &mut HubState, event: &InboxEvent) {
-    use crate::inbox_display::{NOTICE_AGENT_EXITED, NOTICE_MAX_DELIVER};
+    use crate::inbox_display::{NOTICE_MAX_DELIVER, PaneTermination};
     if st.card_notice_sink.is_none() || event.state != StateName::Undeliverable {
         return;
     }
     let detail = match event.undeliverable_reason {
-        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER,
+        Some(UndeliverableReason::MaxDeliver) => NOTICE_MAX_DELIVER.into(),
         Some(UndeliverableReason::AgentExited) => event_termination(st, event)
-            .map_or(NOTICE_AGENT_EXITED, |termination| termination.card_notice()),
+            .unwrap_or(&PaneTermination::Unknown)
+            .card_notice()
+            .into(),
         _ => return,
     };
     let Some(recipient) = event.recipient.as_ref() else {
@@ -5680,7 +5682,7 @@ fn settle_late_ack(st: &mut HubState, event: &InboxEvent) {
         agent_id,
         delivery_id: event.message_id.to_string(),
         session_id: None,
-        detail: crate::inbox_display::NOTICE_DELIVERED_LATE,
+        detail: crate::inbox_display::NOTICE_DELIVERED_LATE.into(),
         cleared: true,
     });
 }
