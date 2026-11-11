@@ -9867,7 +9867,7 @@ mod hook_ingestion_tests {
             agent_id: agent_id.clone(),
             delivery_id: "cap-exhausted-257".to_string(),
             session_id: None,
-            detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task",
+            detail: "a spawn-time prompt was written into this pane but the daemon is already watching its maximum number of unconfirmed deliveries, so this one is NOT being confirmed or retried; check whether the pane acted on its task".into(),
             cleared: false,
         });
         let report = tokio::time::timeout(Duration::from_millis(300), async {
@@ -9948,7 +9948,8 @@ mod hook_ingestion_tests {
                 crate::inbox_display::NOTICE_DELIVERED_LATE
             } else {
                 crate::inbox_display::NOTICE_MAX_DELIVER
-            },
+            }
+            .into(),
             cleared,
         };
         let next_event = |rx: &mut broadcast::Receiver<BroadcastMsg>| {
