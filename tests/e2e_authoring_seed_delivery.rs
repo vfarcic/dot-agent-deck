@@ -215,7 +215,13 @@ fn assert_ready_then_received_once(
         kind.as_str()
     );
     let id = messages[0].id.as_str().to_string();
-    let doorbell = dot_agent_deck::doorbell::doorbell_line(&id);
+    // Issue #1730: the line names the deck the daemon runs from.
+    let doorbell = dot_agent_deck::doorbell::doorbell_line_naming(
+        &id,
+        common::contained_deck_binary()
+            .to_str()
+            .expect("the harness deck path is UTF-8"),
+    );
     let opening_line = expected
         .lines()
         .next()

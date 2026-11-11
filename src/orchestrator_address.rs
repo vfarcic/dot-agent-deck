@@ -792,6 +792,9 @@ pub fn attribution(
         _ => ("-".to_string(), "-".to_string()),
     };
     let quote = crate::platform::paths::shell_quote_if_needed;
+    // Issue #1730: the deck the daemon runs from, as every other command the
+    // deck hands an agent names it, not a bare name the agent's PATH resolves.
+    let bin = crate::platform::paths::binary_name();
     let reply = match reply {
         Some(MessageAddress {
             folder: Some(reply_folder),
@@ -811,12 +814,12 @@ pub fn attribution(
                 })
                 .unwrap_or_default();
             format!(
-                "dot-agent-deck inbox send --folder {}{named} --text '<your reply>'",
+                "{bin} inbox send --folder {}{named} --text '<your reply>'",
                 quote(reply_folder)
             )
         }
         _ if folder == "-" => {
-            "dot-agent-deck roles (the sender's folder is unknown; find it there)".to_string()
+            format!("{bin} roles (the sender's folder is unknown; find it there)")
         }
         _ => {
             let pane = preface_pane(caller_pane)
@@ -827,7 +830,7 @@ pub fn attribution(
             } else {
                 "this folder cannot be shown exactly"
             };
-            format!("run dot-agent-deck roles and find {pane} ({why})")
+            format!("run {bin} roles and find {pane} ({why})")
         }
     };
     format!(
@@ -1351,8 +1354,11 @@ mod tests {
         assert!(!preface.contains("reply with"), "{preface}");
         assert_eq!(
             content.body,
-            "sender folder: /w/c\nsender orchestration: cfg\nsender role: worker\n\
-             reply with: dot-agent-deck inbox send --folder /w/c --text '<your reply>'\n\nhello"
+            format!(
+                "sender folder: /w/c\nsender orchestration: cfg\nsender role: worker\n\
+                 reply with: {} inbox send --folder /w/c --text '<your reply>'\n\nhello",
+                crate::platform::paths::binary_name()
+            )
         );
         // A folder that needs quoting is quoted in the reply command.
         let spaced = record("s", "/w/with space", None);
@@ -1511,8 +1517,11 @@ mod tests {
             let reply = reply_line(&body);
             assert_eq!(
                 reply,
-                "reply with: run dot-agent-deck roles and find pane c \
-                 (this folder cannot be shown exactly)",
+                format!(
+                    "reply with: run {} roles and find pane c \
+                     (this folder cannot be shown exactly)",
+                    crate::platform::paths::binary_name()
+                ),
                 "{raw:?}"
             );
             assert!(!body.contains("inbox send"), "{body:?}");
@@ -1552,7 +1561,8 @@ mod tests {
             assert_eq!(
                 reply_line(&body),
                 format!(
-                    "reply with: dot-agent-deck inbox send --folder {quoted} --text '<your reply>'"
+                    "reply with: {} inbox send --folder {quoted} --text '<your reply>'",
+                    crate::platform::paths::binary_name()
                 ),
                 "{raw:?}"
             );
@@ -1580,8 +1590,9 @@ mod tests {
             assert_eq!(
                 reply_line(&body),
                 format!(
-                    "reply with: dot-agent-deck inbox send --folder {caller_dir} --name=name-solo \
-                     --text '<your reply>'"
+                    "reply with: {} inbox send --folder {caller_dir} --name=name-solo \
+                     --text '<your reply>'",
+                    crate::platform::paths::binary_name()
                 ),
                 "{caller_dir}: {body}"
             );
@@ -1604,8 +1615,11 @@ mod tests {
         let body = content_among(&records, &records[0], "b-o", "hi").body;
         assert_eq!(
             reply_line(&body),
-            "reply with: dot-agent-deck inbox send --folder /w/shared --orchestration alpha \
-             --text '<your reply>'",
+            format!(
+                "reply with: {} inbox send --folder /w/shared --orchestration alpha \
+                 --text '<your reply>'",
+                crate::platform::paths::binary_name()
+            ),
             "{body}"
         );
         assert_eq!(
@@ -1638,7 +1652,10 @@ mod tests {
         let reply = reply_line(&body);
         assert_eq!(
             reply,
-            "reply with: dot-agent-deck inbox send --folder /w/team --text '<your reply>'"
+            format!(
+                "reply with: {} inbox send --folder /w/team --text '<your reply>'",
+                crate::platform::paths::binary_name()
+            )
         );
         assert_eq!(
             target_of(&records, by(Some("/w/team"), None)).unwrap(),
@@ -1802,7 +1819,8 @@ mod tests {
         assert!(!text[..frame].contains(&caller_dir), "{text}");
         assert!(
             text[frame..].contains(&format!(
-                "reply with: dot-agent-deck inbox send --folder {caller_dir}"
+                "reply with: {} inbox send --folder {caller_dir}",
+                crate::platform::paths::binary_name()
             )),
             "{text}"
         );
