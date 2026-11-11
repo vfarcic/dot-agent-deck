@@ -5993,8 +5993,8 @@ without depending on the config struct API.
 ##### session/restore/008 — A daemon-empty launch with an orchestration snapshot rebuilds the orchestration tab and replays the orchestrator prompt (PRD #89 Phase 2b M2b.3).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens; since PRD #1666 the replay is read from the role's inbox, not the recorder).
-- **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`.
-- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
+- **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`. The staged snapshot is an old (`version = 1`) one listing `started_role_indices = [0, 1]`, and every declared role, the unlisted `reviewer` included, still gets a daemon agent, because a version-1 list was always `[start_role_index]` and is no record of what ran (issue #929); a clean detach then re-saves the block as `version = 2` with `started_role_indices = [0, 1, 2]`.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); a current (`version = 2`) snapshot that leaves a role out (`session/restore/025`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
@@ -6015,7 +6015,7 @@ without depending on the config struct API.
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (both roles run a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-<role>.log` — no LLM tokens).
 - **Asserts:** with a `tdd-cycle` config whose default start role is `orchestrator` (index 0, `start = true`) and a recorder on BOTH roles, a hand-staged snapshot saving `start_role_index = 1` (`coder`) makes the replayed `orchestrator_prompt` land in the inbox of the role at the SAVED index (`coder`, index 1) — and NOT in the config-default start role's (`orchestrator`, index 0), checked after the positive one lands. Pins that restore reads `snap.start_role_index` rather than recomputing the start cursor from the live config's `start` flag. Since issue #523's review, also that the saved cursor is the tab's ONE seat: `daemon status --json` marks `coder (orchestrator)` and no other role, so the pane the prompt went to is the pane the daemon lets `delegate` (before, it kept registering the config's `start = true` role).
-- **Does not assert:** the drift/bounds handling when the saved index is out of range (`session/restore/010`); `started_role_indices` replay (captured but has no reader); the exact role-card styling / focus border.
+- **Does not assert:** the drift/bounds handling when the saved index is out of range (`session/restore/010`); which roles `started_role_indices` starts (`session/restore/008`, `session/restore/025`); the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/012 — A snapshot whose `project_path` diverges from the saved pane `dir` does not auto-run the config planted at `project_path` (PRD #89 review-fix F1).
@@ -6105,6 +6105,13 @@ without depending on the config struct API.
 - **Agent:** none (`sleep 600`; no LLM).
 - **Asserts:** the first daemon, with no switch, refuses the start with an error starting `START_ERR_ORCHESTRATION_ID_REQUIRED` and naming `v0.35.0`, and runs no agent; against the second, the hydrated agent is a dashboard card (`No agent · old-orchestrator`, `1 agent(s)`), the orchestration name is absent from the screen (no tab was rebuilt), and the post-detach terminal stream carries the hydration `session_warnings` line naming the orchestration. Verified load-bearing: without the warning push the test fails.
 - **Does not assert:** a real pre-v0.35.0 TUI's display of the refusal (that binary is not built here); a live `OrchestrationSurface` with no token, which builds no tab and is only logged; routing for such a pane, which registers no role.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/025 — A current (`version = 2`) snapshot restores only the roles that were running when it was saved; the others come back as empty role cards (issue #929).
+- **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (all three roles run `session/restore/008`'s recorder shell script, which logs its own start to `started-<role>.log`, self-posts `SessionStart` and records its stdin; no LLM).
+- **Asserts:** with a hand-staged `version = 2` snapshot of a three-role orchestration listing `started_role_indices = [0, 1]`, the rebuilt tab shows the `coder` and `reviewer` cards, the daemon runs agents for the orchestrator and `coder`, there is no daemon agent for `reviewer` and its command never ran (`started-reviewer.log` absent, read after the `coder`'s start, which the same pass spawns); a clean detach then re-saves `version = 2` with the same `[0, 1]`, so the empty slot stays empty across another restart. Seen red before the fix at the `reviewer` agent assertion, with the rebuilt-tab precondition passing.
+- **Does not assert:** that `dot-agent-deck pane spawn reviewer` starts the empty role afterwards (`pane/spawn/*` covers spawning into a dead slot); the old-snapshot path (`session/restore/008`); the periodic flush's capture, which runs the same `record_started_roles` as the detach save but is not separately driven here; the empty card's styling.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -6282,6 +6289,13 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 - **Does not assert:** the restore branch that consumes the metadata (`session/restore/008`–`009`); the serde round-trip of the schema in isolation (`config/saved-session/001`); the coalescing window (`session/save/003`).
 - **Platform coverage:** mac+linux.
 
+##### session/save/005 — Saving the workspace records which orchestration roles are running, by whether each role's slot holds a live pane (issue #929).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, `TabManager::record_started_roles` against a mock pane controller).
+- **Agent:** none.
+- **Asserts:** for a two-role tab whose saved block carries the old `version = 1` / `[0]`, recording stamps `ORCHESTRATION_SNAPSHOT_VERSION` and lists `[0, 1]` when both panes are live, `[0]` when the `coder` pane is missing from the daemon-managed set, `[0]` after the `coder` pane closed (its slot emptied), and `[0]` when the `coder` slot is a dead-slot placeholder even if that id were in the live set.
+- **Does not assert:** that both save paths call it (the detach save is driven by `session/restore/008` and `session/restore/025`); what restore does with the list (`config/saved-session/003`, `session/restore/025`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Saved-session schema (orchestration metadata, PRD #89 Phase 2b)
 
 This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option<OrchestrationSnapshot>` (role order, `start_role_index`, `orchestrator_prompt`, resolved config name + project path, `version`, and which roles were started) so the daemon-empty restore path can rebuild an orchestration tab. The field is `Option` + `#[serde(default)]` so old `session.toml` files still parse.
@@ -6292,7 +6306,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession` / `SavedPane` / `OrchestrationSnapshot`; no TUI harness, no I/O).
 - **Agent:** none.
 - **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`) serializes to TOML and deserializes back with every field intact; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the field existed.
-- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot); any TUI rendering.
+- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot, `session/save/005`); any TUI rendering.
 - **Platform coverage:** mac+linux+windows.
 
 ##### config/saved-session/002 — A `[focus]` table round-trips through TOML, a `session.toml` predating it loads as "nothing remembered", and a PARTIAL table does not take the saved panes down with it (issue #949).
@@ -6300,6 +6314,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** (a) a populated `SavedFocus` (`version`, `dashboard_active`, `active_pane`, `tab_panes`) serializes to TOML and deserializes back equal; (b) a legacy `session.toml` with no `[focus]` table parses with `focus == None`, which the restore path reads as "nothing remembered" and which therefore leaves the deck's own landing choice untouched; (c) a `[focus]` table carrying only ONE key still parses, the saved panes beside it survive, and the absent keys take their `#[serde(default)]` values. (d) the OTHER compatibility direction — an OLDER build reading what this one writes — checked by deserializing the new writer's output into a local struct carrying only the pre-issue-#949 fields, which must still recover the panes and `last_command`. (c) and (d) are the cases that matter most: `SavedSession::load` turns any TOML error into "no session at all", so an unrecognised `[focus]` table must never cost either build every pane. (d) is a claim about `deny_unknown_fields` being absent, which is the kind of thing worth checking rather than asserting.
 - **Does not assert:** the capture that populates the field or the restore that consumes it (`session/restore/017`–`018`); the user-visible detach/reattach cycle (`session/restore/016`); the file's on-disk permissions or atomic-rename write (`session/save/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/003 — Restore believes `started_role_indices` only from a current (`version` 2 or later) snapshot, and always starts the start role (issue #929).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::OrchestrationSnapshot::roles_to_start_on_restore`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** a `version = 1` snapshot starts every role whether its list is `[0]`, `[0, 1]` or empty, and so does one whose `version` defaulted to 0; `ORCHESTRATION_SNAPSHOT_VERSION` is 2; a version-2 snapshot starts the listed roles (`[0, 1]` → coder started, reviewer not), adds the start role when the list leaves it out (start 1, list `[2]`), starts only the start role for an empty list, ignores an index past the role count, and a version-3 snapshot is read the same way.
+- **Does not assert:** that the restore path calls it (`session/restore/025`); the capture that writes the list (`session/save/005`).
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)
