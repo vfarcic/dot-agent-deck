@@ -1,22 +1,18 @@
 //! The harness's own unit tests — the pure-function half of
-//! `tests/common/mod.rs`: temp-root containment and name parsing, credential
+//! `tests/common/lib.rs`: temp-root containment and name parsing, credential
 //! collection and env-var trimming, the redaction range arithmetic and the
 //! wrapped-credential matcher.
 //!
-//! **Exactly one binary compiles this file** — `tests/harness_unit.rs`, the
-//! only place it is named. That is the point of it being a file rather than
-//! the `#[cfg(test)] mod harness_unit_tests` it used to be inside
-//! `tests/common/mod.rs`, and issue #806 is why. `cfg(test)` is true in
-//! **every** integration-test target, not only in the one being tested, so a
-//! `#[cfg(test)]` module inside the harness compiled into every binary that
-//! wrote `mod common;` — and nextest then ran all of it, once per binary.
-//! Measured on `45528bc`, the commit before the move: **108** distinct tests
-//! became **7020** executions under lane 1 (`cargo test-e2e`, 65 binaries) —
-//! 75.4% of everything that lane selects — 1836 in the fast tier (17
-//! binaries) and 9612 under `cargo test-e2e-live` (89 binaries). The cost was
-//! multiplicative, not additive: one test added here cost 65 executions in
-//! every lane-1 run, forever, which is the wrong incentive on a module this
-//! repo deliberately keeps well-tested.
+//! **They run in exactly one binary: the harness crate's own unit-test
+//! target** (issue #2083), declared as `#[cfg(test)] mod harness_unit_tests`
+//! in `lib.rs`. `cargo test-fast` reaches it through `--workspace`. Issue #806
+//! is why that matters: while the harness was a `mod common;` in every test
+//! binary, `cfg(test)` was true in all of them, so a `#[cfg(test)]` module in
+//! the harness compiled into every binary that wrote `mod common;` and nextest
+//! ran all of it once per binary. Measured on `45528bc`: **108** distinct
+//! tests became **7020** executions under lane 1 (65 binaries). #806 moved
+//! them into a single dedicated binary (`tests/harness_unit.rs`); since the
+//! harness became a crate, its own unit-test target is that single binary.
 //!
 //! Nothing here needs a binary of its own to run in. These are assertions
 //! about pure functions and about directories under a `tempfile` root, and
@@ -46,22 +42,17 @@
 //! here uses; under plain `cargo test`, sibling tests share the process and
 //! these writes race them (issue #245).
 //!
-//! **Why so much of `mod.rs` is `pub(crate)`.** This module is a *sibling* of
-//! `common`, not a child of it, so `use super::*` no longer reaches the
-//! harness's private helpers. The helpers these tests cover therefore carry
-//! `pub(crate)` — 66 declarations of 64 distinct items (two are declared
-//! twice, under `#[cfg]` pairs) plus four struct fields, widened for this
-//! file and for nothing else. Rust offers no narrower spelling: a private
-//! item cannot be re-exported (E0364/E0365), and no `#[cfg]` available here
-//! distinguishes one test binary from another — `cfg(test)` is true in all of
-//! them, and feature, `RUSTFLAGS` and `build.rs` cfgs are per-package rather
-//! than per-target. The module tree is the only thing that can single one
-//! out.
+//! **Why so much of `lib.rs` is `pub(crate)`.** Under #806 this module was a
+//! sibling of `common` in another binary, so the helpers these tests cover
+//! were widened to `pub(crate)` to be reachable. It is now a child of the
+//! crate root, which reaches the root's private items anyway; the widening is
+//! left in place because narrowing it again is churn with no effect outside
+//! this crate.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::common::*;
+use crate::*;
 
 /// Scenario: A failed run leaves a cast, grid, fixture, logs and provenance.
 /// Starting and completing a passing rerun clears the current files but keeps
@@ -2093,7 +2084,7 @@ fn the_harness_root_is_never_inside_the_repository() {
         eprintln!("skipping: {TEMP_BASE_ENV} is set, so placement is explicit");
         return;
     }
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let repo = checkout_root();
     let root = harness_temp_root();
     assert!(
         !root.starts_with(repo),
@@ -2853,9 +2844,9 @@ fn opencode_version_parser_reads_both_majors_and_refuses_noise() {
 }
 
 /// Scenario: Resolve the OpenCode test-binary knob against a scratch home and
-/// PATH. `v1` names the pinned 1.x under the home only once that file exists,
-/// a path names itself, and a bare name is found on PATH; nothing else
-/// resolves.
+/// PATH. `v1` and `v2` name the pinned 1.x and 2.x under the home only once
+/// each file exists, a path names itself, and a bare name is found on PATH;
+/// nothing else resolves.
 #[test]
 fn opencode_test_bin_resolves_v1_to_the_pinned_install() {
     let home = race_safe_tempdir();
@@ -2885,6 +2876,19 @@ fn opencode_test_bin_resolves_v1_to_the_pinned_install() {
     assert_eq!(
         resolve_opencode_test_bin("opencode", home.path(), &path),
         Some(bin_dir.path().join("opencode"))
+    );
+    // Issue #2051: `v2` names the pinned 2.x the same way.
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V2, home.path(), &path),
+        None,
+        "v2 resolves only once the pinned 2.x is installed"
+    );
+    let pinned_v2 = home.path().join(OPENCODE_PINNED_V2);
+    std::fs::create_dir_all(pinned_v2.parent().unwrap()).expect("pinned 2.x dir");
+    std::fs::write(&pinned_v2, "").expect("pinned 2.x binary");
+    assert_eq!(
+        resolve_opencode_test_bin(OPENCODE_TEST_BIN_V2, home.path(), &path),
+        Some(pinned_v2)
     );
 }
 
@@ -3196,10 +3200,10 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
     let redactions = imported.expect("the fabricated documents import cleanly");
 
     // The bytes the importer actually WROTE, which is what an agent reads and
-    // what a `cat` in a pane paints. Read back rather than assumed: the
-    // credential set is copied verbatim while the settings are re-serialised
-    // from the parsed document, so only one of the two is byte-identical to
-    // its source.
+    // what a `cat` in a pane paints. Read back rather than assumed: both are
+    // re-serialised from the parsed document — the credential set as its
+    // access-only copy (issue #1731) — so neither is byte-identical to its
+    // source.
     let written_credentials =
         std::fs::read_to_string(test_home.path().join(".claude").join(".credentials.json"))
             .expect("the importer wrote the credential document into the isolated HOME");
@@ -3216,11 +3220,6 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
         (
             "accessToken",
             FABRICATED_CLAUDE_ACCESS_TOKEN,
-            &written_credentials,
-        ),
-        (
-            "refreshToken",
-            FABRICATED_CLAUDE_REFRESH_TOKEN,
             &written_credentials,
         ),
         (
@@ -3245,6 +3244,19 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
              copied into the isolated HOME unredactable: {redactions:?}"
         );
     }
+    // Issue #1731: the refresh token is NOT copied (the isolated HOME gets an
+    // access-only login), and is still returned, because it was in the host
+    // document the copy was made from.
+    assert!(
+        !written_credentials.contains(FABRICATED_CLAUDE_REFRESH_TOKEN),
+        "the refresh token was copied into the isolated HOME:\n{written_credentials}"
+    );
+    assert!(
+        redactions
+            .iter()
+            .any(|r| r == FABRICATED_CLAUDE_REFRESH_TOKEN),
+        "the host refresh token is no longer returned for redaction: {redactions:?}"
+    );
 
     // Non-vacuity of the SELF-REGISTRATION: `redact_credentials_for_output`
     // reads the process-global store and nothing else, so this is green only
@@ -3309,10 +3321,11 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
 
     // Non-vacuity of the SHAPE: the tokens really are split across rows, so
     // a byte-exact matcher would not have caught them and this exercises the
-    // wrapped path rather than the contiguous one.
+    // wrapped path rather than the contiguous one. (The refresh token is not
+    // in the written document at all since issue #1731, so it has no shape to
+    // check here; it is still asserted on below.)
     for (what, value) in [
         ("accessToken", FABRICATED_CLAUDE_ACCESS_TOKEN),
-        ("refreshToken", FABRICATED_CLAUDE_REFRESH_TOKEN),
         (
             "settings.json's ANTHROPIC_AUTH_TOKEN",
             FABRICATED_CLAUDE_SETTINGS_TOKEN,
@@ -3389,7 +3402,7 @@ fn a_rendered_imported_claude_credential_document_survives_into_no_sink() {
     // itself, which the global-store assertion above proves.
     let panic_text = format_redacted_panic(
         "deck",
-        "tests/common/mod.rs:1:1",
+        "tests/common/lib.rs:1:1",
         &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
     );
     for (what, value) in [
@@ -3909,7 +3922,7 @@ fn a_credential_wrapped_across_grid_rows_is_redacted_from_every_sink() {
     register_diagnostic_redactions(redactions.clone());
     let panic_text = format_redacted_panic(
         "deck",
-        "tests/common/mod.rs:1:1",
+        "tests/common/lib.rs:1:1",
         &format!("did not see \"ready\" within 30s.\nFinal grid:\n{grid}"),
     );
     assert_no_fragment_survives(&panic_text, key, "the panic seam");
@@ -4670,7 +4683,7 @@ fn a_panic_message_is_redacted_without_losing_its_diagnostic_shape() {
 
     let rendered = format_redacted_panic(
         "deck",
-        "tests/common/mod.rs:1:1",
+        "tests/common/lib.rs:1:1",
         &format!(
             "did not see \"ready\" within 30s.\nFinal grid:\n  \
              ANTHROPIC_API_KEY: sk-ant-...{suffix}\n  Do you want to use this API key?\n"
@@ -4681,7 +4694,7 @@ fn a_panic_message_is_redacted_without_losing_its_diagnostic_shape() {
         "a registered credential survived the panic seam: {rendered}"
     );
     assert!(rendered.contains("[REDACTED-CREDENTIAL]"), "{rendered}");
-    assert!(rendered.contains("thread 'deck' panicked at tests/common/mod.rs:1:1"));
+    assert!(rendered.contains("thread 'deck' panicked at tests/common/lib.rs:1:1"));
     assert!(rendered.contains("did not see \"ready\" within 30s."));
     assert!(rendered.contains("Do you want to use this API key?"));
 }
@@ -5023,7 +5036,7 @@ fn no_test_prints_terminal_content_outside_the_redacting_panic_seam() {
         &src[open..]
     }
 
-    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let tests_dir = checkout_root().join("tests");
     let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .expect("read tests/")
         .filter_map(|entry| {
@@ -5031,7 +5044,7 @@ fn no_test_prints_terminal_content_outside_the_redacting_panic_seam() {
             (path.extension()? == "rs").then_some(path)
         })
         .collect();
-    sources.push(tests_dir.join("common").join("mod.rs"));
+    sources.push(tests_dir.join("common").join("lib.rs"));
     sources.sort();
     assert!(
         sources.len() > 50,
@@ -5141,7 +5154,7 @@ fn no_test_installs_a_competing_panic_hook() {
         line.trim_start().starts_with("use ")
             && (line.contains(concat!("set_", "hook")) || line.contains(concat!("take_", "hook")))
     };
-    let tests_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
+    let tests_dir = checkout_root().join("tests");
     let mut sources: Vec<PathBuf> = std::fs::read_dir(&tests_dir)
         .expect("read tests/")
         .filter_map(|entry| {
@@ -5149,7 +5162,7 @@ fn no_test_installs_a_competing_panic_hook() {
             (path.extension()? == "rs").then_some(path)
         })
         .collect();
-    sources.push(tests_dir.join("common").join("mod.rs"));
+    sources.push(tests_dir.join("common").join("lib.rs"));
     sources.sort();
     assert!(sources.len() > 50, "the scan is not reaching the suite");
 
@@ -5162,7 +5175,7 @@ fn no_test_installs_a_competing_panic_hook() {
                 continue;
             }
             // The seam's own installation is the one legitimate site.
-            if path.ends_with("common/mod.rs") && line.contains("Box::new(|info|") {
+            if path.ends_with("common/lib.rs") && line.contains("Box::new(|info|") {
                 seam_installations += 1;
                 continue;
             }
@@ -5780,7 +5793,7 @@ fn an_io_stall_widens_the_ceiling_the_load_average_left_alone() {
 mod load_context_tests {
     use std::time::Duration;
 
-    use crate::common::load_context::*;
+    use crate::load_context::*;
 
     const PSI_CPU: &str = "some avg10=7.21 avg60=19.87 avg300=16.87 total=31056709947\n\
                            full avg10=0.00 avg60=0.00 avg300=0.00 total=0\n";
@@ -6048,7 +6061,7 @@ mod load_context_tests {
         if std::env::var_os(LOAD_CHILD_ENV).is_none() {
             return;
         }
-        let _dir = crate::common::harness_tempdir().expect("harness tempdir");
+        let _dir = crate::harness_tempdir().expect("harness tempdir");
         panic!("{LOAD_CHILD_MARKER}");
     }
 
@@ -6497,6 +6510,237 @@ fn a_scratch_pi_login_carries_no_refresh_token_and_a_run_margin() {
     );
 }
 
+// -----------------------------------------------------------------------
+// Issue #1731 — no scratch HOME gets an OAuth refresh token
+// -----------------------------------------------------------------------
+
+/// A FABRICATED JWT whose payload carries `exp` = 2100-01-01, the shape of a
+/// Codex ChatGPT access token. Header and payload are real base64url JSON so
+/// the harness can read the expiry; the signature is filler.
+const FABRICATED_CODEX_ACCESS_TOKEN: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjQxMDI0NDQ4MDAsImlhdCI6MTcwMDAwMDAwMCwic3ViIjoiRkFLRS1zdWIifQ.FAKE-signature-Qw8Zt3Lp6Rv1Xn4Ks7Bd2Hf5Jm9Uc0Ye";
+
+/// A FABRICATED JWT whose `exp` is 1_700_003_600 (one hour after
+/// [`SCRATCH_NOW_SECS`]), for the run-margin refusals.
+const FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR: &str = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJleHAiOjE3MDAwMDM2MDAsInN1YiI6IkZBS0Utc3ViIn0.FAKE-signature-Gh5Nw2Pq8Tz4Vb7Lc1Xm3Rk6Ds9Fj0Ya";
+
+/// The refresh token of the fabricated Codex and OpenCode logins below.
+const FABRICATED_OPENAI_REFRESH_TOKEN: &str =
+    "rt_FAKE-Tn8Vq2Lx5Bw9Kd3Rm7Hc1Zp4Gs6Jf0Ye-Nu3Wa8Qi5Ob2Xt7Lk9Ev4Mc1";
+
+/// A fabricated `claudeAiOauth` refresh token for an MCP server's OAuth entry,
+/// which Claude Code stores in the same credentials document.
+const FABRICATED_CLAUDE_MCP_REFRESH_TOKEN: &str =
+    "mcp-refresh-FAKE-Ys4Kd8Wn2Pq6Tb9Lx3Rv7Hm1Jc5Zg0Fa-Qe2Ui8Ot4Na6";
+
+/// Every string value anywhere in `value`, for "is this secret present in the
+/// written document" assertions that must not care where it was put.
+fn all_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(s) => out.push(s.clone()),
+        serde_json::Value::Array(items) => items.iter().for_each(|v| all_strings(v, out)),
+        serde_json::Value::Object(map) => map.values().for_each(|v| all_strings(v, out)),
+        _ => {}
+    }
+}
+
+/// Run `import` with `HOME` pointed at `host_home` and both API keys cleared,
+/// restoring all three before returning, so a failed assertion afterwards does
+/// not leave the process reading the fixture, and a later test in the same
+/// process still sees the keys it started with.
+fn import_from_fabricated_host<T>(host_home: &Path, import: impl FnOnce() -> T) -> T {
+    let names = ["HOME", ANTHROPIC_API_KEY_ENV, "OPENAI_API_KEY"];
+    let saved: Vec<_> = names.iter().map(std::env::var_os).collect();
+    // SAFETY: see "Environment writes" in this file's header.
+    unsafe {
+        std::env::remove_var(ANTHROPIC_API_KEY_ENV);
+        std::env::remove_var("OPENAI_API_KEY");
+        std::env::set_var("HOME", host_home);
+    }
+    let result = import();
+    for (name, value) in names.iter().zip(&saved) {
+        // SAFETY: as above.
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+    result
+}
+
+/// Scenario: Point `HOME` at a fabricated host whose `~/.claude/.credentials.json`
+/// holds a Claude login and an MCP server login, each with a refresh token, and
+/// run the real `import_claude_credentials` into a fresh test HOME. The written
+/// document keeps the Claude access token and carries no refresh token at all,
+/// while both refresh tokens are still returned and registered for redaction.
+#[test]
+fn a_scratch_claude_home_carries_no_refresh_token() {
+    let host = harness_tempdir().expect("fabricated host home");
+    std::fs::create_dir_all(host.path().join(".claude")).unwrap();
+    let document = serde_json::json!({
+        "claudeAiOauth": {
+            "accessToken": FABRICATED_CLAUDE_ACCESS_TOKEN,
+            "refreshToken": FABRICATED_CLAUDE_REFRESH_TOKEN,
+            "expiresAt": 4_102_444_800_000_i64,
+            "refreshTokenExpiresAt": 4_102_444_800_000_i64,
+            "scopes": ["user:inference"],
+            "subscriptionType": "max",
+        },
+        "mcpOAuth": {
+            "fake-server|0000": {
+                "accessToken": "mcp-access-FAKE-Lm3Np7Qr1St5Uv9Wx2Yz6Ab0Cd4",
+                "refreshToken": FABRICATED_CLAUDE_MCP_REFRESH_TOKEN,
+                "expiresAt": 4_102_444_800_000_i64,
+            }
+        }
+    });
+    std::fs::write(
+        host.path().join(".claude").join(".credentials.json"),
+        document.to_string(),
+    )
+    .unwrap();
+    let test_home = harness_tempdir().expect("isolated test HOME");
+    let redactions =
+        import_from_fabricated_host(host.path(), || import_claude_credentials(test_home.path()))
+            .expect("a login with hours left imports");
+
+    let written: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(test_home.path().join(".claude").join(".credentials.json")).unwrap(),
+    )
+    .unwrap();
+    let mut strings = Vec::new();
+    all_strings(&written, &mut strings);
+    for (what, secret) in [
+        ("the Claude refresh token", FABRICATED_CLAUDE_REFRESH_TOKEN),
+        (
+            "an MCP server's refresh token",
+            FABRICATED_CLAUDE_MCP_REFRESH_TOKEN,
+        ),
+    ] {
+        assert!(
+            !strings.iter().any(|s| s == secret),
+            "{what} was copied into the scratch HOME, where a refresh would rotate the \
+             host login out from under the developer"
+        );
+        assert!(
+            redactions.iter().any(|r| r == secret),
+            "{what} is no longer registered for redaction: {redactions:?}"
+        );
+    }
+    assert_eq!(
+        written["claudeAiOauth"]["accessToken"], FABRICATED_CLAUDE_ACCESS_TOKEN,
+        "the scratch login keeps the access token the agent authenticates from"
+    );
+}
+
+/// Scenario: Point `HOME` at a fabricated host whose `~/.codex/auth.json` is a
+/// ChatGPT login with a refresh token and run the real
+/// `import_codex_credentials`. The written `auth.json` keeps the access token
+/// and holds an EMPTY `refresh_token` (Codex refuses a login without the
+/// field), and the host's refresh token is still returned for redaction.
+#[test]
+fn a_scratch_codex_home_carries_no_refresh_token() {
+    let host = harness_tempdir().expect("fabricated host home");
+    std::fs::create_dir_all(host.path().join(".codex")).unwrap();
+    let auth = serde_json::json!({
+        "auth_mode": "chatgpt",
+        "OPENAI_API_KEY": null,
+        "tokens": {
+            "id_token": FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR,
+            "access_token": FABRICATED_CODEX_ACCESS_TOKEN,
+            "refresh_token": FABRICATED_OPENAI_REFRESH_TOKEN,
+            "account_id": "FAKE-account",
+        },
+        "last_refresh": "2026-11-10T07:00:00.000000000Z",
+    });
+    std::fs::write(
+        host.path().join(".codex").join("auth.json"),
+        auth.to_string(),
+    )
+    .unwrap();
+    let fixture = harness_tempdir().expect("fixture dir");
+    let test_home = fixture.path().join("home");
+    std::fs::create_dir_all(&test_home).unwrap();
+    let redactions =
+        import_from_fabricated_host(host.path(), || import_codex_credentials(&test_home))
+            .expect("a login with days left imports");
+
+    let written: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(test_home.join(".codex").join("auth.json")).unwrap())
+            .unwrap();
+    let mut strings = Vec::new();
+    all_strings(&written, &mut strings);
+    assert!(
+        !strings.iter().any(|s| s == FABRICATED_OPENAI_REFRESH_TOKEN),
+        "the Codex refresh token was copied into the scratch HOME"
+    );
+    assert_eq!(
+        written["tokens"]["refresh_token"], "",
+        "Codex 0.164 refuses an auth.json without `refresh_token` (\"missing field\"), so \
+         the scratch copy blanks it rather than removing it"
+    );
+    assert_eq!(
+        written["tokens"]["access_token"],
+        FABRICATED_CODEX_ACCESS_TOKEN
+    );
+    assert!(
+        redactions
+            .iter()
+            .any(|r| r == FABRICATED_OPENAI_REFRESH_TOKEN),
+        "the host refresh token is no longer registered for redaction: {redactions:?}"
+    );
+}
+
+/// Scenario: Import a fabricated OpenCode `auth.json` holding an OAuth login
+/// with hours left. The written entry keeps the access token, carries no
+/// refresh token, and the refresh token is still returned for redaction.
+#[test]
+fn a_scratch_opencode_home_carries_no_refresh_token() {
+    let source = race_safe_tempdir();
+    let target = race_safe_tempdir();
+    let source_auth = source.path().join(".local/share/opencode/auth.json");
+    std::fs::create_dir_all(source_auth.parent().unwrap()).unwrap();
+    let in_hours = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 5 * 3_600_000;
+    std::fs::write(
+        &source_auth,
+        serde_json::json!({
+            "openai": {
+                "type": "oauth",
+                "refresh": FABRICATED_OPENAI_REFRESH_TOKEN,
+                "access": FABRICATED_CODEX_ACCESS_TOKEN,
+                "expires": in_hours,
+                "accountId": "FAKE-account",
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+    let redactions = import_opencode_credentials_from(source.path(), target.path())
+        .expect("a login with hours left imports");
+    let written: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(target.path().join(".local/share/opencode/auth.json")).unwrap(),
+    )
+    .unwrap();
+    let mut strings = Vec::new();
+    all_strings(&written, &mut strings);
+    assert!(
+        !strings.iter().any(|s| s == FABRICATED_OPENAI_REFRESH_TOKEN),
+        "the OpenCode refresh token was copied into the scratch HOME"
+    );
+    assert_eq!(written["openai"]["access"], FABRICATED_CODEX_ACCESS_TOKEN);
+    assert!(
+        redactions
+            .iter()
+            .any(|r| r == FABRICATED_OPENAI_REFRESH_TOKEN),
+        "the host refresh token is no longer registered for redaction: {redactions:?}"
+    );
+}
+
 /// Scenario: Look for a missing sentinel's name around where it was expected.
 /// With nothing of that name nearby the note is empty; with a file of that name
 /// one level up — where a real agent once wrote it after inferring its working
@@ -6617,4 +6861,241 @@ fn contain_path_drops_a_deck_telemetry_shim_directory_and_nothing_like_it() {
         expected,
         "only the shim directory and the relative entries are dropped: {rewritten}"
     );
+}
+
+/// Seconds since the epoch of the fixed clock the scratch-login tests use:
+/// one hour before [`FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR`] expires.
+const SCRATCH_NOW_SECS: u64 = 1_700_000_000;
+
+fn scratch_now(offset_secs: i64) -> std::time::SystemTime {
+    std::time::UNIX_EPOCH
+        + Duration::from_secs(SCRATCH_NOW_SECS.checked_add_signed(offset_secs).unwrap())
+}
+
+/// Scenario: Read the `exp` claim of fabricated JWTs, padded and unpadded, and
+/// of strings that are not a three-part token with a JSON payload. Only the
+/// well-formed tokens yield an expiry.
+#[test]
+fn a_jwt_expiry_is_read_from_its_payload_and_nothing_else() {
+    assert_eq!(
+        jwt_expiry_secs(FABRICATED_CODEX_ACCESS_TOKEN),
+        Some(4_102_444_800)
+    );
+    // `{"exp":4102444800,"sub":"FAKE-pad"}`, base64url WITH its `=` padding.
+    assert_eq!(
+        jwt_expiry_secs("eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDAsInN1YiI6IkZBS0UtcGFkIn0=.sig"),
+        Some(4_102_444_800),
+        "a padded payload"
+    );
+    assert_eq!(
+        jwt_expiry_secs(FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR),
+        Some(SCRATCH_NOW_SECS + 3600)
+    );
+    for bad in [
+        "",
+        "not-a-jwt",
+        "a.b",
+        "a.b.c.d",
+        "eyJhbGciOiJub25lIn0.!!!.sig",
+        // `{"sub":"x"}` — valid JSON with no `exp`.
+        "eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.sig",
+    ] {
+        assert_eq!(jwt_expiry_secs(bad), None, "{bad:?}");
+    }
+}
+
+/// Scenario: Turn fabricated Claude credential documents into the copy a test
+/// HOME gets. A login with hours left keeps its access token and loses every
+/// refresh key and the whole `mcpOAuth` block; one with ten minutes left, or
+/// already expired, is refused with the `claude login` remedy and no token in
+/// the message.
+#[test]
+fn a_scratch_claude_login_carries_no_refresh_token_and_a_run_margin() {
+    let at_ms = |offset_secs: i64| (i64::try_from(SCRATCH_NOW_SECS).unwrap() + offset_secs) * 1000;
+    let document = |expires_at: i64| {
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "ACCESS-TOKEN",
+                "refreshToken": "REFRESH-TOKEN",
+                "expiresAt": expires_at,
+                "refreshTokenExpiresAt": at_ms(30 * 86_400),
+                "scopes": ["user:inference"],
+            },
+            "mcpOAuth": { "srv": { "refreshToken": "MCP-REFRESH-TOKEN" } },
+        })
+    };
+    let now = scratch_now(0);
+    assert_eq!(
+        claude_scratch_login(&document(at_ms(3 * 3600)), now).expect("three hours is enough"),
+        serde_json::json!({
+            "claudeAiOauth": {
+                "accessToken": "ACCESS-TOKEN",
+                "expiresAt": at_ms(3 * 3600),
+                "scopes": ["user:inference"],
+            }
+        })
+    );
+    for (expires_at, why) in [(at_ms(600), "ten minutes left"), (at_ms(-600), "expired")] {
+        let err = claude_scratch_login(&document(expires_at), now).expect_err(why);
+        assert!(err.contains("claude login"), "{why}: {err}");
+        assert!(!err.contains("TOKEN"), "{why}: quotes a secret: {err}");
+    }
+}
+
+/// Scenario: Turn fabricated Codex `auth.json` documents into the copy a
+/// scratch `CODEX_HOME` gets. A ChatGPT login whose access token lasts keeps it
+/// and gets an empty `refresh_token`; one expiring within the margin, or whose
+/// access token has no readable expiry, is refused with the `codex login`
+/// remedy; an API-key login comes back unchanged.
+#[test]
+fn a_scratch_codex_login_carries_no_refresh_token_and_a_run_margin() {
+    let chatgpt = |access: &str| {
+        serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "id_token": "ID-TOKEN",
+                "access_token": access,
+                "refresh_token": "REFRESH-TOKEN",
+                "account_id": "ACCOUNT",
+            },
+            "last_refresh": "2023-11-14T22:13:20Z",
+        })
+    };
+    let copied = codex_scratch_login(chatgpt(FABRICATED_CODEX_ACCESS_TOKEN), scratch_now(0))
+        .expect("an access token valid until 2100 lasts the run");
+    let mut expected = chatgpt(FABRICATED_CODEX_ACCESS_TOKEN);
+    expected["tokens"]["refresh_token"] = "".into();
+    assert_eq!(copied, expected, "only the refresh token changes");
+
+    for (access, now, why) in [
+        (
+            FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR,
+            scratch_now(600),
+            "fifty minutes left",
+        ),
+        (
+            FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR,
+            scratch_now(7200),
+            "expired",
+        ),
+        ("OPAQUE-ACCESS-TOKEN", scratch_now(0), "no readable expiry"),
+    ] {
+        let err = codex_scratch_login(chatgpt(access), now).expect_err(why);
+        assert!(err.contains("codex login"), "{why}: {err}");
+        assert!(
+            !err.contains("TOKEN") && !err.contains("eyJ"),
+            "{why}: {err}"
+        );
+    }
+    assert!(
+        codex_scratch_login(
+            chatgpt(FABRICATED_CODEX_ACCESS_TOKEN_ONE_HOUR),
+            scratch_now(0)
+        )
+        .is_ok(),
+        "exactly the margin left is enough"
+    );
+
+    let keyed = serde_json::json!({ "OPENAI_API_KEY": "API-KEY", "tokens": null });
+    assert_eq!(
+        codex_scratch_login(keyed.clone(), scratch_now(0)).expect("nothing to refresh"),
+        keyed
+    );
+}
+
+/// Scenario: Turn a fabricated OpenCode `auth.json` with four providers into
+/// the copy a test HOME gets: the API key is kept as it is, the lasting OAuth
+/// login keeps its access token with an empty `refresh`, and the expiring and
+/// expiry-less OAuth logins are left out and reported with the remedy.
+#[test]
+fn a_scratch_opencode_auth_keeps_lasting_logins_without_refresh_tokens() {
+    let ms = |offset_secs: u64| (SCRATCH_NOW_SECS + offset_secs) * 1000;
+    let auth = serde_json::json!({
+        "openrouter": { "type": "api", "key": "API-KEY" },
+        "openai": {
+            "type": "oauth", "access": "ACCESS-TOKEN", "refresh": "REFRESH-TOKEN",
+            "expires": ms(3 * 3600), "accountId": "ACCOUNT",
+        },
+        "anthropic": {
+            "type": "oauth", "access": "ACCESS-TOKEN-2", "refresh": "REFRESH-TOKEN-2",
+            "expires": ms(600),
+        },
+        "github-copilot": {
+            "type": "oauth", "access": "ACCESS-TOKEN-3", "refresh": "REFRESH-TOKEN-3",
+        },
+    });
+    let (copied, dropped) = opencode_scratch_auth(auth, scratch_now(0));
+    assert_eq!(
+        copied,
+        serde_json::json!({
+            "openrouter": { "type": "api", "key": "API-KEY" },
+            "openai": {
+                "type": "oauth", "access": "ACCESS-TOKEN", "refresh": "",
+                "expires": ms(3 * 3600), "accountId": "ACCOUNT",
+            },
+        })
+    );
+    let mut names: Vec<&str> = dropped.iter().map(|(p, _)| p.as_str()).collect();
+    names.sort_unstable();
+    assert_eq!(names, ["anthropic", "github-copilot"]);
+    for (provider, why) in &dropped {
+        assert!(why.contains("opencode auth login"), "{provider}: {why}");
+        assert!(!why.contains("TOKEN"), "{provider}: quotes a secret: {why}");
+    }
+}
+
+/// Scenario: Stage a fabricated OpenCode host whose test-model provider has a
+/// lasting OAuth login in one auth file and an expiring one in another, with no
+/// API key in the environment: the import succeeds. With only the expiring
+/// login it is refused, naming the provider and the remedy (Greptile, PR #2271).
+#[test]
+fn a_stale_opencode_login_in_one_file_does_not_refuse_a_lasting_one_in_another() {
+    let provider = opencode_test_model().split('/').next().unwrap().to_string();
+    let in_ms = |secs: u64| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + secs * 1000
+    };
+    let login = |expires: u64| {
+        serde_json::json!({ provider.clone(): {
+            "type": "oauth", "access": "ACCESS-TOKEN-FAKE-0001",
+            "refresh": FABRICATED_OPENAI_REFRESH_TOKEN, "expires": expires,
+        }})
+        .to_string()
+    };
+    let stage = |files: &[(&str, String)]| {
+        let source = race_safe_tempdir();
+        for (path, body) in files {
+            let at = source.path().join(path);
+            std::fs::create_dir_all(at.parent().unwrap()).unwrap();
+            std::fs::write(at, body).unwrap();
+        }
+        let target = race_safe_tempdir();
+        let result = import_from_fabricated_host(source.path(), || {
+            import_opencode_credentials_from(source.path(), target.path())
+        });
+        (result, target)
+    };
+
+    let (both, target) = stage(&[
+        (".local/share/opencode/auth.json", login(in_ms(5 * 3600))),
+        (".opencode/auth.json", login(in_ms(600))),
+    ]);
+    both.expect("the lasting login in ~/.local/share authorises the run");
+    let kept =
+        std::fs::read_to_string(target.path().join(".local/share/opencode/auth.json")).unwrap();
+    assert!(!kept.contains(FABRICATED_OPENAI_REFRESH_TOKEN), "{kept}");
+
+    let (stale, _target) = stage(&[(".opencode/auth.json", login(in_ms(600)))]);
+    let err = stale
+        .expect_err("only a login that will not last is left")
+        .to_string();
+    assert!(
+        err.contains(&provider) && err.contains("opencode auth login"),
+        "{err}"
+    );
+    assert!(!err.contains("TOKEN"), "quotes a secret: {err}");
 }

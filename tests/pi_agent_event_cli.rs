@@ -11,7 +11,7 @@
 //! they pin both halves: the flags reach the wire, and the wire fills the card.
 //! The real-Pi end of the path is `pi/live/001` (lane 2).
 
-// Fast-tier, does NOT link `tests/common/mod.rs`; see
+// Fast-tier, does NOT link `tests/common/lib.rs`; see
 // `tests/devin_hook_ingestion.rs` and `docs/develop/e2e-temp-dirs.md`.
 #[path = "../src/test_temp.rs"]
 mod test_temp;

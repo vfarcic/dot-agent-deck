@@ -38,7 +38,7 @@ use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, TabMem
 use dot_agent_deck::event::{AgentEvent, AgentType, DelegateResponse, DelegateSignal, EventType};
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCH_PANE: &str = "recovery-orchestrator";
 const WORKER_PANE: &str = "recovery-coder";
@@ -1600,6 +1600,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
 
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
+            work_id: None,
             task_name: "parity".to_string(),
             working_dir: dispatch_dir.path().to_string_lossy().into_owned(),
             command: None,

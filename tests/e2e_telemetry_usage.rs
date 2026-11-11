@@ -2,7 +2,7 @@
 
 //! Usage accounting observed at a local OTLP receiver, using offline agents.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::TuiDeck;
 use dot_agent_deck::daemon_client::{DaemonClient, StartAgentOptions};

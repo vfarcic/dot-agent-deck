@@ -23,7 +23,7 @@ use dot_agent_deck::daemon_client::{ClientError, DaemonClient, StartAgentOptions
 use dot_agent_deck::daemon_protocol::START_ERR_ORCHESTRATION_TITLE_IN_USE;
 use spec::spec;
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 const ORCHESTRATION: &str = "review";
 
@@ -416,6 +416,7 @@ async fn identity_008_a_title_is_keyed_by_resolved_title_and_cwd_and_freed_on_ex
     .expect("write the spawned run's config");
     let spawned = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
+            work_id: None,
             task_name: "scheduled-review".to_string(),
             working_dir: spawned_cwd.clone(),
             command: None,

@@ -15,7 +15,7 @@
 //! inbox holds it exactly once, and the only bytes the stand-in ever reads are
 //! the token-led doorbell line naming it.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_view.rs"]
 mod inbox_view;
 

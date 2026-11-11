@@ -37,7 +37,7 @@
 //! because `DaemonProc` binds Unix-domain sockets. Every wait is a `common`
 //! helper (linkage-check Decision 21).
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::time::Duration;
 

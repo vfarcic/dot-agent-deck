@@ -18,7 +18,7 @@
 //! No LLM tokens are spent — the pane runs `/bin/sh`, which lets the test ask
 //! the agent-side PTY for its real kernel window size via `stty size`.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use common::{TuiDeck, wait_until};
 use dot_agent_deck::daemon_client::{

@@ -30,7 +30,7 @@
 //! with PRD #120 in mind (stable handle + a tab-closed callback seam) so #120
 //! needs additions, not breaking changes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -126,6 +126,11 @@ pub struct SpawnRequest {
     /// which names it to the agent (`dispatch:<unit>`, `seed`). `None` is a
     /// scheduled task: `schedule:<task_name>`.
     pub seed_reason: Option<String>,
+    /// PRD #1889: the work the spawn serves (a dispatched unit's, a scheduled
+    /// fire's, an issue's), handed to every pane it opens; for an orchestration
+    /// it is the parent of the instance's work. `None`: each pane opens a pane
+    /// work of its own.
+    pub work_id: Option<crate::work_journal::WorkId>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -619,6 +624,7 @@ fn register_dispatched_unit(
     )>,
     kind: crate::dispatched_units::UnitKind,
     publication: Option<crate::agent_pty::InitialPublication>,
+    work: Option<&crate::work_journal::WorkId>,
 ) -> Option<String> {
     let (origin, caller) = unit?;
     let (unit_pane_id, unit_agent_id) = {
@@ -628,6 +634,12 @@ fn register_dispatched_unit(
     let id = registry
         .dispatched_units()
         .register(origin.into_unit(kind, chrono::Utc::now().timestamp_millis()));
+    // PRD #1889: the dispatch's work learns its unit id. Book-keeping only:
+    // the caller holds the state's write guard, so the line is written once
+    // it is released (`WorkTracker::flush_open`).
+    if let Some(work) = work {
+        registry.work().unit_registered(work, &id);
+    }
     tracing::debug!(
         unit_id = %id,
         unit_pane_id = %unit_pane_id,
@@ -777,6 +789,7 @@ async fn spawn_with_unit(
                 agent_type.clone(),
                 shell,
                 unit_origin,
+                req.work_id.clone(),
                 notifier,
             )?;
             // Issue #454: a single-agent spawn registers NOTHING in the
@@ -851,8 +864,14 @@ async fn spawn_with_unit(
                     agent_id: id.clone(),
                 },
                 publication,
+                req.work_id.as_ref(),
             );
             drop(publish_guard);
+            // PRD #1889: the unit's `opened`, with the guard released and
+            // before its task is delivered.
+            if let Some(work) = &req.work_id {
+                registry.work().flush_open(work);
+            }
             // PRD #1666 S5: the prompt is the pane's first inbox message, posted
             // now and bound to the agent just spawned. Nothing waits for it to
             // start a session; nothing is typed.
@@ -1073,6 +1092,7 @@ async fn spawn_with_unit(
                     role.agent_type.clone(),
                     None,
                     unit_origin,
+                    req.work_id.clone(),
                     notifier,
                 );
                 // Issue #600: an orchestration spawn is ALL-OR-NOTHING. This used
@@ -1342,8 +1362,13 @@ async fn spawn_with_unit(
                     terminal_agent_id: delivery_agent_id.clone(),
                 },
                 publication,
+                req.work_id.as_ref(),
             );
             drop(publish_guard);
+            // PRD #1889: as for a single unit, above.
+            if let Some(work) = &req.work_id {
+                registry.work().flush_open(work);
+            }
             // PRD #1666 S5: posted to the orchestrator role's inbox, as above.
             if let Err(error) = post_seed(
                 registry,
@@ -1516,9 +1541,20 @@ pub(crate) async fn close_started_agents(
             .collect::<Vec<_>>()
     })
     .await;
+    // PRD #1889: the agents whose close is confirmed — closed now, or already
+    // gone (`NotFound`) — whose panes' journal ownership is retired below, as
+    // `StopAgent`'s confirmed close retires it. A close that failed otherwise
+    // may leave its child running, so its pane keeps its work.
+    let mut confirmed: HashSet<String> = HashSet::new();
     match closed {
         Ok(outcomes) => {
             for (id, outcome) in outcomes {
+                match &outcome {
+                    Ok(()) | Err(crate::agent_pty::AgentPtyError::NotFound(_)) => {
+                        confirmed.insert(id.clone());
+                    }
+                    Err(_) => {}
+                }
                 if let Err(e) = outcome {
                     // `NotFound` is ordinary here — the child may have exited on
                     // its own between spawning and the failure of a later role.
@@ -1553,6 +1589,15 @@ pub(crate) async fn close_started_agents(
     }
     for pane in &held_panes {
         registry.finish_pane_close(pane, true);
+    }
+    // PRD #1889: a pane's own work (or a plain fire's) closes with the pane,
+    // under its cleanup hold, as in `stop_agent_steps`.
+    for (agent, hold) in started.iter().zip(&holds) {
+        if let Some(hold) = hold
+            && confirmed.contains(&agent.id)
+        {
+            registry.work().pane_closed(hold.pane_id());
+        }
     }
     for (record, hold) in records.iter().zip(&holds) {
         let Some(record) = record else { continue };
@@ -1597,6 +1642,8 @@ fn spawn_one(
     // PRD #1666 part 3, round 5 (plan D7): `Dispatched` for a unit's pane,
     // `Direct` otherwise; pinned on an orchestration role's generation.
     origin: crate::hook_provenance::InstanceOrigin,
+    // PRD #1889: the work the spawn serves (`SpawnRequest::work_id`).
+    work_id: Option<crate::work_journal::WorkId>,
     notifier: &dyn Notifier,
 ) -> Result<String, SpawnError> {
     let mut env = pane_env(pane_id, false);
@@ -1625,6 +1672,7 @@ fn spawn_one(
         // launcher (`devbox run -- codex`) is badged and WRAPPED from its first
         // dispatched spawn rather than reading "No agent" until its first task.
         agent_type: agent_type.or_else(|| AgentType::from_command(command)),
+        work_id,
     };
     registry.spawn_agent(opts).map_err(|e| {
         if e.is_admission_frozen() {
@@ -3062,6 +3110,7 @@ mod tests {
             is_start_role: idx == 0,
         };
         let req = SpawnRequest {
+            work_id: None,
             task_name: "partial-454".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
             command: None,
@@ -3149,6 +3198,7 @@ mod tests {
             is_start_role: idx == 0,
         };
         SpawnRequest {
+            work_id: None,
             task_name: task.to_string(),
             working_dir: dir.to_string_lossy().into_owned(),
             command: None,
@@ -3199,6 +3249,7 @@ mod tests {
             let state = state.clone();
             let event_tx = event_tx.clone();
             let req = SpawnRequest {
+                work_id: None,
                 task_name: "seed-refused".to_string(),
                 working_dir: dir.path().to_string_lossy().into_owned(),
                 command: Some("sleep 30".to_string()),
@@ -3290,6 +3341,230 @@ mod tests {
             0,
             "the unit the spawn recorded has ended"
         );
+    }
+
+    /// PRD #1889: a registry with a work journal installed under `state_dir`.
+    fn registry_with_journal(state_dir: &Path) -> Arc<AgentPtyRegistry> {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        registry.work().install(
+            crate::work_journal::WorkJournal::try_open_with(
+                state_dir,
+                "run1",
+                &crate::deck_identity::DeckId::generate(),
+                crate::work_journal::JournalOptions::default(),
+            )
+            .expect("the work journal opens"),
+        );
+        registry
+    }
+
+    /// PRD #1889: wait (bounded) until the work book is back at `baseline`;
+    /// an attempt's end is written by its reader thread, after the close.
+    async fn wait_for_book(
+        registry: &AgentPtyRegistry,
+        baseline: &crate::work_tracking::BookSizes,
+    ) {
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let sizes = registry.work().book_sizes();
+            if sizes == *baseline {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the work book never returned to its baseline: {sizes:?}, expected {baseline:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// PRD #1889 (audit N1): an orchestration whose later role fails rolls
+    /// back the roles it started through the shared rollback close, and that
+    /// close retires the rolled-back panes' journal ownership as `StopAgent`
+    /// does. Repeated, the work book stays at its baseline: no pane mapping,
+    /// pane work, orchestration or attempt is left behind.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn repeated_partial_orchestration_failures_leave_the_work_book_at_its_baseline() {
+        use crate::project_config::{OrchestrationConfig, OrchestrationRoleConfig};
+
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
+        let journal_state = crate::test_temp::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir for the orchestration cwd");
+        let registry = registry_with_journal(journal_state.path());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let baseline = registry.work().book_sizes();
+        let role = |idx: usize, name: &str, command: &str| RoleSpawn {
+            agent_type: None,
+            role_index: idx,
+            role_name: name.to_string(),
+            command: command.to_string(),
+            is_start_role: idx == 0,
+        };
+        for n in 0..3 {
+            let task = format!("partial-1889-{n}");
+            let req = SpawnRequest {
+                work_id: None,
+                task_name: task.clone(),
+                working_dir: dir.path().to_string_lossy().into_owned(),
+                command: None,
+                prompt: "unused".to_string(),
+                resolved_target: Some(SpawnTarget::Orchestration {
+                    name: task.clone(),
+                    roles: vec![
+                        role(0, "orchestrator", "sleep 30"),
+                        role(1, "worker", "/nonexistent/dot-agent-deck-1889"),
+                    ],
+                    config: Box::new(OrchestrationConfig {
+                        default: false,
+                        name: task.clone(),
+                        roles: vec![OrchestrationRoleConfig {
+                            agent: None,
+                            name: "orchestrator".to_string(),
+                            command: "sleep 30".to_string(),
+                            start: true,
+                            description: None,
+                            prompt_template: None,
+                            clear: false,
+                        }],
+                    }),
+                }),
+                compose_orchestrator_context: None,
+                seed_reason: None,
+            };
+            let result = spawn(req, &registry, &SilentNotifier, None, false, Some(&state)).await;
+            assert!(result.is_err(), "precondition: role 1 fails to spawn");
+            assert_eq!(registry.live_count(), 0, "role 0 was rolled back");
+            wait_for_book(&registry, &baseline).await;
+        }
+        // Every rolled-back orchestration was opened, and closed with its
+        // last role pane.
+        let journal = registry.work().journal().expect("installed");
+        journal.flush();
+        let read = crate::work_journal::read_journal(journal_state.path()).unwrap();
+        let closed = read
+            .lines
+            .iter()
+            .filter(|l| {
+                matches!(
+                    l.event,
+                    crate::work_journal::Event::Closed {
+                        how: crate::work_journal::CloseHow::OrchestrationEnded,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(closed, 3, "{:#?}", read.lines);
+        registry.shutdown_all();
+    }
+
+    /// PRD #1889 (audit N1): a plain scheduled fire whose pane's first prompt
+    /// is refused after the spawn published it. The rollback close retires
+    /// the pane's journal ownership, so the book returns to its baseline and
+    /// the fire, settling afterwards, sees no pane serving it and is closed
+    /// `fire_done` at once, instead of waiting on a pane that is gone.
+    #[tokio::test]
+    async fn a_fire_whose_seed_is_refused_after_publication_closes_at_once() {
+        use crate::work_journal::{CloseHow, Event, Launch, Refs};
+
+        struct SilentNotifier;
+        impl Notifier for SilentNotifier {
+            fn notify(&self, _event: NotifyEvent) {}
+        }
+        let journal_state = crate::test_temp::tempdir().unwrap();
+        let dir = tempfile::tempdir().expect("tempdir for the agent cwd");
+        let registry = registry_with_journal(journal_state.path());
+        let state: crate::state::SharedState =
+            Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+        let fire = registry
+            .work()
+            .open(
+                Launch::ScheduleFire,
+                None,
+                Refs {
+                    schedule: Some("nightly".to_string()),
+                    ..Refs::default()
+                },
+                None,
+            )
+            .expect("a fire work");
+        let baseline = registry.work().book_sizes();
+        let (reached, release) = registry.pause_at_for_test("dispatch-publication");
+        let spawned = {
+            let registry = registry.clone();
+            let state = state.clone();
+            let req = SpawnRequest {
+                work_id: Some(fire.clone()),
+                task_name: "fire-seed-refused".to_string(),
+                working_dir: dir.path().to_string_lossy().into_owned(),
+                command: Some("sleep 30".to_string()),
+                prompt: "the fire's task".to_string(),
+                resolved_target: Some(SpawnTarget::SingleAgent {
+                    command: Some("sleep 30".to_string()),
+                    inherited: None,
+                }),
+                compose_orchestrator_context: None,
+                seed_reason: None,
+            };
+            tokio::spawn(async move {
+                spawn(req, &registry, &SilentNotifier, None, true, Some(&state))
+                    .await
+                    .map(|handle| handle.task_name)
+            })
+        };
+        reached.await.expect("the spawn reaches the pause");
+        let limits = registry.inbox().limits();
+        'fill: for pane in 0.. {
+            let to = crate::inbox::Recipient::bound(format!("filler-{pane}"), "filler");
+            for n in 0..limits.max_per_recipient {
+                if registry
+                    .inbox()
+                    .post_direct(
+                        to.clone(),
+                        crate::inbox::Content::from_deck("test", format!("filler {n}"), "x"),
+                    )
+                    .is_err()
+                {
+                    break 'fill;
+                }
+            }
+        }
+        let _ = release.send(());
+        let outcome = tokio::time::timeout(Duration::from_secs(15), spawned)
+            .await
+            .expect("the spawn answers")
+            .expect("the spawn task");
+        assert!(outcome.is_err(), "a spawn that lost its seed fails");
+        assert_eq!(registry.live_count(), 0, "nothing is left running");
+        wait_for_book(&registry, &baseline).await;
+
+        registry.work().fire_settled(&fire);
+        assert_eq!(registry.work().book_sizes(), baseline);
+        let journal = registry.work().journal().expect("installed");
+        journal.flush();
+        let read = crate::work_journal::read_journal(journal_state.path()).unwrap();
+        let kinds: Vec<&str> = read
+            .lines
+            .iter()
+            .filter(|l| l.event.work() == &fire)
+            .map(|l| l.event.kind())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["opened", "attempt_started", "attempt_ended", "closed"],
+            "{:#?}",
+            read.lines
+        );
+        assert!(read.lines.iter().any(|l| matches!(
+            &l.event,
+            Event::Closed { work, how: CloseHow::FireDone } if *work == fire
+        )));
+        registry.shutdown_all();
     }
 
     /// Start [`closable_orchestration_request`] as a dispatched unit, pause it
@@ -3463,6 +3738,7 @@ mod tests {
             clear: false,
         };
         SpawnRequest {
+            work_id: None,
             task_name: "dispatch-refusal-1065".to_string(),
             working_dir: cwd.to_string_lossy().into_owned(),
             command: None,
@@ -3521,6 +3797,7 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let notifier = RecordingNotifier::default();
         let request = SpawnRequest {
+            work_id: None,
             task_name: "seed-refused".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
             command: Some("cat".to_string()),
@@ -3557,6 +3834,7 @@ mod tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let notifier = RecordingNotifier::default();
         let request = || SpawnRequest {
+            work_id: None,
             task_name: "deferred-1487".to_string(),
             working_dir: dir.path().to_string_lossy().into_owned(),
             command: Some("cat".to_string()),
@@ -4712,6 +4990,7 @@ mod tests {
             },
         );
         let req = SpawnRequest {
+            work_id: None,
             task_name: TASK.to_string(),
             working_dir: std::env::temp_dir().to_string_lossy().into_owned(),
             command: None,

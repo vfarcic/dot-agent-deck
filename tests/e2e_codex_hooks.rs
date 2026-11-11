@@ -2,7 +2,7 @@
 
 //! PTY-attached real-Codex native-hook parity coverage for PRD #20 W1.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -116,7 +116,7 @@ fn deck_hook_response(command: &str) -> String {
 /// Seed `<home>/.local/bin/dot-agent-deck` as a symlink to the binary under
 /// test, and return the path the deck's resolver will therefore pin.
 ///
-/// The same seeding `tests/common/mod.rs` does for every `TuiDeck` HOME, spelled
+/// The same seeding `tests/common/lib.rs` does for every `TuiDeck` HOME, spelled
 /// locally because this test spawns the binary directly rather than through the
 /// harness. Load-bearing twice over: PRD #381's resolver refuses to pin a
 /// `target/{debug,release}` path, so without a step-2a candidate it walks out to

@@ -28,7 +28,7 @@
 #![cfg(unix)]
 
 // Issue #322. This crate is fast-tier and deliberately does NOT link
-// `tests/common/mod.rs`; pulling the PTY harness in would duplicate its ~530
+// `tests/common/lib.rs`; pulling the PTY harness in would duplicate its ~530
 // executions here. But its eight scratch dirs each hold an `attach.sock`, so
 // they were the largest single source of live `/tmp/.tmp*` directories during a
 // recorded `cargo test-e2e` — sampling attributed most of the 49 observed to
@@ -1809,6 +1809,7 @@ async fn dispatch_orchestration(
     .expect("write the dispatched orchestration's config");
     dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
+            work_id: None,
             task_name: format!("dispatch-{name}"),
             working_dir: dir.to_string_lossy().into_owned(),
             command: None,

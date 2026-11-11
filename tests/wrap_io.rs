@@ -2,7 +2,7 @@
 
 //! Fast subprocess coverage for wrapper stream fidelity and signal cleanup.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};

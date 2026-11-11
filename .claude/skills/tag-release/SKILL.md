@@ -113,9 +113,10 @@ Once the release is tagged, the branches and worktrees whose work it contains ar
 ```bash
 bash .claude/skills/tag-release/cleanup.sh
 cargo xtask clean-e2e-tmp
+cargo xtask clean-targets
 ```
 
-Both are detection-only. `cleanup.sh` never removes a worktree, deletes a branch or directory, or signals a process (it does run `git fetch --prune`, which refreshes local remote-tracking refs and touches the remote not at all). `cargo xtask clean-e2e-tmp` without `--apply` is a dry run of the e2e harness's temp-root reaper (`/var/tmp/dad-e2e-<uid>/…` and the older `/tmp/dad-*` roots), which already decides ownership by owning PID and age (CLAUDE.md rule 14), so its own verdict is the one to show. If `cleanup.sh` prints `NOTHING_TO_CLEAN=true` and the reaper finds nothing to remove, say so and finish.
+All three are detection-only. `cleanup.sh` never removes a worktree, deletes a branch or directory, or signals a process (it does run `git fetch --prune`, which refreshes local remote-tracking refs and touches the remote not at all). `cargo xtask clean-e2e-tmp` without `--apply` is a dry run of the e2e harness's temp-root reaper (`/var/tmp/dad-e2e-<uid>/…` and the older `/tmp/dad-*` roots), which already decides ownership by owning PID and age (CLAUDE.md rule 14), so its own verdict is the one to show. `cargo xtask clean-targets` without `--apply` is a dry run of the idle build-tree sweep (issue #2107): it lists each worktree's `target/` it would delete, with its size and how long it has been idle, and why it keeps each other one; [`docs/develop/target-cleanup.md`](../../../docs/develop/target-cleanup.md) has its checks. If `cleanup.sh` prints `NOTHING_TO_CLEAN=true` and neither the reaper nor `clean-targets` finds anything to remove, say so and finish.
 
 What each `cleanup.sh` list holds:
 
@@ -203,6 +204,15 @@ Remove only what the user confirmed, in this order:
    `--apply` decides each root afresh rather than from the earlier dry run's list. That keeps a root whose owning process came alive since, but it also means a root can cross the reaper's age threshold after the user confirmed, and then `--apply` would remove a root the user saw listed as kept.
 
    What the user confirms is therefore the reaper's verdict as its dry run summarised it — the `reap:` count and size and the per-reason breakdown below it — not a list of individual roots. The reaper prints at most 20 paths per group and says `… and N more` past that; when it does, tell the user that the remainder is counted in the summary but not listed. So run the dry run again right before applying and compare it with what the user confirmed: if the `reap:` count or size, any per-reason count or size, or any listed path differs, show the new summary and confirm again before `--apply`. Report what it removed and the per-reason summary of what it kept.
+
+8. **Idle build trees:**
+
+   ```bash
+   cargo xtask clean-targets            # dry run again, immediately before
+   cargo xtask clean-targets --apply
+   ```
+
+   Like the reaper, `--apply` decides each tree afresh, and it re-checks for processes holding a tree immediately before deleting it. So run the dry run again right before applying and compare its `reclaim` lines with what the user confirmed; if a tree was added, show the new list and confirm again. A worktree step 3 removed took its tree with it, so it is no longer listed. Report the `deleted` lines and the `reclaimed` total.
 
 Finally, prune stale worktree metadata:
 

@@ -37,7 +37,7 @@ A test does not opt in. The guard also arms itself when:
 
 Armed that way with no `DOT_AGENT_DECK_TEST_CONFIG_ROOT`, the roots default to where tests make scratch directories (`config_write_guard::default_test_roots`): `/var/tmp/dad-e2e-<uid>`, `DAD_E2E_TMPDIR` when set, and the OS temp dir. The operator's home is none of them, so a test that forgets to isolate `HOME` gets a refused write (an auto-install logs a warning and carries on; an explicit install returns the error) instead of rewriting real config.
 
-A child started with `env_clear` inherits neither signal. The e2e harness therefore pins both variables into every environment it builds from scratch — `TuiDeck`'s and `DaemonProc`'s — through `tests/common/mod.rs::config_containment_env`, with the process's harness root plus the default roots. A test that moves `HOME` somewhere else with `with_env` is judged at write time against those roots.
+A child started with `env_clear` inherits neither signal. The e2e harness therefore pins both variables into every environment it builds from scratch — `TuiDeck`'s and `DaemonProc`'s — through `tests/common/lib.rs::config_containment_env`, with the process's harness root plus the default roots. A test that moves `HOME` somewhere else with `with_env` is judged at write time against those roots.
 
 ## Writing a test that installs hooks
 

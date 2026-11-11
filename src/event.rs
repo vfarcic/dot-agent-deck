@@ -946,7 +946,10 @@ pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
 /// and it fails on an ordinary launcher configuration — `codex` reachable only
 /// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
 /// `NotFound`. Nothing will then announce a turn, so the deck reads the
-/// wrapper's classified output as the pane's status (issue #1493).
+/// wrapper's classified output as the pane's status (issue #1493). The wrapper
+/// also declares it when the wrapped command can set its own `CODEX_HOME` or
+/// working directory (issue #1703), since the trust it recorded is then for a
+/// home or directory Codex may not use.
 ///
 /// Read by [`AgentEvent::declares_prompt_reports_unavailable`]. Any value
 /// counts. It is not, and must not be treated as, an authentication marker: its

@@ -3,7 +3,7 @@
 //! Synthetic coverage for telemetry handoffs and daemon health.
 //! Uses inbox stand-ins and a local OTLP receiver without real agents.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 #[path = "support/inbox_doorbell.rs"]
 mod inbox;
 #[path = "support/inbox_route.rs"]
@@ -22,14 +22,22 @@ const TASK: &str = "PRIVATE_HANDOFF_TASK_1981_7e093c";
 const REPORT: &str = "PRIVATE_HANDOFF_REPORT_1981_58b21a";
 
 fn launch(receiver: &Receiver) -> TuiDeck {
+    launch_with_response_timeout(receiver, "0")
+}
+
+/// [`launch`] with the worker-response timeout at `ms`. The blocked-worker
+/// notice rides the idle-worker watch's delegation record, which is armed only
+/// while that timeout is on.
+fn launch_with_response_timeout(receiver: &Receiver, ms: &str) -> TuiDeck {
     let deck = TuiDeck::builder()
         .without_agent_credentials()
         .impersonating_pane_signals()
         // These synthetic tests run CLI components from the test process with
         // fixture-owned capability tokens, rather than inside a real agent.
         .with_env("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1")
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", ms)
         .with_env("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "300000")
+        .with_env("DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS", "300")
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
         .with_env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/json")
         .with_pty_size(180, 45)
@@ -318,6 +326,86 @@ fn telemetry_otlp_039_handoff_marks_exited_worker_undeliverable() {
     assert!(
         reads(&receiver, &id).is_empty(),
         "a task with no report has no read"
+    );
+    no_private_payload(&receiver);
+}
+
+/// Scenario: Delegate a private task to a stand-in worker, let it take the task, then have the worker's own hook report that its turn ended on an error, as Claude Code's `StopFailure` does after a rate-limit burst. The orchestrator must be told in its inbox, and the handoff must export promptly as `worker_failed` while both agents are still alive; re-delegating with `--supersede` and having the worker report a usage limit must end that second handoff as `worker_blocked`.
+#[spec("telemetry/otlp/047")]
+#[test]
+fn telemetry_otlp_047_failed_worker_ends_its_handoff_promptly() {
+    let receiver = Receiver::start();
+    // An hour: on, so the blocked-worker notice is owed, and never due here.
+    let deck = launch_with_response_timeout(&receiver, "3600000");
+    let (orch, worker) = route::team(&deck, false);
+    let id = delegate(&deck, &orch, &worker);
+    cli(&deck, &worker, &["inbox", "fetch", "--json"]);
+    inbox::state(&deck, &worker, &id, "acknowledged");
+    // The worker reports a wait, then, inside the debounce, its turn ends on
+    // a provider error that is not a quota block — a transient 429 Claude
+    // Code classifies `error` — and it sits at its prompt owing the task. The
+    // failure replaces the pending wait (PR #2239 review).
+    inbox::status(&deck, &worker, "waiting_for_input", "claude_code");
+    inbox::status(&deck, &worker, "error", "claude_code");
+    let notice = route::notice(&deck, &orch, "delegated worker stopped on an error");
+    assert!(
+        !notice
+            .to_string()
+            .contains("delegated worker is waiting for input"),
+        "the failure, not the earlier wait, is reported: {notice}"
+    );
+    let handoff = one_handoff(&receiver, &id);
+    assert!(
+        receiver.run(&orch.id).is_none() && receiver.run(&worker.id).is_none(),
+        "the handoff must end while both agents are alive, not with a run"
+    );
+    assert_eq!(
+        attribute(&handoff, "deck.handoff.outcome"),
+        Some("worker_failed")
+    );
+    assert_eq!(attribute(&handoff, "deck.role"), Some("coder"));
+    assert!(
+        !handoff["events"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|e| e["name"] == "deck.handoff.reported")
+    );
+
+    // The orchestrator re-delivers the task; this time the worker reports a
+    // provider usage limit, which the deck already tells the orchestrator
+    // about (issue #714): that handoff ends too, as a block.
+    cli(
+        &deck,
+        &orch,
+        &["delegate", "--to", "coder", "--supersede", "--task", TASK],
+    );
+    let second = route::messages(&deck, &worker)
+        .into_iter()
+        .filter_map(|m| m["id"].as_str().map(str::to_owned))
+        .find(|m| *m != id)
+        .expect("the superseding task must be posted to the worker");
+    cli(&deck, &worker, &["inbox", "fetch", "--json"]);
+    inbox::state(&deck, &worker, &second, "acknowledged");
+    inbox::status(&deck, &worker, "quota_blocked", "claude_code");
+    route::notice(
+        &deck,
+        &orch,
+        "delegated worker blocked by a provider usage limit",
+    );
+    let blocked = one_handoff(&receiver, &second);
+    assert_eq!(
+        attribute(&blocked, "deck.handoff.outcome"),
+        Some("worker_blocked")
+    );
+    assert_eq!(handoffs(&receiver, &id), vec![handoff], "ended once");
+    stop(&deck, &worker);
+    stop(&deck, &orch);
+    completed_run(&receiver, &orch);
+    assert_eq!(
+        handoffs(&receiver, &second),
+        vec![blocked],
+        "run closure must not export it again"
     );
     no_private_payload(&receiver);
 }

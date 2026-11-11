@@ -5,7 +5,7 @@
 //! the deck minted for their pane. Tokens are never printed or included in an
 //! assertion diagnostic.
 
-mod common;
+dot_agent_deck_test_harness::link!();
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

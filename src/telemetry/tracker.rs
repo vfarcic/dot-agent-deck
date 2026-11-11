@@ -203,6 +203,8 @@ pub struct RunStart {
     pub model: Option<String>,
     pub invoking_skill: Option<String>,
     pub issue_number: Option<u64>,
+    /// PRD #1889: `deck.work.id`, the work this run's attempt serves.
+    pub work_id: Option<String>,
 }
 
 impl RunStart {
@@ -245,6 +247,7 @@ impl RunStart {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 }
@@ -1025,6 +1028,7 @@ impl RunTracker {
         }
         let pane_id = start.pane_id.clone();
         let usage = RunUsage::new(&start.agent, usage_dirs, now);
+        let cards = self.new_cards(&pane_id);
         self.runs.insert(
             pane_id,
             ActiveRun {
@@ -1033,7 +1037,7 @@ impl RunTracker {
                 span_id: new_span_id(),
                 start: now,
                 context: RunContext::default(),
-                cards: self.new_cards(),
+                cards,
                 pr_number: None,
                 status: None,
                 events: Vec::new(),
@@ -1060,9 +1064,19 @@ impl RunTracker {
         );
     }
 
-    fn new_cards(&self) -> ShadowCards {
+    /// A run's card state, with the run's pane registered as its own.
+    ///
+    /// Issue #2078: what reaches a run the daemon has already admitted, but a
+    /// state that manages no pane takes a pane's reports only once a
+    /// `SessionStart` has drawn its card. Pi reports through
+    /// `dot-agent-deck agent-event`, which never sends one, so without the
+    /// registration every Pi status was refused here while the dashboard,
+    /// which registers its panes, showed it.
+    fn new_cards(&self, pane_id: &str) -> ShadowCards {
+        let mut state: Box<AppState> = Box::default();
+        state.register_pane(pane_id.to_string());
         ShadowCards {
-            state: Box::default(),
+            state,
             #[cfg(test)]
             _live: LiveWitness::new(&self.shadow_states),
         }
@@ -1870,6 +1884,24 @@ impl RunTracker {
         }
     }
 
+    /// Issue #2099: the deck told the orchestrator that the worker owing each
+    /// of `tasks` stopped, as `stopped` says: their hand-offs end with it,
+    /// applied like an inbox change, so one whose post has not been placed
+    /// yet is ended when it is.
+    pub fn observe_worker_stopped(
+        &mut self,
+        tasks: &[String],
+        stopped: super::handoff::Stopped,
+        now: u64,
+    ) {
+        for task in tasks {
+            let change = Change::Stopped(task.clone(), stopped);
+            if !self.hold_notice(&change, now) {
+                self.apply_change(change, now);
+            }
+        }
+    }
+
     /// Issue #1981 M7 review: hold `change`, seen at `now`, in the prepared
     /// run holding the post it concerns, after the events held so far, for
     /// [`Self::commit_run`] to apply in that place: applied before the run
@@ -2373,6 +2405,10 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
         AttrKey::DispatchName,
         run.dispatch_name.as_deref(),
     ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::WorkId,
+        start.work_id.as_deref(),
+    ));
     attributes.push(Attribute::str(AttrKey::EndReason, reason.as_str()));
     if let Some(code) = exit_code {
         attributes.push(Attribute::int(AttrKey::ExitCode, i64::from(code)));
@@ -2497,6 +2533,7 @@ pub(crate) mod tests {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 
@@ -2598,6 +2635,66 @@ pub(crate) mod tests {
         assert!(attr(run, AttrKey::Role).is_none());
         assert!(attr(run, AttrKey::Model).is_none());
         assert!(attr(run, AttrKey::InstructionsCommit).is_none());
+    }
+
+    /// Issue #2078: a Pi pane reports through `dot-agent-deck agent-event`,
+    /// which never sends a `SessionStart`, so a run's card state must take
+    /// those reports for the run's own pane as its card does on the dashboard.
+    /// The shell command is the control: it was recorded all along.
+    #[test]
+    fn a_pi_run_records_status_from_agent_event_reports() {
+        let report = |event_type: EventType, tool_name: Option<&str>| {
+            crate::hook::build_agent_event_cli(
+                "p1".into(),
+                Some("pi-agent-1".into()),
+                event_type,
+                crate::hook::AgentEventDetail {
+                    tool_name: tool_name.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut tracker = RunTracker::new();
+        let mut pi = start("p1");
+        pi.agent = AgentType::Pi;
+        pi.agent_id = Some("pi-agent-1".into());
+        tracker.begin_run(pi, 100);
+        tracker.observe_event(&report(EventType::Idle, None), 110);
+        tracker.observe_event(&report(EventType::Thinking, None), 120);
+        tracker.observe_event(&report(EventType::ToolStart, Some("bash")), 130);
+        tracker.observe_event(&report(EventType::ToolEnd, Some("bash")), 140);
+        tracker.observe_event(&report(EventType::Idle, None), 150);
+        tracker.end_run("p1", EndReason::Exited, Some(0), 160);
+        let spans = tracker.take_finished();
+
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|s| s.name == SPAN_AGENT_OPERATION)
+                .count(),
+            1,
+            "the control: the shell command is an operation"
+        );
+        let statuses: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_STATUS)
+            .map(|s| attr(s, AttrKey::Status).cloned())
+            .collect();
+        let str_of = |s: &str| Some(AttrValue::Str(s.into()));
+        assert_eq!(
+            statuses,
+            vec![
+                str_of("idle"),
+                str_of("thinking"),
+                str_of("working"),
+                str_of("idle"),
+            ],
+            "every status the Pi card showed is an interval"
+        );
+        assert_eq!(
+            attr(run_span_of(&spans), AttrKey::StatusChangesCount),
+            Some(&AttrValue::Int(4))
+        );
     }
 
     #[test]
@@ -4665,6 +4762,24 @@ pub(crate) mod tests {
             attr(run, AttrKey::AgentSource),
             Some(&AttrValue::Str("hook".into()))
         );
+    }
+
+    /// PRD #1889: a run's `agent.run` span carries the work its attempt
+    /// serves as `deck.work.id`, and a run with none carries no attribute.
+    #[test]
+    fn a_run_span_carries_its_work_id() {
+        let mut tracker = RunTracker::new();
+        let mut with = start("p1");
+        with.work_id = Some("w-deck-0123456789abcdef".into());
+        tracker.begin_run(with, 0);
+        tracker.begin_run(start("p2"), 0);
+        tracker.end_all(EndReason::Exited, 1);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            attr(run_span_on(&spans, "p1"), AttrKey::WorkId),
+            Some(&AttrValue::Str("w-deck-0123456789abcdef".into()))
+        );
+        assert_eq!(attr(run_span_on(&spans, "p2"), AttrKey::WorkId), None);
     }
 
     /// Issue #1981 M6: the open runs not yet named list their generations,
