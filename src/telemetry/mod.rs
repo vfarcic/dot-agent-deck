@@ -419,7 +419,7 @@ pub fn observe_attach(telemetry: Option<Arc<Telemetry>>, took: std::time::Durati
 
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
-pub const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "4";
 
 /// The service name a span batch carries when `OTEL_SERVICE_NAME` is unset.
 pub const DEFAULT_SERVICE_NAME: &str = "dot-agent-deck";
