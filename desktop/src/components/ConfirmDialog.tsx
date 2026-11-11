@@ -2,7 +2,8 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { CircleStop } from "lucide-react";
 
 import { insideVoicePeer, OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
-import type { KeptWorktree } from "../lib/worktreeClose";
+import { sanitizeText } from "../lib/displayText";
+import type { WorktreeCloseReport } from "../lib/worktreeClose";
 import { KeptWorktreeText } from "./KeptWorktreeText";
 
 /**
@@ -18,7 +19,14 @@ export interface ConfirmState {
   label: string;
   busyLabel: string;
   action: () => Promise<void>;
-  worktreePreview?: () => Promise<KeptWorktree | null>;
+  worktreePreview?: () => Promise<WorktreeCloseReport>;
+  /**
+   * Issue #1958: a second confirm — the close that KEEPS the dispatched
+   * worktree — drawn as a third button after the confirm. Shown only when
+   * `worktreePreview` names a worktree to keep, which it does only for a deck
+   * that can keep one, so an older deck never offers it.
+   */
+  keepWorktree?: { label: string; action: () => Promise<void> };
 }
 
 /**
@@ -29,17 +37,19 @@ export interface ConfirmState {
  * `alertdialog` role, same busy latch.
  */
 export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose: () => void }) {
-  const [busy, setBusy] = useState(false);
-  const [preview, setPreview] = useState<{ state: ConfirmState; kept: KeptWorktree | null }>();
-  const kept = preview?.state === state ? preview.kept : null;
+  const [busy, setBusy] = useState<"confirm" | "keep">();
+  const [preview, setPreview] = useState<{ state: ConfirmState; report: WorktreeCloseReport | null }>();
+  const report = preview?.state === state ? preview.report : null;
+  const kept = report?.kept ?? null;
+  const keepPath = state.keepWorktree ? report?.keepWorktree ?? null : null;
   const checking = Boolean(state.worktreePreview && preview?.state !== state);
   useEffect(() => {
     if (!state.worktreePreview) return;
     let active = true;
     // Best-effort like the TUI: the backend bounds the request, and an error
     // leaves the original confirmation available rather than blocking a close.
-    void state.worktreePreview().catch(() => null).then((kept) => {
-      if (active) setPreview({ state, kept });
+    void state.worktreePreview().catch(() => null).then((report) => {
+      if (active) setPreview({ state, report });
     });
     return () => { active = false; };
   }, [state]);
@@ -61,10 +71,12 @@ export function ConfirmDialog({ state, onClose }: { state: ConfirmState; onClose
     shown.current = state;
     return () => { shown.current = undefined; };
   }, [state]);
-  const confirm = () => {
-    setBusy(true);
+  const run = (which: "confirm" | "keep", action: () => Promise<void>) => {
+    setBusy(which);
     const asked = state;
-    void asked.action().finally(() => { if (shown.current === asked) onClose(); });
+    void action().finally(() => { if (shown.current === asked) onClose(); });
   };
-  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}<div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={busy || checking} onClick={confirm}>{busy ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button></div></section></div>;
+  const confirm = () => run("confirm", state.action);
+  const keep = state.keepWorktree;
+  return <div ref={placed} className="dialog-backdrop" role="presentation" onMouseDown={onClose}><section ref={ref} tabIndex={-1} className={`confirm-dialog${kept ? " has-worktree-preview" : ""}`} role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" onMouseDown={(event) => event.stopPropagation()}><div className="danger-icon"><CircleStop size={20} /></div><h2 id="confirm-title">{state.title}</h2><p>{state.body}</p>{kept && <p className="worktree-close-preview"><KeptWorktreeText kept={kept} /></p>}<div><button className="button secondary" onClick={onClose}>Cancel</button><button className="button danger" disabled={Boolean(busy) || checking} onClick={confirm}>{busy === "confirm" ? state.busyLabel : checking ? "Checking worktree…" : state.label}</button>{keep && keepPath && <button className="button danger" title={`Keeps ${sanitizeText(keepPath)}`} disabled={Boolean(busy)} onClick={() => run("keep", keep.action)}>{busy === "keep" ? state.busyLabel : keep.label}</button>}</div></section></div>;
 }

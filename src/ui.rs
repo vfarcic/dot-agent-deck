@@ -856,6 +856,20 @@ fn send_daemon_request_blocking_at(
     req: &crate::daemon_protocol::AttachRequest,
     timeout: std::time::Duration,
 ) -> std::io::Result<crate::daemon_protocol::AttachResponse> {
+    send_daemon_request_blocking_with_hello_at(path, req, timeout).map(|(_, resp)| resp)
+}
+
+/// [`send_daemon_request_blocking_at`], also answering the `Hello` reply that
+/// admitted the request — so a caller can read the capabilities of the very
+/// daemon process that answered it (issue #1958's close preview).
+fn send_daemon_request_blocking_with_hello_at(
+    path: &Path,
+    req: &crate::daemon_protocol::AttachRequest,
+    timeout: std::time::Duration,
+) -> std::io::Result<(
+    crate::daemon_protocol::AttachResponse,
+    crate::daemon_protocol::AttachResponse,
+)> {
     // Issue #435: `timeout` is a per-operation deadline, and connect is one of
     // the operations. Connecting through the bare `IpcClient::connect` left it
     // outside the budget entirely — on Unix that call blocks uninterruptibly
@@ -899,7 +913,7 @@ fn send_daemon_request_blocking_at(
     }
 
     write_req_frame_blocking(&mut stream, req)?;
-    read_resp_frame_blocking(&mut stream)
+    read_resp_frame_blocking(&mut stream).map(|resp| (hello, resp))
 }
 
 /// Write one `KIND_REQ` frame carrying `req` to a synchronous writer.
@@ -5456,8 +5470,15 @@ pub enum Action {
     CloseSelected,
     /// PRD #241 M3: the user explicitly picked **Close** in the confirmation
     /// dialog. This is the only action that performs the destructive
-    /// close-pane / close-tab teardown.
+    /// close-pane / close-tab teardown — with
+    /// [`Action::ConfirmCloseKeepWorktree`], its keep-the-worktree twin.
     ConfirmCloseSelected,
+    /// Issue #1958: the user picked **Close, keep worktree** in a confirmation
+    /// armed with a dispatched worktree. The same teardown as
+    /// [`Action::ConfirmCloseSelected`], with every stop it sends asking the
+    /// daemon to keep the worktree; a daemon that cannot keep it refuses and
+    /// nothing is closed.
+    ConfirmCloseKeepWorktree,
     /// PRD #80: toggle the embedded-pane layout between stacked and tiled
     /// (Ctrl+T).
     ToggleLayout,
@@ -6974,7 +6995,8 @@ fn gate_pane_input_key(
 /// resolved close the dialog has to be able to say out loud.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CloseConfirmState {
-    /// 0 = Cancel (default), 1 = Close.
+    /// 0 = Cancel (default), 1 = Close, 2 = Close, keep worktree (only when
+    /// [`Self::dispatched_worktree`] arms it).
     pub selected: usize,
     /// What the confirmed close will actually tear down, decided by
     /// [`resolve_close_plan`] — the same function the confirmed close itself
@@ -6986,7 +7008,7 @@ pub struct CloseConfirmState {
     /// The second thing (after `scope`) the dialog has to be able to say out
     /// loud, and the reason this type is no longer `Copy`: it carries a path,
     /// because recovering the work means going to it. Resolved once at arm time
-    /// by [`kept_worktree_for_plan`] — the dialog describes what was armed, and
+    /// by [`close_preview_for_plan`] — the dialog describes what was armed, and
     /// re-probing every frame would put a `git status` in the render loop.
     ///
     /// It is a PREDICTION, and deliberately used only where a prediction is the
@@ -6997,6 +7019,14 @@ pub struct CloseConfirmState {
     /// about what happened. The post-close report comes from the daemon's own
     /// verdict instead; see [`drain_worktree_kept`].
     pub kept_worktree: Option<KeptWorktree>,
+    /// Issue #1958: the dispatched worktree this close may keep on request —
+    /// `Some` arms the third choice, `Close, keep worktree`
+    /// ([`Action::ConfirmCloseKeepWorktree`]). Filled at arm time only when the
+    /// daemon advertises [`crate::daemon_protocol::CAP_KEEP_WORKTREE`] and its
+    /// close preview names the selection's dispatched worktree, whatever that
+    /// tree's state ([`close_preview_for_plan`]). `None` offers Cancel and
+    /// Close only, as before.
+    pub dispatched_worktree: Option<String>,
 }
 
 /// PRD #241 fact-check follow-up: how much a confirmed close destroys, and
@@ -7123,20 +7153,41 @@ fn tab_id_of(tab: &Tab) -> Option<TabId> {
 }
 
 /// The dialog's options, in render/selection order. Index 0 is the
-/// non-destructive default. Only the confirm option's description changes with
+/// non-destructive default. Only the confirm options' descriptions change with
 /// the scope — Cancel means the same thing either way.
-fn close_confirm_options(scope: CloseScope) -> [(&'static str, &'static str); 2] {
-    match scope {
-        CloseScope::Pane => [
+///
+/// Issue #1958: a dialog armed with a dispatched worktree
+/// ([`CloseConfirmState::dispatched_worktree`]) offers a third option, the
+/// Close label plus `, keep worktree` — the suffix the desktop's close dialogs
+/// use too (CLAUDE.md rule 22).
+fn close_confirm_options(state: &CloseConfirmState) -> Vec<(&'static str, &'static str)> {
+    let mut options = match state.scope {
+        CloseScope::Pane => vec![
             ("Cancel", "keep it open"),
             ("Close", "stop the agent and remove it"),
         ],
-        CloseScope::Tab => [
+        CloseScope::Tab => vec![
             ("Cancel", "keep it open"),
             ("Close", "stop all agents and remove the tab"),
         ],
+    };
+    if state.dispatched_worktree.is_some() {
+        options.push(match state.scope {
+            CloseScope::Pane => (
+                CLOSE_KEEP_WORKTREE_LABEL,
+                "stop the agent, keep its worktree",
+            ),
+            CloseScope::Tab => (
+                CLOSE_KEEP_WORKTREE_LABEL,
+                "stop all agents, keep the worktree",
+            ),
+        });
     }
+    options
 }
+
+/// Issue #1958: the third choice's label, in both scopes.
+const CLOSE_KEEP_WORKTREE_LABEL: &str = "Close, keep worktree";
 
 /// The dialog's question, phrased for what the close will actually take.
 fn close_confirm_header(scope: CloseScope) -> &'static str {
@@ -7147,8 +7198,15 @@ fn close_confirm_header(scope: CloseScope) -> &'static str {
 }
 
 /// How many options the dialog offers — the same for every scope, so the key
-/// handler does not need to know which one is on screen.
-const CLOSE_CONFIRM_OPTION_COUNT: usize = 2;
+/// handler does not need to know which one is on screen. Issue #1958: three
+/// when the dialog was armed with a dispatched worktree it may keep.
+fn close_confirm_option_count(state: &CloseConfirmState) -> usize {
+    if state.dispatched_worktree.is_some() {
+        3
+    } else {
+        2
+    }
+}
 
 /// PRD #241 M3: decide whether a dispatched action needs the close
 /// confirmation, and seed the dialog when it does.
@@ -7187,11 +7245,12 @@ fn arm_close_confirmation(
     prompt: CloseConfirmState,
     target: CloseTarget,
     scope: CloseScope,
-    kept_worktree: Option<KeptWorktree>,
+    preview: ClosePreview,
 ) {
     ui.close_confirm = CloseConfirmState {
         scope,
-        kept_worktree,
+        kept_worktree: preview.kept_worktree,
+        dispatched_worktree: preview.dispatched_worktree,
         ..prompt
     };
     ui.close_confirm_target = Some(target);
@@ -7297,26 +7356,58 @@ fn close_plan_pane_ids(plan: &ClosePlan, tab_manager: &TabManager) -> Vec<String
     }
 }
 
+/// What the close preview told the dialog at arm time: the two things
+/// [`CloseConfirmState`] can say about a dispatched worktree.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ClosePreview {
+    /// Issue #717: the worktree a plain close would leave behind holding
+    /// uncommitted work.
+    kept_worktree: Option<KeptWorktree>,
+    /// Issue #1958: the worktree the close may keep on request.
+    dispatched_worktree: Option<String>,
+}
+
 /// Issue #717: ask the daemon whether confirming `plan` would leave a
-/// dispatched worktree on disk holding uncommitted work.
+/// dispatched worktree on disk holding uncommitted work — and, issue #1958,
+/// which dispatched worktree the close may keep on request.
 ///
 /// The daemon is asked rather than the local filesystem because it owns both
 /// halves of the answer: the removal POLICY lives only in its in-memory
 /// worktree registry, and under a remote deck the worktree is not on this
 /// machine at all. Best-effort throughout — a down daemon, a blown deadline or
-/// an older daemon that does not know the request all resolve to `None`, and
+/// an older daemon that does not know the request all resolve to nothing, and
 /// the dialog then reads exactly as it did before this existed.
-fn kept_worktree_for_plan(plan: &ClosePlan, tab_manager: &TabManager) -> Option<KeptWorktree> {
+///
+/// The keep choice is offered only through
+/// [`crate::daemon_client::WorktreeClosePreview::keep_worktree_choice`], read
+/// against the capabilities of the same daemon process that answered the
+/// preview (its `Hello` on this connection): an older daemon would ignore the
+/// keep and remove a clean worktree, so against it the choice is hidden.
+fn close_preview_for_plan(plan: &ClosePlan, tab_manager: &TabManager) -> ClosePreview {
     let pane_ids = close_plan_pane_ids(plan, tab_manager);
     if pane_ids.is_empty() {
-        return None;
+        return ClosePreview::default();
     }
-    send_daemon_request_blocking_with_timeout(
+    let path = crate::endpoint_resolve::client_attach_socket_path();
+    let Ok((hello, resp)) = send_daemon_request_blocking_with_hello_at(
+        &path,
         &crate::daemon_protocol::AttachRequest::DispatchWorktreeClosePreview { pane_ids },
         CLOSE_PREVIEW_TIMEOUT,
-    )
-    .ok()?
-    .kept_worktree
+    ) else {
+        return ClosePreview::default();
+    };
+    let preview = crate::daemon_client::WorktreeClosePreview {
+        kept_worktree: resp.kept_worktree,
+        dispatched_worktree: resp.dispatched_worktree,
+    };
+    let capabilities = crate::daemon_client::DaemonCapabilities::from_hello(&hello);
+    let dispatched_worktree = preview
+        .keep_worktree_choice(&capabilities)
+        .map(str::to_string);
+    ClosePreview {
+        kept_worktree: preview.kept_worktree,
+        dispatched_worktree,
+    }
 }
 
 /// Issue #717: fit a filesystem path into `max_width` columns by dropping
@@ -7407,7 +7498,11 @@ fn drain_pull_request_launch(state: &SharedState, ui: &mut UiState) {
 /// about a worktree that will be kept. Two sentences, because the probe has two
 /// honest outcomes — see [`KeptWorktree::confirmed_dirty`].
 fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
-    if kept.confirmed_dirty {
+    if kept.on_request {
+        // Issue #1958: the user chose `Close, keep worktree` — the same words
+        // as the desktop's notice.
+        "Worktree kept on request:"
+    } else if kept.confirmed_dirty {
         "! Uncommitted work here is KEPT, not deleted:"
     } else {
         "! Uncommitted work here, if any, is KEPT:"
@@ -7478,8 +7573,10 @@ fn resolve_close_target(
 /// PRD #241 M3: key handling for the close confirmation, modelled on
 /// [`handle_quit_confirm_key`]. Up/Down (or k/j) move the highlight, Enter
 /// commits the highlighted option, and Esc cancels. Only an explicit **Close**
-/// selection returns [`Action::ConfirmCloseSelected`]; everything else that
-/// leaves the dialog returns [`Action::DismissModal`], which is a pure
+/// selection returns [`Action::ConfirmCloseSelected`], and only an explicit
+/// **Close, keep worktree** selection on a dialog armed with one (issue #1958)
+/// returns [`Action::ConfirmCloseKeepWorktree`]; everything else that leaves
+/// the dialog returns [`Action::DismissModal`], which is a pure
 /// return-to-Normal.
 ///
 /// PRD #241 review F5: there is deliberately **no `y` shortcut**. An earlier
@@ -7499,18 +7596,17 @@ pub fn handle_close_confirm_key(state: &mut CloseConfirmState, key: KeyEvent) ->
             Action::Continue
         }
         KeyCode::Down | KeyCode::Char('j') => {
-            if state.selected + 1 < CLOSE_CONFIRM_OPTION_COUNT {
+            if state.selected + 1 < close_confirm_option_count(state) {
                 state.selected += 1;
             }
             Action::Continue
         }
-        KeyCode::Enter => {
-            if state.selected == 1 {
-                Action::ConfirmCloseSelected
-            } else {
-                Action::DismissModal
-            }
-        }
+        KeyCode::Enter => match state.selected {
+            1 => Action::ConfirmCloseSelected,
+            // Issue #1958: only reachable on a dialog armed with a worktree.
+            2 if state.dispatched_worktree.is_some() => Action::ConfirmCloseKeepWorktree,
+            _ => Action::DismissModal,
+        },
         KeyCode::Esc => Action::DismissModal,
         _ => Action::Continue,
     }
@@ -10929,13 +11025,17 @@ fn hit_test_card(card_rects: &[(usize, Rect)], col: u16, row: u16) -> Option<usi
 /// and a confirmed close on a dashboard card whose pane lives inside such a tab
 /// — resolves to [`ClosePlan::Tab`] and lands here, so they cannot drift apart
 /// in what they remove or what they report.
+///
+/// Issue #1958: `keep_worktree` asks the daemon, on every role's stop, to keep
+/// the dispatched worktree the tab's roles share.
 fn close_tab_by_index(
     idx: usize,
     ui: &mut UiState,
     state: &SharedState,
     tab_manager: &mut TabManager,
+    keep_worktree: bool,
 ) {
-    match tab_manager.close_tab(idx) {
+    match tab_manager.close_tab_with(idx, keep_worktree) {
         Ok(outcome) => {
             let mut st = state.blocking_write();
             for id in &outcome.closed {
@@ -10960,6 +11060,19 @@ fn close_tab_by_index(
             }
             if outcome.is_clean() {
                 ui.status_message = Some(("Closed tab".to_string(), std::time::Instant::now()));
+            } else if outcome.closed.is_empty()
+                && outcome
+                    .failed
+                    .iter()
+                    .all(|(_, e)| e == crate::daemon_client::KEEP_WORKTREE_UNSUPPORTED)
+            {
+                // Issue #1958: the daemon cannot keep the worktree, so no role
+                // was stopped — a refusal, said as one (the sentence says
+                // nothing was closed), not a partial close to retry.
+                ui.status_message = Some((
+                    crate::daemon_client::KEEP_WORKTREE_UNSUPPORTED.to_string(),
+                    std::time::Instant::now(),
+                ));
             } else {
                 let first_err = outcome
                     .failed
@@ -11342,11 +11455,13 @@ fn dispatch_action(
                 let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
                 // Issue #717: and the SAME plan decides whether this close
                 // would leave a dispatched worktree behind, so the sentence and
-                // the warning describe one resolution rather than two.
-                let kept = plan
+                // the warning describe one resolution rather than two. Issue
+                // #1958: and whether it may keep that worktree on request.
+                let preview = plan
                     .as_ref()
-                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
-                arm_close_confirmation(ui, prompt, target, scope, kept);
+                    .map(|plan| close_preview_for_plan(plan, tab_manager))
+                    .unwrap_or_default();
+                arm_close_confirmation(ui, prompt, target, scope, preview);
             }
             // No target (PRD #113 finding 2: an inactive dashboard selection
             // means nothing is armed) — stay exactly as silent as before, and
@@ -11358,7 +11473,15 @@ fn dispatch_action(
         //
         // PRD #92 F4: inspect each close result and preserve the card / session
         // on failure so the user can see the error and retry.
-        Action::ConfirmCloseSelected => {
+        action @ (Action::ConfirmCloseSelected | Action::ConfirmCloseKeepWorktree) => {
+            // Issue #1958: the keep rides on every stop of this close — only
+            // when the dialog was armed with a worktree to keep, so no other
+            // door can send a keep the daemon never offered.
+            let keep_worktree = matches!(action, Action::ConfirmCloseKeepWorktree);
+            if keep_worktree && ui.close_confirm.dispatched_worktree.is_none() {
+                return Flow::Continue;
+            }
+            ui.close_confirm.dispatched_worktree = None;
             // Leaving the modal is unconditional — whether the teardown
             // succeeds or is preserved for retry, the dialog is done. Taking
             // the target also disarms it, so a second confirmation cannot
@@ -11402,7 +11525,7 @@ fn dispatch_action(
                 // live in such a tab — which is why the dialog said "this tab
                 // and all its panes" either way.
                 Some(ClosePlan::Tab { index }) => {
-                    close_tab_by_index(index, ui, state, tab_manager);
+                    close_tab_by_index(index, ui, state, tab_manager, keep_worktree);
                 }
                 // Plain dashboard pane — close just this one and inspect the
                 // result. PRD #92 F4: preserve the card / session on failure so
@@ -11423,7 +11546,12 @@ fn dispatch_action(
                             .map(|card| card.incarnation.clone())
                             .unwrap_or_default(),
                     );
-                    match pane.close_card(&card) {
+                    let closed = if keep_worktree {
+                        pane.close_card_keeping_worktree(&card)
+                    } else {
+                        pane.close_card(&card)
+                    };
+                    match closed {
                         Ok(()) => {
                             let mut st = state.blocking_write();
                             st.sessions.remove(&session_id);
@@ -11545,10 +11673,11 @@ fn dispatch_action(
                 let target = CloseTarget::Tab(id);
                 let plan = resolve_close_plan(&target, tab_manager, snapshot);
                 let scope = plan.as_ref().map_or(CloseScope::Pane, ClosePlan::scope);
-                let kept = plan
+                let preview = plan
                     .as_ref()
-                    .and_then(|plan| kept_worktree_for_plan(plan, tab_manager));
-                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope, kept);
+                    .map(|plan| close_preview_for_plan(plan, tab_manager))
+                    .unwrap_or_default();
+                arm_close_confirmation(ui, CloseConfirmState::default(), target, scope, preview);
             }
         }
         // PRD #80 M4 / PRD #83: single-click a card → select exactly that card
@@ -21108,7 +21237,11 @@ fn render_close_confirm(
         .try_into()
         .unwrap_or(u16::MAX);
     let popup_width = want_width.max(64).min(area.width.saturating_sub(4));
-    let popup_height = CLOSE_CONFIRM.popup_height(kept_lines, area);
+    // Issue #1958: the keep choice is one more option row, below the first
+    // choice, so it grows the popup without moving the choices.
+    let options = close_confirm_options(state);
+    let extra_options: u16 = (options.len() - 2).try_into().unwrap_or(0);
+    let popup_height = CLOSE_CONFIRM.popup_height(kept_lines + extra_options, area);
     let x = (area.width.saturating_sub(popup_width)) / 2;
     let y = (area.height.saturating_sub(popup_height)) / 2;
     let popup_area = Rect::new(x, y, popup_width, popup_height);
@@ -21145,7 +21278,15 @@ fn render_close_confirm(
         text.push(Line::from(""));
     }
 
-    for (i, (label, desc)) in close_confirm_options(state.scope).iter().enumerate() {
+    // The labels share one column; seven wide, as always, unless a longer
+    // label (issue #1958's keep choice) is drawn.
+    let label_width = options
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(7);
+    for (i, (label, desc)) in options.iter().enumerate() {
         let cursor = if i == selected { ">" } else { " " };
         let style = if i == selected {
             Style::default()
@@ -21155,7 +21296,7 @@ fn render_close_confirm(
             text_primary()
         };
         text.push(Line::styled(
-            format!("  {cursor} {label:<7} \u{2014} {desc}"),
+            format!("  {cursor} {label:<label_width$} \u{2014} {desc}"),
             style,
         ));
     }
@@ -21177,12 +21318,20 @@ fn render_close_confirm(
         .border_style(Style::default().fg(Color::Yellow));
     frame.render_widget(Paragraph::new(text).block(block), popup_area);
 
-    // Clickable equivalents of the two options, on the blank row above the
+    // Clickable equivalents of the options, on the blank row above the
     // keyboard hint (same placement as the quit dialog's button row).
-    let buttons = [
+    let mut buttons = vec![
         Button::new("Cancel", "", Action::DismissModal, true),
         Button::new("Close", "", Action::ConfirmCloseSelected, true),
     ];
+    if state.dispatched_worktree.is_some() {
+        buttons.push(Button::new(
+            CLOSE_KEEP_WORKTREE_LABEL,
+            "",
+            Action::ConfirmCloseKeepWorktree,
+            true,
+        ));
+    }
     let btn_row = Rect {
         x: popup_area.x + 1,
         y: popup_area.y + popup_area.height.saturating_sub(3),
@@ -21194,7 +21343,7 @@ fn render_close_confirm(
         choices: CLOSE_CONFIRM.choices(
             popup_area,
             kept_lines,
-            close_confirm_options(state.scope).map(|(label, _)| label),
+            options.iter().map(|(label, _)| *label),
             selected,
         ),
     }

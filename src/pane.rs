@@ -113,15 +113,35 @@ pub fn close_panes_concurrently(
     controller: &dyn PaneController,
     pane_ids: &[String],
 ) -> CloseTabOutcome {
+    close_panes_concurrently_with(controller, pane_ids, false)
+}
+
+/// Issue #1958: [`close_panes_concurrently`], keeping the dispatched worktree
+/// when `keep_worktree` is set — every pane goes through
+/// [`PaneController::close_pane_keeping_worktree`]: the daemon keeps the tree
+/// at the first stop that carries the keep, so carrying it on every stop keeps
+/// the tree whichever one the daemon handles first.
+pub fn close_panes_concurrently_with(
+    controller: &dyn PaneController,
+    pane_ids: &[String],
+    keep_worktree: bool,
+) -> CloseTabOutcome {
+    let close = move |id: &str| {
+        if keep_worktree {
+            controller.close_pane_keeping_worktree(id)
+        } else {
+            controller.close_pane(id)
+        }
+    };
     let mut outcome = CloseTabOutcome::default();
     match pane_ids {
         [] => {}
-        [only] => outcome.record(only.clone(), controller.close_pane(only)),
+        [only] => outcome.record(only.clone(), close(only)),
         many => {
             let results = std::thread::scope(|scope| {
                 let handles: Vec<_> = many
                     .iter()
-                    .map(|id| scope.spawn(move || controller.close_pane(id)))
+                    .map(|id| scope.spawn(move || close(id)))
                     .collect();
                 handles
                     .into_iter()
@@ -482,6 +502,22 @@ pub trait PaneController: Send + Sync {
     /// is `close_pane`, for controllers with no daemon behind them.
     fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
         self.close_pane(&card.pane_id)
+    }
+    /// Issue #1958: [`Self::close_pane`], asking the daemon to keep the
+    /// dispatched worktree the pane's agent runs in instead of removing it.
+    /// A controller that cannot ask refuses with nothing closed — never a
+    /// plain close, which could remove the worktree the user asked to keep.
+    /// The default has no daemon behind it and refuses; the daemon-backed
+    /// `EmbeddedPaneController` overrides it.
+    fn close_pane_keeping_worktree(&self, _pane_id: &str) -> Result<(), PaneError> {
+        Err(PaneError::Refused(
+            "this deck cannot keep a worktree on close; nothing was closed".to_string(),
+        ))
+    }
+    /// Issue #1958: [`Self::close_card`], keeping the dispatched worktree —
+    /// see [`Self::close_pane_keeping_worktree`].
+    fn close_card_keeping_worktree(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.close_pane_keeping_worktree(&card.pane_id)
     }
     /// PRD #1666 part 2 (G-fix7): focus the local pane behind a dashboard
     /// card, only when it is the card's — attached on the daemon process the

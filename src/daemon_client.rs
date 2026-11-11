@@ -93,7 +93,22 @@ pub enum ClientError {
     /// request fails closed. Both clients show [`AGENT_IDENTITY_UNKNOWN`].
     #[error("{AGENT_IDENTITY_UNKNOWN}")]
     DaemonUnnamed,
+    /// Issue #1958: a close that asked to keep its worktree reached a daemon
+    /// that does not advertise [`crate::daemon_protocol::CAP_KEEP_WORKTREE`],
+    /// so nothing was sent — that daemon would ignore the request to keep and
+    /// remove a clean worktree. See
+    /// [`DaemonClient::stop_agent_keeping_worktree`].
+    #[error("{KEEP_WORKTREE_UNSUPPORTED}")]
+    KeepWorktreeUnsupported,
 }
+
+/// Issue #1958: what a client says when a close that asked to keep its
+/// worktree is refused because the daemon cannot keep one
+/// ([`ClientError::KeepWorktreeUnsupported`],
+/// [`CloseAgentsError::KeepWorktreeUnsupported`]). Nothing was closed.
+pub const KEEP_WORKTREE_UNSUPPORTED: &str = "the running deck daemon cannot keep a worktree on \
+     close (it is older than this client); nothing was closed — restart the deck daemon on this \
+     version, or close without keeping the worktree";
 
 /// PRD #1666 part 2 (G-fix4): what both clients say when an action aimed at an
 /// agent is refused because the deck restarted since the agent was listed
@@ -231,6 +246,11 @@ pub enum CloseAgentsError {
     /// The daemon does not advertise the capability. Nothing was sent.
     #[error("the running daemon{} is too old for `close`", .daemon_version.as_deref().map(|v| format!(" ({v})")).unwrap_or_default())]
     TooOld { daemon_version: Option<String> },
+    /// Issue #1958: the close asked to keep its worktrees and the daemon does
+    /// not advertise [`crate::daemon_protocol::CAP_KEEP_WORKTREE`]. Nothing was
+    /// sent: that daemon would ignore the keep and remove clean worktrees.
+    #[error("the running daemon{} cannot keep a worktree on close (`--keep-worktree`); nothing was closed — restart the deck daemon on this version, or close without `--keep-worktree`", .daemon_version.as_deref().map(|v| format!(" ({v})")).unwrap_or_default())]
+    KeepWorktreeUnsupported { daemon_version: Option<String> },
     /// No daemon answered at the attach endpoint.
     #[error("no daemon is reachable: {0}")]
     Unreachable(io::Error),
@@ -1346,6 +1366,38 @@ impl DaemonCapabilities {
     /// that only needs to decide whether to offer a launch.
     pub fn supports_prepare_orchestration(&self) -> bool {
         self.prepare_orchestration_spelling().is_ok()
+    }
+
+    /// Issue #1958: whether this daemon can close and keep the worktree
+    /// ([`crate::daemon_protocol::CAP_KEEP_WORKTREE`]). A client offers the
+    /// choice only when this holds and the close preview names a dispatched
+    /// worktree — [`WorktreeClosePreview::keep_worktree_choice`] asks both.
+    pub fn supports_keep_worktree(&self) -> bool {
+        self.supports(crate::daemon_protocol::CAP_KEEP_WORKTREE)
+    }
+}
+
+/// Issue #717 / #1958: what [`DaemonClient::worktree_close_preview`] learned
+/// about closing a set of panes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorktreeClosePreview {
+    /// The dispatched worktree the close would leave behind holding
+    /// uncommitted work (or whose state could not be checked in time).
+    pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// The dispatched worktree the panes own, whatever its state. Only a
+    /// daemon that advertises [`crate::daemon_protocol::CAP_KEEP_WORKTREE`]
+    /// answers it.
+    pub dispatched_worktree: Option<String>,
+}
+
+impl WorktreeClosePreview {
+    /// The worktree to offer "close, keep worktree" for: the dispatched
+    /// worktree, when `capabilities` — the set the caller already holds for
+    /// this daemon — advertise the keep. `None` means offer no such choice.
+    pub fn keep_worktree_choice(&self, capabilities: &DaemonCapabilities) -> Option<&str> {
+        self.dispatched_worktree
+            .as_deref()
+            .filter(|_| capabilities.supports_keep_worktree())
     }
 }
 
@@ -3559,12 +3611,20 @@ impl DaemonClient {
     /// the one that answered, and the request goes on that same connection
     /// (`Hello`'s `follow_on`), so the daemon that answers it is the one whose
     /// reply advertised the verb.
+    ///
+    /// Issue #1958: `keep_worktree` asks the daemon to keep every worktree the
+    /// close frees. **Against a daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_KEEP_WORKTREE`] it is a HARD error
+    /// ([`CloseAgentsError::KeepWorktreeUnsupported`]) with nothing sent** —
+    /// never a plain close, which would remove the clean worktrees the caller
+    /// asked to keep. The field is never sent when `false`.
     pub async fn close_agents(
         &self,
         selector: crate::daemon_protocol::CloseSelector,
         caller: Option<crate::daemon_protocol::CallerClaim>,
         force: bool,
         dry_run: bool,
+        keep_worktree: bool,
     ) -> Result<crate::daemon_protocol::CloseReport, CloseAgentsError> {
         // One connection for the check and the request (review on PR #1681):
         // a second connection could reach a daemon that replaced this one
@@ -3602,6 +3662,11 @@ impl DaemonClient {
                 daemon_version: hello.daemon_version.or(hello.build_version),
             });
         }
+        if keep_worktree && !capabilities.supports_keep_worktree() {
+            return Err(CloseAgentsError::KeepWorktreeUnsupported {
+                daemon_version: hello.daemon_version.or(hello.build_version),
+            });
+        }
         let resp = issue_command(
             &mut rd,
             &mut wr,
@@ -3610,6 +3675,7 @@ impl DaemonClient {
                 caller,
                 force,
                 dry_run,
+                keep_worktree,
             },
         )
         .await
@@ -3702,7 +3768,10 @@ impl DaemonClient {
         let resp = issue_command(
             &mut rd,
             &mut wr,
-            &AttachRequest::StopAgent { id: id.to_string() },
+            &AttachRequest::StopAgent {
+                id: id.to_string(),
+                keep_worktree: false,
+            },
         )
         .await?;
         if !resp.ok {
@@ -3713,12 +3782,99 @@ impl DaemonClient {
         Ok(())
     }
 
+    /// Issue #1958: [`Self::stop_agent`], keeping the dispatched worktree the
+    /// agent was started in, whatever else still runs there: the daemon drops
+    /// its record of the tree before it stops the agent, so no later close
+    /// removes it. Closing an orchestration, send it for EVERY role, so the
+    /// tree is kept whichever stop the daemon handles first.
+    ///
+    /// **A daemon that does not advertise
+    /// [`crate::daemon_protocol::CAP_KEEP_WORKTREE`] is a HARD error
+    /// ([`ClientError::KeepWorktreeUnsupported`]) with nothing sent**, never a
+    /// plain stop: that daemon would ignore the keep and remove a clean
+    /// worktree. The capability is read from a `Hello` on the connection that
+    /// then carries the stop (`follow_on`), so the daemon that stops the agent
+    /// is the one that said it can keep — the same shape as
+    /// [`Self::close_agents`]. On a gated or bound handle that `Hello` is also
+    /// the protocol and binding check [`Self::stop_agent`] makes.
+    pub async fn stop_agent_keeping_worktree(&self, id: &str) -> Result<(), ClientError> {
+        let (mut rd, mut wr) = self.keep_worktree_connect().await?;
+        let resp = issue_command(
+            &mut rd,
+            &mut wr,
+            &AttachRequest::StopAgent {
+                id: id.to_string(),
+                keep_worktree: true,
+            },
+        )
+        .await?;
+        if !resp.ok {
+            return Err(ClientError::Server(
+                resp.error.unwrap_or_else(|| "stop-agent failed".into()),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The connection [`Self::stop_agent_keeping_worktree`] sends on: one whose
+    /// own `Hello` (with `follow_on`) advertised
+    /// [`crate::daemon_protocol::CAP_KEEP_WORKTREE`], or
+    /// [`ClientError::KeepWorktreeUnsupported`] with nothing sent.
+    async fn keep_worktree_connect(
+        &self,
+    ) -> Result<(TransportReadHalf, TransportWriteHalf), ClientError> {
+        let (rd, wr, capabilities) = if self.protocol_gate || self.bound.is_some() {
+            let (rd, wr, capabilities, _) = self.protocol_hello(true).await?;
+            (rd, wr, capabilities)
+        } else {
+            let (mut rd, mut wr) = self.connect().await?;
+            let resp = issue_command(
+                &mut rd,
+                &mut wr,
+                &AttachRequest::Hello {
+                    client_version: crate::daemon_protocol::PROTOCOL_VERSION,
+                    client_build_version: None,
+                    follow_on: true,
+                },
+            )
+            .await?;
+            if !resp.ok {
+                return Err(ClientError::Server(
+                    resp.error
+                        .unwrap_or_else(|| "handshake failed before stop".into()),
+                ));
+            }
+            let capabilities = self.store_capabilities_from_hello(&resp);
+            (rd, wr, capabilities)
+        };
+        if !capabilities.supports_keep_worktree()
+            || !capabilities.supports(crate::daemon_protocol::CAP_HELLO_FOLLOW_ON)
+        {
+            return Err(ClientError::KeepWorktreeUnsupported);
+        }
+        Ok((rd, wr))
+    }
+
     /// Ask what closing these panes would keep, on the admitted daemon process.
     /// Uses the existing v8 request; callers bound their best-effort UI hint.
+    /// [`Self::worktree_close_preview`] also answers which dispatched worktree
+    /// the panes own.
     pub async fn dispatch_worktree_close_preview(
         &self,
         pane_ids: Vec<String>,
     ) -> Result<Option<crate::issue_dispatch_run::KeptWorktree>, ClientError> {
+        Ok(self.worktree_close_preview(pane_ids).await?.kept_worktree)
+    }
+
+    /// Issue #1958: [`Self::dispatch_worktree_close_preview`], with the
+    /// dispatched worktree the panes own whatever its state
+    /// ([`WorktreeClosePreview::dispatched_worktree`]) — `None` from a daemon
+    /// older than [`crate::daemon_protocol::CAP_KEEP_WORKTREE`]. Offer the keep
+    /// choice through [`WorktreeClosePreview::keep_worktree_choice`].
+    pub async fn worktree_close_preview(
+        &self,
+        pane_ids: Vec<String>,
+    ) -> Result<WorktreeClosePreview, ClientError> {
         let (mut rd, mut wr) = self.admitted_connect().await?;
         let resp = issue_command(
             &mut rd,
@@ -3732,7 +3888,10 @@ impl DaemonClient {
                     .unwrap_or_else(|| "worktree close preview failed".into()),
             ));
         }
-        Ok(resp.kept_worktree)
+        Ok(WorktreeClosePreview {
+            kept_worktree: resp.kept_worktree,
+            dispatched_worktree: resp.dispatched_worktree,
+        })
     }
 
     /// PRD #76 M2.17: open a long-lived `SubscribeEvents` connection.
@@ -5713,6 +5872,239 @@ mod tests {
         drop(dir);
     }
 
+    /// Issue #1958: a fake daemon that answers `Hello` with `advertised` and
+    /// serves every later request on the same connection, recording each
+    /// non-hello request. Each answer carries a close report, a dispatched
+    /// worktree and a kept worktree, so every caller gets something to read.
+    #[cfg(unix)]
+    async fn keep_worktree_fake_daemon(
+        advertised: Option<&'static [&'static str]>,
+    ) -> (
+        TempDir,
+        PathBuf,
+        Arc<Mutex<Vec<serde_json::Value>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (dir, path, listener) = {
+            let _g = BIND_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("keep-daemon.sock");
+            let listener = bind_attach_listener(&path).expect("bind fake daemon");
+            (dir, path, listener)
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server_seen = seen.clone();
+        let server = tokio::spawn(async move {
+            while let Ok(Ok(mut stream)) =
+                tokio::time::timeout(std::time::Duration::from_millis(500), listener.accept()).await
+            {
+                while let Ok(Some((KIND_REQ, payload))) = read_frame(&mut stream).await {
+                    let request: serde_json::Value =
+                        serde_json::from_slice(&payload).expect("decode request");
+                    let response = if request["op"] == "hello" {
+                        AttachResponse {
+                            capabilities: advertised
+                                .map(|list| list.iter().map(|cap| cap.to_string()).collect()),
+                            daemon_version: Some("0.40.2".to_string()),
+                            ..AttachResponse::hello(PROTOCOL_VERSION)
+                        }
+                    } else {
+                        server_seen.lock().unwrap().push(request);
+                        AttachResponse {
+                            close_report: Some(crate::daemon_protocol::CloseReport::default()),
+                            dispatched_worktree: Some("/w/unit".to_string()),
+                            kept_worktree: Some(crate::issue_dispatch_run::KeptWorktree {
+                                path: "/w/unit".to_string(),
+                                confirmed_dirty: true,
+                                on_request: false,
+                            }),
+                            ..AttachResponse::ok()
+                        }
+                    };
+                    if crate::daemon_protocol::write_resp(&mut stream, &response)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }
+        });
+        (dir, path, seen, server)
+    }
+
+    /// Issue #1958 (U2): a stop or close that asks to keep its worktree is a
+    /// HARD error against a daemon that does not advertise `keep-worktree`
+    /// (or cannot serve the request on the checked connection), and nothing
+    /// reaches it — that daemon would ignore the keep and remove a clean tree.
+    /// Advertised, the keep goes out; and a plain stop or close never carries
+    /// the field at all.
+    #[cfg(unix)]
+    #[test]
+    fn keep_worktree_is_withheld_and_refused_hard_by_a_daemon_that_does_not_advertise_it() {
+        use crate::daemon_protocol::{
+            CAP_CLOSE_AGENTS, CAP_HELLO_FOLLOW_ON, CAP_KEEP_WORKTREE, CloseSelector,
+        };
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build fake-daemon runtime");
+        runtime.block_on(async {
+            let without: [Option<&'static [&'static str]>; 4] = [
+                None,
+                Some(&[CAP_CLOSE_AGENTS, CAP_HELLO_FOLLOW_ON]),
+                Some(&[CAP_KEEP_WORKTREE]),
+                Some(&[CAP_KEEP_WORKTREE, CAP_CLOSE_AGENTS]),
+            ];
+            for advertised in without {
+                let (dir, path, seen, server) = keep_worktree_fake_daemon(advertised).await;
+                let client = DaemonClient::new(path);
+                let err = client
+                    .stop_agent_keeping_worktree("7")
+                    .await
+                    .expect_err("an older daemon must refuse the keep, not get a plain stop");
+                assert!(
+                    matches!(err, ClientError::KeepWorktreeUnsupported),
+                    "advertised {advertised:?}: {err:?}"
+                );
+                assert_eq!(err.to_string(), KEEP_WORKTREE_UNSUPPORTED);
+                let err = client
+                    .close_agents(CloseSelector::AllUnits, None, false, true, true)
+                    .await
+                    .expect_err("an older daemon must refuse the keep, not get a plain close");
+                assert!(
+                    matches!(
+                        err,
+                        CloseAgentsError::KeepWorktreeUnsupported { .. }
+                            | CloseAgentsError::TooOld { .. }
+                    ),
+                    "advertised {advertised:?}: {err:?}"
+                );
+                server.await.unwrap();
+                assert!(
+                    seen.lock().unwrap().is_empty(),
+                    "advertised {advertised:?}: nothing may be sent: {:?}",
+                    seen.lock().unwrap()
+                );
+                drop(dir);
+            }
+
+            // A daemon that can close but not keep: the close is refused as
+            // a keep the daemon cannot make, naming its version.
+            let (dir, path, seen, server) =
+                keep_worktree_fake_daemon(Some(&[CAP_CLOSE_AGENTS, CAP_HELLO_FOLLOW_ON])).await;
+            let err = DaemonClient::new(path.clone())
+                .close_agents(CloseSelector::AllUnits, None, false, true, true)
+                .await
+                .expect_err("refused");
+            match &err {
+                CloseAgentsError::KeepWorktreeUnsupported { daemon_version } => {
+                    assert_eq!(daemon_version.as_deref(), Some("0.40.2"));
+                }
+                other => panic!("expected KeepWorktreeUnsupported, got {other:?}"),
+            }
+            // ... and the same close without the keep goes out, without the
+            // field.
+            DaemonClient::new(path)
+                .close_agents(CloseSelector::AllUnits, None, false, true, false)
+                .await
+                .expect("a plain close is unaffected");
+            server.await.unwrap();
+            {
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 1, "{seen:?}");
+                assert_eq!(seen[0]["op"], "close-agents");
+                assert!(seen[0].get("keep_worktree").is_none(), "{:?}", seen[0]);
+            }
+            drop(dir);
+
+            // Advertised: the keep is sent, on both verbs; a plain stop
+            // carries no field.
+            let (dir, path, seen, server) = keep_worktree_fake_daemon(Some(&[
+                CAP_CLOSE_AGENTS,
+                CAP_HELLO_FOLLOW_ON,
+                CAP_KEEP_WORKTREE,
+            ]))
+            .await;
+            let client = DaemonClient::new(path);
+            client
+                .stop_agent_keeping_worktree("7")
+                .await
+                .expect("an advertising daemon is sent the keep");
+            client
+                .close_agents(CloseSelector::AllUnits, None, false, true, true)
+                .await
+                .expect("an advertising daemon is sent the keep");
+            client.stop_agent("8").await.expect("plain stop");
+            server.await.unwrap();
+            {
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), 3, "{seen:?}");
+                assert_eq!(seen[0]["op"], "stop-agent");
+                assert_eq!(seen[0]["id"], "7");
+                assert_eq!(seen[0]["keep_worktree"], true);
+                assert_eq!(seen[1]["op"], "close-agents");
+                assert_eq!(seen[1]["keep_worktree"], true);
+                assert_eq!(seen[2]["op"], "stop-agent");
+                assert!(seen[2].get("keep_worktree").is_none(), "{:?}", seen[2]);
+            }
+            drop(dir);
+        });
+    }
+
+    /// Issue #1958 (U2): the preview answers the dispatched worktree beside
+    /// the kept one, and the keep choice is offered only when the capability
+    /// set the caller holds advertises `keep-worktree`.
+    #[cfg(unix)]
+    #[test]
+    fn the_close_preview_names_the_dispatched_worktree_and_gates_the_keep_choice() {
+        use crate::daemon_protocol::CAP_KEEP_WORKTREE;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("build fake-daemon runtime");
+        runtime.block_on(async {
+            let (dir, path, _seen, server) = keep_worktree_fake_daemon(None).await;
+            let client = DaemonClient::new(path);
+            let preview = client
+                .worktree_close_preview(vec!["p1".to_string()])
+                .await
+                .expect("preview");
+            assert_eq!(preview.dispatched_worktree.as_deref(), Some("/w/unit"));
+            assert_eq!(
+                preview.kept_worktree.as_ref().map(|k| k.path.as_str()),
+                Some("/w/unit")
+            );
+            // The older entry point still answers the kept half alone.
+            let kept = client
+                .dispatch_worktree_close_preview(vec!["p1".to_string()])
+                .await
+                .expect("preview");
+            assert_eq!(kept, preview.kept_worktree);
+            server.await.unwrap();
+            drop(dir);
+
+            let advertising = DaemonCapabilities::from_hello(&AttachResponse {
+                capabilities: Some(vec![CAP_KEEP_WORKTREE.to_string()]),
+                ..AttachResponse::ok()
+            });
+            assert!(advertising.supports_keep_worktree());
+            assert_eq!(preview.keep_worktree_choice(&advertising), Some("/w/unit"));
+            assert!(!DaemonCapabilities::absent().supports_keep_worktree());
+            assert_eq!(
+                preview.keep_worktree_choice(&DaemonCapabilities::absent()),
+                None
+            );
+            assert_eq!(
+                WorktreeClosePreview::default().keep_worktree_choice(&advertising),
+                None,
+                "no dispatched worktree, no choice"
+            );
+        });
+    }
+
     /// PRD #1589 — `close` against a daemon that does not advertise
     /// `close-agents` is a HARD error naming the daemon's version, and the
     /// request never reaches the socket: unlike `focus-gained`'s silent
@@ -5923,6 +6315,7 @@ mod tests {
                     },
                 ),
                 None,
+                false,
                 false,
                 false,
             )
@@ -6204,6 +6597,7 @@ mod tests {
                     None,
                     false,
                     true,
+                    false,
                 )
                 .await
                 .expect("the daemon that advertised the verb answers it");
@@ -6231,6 +6625,7 @@ mod tests {
                 None,
                 false,
                 true,
+                false,
             )
             .await
             .expect_err("no daemon");

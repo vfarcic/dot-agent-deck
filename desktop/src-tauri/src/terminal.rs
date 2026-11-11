@@ -3128,7 +3128,7 @@ mod tests {
         // The row the scripted deck listed carries the process its `Hello`
         // names (PRD #1666 part 2, G-fix4/G-fix5).
         let listed = fixture_incarnation();
-        let stopping = crate::stop_agent_action(&state, &wire_a, "planner", &listed);
+        let stopping = crate::stop_agent_action(&state, &wire_a, "planner", &listed, false);
         let moving = async {
             stop_arrived_rx
                 .await

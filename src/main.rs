@@ -282,6 +282,11 @@ enum Commands {
         /// Print the report as JSON.
         #[arg(long)]
         json: bool,
+        /// Keep the worktree of each unit this closes, even when it has no
+        /// uncommitted changes. `dot-agent-deck worktree reclaim` finds it
+        /// later.
+        #[arg(long = "keep-worktree")]
+        keep_worktree: bool,
     },
     /// List the live agents with their folder, orchestration and role, and
     /// which one is each orchestration's orchestrator — the agent to message
@@ -2283,6 +2288,7 @@ fn main() -> ExitCode {
             dry_run,
             force,
             json,
+            keep_worktree,
         }) => {
             let args = dot_agent_deck::close_cli::CloseArgs {
                 units,
@@ -2294,6 +2300,7 @@ fn main() -> ExitCode {
                 dry_run,
                 force,
                 json,
+                keep_worktree,
             };
             run_close_cli(args)
         }

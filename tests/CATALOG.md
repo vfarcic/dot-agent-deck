@@ -2308,7 +2308,7 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 ##### prompt/close-confirm/001 — Command-mode Ctrl+W opens a Cancel-default close confirmation.
 - **Layer:** L1 (in-process key mapper + close-confirm state + ratatui `TestBackend`).
 - **Agent:** none.
-- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default.
+- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default; with no keep-worktree choice armed (nothing dispatched in the selection, or a daemon without the keep capability) neither scope draws a `keep worktree` choice, and Down twice from Cancel stops on Close, whose Enter is `ConfirmCloseSelected` (issue #1958).
 - **Does not assert:** daemon teardown after confirmation (covered by `lifecycle/stop/*` and `dashboard/pane/002`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -2369,6 +2369,27 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Asserts:** after Ctrl+W arms a card whose session id is `{pane_id}-session`, a second `SessionStart` under that SAME id differing ONLY in `agent_id` takes the pane; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than tearing down the replacement generation.
 - **Why it exists:** `prompt/close-confirm/005` proves the vanishing case through a session id that goes away, which is the easy half — the key stops resolving and the close cannot land anywhere. Pi's producer key is derived from the pane and is stable across respawns, so it never stops resolving, and an armed target keyed on the id alone resolved straight onto whichever generation currently occupied the pane. The fix arms on the generation (session id plus `agent_id`), which is only detectable because #284 refreshes `agent_id` in place on the surviving entry.
 - **Does not assert:** the state seam's own supersession rule (`status/supersede/005`); tab identity binding (`mouse/tabstrip/003`); that a `None` → `Some` identity transition is treated as the same card (a deliberate agreement with the state seam, unit-tested at `resolve_close_plan`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/011 — A close whose selection has a dispatched worktree the daemon can keep offers `Close, keep worktree` as a third choice (issue #1958).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`, plus `handle_close_confirm_key`).
+- **Agent:** none.
+- **Asserts:** a `CloseConfirmState` armed with `dispatched_worktree: Some(path)` draws Cancel, Close and `Close, keep worktree` top to bottom in both the pane scope and the tab scope (each with its own header and Close description), Cancel stays the default, and the keyboard hint is still inside the popup — also with the dirty-tree warning drawn above the choices; Down twice from Cancel reaches the keep choice and stops there, Enter on it returns `Action::ConfirmCloseKeepWorktree`, Enter on Close still returns `Action::ConfirmCloseSelected` and Enter on Cancel `Action::DismissModal`.
+- **Does not assert:** how the TUI decides to arm it (the daemon's `CAP_KEEP_WORKTREE` and the close preview's `dispatched_worktree`, unit-tested in `daemon_client`), the keep row's description, mouse buttons, or the close itself (`prompt/close-confirm/012`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/012 — Ctrl+W's `Close, keep worktree` closes a clean dispatched unit and keeps its worktree, saying so on the status line (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
+- **Agent:** none — identity-recording `cat` probe.
+- **Asserts:** with a clean dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its card selected, Ctrl+W draws Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes the agent, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk.
+- **Does not assert:** the tab/orchestration scope in the TUI (`prompt/close-confirm/013`), a daemon without the keep capability, or a real agent.
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/013 — Ctrl+W's `Close, keep worktree` on a dispatched team's tab stops both roles and keeps their shared worktree (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --orchestration`).
+- **Agent:** none — identity-recording `cat` probes for both roles.
+- **Asserts:** with a clean two-role dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its tab active, Ctrl+W draws `Close this tab and all its agents?` with Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes both roles and the tab, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk. Fails if `TabManager::close_tab_with` drops the keep on its fan-out.
+- **Does not assert:** a keep on one role of a team followed by an ordinary close of the other (the daemon-level `close_agents::tests::keeping_on_one_role_survives_an_ordinary_close_of_the_last`), a daemon without the keep capability, or a real agent.
 - **Platform coverage:** mac+linux.
 
 #### prompt/pane-input
@@ -3655,6 +3676,20 @@ Issue #2051: the deck's OpenCode plugin under the real, pinned OpenCode binaries
 - **Agent:** none (six hydrated orchestration role panes with staggered 150–400 ms synthetic close delays).
 - **Asserts:** the close completes below a 1.0-second wall-clock ceiling versus a 1.65-second sequential sum, reports closed pane ids in original role order rather than completion order, and removes the clean tab.
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/020 — "Close, keep worktree" carries the keep on the retry and on the replacement's stop (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon that answers a follow-on `Hello` and records each StopAgent's `keep_worktree`).
+- **Agent:** none (the original agent answers exact NotFound twice and ListAgents reports replacement B, which stops).
+- **Asserts:** an ordinary close sends its three stops (first try, retry, replacement) with no keep; `close_pane_keeping_worktree` sends the same three stops, each with `keep_worktree: true`.
+- **Does not assert:** what the daemon does with the keep (`close_agents::tests`), the tab fan-out (`prompt/close-confirm/013`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/021 — "Close, keep worktree" carries the keep on every stop of a chained slot handover (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (replacement B loses its slot to C while its stop is in flight; C stops).
+- **Asserts:** the keeping close chases the handover to C and every StopAgent it sends carries `keep_worktree: true`.
+- **Does not assert:** the slot-churn bounds (`lifecycle/stop/013`, `lifecycle/stop/014`).
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/wire-restart
@@ -6145,6 +6180,13 @@ without depending on the config struct API.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close/004 — A real dispatched agent closed with `Close, keep worktree` leaves its clean worktree on disk, and the status line says it was kept on request and where (issue #1958). [reel]
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatcher_mode.rs`; `TuiDeck` on the `minimal` fixture driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → Down, Down, Enter path).
+- **Agent:** claude/haiku — a REAL interactive Claude Code (`claude --model claude-haiku-4-5-20251001`, no `-p`) as the dispatched unit; the caller pane is a shell, so the unit starts the deck's `default_command` (issue #1602).
+- **Asserts:** the agent does one directive, deterministic operation in its own worktree — writing a uniquely named sentinel file into the git-ignored `.dot-agent-deck/` — and goes Idle with the worktree clean (the premise: an ordinary Close would remove it, `dispatch/close/003`); the close confirmation offers `Close, keep worktree`; choosing it puts `Worktree kept on request:` and the worktree's path on the status line, removes the agent from the daemon, and leaves the worktree and the agent's sentinel on disk.
+- **Does not assert:** the tab/orchestration scope (the CLI's is `dispatch/close-verb/013`), a daemon without the keep capability, the desktop dialogs (`AgentOverviewStop.test.tsx`, `AgentPaneOverlay.test.tsx`), or `worktree reclaim` afterwards. The stand-in twin with no agent is `prompt/close-confirm/012`.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/close-verb
 
 ##### dispatch/close-verb/001 — A completed single unit closes from its dispatcher's environment; its worktree is removed and its branch kept.
@@ -6214,6 +6256,20 @@ without depending on the config struct API.
 - **Agent:** none — identity-recording `cat` probes.
 - **Asserts:** a two-unit JSON listing supplies a stable `unit_id`; `close --unit-id <id> --json` exits 0 and reports only that id closed, removes its agent and worktree, and leaves the other unit, its worktree and the dispatcher alive.
 - **Does not assert:** selector conflicts, ambiguous names or stale ids, which belong to CLI/daemon regression tests.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/012 — `close <unit> --keep-worktree` keeps a clean unit's worktree and reports it kept on request (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** two completed clean single units (each with a file in its ignored `.dot-agent-deck/`) closed by name with `--keep-worktree` both exit 0 and lose their agents but keep their worktrees and `.dot-agent-deck/` contents; the human report reads `<path>: kept on request` and names `dot-agent-deck worktree reclaim`, and the `--json` report carries one `kept-on-request` verdict for that path.
+- **Does not assert:** `--dry-run` wording, a dirty tree with keep, or the refusal against a daemon without the capability (unit-tested in `close_cli` / `daemon_client`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/013 — `close --orchestration-of <pane> --keep-worktree` keeps the worktree a team shared (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes in a two-role orchestration.
+- **Asserts:** closing a completed clean two-role unit through a worker's pane with `--keep-worktree --json` exits 0, removes both roles, keeps the shared worktree and its `.dot-agent-deck/` file, and reports one `kept-on-request` verdict for that path.
+- **Does not assert:** the TUI's tab-scope keep or a keep on a non-last role's StopAgent.
 - **Platform coverage:** mac+linux.
 
 #### dispatch/single

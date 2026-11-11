@@ -156,12 +156,13 @@ The TUI shows the same pull request on the agent's card, as `#1234` with a glyph
 
 - **Stop one agent:** press the stop control on its row (`Close <name> agent`), or **Close agent** in its full-window pane. The confirmation, `Close <name>?`, names the daemon the stop request goes to. For an orchestration role it warns that the other roles keep running. Press **Close agent**. Closing from the pane returns you to the Dashboard.
 - **Stop every role of an orchestration:** press **Close** on its group header. The confirmation lists every role it will stop. Press **Close all N roles** (or **Close 1 role**).
+- **Stop but keep the worktree:** for a dispatched unit, both confirmations also offer **Close agent, keep worktree** or **Close all N roles, keep worktree**. It closes the same agents but leaves the unit's worktree on disk, clean or not, so you can start another agent in it later. On one role of an orchestration, **Close agent, keep worktree** keeps the worktree the roles share even after you close the other roles normally. A notice then reads `Worktree kept on request:` followed by the directory and stays until you dismiss it with its **×**. The button appears only when the daemon can keep a worktree; after an upgrade, restart the daemon to get it.
 
 **Check it worked:** the row, or the whole group, disappears from the section. If the app cannot confirm that some roles stopped, it says how many may still be running on which daemon, in a message on the Dashboard and in the New agent dialog; open the TUI against that daemon, or run `dot-agent-deck daemon status` on its host, to see what is still there.
 
-In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab.
+In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab; its confirmation offers **Close, keep worktree** for a dispatched unit. The TUI has no single-role close: closing a role's card closes its whole tab.
 
-If a dispatched unit has uncommitted changes, both clients' close confirmations warn that the worktree will be **KEPT**, naming its directory. After the close, the desktop shows a notice naming the daemon and the directory actually kept; it stays until you dismiss it with its **×**. The TUI reports the kept directory on its status line. A clean worktree is removed without a kept-worktree notice. See [Dispatcher Mode → Finish up](../dispatcher-mode.md#finish-up) to recover work or clean up leftover worktrees.
+If a dispatched unit has uncommitted changes, both clients' close confirmations warn that the worktree will be **KEPT**, naming its directory. After the close, the desktop shows a notice naming the daemon and the directory actually kept; it stays until you dismiss it with its **×**. The TUI reports the kept directory on its status line. A clean worktree is removed without a kept-worktree notice, unless you chose to keep it. See [Dispatcher Mode → Finish up](../dispatcher-mode.md#finish-up) to recover work or clean up leftover worktrees.
 
 ## When a daemon is not there
 

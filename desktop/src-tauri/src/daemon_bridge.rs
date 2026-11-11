@@ -6624,12 +6624,18 @@ mod tests {
         let remote_wire = deck_wire_id(&remote_endpoint);
 
         let incarnation = remote.incarnation();
-        let unknown =
-            crate::stop_agent_action(&state, "deck-ffffffffffffffff", &remote_agent, &incarnation)
-                .await;
+        let unknown = crate::stop_agent_action(
+            &state,
+            "deck-ffffffffffffffff",
+            &remote_agent,
+            &incarnation,
+            false,
+        )
+        .await;
         let after_unknown = (live_ids(&local), live_ids(&remote));
         let stopped =
-            crate::stop_agent_action(&state, &remote_wire, &remote_agent, &incarnation).await;
+            crate::stop_agent_action(&state, &remote_wire, &remote_agent, &incarnation, false)
+                .await;
         let on_local = live_ids(&local);
         let on_remote = live_ids(&remote);
         local.shutdown();
@@ -6700,9 +6706,10 @@ mod tests {
         ];
 
         let (unknown_scope, unknown) =
-            crate::stop_orchestration_action(&state, "deck-ffffffffffffffff", &roles).await;
+            crate::stop_orchestration_action(&state, "deck-ffffffffffffffff", &roles, false).await;
         let after_unknown = live_ids(&remote).len();
-        let (scope, closed) = crate::stop_orchestration_action(&state, &remote_wire, &roles).await;
+        let (scope, closed) =
+            crate::stop_orchestration_action(&state, &remote_wire, &roles, false).await;
         let on_local = live_ids(&local);
         let on_remote = live_ids(&remote);
         local.shutdown();

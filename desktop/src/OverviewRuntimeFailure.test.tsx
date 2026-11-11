@@ -132,6 +132,19 @@ describe("a launch failure that lands while the overview is up (PRD #1223 audit 
     expect(screen.getByTestId("worktree-kept-toast")).toHaveTextContent("/remote/otherworktree");
   });
 
+  /** Scenario (issue #1958): a unit closed with "keep worktree" reports its worktree kept; the notice says it was kept on request, in the TUI status line's words, and names the directory. */
+  it("says a worktree the user asked to keep was kept on request", async () => {
+    const fleet = createFixtureFleet("fleet").map((deck) => ({ ...deck, agents: [] }));
+    bridge.connect.mockResolvedValue(fleet);
+    render(<App />);
+    await waitFor(() => expect(latestRuntime?.fleet).toEqual(fleet));
+    const notify = bridge.subscribe.mock.calls[0][2]!;
+    act(() => notify({ deckId: FIXTURE_REMOTE_DAEMON_ID, path: "/remote/project-dispatch-1958", confirmed_dirty: false, on_request: true }));
+    const toast = screen.getByTestId("worktree-kept-toast");
+    expect(toast).toHaveTextContent("dev@build-box: Worktree kept on request: /remote/project-dispatch-1958");
+    expect(toast).not.toHaveTextContent("KEPT");
+  });
+
   /**
    * Scenario: on the overview, open New agent, pick the daemon and its home
    * directory and press Start. While the daemon is still thinking, leave for the

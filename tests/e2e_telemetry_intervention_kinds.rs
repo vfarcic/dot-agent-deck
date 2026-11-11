@@ -276,6 +276,7 @@ fn finish(receiver: &Receiver, deck: &TuiDeck, agent: &AgentRecord) -> Value {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();
