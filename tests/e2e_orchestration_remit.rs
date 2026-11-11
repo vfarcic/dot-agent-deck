@@ -1305,7 +1305,10 @@ fn orchestration_remit_010_reattached_tab_rearms_from_the_latest_rearm() {
     assert_record_follows(&daemon.attach_socket, &second_path);
     for id in agent_ids {
         let stopped = daemon
-            .send_attach_request(&AttachRequest::StopAgent { id })
+            .send_attach_request(&AttachRequest::StopAgent {
+                id,
+                keep_worktree: false,
+            })
             .expect("stop an orchestration role");
         assert!(stopped.ok, "stop failed: {:?}", stopped.error);
     }

@@ -57,7 +57,7 @@ These are held by the daemon process, so a TUI detach and reattach leaves them i
 
 ### Telemetry
 
-The run trace carries `deck.run.id` (minted per spawn and passed into the agent's `OTEL_RESOURCE_ATTRIBUTES`), `deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.name`, `deck.orchestration.id` and `deck.pr.number`. Since `e754ea08` it also carries `deck.dispatch.name` (#1991, read from the dispatched-units registry) and an `agent.handoff` span per delegated task, keyed by the task id (#2010). `deck.issue.number` is still defined and never filled, and no attribute carries a schedule name or a unit id as its own value; a schedule name appears only inside a daemon-spawned pane id ([`telemetry.md`](telemetry.md)). A nested `codex exec` shares its pane's run id ([`execution-accounting.md`](execution-accounting.md)).
+The run trace carries `deck.run.id` (minted per spawn and passed into the agent's `OTEL_RESOURCE_ATTRIBUTES`), `deck.pane.id`, `deck.agent`, `deck.role`, `deck.orchestration.name`, `deck.orchestration.id`, `deck.pr.number` and, since issue #2096, `deck.pr.numbers` (every pull request the run saw, not only the last). Since `e754ea08` it also carries `deck.dispatch.name` (#1991, read from the dispatched-units registry) and an `agent.handoff` span per delegated task, keyed by the task id (#2010). `deck.issue.number` is still defined and never filled, and no attribute carries a schedule name or a unit id as its own value; a schedule name appears only inside a daemon-spawned pane id ([`telemetry.md`](telemetry.md)). A nested `codex exec` shares its pane's run id ([`execution-accounting.md`](execution-accounting.md)).
 
 ## Scenarios
 

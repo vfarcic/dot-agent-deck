@@ -109,6 +109,8 @@ pub enum Action {
     RestartNotice,
     /// PRD #1666 part 2 (G-fix7d): dismiss the restart notice.
     DismissRestartNotice,
+    /// PRD #385 M5: open keyboard copy mode on the focused pane.
+    CopyMode,
 }
 
 /// Static description of one action: which section it lives in, its config
@@ -422,6 +424,17 @@ pub const ACTIONS: &[ActionSpec] = &[
         name: "dismiss_restart_notice",
         default: "c",
         description: "Dismiss the restart notice",
+    },
+    // PRD #385 M5: keyboard copy mode on the focused pane, `v` as in tmux and
+    // vi (decision 7), free in command mode. Last in canonical order, for the
+    // reason `host_metrics` is. Copy mode's own keys are fixed, like a
+    // dialog's.
+    ActionSpec {
+        action: Action::CopyMode,
+        section: Section::Dashboard,
+        name: "copy_mode",
+        default: "v",
+        description: "Copy mode (select and copy with the keyboard)",
     },
 ];
 

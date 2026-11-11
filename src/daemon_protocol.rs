@@ -1147,6 +1147,26 @@ pub const CAP_CLOSE_AGENTS: &str = "close-agents";
 /// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
 pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
 
+/// Capability string for the `keep_worktree` field of
+/// [`AttachRequest::StopAgent`] and [`AttachRequest::CloseAgents`] (issue
+/// #1958): close a dispatched unit, or an orchestration, and leave its worktree
+/// on disk whatever its state. Also names the
+/// [`AttachResponse::dispatched_worktree`] answer of
+/// [`AttachRequest::DispatchWorktreeClosePreview`], which is how a client knows
+/// to offer the choice.
+///
+/// **Every sender withholds the field unless the daemon advertised this.** An
+/// older daemon ignores an unknown field
+/// (`unknown_fields_are_ignored_so_a_newer_client_degrades_against_an_older_daemon`),
+/// so a keep sent to it would be read as a plain stop and REMOVE a clean
+/// worktree the user asked to keep. The check lives in the client library
+/// ([`crate::daemon_client::DaemonClient::stop_agent_keeping_worktree`],
+/// [`crate::daemon_client::DaemonClient::close_agents`]), which refuses hard and
+/// sends nothing rather than degrading to a plain close. No
+/// [`PROTOCOL_VERSION`] bump. Advertised on every platform: neither handler's
+/// keep path is `#[cfg]`-gated.
+pub const CAP_KEEP_WORKTREE: &str = "keep-worktree";
+
 /// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
 /// round 5, plan D10): the deck's recovery rows — reports and dispatch results
 /// set aside because their recipient was gone. Sent only by
@@ -1357,6 +1377,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
     CAP_ADDRESSED_MESSAGE_AGENT,
+    CAP_KEEP_WORKTREE,
     CAP_PROJECT_TRUST,
 ];
 #[cfg(not(unix))]
@@ -1383,6 +1404,7 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
     CAP_ADDRESSED_MESSAGE_AGENT,
+    CAP_KEEP_WORKTREE,
     CAP_PROJECT_TRUST,
 ];
 
@@ -2336,6 +2358,20 @@ pub enum AttachRequest {
     },
     StopAgent {
         id: String,
+        /// Issue #1958: keep the dispatched worktree the stopped agent was
+        /// started in on disk, whatever its state and whatever else still runs
+        /// in it, by dropping the daemon's record of the tree before the agent
+        /// is stopped — so no later close, of a sibling role or of an agent
+        /// restarted in the same directory, can remove it. Reported once as a
+        /// `WorktreeKept` broadcast with `on_request`, by the stop that took
+        /// the record.
+        ///
+        /// **Withheld unless the daemon advertises [`CAP_KEEP_WORKTREE`]**: an
+        /// older daemon would drop the key and remove the tree. No
+        /// [`PROTOCOL_VERSION`] bump: an additive optional field, omitted when
+        /// `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_worktree: bool,
     },
     /// PRD #1589: close dispatched units, one agent, or one orchestration
     /// instance — the `dot-agent-deck close` verb.
@@ -2365,6 +2401,14 @@ pub enum AttachRequest {
         /// Resolve and report, stop nothing.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dry_run: bool,
+        /// Issue #1958: keep the worktree each closed target owns, whatever its
+        /// state and whatever else still runs in it, by dropping the daemon's
+        /// record of it before anything is stopped; reported as
+        /// [`WorktreeVerdictKind::KeptOnRequest`]. A dry run reports the keep
+        /// it would make and drops nothing. **Withheld unless the daemon
+        /// advertises [`CAP_KEEP_WORKTREE`]**, like `StopAgent`'s.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_worktree: bool,
     },
     /// Issue #1947: message an orchestration's orchestrator (or a folder's
     /// one standalone agent) by address — `dot-agent-deck inbox send`.
@@ -3817,6 +3861,10 @@ pub enum WorktreeVerdictKind {
     /// The agents are stopped, and the cleanup had not answered within the
     /// bound; it is still running and its outcome is unknown.
     TimedOut,
+    /// Issue #1958: kept because the close asked to keep it, whatever its
+    /// state. The daemon no longer records it, so it is `worktree reclaim`'s
+    /// to find. An older CLI decodes it as [`Self::Unknown`].
+    KeptOnRequest,
     #[serde(other)]
     Unknown,
 }
@@ -3909,6 +3957,17 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// Issue #1958: the other answer to
+    /// [`AttachRequest::DispatchWorktreeClosePreview`] — the dispatched
+    /// worktree the daemon has recorded for the panes being closed, whatever
+    /// its state and whatever its removal policy, so a client knows to offer
+    /// "close, keep worktree". Read from the registry alone, so it is filled
+    /// even when the dirtiness probe behind [`Self::kept_worktree`] times out.
+    /// `None` when the selection owns no recorded worktree, on every other
+    /// response, and from a daemon older than [`CAP_KEEP_WORKTREE`]. Additive
+    /// + optional, no [`PROTOCOL_VERSION`] bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_worktree: Option<String>,
     /// PRD #819 M2: the answer to [`AttachRequest::ListProjects`]. `None` on
     /// every other response. Additive + optional, so the field itself is
     /// forward-compatible in both directions; the `PROTOCOL_VERSION` bump this
@@ -7335,7 +7394,7 @@ async fn handle_connection(
                 }
             }
         }
-        AttachRequest::StopAgent { id } => {
+        AttachRequest::StopAgent { id, keep_worktree } => {
             // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
             // close_agent removes the registry entry, so we can clean up
             // the daemon's per-pane role-map entries after a successful
@@ -7408,6 +7467,44 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
+            // Issue #1958 (F1): a keep is latched HERE, before anything is
+            // stopped and whatever else still runs in the tree, by taking the
+            // registry entry. The deck's cleanups of a dispatched tree — a
+            // stop's, a close's and a failed dispatch's rollback — remove only a
+            // tree whose entry they took, so no later one — this stop's, a
+            // sibling role's earlier ordinary stop's, a close of an agent started
+            // in the same directory afterwards, or the rollback of a dispatch
+            // this stop ended while it was starting — removes it. Left to the cleanup after the stop, the keep
+            // was lost to whichever of those got there first.
+            //
+            // If the stop then fails, the agent keeps running in a tree the
+            // daemon no longer records: no close removes it, and the user finds
+            // and removes it with `dot-agent-deck worktree reclaim`. The entry is
+            // not put back — that would hand the tree to the next ordinary close.
+            //
+            // Round 2: a latch that finds no entry is NOT a keep and is not
+            // reported as one. The ordinary cleanups take the entry only once
+            // they see nothing running in the tree, so for an agent they saw
+            // running there it means an unrecorded tree or one another keep
+            // already holds. For an agent whose process had already exited, or
+            // one started in the tree after an ordinary stop's cleanup looked,
+            // it can also be a tree that cleanup already took for removal; that
+            // removal is not undone, and the cleanup that owns it reports what
+            // it did.
+            let kept_on_request = if keep_worktree {
+                let kept = dispatched_worktree.as_deref().and_then(|worktree| {
+                    crate::issue_dispatch_run::keep_on_request(&worktree_registry, worktree)
+                });
+                if kept.is_none() && dispatched_worktree.is_some() {
+                    tracing::info!(
+                        agent_id = %id,
+                        "stop: keep requested, but the deck holds no record of the agent's worktree to keep"
+                    );
+                }
+                kept
+            } else {
+                None
+            };
             // PRD #1589: the teardown itself is shared with `CloseAgents`, which
             // takes the same steps in the same order — see
             // [`stop_agent_steps`]. The existing teardown is unchanged. What the
@@ -7466,24 +7563,34 @@ async fn handle_connection(
                         // instead of leaving the user with the dialog's
                         // arm-time prediction.
                         let event_tx = event_tx.clone();
+                        // Issue #1958: a keep latched above has nothing left to
+                        // clean up; its report is broadcast from here, after
+                        // the stop, once — the same place an ordinary stop's
+                        // verdict comes from. A stop that ASKED to keep never
+                        // takes the ordinary removal path, whatever its latch
+                        // found: a latch that found no entry means another keep
+                        // already holds the tree, an ordinary cleanup already
+                        // owns its removal, or the deck never recorded it — and
+                        // an entry recorded again since is not this stop's to
+                        // remove. Only a latched keep is reported as one.
                         tokio::spawn(async move {
-                            if !crate::issue_dispatch_run::worktree_still_in_use(
-                                &registry.agent_records_for_worktree_cleanup(),
-                                &worktree,
-                            ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
-                                &worktree_registry,
-                                &worktree,
-                            ) && let Some(kept) = crate::issue_dispatch_run::remove_worktree(
-                                &worktree,
-                                &entry.clone_dir,
-                                entry.policy,
-                            )
-                            .await
-                            {
+                            registry.pause_point("stop-worktree-cleanup").await;
+                            let kept = if keep_worktree {
+                                kept_on_request
+                            } else {
+                                crate::issue_dispatch_run::cleanup_after_stop(
+                                    &registry.agent_records_for_worktree_cleanup(),
+                                    &worktree_registry,
+                                    &worktree,
+                                )
+                                .await
+                            };
+                            if let Some(kept) = kept {
                                 // Errs only when nothing is subscribed (a
                                 // standalone daemon), which is not a failure.
                                 let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
                             }
+                            registry.pause_point("stop-worktree-cleanup-done").await;
                         });
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
@@ -7491,6 +7598,11 @@ async fn handle_connection(
                 Err(msg) => {
                     // PRD #126: the close failed, so the agent is still live;
                     // `stop_agent_steps` has already rolled the closing mark back.
+                    // Issue #1958: a keep latched above stands (see there), so
+                    // it is reported here, the one report it gets.
+                    if let Some(kept) = kept_on_request {
+                        let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
+                    }
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
             };
@@ -7530,6 +7642,7 @@ async fn handle_connection(
             caller,
             force,
             dry_run,
+            keep_worktree,
         } => {
             // PRD #1589: resolve, authorize, refuse or close — see
             // `crate::close_agents`. Every outcome, refusals included, is a
@@ -7539,6 +7652,7 @@ async fn handle_connection(
                 caller,
                 force,
                 dry_run,
+                keep_worktree,
                 &registry,
                 &state,
                 &event_tx,
@@ -7947,6 +8061,24 @@ async fn handle_connection(
             .await;
             let mut resp = AttachResponse::ok();
             resp.kept_worktree = kept;
+            // Issue #1958: from the registry alone, after the probe and
+            // whatever it answered. F3: each pane's owner is resolved the way
+            // `StopAgent` resolves the agent it cleans up after — an exited
+            // generation still holding its pane counts, since closing that pane
+            // is what removes its tree — and through `agent_id_for_pane_any`,
+            // which skips a generation a successor has since been published
+            // over, so a retired agent does not answer for a reused pane.
+            let owners: Vec<crate::agent_pty::AgentRecord> = pane_ids
+                .iter()
+                .filter_map(|pane| registry.agent_id_for_pane_any(pane))
+                .filter_map(|id| registry.agent_record_any(&id))
+                .collect();
+            resp.dispatched_worktree = crate::issue_dispatch_run::dispatched_worktree_of_panes(
+                &owners,
+                &worktree_registry,
+                &pane_ids,
+            )
+            .map(|path| path.to_string_lossy().into_owned());
             write_resp(&mut stream, &resp).await?
         }
         // PRD #819 M3. `ListProjects` answers from what the daemon already
@@ -13466,6 +13598,125 @@ mod tests {
         let resp: AttachResponse = serde_json::from_str(r#"{"ok":true,"fieldFromTheFuture":true}"#)
             .expect("a response carrying unknown fields must still decode");
         assert!(resp.ok);
+    }
+
+    /// Issue #1958 (U1): `keep_worktree` is omitted from the wire when
+    /// `false`, so a plain stop or close is byte-for-byte what an older daemon
+    /// already reads, and a request without it decodes as `false`.
+    #[test]
+    fn keep_worktree_is_omitted_when_false_and_defaults_to_false() {
+        let plain = serde_json::to_value(AttachRequest::StopAgent {
+            id: "a1".into(),
+            keep_worktree: false,
+        })
+        .unwrap();
+        assert_eq!(plain, serde_json::json!({"op": "stop-agent", "id": "a1"}));
+        let keep = serde_json::to_value(AttachRequest::StopAgent {
+            id: "a1".into(),
+            keep_worktree: true,
+        })
+        .unwrap();
+        assert_eq!(
+            keep,
+            serde_json::json!({"op": "stop-agent", "id": "a1", "keep_worktree": true})
+        );
+        let old: AttachRequest = serde_json::from_str(r#"{"op":"stop-agent","id":"a1"}"#).unwrap();
+        assert!(matches!(
+            old,
+            AttachRequest::StopAgent {
+                keep_worktree: false,
+                ..
+            }
+        ));
+
+        let close = |keep_worktree| {
+            serde_json::to_value(AttachRequest::CloseAgents {
+                selector: CloseSelector::AllUnits,
+                caller: None,
+                force: false,
+                dry_run: true,
+                keep_worktree,
+            })
+            .unwrap()
+        };
+        assert!(close(false).get("keep_worktree").is_none());
+        assert_eq!(close(true)["keep_worktree"], true);
+        let decoded: AttachRequest = serde_json::from_value(close(false)).unwrap();
+        assert!(matches!(
+            decoded,
+            AttachRequest::CloseAgents {
+                keep_worktree: false,
+                ..
+            }
+        ));
+        let decoded: AttachRequest = serde_json::from_value(close(true)).unwrap();
+        assert!(matches!(
+            decoded,
+            AttachRequest::CloseAgents {
+                keep_worktree: true,
+                ..
+            }
+        ));
+    }
+
+    /// Issue #1958 (U1): the reporting half — the new verdict's wire name
+    /// (and that an unknown one still decodes, which is how an older CLI reads
+    /// it), `on_request` omitted when `false` and defaulted when absent, and
+    /// the preview's `dispatched_worktree` omitted when `None`.
+    #[test]
+    fn keep_on_request_reporting_is_additive_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(WorktreeVerdictKind::KeptOnRequest).unwrap(),
+            serde_json::json!("kept-on-request")
+        );
+        assert_eq!(
+            serde_json::from_str::<WorktreeVerdictKind>(r#""kept-on-request""#).unwrap(),
+            WorktreeVerdictKind::KeptOnRequest
+        );
+        assert_eq!(
+            serde_json::from_str::<WorktreeVerdictKind>(r#""kept-for-a-reason-from-the-future""#)
+                .unwrap(),
+            WorktreeVerdictKind::Unknown
+        );
+
+        let measured = KeptWorktree {
+            path: "/w".into(),
+            confirmed_dirty: true,
+            on_request: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&measured).unwrap(),
+            serde_json::json!({"path": "/w", "confirmed_dirty": true})
+        );
+        let requested = KeptWorktree::on_request(std::path::Path::new("/w"));
+        assert_eq!(
+            serde_json::to_value(&requested).unwrap(),
+            serde_json::json!({"path": "/w", "confirmed_dirty": false, "on_request": true})
+        );
+        let old: KeptWorktree =
+            serde_json::from_str(r#"{"path":"/w","confirmed_dirty":true}"#).unwrap();
+        assert_eq!(old, measured);
+
+        let resp = serde_json::to_value(AttachResponse::ok()).unwrap();
+        assert!(resp.get("dispatched_worktree").is_none(), "{resp}");
+        let resp = AttachResponse {
+            dispatched_worktree: Some("/w".into()),
+            ..AttachResponse::ok()
+        };
+        let round: AttachResponse =
+            serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
+        assert_eq!(round.dispatched_worktree.as_deref(), Some("/w"));
+        let old: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(old.dispatched_worktree, None);
+    }
+
+    /// Issue #1958 (U1): the keep is advertised on every platform, since
+    /// neither handler's keep path is `#[cfg]`-gated, under the name clients
+    /// check.
+    #[test]
+    fn keep_worktree_is_advertised() {
+        assert_eq!(CAP_KEEP_WORKTREE, "keep-worktree");
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_KEEP_WORKTREE));
     }
 
     /// PRD #882 — an `AttachResponse` from a daemon that predates the policy

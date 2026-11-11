@@ -24,6 +24,9 @@ pub mod authoring_seeds;
 pub mod bounded_read;
 pub mod build_id;
 pub mod build_version_handshake;
+// PRD #385: a pane selection copied to the native clipboard and OSC 52.
+pub mod clipboard;
+pub mod copy_mode;
 // PRD #1589: the daemon side of `close` — resolve, authorize, refuse or close.
 pub mod close_agents;
 // PRD #1589: the `close` command's request building and report rendering.
@@ -236,6 +239,8 @@ pub mod trust_cli;
 pub mod trust_prompt;
 pub mod turn_reply;
 pub mod ui;
+// Issue #2094: what the deck sets for an agent in a pane another agent drives.
+pub mod unattended_pane;
 // Issue #670: the one implementation of the control-character / Unicode-bidi
 // filter applied to producer-supplied strings before they reach a terminal.
 pub mod untrusted_text;
@@ -245,6 +250,9 @@ pub mod version;
 pub mod vt_grid;
 pub mod vt_work;
 pub mod watch;
+// PRD #385: the deck's ratatui backend, drawing a two-column glyph so its
+// second column is right whichever width the host terminal gives it.
+pub mod wide_glyph_backend;
 // PRD #1889: the work journal, the deck's durable record of its units of work.
 pub mod work_journal;
 // PRD #1889: which work each launch, attempt, report and end belongs to.

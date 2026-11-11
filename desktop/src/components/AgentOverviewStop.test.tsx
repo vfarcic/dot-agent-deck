@@ -59,7 +59,7 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
   /** Scenario: close a remote dispatched agent or its whole team. The confirmation names the worktree the daemon predicts will be kept; an ordinary close has no warning, and an inconclusive probe does not claim confirmed uncommitted changes. */
   it.each(["agent", "orchestration"] as const)("previews the kept worktree before closing a remote %s", async (kind) => {
     const path = "/home/build/project-dispatch-1674";
-    const preview = vi.fn<NonNullable<DeckRuntimeState["previewWorktreeClose"]>>(async () => ({ path, confirmed_dirty: true }));
+    const preview = vi.fn<NonNullable<DeckRuntimeState["previewWorktreeClose"]>>(async () => ({ kept: { path, confirmed_dirty: true }, keepWorktree: null }));
     const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
     const rt = { ...runtime(runAction), previewWorktreeClose: preview };
     render(<AgentOverview runtime={rt} onNavigate={vi.fn()} />);
@@ -73,15 +73,42 @@ describe("stopping from the overview (PRD #1223 U4)", () => {
     expect(runAction).not.toHaveBeenCalled();
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
 
-    preview.mockResolvedValueOnce({ path, confirmed_dirty: false });
+    preview.mockResolvedValueOnce({ kept: { path, confirmed_dirty: false }, keepWorktree: null });
     open();
     await waitFor(() => expect(confirmation()).toHaveTextContent("Uncommitted work here, if any, is KEPT:"));
     fireEvent.click(within(confirmation()!).getByRole("button", { name: "Cancel" }));
 
-    preview.mockResolvedValueOnce(null);
+    preview.mockResolvedValueOnce({ kept: null, keepWorktree: null });
     open();
     await waitFor(() => expect(within(confirmation()!).getByRole("button", { name: kind === "agent" ? "Close agent" : "Close all 2 roles" })).toBeEnabled());
     expect(confirmation()).not.toHaveTextContent("KEPT");
+    expect(within(confirmation()!).queryByRole("button", { name: /keep worktree/ })).toBeNull();
+  });
+
+  /**
+   * Scenario (issue #1958): close a remote dispatched agent, or its whole team,
+   * whose deck can keep the worktree. The confirmation offers Cancel, the close,
+   * and "…, keep worktree", in that order; pressing the keep button sends the
+   * stop with `keepWorktree: true` — for an orchestration, one
+   * `stop_orchestration` the crate fans out to every role with the keep.
+   */
+  it.each(["agent", "orchestration"] as const)("offers a close that keeps the worktree of a remote %s and sends the keep", async (kind) => {
+    const path = "/home/build/project-dispatch-1958";
+    const preview = vi.fn<NonNullable<DeckRuntimeState["previewWorktreeClose"]>>(async () => ({ kept: null, keepWorktree: path }));
+    const runAction = vi.fn(async (): Promise<DeckActionResult> => ({ ok: true }));
+    render(<AgentOverview runtime={{ ...runtime(runAction), previewWorktreeClose: preview }} onNavigate={vi.fn()} />);
+    fireEvent.click(kind === "agent"
+      ? within(row(FIXTURE_REMOTE_DAEMON_ID, "41")).getByTestId("overview-stop-agent")
+      : screen.getByRole("button", { name: "Close demo-project-orchestrator-1 orchestration" }));
+    const close = kind === "agent" ? "Close agent" : "Close all 2 roles";
+    const keep = await within(confirmation()!).findByRole("button", { name: `${close}, keep worktree` });
+    expect(within(confirmation()!).getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", close, `${close}, keep worktree`]);
+    expect(runAction).not.toHaveBeenCalled();
+    await act(async () => fireEvent.click(keep));
+    expect(runAction).toHaveBeenCalledExactlyOnceWith(kind === "agent"
+      ? { type: "stop_agent", deckId: FIXTURE_REMOTE_DAEMON_ID, agentId: "41", incarnation: "listed-process-a", keepWorktree: true }
+      : { type: "stop_orchestration", deckId: FIXTURE_REMOTE_DAEMON_ID, roles: [{ agentId: "41", name: "planner", incarnation: "listed-process-a" }, { agentId: "42", name: "builder", incarnation: "listed-process-a" }], keepWorktree: true });
+    expect(confirmation()).toBeNull();
   });
 
   /**

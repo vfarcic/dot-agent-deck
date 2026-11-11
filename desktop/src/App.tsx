@@ -33,7 +33,7 @@ import {
   Zap,
 } from "lucide-react";
 import { AgentOverview, CONFIRMATION_ALREADY_OPEN, DASHBOARD_COVERED, modalOpen, STOP_TARGET_GONE, STOP_TARGET_RESTARTED, stopAgentConfirmation, toOverviewAgent } from "./components/AgentOverview";
-import { worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
+import { KEEP_WORKTREE_SUFFIX, worktreePreview, type WorktreeKeptEntry } from "./lib/worktreeClose";
 import { KeptWorktreeText } from "./components/KeptWorktreeText";
 import { NavigationRail, type RailContext } from "./components/NavigationRail";
 import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/AgentTile";
@@ -936,11 +936,13 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     // voice-registry-exempt: a confirmed stop succeeded; retire that subject's view without dismissing a newer pane
     const stopped = () => setView((current) => current === agentView ? { kind: "overview" } : current);
     const question = stopAgentConfirmation(toOverviewAgent(paneAgent), paneDeck.connection, runtime.runAction, stopped, runtime.previewWorktreeClose);
-    setAgentStopConfirm({ ...question, ownerView: agentView, action: async () => {
+    const tracked = (stop: () => Promise<void>) => async () => {
       const attempt = { view: agentView };
       stoppingAttempt.current = attempt;
-      try { await question.action(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
-    } });
+      try { await stop(); } finally { if (stoppingAttempt.current === attempt) stoppingAttempt.current = undefined; }
+    };
+    // Issue #1958: the keep-worktree close is the same stop, tracked the same way.
+    setAgentStopConfirm({ ...question, ownerView: agentView, action: tracked(question.action), ...(question.keepWorktree ? { keepWorktree: { ...question.keepWorktree, action: tracked(question.keepWorktree.action) } } : {}) });
     return undefined;
   }, [agentView, confirmationOpen, paneAgent, paneDeck, paneDeckAttachable, runtime.runAction]);
   const agentStopContext = agentView && paneDeckAttachable && paneAgent ? {
@@ -2275,6 +2277,8 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
       busyLabel: "Stopping…",
       worktreePreview: worktreePreview(runtime, snapshot.connection.deckId ?? "", [selectedAgent]),
       action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation }, `${selectedAgent.role} close requested.`); },
+      // Issue #1958: shown only when the preview names a worktree the deck can keep.
+      keepWorktree: { label: `Close agent${KEEP_WORKTREE_SUFFIX}`, action: async () => { await perform({ type: "stop_agent", deckId: snapshot.connection.deckId ?? "", agentId: selectedAgent.id, incarnation: selectedAgent.incarnation, keepWorktree: true }, `${selectedAgent.role} close requested.`); } },
     });
   };
 

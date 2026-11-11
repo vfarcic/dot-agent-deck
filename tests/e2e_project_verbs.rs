@@ -1409,7 +1409,10 @@ fn project_launch_008_ended_orchestration_removes_only_its_own_context() {
     assert_eq!(daemon.agent_records().len(), 2, "both runs are live");
 
     let stopped = daemon
-        .send_attach_request(&AttachRequest::StopAgent { id: first_id })
+        .send_attach_request(&AttachRequest::StopAgent {
+            id: first_id,
+            keep_worktree: false,
+        })
         .expect("stop first orchestration's only pane");
     assert!(stopped.ok, "stop failed: {:?}", stopped.error);
     assert!(

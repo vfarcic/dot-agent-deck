@@ -34,6 +34,14 @@ struct Script {
     answer_capability: Option<bool>,
     answer_delay: Option<std::time::Duration>,
     answer_requests: Vec<serde_json::Value>,
+    /// Issue #1958: whether the deck advertises `keep-worktree`, when set;
+    /// unset advertises what this build does.
+    keep_capability: Option<bool>,
+    /// Every `stop-agent` request, as sent.
+    stop_requests: Vec<serde_json::Value>,
+    /// Issue #1958: a `Hello` is read and never answered, the connection held
+    /// open — a deck that accepts and then goes quiet.
+    silent_hello: bool,
 }
 
 /// A deck whose daemon restarts at its socket as the same build. Every request
@@ -166,6 +174,9 @@ impl RestartingDeck {
                             let request: serde_json::Value =
                                 serde_json::from_slice(&payload).unwrap_or_default();
                             let op = request["op"].as_str().unwrap_or_default().to_string();
+                            if op == "stop-agent" {
+                                script.lock().unwrap().stop_requests.push(request.clone());
+                            }
                             if op == "answer-question" {
                                 let delay = {
                                     let mut script = script.lock().unwrap();
@@ -181,10 +192,25 @@ impl RestartingDeck {
                                     tokio::time::sleep(delay).await;
                                 }
                             }
+                            if op == "hello" && script.lock().unwrap().silent_hello {
+                                std::future::pending::<()>().await;
+                            }
                             let reply = if op == "hello" {
                                 *script.lock().unwrap().hellos.entry(process).or_default() += 1;
                                 follow_on = request["follow_on"] == true;
                                 let mut hello = hello_from(process);
+                                if let Some(advertise) = script.lock().unwrap().keep_capability {
+                                    let capabilities = hello.capabilities.get_or_insert_default();
+                                    capabilities.retain(|cap| {
+                                        cap != dot_agent_deck::daemon_protocol::CAP_KEEP_WORKTREE
+                                    });
+                                    if advertise {
+                                        capabilities.push(
+                                            dot_agent_deck::daemon_protocol::CAP_KEEP_WORKTREE
+                                                .into(),
+                                        );
+                                    }
+                                }
                                 if let Some(advertise) = script.lock().unwrap().answer_capability {
                                     let capabilities = hello.capabilities.get_or_insert_default();
                                     capabilities.retain(|cap| cap != dot_agent_deck::daemon_protocol::CAP_ANSWER_SETTLEMENT);
@@ -443,7 +469,7 @@ async fn handshake_013_a_stop_confirmed_after_a_restart_stops_nothing() {
         "the row carries the process that listed it"
     );
     deck.restart_as("b");
-    let stopped = crate::stop_agent_action(&state, &wire, &card.id, &card.incarnation).await;
+    let stopped = crate::stop_agent_action(&state, &wire, &card.id, &card.incarnation, false).await;
     assert_eq!(
         stopped.err().as_deref(),
         Some(AGENT_GONE_AFTER_RESTART),
@@ -457,7 +483,7 @@ async fn handshake_013_a_stop_confirmed_after_a_restart_stops_nothing() {
     );
 
     let card = listed_row(&deck, &state).await;
-    crate::stop_agent_action(&state, &wire, &card.id, &card.incarnation)
+    crate::stop_agent_action(&state, &wire, &card.id, &card.incarnation, false)
         .await
         .expect("control: the restarted deck's own card stops its agent");
     assert_eq!(
@@ -489,7 +515,7 @@ async fn handshake_013_an_orchestration_close_after_a_restart_stops_nothing() {
     assert_eq!(cards.len(), 2, "precondition: two roles were listed");
     let roles: Vec<_> = cards.iter().map(role).collect();
     deck.restart_as("b");
-    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles).await;
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles, false).await;
     let failure = closed.expect_err("a stale role's stop is not confirmed");
     assert_eq!(
         failure.unconfirmed_stops,
@@ -506,7 +532,7 @@ async fn handshake_013_an_orchestration_close_after_a_restart_stops_nothing() {
         .await
         .agents;
     let roles: Vec<_> = cards.iter().map(role).collect();
-    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles).await;
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles, false).await;
     closed.expect("control: the restarted deck's own role is stopped");
     assert_eq!(
         deck.received_by("b"),
@@ -515,6 +541,168 @@ async fn handshake_013_an_orchestration_close_after_a_restart_stops_nothing() {
             "stop-agent".to_string(),
             "stop-agent".to_string()
         ]
+    );
+}
+
+/// Scenario (issue #1958): the user picks "Close agent, keep worktree" and then
+/// "Close all 2 roles, keep worktree" on a deck that does not advertise the
+/// keep. Both are refused with the client's sentence and the deck is sent no
+/// stop at all — never a plain stop, which would remove the worktree the user
+/// asked to keep. The same closes without the keep go out (control).
+#[tokio::test]
+async fn a_keep_close_on_a_deck_that_cannot_keep_stops_nothing() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("keep-refused", "a");
+    deck.script.lock().unwrap().keep_capability = Some(false);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let cards = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+        .await
+        .agents;
+    assert_eq!(cards.len(), 2, "precondition: two roles were listed");
+    let roles: Vec<_> = cards
+        .iter()
+        .map(|card| crate::dto::StopOrchestrationRole {
+            agent_id: card.id.clone(),
+            name: format!("role-{}", card.id),
+            incarnation: card.incarnation.clone(),
+        })
+        .collect();
+
+    let stopped =
+        crate::stop_agent_action(&state, &wire, &cards[0].id, &cards[0].incarnation, true).await;
+    assert_eq!(
+        stopped.err().as_deref(),
+        Some(dot_agent_deck::daemon_client::KEEP_WORKTREE_UNSUPPORTED)
+    );
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles, true).await;
+    let failure = closed.expect_err("an orchestration keep close is refused");
+    assert_eq!(
+        failure.message,
+        dot_agent_deck::daemon_client::KEEP_WORKTREE_UNSUPPORTED
+    );
+    assert!(
+        failure.unconfirmed_stops.is_empty(),
+        "nothing was asked to stop"
+    );
+    assert!(
+        !deck.received_by("a").contains(&"stop-agent".to_string()),
+        "a keep close the deck cannot honour sends no stop: {:?}",
+        deck.received_by("a")
+    );
+
+    crate::stop_agent_action(&state, &wire, &cards[0].id, &cards[0].incarnation, false)
+        .await
+        .expect("control: the same close without the keep stops the agent");
+    let requests = deck.script.lock().unwrap().stop_requests.clone();
+    assert_eq!(requests.len(), 1, "{requests:?}");
+    assert!(requests[0].get("keep_worktree").is_none(), "{requests:?}");
+}
+
+/// Scenario (issue #1958): on a deck that advertises the keep, "Close agent,
+/// keep worktree" sends its stop with the keep, and "Close all 2 roles, keep
+/// worktree" sends the keep on EVERY role's stop — the deck keeps the tree at
+/// whichever of them it handles first.
+#[tokio::test]
+async fn a_keep_close_sends_the_keep_on_every_stop() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("keep-sent", "a");
+    deck.script.lock().unwrap().keep_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let cards = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+        .await
+        .agents;
+    assert_eq!(cards.len(), 2, "precondition: two roles were listed");
+
+    crate::stop_agent_action(&state, &wire, &cards[0].id, &cards[0].incarnation, true)
+        .await
+        .expect("the keep stop is served");
+    let roles: Vec<_> = cards
+        .iter()
+        .map(|card| crate::dto::StopOrchestrationRole {
+            agent_id: card.id.clone(),
+            name: format!("role-{}", card.id),
+            incarnation: card.incarnation.clone(),
+        })
+        .collect();
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles, true).await;
+    closed.expect("the keep close is served");
+
+    let requests = deck.script.lock().unwrap().stop_requests.clone();
+    assert_eq!(requests.len(), 3, "{requests:?}");
+    for request in &requests {
+        assert_eq!(request["keep_worktree"], true, "{requests:?}");
+    }
+    let mut ids: Vec<_> = requests[1..]
+        .iter()
+        .map(|request| request["id"].as_str().unwrap_or_default().to_string())
+        .collect();
+    ids.sort();
+    assert_eq!(ids, ["1", "2"], "every role is stopped with the keep");
+}
+
+/// Scenario (issue #1958, PR #2268 review): the user picks "Close all 2 roles,
+/// keep worktree" on a deck the app already trusts, but whose capabilities
+/// have to be asked again and which never answers that `Hello`. The close is
+/// refused once the role-stop bound runs out, saying the daemon did not answer
+/// whether it can keep the worktree, and no role is sent a stop.
+#[tokio::test]
+async fn a_keep_close_on_a_deck_that_never_answers_hello_is_refused_in_bound() {
+    let _selection = crate::dto::SELECTION_LOCK.lock().await;
+    let deck = RestartingDeck::start("keep-silent", "a");
+    deck.script.lock().unwrap().keep_capability = Some(true);
+    let _local = select(&deck);
+    let state = DesktopState::default();
+    let wire = crate::dto::deck_wire_id(&deck.endpoint());
+    let cards = crate::daemon_bridge::snapshot_of(&deck.endpoint(), &state.daemon)
+        .await
+        .agents;
+    assert_eq!(cards.len(), 2, "precondition: two roles were listed");
+    let roles: Vec<_> = cards
+        .iter()
+        .map(|card| crate::dto::StopOrchestrationRole {
+            agent_id: card.id.clone(),
+            name: format!("role-{}", card.id),
+            incarnation: card.incarnation.clone(),
+        })
+        .collect();
+    // A failed request elsewhere cleared the capability cache, so the close's
+    // check is a fresh `Hello` — and the deck stops answering them.
+    state
+        .daemon
+        .trusted(&deck.endpoint())
+        .await
+        .expect("precondition: the deck is trusted")
+        .client
+        .invalidate_capabilities();
+    deck.script.lock().unwrap().silent_hello = true;
+
+    // Paused, so the bound elapses as soon as nothing but the silent `Hello`
+    // is left to wait on.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let (_, closed) = crate::stop_orchestration_action(&state, &wire, &roles, true).await;
+    let waited = started.elapsed();
+    tokio::time::resume();
+
+    let failure = closed.expect_err("a keep close the deck never confirms is refused");
+    assert_eq!(failure.message, crate::keep_capability_unanswered_message());
+    assert!(
+        failure.unconfirmed_stops.is_empty(),
+        "nothing was asked to stop: {:?}",
+        failure.unconfirmed_stops
+    );
+    assert!(
+        waited >= crate::ORCHESTRATION_ROLE_STOP_TIMEOUT
+            && waited < crate::ORCHESTRATION_ROLE_STOP_TIMEOUT * 2,
+        "the refusal comes from the role-stop bound: {waited:?}"
+    );
+    assert!(
+        deck.script.lock().unwrap().stop_requests.is_empty(),
+        "a keep close whose capability check went unanswered sends no stop"
     );
 }
 

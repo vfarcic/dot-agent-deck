@@ -154,6 +154,9 @@ pub struct CloseArgs {
     pub dry_run: bool,
     pub force: bool,
     pub json: bool,
+    /// `--keep-worktree` (issue #1958): keep every worktree the close frees,
+    /// whatever its state.
+    pub keep_worktree: bool,
 }
 
 impl CloseArgs {
@@ -219,7 +222,13 @@ pub async fn run_close(
     // ids this preview lists, in a second request (auditor S2).
     let dry_run = args.dry_run || bulk;
     let first = match client
-        .close_agents(selector, claim.clone(), args.force, dry_run)
+        .close_agents(
+            selector,
+            claim.clone(),
+            args.force,
+            dry_run,
+            args.keep_worktree,
+        )
         .await
     {
         Ok(report) => report,
@@ -241,7 +250,13 @@ pub async fn run_close(
         return render(&first, None, args.json);
     }
     match client
-        .close_agents(CloseSelector::UnitIds { ids }, claim, args.force, false)
+        .close_agents(
+            CloseSelector::UnitIds { ids },
+            claim,
+            args.force,
+            false,
+            args.keep_worktree,
+        )
         .await
     {
         Ok(applied) => render(&applied, Some(&first), args.json),
@@ -281,6 +296,19 @@ pub fn client_error_output(json: bool, error: &CloseAgentsError) -> CloseOutput 
                 "the running daemon{} is too old for `close`; nothing was closed. Restart it \
                  onto this build with `dot-agent-deck daemon restart`, or close from the TUI or \
                  the desktop app.",
+                daemon_version
+                    .as_deref()
+                    .map(|v| format!(" ({v})"))
+                    .unwrap_or_default()
+            ),
+            EXIT_DAEMON_TOO_OLD,
+        ),
+        CloseAgentsError::KeepWorktreeUnsupported { daemon_version } => error_output(
+            json,
+            format!(
+                "the running daemon{} cannot keep a worktree on close; nothing was closed. \
+                 Restart it onto this build with `dot-agent-deck daemon restart`, or close \
+                 without --keep-worktree.",
                 daemon_version
                     .as_deref()
                     .map(|v| format!(" ({v})"))
@@ -375,9 +403,15 @@ fn verdict_text(kind: WorktreeVerdictKind) -> &'static str {
         WorktreeVerdictKind::TimedOut => {
             "cleanup still running: the agents are stopped, the outcome is not known yet"
         }
+        WorktreeVerdictKind::KeptOnRequest => "kept on request",
         WorktreeVerdictKind::Unknown => "unknown",
     }
 }
+
+/// Issue #1958: the line under a worktree kept on request, saying how to find
+/// it again.
+const KEPT_ON_REQUEST_HINT: &str = "    find or remove it later with `dot-agent-deck worktree reclaim`, \
+     run from the repository it belongs to\n";
 
 fn pane_lines(out: &mut String, t: &CloseTarget) {
     for pane in &t.panes {
@@ -593,11 +627,14 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
                 .as_deref()
                 .map(|b| format!(" (branch {} kept)", shown(b)))
                 .unwrap_or_default();
-            out.push_str(&format!(
-                "  {}: {}{branch}\n",
-                shown(&verdict.path),
-                verdict_text(verdict.verdict)
-            ));
+            let text = match verdict.verdict {
+                WorktreeVerdictKind::KeptOnRequest if report.dry_run => "would be kept on request",
+                kind => verdict_text(kind),
+            };
+            out.push_str(&format!("  {}: {text}{branch}\n", shown(&verdict.path)));
+            if verdict.verdict == WorktreeVerdictKind::KeptOnRequest {
+                out.push_str(KEPT_ON_REQUEST_HINT);
+            }
         }
     }
     out
@@ -820,6 +857,62 @@ mod tests {
         assert_eq!(json["worktrees"][0]["verdict"], "kept-dirty");
         assert_eq!(json["targets"][1]["outcome"], "refused");
         assert_eq!(json["exit_code"], 1);
+    }
+
+    /// Issue #1958: a worktree kept on request reads `kept on request` with
+    /// its path and a pointer at `worktree reclaim` (`would be kept on request`
+    /// in a dry run), and the JSON carries `kept-on-request`. A daemon that
+    /// cannot keep is a non-zero exit with a message that nothing was closed.
+    #[test]
+    fn a_worktree_kept_on_request_is_reported_with_its_path_and_reclaim() {
+        let mut closed = target(CloseOutcome::Closed);
+        closed.branch = Some("agent/dispatch-issue-1".into());
+        closed.worktree_verdict = Some(WorktreeVerdict {
+            path: "/wt/issue-1".into(),
+            verdict: WorktreeVerdictKind::KeptOnRequest,
+        });
+        let report = CloseReport {
+            targets: vec![closed.clone()],
+            ..CloseReport::default()
+        };
+        let human = render_human(&report, None);
+        assert!(
+            human.contains("  /wt/issue-1: kept on request (branch agent/dispatch-issue-1 kept)\n"),
+            "{human}"
+        );
+        assert!(human.contains("dot-agent-deck worktree reclaim"), "{human}");
+        let json = render_json(&report, None);
+        assert_eq!(json["worktrees"][0]["verdict"], "kept-on-request");
+        assert_eq!(json["worktrees"][0]["path"], "/wt/issue-1");
+        assert_eq!(json["exit_code"], 0);
+
+        let mut listed = closed;
+        listed.outcome = CloseOutcome::Listed;
+        let dry = CloseReport {
+            dry_run: true,
+            targets: vec![listed],
+            ..CloseReport::default()
+        };
+        let human = render_human(&dry, None);
+        assert!(
+            human.contains("/wt/issue-1: would be kept on request"),
+            "{human}"
+        );
+
+        let refused = client_error_output(
+            false,
+            &CloseAgentsError::KeepWorktreeUnsupported {
+                daemon_version: Some("0.40.2".into()),
+            },
+        );
+        assert_eq!(refused.code, EXIT_DAEMON_TOO_OLD);
+        assert!(refused.stdout.is_empty());
+        assert!(
+            refused.stderr.contains("(0.40.2) cannot keep a worktree")
+                && refused.stderr.contains("nothing was closed"),
+            "{}",
+            refused.stderr
+        );
     }
 
     #[test]

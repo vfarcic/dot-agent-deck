@@ -330,7 +330,7 @@ describe("agent pane overlay", () => {
     const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
     let settle!: (result: DeckActionResult) => void;
     const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
-    const previewWorktreeClose = vi.fn(async () => ({ path: "/remote/kept-dispatch", confirmed_dirty: true }));
+    const previewWorktreeClose = vi.fn(async () => ({ kept: { path: "/remote/kept-dispatch", confirmed_dirty: true }, keepWorktree: null }));
     const rt = { ...initial, snapshot, fleet: [snapshot], runAction, previewWorktreeClose };
     const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from };
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
@@ -363,6 +363,27 @@ describe("agent pane overlay", () => {
     expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
     expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
     expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
+  });
+
+  /** Scenario (issue #1958): close the viewed dispatched agent with "Close agent, keep worktree". The daemon receives the captured stop with the keep, and once it is confirmed the pane returns to the dashboard as an ordinary close does. */
+  it("closes the viewed agent keeping its worktree and returns to the dashboard", async () => {
+    const initial = runtime();
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+    let settle!: (result: DeckActionResult) => void;
+    const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
+    const previewWorktreeClose = vi.fn(async () => ({ kept: null, keepWorktree: "/remote/unit-1958" }));
+    const rt = { ...initial, snapshot, fleet: [snapshot], runAction, previewWorktreeClose };
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from: "overview" as const };
+    const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    const dialog = screen.getByRole("alertdialog");
+    fireEvent.click(await within(dialog).findByRole("button", { name: "Close agent, keep worktree" }));
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", keepWorktree: true });
+    const ended = { ...snapshot, agents: snapshot.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<DeckShell runtime={{ ...rt, snapshot: ended, fleet: [ended] }} initialView={view} />);
+    await act(async () => settle({ ok: true }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
   });
 
   /** Scenario: an agent disappears while its close confirmation is awaiting a click. The pane and its confirmation close together, without sending the captured stop request. */

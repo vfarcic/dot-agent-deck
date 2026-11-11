@@ -2067,6 +2067,7 @@ fn dispatch_006_close_removes_worktree_preserves_clone() {
     daemon
         .send_attach_request(&AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         })
         .expect("StopAgent over the attach socket");
 
@@ -2272,6 +2273,7 @@ fn dispatch_008_refire_after_close_redispatches() {
     daemon
         .send_attach_request(&AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         })
         .expect("StopAgent over the attach socket");
     assert!(
@@ -2421,6 +2423,7 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     daemon
         .send_attach_request(&AttachRequest::StopAgent {
             id: reviewer.id.clone(),
+            keep_worktree: false,
         })
         .expect("StopAgent reviewer over the attach socket");
 
@@ -2441,6 +2444,7 @@ fn dispatch_009_multirole_orchestration_cleanup_refcount() {
     daemon
         .send_attach_request(&AttachRequest::StopAgent {
             id: orchestrator.id.clone(),
+            keep_worktree: false,
         })
         .expect("StopAgent orchestrator over the attach socket");
     let removed = common::wait_until(w(), || {

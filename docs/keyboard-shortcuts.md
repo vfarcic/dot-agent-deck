@@ -15,9 +15,11 @@ The TUI is in one of two modes, and most keys depend on which:
 
 `Ctrl+D` switches between them; in command mode plain `d` does too. The first button in the bar, `[Back to Pane d/Ctrl+D]` or `[Command Mode Ctrl+D]`, says where it takes you. The selected card keeps its `▸ ` marker in both modes.
 
+From command mode, `v` opens [copy mode](#copy-mode), for selecting text with the keyboard; the chip reads ` COPY ` until you leave it.
+
 ## Mouse
 
-The main commands have clickable buttons along the bottom, each labelled with its keyboard shortcut. On a dashboard card, a click selects it and a double click focuses its pane. Cards, tab headers, dialogs, the directory picker and forms respond to clicks.
+The main commands have clickable buttons along the bottom, each labelled with its keyboard shortcut. On a dashboard card, a click selects it and a double click focuses its pane. A click in a pane focuses that pane. Cards, tab headers, dialogs, the directory picker and forms respond to clicks. To select and copy text in a pane, drag across it ([Copying text](#copying-text)).
 
 The wheel scrolls the focused pane while the pointer is inside it. Anywhere else (the card list, the bars, a pane that is not focused, a pane's border) the wheel does nothing. The Schedules manager scrolls its own list; other dialogs ignore the wheel.
 
@@ -76,7 +78,7 @@ A chord works only while its command is on its default letter and no other comma
 
 ### `Ctrl+W` closes only from command mode
 
-While you type in a pane, `Ctrl+W` is passed through (it deletes the previous word in shells and editors). In command mode it opens a confirmation that defaults to **Cancel**; choose **Close** to stop the agent and remove its card.
+While you type in a pane, `Ctrl+W` is passed through (it deletes the previous word in shells and editors). In command mode it opens a confirmation that defaults to **Cancel**; choose **Close** to stop the agent and remove its card. For a dispatched unit, a third choice, **Close, keep worktree**, closes it the same way but leaves its worktree on disk.
 
 ### `Ctrl+Z` zooms the focused agent pane
 
@@ -130,6 +132,7 @@ Command mode. If you are typing in a pane, press `Ctrl+D` first.
 | `y` / `n` | Approve / deny a pending permission request; only when the selected card shows **Needs Input**. Otherwise `n` starts a new agent (see [Plain letters in command mode](#plain-letters-in-command-mode)). |
 | `d`, `n`, `w`, `t`, `z`, `e` | The same as `Ctrl+` with that letter (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
 | `Ctrl+M`, `Ctrl+S`, `Ctrl+G`, `Ctrl+U`, `Ctrl+R` | The same as the letter alone (see [Plain letters in command mode](#plain-letters-in-command-mode)) |
+| `v` | Open [copy mode](#copy-mode) on the focused pane |
 | `?` | Toggle the help overlay |
 
 ### Scrolling back through a pane
@@ -145,6 +148,37 @@ What there is to scroll depends on what the program in the pane writes:
 - **A full-screen program or dialog in the pane** (a picker, a permission dialog, an editor): scrolling does nothing, with no message, until it closes; the history is still there afterwards.
 
 A pane the deck starts is empty at first, so there is nothing above the agent's first output to scroll back to.
+
+## Copying text
+
+### With the mouse
+
+Drag across text in any pane to select it, in command mode or while typing in a pane. The pane does not need to be focused first: the drag focuses it and selects in it in one go. The selection stays only inside that pane, even when the pane sits next to another. When you release the button, the selected text is copied, and it stays highlighted so you can see what was copied. A double click selects a word and a triple click a paragraph, and each copies the same way.
+
+The highlight goes away on your next click, when you type into that pane, when you switch tabs, when the pane closes, or when the pane's output moves the text it covers. If you open the help overlay or a dialog while you are still dragging, the selection is dropped and nothing is copied.
+
+The status line says where the text went: `Copied to clipboard` when it is on the clipboard, or a message starting `Sent to terminal clipboard (OSC 52)` when the deck asked your terminal to put it there, which is normal over ssh. A message that ends `clipboard write still pending`, or reads `Clipboard write not confirmed yet`, means the clipboard had not answered yet when the message appeared and the text may still land, so paste to check. [Troubleshooting → Copy and paste](troubleshooting.md#copy-and-paste) lists every message and what to do when paste comes up empty.
+
+### Copy mode
+
+Copy mode selects and copies text with the keyboard, including text that has scrolled off the top of the pane. Use it when your mouse does not reach the deck, for example in a terminal or a multiplexer that does not pass mouse clicks on. It copies the same way a drag does, so the status line reports the same messages.
+
+Press `v` in command mode to open copy mode on the focused pane. The chip at the left of the bottom bar reads ` COPY `, a cursor appears in the pane, and the pane stops moving: output that arrives while copy mode is open shows up once you leave it. Nothing you type in copy mode reaches the agent.
+
+| Key | Action |
+|---|---|
+| Arrow keys / `h` `j` `k` `l` | Move the cursor |
+| `PageUp` / `PageDown` | Page back / forward through the pane's history |
+| `g` / `G` | Go to the top of the history / the bottom of the pane |
+| `v` / `Space` | Start the selection at the cursor (again to drop it) |
+| `y` / `Enter` | Copy the selection and leave copy mode |
+| `Esc` / `q` | Leave copy mode without copying |
+
+The selection runs from where you started it to the cursor, like a drag. `y` with nothing selected does nothing. Leaving copy mode returns the pane to where it was scrolled before. You can rebind the key that opens copy mode (`copy_mode` in [Actions and defaults](#actions-and-defaults)); the keys inside copy mode are fixed.
+
+### In the desktop app
+
+The desktop app has no copy mode: there the mouse reaches the pane directly, with no terminal in between. There you drag across an agent's output and copy it with your system's copy key, `Ctrl+Shift+C` on Linux and Windows or `Cmd+C` on macOS, and the text goes straight to your clipboard; agents that handle the mouse themselves copy when you release the button. [Desktop app → Dashboard](desktop/dashboard.md#the-agent-pane) has the details.
 
 ## Editing an agent's prompt
 
@@ -217,7 +251,7 @@ While filtering: `Enter` stops editing and keeps the filter, `Backspace` deletes
 | **Rename** | `r` | Type the new name · `Enter` confirms · `Esc` cancels |
 | **Generate config** | `g` | `Up` / `Down` (or `k` / `j`) to choose **Yes**, **No** or **Never** · `Enter` confirms · `Esc` cancels. **Yes** asks the selected agent to write `.dot-agent-deck.toml`; **Never** stops offering it for that directory. |
 | **Quit** | `Ctrl+C` in command mode | `Up` / `Down` (or `k` / `j`) to choose **Detach** (default), **Stop** or **Cancel** · `Enter` confirms · `Esc` dismisses · `Ctrl+C` again leaves immediately. Clicking the footer's `[Quit Ctrl+C]` opens this same dialog. **Detach** keeps the agents running; **Stop** stops them and the daemon, asking once more first while agents are running. See [Resuming Sessions](session-management.md#resuming-sessions). |
-| **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed ahead that is still waiting to be read when it opens is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
+| **Close confirmation** | `Ctrl+W`, the `[Close]` button, or a tab's `[×]` | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Close**, and for a dispatched unit **Close, keep worktree** · `Enter` confirms · `Esc` dismisses. It names what it will close and closes exactly that. A key typed ahead that is still waiting to be read when it opens is discarded. If a pane refuses to stop, the tab is kept so you can try again. |
 | **Upgrade** | `u`, or a click on the footer's update notice | `Up` / `Down` (or `k` / `j`) to choose **Cancel** (default) or **Upgrade** · `Enter` confirms · `Esc` closes · `PageUp` / `PageDown` (or the mouse wheel) scroll a plan too long for the terminal; **Upgrade** waits until the whole plan has been on screen. It asks about one copy at a time; after one copy is upgraded, **Cancel** skips the next. A copy the TUI cannot upgrade offers only **Close**. See [Upgrade from the TUI](installation.md#upgrade-from-the-tui). |
 | **Review project commands** | Starting an orchestration from the New Agent form, or restoring one, that you have not approved as its file now reads | `a` approves the text shown and starts (or restores) it · `Esc` cancels, starting and remembering nothing · `Up` / `Down` and `PageUp` / `PageDown` (or the mouse wheel) scroll. Clicking the footer's `a approve and start` (`a approve and restore` in a restore) or `Esc cancel` does the same as its key. `Enter` does not approve, and a key typed before the prompt was drawn does not answer it. See [Approving Project Commands](project-trust.md). |
 | **Star prompt** | Shown at startup about once every 10 launches, until dismissed | `s` opens the repository to star it · `l` or `Esc` asks again later · `d` never asks again |
@@ -303,6 +337,7 @@ Modifier and named-key names are case-insensitive (`ctrl+enter` equals `Ctrl+Ent
 | `host_metrics` | `m` | Open the Host of this deck overlay |
 | `restart_notice` | `a` | List the agents a deck restart stopped |
 | `dismiss_restart_notice` | `c` | Dismiss the restart notice |
+| `copy_mode` | `v` | Open copy mode on the focused pane |
 
 Not remappable, and they work alongside your bindings: `Down` / `Up` for card selection, `Tab` / `Shift+Tab` / `Left` / `Right` for tabs, `Ctrl+PageUp` / `Ctrl+PageDown`, `S` for the Schedules manager, and `Ctrl+C`, which always opens the quit dialog from command mode. There is no `quit` action.
 

@@ -78,8 +78,9 @@ describe("TauriDeckBridge", () => {
     const unsubscribe = await bridge.subscribe(vi.fn(), vi.fn(), kept);
     await bridge.connect();
     const report = { path: "/remote/project-dispatch", confirmed_dirty: true };
-    invoke.mockResolvedValueOnce(report);
-    expect(await bridge.previewWorktreeClose("remote", ["pane-41", "pane-42"], "process-a")).toEqual(report);
+    const preview = { kept: report, keepWorktree: "/remote/project-dispatch" };
+    invoke.mockResolvedValueOnce(preview);
+    expect(await bridge.previewWorktreeClose("remote", ["pane-41", "pane-42"], "process-a")).toEqual(preview);
     expect(invoke).toHaveBeenLastCalledWith("desktop_worktree_close_preview", { deckId: "remote", paneIds: ["pane-41", "pane-42"], incarnation: "process-a" });
     expect(kept).not.toHaveBeenCalled();
     const emit = (payload: unknown) => listeners.get("desktop://daemon-event")?.({ payload });
@@ -88,13 +89,18 @@ describe("TauriDeckBridge", () => {
     expect(kept).not.toHaveBeenCalled();
     emit({ kind: "worktree_kept", deck: "remote", ...report });
     emit({ kind: "worktree_kept", deck: snapshot.connection.deckId, path: "/local/kept", confirmed_dirty: false });
+    // Issue #1958: a keep the user asked for carries `on_request`, and only `true` is read as one.
+    emit({ kind: "worktree_kept", deck: "remote", path: "/remote/asked", confirmed_dirty: false, on_request: true });
+    emit({ kind: "worktree_kept", deck: "remote", path: "/remote/not-asked", confirmed_dirty: false, on_request: "yes" });
     expect(kept.mock.calls).toEqual([
       [{ deckId: "remote", ...report }],
       [{ deckId: snapshot.connection.deckId, path: "/local/kept", confirmed_dirty: false }],
+      [{ deckId: "remote", path: "/remote/asked", confirmed_dirty: false, on_request: true }],
+      [{ deckId: "remote", path: "/remote/not-asked", confirmed_dirty: false }],
     ]);
     unsubscribe();
     emit({ kind: "worktree_kept", deck: "remote", ...report });
-    expect(kept).toHaveBeenCalledTimes(2);
+    expect(kept).toHaveBeenCalledTimes(4);
     await bridge.dispose();
   });
 

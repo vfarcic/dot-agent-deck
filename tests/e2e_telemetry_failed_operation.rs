@@ -115,6 +115,7 @@ fn telemetry_otlp_045_failed_claude_call_ends_its_operation() {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: agent.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();
