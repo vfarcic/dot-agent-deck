@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use dot_agent_deck::composer_probe::keymap::{
-    ClaudeKeymap, CodexSources, Hold, SOURCE_BYTES, SourceRead, Unreadable,
+    ClaudeKeymap, CodexBaseline, CodexSources, Hold, SOURCE_BYTES, SourceRead, Unreadable,
     claude_keybindings_path, codex_key, codex_keymap, is_ctrl_g, read_source,
 };
 use dot_agent_deck::doorbell_activation::{
@@ -313,6 +313,90 @@ fn probe_014_ctrl_g_in_its_spellings() {
 
 fn args(list: &[&str]) -> Vec<OsString> {
     list.iter().map(OsString::from).collect()
+}
+
+/// Scenario: A launcher such as `devbox run codex-big` starts Codex with `-c` options of its own that the deck's launch line never shows (issue #2258). Codex bound with only overrides that can't set a key binding (`model_reasoning_effort`, `check_for_update_on_startup`), even beside the telemetry shim's `otel` pair, matches the spawn's baseline. One that adds a `tui` override, a `profile` or `profiles` key, a quoted key, a value with a newline that adds another key, an `otel` override the telemetry shim didn't write, the deck wrapper's `shell_environment_policy` pair anywhere but first, a `-p` profile, or that drops one of the baseline's own overrides still holds as changed.
+#[spec("inbox/probe/014")]
+#[test]
+fn probe_014_a_launchers_keymap_neutral_overrides_match_the_baseline() {
+    let home = test_temp::tempdir().unwrap();
+    let cwd = test_temp::tempdir().unwrap();
+    let launcher = CodexBaseline::at_spawn(home.path(), &args(&["run", "codex-big"]), cwd.path())
+        .expect("a launcher's baseline");
+    let neutral = args(&[
+        "--model",
+        "gpt-6.1-sol",
+        "-c",
+        "model_reasoning_effort=high",
+        "-c",
+        "check_for_update_on_startup=false",
+    ]);
+    assert_eq!(launcher.bound(home.path(), &neutral, cwd.path()), Ok(()));
+    let shim = [
+        args(&[
+            "-c",
+            r#"otel.trace_exporter={otlp-http={endpoint="http://127.0.0.1:4318/v1/traces",protocol="binary"}}"#,
+        ]),
+        neutral.clone(),
+    ]
+    .concat();
+    assert_eq!(
+        launcher.bound(home.path(), &shim, cwd.path()),
+        Ok(()),
+        "the telemetry shim's pair in front"
+    );
+    for (extra, why) in [
+        (
+            args(&["-c", "tui.keymap.global.open_external_editor=ctrl-e"]),
+            "a tui override",
+        ),
+        (args(&["-c", "tui={keymap={}}"]), "a tui table"),
+        (args(&["-c", "profile=other"]), "a profile key"),
+        (args(&["-c", "profiles.other.model=o3"]), "a profiles key"),
+        (args(&["-c", "\"tui\".keymap={}"]), "a quoted key"),
+        (args(&["-p", "other"]), "a profile flag"),
+        (args(&["-c", "no-equals"]), "an override with no value"),
+        (
+            args(&[
+                "-c",
+                "model=\"o3\"\ntui.keymap.global.open_external_editor=\"f6\"",
+            ]),
+            "a newline adding a key after the value",
+        ),
+        (
+            args(&["-c", "otel.trace_exporter={}"]),
+            "an otel override the shim didn't write",
+        ),
+        (
+            args(&["-c", "shell_environment_policy.set={}"]),
+            "the wrapper's pair anywhere but first",
+        ),
+    ] {
+        let launch = [neutral.clone(), extra].concat();
+        assert!(
+            launcher.bound(home.path(), &launch, cwd.path()).is_err(),
+            "{why}"
+        );
+    }
+    let own = CodexBaseline::at_spawn(home.path(), &args(&["-c", "model=o3"]), cwd.path()).unwrap();
+    assert_eq!(
+        own.bound(
+            home.path(),
+            &args(&["-c", "model=o3", "-c", "model_reasoning_effort=high"]),
+            cwd.path()
+        ),
+        Ok(()),
+        "the baseline's own override kept, a neutral one added"
+    );
+    assert_eq!(
+        own.bound(
+            home.path(),
+            &args(&["-c", "model_reasoning_effort=high"]),
+            cwd.path()
+        ),
+        Err(Hold::Changed),
+        "the baseline's own override dropped"
+    );
 }
 
 /// Scenario: Codex's launch arguments name its sources: `-c`, `--config`, `--config=` and the attached `-ck=v` and `-c=k=v` forms are overrides in command-line order, `-p`/`--profile` selects `CODEX_HOME/<name>.config.toml` (the last one wins), and nothing after `--` is read. A flag with no value, or an empty profile name, holds as unparsable. The control, with no such flag, has the config file only.

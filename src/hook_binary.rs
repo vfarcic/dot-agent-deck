@@ -3394,25 +3394,44 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn the_probe_reaps_inline_when_no_reaper_thread_can_start() {
-        let dir = crate::test_temp::tempdir().unwrap();
-        let pidfile = dir.path().join("pid");
-        let stub = version_stub(
-            dir.path(),
-            "hung",
-            &format!(
-                "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
-                pidfile.display()
-            ),
-        );
-        take_probe_events();
-        FAIL_REAPER_SPAWN.with(|seam| seam.set(true));
-        let result = run_probe(Path::new(&stub), Duration::from_secs(1));
-        FAIL_REAPER_SPAWN.with(|seam| seam.set(false));
-        let err = result.unwrap_err();
-        assert!(err.contains("did not exit"), "{err}");
-        assert_eq!(take_probe_events(), [ProbeEvent::Kill, ProbeEvent::Reap]);
-        let pid = stub_pid(&pidfile);
-        assert!(is_reaped(pid), "the binary {pid} was left unreaped");
+        // On a loaded box the probe's deadline can kill the stub before its
+        // shell reaches the line that records its pid (issue #2107's gate run
+        // measured it: `stub_pid` then waited out its budget for a file that
+        // could never appear). Such a run proves nothing about WHICH pid was
+        // reaped, so it is repeated, and the reaped-pid assertion only ever
+        // runs on a run whose stub recorded its pid.
+        const ATTEMPTS: usize = 5;
+        for attempt in 1..=ATTEMPTS {
+            let dir = crate::test_temp::tempdir().unwrap();
+            let pidfile = dir.path().join("pid");
+            let stub = version_stub(
+                dir.path(),
+                "hung",
+                &format!(
+                    "#!/bin/sh\necho $$ > '{}'\nexec sleep 30\n",
+                    pidfile.display()
+                ),
+            );
+            take_probe_events();
+            FAIL_REAPER_SPAWN.with(|seam| seam.set(true));
+            let result = run_probe(Path::new(&stub), Duration::from_secs(1));
+            FAIL_REAPER_SPAWN.with(|seam| seam.set(false));
+            let err = result.unwrap_err();
+            assert!(err.contains("did not exit"), "{err}");
+            assert_eq!(take_probe_events(), [ProbeEvent::Kill, ProbeEvent::Reap]);
+            // The probe has returned, so the stub is dead: either it wrote its
+            // pid before the kill or it never will.
+            let Some(pid) = std::fs::read_to_string(&pidfile)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+            else {
+                eprintln!("attempt {attempt}: the stub was killed before it recorded its pid");
+                continue;
+            };
+            assert!(is_reaped(pid), "the binary {pid} was left unreaped");
+            return;
+        }
+        panic!("the stub never recorded its pid before the deadline in {ATTEMPTS} attempts");
     }
 
     /// Scenario: a probe unwinds from a panic while it owns a running binary,

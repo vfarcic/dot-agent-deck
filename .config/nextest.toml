@@ -427,7 +427,8 @@ slow-timeout = { period = "60s", terminate-after = 7 }
 # `target/version-injection-e2e` CARGO_TARGET_DIR. That isolation is required so
 # it cannot clobber the `target/debug` binary the rest of the suite spawns. The
 # nested builds are `--jobs`-capped so they cannot starve the timed e2e tests
-# running alongside them.
+# running alongside them — except in CI's `version` shard, where nothing runs
+# alongside them and `scripts/e2e-shard.sh` lifts the cap (issue #2109).
 #
 # `priority` IS THE FIX FOR ISSUE #928, and what it fixes is not the build's
 # cost — it is WHEN the build starts. nextest schedules in binary-name order,
