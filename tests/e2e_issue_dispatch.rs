@@ -34,6 +34,8 @@
 
 dot_agent_deck_test_harness::link!();
 
+#[path = "support/work_journal.rs"]
+mod journal;
 #[path = "support/inbox_view.rs"]
 mod view;
 
@@ -3282,4 +3284,153 @@ fn config_trust_schedule_006_an_unnamed_orchestration_dispatches_once_the_clone_
         String::from_utf8_lossy(&listed.stdout),
         String::from_utf8_lossy(&listed.stderr)
     );
+}
+
+/// Scenario: Fire an orchestration-shaped `issue_dispatch` task for one open issue of a stub repository. The work journal must open a `launch=schedule_fire` work naming the schedule and, as its child, a `launch=issue_dispatch` work carrying the issue number, repository, `agent/issue-<n>` branch and the issue's worktree, whose dispatched pane is an attempt of that issue's work (or of an orchestration opened under it). Then SIGTERM the daemon by its own pid and start a new one on the same state directory: every attempt that was live must end `how=interrupted`, and walking up its work's `parent` chain must still reach that issue's work with its issue, repository and branch.
+#[spec("journal/launch/005")]
+#[test]
+fn journal_launch_005_issue_dispatch_opens_one_child_work_per_issue() {
+    let stub = GhStub::new();
+    let repo = "acme/journal";
+    stub.add_repo(repo, true);
+    stub.set_issues(repo, &[7]);
+    let work_td = common::harness_tempdir().expect("workspace tempdir");
+    let work = work_td.path().join("ws");
+    std::fs::create_dir_all(&work).expect("create workspace root");
+    let work_str = work.to_string_lossy().into_owned();
+    let toml = dispatch_task(
+        "journal-issues",
+        &work_str,
+        "JOURNAL-ISSUE-{{issue_number}}",
+        repo,
+        5,
+    );
+    let path = stub.path_env();
+    let ghdir = stub.ghstub_dir();
+    let env: Vec<(&str, &str)> = vec![("PATH", path.as_str()), ("GHSTUB_DIR", ghdir.as_str())];
+    let mut daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &env);
+    let state = journal::default_state_dir(&daemon);
+    // PRD #1885: the clone's orchestration is approved, as the user's is.
+    approve_dispatch_clone(&daemon, &stub, repo, &work, "journal-issues");
+    daemon
+        .run_now("journal-issues")
+        .expect("run-now journal-issues");
+    let paths = derive_issue_paths(Path::new(&work_str), "journal-issues", 7);
+    let agent = daemon
+        .wait_for_agent_where(|r| orchestrator_in(r, &paths.worktree_dir), w())
+        .unwrap_or_else(|| {
+            panic!(
+                "precondition: issue #7 dispatches into {:?}",
+                paths.worktree_dir
+            )
+        });
+
+    let fire = journal::wait_for(&state, "an `opened` launch=schedule_fire", |l| {
+        journal::find(l, "opened", |o| {
+            o["launch"] == "schedule_fire" && o["refs"]["schedule"] == "journal-issues"
+        })
+        .cloned()
+    });
+    let fire_work = fire["work"].as_str().expect("fire work id").to_string();
+    let issue = journal::wait_for(&state, "an `opened` launch=issue_dispatch for #7", |l| {
+        journal::find(l, "opened", |o| {
+            o["launch"] == "issue_dispatch" && o["refs"]["issue"] == 7
+        })
+        .cloned()
+    });
+    let issue_work = issue["work"].as_str().expect("issue work id").to_string();
+    assert_eq!(
+        issue["parent"],
+        fire_work.as_str(),
+        "an issue is a child of its fire: {issue}"
+    );
+    assert_eq!(issue["refs"]["repo"], repo, "{issue}");
+    assert_eq!(issue["refs"]["branch"], paths.branch.as_str(), "{issue}");
+    assert!(
+        journal::workspace_is(&issue, &daemon.home, &paths.worktree_dir),
+        "workspace must be the issue's worktree {:?}: {issue}",
+        journal::workspace_spellings(&daemon.home, &paths.worktree_dir)
+    );
+    let attempt = journal::wait_for(&state, "the issue pane's `attempt_started`", |l| {
+        journal::attempt_of(l, &agent.id).cloned()
+    });
+    let attempt_work = attempt["work"].as_str().unwrap_or_default();
+    let lines = journal::lines(&state);
+    assert!(
+        attempt_work == issue_work
+            || journal::find(&lines, "opened", |o| {
+                o["work"] == attempt_work && o["parent"] == issue_work.as_str()
+            })
+            .is_some(),
+        "the dispatched pane must be an attempt of the issue's work or of a work under it: \
+         {attempt}\n{}",
+        journal::dump(&state)
+    );
+    stub.assert_no_unhandled_calls();
+
+    // Restart: every attempt live at the SIGTERM is interrupted, and its work
+    // still leads up to the issue it served.
+    let live: Vec<String> = journal::all(&lines, "attempt_started", |_| true)
+        .into_iter()
+        .filter_map(|s| s["attempt"].as_str())
+        .filter(|a| journal::find(&lines, "attempt_ended", |e| e["attempt"] == *a).is_none())
+        .map(str::to_string)
+        .collect();
+    assert!(
+        live.contains(&attempt["attempt"].as_str().unwrap_or_default().to_string()),
+        "precondition: the issue pane's attempt is live before the restart: {live:?}\n{}",
+        journal::dump(&state)
+    );
+    // The daemon's own pid, never a pattern (CLAUDE.md rule 12).
+    // SAFETY: kill(2) on a pid this test spawned and still holds.
+    assert_eq!(
+        unsafe { libc::kill(daemon.pid() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert!(
+        daemon.wait_for_exit(common::load_scaled(Duration::from_secs(20))),
+        "the daemon must exit on SIGTERM"
+    );
+    let state_env = state.to_string_lossy().into_owned();
+    let mut second =
+        common::spawn_daemon_serve_with_env(None, "0", &[("DOT_AGENT_DECK_STATE_DIR", &state_env)]);
+    assert!(second.is_alive_public(), "the second daemon must start");
+    let ends = journal::wait_for(
+        &state,
+        "`attempt_ended how=interrupted` for every live attempt",
+        |l| {
+            live.iter()
+                .map(|a| {
+                    journal::find(l, "attempt_ended", |e| {
+                        e["attempt"] == a.as_str() && e["how"] == "interrupted"
+                    })
+                    .cloned()
+                })
+                .collect::<Option<Vec<_>>>()
+        },
+    );
+    let lines = journal::lines(&state);
+    for end in &ends {
+        let work = end["work"].as_str().unwrap_or_default();
+        let chain = journal::ancestry(&lines, work);
+        let issue_open = chain
+            .iter()
+            .find(|o| o["launch"] == "issue_dispatch")
+            .unwrap_or_else(|| {
+                panic!(
+                    "an interrupted attempt's work must lead up to its issue_dispatch work: \
+                     {end}\nchain: {chain:?}\n{}",
+                    journal::dump(&state)
+                )
+            });
+        assert_eq!(issue_open["work"], issue_work.as_str(), "{end}");
+        assert_eq!(issue_open["refs"]["issue"], 7, "{issue_open}");
+        assert_eq!(issue_open["refs"]["repo"], repo, "{issue_open}");
+        assert_eq!(
+            issue_open["refs"]["branch"],
+            paths.branch.as_str(),
+            "{issue_open}"
+        );
+    }
+    assert!(second.is_alive_public());
 }

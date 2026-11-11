@@ -1603,6 +1603,7 @@ async fn dispatch_003_the_dispatch_and_startagent_paths_respawn_identically() {
 
     let handle = dot_agent_deck::spawn::spawn(
         dot_agent_deck::spawn::SpawnRequest {
+            work_id: None,
             task_name: "parity".to_string(),
             working_dir: dispatch_dir.path().to_string_lossy().into_owned(),
             command: None,

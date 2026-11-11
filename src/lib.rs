@@ -245,6 +245,10 @@ pub mod version;
 pub mod vt_grid;
 pub mod vt_work;
 pub mod watch;
+// PRD #1889: the work journal, the deck's durable record of its units of work.
+pub mod work_journal;
+// PRD #1889: which work each launch, attempt, report and end belongs to.
+pub mod work_tracking;
 pub mod worktree_owner;
 pub mod worktree_reclaim;
 pub mod wrap;
