@@ -34,7 +34,7 @@ function tile(agent: AgentSession) {
     onTabChange={vi.fn()} onTerminalInput={vi.fn(async () => {})}
     onTerminalResize={vi.fn(async () => {})} onEvidenceSelect={vi.fn()}
     onInboxAction={vi.fn(async () => ({ outcome: "applied" }))} />);
-  return within(screen.getByRole("article", { name: "Auditor" }));
+  return within(screen.getByRole("article", { name: "test / Auditor" }));
 }
 
 describe("an OpenCode agent the deck cannot fully support (PRD #2050)", () => {

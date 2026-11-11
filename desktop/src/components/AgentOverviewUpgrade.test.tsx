@@ -428,3 +428,39 @@ describe("Upgrade on the Local daemon section (issue #1753)", () => {
     expect(button).toHaveAttribute("title", `${behindAppHeadline} ${cliHeadline} Its daemon runs 0.43.0; this app is 0.44.0.`);
   });
 });
+
+describe("the dashboard's Replace daemon (issue #1073)", () => {
+  /** A fleet whose local daemon answered and was refused, beside a connected remote deck that is the SELECTED one. */
+  function refusedLocalFleet(): DeckSnapshot[] {
+    const [local, remote] = createFixtureFleet("fleet");
+    const refused: DeckSnapshot = {
+      ...local,
+      agents: [],
+      connection: { ...local.connection, status: "error", daemonDetected: true, runningAgentCount: 2, message: "This daemon was built from a version this app cannot read safely." },
+    };
+    return [remote, refused];
+  }
+
+  /** Scenario: With a remote daemon selected, the refused local daemon's card offers Replace daemon, and it runs the replace on the LOCAL daemon. */
+  it("replaces the local daemon from its card when another daemon is selected", async () => {
+    const deck = runtime(refusedLocalFleet(), { mode: "live" });
+    expect(deck.snapshot.connection.deckId).toBe(FIXTURE_REMOTE_DAEMON_ID);
+    render(<AgentOverview runtime={deck} onNavigate={vi.fn()} />);
+
+    const note = within(group(FIXTURE_DAEMON_ID)).getByTestId("overview-incompatible");
+    expect(note).toHaveTextContent("Replace daemon stops this daemon and starts the one that came with this app");
+    fireEvent.click(within(group(FIXTURE_DAEMON_ID)).getByTestId("overview-replace"));
+    expect(screen.getByRole("alertdialog")).toHaveTextContent("Replace");
+    fireEvent.click(screen.getByTestId("upgrade-start"));
+    await waitFor(() => expect(deck.upgradeDaemon).toHaveBeenCalledWith(FIXTURE_DAEMON_ID, expect.any(Function)));
+  });
+
+  /** Scenario: A refused REMOTE daemon offers no Replace (it has Upgrade instead), and the fixture preview offers none either. */
+  it("offers Replace only on the local daemon, in live mode", () => {
+    const view = render(<AgentOverview runtime={runtime(createFixtureFleet("upgrade"), { mode: "live" })} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("overview-replace")).not.toBeInTheDocument();
+    view.unmount();
+    render(<AgentOverview runtime={runtime(refusedLocalFleet())} onNavigate={vi.fn()} />);
+    expect(screen.queryByTestId("overview-replace")).not.toBeInTheDocument();
+  });
+});

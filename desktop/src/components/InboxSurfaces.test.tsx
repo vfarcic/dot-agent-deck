@@ -1,6 +1,7 @@
 import { render, screen, within } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import words from "../../../tests/fixtures/inbox-display.json";
+import terminationCases from "../../../tests/fixtures/inbox-termination-cards.json";
 import { AgentTile } from "./AgentTile";
 import { HandoffRail } from "./HandoffRail";
 import { mapDesktopSnapshot, TauriDeckBridge, type DesktopSnapshotDto } from "../lib/bridge";
@@ -63,12 +64,12 @@ describe("inbox cards and handoff rail (S13)", () => {
     Object.assign(before.agents[0], { agentType });
     Object.assign(before.agents[0].inbox!, { wakeHold: "possible_draft" });
     const view = render(card(mapDesktopSnapshot(before).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(words.wakeHolds.possible_draft);
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(words.wakeHolds.possible_draft);
     const absent = snapshot(1, 0, true);
     Object.assign(absent.agents[0], { agentType });
     Object.assign(absent.agents[0].inbox!, { wakeHold });
     view.rerender(card(mapDesktopSnapshot(absent).agents[0]));
-    const tile = screen.getByRole("article", { name: "Coder" });
+    const tile = screen.getByRole("article", { name: "test / Coder" });
     expect(tile).toHaveTextContent(words.wakeHolds[wakeHold]);
     expect(tile).not.toHaveTextContent(words.wakeHolds.possible_draft);
     view.rerender(card(mapDesktopSnapshot(snapshot()).agents[0]));
@@ -79,13 +80,13 @@ describe("inbox cards and handoff rail (S13)", () => {
   it.each([[2, 0], [0, 2], [1, 1]])("shows ✉2 for %i queued and %i fetched messages", (queued, fetched) => {
     const mapped = mapDesktopSnapshot(snapshot(queued, fetched));
     render(card(mapped.agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(`${words.glyph}2`);
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(`${words.glyph}2`);
   });
 
   /// Scenario: The daemon reports that nothing has woken the agent for its waiting message; the card says it is waiting to wake and what to do, in the words the TUI uses.
   it("shows a stalled wake and what to do on the agent card", () => {
     render(card(mapDesktopSnapshot(snapshot(1, 0, true)).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(
       `${words.glyph}1 ${words.wakeStalled}: ${words.wakeStalledHint}`,
     );
   });
@@ -105,7 +106,7 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot(1, 0, true);
     Object.assign(dto.agents[0].inbox!, { wakeHold: hold });
     render(card(mapDesktopSnapshot(dto).agents[0]));
-    const tile = screen.getByRole("article", { name: "Coder" });
+    const tile = screen.getByRole("article", { name: "test / Coder" });
     expect(tile).toHaveTextContent(`${words.glyph}1 ${words.wakeHolds[hold]}`);
     expect(tile).not.toHaveTextContent(words.wakeStalled);
   });
@@ -116,9 +117,9 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot();
     Object.assign(dto.agents[0], { status, inputHeld: { generation: 9, cause, heldOps: 2, heldBytes: 7, sinceMs: 1 } });
     const view = render(card(mapDesktopSnapshot(dto).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(text);
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(text);
     view.rerender(card(mapDesktopSnapshot(snapshot()).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent(text);
+    expect(screen.getByRole("article", { name: "test / Coder" })).not.toHaveTextContent(text);
   });
 
   /// Scenario: inbox/probe/080 — the agent that replaced one whose typing was held arrives through the snapshot bridge saying that typing was discarded. Its tile shows the shared not-delivered words, a hold of its own takes their place, and the next snapshot without either clears the row.
@@ -126,7 +127,7 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot();
     Object.assign(dto.agents[0], { inputDiscarded: true });
     const view = render(card(mapDesktopSnapshot(dto).agents[0]));
-    const tile = screen.getByRole("article", { name: "Coder" });
+    const tile = screen.getByRole("article", { name: "test / Coder" });
     expect(tile).toHaveTextContent(words.inputNotDelivered);
     expect(words.inputNotDelivered.startsWith(words.notDelivered)).toBe(true);
     const held = snapshot();
@@ -147,7 +148,7 @@ describe("inbox cards and handoff rail (S13)", () => {
       cause, pathComponent: "/safe/old-path", filesystem: "overlayfs",
     } });
     const view = render(card(mapDesktopSnapshot(dto).agents[0]));
-    const tile = screen.getByRole("article", { name: "Coder" });
+    const tile = screen.getByRole("article", { name: "test / Coder" });
     expect(tile).toHaveTextContent("/safe/old-path");
     if (cause === "filesystem") {
       for (const required of ["overlayfs", "TMPDIR", "CODEX_HOME", "ext4", "XFS", "Btrfs", "tmpfs", "APFS", "HFS+"]) {
@@ -171,8 +172,8 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot(1);
     Object.assign(dto.agents[0].inbox!, { wakeHold: "cannot_check", holdDetail });
     render(card(mapDesktopSnapshot(dto).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(words.wakeHolds.cannot_check);
-    expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("do-not-inherit");
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(words.wakeHolds.cannot_check);
+    expect(screen.getByRole("article", { name: "test / Coder" })).not.toHaveTextContent("do-not-inherit");
   });
 
   /// Scenario: inbox/probe/018 — an older client receives a future hold without the stalled bit. Its card retains the generic waiting-to-wake fallback.
@@ -180,7 +181,7 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot(1);
     Object.assign(dto.agents[0].inbox!, { wakeHold: "future_hold" });
     render(card(mapDesktopSnapshot(dto).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(`${words.wakeStalled}: ${words.wakeStalledHint}`);
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(`${words.wakeStalled}: ${words.wakeStalledHint}`);
   });
 
   /// Scenario: inbox/probe/018 — a needs-fetch or cannot-check hold has no display words and no stalled bit. The real tile must still show the generic waiting-to-wake fallback, rather than queued or undefined.
@@ -192,8 +193,8 @@ describe("inbox cards and handoff rail (S13)", () => {
       const dto = snapshot(1);
       Object.assign(dto.agents[0].inbox!, { wakeHold: hold });
       render(card(mapDesktopSnapshot(dto).agents[0]));
-      expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(`${words.wakeStalled}: ${words.wakeStalledHint}`);
-      expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("undefined");
+      expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(`${words.wakeStalled}: ${words.wakeStalledHint}`);
+      expect(screen.getByRole("article", { name: "test / Coder" })).not.toHaveTextContent("undefined");
     } finally {
       if (saved === undefined) delete table[hold];
       else table[hold] = saved;
@@ -209,7 +210,7 @@ describe("inbox cards and handoff rail (S13)", () => {
       cause: "filesystem", pathComponent, filesystem,
     } });
     render(card(mapDesktopSnapshot(dto).agents[0]));
-    const tile = screen.getByRole("article", { name: "Coder" });
+    const tile = screen.getByRole("article", { name: "test / Coder" });
     expect(tile.textContent).toContain("/safe/\\n\\u{1b}\\u{202e}$(touch sentinel);");
     expect(tile.textContent).toContain("fs-\\n\\u{1b}\\u{202e}");
     for (const forbidden of ["PATH_TAIL", "FS_TAIL", "\u001b", "\u202e", "é".repeat(257), "界".repeat(257)]) {
@@ -239,13 +240,13 @@ describe("inbox cards and handoff rail (S13)", () => {
           wake_update: true, wake_hold: "cannot_check", hold_detail: { cause: "io", path_component: path },
         }) });
         view.rerender(card(fleet[0].agents[0], fleet[0].evidence));
-        expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(path);
-        if (path.includes("second")) expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("first-path");
+        expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(path);
+        if (path.includes("second")) expect(screen.getByRole("article", { name: "test / Coder" })).not.toHaveTextContent("first-path");
       }
       listeners.get("desktop://daemon-event")?.({ payload: inbox("queued", { wake_update: true, wake_hold: "needs_fetch" }) });
       view.rerender(card(fleet[0].agents[0], fleet[0].evidence));
-      expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(words.wakeHolds.needs_fetch);
-      expect(screen.getByRole("article", { name: "Coder" })).not.toHaveTextContent("second-path");
+      expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(words.wakeHolds.needs_fetch);
+      expect(screen.getByRole("article", { name: "test / Coder" })).not.toHaveTextContent("second-path");
     } finally { await bridge.dispose(); }
   });
 
@@ -258,7 +259,7 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot(0, 0, false);
     Object.assign(dto.agents[0].inbox!, { wakeHold: hold });
     render(card(mapDesktopSnapshot(dto).agents[0]));
-    const tile = screen.getByRole("article", { name: "Coder" });
+    const tile = screen.getByRole("article", { name: "test / Coder" });
     const alone = (words.wakeHoldsAlone as Record<string, string>)[hold];
     if (warns) {
       expect(tile).toHaveTextContent(alone);
@@ -276,7 +277,7 @@ describe("inbox cards and handoff rail (S13)", () => {
     const dto = snapshot(1, 0, false);
     Object.assign(dto.agents[0].inbox!, extra);
     render(card(mapDesktopSnapshot(dto).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveTextContent(
+    expect(screen.getByRole("article", { name: "test / Coder" })).toHaveTextContent(
       `${words.glyph}1 ${words.wakeStalled}: ${words.wakeStalledHint}`,
     );
   });
@@ -284,11 +285,21 @@ describe("inbox cards and handoff rail (S13)", () => {
   /// Scenario: Acknowledged messages leave no pending badge on the card.
   it("omits the pending envelope when queued and fetched are zero", () => {
     render(card(mapDesktopSnapshot(snapshot()).agents[0]));
-    expect(screen.getByRole("article", { name: "Coder" }).textContent).not.toMatch(/✉\d/);
+    expect(screen.getByRole("article", { name: "test / Coder" }).textContent).not.toMatch(/✉\d/);
   });
 
-  /// Scenario: Receive an undeliverable broadcast and its delivery_notice event through the real bridge, then show Error and the notice on the card.
-  it("shows Error and the not-delivered notice on the agent card", async () => {
+  /**
+   * Issue #1933: the notice the daemon sends when a worker's pane ended first,
+   * in the shared words. `inbox/status/008`'s TUI half pins that the real
+   * inbox hub sends exactly this; the tile prints it as it came.
+   */
+  function terminationNotice(termination: { kind: string; code?: number }): string {
+    const explanation = (words.terminations as Record<string, string>)[termination.kind];
+    return `${words.notDelivered}: ${explanation.replace("{code}", String(termination.code))}`;
+  }
+
+  /// Scenario: inbox/status/008 — a worker's pane ends before it takes a message: its command exits with code 0, 7 or 23, the deck's connection ends, or the pane is replaced, closed or ends some unknown way. The undeliverable broadcast and the daemon's delivery_notice event arrive through the real bridge, and the tile shows Error and the same notice as the TUI's card, exit code included.
+  it.each(terminationCases)("shows Error and how the pane ended on the agent card ($name)", async ({ termination }) => {
     const dto = snapshot();
     invoke.mockResolvedValue(dto);
     const bridge = new TauriDeckBridge();
@@ -296,20 +307,31 @@ describe("inbox cards and handoff rail (S13)", () => {
     try {
       await bridge.subscribe((next) => { fleet = next; }, vi.fn());
       await bridge.connect();
-      const notice = `${words.notDelivered}: review the fixture (agent exited)`;
-      listeners.get("desktop://daemon-event")?.({ payload: inbox("undeliverable", { reason: "agent_exited" }) });
+      const notice = terminationNotice(termination);
+      listeners.get("desktop://daemon-event")?.({ payload: inbox("undeliverable", { reason: "agent_exited", termination }) });
       listeners.get("desktop://daemon-event")?.({ payload: {
         kind: "event", session_id: "session-7", pane_id: "worker", agent_id: "7",
         agent_type: "codex", event_type: "error", timestamp: "2026-10-13T00:00:00Z",
         tool_detail: notice, metadata: { delivery_notice: notice },
       } });
       render(card(fleet[0].agents[0], fleet[0].evidence));
-      const tile = within(screen.getByRole("article", { name: "Coder" }));
+      const tile = within(screen.getByRole("article"));
       expect(tile.getByText(/^error$/i)).toBeVisible();
       expect(tile.getByText(notice)).toBeVisible();
     } finally {
       await bridge.dispose();
     }
+  });
+
+  /// Scenario: inbox/status/008 — the desktop reconnects to a deck whose snapshot already holds an Error agent with each pane-ending notice. The tile shows Error and the whole notice, exit code included, uncut.
+  it.each(terminationCases)("hydrates how the pane ended on the agent card ($name)", ({ termination }) => {
+    const notice = terminationNotice(termination);
+    const dto = snapshot();
+    Object.assign(dto.agents[0], { status: "error", deliveryNotice: notice });
+    render(card(mapDesktopSnapshot(dto).agents[0]));
+    const tile = within(screen.getByRole("article"));
+    expect(tile.getByText(/^error$/i)).toBeVisible();
+    expect(tile.getByText(notice)).toBeVisible();
   });
 
   /// Scenario: Posting a message paints its subject and a queued delegation in the live rail.
