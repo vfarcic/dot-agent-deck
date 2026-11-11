@@ -214,9 +214,12 @@ Refresh the integration with `dot-agent-deck hooks install` on the machine runni
 
 When the agent's pane ended before it took a message, the line says what the deck saw end it, in both clients, and an orchestrator that had delegated it a task it hadn't taken yet is told the same:
 
-- `the command started in this agent's pane exited`: the command the deck started in the pane, such as `claude` or `devbox run codex-big`, exited; the orchestrator's message gives its exit code. The agent usually ended with it, but an agent that command started in the background can still be running: look at the pane, or for the agent's process, before you start another.
-- `the deck's connection to this agent's pane ended`: the pane's terminal closed while the command the deck started was still running, or before the deck could read how it ended. The agent may still be running, but the deck can no longer reach it: stop it yourself if it is, then restart the agent from the deck.
-- A worker's pane that was closed, or replaced by a new agent started in it, is named that way in the orchestrator's message, and the task stays with the agent that was there: the new agent doesn't get it. When a new agent was being started in the pane but had not started yet, or failed to start, the message only says that the agent's pane ended. Restarting a worker with `dot-agent-deck pane restart` cancels its waiting tasks instead, and the orchestrator that asked for the restart isn't told about them.
+- `the command started in the agent's pane exited (code N)`: the command the deck started in the pane, such as `claude` or `devbox run codex-big`, exited with code N. The agent usually ended with it, but an agent that command started in the background can still be running: look at the pane, or for the agent's process, before you start another.
+- `the deck's connection to the agent's pane ended`: the pane's terminal closed while the command the deck started was still running, or before the deck could read how it ended. The agent may still be running, but the deck can no longer reach it: stop it yourself if it is, then restart the agent from the deck.
+- `the agent's pane was replaced` or `the pane was closed`: the worker's pane was replaced by a new agent started in it, or closed. The message stays with the agent that was there: the new agent doesn't get it.
+- `the agent's pane ended`: a new agent was being started in the pane but had not started yet, or failed to start, so the deck can't say more.
+
+Restarting a worker with `dot-agent-deck pane restart` cancels its waiting tasks instead, and the orchestrator that asked for the restart isn't told about them.
 
 ### A message says delivery uncertain
 

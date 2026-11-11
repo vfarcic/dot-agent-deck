@@ -95,22 +95,22 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
   it("shows an off-selected-tab orchestrator in the deck header and on its tile", () => {
     const mapped = mapDesktopSnapshot(snapshot());
     const offTab = render(tile(mapped, "diff"));
-    expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(words.wakeHolds.possible_draft);
+    expect(screen.getByRole("article", { name: "team-away / Coordinator" })).toHaveTextContent(words.wakeHolds.possible_draft);
     expect(screen.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true");
     offTab.unmount();
     const view = render(<DeckShell runtime={runtime(mapped)} initialView={{ kind: "deck" }} />);
-    const coder = screen.getByRole("article", { name: "Coder" });
+    const coder = screen.getByRole("article", { name: "team-away / Helper" });
     expect(coder).not.toHaveClass("is-selected");
     expectAttention(header(view.container));
     fireEvent.mouseDown(coder);
     expect(coder).toHaveClass("is-selected");
-    expect(screen.getByRole("article", { name: "Captain" })).not.toHaveClass("is-selected");
+    expect(screen.getByRole("article", { name: "team-away / Coordinator" })).not.toHaveClass("is-selected");
     expectAttention(header(view.container));
     fireEvent.click(screen.getByTestId("open-overview"));
     expectAttention(header(view.container));
     fireEvent.click(screen.getByTestId("open-deck"));
-    fireEvent.mouseDown(screen.getByRole("article", { name: "Coder" }));
-    expect(screen.getByRole("article", { name: "Coder" })).toHaveClass("is-selected");
+    fireEvent.mouseDown(screen.getByRole("article", { name: "team-away / Helper" }));
+    expect(screen.getByRole("article", { name: "team-away / Helper" })).toHaveClass("is-selected");
     expectAttention(header(view.container));
   });
 
@@ -124,19 +124,19 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
       fleet = await bridge.connect();
       const shell = () => <DeckShell runtime={runtime(fleet[0])} initialView={{ kind: "deck" }} />;
       const view = render(shell());
-      expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(words.wakeHolds.possible_draft);
+      expect(screen.getByRole("article", { name: "team-away / Coordinator" })).toHaveTextContent(words.wakeHolds.possible_draft);
       expectAttention(header(view.container));
       await act(async () => { wake("7", "captain-pane", nextHold ?? undefined); });
       view.rerender(shell());
-      expect(screen.getByRole("article", { name: "Captain" })).not.toHaveTextContent(words.wakeHolds.possible_draft);
-      expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(nextHold ? words.wakeHolds.awaiting_prompt : words.wakeStalled);
+      expect(screen.getByRole("article", { name: "team-away / Coordinator" })).not.toHaveTextContent(words.wakeHolds.possible_draft);
+      expect(screen.getByRole("article", { name: "team-away / Coordinator" })).toHaveTextContent(nextHold ? words.wakeHolds.awaiting_prompt : words.wakeStalled);
       expect(header(view.container)).not.toHaveTextContent(words.wakeHolds.possible_draft);
       if (nextHold) expectAttention(header(view.container), words.wakeHolds.awaiting_prompt);
       else expectOnlyCount(header(view.container));
       await act(async () => { wake("7", "captain-pane"); });
       view.rerender(shell());
-      expect(screen.getByRole("article", { name: "Captain" })).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
-      expect(screen.getByRole("article", { name: "Captain" })).toHaveTextContent(words.wakeStalled);
+      expect(screen.getByRole("article", { name: "team-away / Coordinator" })).not.toHaveTextContent(words.wakeHolds.awaiting_prompt);
+      expect(screen.getByRole("article", { name: "team-away / Coordinator" })).toHaveTextContent(words.wakeStalled);
       expectOnlyCount(header(view.container));
     } finally { await bridge.dispose(); }
   });
@@ -168,7 +168,7 @@ describe("inbox/status/034 — orchestrator wake attention", () => {
       await act(async () => { listeners.get("desktop://snapshot")?.({ payload: replacement }); });
       await act(async () => { wake("7", "captain-pane", "possible_draft"); });
       const view = render(<DeckShell runtime={runtime(fleet[0])} initialView={{ kind: "deck" }} />);
-      expect(screen.getByRole("article", { name: "Captain" })).not.toHaveTextContent(words.wakeHolds.possible_draft);
+      expect(screen.getByRole("article", { name: "team-away / Coordinator" })).not.toHaveTextContent(words.wakeHolds.possible_draft);
       expect(header(view.container)).not.toHaveTextContent(words.wakeHolds.possible_draft);
       await act(async () => { wake("9", "captain-pane", "awaiting_prompt"); });
       view.rerender(<DeckShell runtime={runtime(fleet[0])} initialView={{ kind: "deck" }} />);

@@ -193,8 +193,16 @@ function agentIn(id: string, cwd: string): AgentSession {
 /** Pick the one project the fake daemon offers, and wait for it to resolve. */
 async function chooseTheOnlyProject() {
   fireEvent.click(screen.getByTestId("open-projects"));
-  await waitFor(() => expect(screen.getByRole("button", { name: /deck/ })).toBeVisible());
-  fireEvent.click(screen.getByRole("button", { name: /deck/ }));
+  // Issue #1798: an agent tile's controls name its orchestration run
+  // ("Open deck-orchestrator-1 / orchestrator agent"), so the project is the
+  // one `deck` button outside the tiles.
+  const project = () => {
+    const [only, ...others] = screen.getAllByRole("button", { name: /deck/ }).filter((button) => !button.closest("article"));
+    expect(others).toEqual([]);
+    return only;
+  };
+  await waitFor(() => expect(project()).toBeVisible());
+  fireEvent.click(project());
   await waitFor(() => expect(screen.getByTestId("selected-project")).toBeVisible());
   fireEvent.click(screen.getByRole("button", { name: "Configure orchestration" }));
 }
@@ -420,7 +428,7 @@ describe("ControlDeck", () => {
     render(<ControlDeck runtime={runtime()} onNavigate={onNavigate} />);
 
     const tile = screen.getByTestId("agent-tile-planner");
-    const open = within(tile).getByRole("button", { name: "Open Planner agent" });
+    const open = within(tile).getByRole("button", { name: "Open Plan / architecture agent" });
     expect(open.tagName).toBe("BUTTON");
     open.focus();
     expect(open).toHaveFocus();
@@ -469,7 +477,7 @@ describe("ControlDeck", () => {
     const terminal = screen.getByTestId("terminal-input-applied");
     expect(terminal).toHaveAttribute("data-input-state", "applied");
     expect(terminal).toHaveAttribute("aria-disabled", "false");
-    expect(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeEnabled();
+    expect(within(terminal).getByRole("textbox", { name: "Plan / architecture terminal input" })).toBeEnabled();
     expect(screen.queryByTestId("terminal-input-status-input-applied")).toBeNull();
   });
 
@@ -491,7 +499,7 @@ describe("ControlDeck", () => {
       const terminal = screen.getByTestId(`terminal-${id}`);
       expect.soft(terminal).toHaveAttribute("data-input-state", inputState);
       expect.soft(terminal).toHaveAttribute("aria-disabled", "true");
-      expect.soft(within(terminal).getByRole("textbox", { name: "Planner terminal input" })).toBeDisabled();
+      expect.soft(within(terminal).getByRole("textbox", { name: "Plan / architecture terminal input" })).toBeDisabled();
       const status = screen.queryByTestId(`terminal-input-status-${id}`);
       expect(status, `missing terminal-input-status-${id}`).not.toBeNull();
       expect(status!).toHaveAttribute("role", "status");
