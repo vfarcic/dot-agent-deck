@@ -100,8 +100,10 @@ export default defineConfig({
   // in any of the 16 runs. The specs share nothing a second worker could race
   // on: each test gets its own browser context, the fixture state lives in the
   // page, and the one server is a read-only `vite preview` of the built
-  // bundle. Contention is absorbed by `e2e/support/load-budget.ts`, which
-  // stretches a test's budget with the load average, not by retries.
+  // bundle. Specs that import `test` from `e2e/support/load-budget.ts` get an
+  // outer test budget that grows with the load average; locator assertions
+  // keep their normal timeout, and specs using Playwright's own `test` get no
+  // such adjustment. Retries stay off.
   workers: process.env.CI ? 4 : undefined,
   // The JUnit report is what both CI backends keep as the run's test results
   // (issue #1981 M10), on green runs as well as red ones.
