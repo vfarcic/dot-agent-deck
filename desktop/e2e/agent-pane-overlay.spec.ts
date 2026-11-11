@@ -151,7 +151,7 @@ test.describe("agent pane overlay", () => {
     const tileLayout = await terminalLayout(page.getByTestId("terminal-planner"));
     const originalGrid = await grid.elementHandle();
     expect(originalGrid, "the daemon has no grid node to preserve").not.toBeNull();
-    await page.getByRole("button", { name: "Open Planner agent" }).click();
+    await page.getByRole("button", { name: "Open Plan / architecture agent" }).click();
 
     const overlay = page.getByTestId("agent-pane-overlay");
     await expect(overlay).toHaveAttribute("role", "dialog");
@@ -227,7 +227,7 @@ test.describe("agent pane overlay", () => {
     await expect(overlay.getByRole("heading", { name: "Nightly build watch" })).toBeVisible();
     await expect(overlay.locator(".agent-terminal-stack")).toHaveAttribute("data-terminal-state", "attached");
     await expect(overlay.locator(".terminal-viewport")).toBeVisible();
-    await expect(overlay.getByLabel("Builder terminal input")).toBeAttached();
+    await expect(overlay.getByLabel("Nightly build watch terminal input")).toBeAttached();
     await expect(overlay.getByTestId("terminal-absent-planner")).toHaveCount(0);
     await expect(page.getByTestId("deck-selector-current")).toHaveText("All daemons");
     await overlay.getByRole("button", { name: "Back to dashboard" }).click();
