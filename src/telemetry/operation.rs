@@ -153,6 +153,15 @@ impl Decline {
             syntax: Some(syntax_of(word)),
         }
     }
+
+    /// [`Decline::at`] for a word where a setting can stand
+    /// ([`setting_syntax`]).
+    fn at_setting(reason: DeclineReason, word: &str) -> Self {
+        Decline {
+            reason,
+            syntax: Some(setting_syntax(word)),
+        }
+    }
 }
 
 /// Where the classifier stopped: the value of `deck.operation.declined`.
@@ -185,8 +194,8 @@ pub enum DeclineReason {
     /// other characters (`./Build.sh`).
     ProgramShape,
     /// An argument up to and including the first non-option one is not plain
-    /// (`git commit -m "…"` is fine; `grep "x" f` and `cargo test --x=y` are
-    /// not).
+    /// (`grep "x" f` and `cargo --x=y test` are; `git commit -m "…"` is not,
+    /// since reading stops at `commit`).
     ArgumentSyntax,
     /// Codex: an empty argument, or one starting or ending with a space, in
     /// the joined argv.
@@ -342,12 +351,18 @@ fn assignment_value(word: &str) -> Option<&str> {
 }
 
 /// The syntax of a word that is not simple, read from its first character a
-/// simple word cannot hold — in a `NAME=value` word, from its value's.
+/// simple word cannot hold: the `=` of `foo=bar` as an argument is `equals`.
 fn syntax_of(word: &str) -> Syntax {
-    let text = assignment_value(word).unwrap_or(word);
-    text.bytes()
+    word.bytes()
         .position(|b| !(b.is_ascii_alphanumeric() || SIMPLE_WORD_PUNCTUATION.contains(&b)))
-        .map_or(Syntax::Other, |at| syntax_at(&text.as_bytes()[at..]))
+        .map_or(Syntax::Other, |at| syntax_at(&word.as_bytes()[at..]))
+}
+
+/// [`syntax_of`] for a word where a `NAME=value` setting can stand — in front
+/// of the program, or after a setup command such as `export` — read from the
+/// value when it is one.
+fn setting_syntax(word: &str) -> Syntax {
+    syntax_of(assignment_value(word).unwrap_or(word))
 }
 
 /// The syntax of a `-c` script that `unquote` does not read: inside a
@@ -840,7 +855,7 @@ fn read_segment(segment: &[&str], wrappers: bool) -> Option<Description> {
         return rest
             .iter()
             .find(|w| !(is_simple_word(w) || is_simple_assignment(w)))
-            .map(|w| Description::declining(Decline::at(DeclineReason::SetupSyntax, w)));
+            .map(|w| Description::declining(Decline::at_setting(DeclineReason::SetupSyntax, w)));
     }
     if SHELLS.contains(&program) {
         return Some(match shell_operand(rest) {
@@ -1039,12 +1054,11 @@ fn command_words<'a>(segment: &'a [&'a str]) -> Result<&'a [&'a str], Decline> {
             return Ok(words);
         };
         if !is_simple_word(first) {
-            let reason = if assignment_value(first).is_some() {
-                DeclineReason::AssignmentSyntax
+            return Err(if assignment_value(first).is_some() {
+                Decline::at_setting(DeclineReason::AssignmentSyntax, first)
             } else {
-                DeclineReason::ProgramSyntax
-            };
-            return Err(Decline::at(reason, first));
+                Decline::at(DeclineReason::ProgramSyntax, first)
+            });
         }
         let prefix = program_name(first);
         let options = match prefix {
@@ -2406,6 +2420,10 @@ mod tests {
             ("ls ~/code", Syntax::Tilde),
             ("ls #x", Syntax::Comment),
             ("cargo --config=x build", Syntax::Equals),
+            // An argument shaped like a setting is not one: its `=` is what
+            // stops the reading.
+            ("grep foo=bar file", Syntax::Equals),
+            ("make CC=gcc", Syntax::Equals),
             ("ls !x", Syntax::Other),
             ("ls é", Syntax::Other),
         ] {

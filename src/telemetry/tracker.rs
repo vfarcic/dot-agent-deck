@@ -4011,9 +4011,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// One `agent.operation` per shell command, from its start to its end,
-    /// paired by call id when several overlap and by age otherwise; other
-    /// tools make none, and the run counts them.
     /// A shell command the classifier declines sends why, as the deck's own
     /// fixed values; one it names sends no `deck.operation.declined`
     /// (issue #2088).
@@ -4059,6 +4056,9 @@ pub(crate) mod tests {
         assert_eq!(attr(ops[1], AttrKey::OperationDeclinedSyntax), None);
     }
 
+    /// One `agent.operation` per shell command, from its start to its end,
+    /// paired by call id when several overlap and by age otherwise; other
+    /// tools make none, and the run counts them.
     #[test]
     fn shell_commands_become_operations() {
         let mut tracker = RunTracker::new();
