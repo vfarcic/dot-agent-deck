@@ -2375,6 +2375,17 @@ fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64, end: Operation
         AttrKey::OperationWrappedWord,
         described.wrapped.word.as_deref(),
     ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationDeclined,
+        described.declined.map(|d| d.reason.as_str()),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationDeclinedSyntax,
+        described
+            .declined
+            .and_then(|d| d.syntax)
+            .map(|s| s.as_str()),
+    ));
     attributes.extend(Attribute::opt_str(AttrKey::OperationEnd, end.as_str()));
     SpanRecord {
         trace_id: run.trace_id,
@@ -4003,6 +4014,51 @@ pub(crate) mod tests {
     /// One `agent.operation` per shell command, from its start to its end,
     /// paired by call id when several overlap and by age otherwise; other
     /// tools make none, and the run counts them.
+    /// A shell command the classifier declines sends why, as the deck's own
+    /// fixed values; one it names sends no `deck.operation.declined`
+    /// (issue #2088).
+    #[test]
+    fn a_declined_command_sends_why_and_a_named_one_does_not() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        for (t, (kind, command)) in [
+            (EventType::ToolStart, "grep \"hunter2\" secrets.txt"),
+            (EventType::ToolEnd, "grep \"hunter2\" secrets.txt"),
+            (EventType::ToolStart, "cargo test"),
+            (EventType::ToolEnd, "cargo test"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tracker.observe_event(
+                &shell("p1", kind, "Bash", Some(command), None),
+                10 + t as u64,
+            );
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        let ops: Vec<&SpanRecord> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_OPERATION)
+            .collect();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(attr(ops[0], AttrKey::OperationProgram), None);
+        assert_eq!(
+            attr(ops[0], AttrKey::OperationDeclined),
+            Some(&AttrValue::Str("argument_syntax".into()))
+        );
+        assert_eq!(
+            attr(ops[0], AttrKey::OperationDeclinedSyntax),
+            Some(&AttrValue::Str("quote".into()))
+        );
+        assert_eq!(
+            attr(ops[1], AttrKey::OperationProgram),
+            Some(&AttrValue::Str("cargo".into()))
+        );
+        assert_eq!(attr(ops[1], AttrKey::OperationDeclined), None);
+        assert_eq!(attr(ops[1], AttrKey::OperationDeclinedSyntax), None);
+    }
+
     #[test]
     fn shell_commands_become_operations() {
         let mut tracker = RunTracker::new();
