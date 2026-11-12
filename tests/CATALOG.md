@@ -15783,7 +15783,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** a real agent's hooks (`telemetry/otlp/050`), subagent calls or the wrapper's output-derived Idle (unit tests `a_running_call_outlives_prompts_siblings_and_other_threads` in `src/telemetry/tracker.rs`), or Codex's, OpenCode's, Devin's or Pi's turn ends, which reach the same tracker path as `Idle`.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/050 — A command interrupted with Escape in real interactive Claude Code ends its operation at the Escape. [reel]
+##### telemetry/otlp/050 — A command interrupted with Escape in real interactive Claude Code ends its operation at the Escape.
 
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_failed_operation_live.rs`); local OTLP/JSON receiver.
 - **Agent:** real interactive Claude Code on Haiku, with the hooks the deck installs.
