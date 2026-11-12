@@ -4029,11 +4029,34 @@ mod tests {
         }
         let tmp = crate::test_temp::tempdir().unwrap();
         // One path component is capped at 255 bytes, so the length comes from
-        // nesting under the hostile component.
+        // nesting under the hostile component. The whole path is built to a
+        // fixed byte length rather than a fixed number of components: it has
+        // to run well past `MAX_LOGGED_PATH_CHARS` (and past the logged line,
+        // which carries a 512-character head of it plus the message), yet stay
+        // under macOS's PATH_MAX of 1024 bytes including the NUL, which a
+        // 1250-byte path broke with ENAMETOOLONG on `build-macos` (#1958).
+        // Building to a target makes it independent of how long the temp
+        // root is on a given machine.
+        const PATH_BYTES: usize = 960;
+        const MACOS_PATH_MAX: usize = 1024;
         let mut hostile = tmp.path().join("wt\nWARN forged line\r\u{1b}[2J\u{202e}");
-        for _ in 0..6 {
-            hostile.push("x".repeat(200));
+        loop {
+            let len = hostile.as_os_str().len();
+            if len + 2 > PATH_BYTES {
+                break;
+            }
+            hostile.push("x".repeat((PATH_BYTES - len - 1).min(200)));
         }
+        let path_bytes = hostile.as_os_str().len();
+        assert!(
+            path_bytes < MACOS_PATH_MAX,
+            "the path must fit macOS's PATH_MAX: {path_bytes} bytes"
+        );
+        assert!(
+            hostile.to_string_lossy().chars().count()
+                > crate::daemon_stop::MAX_LOGGED_PATH_CHARS + 256,
+            "the path must run well past the log bound: {path_bytes} bytes"
+        );
         std::fs::create_dir_all(&hostile).unwrap();
         let registry = Arc::new(AgentPtyRegistry::new());
         let worktrees = new_worktree_registry();

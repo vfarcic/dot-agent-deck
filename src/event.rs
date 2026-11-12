@@ -1259,6 +1259,25 @@ pub struct BackgroundWork {
     /// the daemon's clock. `None` when the daemon has no start for any of them.
     #[serde(default)]
     pub since_ms: Option<i64>,
+    /// Issue #1757: how many of [`Self::commands`] the agent started in the
+    /// turn that just ended — first sampled at or after that turn's start (and
+    /// no later than shortly after its end, the sampling grace). A client folds
+    /// an `Idle` card with `awaited > 0` into
+    /// [`crate::state::SessionStatus::Waiting`]. Counts commands only, never
+    /// subagents.
+    ///
+    /// The additive rung of CLAUDE.md rule 18, so no `PROTOCOL_VERSION` bump:
+    /// `#[serde(default)]` reads an older daemon's aggregate as 0 (the card
+    /// stays Idle with its Background line, today's behaviour), and zero is
+    /// omitted on the wire, so an aggregate with nothing awaited is
+    /// byte-for-byte the pre-#1757 shape an older reader already decodes.
+    /// Pinned by `status_waiting_003_wire_stays_compatible_both_ways`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub awaited: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 impl BackgroundWork {

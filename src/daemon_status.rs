@@ -241,6 +241,7 @@ pub fn format_human(agents: &[StatusAgent]) -> String {
 mod tests {
     use super::*;
     use crate::state::SessionSnapshot;
+    use spec::spec;
 
     fn record(id: &str, pane: &str, live: Option<SessionSnapshot>) -> AgentRecord {
         AgentRecord {
@@ -393,6 +394,9 @@ mod tests {
             // a status string it does not know (`"Unknown"` below is exactly
             // that case re-emitted), so no existing reader's contract moves.
             SessionStatus::Blocked => "Blocked",
+            // Issue #1757, additive like `Blocked` — no `SCHEMA_VERSION` bump.
+            // Distinct from Needs input's `WaitingForInput`.
+            SessionStatus::Waiting => "Waiting",
             // Deserialize-side catch-all for a status string a newer daemon
             // sends that this build does not know. The CLI still re-emits it,
             // so it is part of what a script can read.
@@ -400,7 +404,7 @@ mod tests {
         }
     }
 
-    const ALL_STATUSES: [SessionStatus; 8] = [
+    const ALL_STATUSES: [SessionStatus; 9] = [
         SessionStatus::Thinking,
         SessionStatus::Working,
         SessionStatus::Compacting,
@@ -408,6 +412,7 @@ mod tests {
         SessionStatus::Idle,
         SessionStatus::Error,
         SessionStatus::Blocked,
+        SessionStatus::Waiting,
         SessionStatus::Unknown,
     ];
 
@@ -458,6 +463,31 @@ mod tests {
                  update this literal"
             );
         }
+    }
+
+    /// Scenario: Build `daemon status` rows for an agent whose card is Waiting, then print the table and the `--json` document. Both name the status `Waiting`, a value distinct from Needs input's `WaitingForInput`, and the document keeps schema version 2 because the value is additive.
+    #[spec("status/waiting/005")]
+    #[test]
+    fn status_waiting_005_daemon_status_publishes_waiting() {
+        // Issue #1757: read through the wire name so this module compiles
+        // before the variant exists; `Unknown` until then.
+        let waiting: SessionStatus = serde_json::from_value(serde_json::json!("Waiting")).unwrap();
+        assert_ne!(
+            waiting,
+            SessionStatus::Unknown,
+            "issue #1757: SessionStatus::Waiting does not exist yet"
+        );
+        let agents =
+            build_status_agents(vec![record("agent-1", "pane-1", Some(snapshot(waiting)))]);
+        let table = format_human(&agents);
+        assert!(
+            table.lines().nth(1).unwrap().split('\t').nth(3) == Some("Waiting"),
+            "STATUS column: {table:?}"
+        );
+        let json = serde_json::to_value(StatusDocument::new(agents)).unwrap();
+        assert_eq!(json["agents"][0]["status"], "Waiting");
+        assert_ne!(json["agents"][0]["status"], "WaitingForInput");
+        assert_eq!(json["schema_version"], 2);
     }
 
     #[test]

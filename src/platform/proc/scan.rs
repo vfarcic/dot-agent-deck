@@ -199,6 +199,89 @@ pub const CLAUDE_BASH_TOOL_SHAPE: ShellToolShape = ShellToolShape {
 /// against a live agent of that kind, not that it looks plausible.
 pub const MEASURED_SHELL_TOOL_SHAPES: &[ShellToolShape] = &[CLAUDE_BASH_TOOL_SHAPE];
 
+/// Issue #1757: OpenCode 2's private server, as the daemon's OpenCode watch
+/// positively identified it for one pane ([`crate::opencode_mode`]) — part of
+/// the agent, not a command it ran.
+///
+/// Measured on OpenCode 2.2.5 (2026-11-10, `status/waiting/009`, PRD #2050's
+/// `src/opencode_mode.rs` measurement, and a re-measure for round 2 of the
+/// review): `opencode --standalone` (and `opencode mini`) runs on the pane's
+/// terminal and starts its private server as a **direct child**, argv
+/// `[<path>/opencode, serve, --stdio, --port, 0]`, executable the same OpenCode
+/// binary, stdin and stdout a socketpair with the client, in a POSIX session
+/// of its own. To the structural test that server is a detached descendant, so
+/// every OpenCode 2 card counted it as a background command (and, first
+/// sampled in the pane's first turn, as one the agent waits on). The shell
+/// tool's commands run under that server, each a session of its own below it,
+/// and the deck's server plugin's inbox watcher runs in the server's session.
+/// So the walk re-roots at the server ([`walk_with_reference_session`]) the way
+/// it does at a nested terminal: its session is the reference for its subtree,
+/// and a command detached below it still counts.
+///
+/// **Identity, not command text.** Matching a command line's text would let
+/// any command that merely quotes `opencode serve --stdio` (a shell running
+/// it, an argument naming it, a process that forged its argv) hide itself and
+/// its session from the count. So this names one process pair the watch
+/// identified, and the scan accepts nothing else:
+///
+/// - the watch found the pane's OpenCode **client** by its executable (not its
+///   command text) and its session subcommand, and the server as that client's
+///   direct child whose executable is OpenCode and whose argv, read as argv,
+///   carries `serve` and `--stdio` ([`crate::opencode_mode::find_client`]) —
+///   the first such child, so a second one is a command;
+/// - only for a client whose version is **known to be 2.x**: OpenCode 1.x has
+///   no private server, and on 1.x the shell tool runs in the client, so a tool
+///   that starts `opencode serve --stdio` makes exactly this shape. An unknown
+///   version (a wrapper the deck could not probe, or a client that replaced
+///   the one a direct spawn was probed as) identifies no server;
+/// - the daemon keeps only the pair its watch's last successful look
+///   identified, and none after a look that failed;
+/// - the scan then re-checks the pair against its own sample
+///   ([`is_identified_agent_server`]): that pid, still the client's child, a
+///   session boundary below a client that is not itself detached, and a
+///   sampled command line whose words are an OpenCode program followed by
+///   `serve --stdio` ([`is_opencode_private_server_command`]). A pid reused
+///   since the watch looked by a process that fails any of those checks is
+///   not exempted. The pair is two numeric pids, not process identities: a
+///   process that reuses the server's pid as another `opencode serve --stdio`
+///   direct child of the same client, in a session of its own, before the
+///   watch's next look (every [`crate::opencode_mode::POLL_INTERVAL`]), is
+///   taken for the server, and so is the server after an `exec` that keeps
+///   that command line.
+///
+/// On 2.x a tool's processes run under the private server (measured), so none
+/// of them is the client's child. Until the watch has looked at a new pane (it
+/// samples every [`crate::opencode_mode::POLL_INTERVAL`]), or when any check
+/// fails or a command line was not read, the server counts as a command:
+/// an over-count the user can see, never a hidden command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentServer {
+    /// The pane's OpenCode client: the server's parent.
+    pub client_pid: i32,
+    /// The client's private server.
+    pub server_pid: i32,
+}
+
+/// Issue #1757: whether `command_line`, a sampled command line (`ps` joins
+/// argv with spaces), runs an OpenCode binary as its private server: the
+/// program word names an OpenCode binary ([`crate::opencode_version::opencode_name`],
+/// by file name) and the next two words are `serve` and `--stdio`, as measured
+/// on 2.2.5 (`<path>/opencode serve --stdio --port 0`). Words in fixed
+/// positions, not substrings: `bash -c 'opencode serve --stdio'` and
+/// `python x.py opencode serve --stdio` are not it. Only ever a re-check of an
+/// [`AgentServer`] the watch identified by executable; a program path with a
+/// space in it fails it, which counts the server (visible) rather than hiding
+/// a command.
+pub fn is_opencode_private_server_command(command_line: &str) -> bool {
+    let mut words = command_line.split_whitespace();
+    words
+        .next()
+        .and_then(|program| program.rsplit('/').next())
+        .is_some_and(crate::opencode_version::opencode_name)
+        && words.next() == Some("serve")
+        && words.next() == Some("--stdio")
+}
+
 /// Every transitive descendant of `root_pid` in `table`, each reported exactly
 /// once and never including `root_pid` itself.
 ///
@@ -287,7 +370,10 @@ pub fn descendant_shell_activity(
 /// candidate, so a matched session never admits an unmatched one beside it.
 /// A process tree inside one session counts once, and the walk re-roots at a
 /// nested terminal session as [`detached_descendants`] does, so a wrapped
-/// agent's inner PTY is never itself a command.
+/// agent's inner PTY is never itself a command. A session nested inside a
+/// detached one counts as a session of its own; the one exception, which
+/// merges two sessions in a card's displayed count and nowhere else, is
+/// selected per pane ([`command_sessions_in_pane`]).
 ///
 /// `None` has [`descendant_shell_activity`]'s meaning — no answer — and must not
 /// be read as zero. Same table, same columns: it reads no command line or
@@ -297,21 +383,319 @@ pub fn qualifying_command_sessions(
     root_pid: i32,
     shapes: &[ShellToolShape],
 ) -> Option<HashSet<i32>> {
-    let walk = walk_with_reference_session(table, root_pid)?;
+    qualifying_command_sessions_with_server(table, root_pid, shapes, None)
+}
+
+/// Issue #1757: [`qualifying_command_sessions`] for a pane whose agent runs a
+/// server of its own in a session of its own, identified as `server`
+/// ([`AgentServer`]): that server is part of the agent, so the walk re-roots
+/// at it as it does at a nested terminal. Its own session is never a command,
+/// and nor is anything in it; a command detached below it still counts. With
+/// `None`, or when the sample does not bear the identity out
+/// ([`is_identified_agent_server`]), this is [`qualifying_command_sessions`].
+///
+/// It reads no command line [`command_line_targets`] did not already have
+/// sampled: the server is a session boundary of the plain walk, which is the
+/// set that function reads, so this re-rooting adds no argv read (issue #862).
+/// A server row whose command line was not read is not re-rooted, so it
+/// counts as before.
+pub fn qualifying_command_sessions_with_server(
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+    server: Option<AgentServer>,
+) -> Option<HashSet<i32>> {
+    qualifying_command_sessions_in_pane(table, root_pid, shapes, server, None)
+}
+
+/// Issue #1757: a sandbox wrapper an agent runs each command under, whose
+/// nested sessions a card displays as one command ([`command_sessions_in_pane`]).
+/// Selected per pane from the agent kind the registry holds for it, never
+/// inferred from the process table, so only a pane the registry knows as that
+/// agent pairs any sessions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandWrapper {
+    /// Codex's Linux sandbox, as measured on codex-cli 0.164.0 (Linux,
+    /// 2026-11-11: the trees `status/waiting/024` printed, and a re-measure with
+    /// `codex sandbox -- /bin/bash -c 'sleep 20'`). Codex's exec tool starts
+    /// each command as `<CODEX_HOME>/tmp/arg0-linux/codex-arg0<random>/codex-linux-sandbox
+    /// --sandbox-policy-cwd <dir> … --permission-profile <json> -- <command>`
+    /// (Codex runs itself through that `codex-linux-sandbox` link) in a session
+    /// of its own (its pid is that session's id) as a direct child of the
+    /// agent; its one child
+    /// is `bwrap … --new-session … --argv0 codex-linux-sandbox -- …` in the
+    /// same session; and bubblewrap's one child is `codex-linux-sandbox …
+    /// --apply-seccomp-then-exec -- <command>`, leader of a second session that
+    /// `--new-session` created, which runs the command. Two sessions, one
+    /// command: counting both read `Background: 2 commands`.
+    ///
+    /// The match pairs the two sessions for the displayed command count only
+    /// ([`CommandSessions::same_command`]); both stay in the raw set. It reads
+    /// the two wrappers' command lines and the tree's shape, never an
+    /// executable's identity (issue #862 keeps the sample to the session
+    /// boundaries' argv), so a process can forge the chain: two
+    /// self-titled session leaders with any sole child between them. At worst
+    /// that under-counts the displayed number by one; it cannot hide a command
+    /// from the busy reading or from the Waiting decision, which read every raw
+    /// session with its own first-seen age.
+    CodexLinuxSandbox,
+}
+
+/// Issue #1757: the qualifying POSIX sessions below one pane
+/// ([`command_sessions_in_pane`]), raw, with the pairs a [`CommandWrapper`]
+/// match says are one command.
+///
+/// `sessions` is every qualifying session, uncollapsed: what the busy reading
+/// and each session's own first-seen age (and so the Waiting decision) are
+/// computed from. `same_command` maps the inner session of each matched
+/// wrapper chain to its outer session, both in `sessions`, and is consulted
+/// only to count commands for display ([`Self::commands`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandSessions {
+    /// Every qualifying session.
+    pub sessions: HashSet<i32>,
+    /// Inner session → outer session of each matched wrapper chain.
+    pub same_command: HashMap<i32, i32>,
+}
+
+impl CommandSessions {
+    /// Whether no session qualifies: the pane is structurally idle.
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+
+    /// The session that stands for `session`'s command in the displayed count:
+    /// its paired outer session when that one is in `sessions`, else itself.
+    pub fn command_of(&self, session: i32) -> i32 {
+        self.same_command
+            .get(&session)
+            .copied()
+            .filter(|outer| self.sessions.contains(outer))
+            .unwrap_or(session)
+    }
+
+    /// One session per command, for display: `sessions` without the inner
+    /// session of each matched chain.
+    pub fn commands(&self) -> HashSet<i32> {
+        self.sessions
+            .iter()
+            .map(|session| self.command_of(*session))
+            .collect()
+    }
+}
+
+impl From<HashSet<i32>> for CommandSessions {
+    /// Sessions with no pairs: each is a command of its own.
+    fn from(sessions: HashSet<i32>) -> Self {
+        Self {
+            sessions,
+            same_command: HashMap::new(),
+        }
+    }
+}
+
+/// Issue #1757: the file name of the program word both stages of Codex's
+/// Linux sandbox carry, as measured: the outer stage's is a path to the link
+/// Codex runs itself through (`<CODEX_HOME>/tmp/arg0-linux/codex-arg0<random>/codex-linux-sandbox`,
+/// `status/waiting/024`; the bare name under `codex sandbox`), and the inner
+/// stage's is the bare name bubblewrap's `--argv0` sets.
+const CODEX_LINUX_SANDBOX_PROGRAM: &str = "codex-linux-sandbox";
+
+/// Issue #1757: the option that marks the inner stage of Codex's Linux
+/// sandbox — measured as the last word before the `--` that starts the command.
+const CODEX_APPLY_SECCOMP_THEN_EXEC: &str = "--apply-seccomp-then-exec";
+
+/// Which stage of Codex's Linux sandbox a sampled command line is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSandboxStage {
+    /// The wrapper Codex's exec tool starts, in a session of its own.
+    Outer,
+    /// The wrapper bubblewrap starts in the session `--new-session` created.
+    Inner,
+}
+
+/// Issue #1757: read `command_line` (a sampled command line, `ps` joining argv
+/// with spaces) as a stage of Codex's Linux sandbox, by words in fixed
+/// positions, never substrings: the program word's file name exactly
+/// [`CODEX_LINUX_SANDBOX_PROGRAM`], the next word `--sandbox-policy-cwd`, and a
+/// standalone `--` with a command after it. The inner stage is the one whose
+/// last word before that `--` is [`CODEX_APPLY_SECCOMP_THEN_EXEC`]; the outer
+/// stage carries that word nowhere before it. Anything else — unread, another
+/// program, the word somewhere else — is neither. A path with a space in it
+/// can shift the words; such a misreading can only fail to recognise a chain,
+/// which leaves its sessions counted (visible) rather than hiding one.
+fn codex_sandbox_stage(command_line: &CommandLine) -> Option<CodexSandboxStage> {
+    let words: Vec<&str> = command_line.read()?.split_whitespace().collect();
+    if words.first().and_then(|program| program.rsplit('/').next())
+        != Some(CODEX_LINUX_SANDBOX_PROGRAM)
+        || words.get(1) != Some(&"--sandbox-policy-cwd")
+    {
+        return None;
+    }
+    let separator = words.iter().position(|word| *word == "--")?;
+    if separator + 1 >= words.len() {
+        return None;
+    }
+    let options = &words[..separator];
+    if options.last() == Some(&CODEX_APPLY_SECCOMP_THEN_EXEC) {
+        Some(CodexSandboxStage::Inner)
+    } else if options.contains(&CODEX_APPLY_SECCOMP_THEN_EXEC) {
+        None
+    } else {
+        Some(CodexSandboxStage::Outer)
+    }
+}
+
+/// Issue #1757: [`qualifying_command_sessions_with_server`] for a pane whose
+/// agent runs each command under `wrapper` ([`CommandWrapper`], chosen by the
+/// pane's agent kind), one session per command as a card displays them:
+/// [`command_sessions_in_pane`]'s [`CommandSessions::commands`]. With `None`
+/// it is exactly [`qualifying_command_sessions_with_server`].
+///
+/// This is the displayed count's set, not the set a pane's background ages
+/// are kept for: those come from [`command_sessions_in_pane`]'s raw
+/// `sessions`, so a wrapper match cannot hide a session's own first-seen age.
+pub fn qualifying_command_sessions_in_pane(
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+    server: Option<AgentServer>,
+    wrapper: Option<CommandWrapper>,
+) -> Option<HashSet<i32>> {
+    command_sessions_in_pane(table, root_pid, shapes, server, wrapper)
+        .map(|sessions| sessions.commands())
+}
+
+/// Issue #1757: the qualifying sessions below a pane whose agent runs each
+/// command under `wrapper`, raw, with the pairs that wrapper says are one
+/// command ([`CommandSessions`]).
+///
+/// `sessions` is exactly [`qualifying_command_sessions_with_server`]'s set,
+/// whatever `wrapper` is: no session is ever removed from it. With
+/// [`CommandWrapper::CodexLinuxSandbox`], `same_command` pairs the inner
+/// sandbox session of each chain that matches the measured wrapper in every
+/// link with the outer session ([`codex_linux_sandbox_pairs`]). Pairing comes
+/// after qualification, so a session that does not itself qualify is never
+/// paired, and nothing outside the wrapper chain is: a session a command
+/// starts below the inner stage, or a nested session below any other detached
+/// process, is a command of its own.
+///
+/// It reads no command line [`command_line_targets`] did not already have
+/// sampled (issue #862): both wrapper stages it reads are session boundaries
+/// of the plain walk — the outer's parent is the agent, in another session,
+/// and the inner's parent is bubblewrap, in the outer session — and bubblewrap,
+/// which is not a boundary and whose command line is not read, is checked by
+/// its position in the tree alone. That is why a match is trusted for the
+/// displayed count only ([`CommandWrapper::CodexLinuxSandbox`]).
+pub fn command_sessions_in_pane(
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+    server: Option<AgentServer>,
+    wrapper: Option<CommandWrapper>,
+) -> Option<CommandSessions> {
+    let walk = walk_with_reference_session(table, root_pid, server)?;
+    let sessions = qualifying_sessions_of_walk(&walk, table, root_pid, shapes);
+    let same_command = match wrapper {
+        Some(CommandWrapper::CodexLinuxSandbox) => {
+            codex_linux_sandbox_pairs(&walk, table, &sessions)
+        }
+        None => HashMap::new(),
+    };
+    Some(CommandSessions {
+        sessions,
+        same_command,
+    })
+}
+
+/// Issue #1757: pair, inner session → outer session, each chain among the
+/// qualifying `sessions` shaped exactly like Codex's Linux sandbox
+/// ([`CommandWrapper::CodexLinuxSandbox`]), in every link:
+///
+/// - the **outer** wrapper: a walked row whose command line reads as the outer
+///   stage ([`codex_sandbox_stage`]), the leader of its own session (pid equal
+///   to session id), that session qualifying, and its parent in the session it
+///   is compared against — the outermost detached session on its branch, as
+///   the agent starts it;
+/// - **bubblewrap**: the outer wrapper's only child in the table, in the outer
+///   session and not a leader;
+/// - the **inner** wrapper: bubblewrap's only child in the table, whose command
+///   line reads as the inner stage, the leader of a session of its own that
+///   qualifies.
+///
+/// Any link missing, extra, unread or unreadable (a session id of 0 or less)
+/// leaves the two sessions unpaired: an over-count the user can see. One
+/// wrapper chain is one command, so a chain pairs no session but the one at
+/// its inner stage. A pair only merges two sessions in the displayed count;
+/// both stay in the raw set ([`CommandSessions`]).
+fn codex_linux_sandbox_pairs(
+    walk: &[(&ProcessInfo, i32)],
+    table: &[ProcessInfo],
+    sessions: &HashSet<i32>,
+) -> HashMap<i32, i32> {
+    let row_of: HashMap<i32, &ProcessInfo> = table.iter().map(|row| (row.pid, row)).collect();
+    let mut children: HashMap<i32, Vec<&ProcessInfo>> = HashMap::new();
+    for row in table {
+        children.entry(row.ppid).or_default().push(row);
+    }
+    let only_child = |pid: i32| match children.get(&pid).map(Vec::as_slice) {
+        Some([child]) => Some(*child),
+        _ => None,
+    };
+    let mut pairs = HashMap::new();
+    for (outer, reference) in walk {
+        if outer.session_id <= 0
+            || outer.pid != outer.session_id
+            || !sessions.contains(&outer.session_id)
+            || row_of.get(&outer.ppid).map(|parent| parent.session_id) != Some(*reference)
+            || codex_sandbox_stage(&outer.command_line) != Some(CodexSandboxStage::Outer)
+        {
+            continue;
+        }
+        let Some(bwrap) = only_child(outer.pid) else {
+            continue;
+        };
+        if bwrap.session_id != outer.session_id || bwrap.pid == bwrap.session_id {
+            continue;
+        }
+        let Some(inner) = only_child(bwrap.pid) else {
+            continue;
+        };
+        if inner.session_id > 0
+            && inner.pid == inner.session_id
+            && inner.session_id != outer.session_id
+            && sessions.contains(&inner.session_id)
+            && codex_sandbox_stage(&inner.command_line) == Some(CodexSandboxStage::Inner)
+        {
+            pairs.insert(inner.session_id, outer.session_id);
+        }
+    }
+    pairs
+}
+
+/// The qualifying sessions of an already-walked pane
+/// ([`walk_with_reference_session`]): the body of
+/// [`qualifying_command_sessions_with_server`].
+fn qualifying_sessions_of_walk(
+    walk: &[(&ProcessInfo, i32)],
+    table: &[ProcessInfo],
+    root_pid: i32,
+    shapes: &[ShellToolShape],
+) -> HashSet<i32> {
     // A row whose session id could not be read is unclassifiable, not
     // "different" — counting it as different would turn an exit racing the
     // sample into a false `Working`.
     let detached = walk
-        .into_iter()
+        .iter()
         .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
-        .map(|(row, _)| row);
+        .map(|(row, _)| *row);
     // The structural test has already answered. `shapes` is the optional argv
     // cross-check on top of it, and an empty `shapes` means the caller asked for
     // the structural test alone — in which case no command line is consulted at
     // all, which is why a pane whose agent kind has never been measured costs no
     // argv read even while it is busy.
     if shapes.is_empty() {
-        return Some(detached.map(|row| row.session_id).collect());
+        return detached.map(|row| row.session_id).collect();
     }
     let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     let mut sessions = HashSet::new();
@@ -357,7 +741,7 @@ pub fn qualifying_command_sessions(
             }
         }
     }
-    Some(sessions)
+    sessions
 }
 
 /// The **structural half** of [`descendant_shell_activity`] on its own: the pids
@@ -376,7 +760,7 @@ pub fn qualifying_command_sessions(
 /// what keeps those two sets identical rather than merely intended to be.
 pub fn detached_descendants(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
     Some(
-        walk_with_reference_session(table, root_pid)?
+        walk_with_reference_session(table, root_pid, None)?
             .into_iter()
             // A row whose session id could not be read is unclassifiable, not
             // "different" — counting it as different would turn an exit racing
@@ -394,11 +778,39 @@ fn is_nested_terminal_session(row: &ProcessInfo) -> bool {
     row.session_leader && row.has_controlling_tty && row.session_id > 0
 }
 
+/// Issue #1757: is `row` the server `server` names ([`AgentServer`]), as this
+/// sample shows it? Its pid, its parent the identified client, the client not
+/// itself detached from `reference` (the session the client's branch is
+/// compared against), `row` a session boundary in a session of its own, and
+/// its sampled command line an OpenCode private server's
+/// ([`is_opencode_private_server_command`]). Any of that failing, or unread,
+/// is "not the server".
+fn is_identified_agent_server(
+    row: &ProcessInfo,
+    reference: i32,
+    session_of: &HashMap<i32, i32>,
+    server: AgentServer,
+) -> bool {
+    row.pid == server.server_pid
+        && row.ppid == server.client_pid
+        && session_of.get(&server.client_pid) == Some(&reference)
+        && row.session_id > 0
+        && row.session_id != reference
+        && row
+            .command_line
+            .read()
+            .is_some_and(is_opencode_private_server_command)
+}
+
 /// [`descendants`] of `root_pid`, each paired with the session id it must be
 /// compared against: `root_pid`'s own, except below a nested terminal session
-/// ([`is_nested_terminal_session`]), whose subtree is compared against that
-/// session. A nested terminal session itself is reported with its own session as
-/// its reference, so it is never detached from itself. `None` has
+/// ([`is_nested_terminal_session`]) or, issue #1757, the agent's identified
+/// server ([`is_identified_agent_server`], only with a `server`), whose
+/// subtree is compared against that session. Such a session's leader is
+/// reported with its own session as its reference, so it is never detached
+/// from itself. The server is one pid, so nothing else on any branch is
+/// re-rooted as it: a `serve --stdio` a tool starts, below the server or
+/// beside it, is a command like any other. `None` has
 /// [`detached_descendants`]'s meaning.
 ///
 /// Same visited-set walk as [`descendants`], for the same reason: it must
@@ -406,7 +818,13 @@ fn is_nested_terminal_session(row: &ProcessInfo) -> bool {
 fn walk_with_reference_session(
     table: &[ProcessInfo],
     root_pid: i32,
+    server: Option<AgentServer>,
 ) -> Option<Vec<(&ProcessInfo, i32)>> {
+    let session_of: HashMap<i32, i32> = if server.is_some() {
+        table.iter().map(|row| (row.pid, row.session_id)).collect()
+    } else {
+        HashMap::new()
+    };
     let root = table.iter().find(|row| row.pid == root_pid)?;
     if root.session_id <= 0 {
         return None;
@@ -428,7 +846,10 @@ fn walk_with_reference_session(
             if !visited.insert(kid.pid) {
                 continue;
             }
-            let reference = if is_nested_terminal_session(kid) {
+            let is_server = server.is_some_and(|server| {
+                is_identified_agent_server(kid, reference, &session_of, server)
+            });
+            let reference = if is_server || is_nested_terminal_session(kid) {
                 kid.session_id
             } else {
                 reference
@@ -483,7 +904,10 @@ fn walk_with_reference_session(
 pub fn shell_tool_candidates(table: &[ProcessInfo], root_pid: i32) -> Option<Vec<i32>> {
     let session_of: HashMap<i32, i32> = table.iter().map(|row| (row.pid, row.session_id)).collect();
     Some(
-        walk_with_reference_session(table, root_pid)?
+        // The plain walk, never re-rooted at an agent's server: this set is
+        // whose command lines get read, and the server's must be among them
+        // for `qualifying_command_sessions_with_server` to recognise it.
+        walk_with_reference_session(table, root_pid, None)?
             .into_iter()
             .filter(|(row, reference)| row.session_id > 0 && row.session_id != *reference)
             .map(|(row, _)| row)

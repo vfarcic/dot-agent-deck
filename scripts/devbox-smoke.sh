@@ -79,7 +79,6 @@ bash "$(dirname "$0")/devbox-check-gtk.sh"
 
 echo "== recording toolchain =="
 asciinema --version
-agg --version
 ffmpeg -version | head -1
 
 echo "OK: devbox environment is usable"

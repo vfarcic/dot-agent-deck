@@ -1,0 +1,12 @@
+---
+source: tests/render_dashboard.rs
+expression: normal
+---
+┌ 1 ClaudeCode · waiting ─────────────────────────────────────────── ● Waiting ┐
+│Dir:  —                                                                       │
+│Background: 1 command · 5m                                                    │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+│                                                                              │
+└────────────────────────────────────────────────────────── Last: 0s  Tools: 0 ┘

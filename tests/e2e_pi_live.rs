@@ -1,7 +1,7 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live"))]
 
-//! L2 PTY-attached REAL-`pi` live-pane showcases (PRD #201, CLAUDE.md rule 4 +
-//! demo-reel eligibility per PRD #180). These are the Pi feature's "AS A USER
+//! L2 PTY-attached REAL-`pi` live-pane showcases (PRD #201, CLAUDE.md rule 4).
+//! These are the Pi feature's "AS A USER
 //! ACTUALLY USES AND SEES IT" tests: the REAL `dot-agent-deck` binary driven
 //! through the vt100/`TuiDeck` harness, with a REAL `pi` agent booting and
 //! working LIVE in a pane.
@@ -27,7 +27,7 @@
 //! This test closes that gap: it drives the real binary through the vt100
 //! harness (mirroring `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs`
 //! and the catalog reference `scheduler/dispatch/013`), so the Pi surface a user
-//! sees is what is asserted AND what the reel clip captures.
+//! sees is what is asserted AND what the recorded cast captures.
 //!
 //! ## `pi/live/001` scenario: a single live Pi pane (deterministic status)
 //! A reliable single live Pi pane with a visible real status fully satisfies
@@ -42,8 +42,8 @@
 //! - **Experimental flag ON** (`DOT_AGENT_DECK_EXPERIMENTAL=1`): the Pi
 //!   first-class identity is gated behind `features::show_pi_agent()` at the
 //!   render seam (CLAUDE.md rule 9). With the flag ON the card title reads
-//!   `Pi · <id>`; without it the Pi identity would be suppressed and the reel
-//!   clip would show no Pi surface. The deck reads the flag from its env.
+//!   `Pi · <id>`; without it the Pi identity would be suppressed and the grid
+//!   would show no Pi surface. The deck reads the flag from its env.
 //! - **Bundled extension auto-materialized at daemon startup** (PRD #201):
 //!   the per-test HOME starts WITHOUT the extension; because this drives the REAL
 //!   binary, the deck's lazy-spawned daemon runs the `daemon serve` entry, whose
@@ -153,7 +153,7 @@ fn card_tool_count(card: &str) -> Option<u32> {
 /// `Dir:`, the submitted prompt (`Prmt:`), the `bash — <command>` call Pi ran,
 /// and `Tools: N` with N > 0. Best-effort (logged, not
 /// gating): the directed sentinel file appears in the pane cwd. PTY-attached, so
-/// it records a `full-stream.cast` (reel-eligible, PRD #180); flaky-tolerant
+/// it records a `full-stream.cast`; flaky-tolerant
 /// (real LLM) — run once, not looped.
 #[spec("pi/live/001")]
 #[test]
@@ -179,7 +179,7 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
 
     let deck = TuiDeck::builder()
         // 200 cols so the dashboard renders the card (left) AND the live pi pane
-        // (right) side by side — the reel clip shows both — and the Normal-mode
+        // (right) side by side — the grid shows both — and the Normal-mode
         // bar keeps full labels (PRD #127).
         .with_pty_size(200, 50)
         // Gate ON so the first-class Pi identity renders (features::show_pi_agent).
@@ -211,7 +211,7 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
         .launch_with_fixture("minimal");
 
     // The restored pane auto-focuses: the bottom bar shows the focused-pane
-    // Command-Mode affordance. This is the reel's "live pi in the pane" moment
+    // Command-Mode affordance. This is the "live pi in the pane" moment
     // (pi boots + processes the directive in the focused terminal).
     deck.wait_for_string("[Command Mode Ctrl+D]");
 
@@ -346,8 +346,8 @@ fn pi_live_001_live_pane_shows_identity_and_status() {
 }
 
 // ---------------------------------------------------------------------------
-// pi/live/002 — Pi receives its restored inbox seed, driven live.
-// through a full orchestration reel clip (PRD #201, phase-5 parity gap).
+// pi/live/002 — Pi receives its restored inbox seed, driven live
+// through a full orchestration (PRD #201, phase-5 parity gap).
 // ---------------------------------------------------------------------------
 
 /// Pinned cheap Claude model for the worker role (same tier `chain-smoke/pi/001`
@@ -483,7 +483,7 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
 
     let deck = TuiDeck::builder()
         // 200 cols so the orchestration tab renders BOTH role panes (pi
-        // orchestrator + claude worker) side by side — the reel clip shows the
+        // orchestrator + claude worker) side by side — the grid shows the
         // delegation happening live.
         .with_pty_size(200, 50)
         // PRD #1885: the restored orchestration's project starts approved, so
@@ -595,8 +595,8 @@ fn pi_live_002_native_seeded_orchestration_delegates_live() {
     );
 
     // Best-effort (logged, not gating): the sentinel filename surfaced live in
-    // the worker pane on the grid — the reel narrative of the worker doing the
-    // delegated work. The load-bearing proof is the file assertions above.
+    // the worker pane on the grid — the visible narrative of the worker doing
+    // the delegated work. The load-bearing proof is the file assertions above.
     let saw_sentinel_grid =
         deck.wait_for_stream_string_within(ORCH_SENTINEL_NAME, Duration::from_secs(20));
     eprintln!(

@@ -609,6 +609,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
 .agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
+/* Issue #1757: Waiting — the turn ended while a command it started still runs.
+   Running's colour, hollow: its work is not done, but it is not working now. */
+.agent-state-mark.status-waiting { color: var(--teal); background: transparent; box-shadow: inset 0 0 0 2px var(--teal); }
 /* Issue #1798: one line while it fits. A tile crowded with badges wraps the
    rest onto a second row rather than pushing the rename pencil, which ends the
    line, out of the header. */
@@ -628,6 +631,7 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
+.status-label.status-waiting { color: var(--teal); background: transparent; outline: 1px dashed var(--teal); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
 /* Issue #2075 — a question waiting, and for how long: the overview's ORCHESTRATOR
@@ -1589,6 +1593,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .count-running { color: var(--teal); }
 .count-needs-input { color: var(--amber); }
 .count-failed { color: var(--red); }
+/* Issue #1757: Waiting's mark is hollow teal; its count reads in the same teal. */
+.count-waiting { color: var(--teal); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }
 

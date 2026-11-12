@@ -101,7 +101,7 @@ To show only some agents on the [dashboard](dashboard.md#filter-the-dashboard), 
 | You can filter by | For example |
 | --- | --- |
 | Kind | "show me all orchestration agents", "show only the dispatchers" |
-| Status | "show me all working agents", "show only agents waiting for input" |
+| Status | "show me all working agents", "show only agents waiting for input", "show only the agents that are waiting", "show only busy agents" (Working, Thinking and Waiting: every agent whose work is not done) |
 | Agent type | "show Codex agents" |
 | Daemon | "show the agents on build box" |
 | A name or other words | "filter by billing" |
