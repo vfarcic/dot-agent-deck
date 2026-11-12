@@ -37,6 +37,11 @@ export function agentTypeLabel(agentType: AgentTypeId | undefined): string | und
  * reports for an agent with no hook state at all, so it is not evidence of a
  * turn, and `error`, `blocked` and `unknown` say nothing about one either.
  * Voice's interrupt is sent only on `working`, so every one of those refuses.
+ *
+ * Issue #1757: `waiting` is idle here — the agent's turn ended and its prompt
+ * is free, though a command it started still runs. Reading it as no turn at
+ * all would hide the stop between two turns from the pane's turn epoch, so an
+ * interrupt queued in one turn could land in the next.
  */
 export function agentTurn(status: string): AgentTurn | undefined {
   switch (status) {
@@ -46,6 +51,7 @@ export function agentTurn(status: string): AgentTurn | undefined {
       return "working";
     case "idle":
     case "waiting_for_input":
+    case "waiting":
       return "idle";
     default:
       return undefined;

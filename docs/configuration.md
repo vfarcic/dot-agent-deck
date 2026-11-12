@@ -65,7 +65,7 @@ dot-agent-deck config set bell.on_idle true            # also ring when an agent
 | --- | --- | --- |
 | `bell.enabled` | `true` | master switch; `false` silences every bell below |
 | `bell.on_waiting_for_input` | `true` | waiting for input |
-| `bell.on_idle` | `false` | idle |
+| `bell.on_idle` | `false` | idle, about a second and a half after its turn ends; not **Waiting**, which rings when it turns idle |
 | `bell.on_error` | `true` | errored, or blocked by a provider usage limit |
 
 Restart the TUI for a change to take effect.

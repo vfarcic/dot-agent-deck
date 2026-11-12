@@ -2066,6 +2066,10 @@ struct UiState {
     keybindings: KeybindingConfig,
     /// Tracks last-seen status per session for bell transition detection.
     last_bell_status: HashMap<String, SessionStatus>,
+    /// Issue #1757: sessions whose step into `Idle` is still settling, with
+    /// when this TUI first saw it — see [`compute_bell_needed`]. A settling
+    /// card neither rings the idle bell nor blinks its dot.
+    idle_settling: HashMap<String, std::time::Instant>,
     /// Issue #2075: the questions this TUI has already sent a notification
     /// for, as (session id, question id), so each notifies once.
     question_notified: HashSet<(String, String)>,
@@ -2644,6 +2648,7 @@ impl UiState {
             config,
             keybindings,
             last_bell_status: HashMap::new(),
+            idle_settling: HashMap::new(),
             question_notified: HashSet::new(),
             upgrade_check: None,
             upgrade_dialog: None,
@@ -5276,17 +5281,56 @@ fn surface_one_orchestration(
 // Bell transition detection
 // ---------------------------------------------------------------------------
 
+/// Issue #1757 (Qodo on PR #2250): how long a card that stepped into `Idle`
+/// from anything but `Waiting` stays "settling" — no idle bell, no blinking
+/// dot — before the TUI treats its turn as done. A command the agent started
+/// just before its turn ended is sampled only after the `Idle`, and the card
+/// then turns Waiting; announcing that first `Idle` would ring once for the
+/// turn and again when Waiting returns to `Idle`. Measured on this TUI's own
+/// clock from when it first saw the `Idle`, which is never earlier than the
+/// daemon's end of the turn, so no clock shared with the daemon is needed.
+const IDLE_SETTLE: std::time::Duration =
+    std::time::Duration::from_millis(crate::state::TURN_SETTLE_MS as u64);
+
+/// Which sessions changed into a status that rings the bell since
+/// `last_bell_status`, and the status map to remember for the next frame.
+///
+/// Issue #1757: a step into `Idle` from anything but `Waiting` is held in
+/// `idle_settling` (session id → when this TUI first saw it) for
+/// [`IDLE_SETTLE`] before it counts: until then the session keeps its previous
+/// entry in the returned map, so a step on to `Waiting` reads as a change from
+/// the working status (which does not ring) and only the later `Waiting` →
+/// `Idle` rings. A session no longer `Idle` leaves `idle_settling`.
 fn compute_bell_needed(
     sessions: &HashMap<String, SessionState>,
     last_bell_status: &HashMap<String, SessionStatus>,
+    idle_settling: &mut HashMap<String, std::time::Instant>,
     bell_config: &BellConfig,
+    now: std::time::Instant,
 ) -> (bool, HashMap<String, SessionStatus>) {
     let mut need_bell = false;
     let mut new_status_map = HashMap::with_capacity(sessions.len());
+    idle_settling.retain(|id, _| {
+        sessions
+            .get(id)
+            .is_some_and(|session| session.status == SessionStatus::Idle)
+    });
 
     for (id, session) in sessions {
         let current = &session.status;
-        let changed = last_bell_status.get(id) != Some(current);
+        let previous = last_bell_status.get(id);
+        let changed = previous != Some(current);
+
+        if changed && *current == SessionStatus::Idle && previous != Some(&SessionStatus::Waiting) {
+            let since = *idle_settling.entry(id.clone()).or_insert(now);
+            if now.saturating_duration_since(since) < IDLE_SETTLE {
+                if let Some(previous) = previous {
+                    new_status_map.insert(id.clone(), previous.clone());
+                }
+                continue;
+            }
+        }
+        idle_settling.remove(id);
 
         if changed && bell_config.should_bell(current) {
             need_bell = true;
@@ -15475,6 +15519,22 @@ pub fn run_tui(
         // rather than answering a dialog the user has not seen — whichever path
         // opened it, the key path's break to re-render included. The gate at
         // the top of the event loop covers the paths that keep reading.
+        // Bell transition detection — before the draw, so a card whose `Idle`
+        // is still settling (issue #1757) draws a steady dot from its first
+        // frame.
+        let (need_bell, new_bell_status) = compute_bell_needed(
+            &snapshot.sessions,
+            &ui.last_bell_status,
+            &mut ui.idle_settling,
+            &ui.config.bell,
+            std::time::Instant::now(),
+        );
+        ui.last_bell_status = new_bell_status;
+        if need_bell {
+            use std::io::Write;
+            let _ = std::io::stdout().write_all(b"\x07");
+            let _ = std::io::stdout().flush();
+        }
         if confirmation_awaits_frame(&ui) {
             while crossterm::event::poll(std::time::Duration::from_millis(0))? {
                 let _ = event::read()?;
@@ -15504,16 +15564,6 @@ pub fn run_tui(
             },
         )?;
         tick = tick.wrapping_add(1);
-
-        // Bell transition detection
-        let (need_bell, new_bell_status) =
-            compute_bell_needed(&snapshot.sessions, &ui.last_bell_status, &ui.config.bell);
-        ui.last_bell_status = new_bell_status;
-        if need_bell {
-            use std::io::Write;
-            let _ = std::io::stdout().write_all(b"\x07");
-            let _ = std::io::stdout().flush();
-        }
 
         // Issue #2075: one terminal notification per question left unanswered
         // for `notifications.question_after_minutes`.
@@ -18134,11 +18184,17 @@ fn render_card_grid(
                 .pane_id
                 .as_deref()
                 .and_then(|pane_id| ui.pane_declared_agent.get(pane_id));
+            // Issue #1757: the tick only drives the blinking dot, and a card
+            // whose `Idle` is still settling must not blink yet — it may turn
+            // Waiting — so it draws on the tick of a lit dot.
+            let settling = ids
+                .get(col_idx)
+                .is_some_and(|id| ui.idle_settling.contains_key(*id));
             render_session_card(
                 frame,
                 card_area,
                 session,
-                tick,
+                if settling { 0 } else { tick },
                 is_selected,
                 display_name,
                 card_number,
@@ -20000,6 +20056,12 @@ fn render_stats_bar(frame: &mut Frame, stats: &DashboardStats, area: Rect) {
             stats.blocked,
             "blocked",
             Style::default().fg(palette::status_color(&SessionStatus::Blocked)),
+        ),
+        // Issue #1757: the card's word, `Waiting`; Needs input is `needs input`.
+        (
+            stats.awaiting,
+            "waiting",
+            Style::default().fg(palette::status_color(&SessionStatus::Waiting)),
         ),
         (stats.idle, "idle", text_primary()),
     ];
@@ -25139,6 +25201,8 @@ fn fit_card_rows(
 }
 
 fn flash_dot(status: &SessionStatus, tick: u64) -> &'static str {
+    // Issue #1757: Waiting does not blink — its work is not done, so there is
+    // nothing yet to draw the eye to; the dot starts blinking when it turns Idle.
     let needs_attention =
         *status == SessionStatus::WaitingForInput || *status == SessionStatus::Idle;
     if needs_attention && (tick / 30) % 2 == 1 {
@@ -25209,6 +25273,8 @@ fn status_style(status: &SessionStatus) -> (&str, Style) {
         SessionStatus::Compacting => ("Compacting", style),
         SessionStatus::WaitingForInput => ("Needs Input", style.add_modifier(Modifier::BOLD)),
         SessionStatus::Idle => ("Idle", style),
+        // Issue #1757: not bold — nothing needs the user.
+        SessionStatus::Waiting => ("Waiting", style),
         SessionStatus::Error => ("Error", style),
         // Issue #714: bold like "Needs Input" — a person has to act.
         SessionStatus::Blocked => ("Blocked", style.add_modifier(Modifier::BOLD)),
@@ -39104,8 +39170,101 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("a".into(), SessionStatus::Working);
 
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) = bell_now(&sessions, &last, &BellConfig::default());
         assert!(need_bell);
+    }
+
+    /// Scenario: A card goes from Working to Waiting — its turn ended while a command it started still runs — and later to Idle when that command exits, with the bell's idle switch on. Nothing rings on the step to Waiting, because the work is not done; the bell rings on the later step from Waiting to Idle.
+    #[spec("status/waiting/010")]
+    #[test]
+    fn status_waiting_010_bell_rings_on_the_later_step_to_idle() {
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let mut sessions = HashMap::new();
+        sessions.insert("a".into(), make_session(SessionStatus::Waiting));
+        let mut last = HashMap::new();
+        last.insert("a".into(), SessionStatus::Working);
+        let (need_bell, last) = bell_now(&sessions, &last, &config);
+        assert!(!need_bell, "Working -> Waiting: the work is not done");
+
+        sessions.insert("a".into(), make_session(SessionStatus::Idle));
+        let (need_bell, _) = bell_now(&sessions, &last, &config);
+        assert!(need_bell, "Waiting -> Idle: the work is done now");
+    }
+
+    /// The bell decision for one frame with nothing settling yet.
+    fn bell_now(
+        sessions: &HashMap<String, SessionState>,
+        last: &HashMap<String, SessionStatus>,
+        config: &BellConfig,
+    ) -> (bool, HashMap<String, SessionStatus>) {
+        compute_bell_needed(
+            sessions,
+            last,
+            &mut HashMap::new(),
+            config,
+            std::time::Instant::now(),
+        )
+    }
+
+    /// Scenario: With the bell's idle switch on, a card's turn ends (Working to Idle), and half a second later the daemon samples a command the agent started just before the end, so the card turns Waiting; when that command exits the card turns Idle again. Frames are checked every 100 ms: during the first Idle the card is held as settling (no bell, and it draws the steady dot), and the bell rings exactly once, at the final Idle.
+    #[spec("status/waiting/019")]
+    #[test]
+    fn status_waiting_019_a_turn_that_ends_as_waiting_rings_once() {
+        let config = BellConfig {
+            on_idle: true,
+            ..Default::default()
+        };
+        let step = std::time::Duration::from_millis(100);
+        let t0 = std::time::Instant::now();
+        // (from, status the card reads) — the daemon's sequence for one turn.
+        let timeline = [
+            (std::time::Duration::ZERO, SessionStatus::Working),
+            (std::time::Duration::from_millis(1_000), SessionStatus::Idle),
+            (
+                std::time::Duration::from_millis(1_500),
+                SessionStatus::Waiting,
+            ),
+            (std::time::Duration::from_millis(4_000), SessionStatus::Idle),
+        ];
+        let mut last: HashMap<String, SessionStatus> = HashMap::new();
+        let mut settling = HashMap::new();
+        let mut bells = Vec::new();
+        let mut elapsed = std::time::Duration::ZERO;
+        while elapsed < std::time::Duration::from_millis(8_000) {
+            let status = timeline
+                .iter()
+                .rev()
+                .find(|(from, _)| *from <= elapsed)
+                .map(|(_, status)| status.clone())
+                .expect("timeline starts at zero");
+            let mut sessions = HashMap::new();
+            sessions.insert("a".to_string(), make_session(status.clone()));
+            let (need_bell, next) =
+                compute_bell_needed(&sessions, &last, &mut settling, &config, t0 + elapsed);
+            if need_bell {
+                bells.push((elapsed, status.clone()));
+            }
+            if (1_000..1_500).contains(&elapsed.as_millis()) {
+                assert!(
+                    settling.contains_key("a"),
+                    "the first Idle is still settling at {elapsed:?}, so its dot must not blink"
+                );
+            }
+            last = next;
+            elapsed += step;
+        }
+        assert_eq!(bells.len(), 1, "one turn, one bell: {bells:?}");
+        let (at, status) = &bells[0];
+        assert_eq!(*status, SessionStatus::Idle);
+        assert!(
+            *at >= std::time::Duration::from_millis(4_000),
+            "the bell rings at the final Idle, not the first: {at:?}"
+        );
+        // A settling card renders on the tick of a lit dot.
+        assert_eq!(flash_dot(&SessionStatus::Idle, 0), "●");
     }
 
     #[test]
@@ -39116,7 +39275,7 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("a".into(), SessionStatus::WaitingForInput);
 
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) = bell_now(&sessions, &last, &BellConfig::default());
         assert!(!need_bell);
     }
 
@@ -39129,7 +39288,7 @@ mod tests {
         last.insert("a".into(), SessionStatus::Working);
 
         // Default config has on_idle = false
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) = bell_now(&sessions, &last, &BellConfig::default());
         assert!(!need_bell);
     }
 
@@ -39145,8 +39304,18 @@ mod tests {
             on_idle: true,
             ..Default::default()
         };
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
-        assert!(need_bell);
+        // Issue #1757: a step into Idle from a live turn rings once it has
+        // settled, not on the frame it appears.
+        let mut settling = HashMap::new();
+        let t0 = std::time::Instant::now();
+        let (need_bell, held) = compute_bell_needed(&sessions, &last, &mut settling, &config, t0);
+        assert!(!need_bell, "still settling");
+        assert_eq!(held.get("a"), Some(&SessionStatus::Working));
+        let (need_bell, settled) =
+            compute_bell_needed(&sessions, &held, &mut settling, &config, t0 + IDLE_SETTLE);
+        assert!(need_bell, "settled Idle rings");
+        assert_eq!(settled.get("a"), Some(&SessionStatus::Idle));
+        assert!(settling.is_empty());
     }
 
     #[test]
@@ -39160,7 +39329,7 @@ mod tests {
             enabled: false,
             ..Default::default()
         };
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &config);
+        let (need_bell, _) = bell_now(&sessions, &last, &config);
         assert!(!need_bell);
     }
 
@@ -39174,7 +39343,7 @@ mod tests {
         last.insert("a".into(), SessionStatus::Working);
         last.insert("b".into(), SessionStatus::Working);
 
-        let (need_bell, _) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, _) = bell_now(&sessions, &last, &BellConfig::default());
         assert!(need_bell);
     }
 
@@ -39185,7 +39354,7 @@ mod tests {
         let mut last = HashMap::new();
         last.insert("gone".into(), SessionStatus::Working);
 
-        let (_, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (_, new_map) = bell_now(&sessions, &last, &BellConfig::default());
         assert!(!new_map.contains_key("gone"));
     }
 
@@ -39196,7 +39365,7 @@ mod tests {
 
         let last = HashMap::new(); // empty — session is brand new
 
-        let (need_bell, new_map) = compute_bell_needed(&sessions, &last, &BellConfig::default());
+        let (need_bell, new_map) = bell_now(&sessions, &last, &BellConfig::default());
         assert!(need_bell);
         assert_eq!(new_map.get("new"), Some(&SessionStatus::WaitingForInput));
     }

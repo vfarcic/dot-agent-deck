@@ -2251,6 +2251,9 @@ pub fn status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
         SessionStatus::Blocked => "blocked",
+        // Issue #1757: not `waiting`, which has meant Needs input since the
+        // attribute was published (docs/telemetry.md).
+        SessionStatus::Waiting => "awaiting_command",
         SessionStatus::Unknown => "unknown",
     }
 }

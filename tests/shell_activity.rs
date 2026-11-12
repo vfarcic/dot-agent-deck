@@ -52,10 +52,9 @@ use std::time::{Duration, Instant};
 
 #[cfg(unix)]
 use dot_agent_deck::agent_pty::{AgentPtyRegistry, DOT_AGENT_DECK_PANE_ID, SpawnOptions};
-#[cfg(unix)]
-use dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
 use dot_agent_deck::platform::proc::{
-    CommandLine, ProcessInfo, descendant_shell_activity, descendants, process_table,
+    CLAUDE_BASH_TOOL_SHAPE, CommandLine, ProcessInfo, descendant_shell_activity, descendants,
+    process_table,
 };
 
 use spec::spec;
@@ -651,6 +650,847 @@ fn background_005_scan_deduplicates_qualifying_sessions_and_reroots() {
         qualifying_command_sessions(&table, AGENT_PID, &[]),
         None,
         "unknown observation must not become zero"
+    );
+}
+
+/// Scenario: Classify a Claude pane's process table that holds the deck's own inbox waiter — `sh -c '<deck>' inbox wait --agent claude-code` and the deck process under it — in a session of its own, and an OpenCode-style watcher left in the agent's session. Neither is a background command, so neither can make a card read Waiting; a real Bash-tool command beside the waiter still counts.
+#[spec("status/waiting/006")]
+#[test]
+fn status_waiting_006_inbox_waiter_is_not_a_background_command() {
+    use dot_agent_deck::platform::proc::qualifying_command_sessions;
+    use std::collections::HashSet;
+
+    const WAITER_SID: i32 = 70118;
+    let shape = dot_agent_deck::platform::proc::CLAUDE_BASH_TOOL_SHAPE;
+    let waiter = |sid: i32| {
+        vec![
+            // Claude Code runs a hook as `sh -c <command>`.
+            ProcessInfo {
+                pid: 70120,
+                ppid: AGENT_PID,
+                session_id: sid,
+                has_controlling_tty: false,
+                session_leader: sid != AGENT_SID,
+                command_line: CommandLine::Read(
+                    "/bin/sh -c '/home/user/.local/bin/dot-agent-deck' inbox wait --agent claude-code"
+                        .to_string(),
+                ),
+            },
+            ProcessInfo {
+                pid: 70121,
+                ppid: 70120,
+                session_id: sid,
+                has_controlling_tty: false,
+                session_leader: false,
+                command_line: CommandLine::Read(
+                    "/home/user/.local/bin/dot-agent-deck inbox wait --agent claude-code"
+                        .to_string(),
+                ),
+            },
+        ]
+    };
+
+    // A Claude pane, the waiter in a session of its own: the argv cross-check
+    // refuses it.
+    let mut table = backbone_rows(false);
+    table.extend(waiter(WAITER_SID));
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::new()),
+        "the deck's own waiter is not a background command"
+    );
+    // Control: a real Bash-tool command beside it still counts, alone.
+    table.push(bash_tool_descendant_row());
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[shape]),
+        Some(HashSet::from([BASH_TOOL_SID])),
+        "the waiter must not hide or join a real command"
+    );
+
+    // An agent with no measured shape (OpenCode, Pi): its watcher stays in the
+    // agent's own session, so the structural test alone refuses it.
+    let mut table = backbone_rows(false);
+    table.extend(waiter(AGENT_SID));
+    assert_eq!(
+        qualifying_command_sessions(&table, AGENT_PID, &[]),
+        Some(HashSet::new()),
+        "a watcher in the agent's own session is not a background command"
+    );
+}
+
+/// Scenario: Classify an OpenCode 2 pane's process table, shaped as measured on OpenCode 2.2.5 (the client on the pane, its private server `<path>/opencode serve --stdio --port 0` as its direct child in a POSIX session of its own, the deck's inbox watcher in the server's session), given the client/server pair the daemon's OpenCode watch identified. That server and its session are not a background command; every other process counts as before: a command below the server, a `serve --stdio` a tool starts below or beside it, one a wrapper shell starts, a server whose command line was not read or no longer reads as a server, and anything on a pane with no identified server (OpenCode 1.x, an unknown version), even when its command text quotes `opencode serve --stdio`.
+#[spec("status/waiting/016")]
+#[test]
+fn status_waiting_016_opencode_own_server_is_not_a_background_command() {
+    use dot_agent_deck::platform::proc::{
+        AgentServer, is_opencode_private_server_command, qualifying_command_sessions,
+        qualifying_command_sessions_with_server,
+    };
+    use std::collections::HashSet;
+
+    const WRAPPER: i32 = 80090;
+    const CLIENT: i32 = 80100;
+    const SERVER: i32 = 80110;
+    const COMMAND_SID: i32 = 80120;
+    const TOOL_SERVER_SID: i32 = 80130;
+    const SIBLING_SID: i32 = 80150;
+    const FORGED_SID: i32 = 80160;
+    const SERVER_ARGV: &str = "/home/user/.opencode/bin/opencode serve --stdio --port 0";
+    let identified = Some(AgentServer {
+        client_pid: CLIENT,
+        server_pid: SERVER,
+    });
+    let row = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id: sid,
+        has_controlling_tty: sid == CLIENT,
+        session_leader: pid == sid,
+        command_line: argv.map_or(CommandLine::NotSampled, |argv| {
+            CommandLine::Read(argv.to_string())
+        }),
+    };
+    // What the sampler reads: a command line for each session-boundary row.
+    let standalone = || {
+        vec![
+            row(CLIENT, 1, CLIENT, None),
+            row(SERVER, CLIENT, SERVER, Some(SERVER_ARGV)),
+            // The server plugin's inbox watcher and another server child, in
+            // the server's own session.
+            row(80111, SERVER, SERVER, None),
+            row(80112, SERVER, SERVER, None),
+        ]
+    };
+    let count = |table: &[ProcessInfo], root: i32, server: Option<AgentServer>| {
+        qualifying_command_sessions_with_server(table, root, &[], server)
+    };
+
+    let table = standalone();
+    assert_eq!(
+        qualifying_command_sessions(&table, CLIENT, &[]),
+        Some(HashSet::from([SERVER])),
+        "premise: without the identified server the structural test counts it"
+    );
+    assert_eq!(count(&table, CLIENT, None), Some(HashSet::from([SERVER])));
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::new()),
+        "OpenCode's own server, and its session, are not a background command"
+    );
+
+    // A real backgrounded command: the shell tool's child of the server, in a
+    // session of its own, with its own child.
+    let mut table = standalone();
+    table.push(row(
+        80120,
+        SERVER,
+        COMMAND_SID,
+        Some("/bin/bash -c ping -c 60 127.0.0.1 && touch sentinel"),
+    ));
+    table.push(row(80121, 80120, COMMAND_SID, None));
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([COMMAND_SID])),
+        "the command below the server counts, once"
+    );
+
+    // A server a tool started below the agent's own is a command like any
+    // other: only the identified pid is the agent's.
+    table.push(row(80130, SERVER, TOOL_SERVER_SID, Some(SERVER_ARGV)));
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([COMMAND_SID, TOOL_SERVER_SID])),
+        "a tool's own `serve --stdio` is not the agent's server"
+    );
+
+    // A sibling of the real server — a second `serve --stdio` child of the
+    // client, in a session of its own — counts.
+    let mut table = standalone();
+    table.push(row(80150, CLIENT, SIBLING_SID, Some(SERVER_ARGV)));
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([SIBLING_SID])),
+        "a sibling of the identified server is a command"
+    );
+
+    // A wrapper shell runs the client; a process that forged a server's argv,
+    // whose parent is that shell, counts — and it would even if the identity
+    // named its pid, since its parent is not the client.
+    let wrapped = || {
+        let mut table = vec![row(WRAPPER, 1, CLIENT, None)];
+        table.extend(standalone().into_iter().map(|mut r| {
+            if r.pid == CLIENT {
+                r.ppid = WRAPPER;
+            }
+            r
+        }));
+        table.push(row(
+            80160,
+            WRAPPER,
+            FORGED_SID,
+            Some("opencode serve --stdio"),
+        ));
+        table
+    };
+    assert_eq!(
+        count(&wrapped(), WRAPPER, identified),
+        Some(HashSet::from([FORGED_SID])),
+        "a forged server under a shell is a command; the real one is not"
+    );
+    assert_eq!(
+        count(
+            &wrapped(),
+            WRAPPER,
+            Some(AgentServer {
+                client_pid: CLIENT,
+                server_pid: 80160,
+            })
+        ),
+        Some(HashSet::from([SERVER, FORGED_SID])),
+        "an identity whose pid's parent is not the client exempts nothing"
+    );
+
+    // A server whose command line was not read is not recognised, so it
+    // counts as it did before rather than hiding what runs below it — and a
+    // readable `serve --stdio` a tool starts below it counts too.
+    let mut table = standalone();
+    table[1].command_line = CommandLine::Unavailable;
+    table.push(row(80130, SERVER, TOOL_SERVER_SID, Some(SERVER_ARGV)));
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([SERVER, TOOL_SERVER_SID])),
+        "an unread server counts, and so does the tool server below it"
+    );
+
+    // The identified pid, reused since the watch looked by a process whose
+    // command line is not a server's, counts.
+    let mut table = standalone();
+    table[1].command_line = CommandLine::Read("/bin/bash -c sleep 60".to_string());
+    assert_eq!(
+        count(&table, CLIENT, identified),
+        Some(HashSet::from([SERVER])),
+        "a reused pid is not the server"
+    );
+
+    // OpenCode 1.x, and a pane whose OpenCode version the deck does not know:
+    // the watch identifies no server, so nothing is exempted — not a shell
+    // command quoting the server's words, not a `serve --stdio` a tool
+    // started as the client's own child.
+    let opencode_1 = vec![
+        row(CLIENT, 1, CLIENT, None),
+        row(80111, CLIENT, CLIENT, None),
+        row(
+            80140,
+            CLIENT,
+            80140,
+            Some("/bin/bash -c sleep 600; opencode serve --stdio --port 0"),
+        ),
+        row(80141, 80140, 80140, None),
+        row(
+            80145,
+            CLIENT,
+            80145,
+            Some("opencode serve --stdio --port 0"),
+        ),
+    ];
+    assert_eq!(
+        count(&opencode_1, CLIENT, None),
+        Some(HashSet::from([80140, 80145])),
+        "OpenCode 1.x counts exactly as before"
+    );
+    assert_eq!(
+        count(&opencode_1, CLIENT, None),
+        qualifying_command_sessions(&opencode_1, CLIENT, &[]),
+    );
+
+    // The command-line re-check reads words in place, not substrings.
+    for server in [
+        SERVER_ARGV,
+        "opencode serve --stdio --port 0",
+        "/opt/bin/opencode-1.18.35 serve --stdio",
+    ] {
+        assert!(is_opencode_private_server_command(server), "{server}");
+    }
+    for not_server in [
+        "/bin/bash -c opencode serve --stdio --port 0",
+        "/bin/bash -c : 'opencode serve --stdio'; sleep 60; :",
+        "python3 x.py opencode serve --stdio --port 0",
+        "/usr/bin/node /x/opencode serve --stdio",
+        "opencode serve --service",
+        "opencode --stdio serve",
+        "notopencode serve --stdio",
+        "opencode",
+        "",
+    ] {
+        assert!(
+            !is_opencode_private_server_command(not_server),
+            "{not_server}"
+        );
+    }
+}
+
+/// Scenario: The daemon's OpenCode watch looks at a pane's process tree (executables and arguments, as it samples them) and names the private server the shell-activity scan may exempt. It names one only for a client whose version is known to be 2.x, and only that client's first direct child whose executable is OpenCode and whose arguments are `serve --stdio`: not on OpenCode 1.x (where a tool can start that shape as the client's child), not for an unknown version, not a process that only forged a server's arguments, not one a wrapper shell started, and not a second server. Fed into the scan, the named server is exempted and a forged one beside it still counts.
+#[spec("status/waiting/017")]
+#[test]
+fn status_waiting_017_the_watch_names_only_a_known_opencode_2s_own_server() {
+    use dot_agent_deck::opencode_mode::{ProcRow, Watch, Watched, evaluate};
+    use dot_agent_deck::platform::proc::{AgentServer, qualifying_command_sessions_with_server};
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    const OC: &str = "/home/user/.opencode/bin/opencode";
+    let proc_row = |pid: i32, ppid: i32, exe: &str, argv: &[&str]| ProcRow {
+        pid,
+        ppid,
+        exe: Some(PathBuf::from(exe)),
+        argv: (!argv.is_empty()).then(|| argv.iter().map(|a| a.to_string()).collect()),
+    };
+    let server_argv: &[&str] = &[OC, "serve", "--stdio", "--port", "0"];
+    // The pane's shell (100) runs the client (101); the client's private
+    // server (102); a forged `serve --stdio` the pane's shell started (103,
+    // a Python whose argv claims to be OpenCode).
+    let tree = || {
+        vec![
+            proc_row(100, 1, "/usr/bin/bash", &[]),
+            proc_row(101, 100, OC, &["opencode", "--standalone"]),
+            proc_row(102, 101, OC, server_argv),
+            proc_row(
+                103,
+                100,
+                "/usr/bin/python3",
+                &["opencode", "serve", "--stdio", "--port", "0"],
+            ),
+        ]
+    };
+    let watched = |spawn_version| Watched {
+        pane_id: "p".to_string(),
+        agent_id: "agent-p".to_string(),
+        root_pid: 100,
+        spawn_version,
+    };
+    let unprobed = |_: &Path| None;
+    let identify = |rows: &[ProcRow], spawn_version| {
+        let mut watch = Watch::default();
+        evaluate(
+            &[watched(spawn_version)],
+            rows,
+            &mut watch,
+            std::time::Instant::now(),
+            &unprobed,
+            &HashMap::new(),
+        );
+        watch.private_server("agent-p")
+    };
+
+    let identified = identify(&tree(), Some((2, 2, 5)));
+    assert_eq!(
+        identified,
+        Some(AgentServer {
+            client_pid: 101,
+            server_pid: 102,
+        }),
+        "a known 2.x client's private server"
+    );
+    assert_eq!(
+        identify(&tree(), Some((1, 19, 5))),
+        None,
+        "OpenCode 1.x: a `serve --stdio` child is a tool's"
+    );
+    assert_eq!(identify(&tree(), None), None, "an unknown version");
+
+    // A second server child of the client is not the one named.
+    let mut two = tree();
+    two.push(proc_row(104, 101, OC, server_argv));
+    assert_eq!(
+        identify(&two, Some((2, 2, 5))),
+        identified,
+        "the first only"
+    );
+
+    // A client whose only `serve --stdio` child is not an OpenCode executable,
+    // or that only the wrapper shell has, has no private server.
+    let forged_only: Vec<ProcRow> = tree()
+        .into_iter()
+        .filter(|r| r.pid != 102)
+        .chain([proc_row(105, 101, "/usr/bin/python3", server_argv)])
+        .collect();
+    assert_eq!(identify(&forged_only, Some((2, 2, 5))), None);
+
+    // The client gone: the identity is forgotten on the next look.
+    let mut watch = Watch::default();
+    let now = std::time::Instant::now();
+    evaluate(
+        &[watched(Some((2, 2, 5)))],
+        &tree(),
+        &mut watch,
+        now,
+        &unprobed,
+        &HashMap::new(),
+    );
+    assert!(watch.private_server("agent-p").is_some());
+    let gone: Vec<ProcRow> = tree().into_iter().filter(|r| r.pid == 100).collect();
+    evaluate(
+        &[watched(Some((2, 2, 5)))],
+        &gone,
+        &mut watch,
+        now,
+        &unprobed,
+        &HashMap::new(),
+    );
+    assert_eq!(watch.private_server("agent-p"), None);
+
+    // Fed into the scan: the same tree as the shell-activity sampler sees it.
+    let info = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id: sid,
+        has_controlling_tty: sid == 100,
+        session_leader: pid == sid,
+        command_line: argv.map_or(CommandLine::NotSampled, |a| CommandLine::Read(a.into())),
+    };
+    let table = vec![
+        info(100, 1, 100, None),
+        info(101, 100, 100, None),
+        info(102, 101, 102, Some(&server_argv.join(" "))),
+        info(103, 100, 103, Some("opencode serve --stdio --port 0")),
+    ];
+    assert_eq!(
+        qualifying_command_sessions_with_server(&table, 100, &[], identified),
+        Some(HashSet::from([103])),
+        "the identified server is exempt; the forged one beside it counts"
+    );
+    assert_eq!(
+        qualifying_command_sessions_with_server(&table, 100, &[], None),
+        Some(HashSet::from([102, 103])),
+        "with no identity, both count"
+    );
+}
+
+/// Scenario: A pane started directly on OpenCode 2.x has its client and private server identified by the daemon's OpenCode watch; then, without a respawn, another client takes the pane — a new process running a 1.x binary, a new process whose version the deck never recorded, or the same process `exec`ing a 1.x binary — and that client starts a tool command `opencode serve --stdio` as its direct child in a session of its own. The spawn's 2.x version no longer vouches for the pane's client, so the watch names no private server and the shell-activity scan counts that tool command (and what runs in its session), while the original client, still the one the deck started, keeps its own server exempt.
+#[spec("status/waiting/018")]
+#[test]
+fn status_waiting_018_a_replacement_client_does_not_inherit_the_spawns_version() {
+    use dot_agent_deck::opencode_mode::{ProcRow, Watch, Watched, evaluate};
+    use dot_agent_deck::platform::proc::{AgentServer, qualifying_command_sessions_with_server};
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+
+    const V2: &str = "/opt/v2/opencode";
+    const V1: &str = "/opt/old/opencode-1.19.5";
+    const UNPROBED: &str = "/opt/elsewhere/opencode";
+    let proc_row = |pid: i32, ppid: i32, exe: &str, argv: &[&str]| ProcRow {
+        pid,
+        ppid,
+        exe: Some(PathBuf::from(exe)),
+        argv: (!argv.is_empty()).then(|| argv.iter().map(|a| a.to_string()).collect()),
+    };
+    // The pane runs `/opt/v2/opencode --standalone; <another OpenCode>; :`,
+    // a direct command the spawn probed as 2.2.5.
+    let watched = [Watched {
+        pane_id: "p".to_string(),
+        agent_id: "agent-p".to_string(),
+        root_pid: 100,
+        spawn_version: Some((2, 2, 5)),
+    }];
+    // Only the 1.x binary has a recorded version of its own; the 2.x client's
+    // is known from the spawn, and `UNPROBED` from nothing.
+    let version_of = |exe: &Path| (exe == Path::new(V1)).then_some((1, 19, 5));
+    let first = vec![
+        proc_row(100, 1, "/usr/bin/bash", &[]),
+        proc_row(101, 100, V2, &["opencode", "--standalone"]),
+        proc_row(102, 101, V2, &[V2, "serve", "--stdio", "--port", "0"]),
+    ];
+    // A client (`client_pid`, running `exe`) whose tool started a
+    // `serve --stdio` (202) as the client's direct child.
+    let replaced = |client_pid: i32, exe: &str| {
+        vec![
+            proc_row(100, 1, "/usr/bin/bash", &[]),
+            proc_row(client_pid, 100, exe, &["opencode"]),
+            proc_row(
+                202,
+                client_pid,
+                V2,
+                &[V2, "serve", "--stdio", "--port", "0"],
+            ),
+        ]
+    };
+    let t0 = std::time::Instant::now();
+    let look = |watch: &mut Watch, rows: &[ProcRow], n: u32| {
+        evaluate(
+            &watched,
+            rows,
+            watch,
+            t0 + std::time::Duration::from_secs(5 * u64::from(n)),
+            &version_of,
+            &HashMap::new(),
+        );
+        watch.private_server("agent-p")
+    };
+
+    // The scan's view of a replacement tree: the client on the pane's
+    // session, the tool's server detached with a child of its own.
+    let info = |pid: i32, ppid: i32, sid: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id: sid,
+        has_controlling_tty: sid == 100,
+        session_leader: pid == sid,
+        command_line: argv.map_or(CommandLine::NotSampled, |a| CommandLine::Read(a.into())),
+    };
+    let tool_server = format!("{V2} serve --stdio --port 0");
+    let scan_of = |client_pid: i32| {
+        vec![
+            info(100, 1, 100, None),
+            info(client_pid, 100, 100, None),
+            info(202, client_pid, 202, Some(&tool_server)),
+            info(203, 202, 202, None),
+        ]
+    };
+
+    for (name, client_pid, exe) in [
+        ("a new 1.x client", 201, V1),
+        ("a new client of unknown version", 201, UNPROBED),
+        ("the 2.x client exec'ing a 1.x binary", 101, V1),
+    ] {
+        let mut watch = Watch::default();
+        assert_eq!(
+            look(&mut watch, &first, 0),
+            Some(AgentServer {
+                client_pid: 101,
+                server_pid: 102,
+            }),
+            "{name}: premise, the spawn's own 2.x client and its server"
+        );
+        // The pane runs no OpenCode for a look, then the replacement: a gap
+        // does not make the replacement the spawn's client.
+        let shell_only: Vec<ProcRow> = first.iter().filter(|r| r.pid == 100).cloned().collect();
+        assert_eq!(look(&mut watch, &shell_only, 1), None, "{name}: no client");
+        let identity = look(&mut watch, &replaced(client_pid, exe), 2);
+        assert_eq!(identity, None, "{name}: no private server is named");
+        assert_eq!(
+            watch.private_servers(),
+            vec![],
+            "{name}: nothing to publish"
+        );
+        assert_eq!(
+            qualifying_command_sessions_with_server(&scan_of(client_pid), 100, &[], identity),
+            Some(HashSet::from([202])),
+            "{name}: the tool's `serve --stdio` and its session count"
+        );
+    }
+
+    // Without the gap, back to back, the same.
+    let mut watch = Watch::default();
+    assert!(look(&mut watch, &first, 0).is_some());
+    assert_eq!(look(&mut watch, &replaced(201, V1), 1), None);
+
+    // The spawn's own client, looked at again, keeps its server exempt.
+    let mut watch = Watch::default();
+    assert!(look(&mut watch, &first, 0).is_some());
+    assert_eq!(
+        look(&mut watch, &first, 1),
+        Some(AgentServer {
+            client_pid: 101,
+            server_pid: 102,
+        })
+    );
+    assert_eq!(
+        watch.private_servers(),
+        vec![(
+            "agent-p".to_string(),
+            AgentServer {
+                client_pid: 101,
+                server_pid: 102,
+            }
+        )]
+    );
+}
+
+/// Scenario: Classify a Codex pane's process table as measured on Linux (codex-cli 0.164.0), where one command started through Codex's exec tool runs under `codex-linux-sandbox` in a session of its own, `bwrap` sits in that session, and the inner `codex-linux-sandbox --apply-seccomp-then-exec` leads a second session that runs the command. On a Codex pane that chain counts as one command and a second chain as a second; the same table on any other pane counts both sessions, and a Codex pane counts every session whose chain differs from the measured one in any link.
+#[spec("status/waiting/025")]
+#[test]
+fn status_waiting_025_codex_linux_sandbox_counts_one_command() {
+    use dot_agent_deck::platform::proc::{
+        CommandWrapper, command_line_targets, qualifying_command_sessions,
+        qualifying_command_sessions_in_pane,
+    };
+    use std::collections::HashSet;
+
+    // Words as measured (the JSON permission profile shortened; it has no
+    // spaces in the measured run either): the outer stage's program is the
+    // link Codex runs itself through, the inner's the bare name bubblewrap's
+    // `--argv0` sets.
+    const OUTER_ARGV: &str = "/home/user/.codex/tmp/arg0-linux/codex-arg0jvJDMd/codex-linux-sandbox \
+         --sandbox-policy-cwd /work --command-cwd /work \
+         --permission-profile {\"type\":\"managed\",\"network\":\"restricted\"} -- /bin/bash -c \
+         sleep 60 && touch done";
+    const INNER_ARGV: &str = "codex-linux-sandbox --sandbox-policy-cwd /work --command-cwd /work \
+         --permission-profile {\"type\":\"managed\",\"network\":\"restricted\"} \
+         --apply-seccomp-then-exec -- /bin/bash -c sleep 60 && touch done";
+    // The agent, pids kept from the tree `status/waiting/024` printed.
+    const CODEX: i32 = 538240;
+    const CODEX_SID: i32 = 537924;
+    const CODEX_PANE: Option<CommandWrapper> = Some(CommandWrapper::CodexLinuxSandbox);
+    let row = |pid: i32, ppid: i32, session_id: i32, argv: Option<&str>| ProcessInfo {
+        pid,
+        ppid,
+        session_id,
+        has_controlling_tty: false,
+        session_leader: pid == session_id,
+        command_line: argv.map_or(CommandLine::NotSampled, |argv| {
+            CommandLine::Read(argv.to_string())
+        }),
+    };
+    // One command through the exec tool: outer wrapper (setsid) → bwrap (same
+    // session, command line never read: not a session boundary) → inner
+    // wrapper (bwrap's `--new-session`) → bash → sleep.
+    let command = |outer: i32, inner: i32| {
+        vec![
+            row(outer, CODEX, outer, Some(OUTER_ARGV)),
+            row(outer + 4, outer, outer, None),
+            row(inner, outer + 4, inner, Some(INNER_ARGV)),
+            row(inner + 1, inner, inner, None),
+            row(inner + 2, inner + 1, inner, None),
+        ]
+    };
+    let agent = || {
+        vec![
+            row(CODEX, 538226, CODEX_SID, None),
+            row(538558, CODEX, CODEX_SID, None),
+        ]
+    };
+    let codex = |table: &[ProcessInfo]| {
+        qualifying_command_sessions_in_pane(table, CODEX, &[], None, CODEX_PANE)
+    };
+
+    let mut table = agent();
+    table.extend(command(538581, 538586));
+    // Issue #862: the two wrappers are the only command lines the sampler
+    // reads, and the rule needs no other.
+    assert_eq!(command_line_targets(&table, &[CODEX]), vec![538581, 538586]);
+    assert_eq!(
+        codex(&table),
+        Some(HashSet::from([538581])),
+        "the sandbox's inner session is the command its outer session runs — one command, not two"
+    );
+    assert_eq!(
+        qualifying_command_sessions(&table, CODEX, &[]),
+        Some(HashSet::from([538581, 538586])),
+        "on any pane but a Codex one the same nesting counts as it always has"
+    );
+    assert_eq!(
+        qualifying_command_sessions_in_pane(&table, CODEX, &[], None, None),
+        Some(HashSet::from([538581, 538586]))
+    );
+
+    // A second command through the same tool is a second chain.
+    table.extend(command(538681, 538686));
+    assert_eq!(codex(&table), Some(HashSet::from([538581, 538681])));
+
+    // A session the command starts below the inner wrapper is outside the
+    // chain: it counts.
+    let mut nested = table.clone();
+    nested.push(row(538700, 538587, 538700, Some("setsid sleep 600")));
+    assert_eq!(
+        codex(&nested),
+        Some(HashSet::from([538581, 538681, 538700]))
+    );
+
+    // Every link is checked; a chain that differs in one counts both sessions.
+    let one_command = || {
+        let mut table = agent();
+        table.extend(command(538581, 538586));
+        table
+    };
+    let both = Some(HashSet::from([538581, 538586]));
+    let mut changed = one_command();
+    changed[3].session_id = 0;
+    assert_eq!(
+        codex(&changed),
+        both,
+        "bubblewrap's session could not be read"
+    );
+    let mut changed = one_command();
+    changed[3].session_id = changed[3].pid;
+    changed[3].session_leader = true;
+    let mut sessions = both.clone().unwrap();
+    sessions.insert(changed[3].pid);
+    assert_eq!(
+        codex(&changed),
+        Some(sessions),
+        "bubblewrap in a session of its own is an extra session"
+    );
+    let mut changed = one_command();
+    changed[4].ppid = 538581;
+    changed.remove(3);
+    assert_eq!(
+        codex(&changed),
+        both,
+        "no bubblewrap: the inner wrapper is the outer's child"
+    );
+    let mut changed = one_command();
+    changed[4].ppid = 538590;
+    changed.push(row(538590, 538585, 538590, Some("setsid bash")));
+    assert_eq!(
+        codex(&changed),
+        Some(HashSet::from([538581, 538586, 538590])),
+        "an extra session between bubblewrap and the inner wrapper"
+    );
+    let mut changed = one_command();
+    changed.push(row(538595, 538585, 538595, Some(INNER_ARGV)));
+    assert_eq!(
+        codex(&changed),
+        Some(HashSet::from([538581, 538586, 538595])),
+        "bubblewrap with a second child is not the measured chain"
+    );
+    let mut changed = one_command();
+    changed[4].command_line = CommandLine::Unavailable;
+    assert_eq!(codex(&changed), both, "an inner wrapper not read");
+    let mut changed = one_command();
+    changed[2].command_line = CommandLine::Unavailable;
+    assert_eq!(codex(&changed), both, "an outer wrapper not read");
+    let mut changed = one_command();
+    changed[4].command_line = CommandLine::Read(
+        "codex-linux-sandbox --sandbox-policy-cwd /work -- /bin/bash -c x \
+         --apply-seccomp-then-exec"
+            .to_string(),
+    );
+    assert_eq!(
+        codex(&changed),
+        both,
+        "the inner stage's option is read before the `--`, not in the command"
+    );
+    let mut changed = one_command();
+    changed[2].command_line = CommandLine::Read(INNER_ARGV.to_string());
+    assert_eq!(codex(&changed), both, "an inner stage where the outer is");
+    let mut changed = one_command();
+    changed[2].command_line =
+        CommandLine::Read("/usr/bin/codex-linux-sandbox-x --sandbox-policy-cwd /w -- a".into());
+    assert_eq!(codex(&changed), both, "another program");
+    let mut changed = one_command();
+    changed[2].command_line =
+        CommandLine::Read("/bin/sh -c codex-linux-sandbox --sandbox-policy-cwd /w -- a".into());
+    assert_eq!(codex(&changed), both, "a shell quoting the wrapper");
+    let mut changed = one_command();
+    changed[2].command_line = CommandLine::Read(OUTER_ARGV.replace(
+        "/home/user/.codex/tmp/arg0-linux/codex-arg0jvJDMd/codex-linux-sandbox",
+        "codex-linux-sandbox",
+    ));
+    assert_eq!(
+        codex(&changed),
+        Some(HashSet::from([538581])),
+        "the bare program name, as `codex sandbox` runs it"
+    );
+
+    // The outer session is not the wrapper: a user's `setsid` launcher whose
+    // child starts a session shaped like the inner wrapper counts both.
+    let mut table = agent();
+    table.extend([
+        row(538800, CODEX, 538800, Some("setsid --wait bash -c run")),
+        row(538804, 538800, 538800, None),
+        row(538806, 538804, 538806, Some(INNER_ARGV)),
+    ]);
+    assert_eq!(
+        codex(&table),
+        Some(HashSet::from([538800, 538806])),
+        "a session nested below anything but the measured wrapper counts"
+    );
+    // A whole wrapper chain below such a launcher is not the outermost
+    // session on its branch, as the agent starts it: all three count.
+    let mut table = agent();
+    table.push(row(
+        538800,
+        CODEX,
+        538800,
+        Some("setsid --wait bash -c run"),
+    ));
+    let mut chain = command(538581, 538586);
+    chain[0].ppid = 538800;
+    table.extend(chain);
+    assert_eq!(codex(&table), Some(HashSet::from([538800, 538581, 538586])));
+
+    // With both commands gone only the agent's own children remain: none.
+    assert_eq!(codex(&agent()), Some(HashSet::new()));
+}
+
+/// Scenario: Classify a Claude pane whose Claude runs below a detached launcher of its own, so the measured Bash-tool session sits inside a detached session whose command line does not match the shape, or was not read. The Bash-tool session counts and the pane reads busy; on a Codex pane, a wrapper chain whose outer session does not itself qualify leaves the inner session counted.
+#[spec("status/waiting/026")]
+#[test]
+fn status_waiting_026_an_unqualified_outer_session_hides_no_command() {
+    use dot_agent_deck::platform::proc::{
+        CommandWrapper, ShellToolShape, descendant_shell_activity, qualifying_command_sessions,
+        qualifying_command_sessions_in_pane,
+    };
+    use std::collections::HashSet;
+
+    let row = |pid: i32, ppid: i32, session_id: i32, argv: CommandLine| ProcessInfo {
+        pid,
+        ppid,
+        session_id,
+        has_controlling_tty: pid == 100,
+        session_leader: pid == session_id,
+        command_line: argv,
+    };
+    let read = |argv: &str| CommandLine::Read(argv.to_string());
+    // Pane shell (the walk's root) → a detached launcher's Claude (session
+    // 200) → Claude's Bash tool (session 300), with the measured shape.
+    let bash_tool = read(
+        "/bin/bash -c source /home/u/.claude/shell-snapshots/snapshot-bash-1.sh && eval 'sleep 60'",
+    );
+    for outer in [read("claude --model haiku"), CommandLine::Unavailable] {
+        let table = vec![
+            row(100, 1, 100, CommandLine::NotSampled),
+            row(200, 100, 200, outer.clone()),
+            row(300, 200, 300, bash_tool.clone()),
+            row(301, 300, 300, CommandLine::NotSampled),
+        ];
+        assert_eq!(
+            qualifying_command_sessions(&table, 100, &[CLAUDE_BASH_TOOL_SHAPE]),
+            Some(HashSet::from([300])),
+            "the Bash-tool session counts below an outer session of {outer:?}"
+        );
+        assert_eq!(
+            descendant_shell_activity(&table, 100, &[CLAUDE_BASH_TOOL_SHAPE]),
+            Some(true),
+            "the pane is busy below an outer session of {outer:?}"
+        );
+    }
+
+    // On a Codex pane the collapse runs only after qualification: with a
+    // cross-check that the inner session carries and the outer does not, the
+    // outer is not counted and so does not take the inner with it.
+    const INNER_ONLY: ShellToolShape = ShellToolShape {
+        agent: "test",
+        alternatives: &[&["--apply-seccomp-then-exec"]],
+    };
+    let table = vec![
+        row(100, 1, 100, CommandLine::NotSampled),
+        row(
+            200,
+            100,
+            200,
+            read("codex-linux-sandbox --sandbox-policy-cwd /w --command-cwd /w -- bash -c x"),
+        ),
+        row(204, 200, 200, CommandLine::NotSampled),
+        row(
+            206,
+            204,
+            206,
+            read(
+                "codex-linux-sandbox --sandbox-policy-cwd /w --command-cwd /w \
+                 --apply-seccomp-then-exec -- bash -c x",
+            ),
+        ),
+    ];
+    assert_eq!(
+        qualifying_command_sessions_in_pane(
+            &table,
+            100,
+            &[INNER_ONLY],
+            None,
+            Some(CommandWrapper::CodexLinuxSandbox)
+        ),
+        Some(HashSet::from([206]))
     );
 }
 

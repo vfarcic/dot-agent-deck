@@ -1266,11 +1266,6 @@ mod tests {
             ".claude",
             "a test HOME's ~/.claude, not the checkout's",
         ),
-        (
-            "tests/harness_isolation.rs",
-            ".claude",
-            "a test HOME's ~/.claude, not the checkout's",
-        ),
     ];
 
     /// What a scanned file's literal reads the checkout on behalf of.

@@ -97,7 +97,7 @@ import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectT
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
 import type { AgentSession, AgentTarget, CleanupWarningEntry, DeckAction, DeckRuntimeState, DeckSnapshot, DeckView, EvidenceItem, PanelTab, OrchestrationLaunchConfig } from "./types";
-import { DEFAULT_VOICE_SETTINGS, modeScopedKey } from "./lib/bridge";
+import { DEFAULT_VOICE_SETTINGS, isWorkUnderWay, modeScopedKey } from "./lib/bridge";
 import { READING_LABEL_MAX_CHARS, type ReadingAgent } from "./lib/reading";
 import { agentSpokenName } from "./lib/agentNames";
 import { questionAgentName } from "./lib/voiceQuestion";
@@ -2723,7 +2723,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
         {!allDecks && <section className="workspace-section" aria-label="Agent terminals">
           <header className="workspace-header">
             <div><span className="section-kicker">AGENT DECK</span><h2>Live work surfaces</h2></div>
-            <div className="workspace-tools">{tilesPaged && <span className="workspace-page" data-testid="deck-tiles-page">{pageMarker(tileSlice)}</span>}<span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => agent.status === "running").length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Events</button></div>
+            <div className="workspace-tools">{tilesPaged && <span className="workspace-page" data-testid="deck-tiles-page">{pageMarker(tileSlice)}</span>}<span>{snapshot.agents.length} agents</span><span>{snapshot.agents.filter((agent) => isWorkUnderWay(agent.status)).length} active</span><button className={evidenceOpen ? "is-active" : ""} onClick={() => VOICE_ACTIONS.toggleEvidenceDrawer.run(voiceContext)}><PanelRight size={14} /> Events</button></div>
           </header>
           {snapshot.connection.status === "loading" && !snapshot.agents.length ? <LoadingDeck /> : snapshot.agents.length ? (
             <div className="agent-grid">

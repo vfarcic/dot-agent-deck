@@ -290,7 +290,50 @@ impl Drop for Fixture {
     }
 }
 
+/// Issue #1757: a command first sampled within the daemon's sampling grace
+/// after a turn ends (two shell-activity polls, 1 s) is classified as started
+/// in that turn and reads Waiting (`status/waiting/007`).
+const PAST_THE_TURN: Duration = Duration::from_millis(1_500);
+
 impl Fixture {
+    /// Issue #1757: let more than the daemon's sampling grace pass since the
+    /// Stop just sent, so a command started next is classified as started
+    /// after the turn: Idle with the Background line, not Waiting. The wait is
+    /// a lower bound, not a deadline: `hook` returns only once the Stop's
+    /// broadcast arrived, so the command's first sample can only come later
+    /// than this after the daemon received the Stop, and a loaded box only
+    /// makes it later still. No observable signal stands in for it, because
+    /// what the policy compares is elapsed time itself; the boundary is pinned
+    /// at fixed times in `status/waiting/015`.
+    pub fn wait_past_the_sampling_grace(&self) {
+        std::thread::sleep(PAST_THE_TURN);
+    }
+
+    /// Issue #1757: wait until the daemon has sampled a command the live turn
+    /// started — the monitor's `ShellBusy` for the busy edge, broadcast after
+    /// the sampled set was recorded under the same lock — so the Stop sent
+    /// next ends a turn whose command the daemon already saw, however slowly
+    /// the detached process started or the monitor polled. `before` is the
+    /// event count taken before the command was started.
+    pub fn wait_sampled_in_turn(&self, before: usize) {
+        let timeout = common::load_scaled(Duration::from_secs(10));
+        let deadline = Instant::now() + timeout;
+        loop {
+            let seen = self.events.snapshot();
+            if seen.iter().skip(before).any(|event| {
+                event.agent_id.as_deref() == Some(&self.agent_id)
+                    && event.event_type == EventType::ShellBusy
+            }) {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the daemon did not sample the turn's command within {timeout:?}: {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
     pub fn wait_count_event(&self, before: usize, count: u64) {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {

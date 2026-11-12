@@ -3697,6 +3697,15 @@ pub struct RunningAgent {
     /// when the command names a launcher script that `exec`s another binary
     /// (an old npm 1.x `bin/opencode`). Daemon-local, not on the wire.
     pub opencode_spawn_version: Option<crate::opencode_version::Version>,
+    /// Issue #1757: this generation's OpenCode 2 client and its private server,
+    /// as the daemon's OpenCode watch last identified them
+    /// ([`crate::opencode_mode::Watch::private_server`], set through
+    /// [`AgentPtyRegistry::publish_opencode_private_servers`]). The shell-activity
+    /// scan re-roots at that server instead of counting it as a background
+    /// command ([`crate::platform::proc::AgentServer`]). `None` until the watch
+    /// has looked, for every pane it identifies no server in, and after a look
+    /// that failed. Daemon-local, not on the wire.
+    pub opencode_private_server: Option<crate::platform::proc::AgentServer>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -3987,6 +3996,22 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
     }
 }
 
+/// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
+/// under, whose nested sessions a card displays as one command
+/// ([`crate::platform::proc::command_sessions_in_pane`]). Only
+/// Codex's was measured, so only a pane the registry knows as Codex selects
+/// one; every other kind (and a pane whose kind is not known yet) selects none
+/// and counts every qualifying session as it always has. Keyed off the same
+/// observed agent kind as [`shell_tool_shape_key`].
+fn command_wrapper_of(
+    agent_type: Option<&AgentType>,
+) -> Option<crate::platform::proc::CommandWrapper> {
+    match agent_type {
+        Some(AgentType::Codex) => Some(crate::platform::proc::CommandWrapper::CodexLinuxSandbox),
+        _ => None,
+    }
+}
+
 /// One live pane a shell-activity sample could classify, resolved under the
 /// registry lock by [`AgentPtyRegistry::shell_activity_candidates`] and then
 /// classified without it by [`AgentPtyRegistry::classify_shell_activity`].
@@ -4013,6 +4038,14 @@ pub struct ShellActivityCandidate {
     /// Empty for every kind that has never been measured, which leaves the
     /// structural session-id test standing alone.
     pub shapes: Vec<crate::platform::proc::ShellToolShape>,
+    /// Issue #1757: *this* pane's agent's own server, as the daemon's OpenCode
+    /// watch identified it ([`RunningAgent::opencode_private_server`]), which
+    /// the scan re-roots at instead of counting as a background command. `None`
+    /// for every pane but an OpenCode 2 one whose server the watch identified.
+    pub server: Option<crate::platform::proc::AgentServer>,
+    /// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
+    /// under ([`command_wrapper_of`]). `None` for every pane but a Codex one.
+    pub wrapper: Option<crate::platform::proc::CommandWrapper>,
 }
 
 impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
@@ -15110,6 +15143,7 @@ impl AgentPtyRegistry {
             badge_command: spawn_command.clone(),
             spawn_command,
             opencode_spawn_version,
+            opencode_private_server: None,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -16162,6 +16196,8 @@ impl AgentPtyRegistry {
             spawn_command: _,
             // The fresh generation's own spawn probes again.
             opencode_spawn_version: _,
+            // And the watch identifies the fresh generation's server afresh.
+            opencode_private_server: _,
             badge_command: previous_badge_command,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
@@ -18774,6 +18810,25 @@ impl AgentPtyRegistry {
         Some(Self::classify_shell_activity(&candidates, &table))
     }
 
+    /// Issue #1757: record the OpenCode 2 clients and private servers the
+    /// daemon's OpenCode watch identified on its last look
+    /// ([`RunningAgent::opencode_private_server`]), by agent id, and clear
+    /// every other agent's, so an identity no look vouches for any more — the
+    /// watch failed, the client is gone or changed, the agent is no longer
+    /// watched — is not carried. An id no longer in the registry is ignored.
+    pub fn publish_opencode_private_servers(
+        &self,
+        servers: &[(String, crate::platform::proc::AgentServer)],
+    ) {
+        let mut inner = self.inner.lock();
+        for (agent_id, agent) in inner.agents.iter_mut() {
+            agent.opencode_private_server = servers
+                .iter()
+                .find(|(id, _)| id == agent_id)
+                .map(|(_, server)| *server);
+        }
+    }
+
     /// PRD #2050: the live agents whose pane runs OpenCode — by the type the
     /// spawn declared or a hook revealed, or else by its command's basename —
     /// with the pid their process tree hangs from, for the daemon's watch on
@@ -18845,6 +18900,8 @@ impl AgentPtyRegistry {
                     agent_id: agent_id.clone(),
                     shell_pid,
                     shapes,
+                    server: agent.opencode_private_server,
+                    wrapper: command_wrapper_of(agent.agent_type.as_ref()),
                 })
             })
             .collect()
@@ -18882,21 +18939,28 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #1678 D4: [`Self::classify_shell_activity`] with the distinct
-    /// qualifying POSIX sessions behind each busy reading — the count a card
-    /// shows as background commands — paired with the candidate (and so the
-    /// spawn) it was classified for. A candidate the table cannot answer for is
-    /// dropped, never reported as zero.
+    /// qualifying POSIX sessions behind each busy reading — raw, each with its
+    /// own first-seen age downstream, plus the pairs the pane's wrapper says
+    /// are one command in the count a card shows (issue #1757,
+    /// [`crate::platform::proc::CommandSessions`]) — paired with the candidate
+    /// (and so the spawn) it was classified for. A candidate the table cannot
+    /// answer for is dropped, never reported as zero.
     pub fn classify_command_sessions<'c>(
         candidates: &'c [ShellActivityCandidate],
         table: &[crate::platform::proc::ProcessInfo],
-    ) -> Vec<(&'c ShellActivityCandidate, std::collections::HashSet<i32>)> {
+    ) -> Vec<(
+        &'c ShellActivityCandidate,
+        crate::platform::proc::CommandSessions,
+    )> {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let sessions = crate::platform::proc::qualifying_command_sessions(
+                let sessions = crate::platform::proc::command_sessions_in_pane(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,
+                    candidate.server,
+                    candidate.wrapper,
                 )?;
                 Some((candidate, sessions))
             })
@@ -19150,6 +19214,7 @@ impl AgentPtyRegistry {
                 spawn_command: None,
                 badge_command: None,
                 opencode_spawn_version: None,
+                opencode_private_server: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real
@@ -21121,6 +21186,44 @@ mod tests {
         }
     }
 
+    /// Issue #1757 (round-3 audit): each publish of the OpenCode watch's
+    /// identities replaces every agent's — an agent the look did not name, and
+    /// every agent after a failed look (an empty publish), keeps none, so a
+    /// stale client/server pair is never carried past a look that does not
+    /// vouch for it.
+    #[test]
+    fn publishing_opencode_private_servers_clears_every_unnamed_agent() {
+        use crate::platform::proc::AgentServer;
+        let registry = AgentPtyRegistry::new();
+        let a = registry.insert_idle_member_for_test("oc-a", "oc", true);
+        let b = registry.insert_idle_member_for_test("oc-b", "oc", false);
+        let server = |client_pid, server_pid| AgentServer {
+            client_pid,
+            server_pid,
+        };
+        let held = |id: &str| registry.inner.lock().agents[id].opencode_private_server;
+
+        registry.publish_opencode_private_servers(&[
+            (a.clone(), server(101, 102)),
+            (b.clone(), server(201, 202)),
+        ]);
+        assert_eq!(held(&a), Some(server(101, 102)));
+        assert_eq!(held(&b), Some(server(201, 202)));
+
+        // The next look names only `a`, with a new pair: `b`'s is cleared.
+        registry.publish_opencode_private_servers(&[
+            (a.clone(), server(103, 104)),
+            ("gone".to_string(), server(1, 2)),
+        ]);
+        assert_eq!(held(&a), Some(server(103, 104)));
+        assert_eq!(held(&b), None, "an agent the look did not name");
+
+        // A failed look publishes nothing: every identity is cleared.
+        registry.publish_opencode_private_servers(&[]);
+        assert_eq!(held(&a), None, "after a failed look");
+        assert_eq!(held(&b), None);
+    }
+
     /// Issue #714 (review): a blocked-worker notice task is cancellable only
     /// until it begins its write, and one that was cancelled first never
     /// begins it — so a cancel can never land on a write in progress.
@@ -21284,6 +21387,27 @@ mod tests {
     /// statement here, which is what made a paneless daemon fork `ps -A` at 2Hz
     /// forever. `shell_activity_candidates` is asserted directly because it is
     /// the guard the early return is keyed off.
+    /// Issue #1757: only a pane the registry knows as Codex selects Codex's
+    /// sandbox wrapper; every other kind, and an unknown one, selects none, so
+    /// its nested sessions count exactly as before.
+    #[test]
+    fn only_a_codex_pane_selects_the_codex_sandbox_wrapper() {
+        assert_eq!(
+            command_wrapper_of(Some(&AgentType::Codex)),
+            Some(crate::platform::proc::CommandWrapper::CodexLinuxSandbox)
+        );
+        for other in [
+            AgentType::ClaudeCode,
+            AgentType::OpenCode,
+            AgentType::Pi,
+            AgentType::Devin,
+            AgentType::None,
+        ] {
+            assert_eq!(command_wrapper_of(Some(&other)), None, "{other:?}");
+        }
+        assert_eq!(command_wrapper_of(None), None);
+    }
+
     #[test]
     fn an_empty_registry_reports_no_shell_activity_without_sampling() {
         let registry = Arc::new(AgentPtyRegistry::new());

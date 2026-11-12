@@ -347,8 +347,8 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
         deck.snapshot_grid()
     );
 
-    // ---- Below here runs only once the tab assertion above passes. It is the reel
-    // narrative — best-effort, NOT gating, so LLM/timing variance can't make the
+    // ---- Below here runs only once the tab assertion above passes. It is the
+    // visible narrative — best-effort, NOT gating, so LLM/timing variance can't make the
     // load-bearing assertion above flaky. ----
 
     // Switch from the Dashboard to the freshly-surfaced orchestration tab (`l` =
@@ -359,10 +359,10 @@ fn dispatch_013_orchestration_surfaces_and_delegates() {
     // The committed sentinel filename should appear once the worker (delegated to
     // by the orchestrator) runs `ls` inside the cloned per-issue worktree. Logged,
     // not asserted: the multi-agent delegation chain is too LLM/timing-dependent
-    // to hard-gate (per the task's reel-narrative guidance).
+    // to hard-gate.
     let saw_sentinel = deck.wait_for_stream_string_within(SENTINEL, Duration::from_secs(150));
     eprintln!(
-        "reel narrative (soft): sentinel {SENTINEL:?} seen in orchestration panes = {saw_sentinel}"
+        "narrative (soft): sentinel {SENTINEL:?} seen in orchestration panes = {saw_sentinel}"
     );
 
     // Agents are instructed not to push or open PRs. Probe (best-effort) for a

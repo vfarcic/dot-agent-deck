@@ -695,10 +695,10 @@ describe("idle and needs input are two states (issue #1676)", () => {
 describe("background work on the tile and the agent screen", () => {
   const DECK_ID = "deck-000000000000dec1";
 
-  function backgroundSnapshot(background: DesktopAgentDto["background"], spawnedAtMs?: number) {
+  function backgroundSnapshot(background: DesktopAgentDto["background"], spawnedAtMs?: number, status: DesktopAgentDto["status"] = "idle") {
     return mapDesktopSnapshot({
       connection: { status: "connected", deckId: DECK_ID, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
-      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "idle", toolCount: 3, ...(spawnedAtMs === undefined ? {} : { spawnedAtMs }), ...(background ? { background } : {}), tab: { kind: "dashboard" } }],
+      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status, toolCount: 3, ...(spawnedAtMs === undefined ? {} : { spawnedAtMs }), ...(background ? { background } : {}), tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
     });
@@ -731,6 +731,38 @@ describe("background work on the tile and the agent screen", () => {
     render(<DeckShell runtime={liveRuntime({ commands: 2, subagents: 1, sinceMs })} initialView={{ kind: "agent", deckId: DECK_ID, agentId: "7", from: "overview" }} />);
     const pane = screen.getByTestId("agent-pane-overlay");
     expect(within(pane).getByTestId("background-work-7")).toHaveTextContent("Background: 2 commands, 1 subagent · 3h 12m");
+  });
+
+  /**
+   * Scenario (issue #1757): an agent whose turn ended while a command it
+   * started in that turn still runs. Its tile reads `waiting` — not `idle` —
+   * with `Background: 1 command · 5m` under it, the TUI card's Waiting and
+   * background line in the same words.
+   */
+  it("shows a Waiting agent as waiting with its background line", () => {
+    const sinceMs = Date.now() - (5 * 60_000 + 5_000);
+    const snapshot = backgroundSnapshot({ commands: 1, subagents: 0, sinceMs }, undefined, "waiting" as DesktopAgentDto["status"]);
+    render(<DeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} />);
+    const tile = screen.getByTestId("agent-tile-claude-code");
+    expect(within(tile).getByText("waiting")).toHaveClass("status-label");
+    expect(within(tile).queryByText("idle")).not.toBeInTheDocument();
+    expect(within(tile).getByTestId("background-work-7")).toHaveTextContent("Background: 1 command · 5m");
+  });
+
+  /**
+   * Scenario (issue #1757): open the agent dashboard on a daemon whose one
+   * agent is Waiting. The header's WAITING counter reads 1 and IDLE reads 0,
+   * as the TUI's stats bar reads `1 waiting` and no `idle` segment.
+   */
+  it("counts a Waiting agent under WAITING, not IDLE, in the dashboard header", () => {
+    const snapshot = backgroundSnapshot({ commands: 1, subagents: 0, sinceMs: Date.now() - 60_000 }, undefined, "waiting" as DesktopAgentDto["status"]);
+    render(<AppDeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} initialView={{ kind: "overview" }} />);
+    const waiting = screen.getByTestId("overview-count-waiting");
+    expect(waiting).toHaveTextContent("WAITING");
+    expect(waiting).toHaveTextContent("1");
+    expect(waiting.querySelector("strong")).toHaveClass("count-waiting");
+    expect(screen.getByTestId("overview-count-idle")).toHaveTextContent("0");
+    expect(screen.getByTestId("overview-count-running")).toHaveTextContent("0");
   });
 
   /** Scenario: the same agent with nothing left running shows no background line at all. */

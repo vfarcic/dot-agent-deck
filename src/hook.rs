@@ -3792,6 +3792,70 @@ mod tests {
         assert_eq!(map_event_type("SomethingElse"), None);
     }
 
+    /// Issue #2085: without its arm each name would read `None` and the event
+    /// would be dropped. No other test maps these two.
+    #[test]
+    fn map_compaction_events() {
+        assert_eq!(map_event_type("PreCompact"), Some(EventType::Compacting));
+        assert_eq!(map_event_type("PostCompact"), Some(EventType::Thinking));
+    }
+
+    /// Issue #2085: a structured tool reporting `failed` is a failure, as
+    /// `error` is.
+    #[test]
+    fn tool_response_with_failed_status_is_a_failure() {
+        assert!(tool_response_is_failure(
+            &serde_json::json!({"status": "failed"})
+        ));
+    }
+
+    /// Issue #2085: each named arm yields a detail the generic branch (the
+    /// first string value, cut at 80 bytes) would not: a value longer than 80,
+    /// only a multi-line command's first line, an argv array joined, a patch
+    /// envelope's file path.
+    #[test]
+    fn extract_tool_detail_named_arms_differ_from_the_generic_branch() {
+        let long = "x".repeat(100);
+        let cases = [
+            ("Read", serde_json::json!({"file_path": long}), long.clone()),
+            ("Edit", serde_json::json!({"file_path": long}), long.clone()),
+            (
+                "Write",
+                serde_json::json!({"file_path": long}),
+                long.clone(),
+            ),
+            ("Grep", serde_json::json!({"pattern": long}), long.clone()),
+            ("Glob", serde_json::json!({"pattern": long}), long.clone()),
+            (
+                "Agent",
+                serde_json::json!({"description": long}),
+                long.clone(),
+            ),
+            (
+                "shell",
+                serde_json::json!({"command": ["/bin/sh", "-lc", "touch x"]}),
+                "/bin/sh -lc touch x".to_string(),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"command": "*** Add File: notes.txt\n+hello"}),
+                "notes.txt".to_string(),
+            ),
+            (
+                "exec",
+                serde_json::json!({"command": "make\nmake test"}),
+                "make".to_string(),
+            ),
+        ];
+        for (tool, input, expected) in cases {
+            assert_eq!(
+                extract_tool_detail(Some(tool), Some(&input)),
+                Some(expected),
+                "{tool}"
+            );
+        }
+    }
+
     /// Issue #622: the `agent-event` CLI's detail lands on the fields every
     /// other producer fills, bounded the same way.
     #[test]
@@ -5325,6 +5389,16 @@ mod tests {
         assert_eq!(
             map_opencode_event_type("session.status", Some("error")),
             Some(EventType::Error)
+        );
+    }
+
+    /// Issue #2085: without its arm `waiting` would fall to the default and
+    /// read Thinking.
+    #[test]
+    fn map_opencode_session_status_waiting() {
+        assert_eq!(
+            map_opencode_event_type("session.status", Some("waiting")),
+            Some(EventType::WaitingForInput)
         );
     }
 

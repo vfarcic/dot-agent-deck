@@ -2327,6 +2327,8 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
         SessionStatus::Blocked => "blocked",
+        // Issue #1757: its own word, never Needs input's `waiting_for_input`.
+        SessionStatus::Waiting => "waiting",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -5024,6 +5026,34 @@ mod tests {
         );
     }
 
+    /// Issue #1757: a session whose turn ended while a command it started in
+    /// that turn still runs maps to its own `"waiting"` status, never
+    /// `"idle"` and never Needs input's `"waiting_for_input"`, and keeps its
+    /// background line. The status is read through its wire name so this
+    /// module compiles before `SessionStatus::Waiting` exists.
+    #[test]
+    fn waiting_status_maps_to_waiting_with_its_background() {
+        let waiting: SessionStatus = serde_json::from_value(serde_json::json!("Waiting")).unwrap();
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.status = waiting;
+        live.background = serde_json::from_value(serde_json::json!({
+            "commands": 1, "subagents": 0, "since_ms": 1_756_684_800_123_i64, "awaited": 1,
+        }))
+        .unwrap();
+        live.background_revision = Some(3);
+        let mapped = map_agent(record);
+        assert_eq!(mapped.status, "waiting");
+        assert_ne!(mapped.status, "waiting_for_input");
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(value["background"]["commands"], 1);
+        assert_eq!(
+            session_status_name(&SessionStatus::WaitingForInput),
+            "waiting_for_input",
+            "Needs input keeps its own word"
+        );
+    }
+
     /// Issue #1678: the daemon's background aggregate reaches the webview as
     /// counts and an instant under `background`, unclamped; an empty aggregate
     /// (the daemon's explicit clear) and a record with no live snapshot both
@@ -5037,6 +5067,7 @@ mod tests {
             commands: 2,
             subagents: 1,
             since_ms: Some(1_756_684_800_123),
+            awaited: 0,
         });
         live.background_revision = Some(7);
         let mapped = map_agent(record.clone());
@@ -5059,6 +5090,7 @@ mod tests {
             commands: 0,
             subagents: 3,
             since_ms: None,
+            awaited: 0,
         });
         let value = serde_json::to_value(map_agent(record.clone())).unwrap();
         assert_eq!(

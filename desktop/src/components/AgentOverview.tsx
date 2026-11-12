@@ -148,6 +148,7 @@ export function agentDomKey(agent: Pick<OverviewAgent, "daemonId" | "id">): stri
 const FIXTURE_DAEMON_STATUS: Partial<Record<AgentStatus, DesktopAgentDto["status"]>> = {
   running: "working",
   needs_input: "waiting_for_input",
+  waiting: "waiting",
   idle: "idle",
   failed: "error",
   blocked: "blocked",
@@ -363,7 +364,9 @@ function roleIndexOf(agent: OverviewAgent): number {
  * Statuses in the order an operator scans them: what needs attention first.
  * Idle comes after every state a person has to act on (issue #1676).
  */
-const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "idle", "queued", "passed", "stopped"];
+// Issue #1757: Waiting after the states a person acts on, before Idle — its
+// work is not done, but nothing needs the user.
+const STATUS_ORDER: AgentStatus[] = ["running", "needs_input", "failed", "blocked", "waiting", "idle", "queued", "passed", "stopped"];
 
 export function countByStatus(agents: OverviewAgent[]): { status: AgentStatus; count: number }[] {
   return STATUS_ORDER
@@ -1646,14 +1649,20 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
           </div>
           {/*
             Issue #1676: which counters give way at a medium-width window is
-            named here, not left to their position. IDLE and GROUPS are the two
-            nobody has to act on; NEEDS INPUT and FAILED stay.
+            named here, not left to their position. WAITING, IDLE and GROUPS
+            are the ones nobody has to act on; NEEDS INPUT and FAILED stay.
           */}
           <div className="run-instruments overview-instruments">
             <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
             <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
             <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
             <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+            {/*
+              Issue #1757: the TUI's stats bar counts `waiting` beside `idle`, so
+              the header does too (CLAUDE.md rule 22). Optional like IDLE:
+              nothing here needs the user.
+            */}
+            <OverviewInstrument label="WAITING" testId="overview-count-waiting" optional><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
             <OverviewInstrument label="IDLE" testId="overview-count-idle" optional><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
             <OverviewInstrument label="GROUPS" testId="overview-count-groups" optional><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
             {/*
