@@ -740,8 +740,24 @@ pub(crate) fn test_control_dir(var: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("fixture HOME"));
-    let root = home.join(root);
+    control_dir_under(&home, &root)
+}
+
+/// `home/name`, created if missing. Split out of [`test_control_dir`] so a
+/// test can hand it a directory in the state the umask race leaves.
+#[cfg(feature = "e2e")]
+fn control_dir_under(home: &std::path::Path, name: &std::path::Path) -> Option<std::path::PathBuf> {
+    let root = home.join(name);
     std::fs::create_dir_all(&root).ok()?;
+    // The daemon's socket binding sets the process umask to `0o177` for a
+    // moment (`with_socket_umask`), so whichever thread created this
+    // directory may have left it at `0o600`, with no search bit. A mode set
+    // with chmod is not filtered by the umask, so restate it on every call.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
     let canonical = root.canonicalize().ok()?;
     if !canonical.starts_with(home.canonicalize().expect("fixture HOME exists")) {
         return None;
@@ -754,12 +770,17 @@ pub(crate) fn test_control_dir(var: &str) -> Option<std::path::PathBuf> {
 pub(crate) fn record_for_test(event: &str) {
     use std::io::Write;
     if let Some(root) = test_control_root() {
-        let mut file = std::fs::OpenOptions::new()
+        // A seam that cannot record must not take the daemon under test down
+        // with it: the test then fails on the observation it waits for, which
+        // names the seam, instead of on an attach EOF (#2280).
+        let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(root.join("observations"))
-            .expect("open test observations");
-        writeln!(file, "{event}").expect("record test observation");
+            .and_then(|mut file| writeln!(file, "{event}"));
+        if let Err(error) = written {
+            tracing::error!(%error, event, "could not record a test observation");
+        }
     }
 }
 
@@ -1200,6 +1221,41 @@ async fn run_tick(
 
 #[cfg(test)]
 mod tests {
+    // Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+    // build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
+    #[cfg(feature = "e2e")]
+    mod e2e_only {
+        /// Issue #2280: the daemon's socket binding sets the process umask to
+        /// `0o177` for a moment, so a control directory another thread creates in
+        /// that window has no search bit, and opening `observations` in it failed
+        /// with PermissionDenied and took the daemon down. The directory is built
+        /// here in exactly that state rather than by racing the umask.
+        #[cfg(unix)]
+        #[test]
+        fn a_control_dir_created_under_the_socket_umask_is_usable() {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let masked = home.path().join("ring-barriers");
+            std::fs::create_dir(&masked).unwrap();
+            std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let root = crate::doorbell::control_dir_under(
+                home.path(),
+                std::path::Path::new("ring-barriers"),
+            );
+            let opened = root.as_ref().map(|root| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(root.join("observations"))
+            });
+            let _ = std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o700));
+            assert!(
+                matches!(opened, Some(Ok(_))),
+                "a control dir left at 0o600 must still take observations: {opened:?}"
+            );
+        }
+    }
+
     use super::*;
     use spec::spec;
 
