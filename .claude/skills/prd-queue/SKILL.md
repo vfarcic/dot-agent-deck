@@ -419,6 +419,8 @@ Two things `/prd-full` cannot supply on its own, both of which the task must:
 - **The isolation is already done.** `/prd-full` aborts unless given both `prdNumber` and `mode`, and `mode: worktree` would invoke `/worktree-prd`, whose `create.sh` cuts a *second* worktree at `../<repo>-prd-<n>-<title-slug>` off the local `main` — outside the pane's cwd and outside anything the deck tracks. `mode: branch` is the answer, plus an explicit instruction to skip the branch-creation steps, since the unit is already on `agent/dispatch-prd-<n>`.
 - **Nothing will notice it finishing.** See the notification block below, which is the reason this shape needs a task at all beyond one sentence.
 
+<!-- The RWX bullet in the task below is a deliberate copy of docs/develop/rwx.md's "For agents": a dispatched unit cannot follow a link back to this skill. Keep it, issue-queue's gates bullet and rwx.md naming the same commands. -->
+
 ```
 Run PRD #<n> end to end in this worktree.
 
@@ -428,9 +430,9 @@ first — it governs the gates below and overrides anything that conflicts with 
 
 YOU ARE ALREADY ISOLATED. dot-agent-deck cut this worktree for you and you are
 already on branch agent/dispatch-prd-<n>. So mode is `branch`, and you SKIP every
-branch-or-worktree creation step in the lifecycle: /prd-full step 1, /prd-start's
-branch creation, and /pr-create's "Create feature branch". Stay on
-agent/dispatch-prd-<n> and open the PR from it. Do NOT run /worktree-prd — it
+branch-or-worktree creation step in the lifecycle: /prd-full step 1 and
+/prd-start's Step 3 branch creation (/pr-create creates no branch; it pushes
+the one you are on). Stay on agent/dispatch-prd-<n> and open the PR from it. Do NOT run /worktree-prd — it
 would cut a second worktree off local `main`, outside this pane's cwd.
 
 <for a file PRD:>
@@ -486,24 +488,17 @@ GATES — CLAUDE.md is the authority, this is the summary:
   five idle minutes. If `rwx whoami` fails, run it locally and say so in your
   report. Anything that reaches a real agent (`cargo test-e2e-live`, or any
   command with the `e2e-live` feature) stays local.
-- The full matrix can also run on GitHub's runners, and it RELIEVES NOTHING
-  above. ci.yml carries a `workflow_dispatch:`, so after a push
-  `gh workflow run ci.yml --ref <branch>` runs it there (take the run id from
-  the URL that prints, not from a listing). Sweep only the half you are
-  missing: with a working `rwx` login, `rwx run .rwx/ci.yml` runs the Linux
-  half on RWX and `-f linux_jobs=false` dispatches build-macos alone (for
-  when your gates did not run on macOS); without one, pass
+- The full matrix can also run on GitHub's runners, and it RELIEVES NO GATE
+  above: the helper stays the per-task gate. Use it after a push, for what no
+  local gate covers (build-macos above all) or when the box is busy, never as
+  the per-edit gate. Sweep only the half you are missing: with a working `rwx`
+  login, `rwx run .rwx/ci.yml` for the Linux half and
+  `gh workflow run ci.yml --ref <branch> -f linux_jobs=false` for build-macos
+  alone; without one, `gh workflow run ci.yml --ref <branch>`, with
   `-f build_macos=false` when your gates ran `cargo test-fast` on macOS and
-  the change leaves build-macos's own job alone. Both default to true. But the helper's gates run BEFORE
-  a commit exists, so they have already passed by the time there is anything
-  to dispatch, and the helper stays the per-task gate. What a dispatch
-  buys is the part no local gate covers at all — build-macos,
-  e2e-deterministic, nix, devbox, security, the desktop jobs,
-  windows-cross-check (not build-windows, `if: false` until Windows ships) — earlier than opening the PR, and the option of NOT
-  adding a second broad local sweep on a box already busy with the mandatory
-  ones. NOT as the per-edit gate: a round trip has a 9.5-minute median against
-  a warm clippy of ~9-15s. It covers neither lane 2 nor anything you have not
-  pushed. docs/develop/ci-on-demand.md has the detail.
+  the change leaves build-macos's own job alone. Take the run id from the URL
+  it prints. It covers neither lane 2 nor anything you
+  have not pushed. docs/develop/ci-on-demand.md has the table and the detail.
 - Lane 2 — the files that reach a real agent, `cargo test-e2e-live <filter>`
   — runs on NO runner anywhere: no test that reaches a real agent runs in CI.
   Where the PRD touches a real-agent path, the unit runs those tests itself with
@@ -524,7 +519,9 @@ GATES — CLAUDE.md is the authority, this is the summary:
   experimental flag before building it.
 - CLAUDE.md rule 12: if it touches the daemon, the TUI↔daemon protocol, orchestration or
   hooks, answer the PROTOCOL_VERSION-versus-.breaking.md question explicitly
-  rather than silently, and run the cross-version check.
+  in the PR body rather than silently, and link the PR's passing
+  `cross-version` CI job as the cross-version run instead of running the
+  harness locally (.claude/skills/pr-create/SKILL.md step 1 has the rest).
 - CLAUDE.md rule 10: do not hard-wrap Markdown prose.
 - A changelog fragment via the dot-ai-changelog-fragment skill.
 
@@ -577,13 +574,12 @@ why you did not — AND RESOLVE THE THREAD; answer a summary item that has no
 thread in a PR comment quoting its title. After your last wait-reviews.sh,
 `.claude/skills/pr-create/unanswered-findings.sh <pr>` must print
 FINDINGS=answered, BEFORE you notify and stop; put its UNANSWERED_COUNT= in
-your report (issue #2081). Resolving is half the job: an unresolved thread blocks the merge button
-AND the approval the merge needs, so a PR with every finding fixed still sits
-(PR #1035 sat a day that way). REVIEWS=incomplete is a result, not a reason
+your report. Resolving is half the job: an unresolved thread blocks the merge button
+AND the approval the merge needs, so a PR with every finding fixed still sits.
+REVIEWS=incomplete is a result, not a reason
 to keep waiting: an app that is out of quota produces nothing at all, so
 report which review was not obtained and go on. Do not defer it to the merge: this run stops
-before merge, so a finding left for "before merging" is read by nobody. Measured on PR #869:
-five findings, two P1, unanswered through 3h45m of further commits.
+before merge, so a finding left for "before merging" is read by nobody.
 
 STOP CONDITION: open the PR, request review from the other maintainer with
 `gh pr create --reviewer <OTHER>`, and STOP. Do not merge. Per CLAUDE.md rule 8
@@ -654,7 +650,8 @@ lifecycle, and it covers what /prd-full does not.
   Ambiguous: proceed and say so; never close on it.
 - You are already isolated. dot-agent-deck cut this worktree and you are on
   branch agent/dispatch-prd-<n>. Neither you nor any worker creates a branch or
-  a worktree: skip /pr-create's "Create feature branch" step and open the PR from
+  a worktree: skip /prd-start's Step 3 branch creation (/pr-create creates no
+  branch; it pushes the one you are on) and open the PR from
   agent/dispatch-prd-<n>. Do not delegate /worktree-prd to anyone.
 - Nobody is watching this pane. `dispatch` is fire-and-forget with no return
   edge, so your notifications are the only channel out of this unit — treat the
@@ -662,22 +659,14 @@ lifecycle, and it covers what /prd-full does not.
   optional. Send with `scripts/notify.sh "<message>"`; it enforces the explicit
   chat_id and has no inbound path, so those two rules hold by construction.
 - The full matrix can run on GitHub's runners, and it is yours to pass on.
-  ci.yml carries a `workflow_dispatch:`, so after a push
-  `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it there; sweep
-  only the half that is missing (`rwx run .rwx/ci.yml` for Linux,
+  After a push, `gh workflow run ci.yml --ref agent/dispatch-prd-<n>` runs it
+  there; sweep only the half that is missing (`rwx run .rwx/ci.yml` for Linux,
   `-f linux_jobs=false` or `-f build_macos=false` on the dispatch, per
-  docs/develop/ci-on-demand.md's table). It
-  relieves NO gate a worker owes: `cargo xtask affected-checks --run` is the
-  gate before a commit exists, so whatever it selected has already passed by
-  the time there is anything to dispatch. What it buys is the part no local
-  gate covers — build-macos, e2e-deterministic, nix, devbox,
-  security, the desktop jobs, windows-cross-check (not build-windows, `if: false`
-  until Windows ships) — earlier than opening the PR, and the option of not
-  adding a second broad local sweep on a box already busy. Never a worker's
-  per-edit gate, where a 9.5-minute median round trip would stand in for a
-  warm clippy of ~9-15s. Your workers run the gates and you do not, so tell
-  whoever you delegate to.
-  docs/develop/ci-on-demand.md has the detail.
+  docs/develop/ci-on-demand.md's table). Use it for what no local gate covers
+  (build-macos above all), never as a worker's per-edit gate. It relieves NO
+  gate a worker owes: `cargo xtask affected-checks --run` is still the gate
+  before every commit. Your workers run the gates and you do not, so tell
+  whoever you delegate to. docs/develop/ci-on-demand.md has the detail.
 - A red any of you meets is this unit's to own (CLAUDE.md rule 6), whoever
   caused it and even if it passes on a retry: it is fixed in this PR, or
   quarantined (a named owner, an expiry issue, and

@@ -419,22 +419,18 @@ EXACTLY AS PUSHING IS — a rerun and a dispatch are the same act by two names.
   <if authored by the runner:>
     On YOUR branch you may start runs. `gh run rerun --failed <run-id>`
     re-runs only what broke, with no commit. And the full matrix can run on
-    GitHub's runners instead of this box: ci.yml carries a
-    `workflow_dispatch:`, so `gh workflow run ci.yml --ref <headRefName>`
-    dispatches it — take the run id from the URL it prints, because a listing
-    on a branch with an open PR returns the PR's run, not yours. Sweep only
-    the half you are missing: with a working `rwx` login,
-    `rwx run .rwx/ci.yml` runs the Linux half on RWX and
-    `-f linux_jobs=false` dispatches build-macos alone; without one,
-    `-f build_macos=false` when your gates ran `cargo test-fast` on macOS and the change leaves `build-macos`'s own job alone. Reach for it
-    when the box is loaded, when a change needs build-macos (build-windows is
-    `if: false` until Windows ships, so a dispatch does not run it),
-    or as a sweep after your fixes. It relieves no gate: the gates
-    `cargo xtask affected-checks --run` selects run before a commit exists, so
-    they have already passed by the time there is anything to dispatch. Never
-    as a per-edit gate either, where a 9.5-minute median round trip would
-    stand in for a warm clippy of ~9-15s.
+    GitHub's runners instead of this box: reach for it when the box is
+    loaded, when a change needs build-macos, or as a sweep after your fixes,
+    never as a per-edit gate. Sweep only the half you are missing: with a
+    working `rwx` login, `rwx run .rwx/ci.yml` for the Linux half and
+    `gh workflow run ci.yml --ref <headRefName> -f linux_jobs=false` for
+    build-macos alone; without one, `gh workflow run ci.yml --ref <headRefName>`,
+    with `-f build_macos=false` when your gates ran `cargo test-fast` on macOS
+    and the change leaves `build-macos`'s own job alone. Take the run id from
+    the URL it prints, not from a listing. It relieves no gate:
+    `cargo xtask affected-checks --run` stays the gate before every commit.
     It covers neither lane 2 nor anything you have not pushed.
+    docs/develop/ci-on-demand.md has the detail.
   <if authored by anyone else:>
     READ-ONLY. NEVER dispatch a workflow run against <login>'s branch and
     NEVER rerun their jobs — not the failed ones, not any of them — for the

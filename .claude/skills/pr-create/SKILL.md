@@ -42,7 +42,7 @@ Wait for CI with `gh pr checks <n>`, and for the automated review apps with:
 
 It waits for every app listed in `reviewers.json` beside it to finish reviewing the PR's **current head**, prints `DONE=` or `TIMED_OUT=` per app, and ends with `REVIEWS=complete` or `REVIEWS=incomplete`. The apps signal "done" differently, which is why the skills do not describe the signals themselves: Qodo creates no check-run, and its review comment names the commit it reviewed; Greptile reviews only when the PR opens, and posts its summary comment when it finishes. Adding, dropping or replacing a reviewer is an edit to `reviewers.json`, not to this file (issue #1256; `docs/develop/governance.md`, "The automated reviewer", has the measurements).
 
-**The wait is bounded, per app.** An app that is out of quota, uninstalled, or broken produces **nothing at all** — no comment, no check-run, no failed state — so "wait until it appears" never terminates. Measured on this repo 2026-08-23: an exhausted Greptile quota produced zero comments *and* zero check-runs, indistinguishable from the app being gone. The script stops at each app's `timeout_minutes`: for an app that reviews every push, counted from when the script starts and again whenever the head moves; for one that reviews only when the PR opens, counted from the PR's creation, so a push never buys it another wait. On `REVIEWS=incomplete`, **proceed and say explicitly in your report which review was not obtained** — that is a result. `ERROR=` (exit 2) means the script could not read the registry or the PR, or could not confirm the head before deciding: treat it as no review obtained, and report the error. Do not hang, and do not report the gate as passed.
+**The wait is bounded, per app.** An app that is out of quota, uninstalled, or broken produces **nothing at all** — no comment, no check-run, no failed state — so "wait until it appears" never terminates. The script stops at each app's `timeout_minutes`: for an app that reviews every push, counted from when the script starts and again whenever the head moves; for one that reviews only when the PR opens, counted from the PR's creation, so a push never buys it another wait. On `REVIEWS=incomplete`, **proceed and say explicitly in your report which review was not obtained** — that is a result. `ERROR=` (exit 2) means the script could not read the registry or the PR, or could not confirm the head before deciding: treat it as no review obtained, and report the error. Do not hang, and do not report the gate as passed.
 
 **A check that goes red here falls under the same rule as one met locally** (step 1): a test that fails in CI and then passes on `gh run rerun` is a flaky test you have now met, so it gets a fix or a quarantine in this PR, not just the green rerun. The PR body was written before this wait, so add the red and its exit to it (`gh pr edit <n> --body-file <file>`) once you have taken one — the body, not only your report, is what step 1 asks to carry it.
 
@@ -54,7 +54,7 @@ gh api repos/{owner}/{repo}/pulls/<n>/comments --paginate
 
 Keep `--paginate` — replies count toward the page, so a busy PR silently truncates the findings you are about to certify as read. The review object carries none of them, and a `COMMENTED` review with a passing check can still carry real defects.
 
-**The inline threads are not every finding.** Qodo's "Code Review by Qodo" issue comment lists its findings at the head as numbered items, and its **informational** tier exists only there (`inline_comments_severity_threshold = 2`), with no thread to answer in; Greptile's summary comment lists its findings too. Those items are findings like any other: the agent reviewer reads them, and a bot finding with no reply and no fix was the commonest reason for its `REQUEST_CHANGES` (issue #2081: 22 of 40 verdicts read were an unanswered bot finding, at least 13 of them a Qodo summary item, while unresolved threads at merge were zero). So list them with:
+**The inline threads are not every finding.** Qodo's "Code Review by Qodo" issue comment lists its findings at the head as numbered items, and its **informational** tier exists only there (`inline_comments_severity_threshold = 2`), with no thread to answer in; Greptile's summary comment lists its findings too. Those items are findings like any other: the agent reviewer reads them, and a bot finding with no reply and no fix was the commonest reason for its `REQUEST_CHANGES` ([`governance.md`](../../../docs/develop/governance.md#the-automated-reviewer) has the count). So list them with:
 
 ```sh
 .claude/skills/pr-create/unanswered-findings.sh <n>
@@ -77,7 +77,7 @@ Resolving is not bookkeeping — it is half the job, and skipping it blocks the 
 - `required_review_thread_resolution` is on, so an unresolved thread blocks the **merge button**;
 - the agent PR reviewer skips any PR carrying one, so it also blocks the **approval** that merge needs.
 
-Measured: #1035 sat a full day with 14 green checks and every finding already fixed, and #1019 sat two days on a finding the reviewer itself had retracted 34 seconds after the author rebutted it.
+[`governance.md`](../../../docs/develop/governance.md#the-evidence-behind-claudemd-rule-8) has the PRs that sat on an unresolved thread.
 
 ```sh
 # unresolved thread ids — PAGINATED. `first:100` is a page, not the total, and

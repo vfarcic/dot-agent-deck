@@ -110,19 +110,13 @@ Update the PRD metadata:
 
 #### F2: Move PRD to Archive
 
-Work on a branch, never on `main` (CLAUDE.md rule 1 says to ask whether the user wants a worktree or a branch). Move the PRD file to the done directory and update roadmap:
+Work on a branch, never on `main` (CLAUDE.md rule 1 says to ask whether the user wants a worktree or a branch). Move the PRD file to the done directory:
 
 ```bash
 git mv prds/[number]-[name].md prds/done/
 ```
 
 **Note**: If the move fails because `prds/done/` doesn't exist, create it with `mkdir -p prds/done` and retry.
-
-**Update ROADMAP.md (if it exists):**
-- [ ] Check if `docs/ROADMAP.md` exists
-- [ ] Remove the closed PRD from the roadmap (search for "PRD #[number]")
-- [ ] Remove the entire line that references this PRD
-- [ ] Closed PRDs should not appear in future roadmap as they're no longer being worked on
 
 #### F3: Update GitHub Issue
 
@@ -193,9 +187,8 @@ Run the gates CLAUDE.md rule 2 names before committing, then:
 
 ```bash
 git add prds/                      # the moved PRD
-git add docs/ROADMAP.md            # if F2 edited it
 git add <each file with a link fix> # every in-repo reference to the old path
-git status   # staged: the moved PRD, the roadmap edit and the link fixes; nothing left unstaged
+git status   # staged: the moved PRD and the link fixes; nothing left unstaged
 
 git commit -m "docs(prd-[number]): close PRD #[number] - [brief reason]
 
