@@ -10,7 +10,7 @@ Owns one arc: **committed work on a branch → a PR that is green, reviewed, and
 
 Out of scope on purpose:
 
-- **Merging.** Nothing here merges or arms auto-merge; it hands off. CLAUDE.md rule 8: nobody merges their own unapproved PR (for an admin that succeeds *silently* rather than failing, which is how the gate decays into ceremony), and agents never arm auto-merge. An approved PR is merged through [`merge-pr`](../merge-pr/SKILL.md) by an agent whose task says to merge, or by a person.
+- **Merging.** Nothing here merges or arms auto-merge; it hands off. [CLAUDE.md rule 8](../../../CLAUDE.md): nobody merges their own unapproved PR, and agents never arm auto-merge. An approved PR is merged through [`merge-pr`](../merge-pr/SKILL.md) by an agent whose task says to merge, or by a person.
 - **Closing the issue.** `Closes #<n>` in the PR body does it on merge.
 - **Implementation.** If a finding needs a code change, make it; if it needs a decision you cannot make, say so on the thread.
 
@@ -19,7 +19,7 @@ This file is **project-local and owned by this repository** — it was forked ou
 ## 1. Before the PR
 
 - CLAUDE.md is the authority on the gates (rules 2 and 5). **Run `cargo xtask affected-checks` and run what it prints** (issue #1575): for a branch with any Rust, build input or unmapped path in it, that is rule 2's fmt and clippy commands and rule 5's `cargo test-fast`; for a branch that is only mapped text (docs, skills, `changelog.d/`, `.github/`, PRDs, `CLAUDE.md` and the like), it is the xtask tests plus the root-package tests that read those files. `cargo xtask affected-checks --run` prints the plan and runs it, stopping at the first failure — prefer it to piping the printed plan into a shell, which reports success when the helper itself fails to build or run. Either way add the tests covering what you touched — **name those in the PR body**, since part of the tier runs on no runner anywhere. Read the rules rather than trusting this summary.
-- **A red you met along the way is yours** (CLAUDE.md rule 6), whoever caused it and even if it passed on a retry: after CLAUDE.md rule 6's isolation rerun, fix it in this PR or quarantine it (a named owner, an expiry issue, and `#[ignore = "quarantined: <owner>, #<issue>"]` on the test), and **say in the PR body which, for each one**. Rerunning it until green and mentioning it is neither; `.claude/skills/verify-pr/SKILL.md` Phase 5 has the mechanics. Before fixing a red your change did not cause, check whether an open PR already fixes it (`gh pr list --search '<test name>'`); if one does, name that PR in the body and leave the red to it — #1460 and #1462 both changed `selectRow` in `desktop/driver/harness.ts` to fix `terminal_002`.
+- **A red you met along the way is yours**, whoever caused it and even if it passed on a retry: after the isolation rerun, fix it in this PR or quarantine it, both as [CLAUDE.md rule 6](../../../CLAUDE.md) says, and **say in the PR body which, for each one**. Rerunning it until green and mentioning it is neither; `.claude/skills/verify-pr/SKILL.md` Phase 5 has the mechanics. Before fixing a red your change did not cause, check whether an open PR already fixes it (`gh pr list --search '<test name>'`); if one does, name that PR in the body and leave the red to it ([why both halves](../../../docs/develop/e2e-lanes.md#a-red-you-meet-is-yours)).
 - **Changelog fragment**: `changelog.d/<issue>.<type>.md`, type one of `breaking|feature|bugfix|doc|misc`. Release notes are built from these, not from PR labels.
 - **User docs** (CLAUDE.md rule 21): a user page under `docs/` the PR touches, and the changelog fragment, say what the user does, sees and configures; implementation detail and issue history go to `docs/develop/` or nowhere, fixed in this PR.
 - **CLAUDE.md rule 23** if the change adds a desktop control: say in the PR body how it is reached by voice — the `commands.toml` row, or the `no_voice` reason — and name any entry it adds to `xtask/linkage-check/voice-control-sites.toml`, `Gap:` entries above all. Linkage-check rule 14's ratchet makes the question unavoidable but cannot judge the answer, so the body is where a reviewer reads it.
@@ -30,7 +30,7 @@ This file is **project-local and owned by this repository** — it was forked ou
 
 `gh pr create`, with a body that says what changed and why, how it was verified (name the tests), and `Closes #<n>` — or `Refs #<n>` for a PR that ships only part of a PRD, which leaves the PRD open (the orchestrator template's step 5 in `.dot-agent-deck.toml` has the rule).
 
-Then `gh pr edit <n> --add-reviewer <the other maintainer>` — but **request review last**, after CI and the automated review have settled, you have pushed the fixes, and every finding is answered (step 4's two checks). `dismiss_stale_reviews_on_push` voids an approval when you push new commits (a `gh pr update-branch` merge was measured not to), so asking early buys a guaranteed second round trip.
+Then `gh pr edit <n> --add-reviewer <the other maintainer>` — but **request review last**, after CI and the automated review have settled, you have pushed the fixes, and every finding is answered (step 4's two checks). `dismiss_stale_reviews_on_push` voids an approval when you push new commits (for `gh pr update-branch`, see [`merge-pr`](../merge-pr/SKILL.md#the-overlap-check-before-a-merge)), so asking early buys a guaranteed second round trip.
 
 ## 3. Settle CI and the automated review
 
@@ -105,7 +105,7 @@ Push fixes **before** requesting review (step 2). Greptile does not re-review �
 
 Report and stop: PR URL, check status, each finding and what you did about it (with `unanswered-findings.sh`'s final `UNANSWERED_COUNT=` and the unresolved-thread count, both taken after the last `wait-reviews.sh`), each red you met and whether it was fixed or quarantined, and whether an automated review was obtained at all.
 
-**Do not arm auto-merge** (CLAUDE.md rule 8). GitHub would merge the PR the moment the approval lands, with nobody present to run `/merge-pr`'s overlap check first ("The overlap check before a merge", `.claude/skills/merge-pr/SKILL.md`) or to watch `main`'s CI run for the merge commit and fix a red. When your task says to take the PR to merged, do it through `/merge-pr` once it is approved; otherwise stop at the PR.
+When your task says to take the PR to merged, do it through [`/merge-pr`](../merge-pr/SKILL.md) once it is approved, never by arming auto-merge ("Out of scope", above); otherwise stop at the PR.
 
 ## Reference
 

@@ -83,6 +83,20 @@ This sample is biased toward success: it holds only merged PRs. The declared dep
 | disjoint file sets per cleanup mode; off-limits list | `/code-cleanup` | 2026-10-04, 2026-10-22 | C17 |
 | never `pkill -f` a pattern the production daemon matches | CLAUDE.md rule 12 | after 2026-09-15 | C16 |
 
+### The `/land-prs` Step 3 incidents (2026-09-26 and 27)
+
+`/land-prs` Step 3 keeps the instructions; these are the runs each one came from.
+
+- **Simulate, do not guess from file lists.** Guessing the order from file overlap held six approved PRs back for no reason on 2026-09-26.
+- **Stack the awaiting-review PRs together.** On 2026-09-26 #1338 and #1331 each merged cleanly on top of the ready stack, and #1331 went `CONFLICTING` the moment #1338 landed.
+- **A clean merge is not a green merge.** #1340's voice deck-switch test failed after #1334 changed how desktop settings save, with no conflict marker anywhere.
+- **Batch what the simulation clears.** Finding collisions during merging instead, as on 2026-09-26, turned every one into a push, a CI run and a re-review.
+- **Stacking does not survive a squash.** Measured on 2026-09-27: #1346 went `CONFLICTING` the moment #1347 (its base) landed, and four of #1346's six review threads were about #1347's code; those went to a follow-up issue (#1365).
+- **A stack moves together.** On 2026-09-27 #1347 drew a `REQUEST_CHANGES` while #1346 (stacked on it) and #1342 (stacked on #1346) were queued behind it; reviewing them first would have spent two reviews on heads about to change.
+- **Build `main` after every batch** (C8). On 2026-09-26 #1335 added a two-argument call in a `src/main.rs` test, #1341 then gave the function a third parameter, and `main` stopped compiling its bin tests with neither PR ever red.
+- **Re-check a PR's premise about `main`** (C13). On 2026-09-27 #1363 was approved to revert the Rust half of a Tauri bump, but #1360 had meanwhile moved the npm half to match, so merging the revert would have re-broken the desktop build; the PR's advisory check, failing where `main` passed, was the tell.
+- **Renovate merges under you.** On 2026-09-26 #1358 moved the Rust `tauri` crate to 2.12.0 through Renovate's `pull_request` bypass while the npm `@tauri-apps/*` packages stayed at 2.11 (held by pnpm's 24-hour release-age gate and Renovate's 3-day npm delay), and `tauri build` refuses the mismatch, which breaks the `desktop-driver` job and the release's desktop bundle. That is why `/tag-release` Step 3 checks the two agree before dispatching.
+
 ## Milestone 2: the smallest dependency vocabulary
 
 It has to work across orchestration, dispatch and cross-project work, and without #628's outcome. So it names only identities that exist today and that survive a daemon restart: an **issue or PR number** (the forge's), a **branch** and a **path set** (Git's). A dispatch name is a label, not an identity: it is reused, and the deck keeps the unit record only in memory. A deck work id from #1889 can be added later as a fourth kind of endpoint without changing the edge kinds.

@@ -64,6 +64,15 @@ gh api "repos/vfarcic/dot-agent-deck/actions/workflows/ci.yml/runs?head_sha=<the
 
 A red is fixed through `/merge-pr` like any other (CLAUDE.md rule 6), and the fix's own merge commit is then the SHA to release; go back to Step 1 for it.
 
+**The Tauri crate and the npm `@tauri-apps/*` packages agree on the same minor.** `tauri build` refuses a mismatch, which breaks the release's desktop bundle, and Renovate can merge one half without the other (the incident is in [`docs/develop/dependency-policy.md`](../../../docs/develop/dependency-policy.md#the-land-prs-step-3-incidents-2026-09-26-and-27)). Read both at the SHA from Step 1:
+
+```bash
+git show <the SHA from Step 1>:Cargo.lock | grep -A1 '^name = "tauri"$' | sed -n 's/^version = "\(.*\)"/\1/p'   # e.g. 2.12.5
+git show <the SHA from Step 1>:desktop/pnpm-lock.yaml | grep -oE "^  '@tauri-apps/(api|cli)@[0-9.]+" | sort -u      # e.g. @tauri-apps/api@2.12.4
+```
+
+When the minors differ, stop and bring it to the user rather than dispatching; do not paper over it with a `minimumReleaseAgeExclude` without the user's say-so.
+
 ```bash
 gh workflow run tag-release.yml --ref main \
   -f version=<X.Y.Z> \
