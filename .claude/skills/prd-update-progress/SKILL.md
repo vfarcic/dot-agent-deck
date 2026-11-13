@@ -278,10 +278,18 @@ When updating a file PRD based on implementation progress:
 After successfully updating the PRD, commit all changes to preserve the progress checkpoint. For an issue PRD the commit carries the implementation work only — the PRD update is already on GitHub — so if there is no work to commit, there is nothing to do here:
 
 ### Commit Implementation Work
+
+**Run the gates first**: `cargo xtask affected-checks --run` ([CLAUDE.md](../../../CLAUDE.md) rules 2 and 5). Fix whatever it reports (`cargo fmt` for a format failure) and stage those fixes with the rest; do not commit while it fails.
+
+**Stage the paths by name, not with `git add .`**: the implementation files this progress covers, plus, for a file PRD, the `prds/<n>-*.md` file Step 7 edited. Read `git status` and leave out anything that is not part of this work (scratch files, another agent's changes, `.dot-agent-deck/` notes). The work and the PRD update still go in as one commit.
+
 ```bash
-# MANDATORY: Stage ALL files - implementation work AND PRD updates together
-# DO NOT selectively add only PRD files - commit everything as one atomic unit
-git add .
+# Gates (CLAUDE.md rules 2 and 5)
+cargo xtask affected-checks --run
+
+# Stage the files of this work by path; for a file PRD include its prds/ file
+git status
+git add <implementation files> [prds/<n>-*.md]
 
 # Verify what will be committed
 git status

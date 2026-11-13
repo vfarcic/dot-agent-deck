@@ -5,44 +5,24 @@ description: Run, build, smoke-test, and screenshot the dot-agent-deck binary ag
 
 # Run dot-agent-deck
 
-`dot-agent-deck` is a Rust TUI/CLI that orchestrates terminal agent
-sessions: a `ratatui` dashboard talking over Unix-socket protocols to
-a `portable-pty`-spawned daemon. Day-to-day driving lives in
-`.claude/skills/run-dot-agent-deck/driver.sh` — it shells out the
-binary against a fresh tempdir sandbox (so it does NOT attach to the
-developer's real daemon and render their actual workflow), captures
-the dashboard with tmux, and verifies clean shutdown.
+`dot-agent-deck` is a Rust TUI/CLI that orchestrates terminal agent sessions: a `ratatui` dashboard talking over Unix-socket protocols to a `portable-pty`-spawned daemon. Day-to-day driving lives in `.claude/skills/run-dot-agent-deck/driver.sh` — it shells out the binary against a fresh tempdir sandbox (so it does NOT attach to the developer's real daemon and render their actual workflow), captures the dashboard with tmux, and verifies clean shutdown.
 
 All paths are relative to the repo root.
 
 ## Why a sandbox
 
-`dot-agent-deck` binds Unix sockets and `flock`s lock files at
-user-global paths (`$XDG_RUNTIME_DIR/dot-agent-deck/*`, fallback
-`$HOME/.cache/dot-agent-deck/`). If you launch the TUI without
-redirecting these:
+`dot-agent-deck` binds Unix sockets and `flock`s lock files at user-global paths (`$XDG_RUNTIME_DIR/dot-agent-deck/*`, fallback `$HOME/.cache/dot-agent-deck/`). If you launch the TUI without redirecting these:
 
-- It attaches to your already-running daemon and shows your real
-  Claude sessions in the dashboard (verified — it picked mine up).
+- It attaches to your already-running daemon and shows your real Claude sessions in the dashboard (verified — it picked mine up).
 - Or it contends on your daemon's lock files and fails to start.
 - `hooks install` rewrites your shell rc files.
 
-The driver redirects every relevant env var (`DOT_AGENT_DECK_SOCKET`,
-`DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_LOCK_DIR`,
-`DOT_AGENT_DECK_STATE_DIR`, `DOT_AGENT_DECK_CONFIG`,
-`DOT_AGENT_DECK_SESSION`, plus `HOME`, `XDG_RUNTIME_DIR`,
-`XDG_STATE_HOME`) into a fresh tempdir per run, so the smoke is
-hermetic.
+The driver redirects every relevant env var (`DOT_AGENT_DECK_SOCKET`, `DOT_AGENT_DECK_ATTACH_SOCKET`, `DOT_AGENT_DECK_LOCK_DIR`, `DOT_AGENT_DECK_STATE_DIR`, `DOT_AGENT_DECK_CONFIG`, `DOT_AGENT_DECK_SESSION`, plus `HOME`, `XDG_RUNTIME_DIR`, `XDG_STATE_HOME`) into a fresh tempdir per run, so the smoke is hermetic.
 
 ## Prerequisites
 
-```bash
-apt-get install -y tmux              # already present on this container
-```
-
-Rust toolchain via `rustup` (cargo 1.95+ / rustc 1.95+ verified). No
-other system libraries needed — the binary statically links
-`vt100`, `portable-pty`, `crossterm`, etc.
+- `tmux` on `PATH` (the driver captures the dashboard with it). The devbox shell does not provide it, so install it with your system's package manager (`brew install tmux`, `apt-get install -y tmux`).
+- The Rust toolchain the devbox shell pins (`devbox.json`); outside devbox, a `rustup` toolchain at least the workspace's `rust-version` (`Cargo.toml`). No other system libraries are needed — the binary statically links `vt100`, `portable-pty`, `crossterm`, etc.
 
 ## Build
 
@@ -50,8 +30,7 @@ other system libraries needed — the binary statically links
 cargo build --release
 ```
 
-Release build because the TUI's render path benefits — debug builds
-visibly stutter. Optimized build takes ~25 s clean, ~1 s incremental.
+Release build because the TUI's render path benefits — debug builds visibly stutter. Optimized build takes ~25 s clean, ~1 s incremental.
 
 ## Run (agent path) — driver.sh
 
@@ -61,12 +40,8 @@ visibly stutter. Optimized build takes ~25 s clean, ~1 s incremental.
 
 Subcommands:
 
-- `cli` — non-interactive surface only: `--version`, `--help`,
-  `init`, `validate`. ~0.1 s. Right for PRs that touch the CLI or
-  config-loading code paths.
-- `tui` — launches the dashboard under tmux, waits for first paint,
-  saves a `capture-pane` screenshot, drives the `Ctrl+C` → `Enter`
-  quit dialog, verifies the tmux session ends cleanly. ~1.5 s.
+- `cli` — non-interactive surface only: `--version`, `--help`, `init`, `validate`. ~0.1 s. Right for PRs that touch the CLI or config-loading code paths.
+- `tui` — launches the dashboard under tmux, waits for first paint, saves a `capture-pane` screenshot, drives the `Ctrl+C` → `Enter` quit dialog, verifies the tmux session ends cleanly. ~1.5 s.
 - `all` — both, in order. Default.
 
 Output of a clean run:
@@ -83,8 +58,7 @@ Config is valid.
 OK
 ```
 
-The screenshot lands at `/tmp/dad-screenshot.txt` (override with
-`DAD_SCREENSHOT=...`). A clean sandbox shows:
+The screenshot lands at `/tmp/dad-screenshot.txt` (override with `DAD_SCREENSHOT=...`). A clean sandbox shows:
 
 ```
                                    No active sessions. Press Ctrl+n to create a pane.
@@ -95,20 +69,11 @@ The screenshot lands at `/tmp/dad-screenshot.txt` (override with
 [Rename r] [Generate g] [Scheduled Tasks s]
 ```
 
-The bottom rows are the persistent button bar (it replaced the old
-`Ctrl+n: new  Ctrl+w: close …` status-bar legend), and it is
-mode-aware: the capture above is command mode, so the first button
-reads `[Back to Pane Ctrl+D]` and `[Close Ctrl+W]` is live. Inside a
-pane the first reads `[Command Mode Ctrl+D]` and `[Close Ctrl+W]` is
-dimmed, because `Ctrl+W` closes only from command mode. On a narrow
-terminal the bar wraps to more rows rather than dropping buttons.
+The bottom rows are the persistent button bar (it replaced the old `Ctrl+n: new  Ctrl+w: close …` status-bar legend), and it is mode-aware: the capture above is command mode, so the first button reads `[Back to Pane Ctrl+D]` and `[Close Ctrl+W]` is live. Inside a pane the first reads `[Command Mode Ctrl+D]` and `[Close Ctrl+W]` is dimmed, because `Ctrl+W` closes only from command mode. On a narrow terminal the bar wraps to more rows rather than dropping buttons.
 
-`No active sessions` is the signal that the sandbox is isolated — a
-non-isolated run would render whatever sessions your real daemon
-knows about.
+`No active sessions` is the signal that the sandbox is isolated — a non-isolated run would render whatever sessions your real daemon knows about.
 
-Override the binary path with `DAD_BIN=...` to smoke an alternate
-build (e.g. `target/debug/dot-agent-deck` for faster iteration).
+Override the binary path with `DAD_BIN=...` to smoke an alternate build (e.g. `target/debug/dot-agent-deck` for faster iteration).
 
 ## Run (human path)
 
@@ -116,56 +81,19 @@ build (e.g. `target/debug/dot-agent-deck` for faster iteration).
 ./target/release/dot-agent-deck
 ```
 
-Opens the dashboard against the user's REAL state — useful only as
-the developer running on a workstation with `hooks install`'d agent
-hooks. Useless headless. The driver above is the agent path.
+Opens the dashboard against the user's REAL state — useful only as the developer running on a workstation with `hooks install`'d agent hooks. Useless headless. The driver above is the agent path.
 
 ## Test
 
-```bash
-cargo test
-```
-
-~1.5 minutes on this container; 800+ tests. Covers the daemon
-protocol, PTY orchestration, delegate dispatch, and F12 reattach
-paths — most PRs that touch internals are verified by `cargo test`
-alone, not by the driver. The driver is for the TUI/CLI surface and
-the screenshot artifact.
-
-Also gate before commit (per `CLAUDE.md` rules 2 and 5):
-
-```bash
-cargo xtask affected-checks --run
-```
-
-It prints and runs what the change needs, stopping at the first failure: for a change with any Rust, build input or unmapped path in it, CLAUDE.md rule 2's fmt and clippy commands and rule 5's `cargo test-fast`; for a change that is only mapped text (docs, skills, `changelog.d/`, `.github/`, PRDs, `CLAUDE.md` and the like), the xtask tests plus the root-package tests that read those files. CLAUDE.md rule 2 is the authority on the commands and on why every clippy flag is load-bearing; run the helper rather than retyping them.
+Gate before commit with `cargo xtask affected-checks --run` ([CLAUDE.md](../../../CLAUDE.md) rules 2 and 5). For a code change it runs the fast tier, `cargo test-fast` (`nextest run --workspace`, `.cargo/config.toml`), not bare `cargo test`: without `--workspace` cargo tests the root package alone and the `xtask/*` members' tests run in no gate (CLAUDE.md rule 5). That tier covers the daemon protocol, PTY orchestration, delegate dispatch and F12 reattach paths, so most PRs that touch internals are verified by it, not by the driver. The driver is for the TUI/CLI surface and the screenshot artifact.
 
 ## Gotchas
 
-- **The dashboard renders YOUR sessions if you skip the sandbox.**
-  The first time I launched the TUI without env-var overrides, it
-  attached to my own running daemon and showed my live Claude pane
-  inside its own pane. That's how I noticed the isolation problem.
-  Always go through `driver.sh`.
-- **`Ctrl+C` doesn't quit — it opens a confirm dialog.** The dialog
-  has `Stop / Cancel`. `Stop` is default-selected, so `Enter`
-  confirms. The driver pauses 0.5 s between the two send-keys
-  because the binary reads the dialog state synchronously between
-  events; back-to-back sends drop one.
-- **Don't run two `driver.sh` invocations concurrently from the
-  same shell.** Each gets its own tempdir, but they share `$$`
-  (which seeds the tmux session name suffix in the script). Use
-  separate shells if you need parallel smokes.
-- **Commands with embedded double quotes break `.dot-agent-deck.toml`
-  basic strings silently** — the TOML parser returns an error and the
-  role lookup falls through to "no respawn" with no visible signal in
-  the TUI. Use TOML basic strings with `\"` escapes, or single-quote
-  the TOML value if the shell command contains no `'`. The
-  F12 e2e test in `tests/orchestration_delegate.rs` documents this.
-- **TUI may not exit cleanly under tmux smaller than ~24×80.** The
-  Stop/Cancel dialog needs ~5 rows; on a tiny pane the dialog clips
-  and the Enter doesn't land on the focused button. The driver uses
-  120×40.
+- **The dashboard renders YOUR sessions if you skip the sandbox.** The first time I launched the TUI without env-var overrides, it attached to my own running daemon and showed my live Claude pane inside its own pane. That's how I noticed the isolation problem. Always go through `driver.sh`.
+- **`Ctrl+C` doesn't quit — it opens a confirm dialog.** The dialog has `Stop / Cancel`. `Stop` is default-selected, so `Enter` confirms. The driver pauses 0.5 s between the two send-keys because the binary reads the dialog state synchronously between events; back-to-back sends drop one.
+- **Don't run two `driver.sh` invocations concurrently from the same shell.** Each gets its own tempdir, but they share `$$` (which seeds the tmux session name suffix in the script). Use separate shells if you need parallel smokes.
+- **Commands with embedded double quotes break `.dot-agent-deck.toml` basic strings silently** — the TOML parser returns an error and the role lookup falls through to "no respawn" with no visible signal in the TUI. Use TOML basic strings with `\"` escapes, or single-quote the TOML value if the shell command contains no `'`. The F12 e2e test in `tests/orchestration_delegate.rs` documents this.
+- **TUI may not exit cleanly under tmux smaller than ~24×80.** The Stop/Cancel dialog needs ~5 rows; on a tiny pane the dialog clips and the Enter doesn't land on the focused button. The driver uses 120×40.
 
 ## Troubleshooting
 

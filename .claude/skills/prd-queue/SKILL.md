@@ -468,7 +468,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
 - Per task: the helper's plan, PLUS the tests covering what the task touched —
   any tier, credentialed included. Find them via tests/CATALOG.md, the `#[spec]`
   annotations, or `cargo xtask list-tests`, and NAME them in the report.
-- Before the PR: NOTHING extra in full. Issue #502 removed the full
+- Before the PR: NOTHING extra in full. There is no full
   `cargo test-e2e` obligation — lane 1 runs in CI on every PR, so read that run
   rather than reproducing it. Say this explicitly in the unit, because an agent
   reading an older PRD will otherwise run the full tier for tens of minutes on
