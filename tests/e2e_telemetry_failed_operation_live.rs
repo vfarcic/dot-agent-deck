@@ -12,7 +12,7 @@ use common::TuiDeck;
 use dot_agent_deck::daemon_client::DaemonClient;
 use dot_agent_deck::daemon_protocol::AttachRequest;
 use spec::spec;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use telemetry_operation_receiver::{EXPORT_WAIT, Receiver, attribute, nanos};
 
 /// Scenario: Start trusted interactive Claude Haiku in a real attached pane and ask it to run one Bash command that copies a uniquely named sentinel with `cp` and then exits 3, visibly completing its turn. That command's exported `cp` operation must end while the run is still open and without the deck's forced-closure attribute, and the card must finish Idle rather than Error.
@@ -122,10 +122,9 @@ fn telemetry_otlp_046_real_claude_failed_command_ends_its_operation() {
     );
 }
 
-/// Write each of `chunks` into the agent's pane through the attach input path,
-/// the way a client forwards what a person types, a moment apart so the agent
-/// reads them as separate keys rather than one paste.
-fn type_into_pane(deck: &TuiDeck, agent_id: &str, chunks: &[&[u8]]) {
+/// Write `bytes` into the agent's pane through the attach input path, the way
+/// a client forwards what a person types.
+fn type_into_pane(deck: &TuiDeck, agent_id: &str, bytes: &[u8]) {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -133,21 +132,10 @@ fn type_into_pane(deck: &TuiDeck, agent_id: &str, chunks: &[&[u8]]) {
         .block_on(async {
             let client = DaemonClient::new(deck.attach_socket_path().to_path_buf());
             let mut stream = client.attach(agent_id).await.unwrap();
-            for chunk in chunks {
-                stream.write_input(chunk).await.unwrap();
-                tokio::time::sleep(Duration::from_millis(500)).await;
-            }
+            stream.write_input(bytes).await.unwrap();
             stream.detach().await.unwrap();
         });
 }
-
-/// How long the probe command runs before the test presses Escape.
-const RUN_BEFORE_ESCAPE: Duration = Duration::from_secs(2);
-
-/// From the probe script's start marker to past the moment its `sleep 20`
-/// would have let it write the finish marker, with 10 s of slack for a loaded
-/// machine: an absent marker after this means the script was stopped.
-const SCRIPT_FINISH_WINDOW: Duration = Duration::from_secs(30);
 
 fn unix_nanos_now() -> u64 {
     SystemTime::now()
@@ -156,7 +144,7 @@ fn unix_nanos_now() -> u64 {
         .as_nanos() as u64
 }
 
-/// Scenario: Start trusted interactive Claude Haiku in a real attached pane and ask it to run, in the foreground, a script that writes a uniquely named start marker, sleeps 20 seconds and then writes a finish marker. Once the start marker appears, press Escape in the pane as a person interrupting it would, then type a request for a one-word reply into the pane so its next turn ends. The script's operation must export while the run is open, marked `interrupted` and ending at the Escape; the finish marker must never appear.
+/// Scenario: Start trusted interactive Claude Haiku in a real attached pane and ask it to run, in the foreground, a script that writes a uniquely named start marker, sleeps 20 seconds and then writes a finish marker. Once the start marker appears, press Escape in the pane as a person interrupting it would and wait for Claude to show the call Interrupted, then type a request for a one-word reply into the pane so its next turn ends. The script's operation must export while the run is open, marked `interrupted` and ending at the Escape; the finish marker must never appear.
 #[spec("telemetry/otlp/050")]
 #[test]
 fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
@@ -202,28 +190,40 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
         Duration::from_secs(120),
     )
     .expect("real Claude must start the script, which writes the unique start marker");
-    let started_at = Instant::now();
-    // Pacing, not a wait on anything: let the command run a moment before it
-    // is interrupted, so the span has a start well before the key.
-    std::thread::sleep(RUN_BEFORE_ESCAPE);
 
     // Escape through the attach input path, the way a client forwards a key a
     // person presses in the pane.
     let before_escape = unix_nanos_now();
-    type_into_pane(&deck, &agent.id, &[b"\x1b"]);
+    type_into_pane(&deck, &agent.id, b"\x1b");
     let after_escape = unix_nanos_now();
+    // Claude Code's own word that the Escape stopped the call: the positive
+    // proof the command did not run to its end.
+    assert!(
+        common::wait_until(Duration::from_secs(30), || deck
+            .snapshot_grid()
+            .contains("Interrupted")),
+        "Claude must show the call interrupted:\n{}",
+        deck.snapshot_grid()
+    );
 
     // Typed, as the person who interrupted would: the deck holds its own
     // messages for a card still Working, and an interrupted turn leaves the
     // card Working, since Claude Code fires no `Stop` for it.
+    // Enter goes in once the pane shows the text, so Claude reads it as a
+    // key after the typing rather than as part of one paste.
     type_into_pane(
         &deck,
         &agent.id,
-        &[
-            b"Do not run any command. Reply INTERRUPT_2093_DONE and end your turn.",
-            b"\r",
-        ],
+        b"Do not run any command. Reply INTERRUPT_2093_DONE and end your turn.",
     );
+    assert!(
+        common::wait_until(Duration::from_secs(30), || deck
+            .snapshot_grid()
+            .contains("Reply INTERRUPT_2093_DONE")),
+        "the typed follow-up never reached Claude's prompt:\n{}",
+        deck.snapshot_grid()
+    );
+    type_into_pane(&deck, &agent.id, b"\r");
     // The probe script's own operation, however Haiku spelled the command
     // (`./interrupt_probe_2093.sh`, `sh interrupt_probe_2093.sh`, …).
     let is_probe = |op: &serde_json::Value| {
@@ -271,11 +271,8 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
         "no operation may wait for the run's end: {:?}",
         receiver.operations(&pane)
     );
-    // The script writes its finish marker 20 s after it starts; past that
-    // window an absent marker means the Escape stopped it.
-    if let Some(left) = SCRIPT_FINISH_WINDOW.checked_sub(started_at.elapsed()) {
-        std::thread::sleep(left);
-    }
+    // Claude showed the call `Interrupted` above; the script's own finish
+    // marker agrees.
     assert!(
         !deck.workdir().join(FINISHED).exists(),
         "the Escape must have stopped the script"
