@@ -130,6 +130,7 @@ A run starts when the deck starts an agent in a pane and ends when the agent exi
 | `deck.status_changes.count` | How many status changes the run had. |
 | `deck.interventions.count` | How many times you stepped in (see `deck.intervention` below). |
 | `deck.operations.count` | How many shell commands the agent ran (see [`agent.operation`](#agentoperation)). |
+| `deck.skills.count` | How many times the agent loaded a skill (see `deck.skill` below). `0` for an agent whose skills the deck cannot see. |
 | `deck.ci.rounds.count` | How many times the pull request's checks went from running to a result while this run watched it (see [`agent.ci`](#agentci)). Runs that watch the same pull request, such as the roles of one orchestration, each count the same rounds, so do not add them up across runs: to count a pull request's rounds, count its `agent.ci` spans that have a `deck.ci.result`, grouped by `deck.pr.number`. |
 | `deck.ci.failures.count` | How many of those ended failing, counted the same way. |
 | `deck.handoffs.uncorrelated.count` | On an orchestrator's run: how many reports it received from `work-done` without a task id, which therefore belong to no [`agent.handoff`](#agenthandoff). Also on any other run that received such a report. |
@@ -140,11 +141,12 @@ Events on the `agent.run` span:
 | --- | --- | --- |
 | `deck.status_change` | `deck.status.from`, `deck.status.to` | The agent's status changed. The first status of a run has only `deck.status.to`. |
 | `deck.intervention` | `deck.intervention.kind`: `interrupt`, `answer`, `paste`, `text` or `navigate` | You stepped in: you typed into the agent's pane from either client, or answered its question by voice in the desktop app. Keystrokes less than about five seconds apart count as one intervention, and its kind is the strongest of what you did in it, in this order: `interrupt` is Ctrl+C or Escape; `answer` is input while the agent's card shows **Needs Input**, or an answer you gave by voice in the desktop app, including one the deck passes to the agent without typing anything into the pane; `paste` is a paste; `text` is typing, Enter or Backspace; `navigate` is only moving around, such as arrow keys, mouse clicks or scrolling in the pane, and other Alt or Ctrl shortcuts. So pressing Escape at a permission prompt is an `interrupt`, and typing a correction after scrolling is `text`. Only the kind is sent, never what you typed or pasted. Input the deck sends on its own, such as a delegated task, a message or a scheduled prompt, is not counted, and neither are the replies your terminal sends without you, such as answers to the agent's questions about the cursor position or colours. |
+| `deck.skill` | `deck.skill.name`, when the skill is defined in a skill directory | The agent loaded a skill with its skill tool: Claude Code's `Skill` or OpenCode's `skill`. `deck.skill.name` is the skill's name, such as `pr-create`, sent only when a skill directory on your machine defines a skill of that name: `<name>/SKILL.md` in a project's `.claude/skills`, `.agents/skills`, `.opencode/skills` or `.opencode/skill`, in the agent's working directory or a directory above it up to the top of its repository, or in your own `~/.claude/skills` (`$CLAUDE_CONFIG_DIR/skills` when you set it), `~/.agents/skills` or `~/.config/opencode/skills`. It is sent only when it is a plain name of lowercase letters, digits, `-`, `_` and `.`, at most 64 characters. Otherwise the event has no name: a built-in or plugin skill, a skill nested deeper in its directory, or a name the agent asked for that nothing defines. Claude Code's own telemetry names every project skill `custom_skill`, so this is where the name is. The skill's arguments are never sent. Codex and Pi load a skill by reading its `SKILL.md` with their ordinary tools, and Devin reports no skill tool, so their runs have no `deck.skill` events. |
 | `deck.ci.change` | `deck.ci.from`, `deck.ci.to`, `deck.pr.number` | The overall result of the pull request's checks changed: `pending`, `passing` or `failing`. The first one for a pull request has only `deck.ci.to`. When several runs watch the same pull request, it is sent once, on the run that has watched it longest. |
 
 Every event on the run also carries `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, with the same values as the run. For a run that learned its agent from its hooks, an event from before that says `none`.
 
-A run with many changes keeps its first 1024 events; the two counts keep counting after that.
+A run with many changes keeps its first 1024 events; `deck.status_changes.count`, `deck.interventions.count` and `deck.skills.count` keep counting after that.
 
 What the kind cannot tell apart:
 
@@ -232,7 +234,7 @@ The OpenCode and Pi figures arrive through the plugin and extension the deck ins
 
 ### `agent.status`
 
-One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id`, `deck.pane.id`, `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, so you can query status time without the parent. They have the run's values; a span that ended before a run learned its agent from its hooks says `none`. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting`, `idle`, `error`, `blocked` and `unknown`.
+One span per stretch of time in one status, ending at the next change or with the run. Attributes: `deck.status`, plus `deck.run.id`, `deck.pane.id`, `deck.agent`, and `deck.role` and `deck.orchestration.id` for an orchestration role, so you can query status time without the parent. They have the run's values; a span that ended before a run learned its agent from its hooks says `none`. The statuses are the ones the dashboard shows ([Session Management](session-management.md)): `thinking`, `working`, `compacting`, `waiting` (**Needs Input**), `awaiting_command` (**Waiting**: the turn ended while a command the agent started in it still runs), `idle`, `error`, `blocked` and `unknown`.
 
 ### `agent.operation`
 
@@ -400,11 +402,11 @@ The `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`, `OTEL_EXPORTER_OTLP_LOGS_PROTOCOL`, `OTE
 
 ## What is never sent
 
-The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, your repository's name (the last part of its `origin` remote) and **the name of the branch an agent starts on** (`vcs.ref.head.name`). Do not put a secret or private content in any of them. Branch names in particular can carry private text: a branch named after a customer, an unreleased product or a security fix sends that name to your backend. To keep them out of it, delete `vcs.ref.head.name` in a Collector ([Trim what is sent](#trim-what-is-sent)). Apart from those, the deck never sends:
+The deck builds what it sends from the attributes on this page. Some values are yours, and the deck sends them as you wrote them: `OTEL_SERVICE_NAME` and `OTEL_RESOURCE_ATTRIBUTES`, the orchestration and role names from your configuration, the name you give `dot-agent-deck dispatch`, your repository's name (the last part of its `origin` remote) **the name of the branch an agent starts on** (`vcs.ref.head.name`), and the names of the skills defined in your skill directories (`deck.skill.name`). Do not put a secret or private content in any of them. Branch names in particular can carry private text: a branch named after a customer, an unreleased product or a security fix sends that name to your backend. To keep them out of it, delete `vcs.ref.head.name` in a Collector ([Trim what is sent](#trim-what-is-sent)). Apart from those, the deck never sends:
 
 - prompts, or anything you type into an agent (an intervention is counted, not recorded);
 - file contents, agent output, or the screen of a pane;
-- tool-call arguments, or anything else from an agent's tool calls;
+- tool-call arguments, or anything else from an agent's tool calls, apart from the name of a skill a skill directory defines (see [`deck.skill`](#agentrun));
 - the text of a delegated task, a worker's report or any other message, or a message's subject;
 - secrets: API keys, the values of environment variables, and the values of your OTLP headers (those go to the endpoint you configured as headers, and to nothing else, and the deck does not write them to its log);
 - pane titles, status details, working-directory paths, remote URLs, or command lines;
@@ -676,6 +678,13 @@ processors:
         action: delete
       - key: deck.operation.wrapped.word
         action: delete
+  # A skill's name is on an event, which the attributes processor does not reach.
+  transform/trim:
+    error_mode: ignore
+    trace_statements:
+      - context: spanevent
+        statements:
+          - delete_key(attributes, "deck.skill.name")
   # Drop whole spans: here, the per-status and per-command spans.
   filter/trim:
     error_mode: ignore
@@ -694,7 +703,7 @@ service:
   pipelines:
     traces:
       receivers: [otlp]
-      processors: [attributes/trim, filter/trim]
+      processors: [attributes/trim, transform/trim, filter/trim]
       exporters: [otlphttp/honeycomb]
 ```
 

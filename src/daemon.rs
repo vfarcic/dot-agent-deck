@@ -3903,8 +3903,9 @@ impl ShellActivityKey {
 #[derive(Debug, Clone)]
 struct ShellActivityReading {
     busy: bool,
-    /// The qualifying POSIX sessions of the last valid sample (issue #1678 D4).
-    sessions: std::collections::HashSet<i32>,
+    /// The qualifying POSIX sessions of the last valid sample (issue #1678 D4),
+    /// raw, with the wrapper pairs the displayed count merges (issue #1757).
+    sessions: crate::platform::proc::CommandSessions,
     /// Whether the spawn's turn had ended when it was last read, so the
     /// monitor emits once when a turn ends with a command still running.
     turn_ended: bool,
@@ -3916,7 +3917,7 @@ fn classify_owned(
     table: &[crate::platform::proc::ProcessInfo],
 ) -> Vec<(
     crate::agent_pty::ShellActivityCandidate,
-    std::collections::HashSet<i32>,
+    crate::platform::proc::CommandSessions,
 )> {
     AgentPtyRegistry::classify_command_sessions(candidates, table)
         .into_iter()
@@ -3969,7 +3970,7 @@ fn classify_owned(
 // measurement — including the 19-20s field sample this is a response to, and
 // what could NOT be reproduced — is in
 // `prds/386-descendant-scan-shell-activity-signal.md` (M5).
-const POLL_INTERVAL: Duration = Duration::from_millis(500);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
 // Issue #429: an upper bound on how long a tick WAITS for a sample —
 // deliberately not a bound on how long the sample's child may live (see
@@ -4510,9 +4511,12 @@ async fn run_shell_activity_monitor_with<S, F>(
                 // emit on every tick until the session materializes.
                 let regressed = busy
                     && card.is_some_and(|card| {
+                        // Issue #1757: Waiting reads like Idle here — its
+                        // prompt is free.
                         matches!(
                             card.status,
                             crate::state::SessionStatus::Idle
+                                | crate::state::SessionStatus::Waiting
                                 | crate::state::SessionStatus::Unknown
                         )
                     });
@@ -4540,7 +4544,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                 if sessions_changed {
                     let mut guard = state.write().await;
                     if pty_registry.shell_activity_candidate_current(&candidate) {
-                        guard.observe_command_sessions(
+                        guard.observe_paired_command_sessions(
                             &candidate.pane_id,
                             &candidate.agent_id,
                             &sessions,
@@ -4613,7 +4617,7 @@ async fn run_shell_activity_monitor_with<S, F>(
                     if !pty_registry.shell_activity_candidate_current(&candidate) {
                         return true;
                     }
-                    state.observe_command_sessions(
+                    state.observe_paired_command_sessions(
                         &candidate.pane_id,
                         &candidate.agent_id,
                         &sessions,

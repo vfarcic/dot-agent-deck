@@ -12,6 +12,7 @@ import {
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
+import { agentTurn } from "../lib/promptKeys";
 import { READING_ALREADY_OFF, READING_ALREADY_ON } from "../lib/reading";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { questionOptionsToSay } from "../lib/voiceQuestion";
@@ -812,6 +813,27 @@ describe("voice control panel", () => {
         expect(queue.delivered(), "cancelled interrupt must restore the prior latch so a fresh request can run").toEqual([[107], [27]]);
         expect(write.mock.calls).toEqual([[target, "k"], guardedWrite(target, "\x1b"), guardedWrite(target, "\x1b")]);
         expect(report()).toHaveTextContent("Interrupted Planner.");
+      } finally {
+        await queue.dispose();
+      }
+    });
+
+    /// Scenario: keyboard input holds the real bridge queue while interrupt is armed, then the agent's daemon status goes working → waiting → working before dispatch (issue #1757). Waiting ends the turn, so the obsolete Escape is cancelled as it is across idle, never delivered into the next turn.
+    it("cancels real bridge queued interrupt across a Waiting stop between turns", async () => {
+      const { say, write, target, keyboard, updatePlanner } = await startPrompt();
+      const queue = await realInputQueue(target, write);
+      try {
+        await keyboard("k");
+        await say("interrupt");
+        expect(write.mock.calls).toEqual([[target, "k"], guardedWrite(target, "\x1b")]);
+        // The turn each daemon status word gives the pane, as the bridge projects it.
+        updatePlanner({ status: "waiting", turn: agentTurn("waiting") });
+        await flush();
+        updatePlanner({ status: "running", turn: agentTurn("working") });
+        await flush();
+        await queue.release();
+        expect(queue.delivered(), "an Escape armed before the Waiting stop must never reach the next turn").toEqual([[107]]);
+        expect(report()).toHaveTextContent(/started.*(new|something)|new.*(turn|work).*before/i);
       } finally {
         await queue.dispose();
       }

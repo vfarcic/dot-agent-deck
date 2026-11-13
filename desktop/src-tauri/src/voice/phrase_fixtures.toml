@@ -2658,6 +2658,55 @@ action = "filter_dashboard"
 outcome = "dispatch"
 resolved_status = "waiting_for_input"
 
+# Issue #1757: "waiting" is the word the Waiting card shows (its turn ended
+# while a command it started still runs), so it selects Waiting; "need input"
+# keeps selecting Needs input. Not phrased "which agents are waiting?": that
+# shape is `open-overview-running`'s ("which agents are running?").
+[[fixtures]]
+name = "dashboard-filter-waiting"
+utterance = "show only the agents that are waiting"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "waiting"
+
+[[fixtures]]
+name = "dashboard-filter-need-input"
+utterance = "show only agents that need input"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "waiting_for_input"
+
+# Issue #1757 (Qodo on PR #2250): other ways of saying Needs input. Their
+# "waiting" is not the Waiting status: what follows it is something the user
+# gives, or the user.
+[[fixtures]]
+name = "dashboard-filter-waiting-on-input"
+utterance = "show only agents waiting on input"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "waiting_for_input"
+
+[[fixtures]]
+name = "dashboard-filter-waiting-for-permission"
+utterance = "show only the agents waiting for permission"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "waiting_for_input"
+
+# Issue #1757: "busy" is the set of statuses whose work is not done (Working,
+# Thinking and Waiting), offered as its own status, not narrowed to Working.
+[[fixtures]]
+name = "dashboard-filter-busy"
+utterance = "show only the busy agents"
+screen = "overview"
+action = "filter_dashboard"
+outcome = "dispatch"
+resolved_status = "busy"
+
 [[fixtures]]
 name = "dashboard-clear-show-everything"
 utterance = "show everything"

@@ -139,6 +139,9 @@ impl BellConfig {
             // Issue #714: a quota-blocked agent needs a person just like an
             // erroring one, so it rings under the same switch.
             SessionStatus::Error | SessionStatus::Blocked => self.on_error,
+            // Issue #1757: Waiting's work is not done, so it never rings, even
+            // under `on_idle`; the bell rings on its later step to Idle.
+            SessionStatus::Waiting => false,
             _ => false,
         }
     }
@@ -3833,6 +3836,36 @@ timeout_secs = 600
             !CONFIG_KEYS.iter().any(|(k, _)| k.starts_with("idle_art.")),
             "no idle_art.* key should remain in the `config set --help` listing"
         );
+    }
+
+    /// Issue #2085: `config get` answers each of these keys with its field's
+    /// value, moved off the default first; a key without its arm is refused.
+    #[test]
+    fn get_field_reads_each_bell_doorbell_and_command_key() {
+        let mut dc = DashboardConfig {
+            default_command: "my-agent --flag".into(),
+            ..Default::default()
+        };
+        dc.bell.enabled = !dc.bell.enabled;
+        dc.bell.on_waiting_for_input = !dc.bell.on_waiting_for_input;
+        dc.bell.on_idle = !dc.bell.on_idle;
+        dc.bell.on_error = !dc.bell.on_error;
+        dc.doorbell.claude = !dc.doorbell.claude;
+        dc.doorbell.codex = !dc.doorbell.codex;
+        for (key, expected) in [
+            ("default_command", dc.default_command.clone()),
+            ("bell.enabled", dc.bell.enabled.to_string()),
+            (
+                "bell.on_waiting_for_input",
+                dc.bell.on_waiting_for_input.to_string(),
+            ),
+            ("bell.on_idle", dc.bell.on_idle.to_string()),
+            ("bell.on_error", dc.bell.on_error.to_string()),
+            ("doorbell.claude", dc.doorbell.claude.to_string()),
+            ("doorbell.codex", dc.doorbell.codex.to_string()),
+        ] {
+            assert_eq!(dc.get_field(key), Ok(expected), "{key}");
+        }
     }
 
     /// PRD #1223: `config set default_dir` takes an absolute path, refuses a

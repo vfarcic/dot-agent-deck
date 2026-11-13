@@ -15,7 +15,8 @@ describe("PRD #1541 — the voice surface's view of the open agent", () => {
 
   it("reads a turn only from statuses that say so", () => {
     for (const status of ["thinking", "working", "compacting"]) expect(agentTurn(status)).toBe("working");
-    for (const status of ["idle", "waiting_for_input"]) expect(agentTurn(status)).toBe("idle");
+    // Issue #1757: Waiting is a turn that ended — the prompt is free — not "no turn".
+    for (const status of ["idle", "waiting_for_input", "waiting"]) expect(agentTurn(status)).toBe("idle");
     // `running` is a hookless agent; the rest say nothing about a turn.
     for (const status of ["running", "error", "blocked", "unknown", "something_new"]) expect(agentTurn(status)).toBeUndefined();
   });

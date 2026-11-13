@@ -56,8 +56,6 @@
 //! short Haiku turn, and `002` spends none. Local-only (Decision 8 / CLAUDE.md rule 5):
 //! gated on the `e2e` feature so CI's `cargo test-fast` never compiles it.
 //! Flaky-tolerant (real agent) per CLAUDE.md rule 4 — run once, not looped.
-//!
-//! Bug fix, not a showcase: NO ` [reel]` marker on the catalog entries (PRD #180).
 
 dot_agent_deck_test_harness::link!();
 

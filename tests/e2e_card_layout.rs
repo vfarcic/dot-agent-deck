@@ -1,6 +1,6 @@
 #![cfg(all(feature = "e2e", feature = "e2e-live", unix))]
 
-//! Reel-eligible PTY coverage for the dashboard card width contract. The test
+//! Real-agent PTY coverage for the dashboard card width contract. The test
 //! drives a genuine interactive Claude Code turn through one client while a
 //! second, fixed-size client records the same live card before and after it
 //! attaches the agent's pane.
@@ -227,7 +227,7 @@ fn card_stats_005_real_agent_card_narrows_without_restructuring() {
         .launch_with_fixture("minimal");
     control.wait_for_string("No active agents");
 
-    std::fs::write(control.workdir().join(SENTINEL), "reel fixture\n")
+    std::fs::write(control.workdir().join(SENTINEL), "card-layout fixture\n")
         .expect("write card-layout sentinel");
     let cwd = control.workdir().to_path_buf();
     let mut trust_paths = vec![cwd.to_string_lossy().into_owned()];

@@ -131,11 +131,11 @@ current_worktree=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
 # quietly unsupported: the assignment degrades to an ordinary INDEXED one, the
 # subscript is evaluated arithmetically, and `set -u` kills the script on that
 # line with a message naming a variable that appears nowhere in it. The same
-# defect was fixed in `scripts/assemble-changelog.sh`, `verify-pr/scan.sh` and
-# `demo-reel-adapter/build.sh` (issues #521, #582); this file was the one
-# instance knowingly left behind, because it was a `dot-ai-` synced mirror and a
-# fix would have been reverted by the next sync. Issue #1089 forked it, so the
-# reason expired and the fix lands here.
+# defect was fixed in `scripts/assemble-changelog.sh` and `verify-pr/scan.sh`
+# (issues #521, #582); this file was the one instance knowingly left behind,
+# because it was a `dot-ai-` synced mirror and a fix would have been reverted
+# by the next sync. Issue #1089 forked it, so the reason expired and the fix
+# lands here.
 #
 # A newline is the one delimiter that is safe: git refuses a ref name containing
 # one, so no branch name can forge a record boundary.

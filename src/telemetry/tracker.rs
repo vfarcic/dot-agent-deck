@@ -72,12 +72,13 @@ use super::handoff::{Change, Handoffs, Posted, RunRef};
 use super::input::InterventionKind;
 use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
+use super::skill::{SKILL_NAME_METADATA_KEY, defined_skill, is_skill_tool, user_skill_roots};
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
 };
 use super::{
-    AttrKey, EVENT_CI_CHANGE, EVENT_INTERVENTION, EVENT_MODEL_USAGE, EVENT_STATUS_CHANGE,
-    SPAN_AGENT_CI, SPAN_AGENT_OPERATION, SPAN_AGENT_RUN, SPAN_AGENT_STATUS,
+    AttrKey, EVENT_CI_CHANGE, EVENT_INTERVENTION, EVENT_MODEL_USAGE, EVENT_SKILL,
+    EVENT_STATUS_CHANGE, SPAN_AGENT_CI, SPAN_AGENT_OPERATION, SPAN_AGENT_RUN, SPAN_AGENT_STATUS,
 };
 
 /// Human input closer together than this is one intervention: a burst of
@@ -391,6 +392,8 @@ struct ActiveRun {
     idle_wait: bool,
     operations: Vec<OpenOperation>,
     operations_count: u64,
+    /// Skill-tool calls the run's agent made (issue #2087).
+    skills_count: u64,
     /// The call ids this run's shell starts and ends named, at most
     /// [`MAX_SEEN_CALL_IDS`], oldest first.
     seen_call_ids: VecDeque<String>,
@@ -681,6 +684,20 @@ impl ActiveRun {
                 *attribute = Attribute::str(AttrKey::InterventionKind, kind.as_str());
             }
         }
+    }
+
+    /// The agent called its skill tool (issue #2087): count it, and keep a
+    /// `deck.skill` event naming the skill `name` when there is one, which
+    /// the caller has already found defined on disk ([`defined_skill`]).
+    fn skill_called(&mut self, name: Option<&str>, now: u64) {
+        self.skills_count += 1;
+        self.push_event(SpanEventRecord {
+            name: EVENT_SKILL,
+            time_unix_nanos: now,
+            attributes: Attribute::opt_str(AttrKey::SkillName, name)
+                .into_iter()
+                .collect(),
+        });
     }
 
     /// Remember whether the deck answers `question` by typing keys into the
@@ -1071,6 +1088,7 @@ impl RunTracker {
                 idle_wait: false,
                 operations: Vec::new(),
                 operations_count: 0,
+                skills_count: 0,
                 seen_call_ids: VecDeque::new(),
                 typed_questions: VecDeque::new(),
                 ci_pr: None,
@@ -1302,6 +1320,25 @@ impl RunTracker {
         };
         if is_shell_tool(event.tool_name.as_deref()) {
             observe_operation(run, &kept, now, &mut self.finished);
+        }
+        if event.event_type == EventType::ToolStart
+            && is_skill_tool(&event.agent_type, event.tool_name.as_deref())
+        {
+            // The hook found the name defined, but an event can reach the
+            // socket from something other than the hook, so the daemon looks
+            // for the skill directory again, from the event's own working
+            // directory, before the name can reach a backend.
+            let name = event
+                .metadata
+                .get(SKILL_NAME_METADATA_KEY)
+                .and_then(|name| {
+                    defined_skill(
+                        name,
+                        event.cwd.as_deref().map(std::path::Path::new),
+                        &user_skill_roots(),
+                    )
+                });
+            run.skill_called(name.as_deref(), now);
         }
         let status = run
             .cards
@@ -2214,6 +2251,9 @@ pub fn status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
         SessionStatus::Blocked => "blocked",
+        // Issue #1757: not `waiting`, which has meant Needs input since the
+        // attribute was published (docs/telemetry.md).
+        SessionStatus::Waiting => "awaiting_command",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -2469,6 +2509,10 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
     attributes.push(Attribute::int(
         AttrKey::OperationsCount,
         saturating_i64(run.operations_count),
+    ));
+    attributes.push(Attribute::int(
+        AttrKey::SkillsCount,
+        saturating_i64(run.skills_count),
     ));
     attributes.push(Attribute::int(
         AttrKey::CiRoundsCount,
@@ -4059,6 +4103,85 @@ pub(crate) mod tests {
     /// One `agent.operation` per shell command, from its start to its end,
     /// paired by call id when several overlap and by age otherwise; other
     /// tools make none, and the run counts them.
+    /// Issue #2087: every skill-tool call of the run's agent is a
+    /// `deck.skill` event and counts; only a name with a skill name's shape
+    /// is kept, and another tool or a call's end adds nothing.
+    #[test]
+    fn skill_calls_become_events_on_the_run() {
+        let project = tempfile::tempdir().unwrap();
+        let defined = project
+            .path()
+            .join(".claude/skills")
+            .join("dad-tracker-skill-2087");
+        std::fs::create_dir_all(&defined).unwrap();
+        std::fs::write(defined.join("SKILL.md"), "x").unwrap();
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        let call = |tool: &str, kind: EventType, name: Option<&str>| {
+            let mut e = event("p1", kind);
+            e.tool_name = Some(tool.into());
+            e.cwd = Some(project.path().to_string_lossy().into_owned());
+            if let Some(name) = name {
+                e.metadata.insert(
+                    super::super::skill::SKILL_NAME_METADATA_KEY.into(),
+                    name.into(),
+                );
+            }
+            e
+        };
+        tracker.observe_event(
+            &call(
+                "Skill",
+                EventType::ToolStart,
+                Some("dad-tracker-skill-2087"),
+            ),
+            10,
+        );
+        tracker.observe_event(
+            &call("Skill", EventType::ToolEnd, Some("dad-tracker-skill-2087")),
+            11,
+        );
+        tracker.observe_event(&call("Skill", EventType::ToolStart, None), 12);
+        tracker.observe_event(&call("Skill", EventType::ToolStart, Some("Not A Name")), 13);
+        // A raw event naming a well-shaped skill no directory defines.
+        tracker.observe_event(
+            &call("Skill", EventType::ToolStart, Some("dad-invented-2087")),
+            15,
+        );
+        tracker.observe_event(
+            &call("Read", EventType::ToolStart, Some("dad-tracker-skill-2087")),
+            14,
+        );
+        tracker.end_run("p1", EndReason::Exited, None, 20);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let skills: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_SKILL)
+            .map(|e| {
+                (
+                    e.time_unix_nanos,
+                    e.attributes
+                        .iter()
+                        .find(|a| a.key == AttrKey::SkillName)
+                        .map(|a| a.value.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            skills,
+            vec![
+                (10, Some(AttrValue::Str("dad-tracker-skill-2087".into()))),
+                (12, None),
+                (13, None),
+                (15, None),
+            ]
+        );
+        assert_eq!(attr(run, AttrKey::SkillsCount), Some(&AttrValue::Int(4)));
+        assert!(spans.iter().all(|s| s.name != SPAN_AGENT_OPERATION));
+    }
+
     #[test]
     fn shell_commands_become_operations() {
         let mut tracker = RunTracker::new();

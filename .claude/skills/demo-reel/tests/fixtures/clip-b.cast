@@ -1,7 +1,0 @@
-{"version": 2, "width": 80, "height": 24, "env": {"TERM": "xterm-256color"}}
-[0.0, "o", "$ echo second clip\r\n"]
-[0.4, "o", "second clip output\r\n"]
-[0.8, "o", "$ "]
-[1.2, "o", "\u001b[0m\u001b[?25h\u001b[3;3H"]
-[1.6, "o", "\u001b[0m\u001b[?25h\u001b[3;3H"]
-[2.0, "o", "\u001b[0m\u001b[?25h\u001b[3;3H"]

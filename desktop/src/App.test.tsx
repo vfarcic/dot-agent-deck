@@ -357,6 +357,18 @@ describe("ControlDeck", () => {
     expect(screen.getByRole("complementary", { name: "Transition events" })).toHaveTextContent("EVENTS");
   });
 
+  /** Scenario (issue #1757): the deck's "active" count includes a Waiting agent, whose work is still under way, alongside a Running one, and leaves out an idle one. */
+  it("counts a Waiting agent as active in the deck toolbar", () => {
+    const base = createFixtureSnapshot("connected");
+    const statuses = ["running", "waiting", "idle", "needs_input"] as const;
+    const snapshot = { ...base, agents: base.agents.map((agent, index) => ({ ...agent, status: statuses[index % statuses.length] })) };
+    render(<ControlDeck runtime={runtime({ snapshot })} />);
+    const tools = within(screen.getByRole("region", { name: "Agent terminals" })).getByText(/agents$/).parentElement!;
+    const expected = snapshot.agents.filter((agent) => agent.status === "running" || agent.status === "waiting").length;
+    expect(snapshot.agents.some((agent) => agent.status === "waiting")).toBe(true);
+    expect(tools).toHaveTextContent(`${expected} active`);
+  });
+
   /**
    * Scenario: open the orchestration editor with only the old preview key saved.
    * Its rows keep the saved role order and the app writes that order under the new key.
