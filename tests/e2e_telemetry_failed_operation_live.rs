@@ -137,6 +137,11 @@ fn type_into_pane(deck: &TuiDeck, agent_id: &str, bytes: &[u8]) {
         });
 }
 
+/// How long typed text must sit in Claude's input box before Enter: an Enter
+/// that arrives in the same burst as the text is taken as part of a paste and
+/// inserts a newline (the interval `tests/e2e_prompt_keys_live.rs` uses).
+const BEFORE_SUBMIT: Duration = Duration::from_millis(750);
+
 fn unix_nanos_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -209,19 +214,18 @@ fn telemetry_otlp_050_real_claude_interrupted_command_ends_at_the_escape() {
     // Typed, as the person who interrupted would: the deck holds its own
     // messages for a card still Working, and an interrupted turn leaves the
     // card Working, since Claude Code fires no `Stop` for it.
-    // Enter goes in once the pane shows the text, so Claude reads it as a
-    // key after the typing rather than as part of one paste.
+    // Enter goes in once the text has sat in Claude's input box for
+    // `BEFORE_SUBMIT`, so Claude reads it as a key after the typing rather
+    // than as a newline inside one paste.
     type_into_pane(
         &deck,
         &agent.id,
         b"Do not run any command. Reply INTERRUPT_2093_DONE and end your turn.",
     );
-    assert!(
-        common::wait_until(Duration::from_secs(30), || deck
-            .snapshot_grid()
-            .contains("Reply INTERRUPT_2093_DONE")),
-        "the typed follow-up never reached Claude's prompt:\n{}",
-        deck.snapshot_grid()
+    deck.wait_until_grid_then_hold(
+        "the typed follow-up settled in Claude's input box",
+        BEFORE_SUBMIT,
+        |grid| grid.contains("Reply INTERRUPT_2093_DONE"),
     );
     type_into_pane(&deck, &agent.id, b"\r");
     // The probe script's own operation, however Haiku spelled the command
