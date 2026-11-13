@@ -237,7 +237,9 @@ test.describe("a confirmation on the dashboard (issue #1709)", () => {
     await expect(page.getByText("Closed.")).toBeVisible();
     await expect(confirm).toHaveCount(0);
     await expect(openPlanner).toBeVisible();
-    expect(await inert(openPlanner)).toBe(false);
+    // The fence comes off in the render after the dialog leaves, which WebKit
+    // can draw a frame later than the dialog's removal, so wait for it.
+    await expect.poll(() => inert(openPlanner)).toBe(false);
   });
 });
 
@@ -272,7 +274,7 @@ test.describe("an agent's output Reader (issue #1709)", () => {
     await pressVoice(page);
     await expect(trigger).toHaveAttribute("aria-pressed", "false");
     await expect(reader).toHaveCount(0);
-    expect(await inert(openPlanner)).toBe(false);
+    await expect.poll(() => inert(openPlanner)).toBe(false);
   });
 });
 
