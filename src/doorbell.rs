@@ -1221,31 +1221,39 @@ async fn run_tick(
 
 #[cfg(test)]
 mod tests {
-    /// Issue #2280: the daemon's socket binding sets the process umask to
-    /// `0o177` for a moment, so a control directory another thread creates in
-    /// that window has no search bit, and opening `observations` in it failed
-    /// with PermissionDenied and took the daemon down. The directory is built
-    /// here in exactly that state rather than by racing the umask.
-    #[cfg(all(feature = "e2e", unix))]
-    #[test]
-    fn a_control_dir_created_under_the_socket_umask_is_usable() {
-        use std::os::unix::fs::PermissionsExt;
-        let home = tempfile::tempdir().unwrap();
-        let masked = home.path().join("ring-barriers");
-        std::fs::create_dir(&masked).unwrap();
-        std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let root = super::control_dir_under(home.path(), std::path::Path::new("ring-barriers"));
-        let opened = root.as_ref().map(|root| {
-            std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(root.join("observations"))
-        });
-        let _ = std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o700));
-        assert!(
-            matches!(opened, Some(Ok(_))),
-            "a control dir left at 0o600 must still take observations: {opened:?}"
-        );
+    // Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+    // build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
+    #[cfg(feature = "e2e")]
+    mod e2e_only {
+        /// Issue #2280: the daemon's socket binding sets the process umask to
+        /// `0o177` for a moment, so a control directory another thread creates in
+        /// that window has no search bit, and opening `observations` in it failed
+        /// with PermissionDenied and took the daemon down. The directory is built
+        /// here in exactly that state rather than by racing the umask.
+        #[cfg(unix)]
+        #[test]
+        fn a_control_dir_created_under_the_socket_umask_is_usable() {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let masked = home.path().join("ring-barriers");
+            std::fs::create_dir(&masked).unwrap();
+            std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let root = crate::doorbell::control_dir_under(
+                home.path(),
+                std::path::Path::new("ring-barriers"),
+            );
+            let opened = root.as_ref().map(|root| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(root.join("observations"))
+            });
+            let _ = std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o700));
+            assert!(
+                matches!(opened, Some(Ok(_))),
+                "a control dir left at 0o600 must still take observations: {opened:?}"
+            );
+        }
     }
 
     use super::*;
