@@ -22,7 +22,10 @@
 //! each kept only when it has the shape of a command word, and never the first
 //! word of a program that prints or searches text, and the same two of each
 //! later command of a chained line and of the command a known wrapper runs
-//! ([`operation::describe`]). No other value on a span is
+//! ([`operation::describe`]). When that filter names no program, which of
+//! the deck's fixed decline names ([`operation::Decline`]) the span carries
+//! depends on the command's shape, but no character of the command is in it.
+//! No other value on a span is
 //! read from an event: the rest come from the
 //! spawn (its ids, role and orchestration), the deck's own counts and enum
 //! names, the configuration and host, and the git probes (a commit hash and the
@@ -72,6 +75,7 @@ pub mod propagation;
 pub mod resource;
 pub mod run_context;
 pub mod shim;
+pub mod skill;
 pub mod span;
 pub mod tracker;
 
@@ -456,6 +460,8 @@ pub const SPAN_NAMES: [&str; 7] = [
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
 pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
+/// Issue #2087: the agent loaded a skill ([`skill`]).
+pub const EVENT_SKILL: &str = "deck.skill";
 pub use accounting::EVENT_MODEL_USAGE;
 
 /// The span events the deck emits on `agent.handoff`: the worker took the
@@ -506,9 +512,17 @@ pub enum AttrKey {
     OperationCommands,
     OperationWrappedProgram,
     OperationWrappedWord,
+    /// Issue #2088: why the first command names no program, and the syntax
+    /// that stopped it.
+    OperationDeclined,
+    OperationDeclinedSyntax,
     /// Issue #1981: why the deck ended an `agent.operation` itself.
     OperationEnd,
     OperationsCount,
+    /// Issue #2087: a defined skill's name, on a `deck.skill` event.
+    SkillName,
+    /// Issue #2087: how many skills the run loaded.
+    SkillsCount,
     CiFrom,
     CiTo,
     CiResult,
@@ -590,8 +604,12 @@ impl AttrKey {
         AttrKey::OperationCommands,
         AttrKey::OperationWrappedProgram,
         AttrKey::OperationWrappedWord,
+        AttrKey::OperationDeclined,
+        AttrKey::OperationDeclinedSyntax,
         AttrKey::OperationEnd,
         AttrKey::OperationsCount,
+        AttrKey::SkillName,
+        AttrKey::SkillsCount,
         AttrKey::CiFrom,
         AttrKey::CiTo,
         AttrKey::CiResult,
@@ -660,8 +678,12 @@ impl AttrKey {
             AttrKey::OperationCommands => "deck.operation.commands",
             AttrKey::OperationWrappedProgram => "deck.operation.wrapped.program",
             AttrKey::OperationWrappedWord => "deck.operation.wrapped.word",
+            AttrKey::OperationDeclined => "deck.operation.declined",
+            AttrKey::OperationDeclinedSyntax => "deck.operation.declined.syntax",
             AttrKey::OperationEnd => "deck.operation.end",
             AttrKey::OperationsCount => "deck.operations.count",
+            AttrKey::SkillName => "deck.skill.name",
+            AttrKey::SkillsCount => "deck.skills.count",
             AttrKey::CiFrom => "deck.ci.from",
             AttrKey::CiTo => "deck.ci.to",
             AttrKey::CiResult => "deck.ci.result",
