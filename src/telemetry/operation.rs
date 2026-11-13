@@ -44,6 +44,12 @@
 //! [`PLAIN_REDIRECTIONS`] or a quoted string `unquote` reads (`is_plain_word`).
 //! Those words are read and not kept: only each command's program and word
 //! are, as [`classify`] keeps them.
+//!
+//! **A command that names no program says why** ([`Description::declined`],
+//! issue #2088): where the reading stopped and, when a word stopped it, the
+//! kind of syntax of that word's first character a simple word cannot hold.
+//! Both are names from fixed lists ([`DeclineReason`], [`Syntax`]), so they
+//! hold nothing of the command's text.
 
 /// What [`classify`] keeps of a command.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -68,6 +74,9 @@ pub struct Description {
     /// The command the first command runs when that one is a wrapper on
     /// [`WRAPPERS`], read as a command of its own.
     pub wrapped: Operation,
+    /// Why the first command names no program: set exactly when
+    /// `operation.program` is absent (issue #2088).
+    pub declined: Option<Decline>,
 }
 
 impl Description {
@@ -81,7 +90,19 @@ impl Description {
                 .collect(),
             operation,
             wrapped: Operation::default(),
+            declined: None,
         }
+    }
+
+    fn declining(decline: Decline) -> Self {
+        Description {
+            declined: Some(decline),
+            ..Description::default()
+        }
+    }
+
+    fn named(named: Result<Operation, Decline>) -> Self {
+        named.map_or_else(Description::declining, Description::of)
     }
 
     /// The commands as one value: each its program, or its program and word
@@ -101,6 +122,281 @@ impl Description {
             })
             .collect();
         (!commands.is_empty()).then(|| commands.join(","))
+    }
+}
+
+/// Why a command names no program (issue #2088): where the classifier
+/// stopped and, when a word's shell syntax stopped it, which kind of syntax.
+/// Both are fixed strings the deck chooses from these lists, never anything
+/// read out of the command, so the categories can be counted without any of
+/// the command's text being sent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Decline {
+    pub reason: DeclineReason,
+    /// The syntax of the word that stopped the classifier, for the reasons
+    /// that stop at a word ([`DeclineReason::reads_a_word`]).
+    pub syntax: Option<Syntax>,
+}
+
+impl Decline {
+    fn of(reason: DeclineReason) -> Self {
+        Decline {
+            reason,
+            syntax: None,
+        }
+    }
+
+    /// `reason`, stopped by `word`, a word that is not simple.
+    fn at(reason: DeclineReason, word: &str) -> Self {
+        Decline {
+            reason,
+            syntax: Some(syntax_of(word)),
+        }
+    }
+
+    /// [`Decline::at`] for a word where a setting can stand
+    /// ([`setting_syntax`]).
+    fn at_setting(reason: DeclineReason, word: &str) -> Self {
+        Decline {
+            reason,
+            syntax: Some(setting_syntax(word)),
+        }
+    }
+}
+
+/// Where the classifier stopped: the value of `deck.operation.declined`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclineReason {
+    /// No command text was reported, or its first line is blank.
+    NoCommand,
+    /// Every command of the line only sets up the next one (`cd repo`).
+    SetupOnly,
+    /// A setup command, such as `cd`, has a word that is not plain
+    /// (`cd "$DIR" && …`).
+    SetupSyntax,
+    /// A `NAME=value` in front of the program has a value that is not plain
+    /// (`X=$(date) make`).
+    AssignmentSyntax,
+    /// A prefix (`env`, `sudo`, `command`, `time`, `nice`) has an option the
+    /// classifier does not know, or one that is not plain.
+    PrefixOption,
+    /// The word naming the program is not plain (`"$HOME/bin/tool"`, `[`).
+    ProgramSyntax,
+    /// The program is shell grammar: a reserved word, a declaration builtin,
+    /// a precommand modifier, `eval` or `exec` ([`UNSUPPORTED_PROGRAMS`]).
+    ShellGrammar,
+    /// A shell (`bash`, `sh`, …) has an option the classifier does not know.
+    ShellOption,
+    /// A shell's `-c` script is neither a plain word nor one plain quoted
+    /// string (`bash -c "make $T"`).
+    ShellScriptSyntax,
+    /// The program's name is not a command word: uppercase, too long, or with
+    /// other characters (`./Build.sh`).
+    ProgramShape,
+    /// An argument up to and including the first non-option one is not plain
+    /// (`grep "x" f` and `cargo --x=y test` are; `git commit -m "…"` is not,
+    /// since reading stops at `commit`).
+    ArgumentSyntax,
+    /// Codex: an empty argument, or one starting or ending with a space, in
+    /// the joined argv.
+    CodexSpacing,
+    /// Codex: a shell run other than as `<shell> -c<flags> <script>`.
+    CodexShell,
+    /// Codex: the word naming the program is not plain.
+    CodexSyntax,
+    /// Codex: the program only sets up the next one (`cd`).
+    CodexSetup,
+    /// Codex: the program is a prefix or a shell, whose command's words
+    /// cannot be placed in a joined argv.
+    CodexPrefix,
+    /// None of the above, such as `bash -c` with no script.
+    Other,
+}
+
+impl DeclineReason {
+    /// Every reason, in the order the docs list them.
+    pub const ALL: &[DeclineReason] = &[
+        DeclineReason::NoCommand,
+        DeclineReason::SetupOnly,
+        DeclineReason::SetupSyntax,
+        DeclineReason::AssignmentSyntax,
+        DeclineReason::PrefixOption,
+        DeclineReason::ProgramSyntax,
+        DeclineReason::ShellGrammar,
+        DeclineReason::ShellOption,
+        DeclineReason::ShellScriptSyntax,
+        DeclineReason::ProgramShape,
+        DeclineReason::ArgumentSyntax,
+        DeclineReason::CodexSpacing,
+        DeclineReason::CodexShell,
+        DeclineReason::CodexSyntax,
+        DeclineReason::CodexSetup,
+        DeclineReason::CodexPrefix,
+        DeclineReason::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeclineReason::NoCommand => "no_command",
+            DeclineReason::SetupOnly => "setup_only",
+            DeclineReason::SetupSyntax => "setup_syntax",
+            DeclineReason::AssignmentSyntax => "assignment_syntax",
+            DeclineReason::PrefixOption => "prefix_option",
+            DeclineReason::ProgramSyntax => "program_syntax",
+            DeclineReason::ShellGrammar => "shell_grammar",
+            DeclineReason::ShellOption => "shell_option",
+            DeclineReason::ShellScriptSyntax => "shell_script_syntax",
+            DeclineReason::ProgramShape => "program_shape",
+            DeclineReason::ArgumentSyntax => "argument_syntax",
+            DeclineReason::CodexSpacing => "codex_spacing",
+            DeclineReason::CodexShell => "codex_shell",
+            DeclineReason::CodexSyntax => "codex_syntax",
+            DeclineReason::CodexSetup => "codex_setup",
+            DeclineReason::CodexPrefix => "codex_prefix",
+            DeclineReason::Other => "other",
+        }
+    }
+
+    /// Whether the reason stops at a word, so [`Decline::syntax`] says what
+    /// kind of syntax that word has.
+    pub fn reads_a_word(self) -> bool {
+        matches!(
+            self,
+            DeclineReason::SetupSyntax
+                | DeclineReason::AssignmentSyntax
+                | DeclineReason::ProgramSyntax
+                | DeclineReason::ShellScriptSyntax
+                | DeclineReason::ArgumentSyntax
+                | DeclineReason::CodexSyntax
+        )
+    }
+}
+
+/// The kind of shell syntax in the word that stopped the classifier: the
+/// value of `deck.operation.declined.syntax`, read from the word's first
+/// character that a plain word cannot hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Syntax {
+    /// `'` or `"`.
+    Quote,
+    /// `$NAME` or `${…}`.
+    Variable,
+    /// `$(…)` or a backtick.
+    Substitution,
+    /// `<<`, a here-document or here-string.
+    Heredoc,
+    /// `<` or `>`.
+    Redirection,
+    /// `\`.
+    Escape,
+    /// `(`, `)`, `{` or `}`.
+    Group,
+    /// `*`, `?`, `[` or `]`.
+    Glob,
+    /// `~`.
+    Tilde,
+    /// `#`.
+    Comment,
+    /// `=` outside a `NAME=value` setting (`--features=e2e`).
+    Equals,
+    /// Any other character, such as `!`, `&` or a non-ASCII one.
+    Other,
+}
+
+impl Syntax {
+    /// Every kind, in the order the docs list them.
+    pub const ALL: &[Syntax] = &[
+        Syntax::Quote,
+        Syntax::Variable,
+        Syntax::Substitution,
+        Syntax::Heredoc,
+        Syntax::Redirection,
+        Syntax::Escape,
+        Syntax::Group,
+        Syntax::Glob,
+        Syntax::Tilde,
+        Syntax::Comment,
+        Syntax::Equals,
+        Syntax::Other,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Syntax::Quote => "quote",
+            Syntax::Variable => "variable",
+            Syntax::Substitution => "substitution",
+            Syntax::Heredoc => "heredoc",
+            Syntax::Redirection => "redirection",
+            Syntax::Escape => "escape",
+            Syntax::Group => "group",
+            Syntax::Glob => "glob",
+            Syntax::Tilde => "tilde",
+            Syntax::Comment => "comment",
+            Syntax::Equals => "equals",
+            Syntax::Other => "other",
+        }
+    }
+}
+
+/// The value of a `NAME=value` word whose `NAME` is a valid name.
+fn assignment_value(word: &str) -> Option<&str> {
+    word.split_once('=').and_then(|(name, value)| {
+        (name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'))
+        .then_some(value)
+    })
+}
+
+/// The syntax of a word that is not simple, read from its first character a
+/// simple word cannot hold: the `=` of `foo=bar` as an argument is `equals`.
+fn syntax_of(word: &str) -> Syntax {
+    word.bytes()
+        .position(|b| !(b.is_ascii_alphanumeric() || SIMPLE_WORD_PUNCTUATION.contains(&b)))
+        .map_or(Syntax::Other, |at| syntax_at(&word.as_bytes()[at..]))
+}
+
+/// [`syntax_of`] for a word where a `NAME=value` setting can stand — in front
+/// of the program, or after a setup command such as `export` — read from the
+/// value when it is one.
+fn setting_syntax(word: &str) -> Syntax {
+    syntax_of(assignment_value(word).unwrap_or(word))
+}
+
+/// The syntax of a `-c` script that `unquote` does not read: inside a
+/// leading quote, the first character that stops `unquote`, or the quote
+/// itself when it is not closed; otherwise as any word.
+fn script_syntax(script: &str) -> Syntax {
+    let Some(quote) = script.chars().next().filter(|c| matches!(c, '\'' | '"')) else {
+        return syntax_of(script);
+    };
+    let inside = &script[1..];
+    let inside = inside.strip_suffix(quote).unwrap_or(inside);
+    inside
+        .bytes()
+        .position(|b| matches!(b, b'\'' | b'"' | b'$' | b'`' | b'\\'))
+        .map_or(Syntax::Quote, |at| syntax_at(&inside.as_bytes()[at..]))
+}
+
+/// The syntax `rest` starts with.
+fn syntax_at(rest: &[u8]) -> Syntax {
+    let next = rest.get(1).copied();
+    match rest.first().copied() {
+        Some(b'\'' | b'"') => Syntax::Quote,
+        Some(b'$') if next == Some(b'(') => Syntax::Substitution,
+        Some(b'`') => Syntax::Substitution,
+        Some(b'$') => Syntax::Variable,
+        Some(b'<') if next == Some(b'<') => Syntax::Heredoc,
+        Some(b'<' | b'>') => Syntax::Redirection,
+        Some(b'\\') => Syntax::Escape,
+        Some(b'(' | b')' | b'{' | b'}') => Syntax::Group,
+        Some(b'*' | b'?' | b'[' | b']') => Syntax::Glob,
+        Some(b'~') => Syntax::Tilde,
+        Some(b'#') => Syntax::Comment,
+        Some(b'=') => Syntax::Equals,
+        _ => Syntax::Other,
     }
 }
 
@@ -141,7 +437,7 @@ pub fn classify_tool(tool_name: Option<&str>, command: Option<&str>) -> Operatio
 /// [`describe`].
 pub fn describe_tool(tool_name: Option<&str>, command: Option<&str>) -> Description {
     if tool_name == Some(JOINED_ARGV_TOOL) {
-        Description::of(classify_joined_argv(command))
+        Description::named(joined_argv(command))
     } else {
         describe(command)
     }
@@ -453,12 +749,20 @@ pub fn describe(command: Option<&str>) -> Description {
 /// argument; so does a line with an empty argument in it, a shell with any
 /// other options, or one of [`UNSUPPORTED_PROGRAMS`].
 pub fn classify_joined_argv(command: Option<&str>) -> Operation {
+    joined_argv(command).unwrap_or_default()
+}
+
+/// [`classify_joined_argv`], or why it names nothing.
+fn joined_argv(command: Option<&str>) -> Result<Operation, Decline> {
     let line = command.and_then(|c| c.lines().next()).unwrap_or("");
+    if line.trim_matches(BLANKS).is_empty() {
+        return Err(Decline::of(DeclineReason::NoCommand));
+    }
     let words: Vec<&str> = line.split(' ').collect();
     // An empty argument, or one starting or ending with a space, leaves an
     // empty word: nothing can be placed.
     if words.iter().any(|w| w.is_empty()) {
-        return Operation::default();
+        return Err(Decline::of(DeclineReason::CodexSpacing));
     }
     let program = match words.as_slice() {
         [shell, flags, script @ ..]
@@ -468,20 +772,27 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
                 cluster.contains('c')
                     && cluster.chars().all(|c| c == 'c' || SHELL_FLAGS.contains(c))
             });
+            if !dash_c {
+                return Err(Decline::of(DeclineReason::CodexShell));
+            }
             match script {
-                [program, ..] if dash_c && is_simple_word(program) => program_name(program),
-                _ => return Operation::default(),
+                [program, ..] if is_simple_word(program) => program_name(program),
+                [program, ..] => return Err(Decline::at(DeclineReason::CodexSyntax, program)),
+                [] => return Err(Decline::of(DeclineReason::Other)),
             }
         }
         [program, ..] if is_simple_word(program) => program_name(program),
-        _ => return Operation::default(),
+        [program, ..] => return Err(Decline::at(DeclineReason::CodexSyntax, program)),
+        [] => return Err(Decline::of(DeclineReason::Other)),
     };
-    let unsure = SETUP_PROGRAMS.contains(&program)
-        || SHELLS.contains(&program)
-        || UNSUPPORTED_PROGRAMS.contains(&program)
-        || ["env", "sudo", "command", "time", "nice"].contains(&program);
-    if unsure {
-        return Operation::default();
+    if SETUP_PROGRAMS.contains(&program) {
+        return Err(Decline::of(DeclineReason::CodexSetup));
+    }
+    if UNSUPPORTED_PROGRAMS.contains(&program) {
+        return Err(Decline::of(DeclineReason::ShellGrammar));
+    }
+    if SHELLS.contains(&program) || ["env", "sudo", "command", "time", "nice"].contains(&program) {
+        return Err(Decline::of(DeclineReason::CodexPrefix));
     }
     named(program, &[])
 }
@@ -491,13 +802,16 @@ pub fn classify_joined_argv(command: Option<&str>) -> Operation {
 /// wrappers is read one level deep, however many it holds.
 fn describe_line(line: &str, wrappers: bool) -> Description {
     let mut out = Description::default();
-    for segment in segments(line) {
+    let segments = segments(line);
+    let blank = segments.is_empty();
+    for segment in segments {
         let Some(read) = read_segment(&segment, wrappers) else {
             continue;
         };
         if out.commands.is_empty() {
             out.operation = read.operation;
             out.wrapped = read.wrapped;
+            out.declined = read.declined;
         }
         if read.commands.is_empty() {
             break;
@@ -510,6 +824,13 @@ fn describe_line(line: &str, wrappers: bool) -> Description {
             break;
         }
     }
+    if out.commands.is_empty() && out.declined.is_none() {
+        out.declined = Some(Decline::of(if blank {
+            DeclineReason::NoCommand
+        } else {
+            DeclineReason::SetupOnly
+        }));
+    }
     out
 }
 
@@ -517,40 +838,48 @@ fn describe_line(line: &str, wrappers: bool) -> Description {
 /// one; a description with no command when it declines. `wrappers` as for
 /// [`describe_line`].
 fn read_segment(segment: &[&str], wrappers: bool) -> Option<Description> {
-    let Some(words) = command_words(segment) else {
-        return Some(Description::default());
+    let words = match command_words(segment) {
+        Ok(words) => words,
+        Err(decline) => return Some(Description::declining(decline)),
     };
     let program = program_name(words.first()?);
     let rest = &words[1..];
     if UNSUPPORTED_PROGRAMS.contains(&program) {
-        return Some(Description::default());
+        return Some(Description::declining(Decline::of(
+            DeclineReason::ShellGrammar,
+        )));
     }
     if SETUP_PROGRAMS.contains(&program) {
         // All of its words are read: a quote or a substitution in one could
         // hide where the next segment starts.
-        let plain = rest
+        return rest
             .iter()
-            .all(|w| is_simple_word(w) || is_simple_assignment(w));
-        return (!plain).then(Description::default);
+            .find(|w| !(is_simple_word(w) || is_simple_assignment(w)))
+            .map(|w| Description::declining(Decline::at_setting(DeclineReason::SetupSyntax, w)));
     }
     if SHELLS.contains(&program) {
         return Some(match shell_operand(rest) {
-            None => Description::default(),
-            Some(ShellInput::File(at)) => Description::of(named(program, &rest[at..])),
-            Some(ShellInput::Stdin) => Description::of(named(program, &[])),
+            None => Description::declining(Decline::of(DeclineReason::ShellOption)),
+            Some(ShellInput::File(at)) => Description::named(named(program, &rest[at..])),
+            Some(ShellInput::Stdin) => Description::named(named(program, &[])),
             // A quoted script holds no quote, so a script inside it is one
             // simple word: the nesting ends there.
-            Some(ShellInput::Command(at)) => match rest.get(at).and_then(|&script| {
-                Some(script)
+            Some(ShellInput::Command(at)) => match rest.get(at) {
+                None => Description::declining(Decline::of(DeclineReason::Other)),
+                Some(&script) => match Some(script)
                     .filter(|s| is_simple_word(s))
                     .or_else(|| unquote(script))
-            }) {
-                Some(script) => describe_line(script, wrappers),
-                None => Description::default(),
+                {
+                    Some(script) => describe_line(script, wrappers),
+                    None => Description::declining(Decline {
+                        reason: DeclineReason::ShellScriptSyntax,
+                        syntax: Some(script_syntax(script)),
+                    }),
+                },
             },
         });
     }
-    let mut description = Description::of(named(program, rest));
+    let mut description = Description::named(named(program, rest));
     if wrappers && !description.commands.is_empty() {
         description.wrapped = wrapped_start(program, rest)
             .and_then(|at| read_segment(&rest[at..], false))
@@ -686,14 +1015,14 @@ fn wrapped_start(program: &str, args: &[&str]) -> Option<usize> {
 /// too, though its word is then dropped. The word is kept only when it is
 /// the first argument: an option before it may take it as its value
 /// (`sshpass -p <password>`), and which options do is not known.
-fn named(program: &str, args: &[&str]) -> Operation {
+fn named(program: &str, args: &[&str]) -> Result<Operation, Decline> {
     if !is_command_word(program) {
-        return Operation::default();
+        return Err(Decline::of(DeclineReason::ProgramShape));
     }
     let mut word = None;
     for (at, arg) in args.iter().enumerate() {
         if !is_simple_word(arg) {
-            return Operation::default();
+            return Err(Decline::at(DeclineReason::ArgumentSyntax, arg));
         }
         if !arg.starts_with('-') && !arg.starts_with('+') {
             word = Some(arg.to_string())
@@ -701,10 +1030,10 @@ fn named(program: &str, args: &[&str]) -> Operation {
             break;
         }
     }
-    Operation {
+    Ok(Operation {
         program: Some(program.to_string()),
         word,
-    }
+    })
 }
 
 /// The basename of the program a simple word runs.
@@ -714,18 +1043,22 @@ fn program_name(word: &str) -> &str {
 
 /// A segment's words from its program on: leading assignments and the prefix
 /// programs in front of it, with their options, the options' values and
-/// assignments, dropped. `None` when one of those words is not simple, or a
+/// assignments, dropped. Declines when one of those words is not simple, or a
 /// prefix's options cannot be told apart from the command it runs.
-fn command_words<'a>(segment: &'a [&'a str]) -> Option<&'a [&'a str]> {
+fn command_words<'a>(segment: &'a [&'a str]) -> Result<&'a [&'a str], Decline> {
     let mut words = segment;
     loop {
         let assignments = words.iter().take_while(|w| is_simple_assignment(w)).count();
         words = &words[assignments..];
         let Some(first) = words.first() else {
-            return Some(words);
+            return Ok(words);
         };
         if !is_simple_word(first) {
-            return None;
+            return Err(if assignment_value(first).is_some() {
+                Decline::at_setting(DeclineReason::AssignmentSyntax, first)
+            } else {
+                Decline::at(DeclineReason::ProgramSyntax, first)
+            });
         }
         let prefix = program_name(first);
         let options = match prefix {
@@ -734,9 +1067,10 @@ fn command_words<'a>(segment: &'a [&'a str]) -> Option<&'a [&'a str]> {
             "command" => &COMMAND,
             "time" => &TIME,
             "nice" => &NICE,
-            _ => return Some(words),
+            _ => return Ok(words),
         };
-        let len = options_len(&words[1..], options)?;
+        let len =
+            options_len(&words[1..], options).ok_or(Decline::of(DeclineReason::PrefixOption))?;
         // `command -v cargo` looks `cargo` up and runs nothing: the program
         // is `command`.
         if prefix == "command"
@@ -744,7 +1078,7 @@ fn command_words<'a>(segment: &'a [&'a str]) -> Option<&'a [&'a str]> {
                 .iter()
                 .any(|w| !w.starts_with("--") && w.starts_with('-') && w.contains(['v', 'V']))
         {
-            return Some(words);
+            return Ok(words);
         }
         words = &words[1 + len..];
     }
@@ -1962,6 +2296,198 @@ mod tests {
             .as_deref(),
             Some("cargo fmt,tail")
         );
+    }
+
+    /// A command of each shape the classifier declines, as its tool reports
+    /// it, with the reason and syntax it gives (issue #2088).
+    const DECLINED: &[(&str, &str, DeclineReason, Option<Syntax>)] = &[
+        ("Bash", "", DeclineReason::NoCommand, None),
+        (
+            "Bash",
+            "cd repo && export X=1",
+            DeclineReason::SetupOnly,
+            None,
+        ),
+        (
+            "Bash",
+            "cd \"$DIR\" && cargo test",
+            DeclineReason::SetupSyntax,
+            Some(Syntax::Quote),
+        ),
+        (
+            "Bash",
+            "STAMP=$(date) make",
+            DeclineReason::AssignmentSyntax,
+            Some(Syntax::Substitution),
+        ),
+        ("Bash", "sudo -e file", DeclineReason::PrefixOption, None),
+        (
+            "Bash",
+            "$HOME/bin/tool run",
+            DeclineReason::ProgramSyntax,
+            Some(Syntax::Variable),
+        ),
+        (
+            "Bash",
+            "for f in a b; do x; done",
+            DeclineReason::ShellGrammar,
+            None,
+        ),
+        (
+            "Bash",
+            "bash -Z script.sh",
+            DeclineReason::ShellOption,
+            None,
+        ),
+        (
+            "Bash",
+            "bash -c \"make $TARGET\"",
+            DeclineReason::ShellScriptSyntax,
+            Some(Syntax::Variable),
+        ),
+        ("Bash", "./Build.sh", DeclineReason::ProgramShape, None),
+        (
+            "Bash",
+            "cat <<EOF",
+            DeclineReason::ArgumentSyntax,
+            Some(Syntax::Heredoc),
+        ),
+        ("shell", "git  status", DeclineReason::CodexSpacing, None),
+        ("shell", "bash script.sh", DeclineReason::CodexShell, None),
+        (
+            "shell",
+            "/bin/sh -lc 'cargo test'",
+            DeclineReason::CodexSyntax,
+            Some(Syntax::Quote),
+        ),
+        (
+            "shell",
+            "/bin/sh -lc cd repo",
+            DeclineReason::CodexSetup,
+            None,
+        ),
+        ("shell", "sudo cargo test", DeclineReason::CodexPrefix, None),
+        ("Bash", "bash -c", DeclineReason::Other, None),
+    ];
+
+    #[test]
+    fn each_declined_shape_gives_its_reason_and_no_program() {
+        for &(tool, command, reason, syntax) in DECLINED {
+            let described = describe_tool(Some(tool), Some(command));
+            assert_eq!(described.operation, Operation::default(), "{command}");
+            assert_eq!(
+                described.declined,
+                Some(Decline { reason, syntax }),
+                "{command}"
+            );
+            assert_eq!(
+                syntax.is_some(),
+                reason.reads_a_word(),
+                "{command}: a syntax exactly for the reasons that read a word"
+            );
+        }
+        // Every reason has a case above.
+        for reason in DeclineReason::ALL {
+            assert!(
+                DECLINED.iter().any(|&(_, _, r, _)| r == *reason),
+                "{reason:?} has no case"
+            );
+        }
+        // No command reported at all, by either kind of tool.
+        for tool in ["Bash", "shell"] {
+            assert_eq!(
+                describe_tool(Some(tool), None).declined,
+                Some(Decline::of(DeclineReason::NoCommand)),
+                "{tool}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_syntax_kind_is_named_by_its_first_character() {
+        for (command, syntax) in [
+            ("grep 'x' f", Syntax::Quote),
+            ("ls $DIR", Syntax::Variable),
+            ("ls ${DIR}", Syntax::Variable),
+            ("ls $(pwd)", Syntax::Substitution),
+            ("ls `pwd`", Syntax::Substitution),
+            ("cat <<'EOF'", Syntax::Heredoc),
+            ("sort <in.txt", Syntax::Redirection),
+            ("make >out.txt", Syntax::Redirection),
+            ("ls a\\ b", Syntax::Escape),
+            ("ls {a,b}", Syntax::Group),
+            ("ls *.rs", Syntax::Glob),
+            ("ls ~/code", Syntax::Tilde),
+            ("ls #x", Syntax::Comment),
+            ("cargo --config=x build", Syntax::Equals),
+            // An argument shaped like a setting is not one: its `=` is what
+            // stops the reading.
+            ("grep foo=bar file", Syntax::Equals),
+            ("make CC=gcc", Syntax::Equals),
+            ("ls !x", Syntax::Other),
+            ("ls é", Syntax::Other),
+        ] {
+            assert_eq!(
+                describe(Some(command)).declined,
+                Some(Decline {
+                    reason: DeclineReason::ArgumentSyntax,
+                    syntax: Some(syntax),
+                }),
+                "{command}"
+            );
+        }
+        for syntax in Syntax::ALL {
+            assert!(!syntax.as_str().is_empty());
+        }
+    }
+
+    /// The reason is the deck's own fixed string: nothing of the command is
+    /// in it, whatever the command holds.
+    #[test]
+    fn the_values_are_fixed_and_carry_no_command_text() {
+        let reasons: Vec<&str> = DeclineReason::ALL.iter().map(|r| r.as_str()).collect();
+        let syntaxes: Vec<&str> = Syntax::ALL.iter().map(|s| s.as_str()).collect();
+        for value in reasons.iter().chain(&syntaxes) {
+            assert!(
+                value.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{value}"
+            );
+        }
+        for command in [
+            "PASSWORD=hunter2 \"$CMD\" secret",
+            "curl -H 'Authorization: hunter2' x",
+            "cd /home/me/secret-project && ./Deploy.sh",
+            "bash -c \"echo hunter2 $X\"",
+        ] {
+            let declined = describe(Some(command)).declined.expect(command);
+            assert!(reasons.contains(&declined.reason.as_str()), "{command}");
+            if let Some(syntax) = declined.syntax {
+                assert!(syntaxes.contains(&syntax.as_str()), "{command}");
+            }
+        }
+    }
+
+    /// A command that names a program declines nothing, and one that names
+    /// none always says why.
+    #[test]
+    fn declined_is_set_exactly_when_no_program_is() {
+        for (tool, command) in [
+            ("Bash", "cargo test --workspace"),
+            ("Bash", "cd repo && cargo fmt"),
+            ("Bash", "bash -c 'cargo test'"),
+            ("Bash", "timeout 600 cargo test"),
+            ("Bash", "echo hunter2"),
+            ("shell", "/bin/sh -lc cargo fmt"),
+        ] {
+            let described = describe_tool(Some(tool), Some(command));
+            assert!(described.operation.program.is_some(), "{command}");
+            assert_eq!(described.declined, None, "{command}");
+        }
+        for &(tool, command, _, _) in DECLINED {
+            let described = describe_tool(Some(tool), Some(command));
+            assert!(described.operation.program.is_none(), "{command}");
+            assert!(described.declined.is_some(), "{command}");
+        }
     }
 
     #[test]

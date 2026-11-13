@@ -22,7 +22,10 @@
 //! each kept only when it has the shape of a command word, and never the first
 //! word of a program that prints or searches text, and the same two of each
 //! later command of a chained line and of the command a known wrapper runs
-//! ([`operation::describe`]). No other value on a span is
+//! ([`operation::describe`]). When that filter names no program, which of
+//! the deck's fixed decline names ([`operation::Decline`]) the span carries
+//! depends on the command's shape, but no character of the command is in it.
+//! No other value on a span is
 //! read from an event: the rest come from the
 //! spawn (its ids, role and orchestration), the deck's own counts and enum
 //! names, the configuration and host, and the git probes (a commit hash and the
@@ -509,6 +512,10 @@ pub enum AttrKey {
     OperationCommands,
     OperationWrappedProgram,
     OperationWrappedWord,
+    /// Issue #2088: why the first command names no program, and the syntax
+    /// that stopped it.
+    OperationDeclined,
+    OperationDeclinedSyntax,
     /// Issue #1981: why the deck ended an `agent.operation` itself.
     OperationEnd,
     OperationsCount,
@@ -597,6 +604,8 @@ impl AttrKey {
         AttrKey::OperationCommands,
         AttrKey::OperationWrappedProgram,
         AttrKey::OperationWrappedWord,
+        AttrKey::OperationDeclined,
+        AttrKey::OperationDeclinedSyntax,
         AttrKey::OperationEnd,
         AttrKey::OperationsCount,
         AttrKey::SkillName,
@@ -669,6 +678,8 @@ impl AttrKey {
             AttrKey::OperationCommands => "deck.operation.commands",
             AttrKey::OperationWrappedProgram => "deck.operation.wrapped.program",
             AttrKey::OperationWrappedWord => "deck.operation.wrapped.word",
+            AttrKey::OperationDeclined => "deck.operation.declined",
+            AttrKey::OperationDeclinedSyntax => "deck.operation.declined.syntax",
             AttrKey::OperationEnd => "deck.operation.end",
             AttrKey::OperationsCount => "deck.operations.count",
             AttrKey::SkillName => "deck.skill.name",
