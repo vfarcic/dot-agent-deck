@@ -18,7 +18,7 @@ That is the **forward** direction, and it is the default. `--direction reverse` 
 
 ## Why this exists
 
-CLAUDE.md rule 12's procedure is written in keystrokes because a person was always going to run it, and four of its paragraphs are about ways a person silently gets it wrong. That had a consequence nobody intended: a dispatched agent reading CLAUDE.md rule 12 concludes it cannot type into two full-screen TUIs, declines the check, and leaves the review thread open. Eight green, mergeable pull requests were blocked on exactly that one thread at the time this was written.
+CLAUDE.md rule 12's procedure is written in keystrokes because a person was always going to run it, and four of its paragraphs are about ways a person silently gets it wrong (those traps now live in [versioning.md's hand-run checklist](versioning.md#the-traps-and-the-runs-that-measured-them), behind a pointer in the rule). That had a consequence nobody intended: a dispatched agent reading CLAUDE.md rule 12 concludes it cannot type into two full-screen TUIs, declines the check, and leaves the review thread open. Eight green, mergeable pull requests were blocked on exactly that one thread at the time this was written.
 
 **CLAUDE.md rule 12's requirement is the scenario, not human fingers.** A driver that reproduces the same scenario and asserts the same tells discharges the same obligation — and unlike a person's recollection, it leaves a file a reviewer can read afterwards.
 
