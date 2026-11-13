@@ -526,7 +526,7 @@ GATES — CLAUDE.md is the authority, this is the summary:
   hooks, answer the PROTOCOL_VERSION-versus-.breaking.md question explicitly
   rather than silently, and run the cross-version check.
 - CLAUDE.md rule 10: do not hard-wrap Markdown prose.
-- A changelog fragment via the dot-ai-changelog-fragment skill.
+- A changelog fragment via the dot-ai-changelog-fragment skill, only when a user can observe the change (CLAUDE.md rule 19; a semantic contract break gets its .breaking.md regardless, rule 12).
 
 NOTIFY WHEN YOU STOP — NOTHING IS WATCHING THIS PANE. `dispatch` is
 fire-and-forget with no return edge, so a run that ends "PR open, checks settled"

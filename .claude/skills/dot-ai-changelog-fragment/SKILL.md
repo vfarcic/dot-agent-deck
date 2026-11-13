@@ -1,102 +1,63 @@
 ---
 name: dot-ai-changelog-fragment
-description: Create changelog fragment for release notes. Invoke during /pr-create workflow during the first push to the PR.
+description: Decide whether a change needs a changelog fragment for the release notes and, if it does, write it. Invoke from /pr-create's "Before the PR" step, before the branch is pushed, or whenever a finished change is about to be committed for a PR.
 user-invocable: true
 ---
 
 # Create Changelog Fragment
 
-Create a towncrier changelog fragment for release notes when completing PRD work. This should be included in the PR so the fragment is reviewed along with the code changes.
+Write the towncrier fragment the release notes are built from, in the same PR as the change so it is reviewed with it.
 
 ## Workflow
 
-### Step 1: Identify the PRD
+### Step 1: Ask whether a fragment exists at all
 
-If not already known from context, ask: "Which PRD should I create release notes for?"
+[CLAUDE.md rule 19](../../../CLAUDE.md) decides this: a fragment exists when a **user can observe the change**. CI, developer tooling, the test harness, a refactor with no behavioural difference and repository configuration get **no fragment, of any type** — stop here and say so. The exception is a semantic contract break (CLAUDE.md rule 12): it gets a `.breaking.md` fragment whatever a user can see, plus its `CONTRACT_BREAKS` entry in `src/daemon_protocol.rs`. When in doubt between internal and user-observable, write the fragment.
 
-Look for:
-- PRD mentioned in recent conversation
-- PRD referenced in current branch name (e.g., `feature/prd-320-*`)
-- PRD file path provided by user
+### Step 2: Read the change
 
-### Step 2: Read the PRD Thoroughly
+The source is the change itself, not a particular document:
 
-Read the entire PRD file to extract:
-- **Problem Statement**: What user pain point was solved, why it mattered
-- **Solution Overview**: What the feature does, how it works
-- **User Impact**: Specific benefits, what users can now do
-- **Key Capabilities**: Individual features, options, or modes added
-- **Technical Details**: Configuration options, environment variables, commands
-- **Documentation Updates**: Which docs were added or updated (check Milestones section)
+- the **issue** the branch works (`gh issue view <n>`; the number is usually in the branch name or the task),
+- for PRD work, the **PRD** — its issue body (issue #1591) or, for an older PRD, its `prds/` file,
+- the **diff** (`git diff origin/main...HEAD`), which is what actually shipped, and the user docs it touched.
 
-### Step 3: Determine Fragment Type
+Extract what the user can now do or no longer suffers, how they use or configure it (commands, keys, flags, config fields, environment variables), what they see in both the TUI and the desktop app (CLAUDE.md rule 22), and which user docs page covers it.
 
-Read `pyproject.toml` to see the available fragment types. Each `[[tool.towncrier.type]]` section has:
-- A comment above it describing when to use that type
-- A `directory` field (the type identifier used in the filename, e.g., `feature` for `.feature.md`)
+### Step 3: Determine the fragment type
 
-**First, ask the breaking question — before matching the change to any other type.** Determine whether this change is *breaking* as this project defines it: does it break compatibility with a prior release, or otherwise require existing users to take action to keep working? Read the project's `breaking`-type comment in `pyproject.toml` for the project-specific definition — it may be broader than an API/CLI change (for example a wire-protocol, on-disk-format, or other cross-process/compatibility contract, including a change that stays structurally compatible but shifts meaning). When the change matches that definition — or you are unsure and it plausibly could — prefer the breaking type. Under-classifying a breaking change is costly: it ships with the wrong version bump and with no breaking-change entry to warn users.
+Read `pyproject.toml`. It is the authority on the types: each `[[tool.towncrier.type]]` section has a comment above it describing when to use that type, and a `directory` field that is the type identifier in the filename (e.g. `feature` for `.feature.md`).
 
-Otherwise, choose the type that best matches the PRD based on those descriptions.
+**Ask the breaking question first.** Read the `breaking` comment: here it means the TUI↔daemon contract, including a same-wire change whose meaning shifts (CLAUDE.md rule 12), not generic user-facing breakage. When the change matches, or plausibly could, use `breaking`: under-classifying ships the wrong version bump. Otherwise pick the type whose comment matches. A change can carry more than one fragment (`1885.feature.md` and `1885.breaking.md`).
 
-### Step 4: Write the Fragment
+### Step 4: Write the fragment
 
-Create file: `changelog.d/[issue-id].[type].md`
+Create `changelog.d/<issue>.<type>.md` — a flat file, not a subdirectory (`changelog.d/329.feature.md`, never `changelog.d/feature/329.md`). `<issue>` is the issue number the change closes.
 
-**IMPORTANT: Use flat structure, NOT subdirectories!**
-- ✅ Correct: `changelog.d/329.feature.md`
-- ❌ Wrong: `changelog.d/feature/329.md`
+Content: an optional `## Title` heading, then a paragraph saying what the user can now do and why it matters, then how they use or configure it, then a link to the docs page if one covers it. CLAUDE.md rule 21 applies: what the user does, sees and configures; no internal mechanisms or issue history.
 
-**Naming convention:**
-- `issue-id`: GitHub issue number from PRD (e.g., `320`)
-- `type`: Type identifier from step 3 (e.g., `feature`, `bugfix`, `misc`)
+Link docs as `https://agent-deck.devopstoolkit.ai/docs/<slug>.md`, where `<slug>` is the page's path under `docs/` without `.md`, as listed in `docs/published.toml` (CLAUDE.md rule 11). Never link a `docs/develop/` page.
 
-**Content format:**
+**Example** (`changelog.d/1958.feature.md`, shortened):
+
 ```markdown
-## [Feature Title]
+## Close a dispatched unit and keep its worktree
 
-[Opening sentence: What this feature is and the problem it solves]
+You can now stop a dispatched unit, or a whole orchestration, and keep its worktree on disk, clean or not, so you can start it again in the same directory later.
 
-[Key capabilities paragraph: Specific things users can now do, with concrete examples]
+In the TUI, the `Ctrl+W` close confirmation offers **Close, keep worktree** for a dispatched unit. In the desktop app, the agent and orchestration close confirmations offer **Close agent, keep worktree**. From a shell, add `--keep-worktree` to `dot-agent-deck close`.
 
-[Configuration/usage paragraph if applicable: How to enable or use the feature]
-
-[Documentation link if docs were updated]
+See [Closing Agents → Keep a worktree on purpose](https://agent-deck.devopstoolkit.ai/docs/closing-agents.md#keep-a-worktree-on-purpose).
 ```
 
-**Documentation links:**
-If the PRD includes documentation updates, link to the relevant page on devopstoolkit.ai. The URL pattern is:
-- `https://devopstoolkit.ai/docs/{project}/{path}`
-- Where `{project}` is: `mcp` (dot-ai), `controller` (dot-ai-controller), `ui` (dot-ai-ui), or `stack` (dot-ai-stack)
-- And `{path}` maps from the docs folder (e.g., `docs/guides/mcp-recommendation-guide.md` → `guides/mcp-recommendation-guide`)
+### Step 5: Confirm
 
-**Example: `changelog.d/142.feature.md`**
-```markdown
-## Multi-Cluster Management
-
-Manage multiple Kubernetes clusters from a single dot-ai instance. Previously, each cluster required its own dot-ai deployment, making it difficult to compare configurations or apply consistent patterns across environments.
-
-The `query` tool now accepts a `--cluster` flag to target specific clusters, and results indicate which cluster each resource belongs to. The `recommend` tool can generate manifests targeting different clusters with environment-specific customizations. Cross-cluster searches let you find resources across all connected clusters simultaneously—useful for tracking down where a particular workload is deployed. Cluster health aggregation shows a unified view of all clusters in the `version` output.
-
-Configure additional clusters by adding kubeconfig contexts to `ADDITIONAL_KUBECONFIGS` (comma-separated paths). Each context becomes available as a cluster target. The default cluster remains the current kubeconfig context when no `--cluster` flag is specified.
-
-See the [Multi-Cluster Setup Guide](https://devopstoolkit.ai/docs/mcp/setup/multi-cluster-setup) for configuration details and examples.
-```
-
-### Step 5: Confirm Creation
-
-Show the user:
-1. The fragment file path created
-2. The content written
-3. Reminder to commit and push with the PR
+Show the fragment's path and content, and commit it with the change.
 
 ## Guidelines
 
-- **User-focused**: Describe what users gain, not implementation details
-- **Specific**: Include concrete examples of what each capability does
-- **Complete**: Cover all major features added, not just the headline
-- **Present tense**: "Tools now return..." not "Added support for..."
-- **No diary style**: "Multi-Cluster Management" not "Added multi-cluster support"
-- **Include configuration**: Mention environment variables, commands, or setup steps
-- **Link to docs**: If PRD updated documentation, link to the specific page on devopstoolkit.ai
-
+- **User-focused**: what users gain, not how it was implemented.
+- **Specific and complete**: concrete examples, every major capability, not only the headline.
+- **Present tense, not diary style**: "You can now…" or "The status line now reads…", not "Added support for…".
+- **Include configuration**: the commands, keys, flags or settings a user needs.
+- **Link to docs** on `agent-deck.devopstoolkit.ai` when a published page covers the change.
