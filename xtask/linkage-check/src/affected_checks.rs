@@ -1252,6 +1252,11 @@ mod tests {
             "a scratch root the test builds; the real CHANGELOG.md is never read",
         ),
         (
+            "src/hook.rs",
+            ".claude/skills",
+            "a skill directory the skill-name test builds in a tempdir (issue #2087), not the checkout's",
+        ),
+        (
             "tests/common/lib.rs",
             ".claude",
             "the host's or a test HOME's ~/.claude, not the checkout's",
