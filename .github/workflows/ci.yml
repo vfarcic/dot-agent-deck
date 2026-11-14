@@ -986,7 +986,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       # The Pi extension's Node suites run from the fast tier
       # (`question_detect_008` in src/hook.rs, `the_pi_extensions_node_suites_pass`
       # in src/orchestrator_ext.rs) and need a Node that strips TypeScript types
@@ -1119,7 +1119,7 @@ jobs:
           save-if: false
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       # The Pi extension's Node suites in the lib tier, as in `test`.
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
@@ -1282,7 +1282,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       # The same Linux deps `clippy` installs, for the same reason: the archive
       # is built with `--workspace`, which includes desktop/src-tauri
       # (dot-agent-deck-desktop), and without them that crate does not build on
@@ -1355,7 +1355,7 @@ jobs:
           toolchain: 1.99.0
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       # The desktop crate's test binaries link these libraries at run time.
       - run: |
           sudo apt-get update
@@ -1782,7 +1782,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
       - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       - run: cargo build
       # Match the Linux `build` job's clippy invocation (no --all-targets) so a
       # test-only lint can't fail Windows-only and be unreproducible on the
@@ -1936,13 +1936,13 @@ jobs:
         continue-on-error: true
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       - if: steps.nextest.outcome == 'failure'
         run: sleep 60
       - if: steps.nextest.outcome == 'failure'
         uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
         with:
-          tool: cargo-nextest@0.9.146
+          tool: cargo-nextest@0.9.149
       # `--workspace` (issue #489), for the reason spelled out on the
       # build-windows step: the `test-fast` alias carries the flag on every
       # platform, so this job must run the xtask tests to keep "green locally"
