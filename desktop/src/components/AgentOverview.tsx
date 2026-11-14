@@ -770,6 +770,27 @@ export const DASHBOARD_FITS = "The whole dashboard is already on screen, so ther
  */
 const dashboardHeading = new WeakMap<HTMLElement, { from: number; to: number }>();
 
+/** The regions {@link watchDashboardHeading} already listens on. */
+const dashboardWatched = new WeakSet<HTMLElement>();
+
+/**
+ * Issue #2306 — forget where the dashboard's own smooth scroll was heading as
+ * soon as it gets there, and when the user starts moving the region
+ * themselves: a wheel, a pointer press or a touch on it, or a key pressed
+ * inside it. Without this a destination outlived its scroll, and a Page Down
+ * after End and then a wheel halfway back up did nothing.
+ */
+function watchDashboardHeading(region: HTMLElement): void {
+  if (dashboardWatched.has(region)) return;
+  dashboardWatched.add(region);
+  const forget = () => dashboardHeading.delete(region);
+  region.addEventListener("scroll", () => {
+    const heading = dashboardHeading.get(region);
+    if (heading && Math.abs(region.scrollTop - heading.to) <= 1) forget();
+  }, { passive: true });
+  for (const type of ["wheel", "pointerdown", "touchstart", "keydown"]) region.addEventListener(type, forget, { passive: true });
+}
+
 /**
  * Issue #2306 — the dashboard's position for the next scroll: where its own
  * smooth scroll is heading while that scroll is still on the way there, and
@@ -777,14 +798,14 @@ const dashboardHeading = new WeakMap<HTMLElement, { from: number; to: number }>(
  * `scrollTop` still reads where it started, so a Page Up pressed straight
  * after a Page Down read "already at the top" and was dropped, and the Page
  * Down then finished a screen down. A scroll counts as on the way while
- * `scrollTop` lies between its start and its destination and has not reached
- * the destination; once it has, or once something else has moved the region
- * outside that span, `scrollTop` is the position again.
+ * `scrollTop` lies between its start and its destination, has not reached the
+ * destination, and the destination is still within the region's room (a
+ * resize can shrink it); otherwise `scrollTop` is the position again.
  */
-function dashboardPosition(region: HTMLElement): number {
+function dashboardPosition(region: HTMLElement, room: number): number {
   const at = region.scrollTop;
   const heading = dashboardHeading.get(region);
-  if (heading && Math.abs(at - heading.to) > 1 && at >= Math.min(heading.from, heading.to) - 1 && at <= Math.max(heading.from, heading.to) + 1) return heading.to;
+  if (heading && heading.to <= room + 1 && Math.abs(at - heading.to) > 1 && at >= Math.min(heading.from, heading.to) - 1 && at <= Math.max(heading.from, heading.to) + 1) return heading.to;
   dashboardHeading.delete(region);
   return at;
 }
@@ -811,15 +832,17 @@ function scrollDashboard(region: HTMLElement | null, move: DashboardScroll): str
   const room = region ? region.scrollHeight - region.clientHeight : 0;
   if (!region || room <= 1) return DASHBOARD_FITS;
   const behavior: ScrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
-  const at = dashboardPosition(region);
+  const at = dashboardPosition(region, room);
   if ((move === "down" || move === "bottom") && at >= room - 1) return DASHBOARD_AT_BOTTOM;
   if ((move === "up" || move === "top") && at <= 1) return DASHBOARD_AT_TOP;
   const screen = Math.max(DASHBOARD_SCROLL_MIN, region.clientHeight - DASHBOARD_SCROLL_OVERLAP);
   const to = move === "top" ? 0 : move === "bottom" ? room : Math.min(room, Math.max(0, at + (move === "down" ? screen : -screen)));
   const from = region.scrollTop;
   region.scrollTo({ top: to, behavior });
-  if (behavior === "smooth") dashboardHeading.set(region, { from, to });
-  else forgetDashboardHeading(region);
+  if (behavior === "smooth" && Math.abs(from - to) > 1) {
+    watchDashboardHeading(region);
+    dashboardHeading.set(region, { from, to });
+  } else forgetDashboardHeading(region);
   return undefined;
 }
 

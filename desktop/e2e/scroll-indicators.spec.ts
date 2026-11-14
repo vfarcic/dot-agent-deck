@@ -172,5 +172,23 @@ test.describe("scroll indicators", () => {
     // and a screen is less than the region's height.
     const down = await fromTheTop(["PageDown", "PageDown"]);
     expect(down.top).toBeGreaterThan(down.height);
+
+    // Where a finished scroll was heading is forgotten: End, then the wheel
+    // halfway back up, and Page Down still moves it down rather than reading
+    // "already at the bottom" from End's destination.
+    // From the top, so the wheel's position is inside the span End covered.
+    const end = await fromTheTop(["End"]);
+    expect(end.top).toBeGreaterThanOrEqual(end.room - 1);
+    const region = page.locator(".overview-body");
+    const top = () => region.evaluate((element) => element.scrollTop);
+    await region.hover();
+    await page.mouse.wheel(0, -Math.round(end.room / 2));
+    await expect.poll(top).toBeLessThan(end.room - 1);
+    await expect.poll(top).toBeGreaterThan(1);
+    await expect.poll(async () => { const before = await top(); await page.waitForTimeout(150); return before === (await top()); }).toBe(true);
+    const halfway = await top();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("PageDown");
+    await expect.poll(top).toBeGreaterThan(halfway);
   });
 });
