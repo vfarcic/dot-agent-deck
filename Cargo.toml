@@ -34,7 +34,7 @@ exclude = ["vendor/crossterm"]
 # claim with nothing behind it. `docs/develop/versioning.md` has the rest,
 # including what this means for `cargo update` and Renovate.
 [workspace.package]
-rust-version = "1.99.0"
+rust-version = "1.99.1"
 
 [package]
 name = "dot-agent-deck"

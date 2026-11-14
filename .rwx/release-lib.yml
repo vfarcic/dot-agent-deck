@@ -109,7 +109,7 @@ tasks:
     if: ${{ tasks.backend.values.rust == 'true' }}
     call: rust-lang/install 1.1.1
     with:
-      rust-version: 1.99.0
+      rust-version: 1.99.1
 
   - key: nextest
     if: ${{ tasks.backend.values.rust == 'true' }}

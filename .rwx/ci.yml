@@ -166,7 +166,7 @@ tasks:
     if: ${{ tasks.backend.values.active == 'true' }}
     call: rust-lang/install 1.1.1
     with:
-      rust-version: 1.99.0
+      rust-version: 1.99.1
 
   - key: nextest
     if: ${{ tasks.backend.values.active == 'true' }}
@@ -345,7 +345,7 @@ tasks:
       echo "b1c8cb14e30889e7e2999e6b69e62d9e9b9ffc0f4df8180564d306d9680e6c55  /tmp/rustup-init" | sha256sum -c -
       chmod +x /tmp/rustup-init
       /tmp/rustup-init -y --profile minimal \
-        --default-toolchain 1.99.0 --component rust-src \
+        --default-toolchain 1.99.1 --component rust-src \
         --target x86_64-pc-windows-msvc --target aarch64-unknown-linux-gnu
       echo "$HOME/.cargo/bin" >> "$RWX_ENV/PATH"
 
