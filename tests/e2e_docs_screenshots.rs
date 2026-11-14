@@ -1126,7 +1126,7 @@ fn docs_screenshot_help() {
 #[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
 fn docs_screenshot_star_prompt() {
     html_dir();
-    let state = tempfile::tempdir().expect("star state dir");
+    let state = common::harness_tempdir().expect("star state dir");
     let path = state.path().join("star-prompt-state.json");
     std::fs::write(
         &path,

@@ -2093,11 +2093,12 @@ impl StarPromptState {
 
     /// Write the state to its file.
     ///
-    /// PRD #2174: written to a sibling temporary file and renamed over the
-    /// old one, so a reader — the other client starting at the same moment —
-    /// sees the old state or the new one, never a half-written file. An
-    /// unreadable file reads as "never dismissed", which would ask again
-    /// someone who had said "Don't ask again".
+    /// PRD #2174: through [`write_config_atomically`] — a uniquely named,
+    /// exclusively created sibling file renamed over the old one, following a
+    /// symlinked state file to its target — so a reader, the other client
+    /// starting at the same moment, sees the old state or the new one, never a
+    /// half-written file. An unreadable file reads as "never dismissed",
+    /// which would ask again someone who had said "Don't ask again".
     pub fn save(&self) -> Result<(), String> {
         let path = self.path();
         if let Some(parent) = path.parent() {
@@ -2106,14 +2107,7 @@ impl StarPromptState {
         }
         let contents = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize star prompt state: {e}"))?;
-        let file_name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "star-prompt-state.json".to_string());
-        let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
-        let written = std::fs::write(&temp, contents).and_then(|()| std::fs::rename(&temp, &path));
-        written.map_err(|e| {
-            let _ = std::fs::remove_file(&temp);
+        write_config_atomically(&path, contents.as_bytes()).map_err(|e| {
             format!(
                 "Failed to write star prompt state at {}: {e}",
                 path.display()
@@ -2121,7 +2115,7 @@ impl StarPromptState {
         })
     }
 
-    /// Fold in what the file holds now, before a choice is saved.
+    /// Fold in what the file holds now.
     ///
     /// PRD #2174: the other client may have written the file since this one
     /// read it — counted a launch, or been told "Don't ask again". Every
@@ -2138,6 +2132,25 @@ impl StarPromptState {
         }
     }
 
+    /// Change the state and save it, as one step against the other client.
+    ///
+    /// PRD #2174: under an exclusive lock on a sidecar beside the state file
+    /// ([`lock_star_prompt`]), the file is read and folded in
+    /// ([`Self::refresh`]), `change` is applied, and the result saved — so a
+    /// launch or a Later saved by one client cannot replace a Don't ask again
+    /// the other saved a moment earlier, and two launches at once both count.
+    fn update(&mut self, change: impl FnOnce(&mut Self)) -> Result<(), String> {
+        let path = self.path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create star prompt directory: {e}"))?;
+        }
+        let _lock = lock_star_prompt(&path)?;
+        self.refresh();
+        change(self);
+        self.save()
+    }
+
     /// Whether this launch is one the reminder is shown at.
     pub fn is_due(&self) -> bool {
         !self.permanently_dismissed
@@ -2145,25 +2158,79 @@ impl StarPromptState {
     }
 
     /// Count this launch, save it, and answer whether to show the reminder.
+    /// A launch that cannot be saved still answers from what was read.
     pub fn increment_and_check(&mut self) -> bool {
-        self.launch_count += 1;
-        let _ = self.save();
+        if self.update(|state| state.launch_count += 1).is_err() {
+            self.launch_count += 1;
+        }
         self.is_due()
     }
 
     /// Remind me later: ask again after another [`STAR_PROMPT_INTERVAL`]
-    /// launches of either client.
-    pub fn snooze(&mut self) {
-        self.refresh();
-        self.last_prompt_at_launch = self.launch_count;
-        let _ = self.save();
+    /// launches of either client. The error says why it could not be saved.
+    pub fn snooze(&mut self) -> Result<(), String> {
+        self.update(|state| state.last_prompt_at_launch = state.launch_count)
     }
 
     /// Star on GitHub, or Don't ask again: never ask again, in either client.
-    pub fn dismiss_permanently(&mut self) {
-        self.refresh();
-        self.permanently_dismissed = true;
-        let _ = self.save();
+    /// The error says why it could not be saved.
+    pub fn dismiss_permanently(&mut self) -> Result<(), String> {
+        self.update(|state| state.permanently_dismissed = true)
+    }
+}
+
+/// How long a save waits for the other client to finish its own.
+const STAR_PROMPT_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+const STAR_PROMPT_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Take the exclusive lock that serialises the two clients' updates of the
+/// star-prompt state at `path`; released when the returned file is dropped.
+///
+/// The pattern `deck_list::acquire_edit_lock` uses, for its reasons: the state
+/// file cannot carry the lock, because every save replaces it by rename, so an
+/// empty, owner-only sidecar `.<name>.lock` that is never replaced or deleted
+/// holds it. A filesystem that cannot lock at all goes ahead unlocked — the
+/// update is still made against a fresh read — and anything else that keeps
+/// the lock from being taken is an error, and nothing is saved.
+fn lock_star_prompt(path: &Path) -> Result<Option<std::fs::File>, String> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "star-prompt-state.json".to_string());
+    let lock_path = path.with_file_name(format!(".{name}.lock"));
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    crate::platform::fsperm::set_create_mode_owner_only(&mut options);
+    let file = options.open(&lock_path).map_err(|e| {
+        format!(
+            "Failed to open the star prompt lock at {}: {e}",
+            lock_path.display()
+        )
+    })?;
+    let deadline = std::time::Instant::now() + STAR_PROMPT_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(Some(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(STAR_PROMPT_LOCK_POLL);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(format!(
+                    "Failed to save the star prompt state: {} stayed locked",
+                    lock_path.display()
+                ));
+            }
+            Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
+                return Ok(None);
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(format!(
+                    "Failed to lock the star prompt state at {}: {e}",
+                    lock_path.display()
+                ));
+            }
+        }
     }
 }
 
@@ -4072,7 +4139,7 @@ command = "vim"
     }
 
     /// PRD #2174: a save replaces the file whole, through a sibling temporary
-    /// file, and leaves nothing else behind in the directory.
+    /// file, and leaves no temporary file behind in the directory.
     #[test]
     fn star_prompt_save_replaces_the_file_and_leaves_no_temporary_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -4081,11 +4148,16 @@ command = "vim"
         for _ in 0..3 {
             state.increment_and_check();
         }
-        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+        let mut names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["star.json".to_string()]);
+        names.sort();
+        // The state, and the empty lock sidecar that serialises the clients.
+        assert_eq!(
+            names,
+            vec![".star.json.lock".to_string(), "star.json".to_string()]
+        );
         assert_eq!(StarPromptState::load_from(&path).launch_count, 3);
     }
 
@@ -4125,8 +4197,8 @@ command = "vim"
             "launch 11 asks the desktop app"
         );
 
-        desktop.dismiss_permanently();
-        tui.snooze();
+        desktop.dismiss_permanently().unwrap();
+        tui.snooze().unwrap();
 
         let after = StarPromptState::load_from(&path);
         assert!(after.permanently_dismissed, "Later undid Don't ask again");
@@ -4135,6 +4207,65 @@ command = "vim"
         for _ in 0..20 {
             assert!(!next.increment_and_check());
         }
+    }
+
+    /// PRD #2174 (Qodo and Greptile, PR #2321): launches and choices racing
+    /// on the shared file lose nothing. Each of sixteen threads reads the
+    /// file, then counts a launch and answers Later, while one more says
+    /// Don't ask again; every launch is counted and the dismissal survives.
+    #[test]
+    fn star_prompt_racing_updates_lose_no_launch_and_no_dismissal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        let start = std::sync::Arc::new(std::sync::Barrier::new(17));
+        let mut threads = Vec::new();
+        for _ in 0..16 {
+            let (path, start) = (path.clone(), start.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut client = StarPromptState::load_from(&path);
+                start.wait();
+                client.increment_and_check();
+                client.snooze().unwrap();
+            }));
+        }
+        {
+            let (path, start) = (path.clone(), start.clone());
+            threads.push(std::thread::spawn(move || {
+                let mut client = StarPromptState::load_from(&path);
+                start.wait();
+                client.dismiss_permanently().unwrap();
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let after = StarPromptState::load_from(&path);
+        assert_eq!(after.launch_count, 16, "a racing launch was lost");
+        assert!(
+            after.permanently_dismissed,
+            "a racing save undid Don't ask again"
+        );
+    }
+
+    /// PRD #2174 (Qodo, PR #2321): a symlinked state file — kept with
+    /// dotfiles, say — stays a symlink, and its target holds the state.
+    #[cfg(unix)]
+    #[test]
+    fn star_prompt_save_keeps_a_symlinked_state_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("dotfiles-star.json");
+        let link = dir.path().join("star.json");
+        std::fs::write(&target, "{}").unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let mut state = StarPromptState::load_from(&link);
+        state.increment_and_check();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(StarPromptState::load_from(&target).launch_count, 1);
     }
 
     /// PRD #2174: "Later" in one client pushes the next reminder in both
@@ -4149,7 +4280,7 @@ command = "vim"
         }
         let mut asked = StarPromptState::load_from(&path);
         assert!(asked.increment_and_check());
-        asked.snooze();
+        asked.snooze().unwrap();
         for launch in 11..=19 {
             let mut client = StarPromptState::load_from(&path);
             assert!(!client.increment_and_check(), "launch {launch} asks");

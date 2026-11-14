@@ -78,9 +78,9 @@ export function publishStarPrompt(prompt: PublishedStarPrompt): () => void {
 
 /**
  * The reminder's flow, for the app shell: asks once at startup whether this
- * launch shows the reminder, and answers `due` until a choice is made.
+ * launch shows the reminder, and answers `due` until a choice is saved.
  * `report` is given Star's sentence, or the reason a choice could not be
- * saved.
+ * saved, in which case the reminder is due again.
  */
 export function useStarPrompt(runtime: StarPromptRuntime, report: (message: string) => void): { due: boolean; choose: (choice: StarChoice) => void } {
   const [due, setDue] = useState(false);
@@ -98,9 +98,15 @@ export function useStarPrompt(runtime: StarPromptRuntime, report: (message: stri
   const choose = useCallback((choice: StarChoice) => {
     setDue(false);
     if (!choosePrompt) return;
+    /* A choice that could not be saved says why, and the reminder comes back
+       so it can be answered again, rather than returning at a later launch
+       with no word of it. */
     void choosePrompt(choice).then(
       (message) => { if (message) report(message); },
-      (cause: unknown) => report(cause instanceof Error ? cause.message : String(cause)),
+      (cause: unknown) => {
+        report(cause instanceof Error ? cause.message : String(cause));
+        setDue(true);
+      },
     );
   }, [choosePrompt, report]);
   return { due, choose };

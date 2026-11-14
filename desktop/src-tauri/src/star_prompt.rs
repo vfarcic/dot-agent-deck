@@ -66,8 +66,9 @@ impl StarLaunch {
 static STAR_LAUNCH: StarLaunch = StarLaunch::new();
 
 /// Record `choice` in the file at `path`, over what the file holds now, so a
-/// choice the TUI saved meanwhile is kept.
-pub fn record_choice(path: PathBuf, choice: StarChoice) {
+/// choice the TUI saved meanwhile is kept. The error says why it could not be
+/// saved.
+pub fn record_choice(path: PathBuf, choice: StarChoice) -> Result<(), String> {
     let mut state = StarPromptState::load_from(path);
     match choice {
         StarChoice::Star | StarChoice::Dismiss => state.dismiss_permanently(),
@@ -87,7 +88,9 @@ pub async fn desktop_star_prompt_launch(webview: Webview) -> Result<bool, String
 
 /// The user's choice in the star reminder. Answers the sentence to show for
 /// Star — thanks, or where to go when the browser did not open — and nothing
-/// for the other two, which the TUI does not report either.
+/// for the other two, which the TUI does not report either. A choice that
+/// could not be saved is an error, and leaves this process's reminder due, so
+/// the webview can show it again; Star opens no browser then.
 #[tauri::command]
 pub async fn desktop_star_prompt_choose(
     webview: Webview,
@@ -96,13 +99,13 @@ pub async fn desktop_star_prompt_choose(
     crate::ensure_main_webview(&webview)?;
     let path = star_prompt_path();
     tokio::task::spawn_blocking(move || {
+        record_choice(path, choice)?;
         STAR_LAUNCH.answered();
-        record_choice(path, choice);
-        (choice == StarChoice::Star)
-            .then(|| star_message(open_with_platform_opener(REPO_URL, LAUNCH_GRACE).is_ok()))
+        Ok((choice == StarChoice::Star)
+            .then(|| star_message(open_with_platform_opener(REPO_URL, LAUNCH_GRACE).is_ok())))
     })
     .await
-    .map_err(|error| format!("Could not save the star reminder's choice: {error}"))
+    .map_err(|error| format!("Could not save the star reminder's choice: {error}"))?
 }
 
 #[cfg(test)]
@@ -162,7 +165,7 @@ mod tests {
         }
         let mut tui = StarPromptState::load_from(&path);
         assert!(tui.increment_and_check());
-        tui.dismiss_permanently();
+        tui.dismiss_permanently().unwrap();
         for launch in 11..=40 {
             assert!(!desktop_launch(&path), "desktop launch {launch} asked");
         }
@@ -177,7 +180,7 @@ mod tests {
                 tui_launch(&path);
             }
             assert!(desktop_launch(&path));
-            record_choice(path.clone(), choice);
+            record_choice(path.clone(), choice).unwrap();
             for launch in 11..=40 {
                 assert!(!tui_launch(&path), "{choice:?}: TUI launch {launch} asked");
             }
@@ -192,7 +195,7 @@ mod tests {
             tui_launch(&path);
         }
         assert!(desktop_launch(&path));
-        record_choice(path.clone(), StarChoice::Later);
+        record_choice(path.clone(), StarChoice::Later).unwrap();
         for launch in 11..=19 {
             assert!(!tui_launch(&path), "TUI launch {launch} asked");
         }
@@ -209,9 +212,22 @@ mod tests {
         assert!(desktop_launch(&path));
         let mut tui = StarPromptState::load_from(&path);
         assert!(tui.increment_and_check());
-        tui.dismiss_permanently();
-        record_choice(path.clone(), StarChoice::Later);
+        tui.dismiss_permanently().unwrap();
+        record_choice(path.clone(), StarChoice::Later).unwrap();
         assert!(StarPromptState::load_from(&path).permanently_dismissed);
+    }
+
+    /// Qodo, PR #2321: a choice that cannot be written is reported, not lost
+    /// silently. The state's directory is a file here, so nothing can be saved.
+    #[test]
+    fn a_choice_that_cannot_be_saved_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("star.json");
+        for choice in [StarChoice::Star, StarChoice::Later, StarChoice::Dismiss] {
+            assert!(record_choice(path.clone(), choice).is_err(), "{choice:?}");
+        }
     }
 
     #[test]

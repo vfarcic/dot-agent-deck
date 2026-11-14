@@ -934,7 +934,7 @@ export function stopAgentConfirmation(agent: OverviewAgent, connection: Connecti
  * passes it to whichever view is mounted; a caller that renders this screen
  * standalone gets everything except the control that needs a document.
  */
-export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, notice, selfUpgrade }: {
+export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = false, voiceChannel, newAgentVoice, onConfirmationChange, onNewAgentChange, notice, selfUpgrade }: {
   runtime: DeckRuntimeState;
   settings?: DesktopSettingsState;
   onNavigate: (view: DeckView) => void;
@@ -945,6 +945,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
    * mode, which does not resume when it is answered.
    */
   onConfirmationChange?: (open: boolean) => void;
+  /** PRD #2174: told whether the New agent dialog is open, so the shell's star reminder waits behind it. */
+  onNewAgentChange?: (open: boolean) => void;
   /**
    * An agent's pane is open over this screen (PRD #1105), which is where the
    * keyboard belongs — so the New agent shortcut stands down: `Ctrl+N` is
@@ -1480,6 +1482,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
   useEffect(() => { confirmationChanged.current?.(confirmationOpen); }, [confirmationOpen]);
   /* An overview unmounted with a confirmation up takes the confirmation with it. */
   useEffect(() => () => { confirmationChanged.current?.(false); }, []);
+  const newAgentChanged = useRef(onNewAgentChange);
+  newAgentChanged.current = onNewAgentChange;
+  const newAgentOpen = newAgent !== undefined && newAgentRuntime !== undefined;
+  useEffect(() => { newAgentChanged.current?.(newAgentOpen); }, [newAgentOpen]);
+  useEffect(() => () => { newAgentChanged.current?.(false); }, []);
   /**
    * Why Connect anyway did not connect, and on WHICH deck (issue #1472). Keyed
    * by the deck it was pressed on, because that is where the reader is looking:

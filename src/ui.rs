@@ -8027,23 +8027,35 @@ fn handle_trust_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     Action::Continue
 }
 
+/// PRD #2174: a star-prompt choice that could not be saved says why on the
+/// status line, as the desktop app's toast does, since the reminder would
+/// otherwise come back at a later launch with no word of it.
+fn report_star_save(ui: &mut UiState, saved: Result<(), String>) {
+    if let Err(why) = saved {
+        ui.status_message = Some((why, std::time::Instant::now()));
+    }
+}
+
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Char('s') => {
             let msg = star_repo_and_report();
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
+            report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('l') | KeyCode::Esc => {
-            ui.star_prompt_state.snooze();
+            let saved = ui.star_prompt_state.snooze();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('d') => {
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
             Action::Continue
         }
         _ => Action::Continue,
@@ -12540,19 +12552,22 @@ fn dispatch_action(
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
             let msg = star_repo_and_report();
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
+            report_star_save(ui, saved);
         }
         // star-prompt [Snooze]: snooze (== `l` / Esc).
         Action::StarSnooze => {
-            ui.star_prompt_state.snooze();
+            let saved = ui.star_prompt_state.snooze();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
         }
         // star-prompt [Dismiss]: stop asking permanently (== `d`).
         Action::StarDismiss => {
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
         }
         // ===== PRD #80 M6: inline-edit button actions =====
         // filter [Apply]: commit and keep the typed filter (== Enter).

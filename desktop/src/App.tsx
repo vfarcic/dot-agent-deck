@@ -614,6 +614,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   const [starNotice, setStarNotice] = useState<string>(); // voice-registry-exempt: Star's sentence in the toast, reporting what the reminder's choice did
   const star = useStarPrompt(runtime, setStarNotice);
   const dismissStarNotice = useCallback(() => setStarNotice(undefined), []);
+  const [newAgentOpen, setNewAgentOpen] = useState(false); // voice-registry-exempt: whether the overview's New agent dialog is open, reported by the overview so the star reminder waits behind it; it opens nothing
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
   const paneAgentShown = paneAgent ?? heldPaneAgent?.agent;
   /**
@@ -1358,7 +1359,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     ? (
       <>
         {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} onNewAgentChange={setNewAgentOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -1413,9 +1414,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   */
   /* PRD #2174 — the star reminder waits while something more important is
      open over the app at startup (a confirmation such as the upgrade the app
-     offers when it starts, the newer-release dialog, Settings, the pull
-     request browser), and comes up once it closes. */
-  const starShown = star.due && !confirmationOpen && !selfUpgradeOpen && !overlaysOpen.settings && !prBrowser;
+     offers when it starts, the newer-release dialog, the New agent dialog,
+     Settings, the pull request browser), and comes up once it closes. Under
+     the New agent dialog it would leave voice's `close` closing the form
+     behind it (Greptile, PR #2321). */
+  const starShown = star.due && !confirmationOpen && !selfUpgradeOpen && !newAgentOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>

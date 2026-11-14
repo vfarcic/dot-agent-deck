@@ -43,7 +43,7 @@ fn tui(path: &Path) -> TuiDeck {
 #[spec("prompt/star/002")]
 #[test]
 fn star_002_dont_ask_again_in_the_tui_stops_the_desktop_app() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = common::harness_tempdir().expect("tempdir");
     let path = dir.path().join("star-prompt-state.json");
     desktop_launches(&path, 9);
 
@@ -69,7 +69,7 @@ fn star_002_dont_ask_again_in_the_tui_stops_the_desktop_app() {
 #[spec("prompt/star/002")]
 #[test]
 fn star_002_dont_ask_again_in_the_desktop_app_stops_the_tui() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = common::harness_tempdir().expect("tempdir");
     let path = dir.path().join("star-prompt-state.json");
     desktop_launches(&path, 9);
     let mut desktop = StarPromptState::load_from(&path);
@@ -77,7 +77,9 @@ fn star_002_dont_ask_again_in_the_desktop_app_stops_the_tui() {
         desktop.increment_and_check(),
         "the desktop's tenth launch asks"
     );
-    desktop.dismiss_permanently();
+    desktop
+        .dismiss_permanently()
+        .expect("desktop saves Don't ask again");
 
     let deck = tui(&path);
     deck.wait_for_string(DASHBOARD);
@@ -95,7 +97,7 @@ fn star_002_dont_ask_again_in_the_desktop_app_stops_the_tui() {
 #[spec("prompt/star/002")]
 #[test]
 fn star_002_later_in_the_tui_delays_the_desktop_app_ten_launches() {
-    let dir = tempfile::tempdir().expect("tempdir");
+    let dir = common::harness_tempdir().expect("tempdir");
     let path = dir.path().join("star-prompt-state.json");
     desktop_launches(&path, 9);
 

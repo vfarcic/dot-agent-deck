@@ -21,7 +21,7 @@ import {
 } from "./lib/starPrompt";
 import { VOICE_ACTIONS } from "./lib/voiceActions";
 import { StarPromptDialog } from "./components/StarPromptDialog";
-import type { DeckRuntimeState } from "./types";
+import type { DeckDirectoryListing, DeckRuntimeState, NewAgentOptions } from "./types";
 
 vi.mock("./components/TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -34,7 +34,7 @@ import { DeckShell } from "./App";
  * words and keys, shown at startup when the shared reminder state says this
  * launch is one it shows at.
  */
-function runtimeOf(star: Partial<Pick<DeckRuntimeState, "starPromptLaunch" | "starPromptChoose">>): DeckRuntimeState {
+function runtimeOf(star: Partial<DeckRuntimeState>): DeckRuntimeState {
   const deck = createFixtureSnapshot("connected");
   const settings: DesktopSettingsDto = { ...structuredClone(DEFAULT_DESKTOP_SETTINGS), endpoints: { remote: [], selection: LOCAL_ENDPOINT_SELECTION } };
   return {
@@ -158,6 +158,17 @@ describe("the star reminder's flow", () => {
     expect(runtime.starPromptLaunch).toHaveBeenCalledOnce();
   });
 
+  /** Scenario: the user chooses Don't ask again, and the choice cannot be saved. The app says why, and the reminder comes back so it can be answered again. */
+  it("comes back when a choice cannot be saved", async () => {
+    const report = vi.fn();
+    const runtime = { starPromptLaunch: vi.fn(async () => true), starPromptChoose: vi.fn(async () => { throw new Error("Failed to write star prompt state"); }) };
+    const { result } = renderHook(() => useStarPrompt(runtime, report));
+    await waitFor(() => expect(result.current.due).toBe(true));
+    act(() => result.current.choose("dismiss"));
+    await waitFor(() => expect(report).toHaveBeenCalledExactlyOnceWith("Failed to write star prompt state"));
+    expect(result.current.due).toBe(true);
+  });
+
   /** Scenario: a launch the reminder does not show at, a runtime that cannot answer, and a runtime without the call: none shows the reminder. */
   it("is not due otherwise", async () => {
     for (const runtime of [{ starPromptLaunch: vi.fn(async () => false) }, { starPromptLaunch: vi.fn(async () => { throw new Error("unreadable"); }) }, {}]) {
@@ -189,6 +200,21 @@ describe("the star reminder in the app", () => {
     expect(toast).toHaveTextContent(STAR_THANKS);
     fireEvent.click(within(toast).getByRole("button", { name: "Dismiss star message" }));
     expect(screen.queryByTestId("star-toast")).toBeNull();
+  });
+
+  /** Scenario: the user opens New agent before the startup check answers that the reminder is due. The reminder waits behind the dialog rather than covering it, and comes up once the dialog closes. */
+  it("waits while the New agent dialog is open", async () => {
+    let answer!: (due: boolean) => void;
+    const starPromptLaunch = vi.fn(() => new Promise<boolean>((resolve) => { answer = resolve; }));
+    const listing: DeckDirectoryListing = { kind: "listing", path: "/home/dev", displayPath: "/home/dev", parent: "/home", entries: [], truncated: false };
+    const options: NewAgentOptions = { kind: "deck", agents: [], experimental: false, authoringKinds: [], lastCommand: "claude" };
+    render(<DeckShell runtime={runtimeOf({ starPromptLaunch, listDirectories: vi.fn(async () => structuredClone(listing)), newAgentOptions: vi.fn(async () => structuredClone(options)) })} initialView={{ kind: "overview" }} />);
+    fireEvent.click(await screen.findByTestId("overview-new-agent"));
+    const dialog = await screen.findByTestId("new-agent-dialog");
+    await act(async () => { answer(true); });
+    expect(screen.queryByTestId("star-prompt-dialog")).toBeNull();
+    fireEvent.click(within(dialog).getByRole("button", { name: "Close new agent" }));
+    expect(await screen.findByTestId("star-prompt-dialog")).toBeVisible();
   });
 
   /** Scenario: the app starts on a launch the reminder state says is not due. No reminder shows. */
