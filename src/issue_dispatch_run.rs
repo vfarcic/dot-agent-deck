@@ -267,6 +267,13 @@ pub async fn nested_worktrees(
         .map_err(|e| format!("could not resolve {}: {e}", worktree_dir.display()))?;
     let mut resolved = Vec::new();
     for listed in crate::worktree_reclaim::worktree_paths_from_porcelain_z(&output.stdout) {
+        // Only an entry that could lie inside is resolved, so one broken
+        // worktree elsewhere in the repository cannot fail every close. Git
+        // records absolute paths, so an entry inside starts with the tree's
+        // path, as git resolved it or as the deck holds it.
+        if !(listed.starts_with(&own) || listed.starts_with(worktree_dir)) {
+            continue;
+        }
         match tokio::fs::canonicalize(&listed).await {
             Ok(path) => resolved.push(path),
             // Gone: nothing left to lose.
@@ -5598,6 +5605,42 @@ mod tests {
         assert!(answer.is_err(), "{answer:?}");
         assert_eq!(outcome, WorktreeRemoval::KeptCouldNotCheck);
         assert!(unit.join(".worktrees/feat-1-demo/wip.txt").is_file());
+    }
+
+    /// Issue #2285 (review): an unresolvable worktree OUTSIDE the tree does
+    /// not stop the check — a clean unit still reads clean and is removed.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresolvable_worktree_elsewhere_does_not_keep_a_clean_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions. Permissions do not bind for
+        // root, which would resolve the sibling anyway.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let unit = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(tmp.path(), &repo, &unit);
+        let fenced = tmp.path().join("fenced");
+        std::fs::create_dir_all(&fenced).unwrap();
+        let sibling = fenced.join("sibling");
+        let out = crate::git_env::fixture_git(&repo, tmp.path())
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "sib",
+                &sibling.to_string_lossy(),
+            ])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        std::fs::set_permissions(&fenced, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let answer = worktree_keep_check(&unit, &repo).await;
+        std::fs::set_permissions(&fenced, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(answer, Ok(TreeKeepCheck::Clean));
     }
 
     /// Issue #2285: the close preview asks the same question as the removal,
