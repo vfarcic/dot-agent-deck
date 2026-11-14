@@ -2196,25 +2196,30 @@ const STAR_PROMPT_LOCK_POLL: std::time::Duration = std::time::Duration::from_mil
 /// The pattern `deck_list::acquire_edit_lock` uses, for its reasons: the state
 /// file cannot carry the lock, because every save replaces it by rename, so an
 /// empty, owner-only sidecar `.<name>.lock` that is never replaced or deleted
-/// holds it. A filesystem that cannot lock at all goes ahead unlocked — the
-/// update is still made against a fresh read — and anything else that keeps
-/// the lock from being taken is an error, and nothing is saved.
+/// holds it. The sidecar sits beside the file a save actually replaces — a
+/// symlinked state file's target — so two clients reaching one file by
+/// different paths take one lock (Qodo, PR #2321).
+///
+/// Only the other client still holding the lock after
+/// [`STAR_PROMPT_LOCK_WAIT`] is an error, and nothing is saved then. A sidecar
+/// that cannot be opened, or a filesystem that cannot lock (`Unsupported`, or
+/// an NFS home without a lock daemon's `ENOLCK`), goes ahead unlocked: the
+/// update is still made against a fresh read, and refusing there would count
+/// no launch and save no choice at all (Qodo, PR #2321).
 fn lock_star_prompt(path: &Path) -> Result<Option<std::fs::File>, String> {
-    let name = path
+    let target = resolve_symlink_chain(path);
+    let name = target
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "star-prompt-state.json".to_string());
-    let lock_path = path.with_file_name(format!(".{name}.lock"));
+    let lock_path = target.with_file_name(format!(".{name}.lock"));
     let mut options = std::fs::OpenOptions::new();
     options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     crate::platform::fsperm::set_create_mode_owner_only(&mut options);
-    let file = options.open(&lock_path).map_err(|e| {
-        format!(
-            "Failed to open the star prompt lock at {}: {e}",
-            lock_path.display()
-        )
-    })?;
+    let Ok(file) = options.open(&lock_path) else {
+        return Ok(None);
+    };
     let deadline = std::time::Instant::now() + STAR_PROMPT_LOCK_WAIT;
     loop {
         match file.try_lock() {
@@ -2228,15 +2233,7 @@ fn lock_star_prompt(path: &Path) -> Result<Option<std::fs::File>, String> {
                     lock_path.display()
                 ));
             }
-            Err(std::fs::TryLockError::Error(e)) if e.kind() == std::io::ErrorKind::Unsupported => {
-                return Ok(None);
-            }
-            Err(std::fs::TryLockError::Error(e)) => {
-                return Err(format!(
-                    "Failed to lock the star prompt state at {}: {e}",
-                    lock_path.display()
-                ));
-            }
+            Err(std::fs::TryLockError::Error(_)) => return Ok(None),
         }
     }
 }
@@ -4279,6 +4276,30 @@ command = "vim"
             8,
             "the save went through"
         );
+    }
+
+    /// PRD #2174 (Qodo, PR #2321): two clients reaching one state file by
+    /// different paths — one through a symlink — take the same lock, the one
+    /// beside the file a save replaces.
+    #[cfg(unix)]
+    #[test]
+    fn star_prompt_lock_sits_beside_the_symlink_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real").join("star.json");
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, "{}").unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let held = lock_star_prompt(&target)
+            .unwrap()
+            .expect("the lock is taken");
+        assert!(dir.path().join("real").join(".star.json.lock").exists());
+        assert!(!dir.path().join(".link.json.lock").exists());
+        // Held through the real path, the link's lock is the same one: taking
+        // it from another handle waits the whole bound and is refused.
+        assert!(lock_star_prompt(&link).is_err());
+        drop(held);
+        assert!(lock_star_prompt(&link).unwrap().is_some());
     }
 
     /// PRD #2174 (Qodo, PR #2321): a symlinked state file — kept with
