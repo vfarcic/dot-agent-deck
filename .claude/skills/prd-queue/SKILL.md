@@ -1,6 +1,6 @@
 ---
 name: prd-queue
-description: 'Build the queue of open PRDs that are actually available to work — those carrying a PRD document and not already in flight — then claim them and dispatch one isolated unit per PRD. Asks the shape per PRD and composes the task DIFFERENTLY for each: a single agent is pointed at /prd-full, while a team is governed by the orchestrator role template and told explicitly not to run it. Use when asked to find a PRD to work on, pick a PRD off the backlog, or run several PRDs in parallel. It does no implementing itself — for one PRD you intend to run yourself, use /prd-full directly.'
+description: 'Build the queue of open PRDs that are actually available to work — those carrying a PRD document and not already in flight — then claim them and dispatch one isolated unit per PRD. Chooses the shape of each PRD with /dispatch-shape and composes the task DIFFERENTLY for each shape: a single agent is pointed at /prd-full, while a team is governed by the orchestrator role template and told explicitly not to run it. Use when asked to find a PRD to work on, pick a PRD off the backlog, or run several PRDs in parallel. It does no implementing itself — for one PRD you intend to run yourself, use /prd-full directly.'
 user-invocable: true
 ---
 
@@ -8,7 +8,7 @@ user-invocable: true
 
 Third sibling of `/issue-queue` and `/pr-review-queue`, for PRDs. Same discipline: select, ask, claim, dispatch, report. The work happens inside dispatched units, never here.
 
-**What makes this one different is step 8.** For issues and PRs the composed task is the same document whatever shape the unit takes. For a PRD it is not: `/prd-full` is the right instruction for a single agent and the *wrong* one for a team, so the shape answered in step 7 decides which of two task documents step 8 writes. That decision is the reason this skill exists, and it is the one thing here you must not carry over from `/issue-queue` unchanged.
+**What makes this one different is step 8.** For issues and PRs the composed task is the same document whatever shape the unit takes. For a PRD it is not: `/prd-full` is the right instruction for a single agent and the *wrong* one for a team, so the shape chosen in step 7 decides which of two task documents step 8 writes. That decision is the reason this skill exists, and it is the one thing here you must not carry over from `/issue-queue` unchanged.
 
 ## When to use this
 
@@ -25,7 +25,7 @@ Not this skill:
 
 It **never implements a PRD, never writes a test plan, and never diagnoses beyond what selection requires**. Reading a PRD document to judge scope and pick a shape is in bounds; reading `src/` to design the implementation is not. If you are editing files under `src/` or `tests/`, you have left this skill.
 
-It also does not decide the shape. Step 7 asks.
+It also does not define how the shape is chosen. Step 7 applies [`dispatch-shape`](../dispatch-shape/SKILL.md), which does.
 
 ## Prerequisite — this skill only runs inside a deck pane
 
@@ -327,38 +327,18 @@ Check both spellings if step 4c turned up an `issue-<n>` branch for this PRD —
 
 A name is single-use: removing a worktree keeps its branch, so a surviving `agent/dispatch-prd-<n>` refuses a re-dispatch. **If it is taken, pick a different name** — `prd-<n>-<MMDD>` disambiguates a second attempt. **Do not delete the branch to free the name.** It may hold committed work that was never pushed, and it is the only reference to it; the refusal is deliberate for exactly that reason. The mechanics, and the deliberate `git branch -D` route out of them, are in [`docs/dispatcher-mode.md`](../../../docs/dispatcher-mode.md) — that is the runner's call, with the branch's contents in front of them, not this skill's.
 
-## Step 7 — Establish the shape and the provider, by asking
+## Step 7 — Choose the shape with `dispatch-shape`, and default the provider
 
-Two questions have to be answered before any dispatch, and they are **different kinds of question**. Neither is deducible from the PRD's size, labels or wording. Ask both — never infer either.
+**Choose each PRD's shape with the [`dispatch-shape`](../dispatch-shape/SKILL.md) skill, and say which you chose and why.** It holds the whole rule — the divisibility criteria, "when close, take `--single`", deciding per unit rather than once per batch, the worked examples (two of them PRDs), the one-line reason, the runner's override, the explicit flag, running `--list-targets` once and what to do when it errors, and which orchestration to name. Until issue #2313 this step asked the runner the shape of every PRD and the provider once per session, so a batch mixing issues and PRDs stopped to ask about the PRDs while `/issue-queue` decided the issues itself.
 
-Run the listing **once**. It is a read-only daemon round-trip and its answer describes the repo, not the unit:
+**A PRD is not a team by being a PRD.** `dispatch-shape` decides from whether the work divides — parts that can progress independently, or a design decision plus implementation plus verification that are each substantial — not from the kind of work or its size. Apply its criteria to the PRD document the unit will work from; step 5's scope read is that reading, and reading the PRD further to judge its shape is in bounds (see what this skill does not do).
 
-```bash
-dot-agent-deck dispatch --list-targets
-```
+What stays specific to this queue:
 
-### Shape — one agent or a team — asked **once per PRD**
-
-Show the runner the output and ask, **for each PRD separately**, which shape it should take. Then **pass the matching flag explicitly on every dispatch** (`--single`, or `--orchestration '<name>'` with the name spelled out — the value is required, and `--list-targets` is where you get it). With neither flag the shape falls back to whatever the repo's config implies, which is the guess this step exists to avoid.
-
-**Per PRD, not per batch, and here that is a stronger rule than it is in `/issue-queue`** (#674). There, a batch-level answer produces one wrong flag; here it also picks the wrong *task document*, because step 8 branches on this answer. Two PRDs in one batch routinely differ in kind — a documentation-shaped PRD and a six-role implementation are not the same work — and the batch-level question has already produced an answer the runner did not want. A homogeneous batch may reuse one answer, but say so out loud rather than assuming it.
-
-### Provider — which orchestration — asked **once per session**
-
-Since issue #705 this repo defines **three** orchestrations rather than one: `mixed`, `anthropic` and `GPT`. They run the identical six roles with the identical prompts, workflow and delegation contract; only which agent each role launches differs. So the listing now offers three, and the old single question — "one agent or a team?" — has quietly become a four-way one.
-
-**Do not ask it that way.** Fold the provider into the per-PRD shape question and the runner re-answers a settled decision on every PRD in the batch:
-
-- **Shape** is a property of **the work**. Is it divisible, does it need independent review? Two PRDs in one batch genuinely differ, which is why it is asked per PRD above.
-- **Provider** is a property of **the session**. Which credits are healthy today, which stack the runner wants exercised. It does not vary with the PRD at all, and asking a runner the same provider question five times in one batch is the symptom to avoid.
-
-So ask the provider **once**, the first time a PRD in this batch turns out to want an orchestration, and reuse that answer for the rest of the session. Re-ask only if the runner raises it, or if a dispatch fails on that provider's credentials — which is the case the three orchestrations exist for: switching the whole team to another provider mid-batch is a different `--orchestration` value and nothing else.
-
-**Pass the name explicitly, always. Never a bare `--orchestration=`.** The bare form opens whichever orchestration the repo declares as its default, which is currently `mixed` — a fact about the config file, not a choice the runner made in this conversation. `--list-targets` marks that one with `[default]`; the marker is there to inform the question, not to answer it. If the runner expresses no preference, say which one you are taking and why (`mixed` is the declared default and exercises the most providers) rather than silently omitting the flag.
-
-### If the listing fails
-
-**If `--list-targets` errors**, you have none of the answers. The message says which case it is: `DOT_AGENT_DECK_PANE_ID environment variable not set` means nothing can be dispatched from here at all (see the prerequisite), and `the daemon did not answer list-targets` means no daemon or an older build. **Take that to the runner rather than acting on it** — a failed query is not a reason to start guessing.
+- **Per PRD, not per batch, and here that is a stronger rule than it is in `/issue-queue`** (#674). There, a wrong batch-level shape produces one wrong flag; here it also picks the wrong *task document*, because step 8 branches on the shape. Two PRDs in one batch routinely differ in whether they divide — a single desktop dialog and a change spanning the daemon and both clients are not the same work.
+- **The provider defaults to `mixed`, as `dispatch-shape` says, and is not asked.** Shape is a property of the PRD; provider is a property of the session, so it does not vary from one PRD to the next. Say which orchestration you named. Re-ask only if the runner raises it, or if a dispatch fails on that provider's credentials — which is the case the three orchestrations (`mixed`, `anthropic`, `GPT`, issue #705) exist for: switching the whole team to another provider mid-batch is a different `--orchestration` value and nothing else — and carry that answer to every later unit.
+- **The runner's own word in the conversation still wins.** If they name a shape or a provider, for one PRD or for the whole batch, take it and stop applying the criteria to those PRDs.
+- **Report each shape with its one-line reason** when you dispatch and again in step 9. Here the reason also explains which task document the unit received.
 
 ## Step 8 — Compose the task in a FILE, and compose it **for the shape**
 
@@ -371,7 +351,7 @@ dot-agent-deck dispatch prd-<n> --single --task-file '.dot-agent-deck/prd-<n>.md
 dot-agent-deck dispatch prd-<n> --orchestration 'mixed' --task-file '.dot-agent-deck/prd-<n>.md'
 ```
 
-**`mixed` is written out here as an example, not as a default to copy.** Substitute whatever the runner chose in step 7 — `anthropic` or `GPT` are the other two. The flag's value is required either way; a bare `--orchestration=` would take the repo's declared default, which is an answer nobody in this conversation gave.
+**`mixed` is written out here as an example, not as a default to copy.** Substitute whatever step 7 settled on — `anthropic` or `GPT` are the other two. The flag's value is required either way; a bare `--orchestration=` would take the repo's declared default, which is an answer nobody in this conversation gave.
 
 **This is a safety rule, not an ergonomic one, and the product says so itself.** The delegation protocol compiled into the binary and handed to every orchestrator it spawns (`src/orchestrator_context.rs`) states that `--task "…"` is a fallback safe *only* when the whole task is **a single line of plain text with no backticks, no `$`, no `"`, no `\` and no `!`**. Both templates below are multi-line blocks quoting code and CLI flags, so they fail that allowlist on shape alone.
 
@@ -723,7 +703,7 @@ Re-check **immediately before each dispatch**, not once for the batch. PRDs move
 
 ## Step 9 — Report where the work went
 
-Give the runner, per unit: PRD number, the shape it was dispatched in and the flag used, the worktree path as `dispatch` reported it, and the branch. Then state plainly:
+Give the runner, per unit: PRD number, the shape it was dispatched in with step 7's one-line reason and the flag used, the worktree path as `dispatch` reported it, and the branch. Then state plainly:
 
 - **Nothing reports back to this pane.** `dispatch` is fire-and-forget with no return edge. Point at the worktree paths and the units' own tabs; never say results will arrive here. For a team unit, add that its Telegram notification at the merge gate is the one channel that *does* reach the runner, and that it is best-effort.
 - **Which shape each PRD got, and therefore which task it received.** A team unit was told not to run `/prd-full` and a single unit was told to; if the runner later wonders why two units behaved differently on similar PRDs, this line is the answer.

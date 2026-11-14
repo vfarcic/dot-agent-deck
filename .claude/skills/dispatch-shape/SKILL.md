@@ -1,6 +1,6 @@
 ---
 name: dispatch-shape
-description: Choose the shape of a unit you are about to dispatch in this repo — one agent (`--single`) or a team (`--orchestration '<name>'`) — from divisibility criteria instead of asking, and report the shape you chose with a one-line reason. Use whenever you are about to run `dot-agent-deck dispatch` in this repo for any reason — an ad-hoc "start X as a separate line of work" in a dispatcher pane, `/issue-queue`, or any other skill that dispatches. It is the maintainer's standing answer to the dispatcher prompt's shape question for this repo; the user's own word in the conversation still wins, and `/prd-queue` keeps its own per-PRD question. Before the first dispatch, also run `/dispatch-base`, which brings the base every unit is cut from up to date.
+description: Choose the shape of a unit you are about to dispatch in this repo — one agent (`--single`) or a team (`--orchestration '<name>'`) — from divisibility criteria instead of asking, and report the shape you chose with a one-line reason. Use whenever you are about to run `dot-agent-deck dispatch` in this repo for any reason — an ad-hoc "start X as a separate line of work" in a dispatcher pane, `/issue-queue`, `/prd-queue`, or any other skill that dispatches. It is the maintainer's standing answer to the dispatcher prompt's shape question for this repo; the user's own word in the conversation still wins. Before the first dispatch, also run `/dispatch-base`, which brings the base every unit is cut from up to date.
 user-invocable: true
 ---
 
@@ -8,7 +8,7 @@ user-invocable: true
 
 A unit starts either as **one agent** or as a **multi-role orchestration**. In this repo, **choose it yourself, from the criteria below, and say which you chose and why.** Do not ask per unit, and do not fall back to a default without applying the test.
 
-This skill is where that decision is defined for **every** dispatch made in this repo — an ad-hoc request in a dispatcher pane ("start X as a separate line of work"), `/issue-queue`, or any other skill that dispatches — except the skills named under [Where this skill does not decide the shape](#where-this-skill-does-not-decide-the-shape), which carry a shape step of their own.
+This skill is where that decision is defined for **every** dispatch made in this repo — an ad-hoc request in a dispatcher pane ("start X as a separate line of work"), `/issue-queue`, `/prd-queue`, or any other skill that dispatches — except the skills named under [Where this skill does not decide the shape](#where-this-skill-does-not-decide-the-shape), which carry a shape step of their own.
 
 ## Before the first dispatch, bring the base up to date with `dispatch-base`
 
@@ -24,9 +24,11 @@ Dispatcher mode seeds every dispatcher pane with `DISPATCHER_SEED_PROMPT` (`src/
 
 **The user's word in the conversation still wins.** If they name a shape — for one unit or for a whole batch — take it and stop applying the criteria to those units. A standing answer is a default the user set; a fresh one replaces it.
 
-## The criterion is DIVISIBILITY, not size
+## The criterion is DIVISIBILITY, not size or kind
 
 A large change confined to one function is a single agent; a medium one spread across separate modules with a decision to argue may be a team. Asking "how big is this?" produces teams on hard problems that do not divide, which is the failure this criterion guards against.
+
+**The kind of work does not decide the shape on its own either.** Whether the unit is a PRD or an issue, a feature or a bug, does not tell you whether it divides: a small PRD confined to one desktop dialog is single-agent work, and a defect that needs a transition decision across two subsystems can be team work. Read the work, not its label, and apply the same tests below to both (issue #2313 removed a condition that picked a team for any PRD or user-facing feature).
 
 Take **`--single`** when any of these holds:
 
@@ -39,7 +41,6 @@ Take **`--orchestration 'mixed'`** only when the work genuinely splits:
 
 - it touches **separate modules or components** that can progress independently (e.g. both socket paths *and* the hook-endpoint writers *and* a permission helper);
 - it carries a **design or transition decision plus implementation plus its own verification**, each substantial;
-- it is a **PRD or a user-facing feature** with milestones rather than a defect;
 - independent review inside the unit would genuinely catch something — not merely "this feels big".
 
 **When the two readings are close, take `--single`.** A team in one file produces internal conflicts and a longer path to the same diff; a single agent on a divisible task merely takes longer. The failure modes are not symmetric.
@@ -50,7 +51,12 @@ Take **`--orchestration 'mixed'`** only when the work genuinely splits:
 
 ## Worked examples
 
-From the 2026-09-19 `/issue-queue` loop. `--single`: a mixed-separator path fix and a log-path default (two one-function fixes, bundled); ~23 tracing call sites needing the same escape helper (mechanical sweep); a delegate readiness race (one decision, one seam); a desktop pane's staleness affordance (one product call). `--orchestration 'mixed'`: a voice-control PRD (new user-facing feature with milestones); a product website (design exploration, build, content, publish); and the `/tmp` endpoint squat, which moves two socket paths *and* the hook-endpoint writers *and* needs a transition strategy plus a versioning decision.
+From the 2026-09-19 `/issue-queue` loop. `--single`: a mixed-separator path fix and a log-path default (two one-function fixes, bundled); ~23 tracing call sites needing the same escape helper (mechanical sweep); a delegate readiness race (one decision, one seam); a desktop pane's staleness affordance (one product call). `--orchestration 'mixed'`: a voice-control PRD (PRD #802: a Rust-side command table, a frontend action registry, a linkage-check guard, a settings section and microphone capture, which progress independently); a product website (design exploration, build, content, publish); and the `/tmp` endpoint squat, which moves two socket paths *and* the hook-endpoint writers *and* needs a transition strategy plus a versioning decision.
+
+Two PRDs, one on each side, because a PRD is not a team by being a PRD:
+
+- **`--single`: PRD #2174**, a star-repo reminder dialog in the desktop app that reuses the TUI's existing schedule and choices. One dialog on one surface, plus one decision (the two clients share one reminder state), with no daemon or protocol change — two agents would collide in the same component.
+- **`--orchestration 'mixed'`: a PRD that spans the daemon, the TUI and the desktop**, such as a new daemon verb that both clients send, gated on a capability, and owing its own cross-version verification (CLAUDE.md rule 12). The daemon half, each client's half and the cross-version run can progress independently, and the gating is a decision worth arguing before any of them is written.
 
 ## Record the choice with a one-line reason
 
@@ -88,10 +94,9 @@ If the user has no preference, say which one you are taking and why (`mixed` is 
 
 ## Where this skill does not decide the shape
 
-Three dispatching skills in this repo carry a shape step of their own, and **inside them their own steps govern — the shape and which orchestration to name — not this skill**, so neither the criteria nor the `mixed` default above applies there:
+Two dispatching skills in this repo carry a shape step of their own, and **inside them their own steps govern — the shape and which orchestration to name — not this skill**, so neither the criteria nor the `mixed` default above applies there:
 
-- **`/prd-queue`** asks the shape once per PRD (its step 7), because there the shape also decides which of two task documents its step 8 writes — `/prd-full` for a single agent, the orchestrator role template for a team. It also asks the provider once per session, the first time a PRD wants a team (the same step), rather than defaulting to `mixed`. Issue #1425 left it unchanged on purpose; whether it should use this skill instead is an open question, not a settled one.
 - **`/pr-review-queue`** asks the shape once per PR (its step 2b), showing the `--list-targets` output, so the answer names the orchestration too. Issue #1425 did not revisit it.
 - **`/code-cleanup`** dispatches every unit `--single`, by the maintainer's decision (its step 4). One bounded area and one small PR is confined work, so the criteria above would choose the same; that skill fixes it rather than re-deciding it per unit.
 
-Everywhere else in this repo — an ad-hoc dispatch, `/issue-queue`, or a skill written later without a shape step of its own — this skill decides.
+Everywhere else in this repo — an ad-hoc dispatch, `/issue-queue`, `/prd-queue`, or a skill written later without a shape step of its own — this skill decides.
