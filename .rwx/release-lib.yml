@@ -125,7 +125,7 @@ tasks:
     if: ${{ tasks.backend.values.rust == 'true' }}
     call: nodejs/install 1.2.0
     with:
-      node-version: "26.13.0"
+      node-version: "26.13.1"
 
   - key: release-lib
     if: ${{ tasks.backend.values.rust == 'true' }}
