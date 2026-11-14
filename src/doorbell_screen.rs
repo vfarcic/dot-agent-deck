@@ -465,11 +465,28 @@ fn codex_numbered(grid: &Grid, row: u16) -> bool {
     digits > 0 && text[digits..].starts_with('.')
 }
 
+/// Append Codex's next wrapped row to the text read so far. Codex wraps a
+/// long line at a space, which the row break replaces, or right after a
+/// hyphen, which keeps its place with no space after it: measured on live
+/// Codex 0.164.0, which drew the deck's line naming
+/// `…/dad-tests-3260328-xsMumn/…` as `…/dad-tests-3260328-` over
+/// `xsMumn/…` (`inbox/codex/009`, 2026-11-10, issue #1730). So a row that
+/// ends in `-` joins the next with nothing between them, and any other row
+/// with one space. The reading is the deck's own line exactly when the rows
+/// came from wrapping it; a draft whose own text has a hyphen before a space
+/// at the wrap point reads without that space, as text the deck did not type.
+pub fn codex_join_wrapped(text: &mut String, next: &str) {
+    if !text.ends_with('-') {
+        text.push(' ');
+    }
+    text.push_str(next);
+}
+
 /// The composer: the lowest row whose first cell is a bold `›` that is
 /// neither dim (a submitted message in the transcript, whose glyph Codex
 /// draws dim) nor inverse (a dialog's highlighted choice), with its text from column 2 and the rows
-/// below it at the same indent until a blank row, joined at single spaces
-/// (Codex wraps the line at word boundaries).
+/// below it at the same indent until a blank row, joined as Codex wrapped
+/// them ([`codex_join_wrapped`]).
 fn codex_composer(grid: &Grid) -> Option<Composer> {
     let prompt_row = (0..grid.rows).rev().find(|&r| {
         codex_glyph(grid, r).is_some_and(|c| c.bold && !c.dim && !c.inverse)
@@ -485,8 +502,7 @@ fn codex_composer(grid: &Grid) -> Option<Composer> {
         }
         // A row below the composer that is not its continuation: the model
         // line and the footer sit after a blank row.
-        text.push(' ');
-        text.push_str(next.trim_start());
+        codex_join_wrapped(&mut text, next.trim_start());
         last_row = row;
         row += 1;
     }
@@ -578,8 +594,7 @@ fn codex_transcript_user_line(grid: &Grid, line: &str) -> bool {
             if next.trim().is_empty() || !next.starts_with("  ") {
                 break;
             }
-            text.push(' ');
-            text.push_str(next.trim());
+            codex_join_wrapped(&mut text, next.trim());
             row += 1;
         }
         text == line
@@ -1245,26 +1260,96 @@ fn standin_from(lookup: impl Fn(&str) -> Option<String>) -> Option<std::path::Pa
 }
 
 /// Whether process `pid` runs `binary`: one of its arguments is that path,
-/// as a script's interpreter is given it (Linux; elsewhere nothing is read,
-/// and the stand-in is not recognised).
+/// as a script's interpreter is given it. Linux reads `/proc/<pid>/cmdline`,
+/// macOS `sysctl(KERN_PROCARGS2)` ([`standin_arguments`]), both without
+/// starting a process, since the doorbell asks at every attempt; elsewhere
+/// nothing is read, and the stand-in is not recognised.
 #[cfg(feature = "e2e")]
 pub fn standin_running(pid: Option<u32>, binary: &std::path::Path) -> bool {
-    #[cfg(target_os = "linux")]
-    {
-        let Some(pid) = pid else {
-            return false;
-        };
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            return false;
-        };
-        let wanted = binary.as_os_str().as_encoded_bytes();
-        cmdline.split(|b| *b == 0).any(|arg| arg == wanted)
+    let Some(arguments) = pid.and_then(standin_arguments) else {
+        return false;
+    };
+    let wanted = binary.as_os_str().as_encoded_bytes();
+    arguments.iter().any(|arg| arg.as_slice() == wanted)
+}
+
+/// Process `pid`'s arguments, as raw bytes, or `None` when they cannot be
+/// read ([`standin_running`]).
+#[cfg(all(feature = "e2e", target_os = "linux"))]
+fn standin_arguments(pid: u32) -> Option<Vec<Vec<u8>>> {
+    let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+    Some(cmdline.split(|b| *b == 0).map(<[u8]>::to_vec).collect())
+}
+
+/// See the Linux variant. `KERN_PROCARGS2` answers the argument count, the
+/// executable's path, NUL padding, then the arguments, each NUL-terminated
+/// (`xnu`'s `sysctl_procargsx`); the environment that follows is not read.
+/// Off Linux this was `false` until issue #2237, so no stand-in doorbell
+/// test could pass on macOS.
+#[cfg(all(feature = "e2e", target_os = "macos"))]
+fn standin_arguments(pid: u32) -> Option<Vec<Vec<u8>>> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
+    let mut size: libc::size_t = 0;
+    // SAFETY: a size query: no buffer, `size` receives the length needed.
+    let asked = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if asked != 0 || size == 0 {
+        return None;
     }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = (pid, binary);
-        false
+    let mut buffer = vec![0u8; size];
+    // SAFETY: `buffer` holds `size` bytes, and the kernel writes at most that
+    // many, storing how many it wrote back into `size`.
+    let read = unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            mib.len() as libc::c_uint,
+            buffer.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if read != 0 {
+        return None;
     }
+    parse_procargs2(&buffer[..size.min(buffer.len())])
+}
+
+/// [`standin_arguments`]'s parser of a `KERN_PROCARGS2` buffer.
+#[cfg(all(feature = "e2e", any(target_os = "macos", test)))]
+fn parse_procargs2(buffer: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let count = i32::from_ne_bytes(buffer.get(..4)?.try_into().ok()?);
+    let count = usize::try_from(count).ok()?;
+    let rest = &buffer[4..];
+    // The executable's path, then the NULs that pad it.
+    let path_end = rest.iter().position(|b| *b == 0)?;
+    let rest = &rest[path_end..];
+    let start = rest.iter().position(|b| *b != 0)?;
+    // Only NUL-terminated strings count: what follows the last NUL is a
+    // truncated string, not an argument.
+    let mut terminated: Vec<&[u8]> = rest[start..].split(|b| *b == 0).collect();
+    terminated.pop();
+    let arguments: Vec<Vec<u8>> = terminated
+        .into_iter()
+        .take(count)
+        .map(<[u8]>::to_vec)
+        .collect();
+    (arguments.len() == count).then_some(arguments)
+}
+
+/// See the Linux variant.
+#[cfg(all(feature = "e2e", not(any(target_os = "linux", target_os = "macos"))))]
+fn standin_arguments(_pid: u32) -> Option<Vec<Vec<u8>>> {
+    None
 }
 
 /// The profile a record names.
@@ -1664,5 +1749,40 @@ mod e2e_only_standin_tests {
         let mut wider = crate::vt_grid::parser(45, 160, 0);
         wider.process(&standin_frame(170, "", None));
         assert!(!(p.width_witness)(wider.screen(), &WidthsSeen::of([160])));
+    }
+
+    /// Issue #2237: the doorbell recognises the stand-in by reading the pane
+    /// process's arguments, on macOS as on Linux. This test process runs its
+    /// own `argv[0]` and not a path it was never given; a pid no process
+    /// holds, or none, runs nothing. Off Linux and macOS the arguments are
+    /// not read, so the positive case is not asserted there.
+    #[test]
+    fn standin_running_reads_a_live_process_arguments() {
+        let me = std::process::id();
+        let own = std::path::PathBuf::from(std::env::args_os().next().expect("argv[0]"));
+        let elsewhere = std::path::Path::new("/nonexistent/doorbell-standin.py");
+        assert!(!standin_running(Some(me), elsewhere));
+        assert!(!standin_running(Some(u32::MAX >> 1), &own));
+        assert!(!standin_running(None, &own));
+        if cfg!(any(target_os = "linux", target_os = "macos")) {
+            assert!(standin_running(Some(me), &own), "{own:?}");
+        }
+    }
+
+    /// [`parse_procargs2`] reads the argument count, skips the executable's
+    /// path and its NUL padding, and stops at the count, before the
+    /// environment; a buffer shorter than its count reads as nothing.
+    #[test]
+    fn procargs2_yields_the_arguments_and_not_the_environment() {
+        let mut buffer = 2i32.to_ne_bytes().to_vec();
+        buffer.extend_from_slice(b"/usr/bin/python3\0\0\0\0python3\0/tmp/standin.py\0HOME=/h\0");
+        assert_eq!(
+            parse_procargs2(&buffer),
+            Some(vec![b"python3".to_vec(), b"/tmp/standin.py".to_vec()])
+        );
+        let mut short = 3i32.to_ne_bytes().to_vec();
+        short.extend_from_slice(b"/bin/sh\0sh\0-c\0");
+        assert_eq!(parse_procargs2(&short), None);
+        assert_eq!(parse_procargs2(b"\x01\0"), None);
     }
 }

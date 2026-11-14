@@ -1390,6 +1390,24 @@ pub fn prepare_orchestration_before(
         split(&err, Some(dir.as_path()))
     })?;
 
+    // PRD #1885: nothing from an orchestration whose commands and prompts are
+    // not the approved text is published or launched. Refused here, before the
+    // publish, with a typed code a new client recognises (it asks the user to
+    // approve, through `ProjectTrustState` / `ApproveProjectTrust`) and a
+    // sentence an older client shows as it is, naming the CLI command that
+    // approves it.
+    {
+        let check = crate::project_trust::check_blocking(
+            &crate::project_trust::TrustStore::default_location(),
+            &dir,
+            orch,
+        );
+        crate::project_trust::log_refusal("prepare-orchestration", &check);
+        if let Some(refusal) = check.refusal() {
+            return Err(not_approved_refusal(&refusal));
+        }
+    }
+
     // The project directory's own identity, read BEFORE the publish so it
     // describes the directory this preparation actually resolved and wrote into.
     // A `None` here is not a soft failure: it means the platform has no inode
@@ -1702,6 +1720,19 @@ fn revalidate_approved_roles(
             return Err(PreparationStale::OrchestrationAmbiguous);
         }
     };
+    // PRD #1885: what this start would run is judged on this read, not trusted
+    // from the preparation's — `config_revision` is a change hint, not a
+    // commitment, and an approval can be revoked in between.
+    if !crate::project_trust::check_blocking(
+        &crate::project_trust::TrustStore::default_location(),
+        &dir,
+        orch,
+    )
+    .verdict
+    .is_approved()
+    {
+        return Err(PreparationStale::NotApproved);
+    }
     // Captured before the context checks so the returned list is the one the
     // orchestration lookup just matched, rather than a second lookup's.
     //
@@ -1914,6 +1945,11 @@ pub enum PreparationStale {
     /// Same inode, different bytes — an in-place rewrite, which a `>` redirect
     /// or another tool's `fs::write` performs.
     ContextRewritten,
+    /// PRD #1885: the orchestration's commands and prompts, as the config now
+    /// reads, are not the approved text (the approval was revoked, or the text
+    /// changed in a way the revision did not catch). Preparing again answers the
+    /// `not-approved` refusal that says how to approve it.
+    NotApproved,
 }
 
 impl PreparationStale {
@@ -1938,6 +1974,9 @@ impl PreparationStale {
             }
             Self::ContextReplaced => "the published orchestrator context has been replaced",
             Self::ContextRewritten => "the published orchestrator context has been rewritten",
+            Self::NotApproved => {
+                "the prepared orchestration's commands and prompts are not approved as they now read"
+            }
         }
     }
 }
@@ -2314,6 +2353,18 @@ pub fn stale_revision_refusal() -> String {
     )
 }
 
+/// PRD #1885: the refusal a `PrepareOrchestration` of an orchestration whose
+/// commands and prompts are not approved gets: the
+/// [`crate::daemon_protocol::PROJECT_ERR_NOT_APPROVED`] code, then the
+/// refusal's own sentence, which names the orchestration, the project, why, and
+/// the command that approves it.
+pub fn not_approved_refusal(refusal: &str) -> String {
+    format!(
+        "{}: {refusal}",
+        crate::daemon_protocol::PROJECT_ERR_NOT_APPROVED
+    )
+}
+
 /// The refusal a `PrepareOrchestration` naming an orchestration the project does not
 /// define gets.
 ///
@@ -2435,6 +2486,13 @@ command = "cat"
 
     fn write_project(dir: &Path, toml: &str) {
         std::fs::write(dir.join(CONFIG_FILE_NAME), toml).expect("seed project config");
+        // PRD #1885: preparing runs only an approved orchestration, and these
+        // tests are about the preparation. Best effort: some seed a config that
+        // does not parse, which there is then nothing to approve in.
+        let _ = crate::project_trust::approve_all(
+            &crate::project_trust::TrustStore::default_location(),
+            dir,
+        );
     }
 
     /// A canonical scratch root. Canonicalised because the harness temp base can

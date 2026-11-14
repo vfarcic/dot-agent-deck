@@ -961,7 +961,16 @@ fn history_submit_trial(
         .map(|i| char::from(alphabet[(trial * 3 + i * 5 + presses * 7 + cols as usize) % 16]))
         .collect();
     let id = format!("m-hist319{}-0f3c9a71d2e4b8{presses}{trial}", &case[..1]);
-    let line = format!("({token}){}", dot_agent_deck::doorbell::doorbell_line(&id));
+    // Issue #1730: the line a deck types names the binary its daemon runs.
+    let line = format!(
+        "({token}){}",
+        dot_agent_deck::doorbell::doorbell_line_naming(
+            &id,
+            common::contained_deck_binary()
+                .to_str()
+                .expect("the harness deck path is UTF-8")
+        )
+    );
     let capture = record(
         claude,
         Some((

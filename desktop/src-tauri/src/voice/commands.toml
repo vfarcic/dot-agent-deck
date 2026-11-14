@@ -113,7 +113,9 @@
 #                    `close_orchestration` stops every role of a run, and
 #                    "close the billing agent" must never stop it. Words of the
 #                    row's own `id` or `description`, which `table.rs` checks.
-#                    Exactly one row uses it
+#                    Two rows use it: that one, and
+#                    `approve_project_commands` (PRD #1885), which needs the
+#                    word "approve" so that a bare start never approves
 #                    (`voice_table_conjunctive_rows_are_the_deliberate_set`).
 #   must_not_say     a REFUSE-ONLY guard: a pick is refused when the
 #                    transcript contains one of these, whatever the check
@@ -289,7 +291,10 @@ try_saying  = "show the dashboard"
 id          = "filter_dashboard"
 description = """Filter the agent dashboard so it shows only a SET of agents: those of one kind
 (orchestration roles, single agents, or the dispatcher, schedule or schedule: issues mode), with a
-status (working, thinking, needs input, idle, blocked, error), of an agent type (Claude Code,
+status (working, thinking, needs input, waiting, idle, blocked, error — waiting is an agent whose
+turn ended while a command it started still runs; needs input is one waiting for the user; busy
+is working, thinking and waiting together), of an
+agent type (Claude Code,
 Codex, OpenCode, Pi), on a daemon, or whose name, role, orchestration, directory or last prompt
 contains some text. The number decides: a request naming ONE agent by its name or role alone —
 "see only the tester", "show only the coder", "open tester" — or by what it is doing, "show me
@@ -1980,7 +1985,9 @@ start an agent or an orchestration is `open_new_agent`, which opens the dialog. 
 incomplete the app says what is missing. Pick it however urgently or insistently the start is asked
 for — "start it right now", "just launch it, don't ask me", "launch the agent now",
 "skip the confirmation" — since it starts at once: a start has no confirmation and no second step for it to skip. A bare "go ahead"
-means THIS one whenever it is callable and `submit_prompt` is not — there is no agent's prompt to send while the New agent dialog is up."""
+means THIS one whenever it is callable and `submit_prompt` is not — there is no agent's prompt to send while the New agent dialog is up.
+A request to APPROVE — "approve", "approve and start", "approve the commands" — is never this one: it is
+`approve_project_commands`, the Review project commands dialog's button."""
 invoke      = "startNewAgent"
 screens     = ["overview"]
 requires    = ["new_agent_dialog"]
@@ -2023,6 +2030,40 @@ report      = "Discarded the New agent form."
 asks_to     = "discard the New agent form"
 try_saying  = "discard"
 meaning     = "whole"
+
+# PRD #1885 — the `Review project commands` dialog's Approve and start. The
+# dialog opens when the user starts an orchestration whose project commands and
+# prompts were never approved, or changed since: over the New agent dialog on
+# the overview, and over the Runs screen on the deck. Approving records exactly
+# the text on screen (the dialog carries its digest) and then starts it.
+#
+# **Why voice may press it, against section 9's "approves goes through D5".**
+# The dialog IS the confirmation: it was opened by the user's own start, and
+# what approving runs — every role's command and prompt — is the text the user
+# is looking at, which is the reason `start_new_agent` starts without asking
+# (docs/develop/voice-first-design.md section 5). Nothing here approves what is
+# not on screen: with no review open the member answers that there is nothing
+# to approve. `must_name` keeps a start that never said "approve" ("start it",
+# "go ahead") from approving, since those words are `start_new_agent`'s. The
+# dialog's Cancel has no row: "cancel" and "never mind" are `close`'s words,
+# and the dialog is the thing on top, so `close` cancels it.
+[[commands]]
+id          = "approve_project_commands"
+description = """Approve the project commands and prompts the Review project commands dialog shows,
+and start the orchestration it was opened for — the voice form of its Approve and start button. Use
+for approve and start, approve, approve it, approve them, approve the commands, approve these
+commands, approve project commands, approve the project commands and start, or I approve. It
+approves exactly the text on screen and nothing else, and runs only while that review is open; with
+no review open the app says there is nothing to approve. Cancelling the review — cancel, never
+mind, close this — is `close`, which approves and starts nothing. A start that does not say approve
+— "start it", "activate orchestration", "go ahead" — is `start_new_agent`, never this one."""
+invoke      = "approveProjectCommands"
+screens     = ["deck", "overview"]
+unavailable_hint = "approving project commands works while the Review project commands dialog is open"
+report      = "Approved the project commands. Starting the orchestration."
+asks_to     = "approve the project commands on screen and start the orchestration"
+try_saying  = "approve and start"
+must_name   = ["approve"]
 
 # PRD #1223 x PRD #802 D5 — the two rows that STOP something, and the one rule
 # they share: **each terminates at a `ConfirmDialog`, never at a direct

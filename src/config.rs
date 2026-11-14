@@ -139,6 +139,9 @@ impl BellConfig {
             // Issue #714: a quota-blocked agent needs a person just like an
             // erroring one, so it rings under the same switch.
             SessionStatus::Error | SessionStatus::Blocked => self.on_error,
+            // Issue #1757: Waiting's work is not done, so it never rings, even
+            // under `on_idle`; the bell rings on its later step to Idle.
+            SessionStatus::Waiting => false,
             _ => false,
         }
     }
@@ -1040,10 +1043,12 @@ pub struct OrchestrationSnapshot {
     /// Which roles had been started, by index into `roles`. Optional —
     /// snapshots that predate this field load with an empty list.
     ///
-    /// PRD #89 review-fix F3: FORWARD-COMPAT ONLY — captured (as
-    /// `vec![start_role_index]`) but not yet consumed on restore. Kept so a
-    /// later "restore which roles were started" feature has the data already
-    /// in old snapshots; do not assume a reader exists today.
+    /// Issue #929: from [`ORCHESTRATION_SNAPSHOT_VERSION`] 2 on, the roles
+    /// whose panes were live when the snapshot was written
+    /// ([`crate::tab::TabManager::record_started_roles`]), and the daemon-empty
+    /// restore starts only those ([`Self::roles_to_start_on_restore`]). A
+    /// version-1 snapshot always holds `[start_role_index]`, whatever was
+    /// running, so it is no record of what ran and restore ignores it.
     #[serde(default)]
     pub started_role_indices: Vec<usize>,
     /// PRD #89 review-fix F4: the user-typed orchestration tab TITLE
@@ -1053,6 +1058,41 @@ pub struct OrchestrationSnapshot {
     /// (the title then falls back to the resolved canonical name on restore).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display_title: Option<String>,
+}
+
+/// The [`OrchestrationSnapshot::version`] this build writes.
+///
+/// Issue #929 moved it from 1 to 2: a version-2 snapshot's
+/// `started_role_indices` lists the roles that were live when it was written,
+/// while a version-1 snapshot's was always `[start_role_index]`. Nothing else
+/// in the format changed, so each build still reads the other's snapshots: an
+/// older deck ignores the list and starts every role, as it always has.
+pub const ORCHESTRATION_SNAPSHOT_VERSION: u32 = 2;
+
+impl OrchestrationSnapshot {
+    /// Issue #929: which of the re-resolved orchestration's `role_count` roles
+    /// the daemon-empty restore starts, by index; a role it does not start
+    /// comes back as a dead slot. A snapshot older than version 2 starts every
+    /// role, as restore always has. A newer one starts the roles in
+    /// `started_role_indices`, ignoring an index past `role_count`, plus the
+    /// saved start role, which receives the replayed prompt and is the pane
+    /// that may delegate.
+    pub fn roles_to_start_on_restore(&self, role_count: usize) -> Vec<bool> {
+        if self.version < 2 {
+            return vec![true; role_count];
+        }
+        let mut start = vec![false; role_count];
+        for &index in self
+            .started_role_indices
+            .iter()
+            .chain(std::iter::once(&self.start_role_index))
+        {
+            if let Some(slot) = start.get_mut(index) {
+                *slot = true;
+            }
+        }
+        start
+    }
 }
 
 /// Issue #949 — where the user was looking when the snapshot was taken, so a
@@ -3494,6 +3534,68 @@ command = "vim"
         );
     }
 
+    /// Scenario: Build snapshots of a three-role orchestration and ask which
+    /// roles a daemon-empty restore starts. An old (`version = 1`) snapshot,
+    /// whose list was only ever `[start_role_index]`, starts every role however
+    /// its list reads; a current one starts the roles it lists plus the start
+    /// role, ignoring an index past the role count, and a current snapshot
+    /// written by a newer deck under a higher version is read the same way.
+    #[spec("config/saved-session/003")]
+    #[test]
+    fn saved_session_003_started_roles_are_honoured_only_from_a_current_snapshot() {
+        let snapshot = |version: u32, start: usize, started: Vec<usize>| OrchestrationSnapshot {
+            version,
+            roles: vec!["orchestrator".into(), "coder".into(), "reviewer".into()],
+            start_role_index: start,
+            orchestrator_prompt: String::new(),
+            config_name: "tdd-cycle".into(),
+            project_path: "/repo/app".into(),
+            started_role_indices: started,
+            display_title: None,
+        };
+
+        // Old snapshots: every role, whatever the list says.
+        for started in [vec![0], vec![0, 1], vec![]] {
+            assert_eq!(
+                snapshot(1, 0, started.clone()).roles_to_start_on_restore(3),
+                vec![true, true, true],
+                "a version-1 snapshot listing {started:?} must still start every role"
+            );
+        }
+        assert_eq!(
+            snapshot(0, 0, vec![0]).roles_to_start_on_restore(3),
+            vec![true, true, true],
+            "a malformed block that defaulted `version` to 0 is treated as old"
+        );
+
+        // Current snapshots: the listed roles.
+        assert_eq!(ORCHESTRATION_SNAPSHOT_VERSION, 2);
+        assert_eq!(
+            snapshot(2, 0, vec![0, 1]).roles_to_start_on_restore(3),
+            vec![true, true, false]
+        );
+        // The start role always starts — it is where the prompt goes and the
+        // one pane that may delegate — even if the list leaves it out.
+        assert_eq!(
+            snapshot(2, 1, vec![2]).roles_to_start_on_restore(3),
+            vec![false, true, true]
+        );
+        assert_eq!(
+            snapshot(2, 0, vec![]).roles_to_start_on_restore(3),
+            vec![true, false, false]
+        );
+        // An index past the roles is ignored rather than trusted.
+        assert_eq!(
+            snapshot(2, 0, vec![0, 7]).roles_to_start_on_restore(3),
+            vec![true, false, false]
+        );
+        // A newer deck's snapshot is still an honest list.
+        assert_eq!(
+            snapshot(3, 0, vec![0, 2]).roles_to_start_on_restore(3),
+            vec![true, false, true]
+        );
+    }
+
     #[test]
     fn saved_session_empty_default() {
         let session = SavedSession::default();
@@ -3734,6 +3836,36 @@ timeout_secs = 600
             !CONFIG_KEYS.iter().any(|(k, _)| k.starts_with("idle_art.")),
             "no idle_art.* key should remain in the `config set --help` listing"
         );
+    }
+
+    /// Issue #2085: `config get` answers each of these keys with its field's
+    /// value, moved off the default first; a key without its arm is refused.
+    #[test]
+    fn get_field_reads_each_bell_doorbell_and_command_key() {
+        let mut dc = DashboardConfig {
+            default_command: "my-agent --flag".into(),
+            ..Default::default()
+        };
+        dc.bell.enabled = !dc.bell.enabled;
+        dc.bell.on_waiting_for_input = !dc.bell.on_waiting_for_input;
+        dc.bell.on_idle = !dc.bell.on_idle;
+        dc.bell.on_error = !dc.bell.on_error;
+        dc.doorbell.claude = !dc.doorbell.claude;
+        dc.doorbell.codex = !dc.doorbell.codex;
+        for (key, expected) in [
+            ("default_command", dc.default_command.clone()),
+            ("bell.enabled", dc.bell.enabled.to_string()),
+            (
+                "bell.on_waiting_for_input",
+                dc.bell.on_waiting_for_input.to_string(),
+            ),
+            ("bell.on_idle", dc.bell.on_idle.to_string()),
+            ("bell.on_error", dc.bell.on_error.to_string()),
+            ("doorbell.claude", dc.doorbell.claude.to_string()),
+            ("doorbell.codex", dc.doorbell.codex.to_string()),
+        ] {
+            assert_eq!(dc.get_field(key), Ok(expected), "{key}");
+        }
     }
 
     /// PRD #1223: `config set default_dir` takes an absolute path, refuses a

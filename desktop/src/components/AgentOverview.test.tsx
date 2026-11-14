@@ -40,7 +40,7 @@ import { DeckShell, DeckSurface } from "../App";
 import { VoiceOn } from "../hooks/useVoiceOn";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import logoUrl from "../assets/logo.svg";
-import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, overviewFilterFacts, toOverviewAgent } from "./AgentOverview";
+import { agentDomKey, agentKey, AgentOverview, ALL_OVERVIEW_COLUMNS, countByStatus, OVERVIEW_CLOCK_TICK_MS, anonymousOrchestrationKey, DEFAULT_OVERVIEW_COLUMNS, gridTemplateFor, groupAgents, groupKey, hoistedCwdOf, orderedColumns, OVERVIEW_COLUMNS_STORAGE_KEY, PERMANENT_COLUMN, readStoredColumns, type OverviewAgent, type OverviewColumnId, type OverviewGroupKind, overviewFilterFacts, toOverviewAgent } from "./AgentOverview";
 import { filterDashboardAgents } from "../lib/dashboardFilter";
 import { DeckSelector } from "./DeckSelector";
 import { OpenPullRequest } from "../lib/prBrowser";
@@ -3400,5 +3400,24 @@ describe("AgentOverview across a fleet (PRD #742 M4)", () => {
     fireEvent.click(within(refusedGroup()).getByRole("button", { name: /Reconnect/ }));
     expect(reconnect).toHaveBeenCalled();
     expect(screen.queryByTestId("overview-connect-anyway-error")).not.toBeInTheDocument();
+  });
+});
+
+describe("Waiting in the status counts (issue #1757)", () => {
+  /**
+   * Scenario: count a group holding one agent of each of Idle, Waiting,
+   * Blocked and Running. Waiting is counted as its own status, after the
+   * states a person has to act on and the working one, and before Idle: its
+   * work is not done, but nothing needs the user.
+   */
+  it("counts Waiting on its own, between the states that need attention and Idle", () => {
+    const of = (status: string) => ({ status }) as unknown as OverviewAgent;
+    const counts = countByStatus([of("idle"), of("waiting"), of("blocked"), of("running"), of("waiting")]);
+    expect(counts).toEqual([
+      { status: "running", count: 1 },
+      { status: "blocked", count: 1 },
+      { status: "waiting", count: 2 },
+      { status: "idle", count: 1 },
+    ]);
   });
 });

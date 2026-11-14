@@ -73,6 +73,9 @@ fn write_config(deck: &TuiDeck, start: bool) {
     );
     std::fs::write(deck.workdir().join(".dot-agent-deck.toml"), config)
         .expect("write orchestration config");
+    // PRD #1885: approved as written, so the form opens it with no trust
+    // prompt; these tests are about the seat, not the gate.
+    deck.approve_project_trust(deck.workdir());
 }
 
 fn role_agent(deck: &TuiDeck, role: &str) -> AgentRecord {

@@ -12,6 +12,7 @@ import {
   type VoiceTranscriptionOutcomeDto,
 } from "../lib/bridge";
 import type { AgentSession, AgentTypeId, DeckActionResult, DeckRuntimeState } from "../types";
+import { agentTurn } from "../lib/promptKeys";
 import { READING_ALREADY_OFF, READING_ALREADY_ON } from "../lib/reading";
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, VoiceQuestionTarget } from "../lib/voiceQuestion";
 import { questionOptionsToSay } from "../lib/voiceQuestion";
@@ -36,6 +37,8 @@ vi.mock("./TerminalViewport", () => ({
 }));
 
 import { DeckShell as AppDeckShell } from "../App";
+import { ProjectTrustDialog } from "./ProjectTrustDialog";
+import { useProjectTrustReview, type ProjectTrust, type ProjectTrustTarget } from "../lib/projectTrust";
 
 /** Existing deck-specific voice cases enter the deck explicitly. */
 function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
@@ -43,6 +46,7 @@ function DeckShell(props: Parameters<typeof AppDeckShell>[0]) {
 }
 import {
   NOTHING_DISPATCHED,
+  REVIEW_MOVED_ON,
   SCREEN_MOVED_ON,
   VOICE_CAP_DISCARDED,
   VOICE_DICTATION_SEND_MS,
@@ -809,6 +813,27 @@ describe("voice control panel", () => {
         expect(queue.delivered(), "cancelled interrupt must restore the prior latch so a fresh request can run").toEqual([[107], [27]]);
         expect(write.mock.calls).toEqual([[target, "k"], guardedWrite(target, "\x1b"), guardedWrite(target, "\x1b")]);
         expect(report()).toHaveTextContent("Interrupted Planner.");
+      } finally {
+        await queue.dispose();
+      }
+    });
+
+    /// Scenario: keyboard input holds the real bridge queue while interrupt is armed, then the agent's daemon status goes working → waiting → working before dispatch (issue #1757). Waiting ends the turn, so the obsolete Escape is cancelled as it is across idle, never delivered into the next turn.
+    it("cancels real bridge queued interrupt across a Waiting stop between turns", async () => {
+      const { say, write, target, keyboard, updatePlanner } = await startPrompt();
+      const queue = await realInputQueue(target, write);
+      try {
+        await keyboard("k");
+        await say("interrupt");
+        expect(write.mock.calls).toEqual([[target, "k"], guardedWrite(target, "\x1b")]);
+        // The turn each daemon status word gives the pane, as the bridge projects it.
+        updatePlanner({ status: "waiting", turn: agentTurn("waiting") });
+        await flush();
+        updatePlanner({ status: "running", turn: agentTurn("working") });
+        await flush();
+        await queue.release();
+        expect(queue.delivered(), "an Escape armed before the Waiting stop must never reach the next turn").toEqual([[107]]);
+        expect(report()).toHaveTextContent(/started.*(new|something)|new.*(turn|work).*before/i);
       } finally {
         await queue.dispose();
       }
@@ -1911,7 +1936,7 @@ describe("voice control panel", () => {
     const voice = voiceControls({ voiceStatus: vi.fn(async () => voiceStatus({ available: true, backend: "remote" })) });
     render(<DeckShell runtime={runtime(resolver(result(DISPATCH)), voice)} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(voiceButton().closest("[inert]")).toBeNull();
     await turnVoiceOn(voice);
@@ -2373,6 +2398,63 @@ describe("voice control panel", () => {
   });
 
   /**
+   * PRD #1885 review (auditor 3). Scenario: review A of a project's commands is
+   * on screen and the user says "approve project commands"; while that answer
+   * is being worked out, A is cancelled and review B opens. When the answer
+   * arrives, B is not approved and nothing starts, and the report says the
+   * review changed so nothing ran.
+   */
+  it("does not approve a project commands review that replaced the one the words were spoken against", async () => {
+    vi.useFakeTimers();
+    const voice = automaticVoice(heard("approve project commands"));
+    const { resolveVoice, settle } = deferredResolver();
+    const reviewOf = (path: string, digest: string): ProjectTrust => ({
+      kind: "review",
+      project: path,
+      orchestration: "team",
+      state: "never_approved",
+      roles: [{ name: "orchestrator", command: `run ${path}`, start: true, clear: true }],
+      removedRoles: [],
+      digest,
+    });
+    const trust = {
+      projectTrustState: vi.fn(async (target: ProjectTrustTarget) => reviewOf(target.path, target.path === "/work/a" ? "aa" : "bb")),
+      approveProjectTrust: vi.fn(async (target: ProjectTrustTarget) => ({ ...reviewOf(target.path, "x"), state: "approved" as const })),
+    };
+    const started: string[] = [];
+    function Reviews() {
+      const review = useProjectTrustReview(trust);
+      const open = (path: string) => { void review.check({ path, orchestration: "team" }, () => { started.push(path); }); };
+      return <>
+        {/* voice-registry-exempt: a test harness's stand-ins for a screen's launch */}
+        <button type="button" onClick={() => open("/work/a")}>open A</button>
+        {/* voice-registry-exempt: a test harness's stand-ins for a screen's launch */}
+        <button type="button" onClick={() => open("/work/b")}>open B</button>
+        {review.shown && <ProjectTrustDialog review={review.shown} onApprove={(token) => { void review.approve(token); }} onCancel={review.cancel} />}
+      </>;
+    }
+    render(<><DeckShell runtime={runtime(resolveVoice, voice)} /><Reviews /></>);
+
+    await turnVoiceOn(voice);
+    await act(async () => { fireEvent.click(screen.getByText("open A")); await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("project-trust-project")).toHaveTextContent("/work/a");
+    await completeAutomaticUtterance(voice);
+
+    await act(async () => { fireEvent.click(within(screen.getByTestId("project-trust-dialog")).getByRole("button", { name: "Cancel" })); await Promise.resolve(); });
+    await act(async () => { fireEvent.click(screen.getByText("open B")); await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByTestId("project-trust-project")).toHaveTextContent("/work/b");
+
+    await settle(result({ kind: "dispatch", transcript: "approve project commands", action: "approve_project_commands", invoke: "approveProjectCommands", params: [], sentence: "Approving the project commands." }));
+    await flush();
+
+    expect(trust.approveProjectTrust).not.toHaveBeenCalled();
+    expect(started).toEqual([]);
+    expect(screen.getByTestId("project-trust-project")).toHaveTextContent("/work/b");
+    expect(screen.getByText(REVIEW_MOVED_ON)).toBeInTheDocument();
+    await act(async () => { fireEvent.click(within(screen.getByTestId("project-trust-dialog")).getByRole("button", { name: "Cancel" })); await Promise.resolve(); });
+  });
+
+  /**
    * A microphone that outlives the panel in front of it.
    *
    * Every other fake in this file answers from inside the call it is in; this
@@ -2804,7 +2886,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
     });
     const view = render(<DeckShell runtime={deck} />);
     await flush();
-    if (openPane) fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    if (openPane) fireEvent.click(screen.getByRole("button", { name: /^Open (prd-1401 \/ )?(Planner|Plan \/ architecture) agent$/ }));
     await turnVoiceOn(voice);
     await act(async () => { await vi.advanceTimersByTimeAsync(VOICE_STATUS_POLL_MS); });
     await flush();
@@ -2904,7 +2986,7 @@ describe("voice reading (PRD #1497, decisions 1–7 of 2026-10-09)", () => {
   /** Scenario (decision 3): with Reading on, opening an agent's pane and then Settings neither ends reading nor says "Reading off."; the indicator stays on every screen. */
   it("keeps reading through panes and Settings", async () => {
     const h = await mount({ reading: "on", notice: "shown" });
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     await flush();
     expect(screen.getByTestId("voice-reading-indicator")).toBeInTheDocument();
     await h.say("open settings");

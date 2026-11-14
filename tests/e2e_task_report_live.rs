@@ -140,6 +140,9 @@ fn work_done_037_a_real_worker_reports_the_task_it_was_given() {
 
     let deck = TuiDeck::builder()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())

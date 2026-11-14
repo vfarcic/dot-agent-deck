@@ -369,7 +369,10 @@ pub fn render_report(report: &AddressedMessageReport) -> CliOutput {
 /// The output for a send that got no report.
 pub fn client_error_output(error: &CloseAgentsError) -> CliOutput {
     match error {
-        CloseAgentsError::TooOld { daemon_version } => CliOutput::stderr(
+        // `KeepWorktreeUnsupported` is a `close` answer that `inbox send`
+        // never gets; read as the same too-old daemon if it ever did.
+        CloseAgentsError::TooOld { daemon_version }
+        | CloseAgentsError::KeepWorktreeUnsupported { daemon_version } => CliOutput::stderr(
             format!(
                 "inbox send: the running daemon{} is too old for `inbox send`; nothing was \
                  sent. Restart it onto this build with `dot-agent-deck daemon restart`.",

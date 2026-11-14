@@ -1,0 +1,8 @@
+{
+  "name": "dot-agent-deck-opencode-2",
+  "private": true,
+  "description": "The real OpenCode 2.x the credential-free lane-1 tests run (issue #2051). scripts/install-pinned-opencode.sh installs it; Renovate bumps it.",
+  "dependencies": {
+    "@opencode/cli": "2.2.7"
+  }
+}

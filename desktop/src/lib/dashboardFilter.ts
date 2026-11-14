@@ -36,7 +36,7 @@ export type DashboardKind = "orchestration" | "single" | "dispatcher" | "schedul
  * even though the dashboard's status column merges Working with Thinking,
  * because "show only working agents" is not a request for thinking ones.
  */
-export type DashboardStatus = "working" | "thinking" | "waiting_for_input" | "idle" | "blocked" | "error";
+export type DashboardStatus = "working" | "thinking" | "waiting_for_input" | "waiting" | "idle" | "blocked" | "error";
 
 export type DashboardFilterFacet = keyof DashboardFilter;
 
@@ -61,6 +61,9 @@ export const DASHBOARD_STATUSES: readonly { id: DashboardStatus; label: string }
   { id: "working", label: "Working" },
   { id: "thinking", label: "Thinking" },
   { id: "waiting_for_input", label: "Needs input" },
+  // Issue #1757: the TUI card's word for an agent whose turn ended while a
+  // command it started still runs.
+  { id: "waiting", label: "Waiting" },
   { id: "idle", label: "Idle" },
   { id: "blocked", label: "Blocked" },
   { id: "error", label: "Error" },
@@ -112,6 +115,7 @@ function kindOf(agent: DashboardFilterFacts): DashboardKind | undefined {
 const COLUMN_FILTER_STATUS: Partial<Record<AgentStatus, DashboardStatus>> = {
   running: "working",
   needs_input: "waiting_for_input",
+  waiting: "waiting",
   idle: "idle",
   failed: "error",
   blocked: "blocked",
@@ -239,6 +243,17 @@ export function buildDashboardFilterHeader(filter: DashboardFilter, visibleCount
  */
 const VOICE_ALL_DAEMONS_ID = "all-daemons";
 
+/**
+ * Issue #1757: the voice status ids that stand for a SET of filter statuses
+ * (`DASHBOARD_STATUSES` in the desktop crate's `voice/outcome.rs`). "Busy" is
+ * every status whose work is not done — Working (whose column also holds
+ * Compacting), Thinking and Waiting — the statuses voice's own "busy" names
+ * an agent by.
+ */
+const VOICE_STATUS_SETS: ReadonlyMap<string, readonly DashboardStatus[]> = new Map([
+  ["busy", ["working", "thinking", "waiting"]],
+]);
+
 /** The voice dispatch's facets, by the row's param names (`commands.toml`'s `filter_dashboard`). */
 export function dashboardFilterFromParams(params: readonly { name: string; value: string }[]): DashboardFilter {
   const value = (name: string) => params.find((param) => param.name === name)?.value;
@@ -247,9 +262,10 @@ export function dashboardFilterFromParams(params: readonly { name: string; value
     return found ? [found.id] : [];
   };
   const daemon = value("daemon");
+  const statusSet = VOICE_STATUS_SETS.get(value("status") ?? "");
   return {
     kinds: one("kind", DASHBOARD_KINDS),
-    statuses: one("status", DASHBOARD_STATUSES),
+    statuses: statusSet ? [...statusSet] : one("status", DASHBOARD_STATUSES),
     agentTypes: one("agent_type", DASHBOARD_AGENT_TYPES),
     daemonIds: daemon && daemon !== VOICE_ALL_DAEMONS_ID ? [daemon] : [],
     text: value("text") ?? "",

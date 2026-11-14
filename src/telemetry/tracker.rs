@@ -72,12 +72,13 @@ use super::handoff::{Change, Handoffs, Posted, RunRef};
 use super::input::InterventionKind;
 use super::operation::{Description, describe_tool, is_shell_tool};
 use super::run_context::RunContext;
+use super::skill::{SKILL_NAME_METADATA_KEY, defined_skill, is_skill_tool, user_skill_roots};
 use super::span::{
     Attribute, SpanEventRecord, SpanId, SpanRecord, TraceId, new_span_id, new_trace_id,
 };
 use super::{
-    AttrKey, EVENT_CI_CHANGE, EVENT_INTERVENTION, EVENT_MODEL_USAGE, EVENT_STATUS_CHANGE,
-    SPAN_AGENT_CI, SPAN_AGENT_OPERATION, SPAN_AGENT_RUN, SPAN_AGENT_STATUS,
+    AttrKey, EVENT_CI_CHANGE, EVENT_INTERVENTION, EVENT_MODEL_USAGE, EVENT_SKILL,
+    EVENT_STATUS_CHANGE, SPAN_AGENT_CI, SPAN_AGENT_OPERATION, SPAN_AGENT_RUN, SPAN_AGENT_STATUS,
 };
 
 /// Human input closer together than this is one intervention: a burst of
@@ -162,6 +163,14 @@ enum OperationEnd {
     RunEnd,
     /// The oldest open call, ended to stay under [`MAX_OPEN_OPERATIONS`].
     Cap,
+    /// Still open when the agent's turn ended (issue #2093): a call the agent
+    /// never reported the end of is over once its turn is.
+    TurnEnd,
+    /// Still open when the agent's turn or run ended, with an interrupt key
+    /// (Escape or Ctrl+C) pressed in the pane while it was open: ended at
+    /// that key (issue #2093). An interrupted Claude Code call fires no end
+    /// of its own.
+    Interrupted,
 }
 
 impl OperationEnd {
@@ -171,6 +180,8 @@ impl OperationEnd {
             OperationEnd::Agent => None,
             OperationEnd::RunEnd => Some("run_end"),
             OperationEnd::Cap => Some("cap"),
+            OperationEnd::TurnEnd => Some("turn_end"),
+            OperationEnd::Interrupted => Some("interrupted"),
         }
     }
 }
@@ -203,6 +214,8 @@ pub struct RunStart {
     pub model: Option<String>,
     pub invoking_skill: Option<String>,
     pub issue_number: Option<u64>,
+    /// PRD #1889: `deck.work.id`, the work this run's attempt serves.
+    pub work_id: Option<String>,
 }
 
 impl RunStart {
@@ -245,6 +258,7 @@ impl RunStart {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 }
@@ -262,6 +276,18 @@ struct OpenOperation {
     operation: Description,
     /// The agent's id for the call, when it reports one.
     call_id: Option<String>,
+    /// A subagent's call: the main thread's turn ending does not end it, since
+    /// a background subagent runs on past that (issue #2093).
+    from_subagent: bool,
+    /// The agent session that started the call: only that session's turn end
+    /// ends it (issue #2093). An OpenCode child session whose parent the
+    /// plugin has not learned yet reports its idle as its own session's.
+    session_id: String,
+    /// The first interrupt key (Escape or Ctrl+C) pressed in the pane while
+    /// the call was open, for a main-thread call (issue #2093). A later key
+    /// does not move it: an interrupted Claude Code turn fires no `Stop`, so
+    /// the call can stay open across further turns and keys.
+    interrupted_at: Option<u64>,
 }
 
 /// A run whose agent is starting: see [`RunTracker::prepare_run`].
@@ -339,6 +365,24 @@ impl Drop for LiveWitness {
     }
 }
 
+/// The most pull requests one run's `deck.pr.numbers` names; later ones are
+/// left out of it, while `deck.pr.number` still names the last.
+const MAX_PR_NUMBERS_PER_RUN: usize = 32;
+
+/// `deck.pr.numbers`'s value: each number with a `,` before and after it,
+/// `,2054,2056,`, so a backend's plain `contains ,2054,` filter matches one
+/// pull request exactly. A string rather than an OTLP array, which the
+/// deck's attribute model does not carry and backends do not all query
+/// alike.
+fn pr_numbers_value(numbers: &[u64]) -> String {
+    let mut value = String::from(",");
+    for number in numbers {
+        value.push_str(&number.to_string());
+        value.push(',');
+    }
+    value
+}
+
 struct ActiveRun {
     start_info: RunStart,
     trace_id: TraceId,
@@ -351,6 +395,10 @@ struct ActiveRun {
     /// report of no pull request leaves it, so the run stays joinable to the
     /// pull request it worked on.
     pr_number: Option<u64>,
+    /// `deck.pr.numbers` (issue #2096): every pull request the run's card
+    /// held, each once, in the order first seen, at most
+    /// [`MAX_PR_NUMBERS_PER_RUN`].
+    pr_numbers: Vec<u64>,
     status: Option<OpenStatus>,
     events: Vec<SpanEventRecord>,
     interventions: u64,
@@ -366,6 +414,8 @@ struct ActiveRun {
     idle_wait: bool,
     operations: Vec<OpenOperation>,
     operations_count: u64,
+    /// Skill-tool calls the run's agent made (issue #2087).
+    skills_count: u64,
     /// The call ids this run's shell starts and ends named, at most
     /// [`MAX_SEEN_CALL_IDS`], oldest first.
     seen_call_ids: VecDeque<String>,
@@ -631,6 +681,15 @@ impl ActiveRun {
             kind
         };
         let now = self.last_human_input.map_or(now, |last| now.max(last));
+        if kind == InterventionKind::Interrupt {
+            for op in self
+                .operations
+                .iter_mut()
+                .filter(|op| !op.from_subagent && op.interrupted_at.is_none())
+            {
+                op.interrupted_at = Some(now);
+            }
+        }
         let new_burst = self
             .last_human_input
             .is_none_or(|last| now.saturating_sub(last) > INTERVENTION_COALESCE_NANOS);
@@ -656,6 +715,20 @@ impl ActiveRun {
                 *attribute = Attribute::str(AttrKey::InterventionKind, kind.as_str());
             }
         }
+    }
+
+    /// The agent called its skill tool (issue #2087): count it, and keep a
+    /// `deck.skill` event naming the skill `name` when there is one, which
+    /// the caller has already found defined on disk ([`defined_skill`]).
+    fn skill_called(&mut self, name: Option<&str>, now: u64) {
+        self.skills_count += 1;
+        self.push_event(SpanEventRecord {
+            name: EVENT_SKILL,
+            time_unix_nanos: now,
+            attributes: Attribute::opt_str(AttrKey::SkillName, name)
+                .into_iter()
+                .collect(),
+        });
     }
 
     /// Remember whether the deck answers `question` by typing keys into the
@@ -1025,6 +1098,7 @@ impl RunTracker {
         }
         let pane_id = start.pane_id.clone();
         let usage = RunUsage::new(&start.agent, usage_dirs, now);
+        let cards = self.new_cards(&pane_id);
         self.runs.insert(
             pane_id,
             ActiveRun {
@@ -1033,8 +1107,9 @@ impl RunTracker {
                 span_id: new_span_id(),
                 start: now,
                 context: RunContext::default(),
-                cards: self.new_cards(),
+                cards,
                 pr_number: None,
+                pr_numbers: Vec::new(),
                 status: None,
                 events: Vec::new(),
                 interventions: 0,
@@ -1044,6 +1119,7 @@ impl RunTracker {
                 idle_wait: false,
                 operations: Vec::new(),
                 operations_count: 0,
+                skills_count: 0,
                 seen_call_ids: VecDeque::new(),
                 typed_questions: VecDeque::new(),
                 ci_pr: None,
@@ -1060,9 +1136,19 @@ impl RunTracker {
         );
     }
 
-    fn new_cards(&self) -> ShadowCards {
+    /// A run's card state, with the run's pane registered as its own.
+    ///
+    /// Issue #2078: what reaches a run the daemon has already admitted, but a
+    /// state that manages no pane takes a pane's reports only once a
+    /// `SessionStart` has drawn its card. Pi reports through
+    /// `dot-agent-deck agent-event`, which never sends one, so without the
+    /// registration every Pi status was refused here while the dashboard,
+    /// which registers its panes, showed it.
+    fn new_cards(&self, pane_id: &str) -> ShadowCards {
+        let mut state: Box<AppState> = Box::default();
+        state.register_pane(pane_id.to_string());
         ShadowCards {
-            state: Box::default(),
+            state,
             #[cfg(test)]
             _live: LiveWitness::new(&self.shadow_states),
         }
@@ -1251,6 +1337,11 @@ impl RunTracker {
         if let Some((pr, revision)) = pull_request {
             if let Some(pr) = &pr {
                 run.pr_number = Some(pr.number);
+                if !run.pr_numbers.contains(&pr.number)
+                    && run.pr_numbers.len() < MAX_PR_NUMBERS_PER_RUN
+                {
+                    run.pr_numbers.push(pr.number);
+                }
             }
             let key = pr.as_ref().map(PrKey::of);
             self.observe_ci(pane_id, key, pr.and_then(|pr| pr.checks), revision, now);
@@ -1260,6 +1351,27 @@ impl RunTracker {
         };
         if is_shell_tool(event.tool_name.as_deref()) {
             observe_operation(run, &kept, now, &mut self.finished);
+        } else if ends_main_turn(event) {
+            end_turn_operations(run, &event.session_id, now, &mut self.finished);
+        }
+        if event.event_type == EventType::ToolStart
+            && is_skill_tool(&event.agent_type, event.tool_name.as_deref())
+        {
+            // The hook found the name defined, but an event can reach the
+            // socket from something other than the hook, so the daemon looks
+            // for the skill directory again, from the event's own working
+            // directory, before the name can reach a backend.
+            let name = event
+                .metadata
+                .get(SKILL_NAME_METADATA_KEY)
+                .and_then(|name| {
+                    defined_skill(
+                        name,
+                        event.cwd.as_deref().map(std::path::Path::new),
+                        &user_skill_roots(),
+                    )
+                });
+            run.skill_called(name.as_deref(), now);
         }
         let status = run
             .cards
@@ -1663,8 +1775,8 @@ impl RunTracker {
             self.finished.push(status_span(&run, open, now));
         }
         for open in std::mem::take(&mut run.operations) {
-            self.finished
-                .push(operation_span(&run, open, now, OperationEnd::RunEnd));
+            let (end, at) = interrupted(&open).unwrap_or((OperationEnd::RunEnd, now));
+            self.finished.push(operation_span(&run, open, at, end));
         }
         if let Some(key) = run.ci_pr.take() {
             let identity = child_identity(&run);
@@ -2031,6 +2143,56 @@ impl FinishingRun {
     }
 }
 
+/// Whether `event` is the agent's main thread ending its turn: `Idle` from
+/// its own hook (Claude Code's or Devin's `Stop`, Codex's `Stop` or
+/// `Interrupt`, OpenCode's idle session, Pi's idle), or Claude Code's
+/// `StopFailure`, which fires instead of `Stop` when an API error ends the
+/// turn and arrives as an `Error` or a `QuotaBlocked` naming no tool (a failed
+/// tool call's `Error` names its tool). Not a subagent's, whose turn is not
+/// the main thread's, and not the wrapper's Idle read from the agent's
+/// output, which can fire while a command runs quietly. A prompt is not a
+/// turn's end: Claude Code fires `UserPromptSubmit` for a prompt typed while
+/// a command runs, before that call's end (issue #2093).
+fn ends_main_turn(event: &AgentEvent) -> bool {
+    let stop_failure = event.agent_type == AgentType::ClaudeCode
+        && matches!(event.event_type, EventType::Error | EventType::QuotaBlocked)
+        && event.tool_name.is_none();
+    (event.event_type == EventType::Idle || stop_failure)
+        && !event.is_from_subagent()
+        && !event
+            .metadata
+            .contains_key(crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY)
+}
+
+/// The main thread of agent session `session_id` ended its turn at `now`
+/// (issue #2093): every call that thread started that is still open is over,
+/// since the agent ends a turn only once its calls are done, so end each — at
+/// the first interrupt key pressed while it was open
+/// ([`OperationEnd::Interrupted`]), else here ([`OperationEnd::TurnEnd`]). A
+/// subagent's call stays open, since a background subagent runs on past the
+/// main thread's turn, and so does another session's.
+fn end_turn_operations(
+    run: &mut ActiveRun,
+    session_id: &str,
+    now: u64,
+    finished: &mut Vec<SpanRecord>,
+) {
+    let (ended, open): (Vec<_>, Vec<_>) = std::mem::take(&mut run.operations)
+        .into_iter()
+        .partition(|op| !op.from_subagent && op.session_id == session_id);
+    run.operations = open;
+    for op in ended {
+        let (end, at) = interrupted(&op).unwrap_or((OperationEnd::TurnEnd, now));
+        finished.push(operation_span(run, op, at, end));
+    }
+}
+
+/// Issue #2093: when `op` was interrupted — the first interrupt key pressed
+/// in the pane while it was open — if it was.
+fn interrupted(op: &OpenOperation) -> Option<(OperationEnd, u64)> {
+    op.interrupted_at.map(|at| (OperationEnd::Interrupted, at))
+}
+
 /// A shell tool's start or end reached `run`: open an operation, or end the
 /// one it belongs to. An end naming a call ends that call's operation only —
 /// or, when the run has never seen that id, the oldest that has no id, since
@@ -2068,6 +2230,9 @@ fn observe_operation(
                     .clone()
                     .unwrap_or_else(|| describe_tool(event.tool_name.as_deref(), None)),
                 call_id: call_id.cloned(),
+                from_subagent: event.is_from_subagent(),
+                session_id: event.session_id.clone(),
+                interrupted_at: None,
             });
         }
         EventType::ToolEnd | EventType::Error => {
@@ -2172,6 +2337,9 @@ pub fn status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
         SessionStatus::Blocked => "blocked",
+        // Issue #1757: not `waiting`, which has meant Needs input since the
+        // attribute was published (docs/telemetry.md).
+        SessionStatus::Waiting => "awaiting_command",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -2333,6 +2501,17 @@ fn operation_span(run: &ActiveRun, open: OpenOperation, now: u64, end: Operation
         AttrKey::OperationWrappedWord,
         described.wrapped.word.as_deref(),
     ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationDeclined,
+        described.declined.map(|d| d.reason.as_str()),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::OperationDeclinedSyntax,
+        described
+            .declined
+            .and_then(|d| d.syntax)
+            .map(|s| s.as_str()),
+    ));
     attributes.extend(Attribute::opt_str(AttrKey::OperationEnd, end.as_str()));
     SpanRecord {
         trace_id: run.trace_id,
@@ -2387,9 +2566,19 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
     if let Some(pr) = run.pr_number {
         attributes.push(Attribute::int(AttrKey::PrNumber, saturating_i64(pr)));
     }
+    if !run.pr_numbers.is_empty() {
+        attributes.push(Attribute::str(
+            AttrKey::PrNumbers,
+            pr_numbers_value(&run.pr_numbers),
+        ));
+    }
     attributes.extend(Attribute::opt_str(
         AttrKey::DispatchName,
         run.dispatch_name.as_deref(),
+    ));
+    attributes.extend(Attribute::opt_str(
+        AttrKey::WorkId,
+        start.work_id.as_deref(),
     ));
     attributes.push(Attribute::str(AttrKey::EndReason, reason.as_str()));
     if let Some(code) = exit_code {
@@ -2406,6 +2595,10 @@ fn run_span(run: ActiveRun, reason: EndReason, exit_code: Option<i32>, now: u64)
     attributes.push(Attribute::int(
         AttrKey::OperationsCount,
         saturating_i64(run.operations_count),
+    ));
+    attributes.push(Attribute::int(
+        AttrKey::SkillsCount,
+        saturating_i64(run.skills_count),
     ));
     attributes.push(Attribute::int(
         AttrKey::CiRoundsCount,
@@ -2515,6 +2708,7 @@ pub(crate) mod tests {
             model: None,
             invoking_skill: None,
             issue_number: None,
+            work_id: None,
         }
     }
 
@@ -2616,6 +2810,66 @@ pub(crate) mod tests {
         assert!(attr(run, AttrKey::Role).is_none());
         assert!(attr(run, AttrKey::Model).is_none());
         assert!(attr(run, AttrKey::InstructionsCommit).is_none());
+    }
+
+    /// Issue #2078: a Pi pane reports through `dot-agent-deck agent-event`,
+    /// which never sends a `SessionStart`, so a run's card state must take
+    /// those reports for the run's own pane as its card does on the dashboard.
+    /// The shell command is the control: it was recorded all along.
+    #[test]
+    fn a_pi_run_records_status_from_agent_event_reports() {
+        let report = |event_type: EventType, tool_name: Option<&str>| {
+            crate::hook::build_agent_event_cli(
+                "p1".into(),
+                Some("pi-agent-1".into()),
+                event_type,
+                crate::hook::AgentEventDetail {
+                    tool_name: tool_name.map(str::to_string),
+                    ..Default::default()
+                },
+            )
+        };
+        let mut tracker = RunTracker::new();
+        let mut pi = start("p1");
+        pi.agent = AgentType::Pi;
+        pi.agent_id = Some("pi-agent-1".into());
+        tracker.begin_run(pi, 100);
+        tracker.observe_event(&report(EventType::Idle, None), 110);
+        tracker.observe_event(&report(EventType::Thinking, None), 120);
+        tracker.observe_event(&report(EventType::ToolStart, Some("bash")), 130);
+        tracker.observe_event(&report(EventType::ToolEnd, Some("bash")), 140);
+        tracker.observe_event(&report(EventType::Idle, None), 150);
+        tracker.end_run("p1", EndReason::Exited, Some(0), 160);
+        let spans = tracker.take_finished();
+
+        assert_eq!(
+            spans
+                .iter()
+                .filter(|s| s.name == SPAN_AGENT_OPERATION)
+                .count(),
+            1,
+            "the control: the shell command is an operation"
+        );
+        let statuses: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_STATUS)
+            .map(|s| attr(s, AttrKey::Status).cloned())
+            .collect();
+        let str_of = |s: &str| Some(AttrValue::Str(s.into()));
+        assert_eq!(
+            statuses,
+            vec![
+                str_of("idle"),
+                str_of("thinking"),
+                str_of("working"),
+                str_of("idle"),
+            ],
+            "every status the Pi card showed is an interval"
+        );
+        assert_eq!(
+            attr(run_span_of(&spans), AttrKey::StatusChangesCount),
+            Some(&AttrValue::Int(4))
+        );
     }
 
     #[test]
@@ -3887,9 +4141,133 @@ pub(crate) mod tests {
         );
     }
 
+    /// A shell command the classifier declines sends why, as the deck's own
+    /// fixed values; one it names sends no `deck.operation.declined`
+    /// (issue #2088).
+    #[test]
+    fn a_declined_command_sends_why_and_a_named_one_does_not() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        for (t, (kind, command)) in [
+            (EventType::ToolStart, "grep \"hunter2\" secrets.txt"),
+            (EventType::ToolEnd, "grep \"hunter2\" secrets.txt"),
+            (EventType::ToolStart, "cargo test"),
+            (EventType::ToolEnd, "cargo test"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            tracker.observe_event(
+                &shell("p1", kind, "Bash", Some(command), None),
+                10 + t as u64,
+            );
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        let ops: Vec<&SpanRecord> = spans
+            .iter()
+            .filter(|s| s.name == SPAN_AGENT_OPERATION)
+            .collect();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(attr(ops[0], AttrKey::OperationProgram), None);
+        assert_eq!(
+            attr(ops[0], AttrKey::OperationDeclined),
+            Some(&AttrValue::Str("argument_syntax".into()))
+        );
+        assert_eq!(
+            attr(ops[0], AttrKey::OperationDeclinedSyntax),
+            Some(&AttrValue::Str("quote".into()))
+        );
+        assert_eq!(
+            attr(ops[1], AttrKey::OperationProgram),
+            Some(&AttrValue::Str("cargo".into()))
+        );
+        assert_eq!(attr(ops[1], AttrKey::OperationDeclined), None);
+        assert_eq!(attr(ops[1], AttrKey::OperationDeclinedSyntax), None);
+    }
+
     /// One `agent.operation` per shell command, from its start to its end,
     /// paired by call id when several overlap and by age otherwise; other
     /// tools make none, and the run counts them.
+    /// Issue #2087: every skill-tool call of the run's agent is a
+    /// `deck.skill` event and counts; only a name with a skill name's shape
+    /// is kept, and another tool or a call's end adds nothing.
+    #[test]
+    fn skill_calls_become_events_on_the_run() {
+        let project = tempfile::tempdir().unwrap();
+        let defined = project
+            .path()
+            .join(".claude/skills")
+            .join("dad-tracker-skill-2087");
+        std::fs::create_dir_all(&defined).unwrap();
+        std::fs::write(defined.join("SKILL.md"), "x").unwrap();
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        let call = |tool: &str, kind: EventType, name: Option<&str>| {
+            let mut e = event("p1", kind);
+            e.tool_name = Some(tool.into());
+            e.cwd = Some(project.path().to_string_lossy().into_owned());
+            if let Some(name) = name {
+                e.metadata.insert(
+                    super::super::skill::SKILL_NAME_METADATA_KEY.into(),
+                    name.into(),
+                );
+            }
+            e
+        };
+        tracker.observe_event(
+            &call(
+                "Skill",
+                EventType::ToolStart,
+                Some("dad-tracker-skill-2087"),
+            ),
+            10,
+        );
+        tracker.observe_event(
+            &call("Skill", EventType::ToolEnd, Some("dad-tracker-skill-2087")),
+            11,
+        );
+        tracker.observe_event(&call("Skill", EventType::ToolStart, None), 12);
+        tracker.observe_event(&call("Skill", EventType::ToolStart, Some("Not A Name")), 13);
+        // A raw event naming a well-shaped skill no directory defines.
+        tracker.observe_event(
+            &call("Skill", EventType::ToolStart, Some("dad-invented-2087")),
+            15,
+        );
+        tracker.observe_event(
+            &call("Read", EventType::ToolStart, Some("dad-tracker-skill-2087")),
+            14,
+        );
+        tracker.end_run("p1", EndReason::Exited, None, 20);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let skills: Vec<_> = run
+            .events
+            .iter()
+            .filter(|e| e.name == EVENT_SKILL)
+            .map(|e| {
+                (
+                    e.time_unix_nanos,
+                    e.attributes
+                        .iter()
+                        .find(|a| a.key == AttrKey::SkillName)
+                        .map(|a| a.value.clone()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            skills,
+            vec![
+                (10, Some(AttrValue::Str("dad-tracker-skill-2087".into()))),
+                (12, None),
+                (13, None),
+                (15, None),
+            ]
+        );
+        assert_eq!(attr(run, AttrKey::SkillsCount), Some(&AttrValue::Int(4)));
+        assert!(spans.iter().all(|s| s.name != SPAN_AGENT_OPERATION));
+    }
+
     #[test]
     fn shell_commands_become_operations() {
         let mut tracker = RunTracker::new();
@@ -4205,6 +4583,254 @@ pub(crate) mod tests {
         );
     }
 
+    /// Issue #2093: a call the agent never reports the end of is over once
+    /// its turn ends. Measured on Claude Code 2.1.322: an Escape that
+    /// interrupts a running Bash call fires no `PostToolUse`, no
+    /// `PostToolUseFailure` and no `Stop` for it, so the next turn's `Stop` is
+    /// the first event proving the call over. The span ends at the interrupt
+    /// key when one reached the pane while the call was open (`interrupted`),
+    /// else at the turn's end (`turn_end`), and is exported then rather than
+    /// held until the run ends.
+    #[test]
+    fn a_call_left_open_by_its_turn_ends_with_the_turn() {
+        let ends = |spans: &[SpanRecord]| {
+            spans
+                .iter()
+                .filter(|s| s.name == SPAN_AGENT_OPERATION)
+                .map(|s| {
+                    (
+                        attr(s, AttrKey::OperationEnd).cloned(),
+                        s.start_unix_nanos,
+                        s.end_unix_nanos,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let mark = |v: &str| Some(AttrValue::Str(v.into()));
+        let bash = |t: EventType, call: &str| shell("p1", t, "Bash", Some("make"), Some(call));
+
+        // Escape interrupts the call; the user's next turn ends with `Stop`.
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&bash(EventType::ToolStart, "c1"), 10);
+        tracker.observe_human_input("p1", 20, InterventionKind::Interrupt);
+        tracker.observe_event(&event("p1", EventType::Thinking), 30);
+        tracker.observe_event(&event("p1", EventType::Idle), 50);
+        assert_eq!(
+            ends(&tracker.take_finished()),
+            vec![(mark("interrupted"), 10, 20)],
+            "ended at the interrupt key, when the turn after it ended"
+        );
+
+        // No interrupt key: the turn's end is the call's.
+        tracker.observe_event(&bash(EventType::ToolStart, "c2"), 60);
+        tracker.observe_event(&event("p1", EventType::Idle), 70);
+        assert_eq!(
+            ends(&tracker.take_finished()),
+            vec![(mark("turn_end"), 60, 70)]
+        );
+
+        // An interrupt key from before the call started says nothing about it.
+        tracker.observe_event(&bash(EventType::ToolStart, "c3"), 80);
+        tracker.observe_event(&event("p1", EventType::Idle), 90);
+        assert_eq!(
+            ends(&tracker.take_finished()),
+            vec![(mark("turn_end"), 80, 90)]
+        );
+
+        // An interrupt key on a call that then reports its own end: the
+        // agent's end stands, with no mark.
+        tracker.observe_event(&bash(EventType::ToolStart, "c4"), 100);
+        tracker.observe_human_input("p1", 105, InterventionKind::Interrupt);
+        tracker.observe_event(&bash(EventType::ToolEnd, "c4"), 110);
+        tracker.observe_event(&event("p1", EventType::Idle), 120);
+        assert_eq!(ends(&tracker.take_finished()), vec![(None, 100, 110)]);
+        tracker.end_run("p1", EndReason::Exited, None, 200);
+        assert_eq!(ends(&tracker.take_finished()), vec![]);
+    }
+
+    /// Issue #2093: what must NOT end a call that is still running. A prompt
+    /// typed while a command runs fires `UserPromptSubmit` at once, before the
+    /// call's `PostToolUse` (measured on Claude Code 2.1.322: 21 s apart), and
+    /// parallel calls start while their siblings run, so neither a prompt nor
+    /// the next `PreToolUse` proves a call over. Nor does a subagent's turn
+    /// end, a wrapper's output-derived Idle, or a main-thread turn end for a
+    /// call a background subagent started.
+    #[test]
+    fn a_running_call_outlives_prompts_siblings_and_other_threads() {
+        let open_ops = |tracker: &RunTracker| tracker.runs["p1"].operations.len();
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c1")),
+            10,
+        );
+        let mut prompt = event("p1", EventType::Thinking);
+        prompt.user_prompt = Some("also tell me the date".into());
+        tracker.observe_event(&prompt, 20);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolStart, "Bash", Some("ls"), Some("c2")),
+            21,
+        );
+        let mut subagent_idle = event("p1", EventType::Idle);
+        subagent_idle
+            .metadata
+            .insert(crate::event::SUBAGENT_ID_METADATA_KEY.into(), "a1".into());
+        tracker.observe_event(&subagent_idle, 22);
+        let mut wrapper_idle = event("p1", EventType::Idle);
+        wrapper_idle.metadata.insert(
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_KEY.into(),
+            crate::event::WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE.into(),
+        );
+        tracker.observe_event(&wrapper_idle, 23);
+        assert_eq!(open_ops(&tracker), 2, "both calls still run");
+        assert_eq!(operations(&tracker.take_finished()), vec![]);
+
+        // A background subagent's call survives the main thread's turn end.
+        let mut background = shell(
+            "p1",
+            EventType::ToolStart,
+            "Bash",
+            Some("sleep"),
+            Some("s1"),
+        );
+        background
+            .metadata
+            .insert(crate::event::SUBAGENT_ID_METADATA_KEY.into(), "a1".into());
+        tracker.observe_event(&background, 24);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolEnd, "Bash", None, Some("c1")),
+            30,
+        );
+        tracker.observe_event(
+            &shell("p1", EventType::ToolEnd, "Bash", None, Some("c2")),
+            31,
+        );
+        tracker.observe_event(&event("p1", EventType::Idle), 40);
+        assert_eq!(open_ops(&tracker), 1, "the subagent's call still runs");
+        tracker.end_run("p1", EndReason::Exited, None, 50);
+        let ends = tracker
+            .take_finished()
+            .into_iter()
+            .filter(|s| s.name == SPAN_AGENT_OPERATION)
+            .map(|s| attr(&s, AttrKey::OperationEnd).cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ends,
+            vec![None, None, Some(AttrValue::Str("run_end".into()))]
+        );
+    }
+
+    /// Issue #2093 review (Greptile, Qodo): a later interrupt key does not
+    /// move an earlier call's end. An interrupted Claude Code turn fires no
+    /// `Stop`, so a call it killed stays open into the next turn, where the
+    /// person may press Escape again: each call ends at the first key pressed
+    /// while it was open.
+    #[test]
+    fn each_interrupted_call_keeps_the_first_key_pressed_while_it_ran() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c1")),
+            10,
+        );
+        tracker.observe_human_input("p1", 20, InterventionKind::Interrupt);
+        tracker.observe_event(
+            &shell(
+                "p1",
+                EventType::ToolStart,
+                "Bash",
+                Some("cargo"),
+                Some("c2"),
+            ),
+            30,
+        );
+        tracker.observe_human_input("p1", 40, InterventionKind::Interrupt);
+        tracker.observe_human_input("p1", 45, InterventionKind::Interrupt);
+        tracker.observe_event(&event("p1", EventType::Idle), 50);
+        let mut ends = tracker
+            .take_finished()
+            .into_iter()
+            .filter(|s| s.name == SPAN_AGENT_OPERATION)
+            .map(|s| {
+                (
+                    attr(&s, AttrKey::OperationEnd).cloned(),
+                    s.start_unix_nanos,
+                    s.end_unix_nanos,
+                )
+            })
+            .collect::<Vec<_>>();
+        ends.sort_by_key(|(_, start, _)| *start);
+        let interrupted = Some(AttrValue::Str("interrupted".into()));
+        assert_eq!(
+            ends,
+            vec![(interrupted.clone(), 10, 20), (interrupted, 30, 40)]
+        );
+    }
+
+    /// Issue #2093 review (Qodo): Claude Code's `StopFailure` ends a turn
+    /// instead of `Stop`, as an `Error` or a `QuotaBlocked` naming no tool,
+    /// so it ends the turn's open calls too. A failed call's `Error` names
+    /// its tool and ends no other call; another session's idle (an OpenCode
+    /// child the plugin has not placed yet) ends none of this session's.
+    #[test]
+    fn a_failed_turn_ends_its_calls_and_other_sessions_do_not() {
+        let open_ops = |tracker: &RunTracker| tracker.runs["p1"].operations.len();
+        for failure in [EventType::Error, EventType::QuotaBlocked] {
+            let mut tracker = RunTracker::new();
+            tracker.begin_run(start("p1"), 0);
+            tracker.observe_event(
+                &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c1")),
+                10,
+            );
+            let mut read_failed = event("p1", EventType::Error);
+            read_failed.tool_name = Some("Read".into());
+            tracker.observe_event(&read_failed, 15);
+            let mut child_idle = event("p1", EventType::Idle);
+            child_idle.session_id = "child-session".into();
+            tracker.observe_event(&child_idle, 16);
+            assert_eq!(open_ops(&tracker), 1, "{failure:?}");
+            tracker.observe_event(&event("p1", failure.clone()), 20);
+            assert_eq!(open_ops(&tracker), 0, "{failure:?}");
+            let op = tracker
+                .take_finished()
+                .into_iter()
+                .find(|s| s.name == SPAN_AGENT_OPERATION)
+                .unwrap();
+            assert_eq!(
+                attr(&op, AttrKey::OperationEnd),
+                Some(&AttrValue::Str("turn_end".into())),
+                "{failure:?}"
+            );
+            assert_eq!((op.start_unix_nanos, op.end_unix_nanos), (10, 20));
+        }
+    }
+
+    /// Issue #2093: an interrupted call whose run ends before another turn
+    /// does (the user closes the pane after pressing Escape) ends at the
+    /// interrupt key, not at the run's end.
+    #[test]
+    fn an_interrupted_call_ends_at_the_key_when_the_run_ends_first() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(
+            &shell("p1", EventType::ToolStart, "Bash", Some("make"), Some("c1")),
+            10,
+        );
+        tracker.observe_human_input("p1", 20, InterventionKind::Interrupt);
+        tracker.end_run("p1", EndReason::Closed, None, 1000);
+        let op = tracker
+            .take_finished()
+            .into_iter()
+            .find(|s| s.name == SPAN_AGENT_OPERATION)
+            .expect("the operation");
+        assert_eq!(
+            attr(&op, AttrKey::OperationEnd),
+            Some(&AttrValue::Str("interrupted".into()))
+        );
+        assert_eq!((op.start_unix_nanos, op.end_unix_nanos), (10, 20));
+    }
+
     pub(crate) fn checks_report(
         pane: &str,
         number: u64,
@@ -4495,6 +5121,61 @@ pub(crate) mod tests {
         );
     }
 
+    /// Issue #2096: a run that opens two pull requests names both, so each
+    /// of them joins to the run; `deck.pr.number` still names the last.
+    #[test]
+    fn a_run_that_opens_two_pull_requests_names_both() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        tracker.observe_event(&pr_report("p1", Some(2054), Some(1)), 10);
+        tracker.observe_event(&pr_report("p1", None, Some(2)), 20);
+        tracker.observe_event(&pr_report("p1", Some(2056), Some(3)), 30);
+        tracker.observe_event(&pr_report("p1", Some(2054), Some(4)), 35);
+        tracker.end_run("p1", EndReason::Exited, None, 40);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let names_2054 = run.attributes.iter().any(|a| match &a.value {
+            AttrValue::Int(n) => *n == 2054,
+            AttrValue::Str(s) => s.split(',').any(|n| n == "2054"),
+            AttrValue::Bool(_) => false,
+        });
+        assert!(names_2054, "the first pull request is lost: {run:?}");
+        assert_eq!(
+            attr(run, AttrKey::PrNumbers),
+            Some(&AttrValue::Str(",2054,2056,".into())),
+            "each pull request once, in the order the run first saw it"
+        );
+        assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(2054)));
+    }
+
+    /// Issue #2096: `deck.pr.numbers` keeps the first
+    /// [`MAX_PR_NUMBERS_PER_RUN`] pull requests, while `deck.pr.number`
+    /// still follows the latest one past the cap.
+    #[test]
+    fn the_list_of_pull_requests_stops_at_its_cap() {
+        let mut tracker = RunTracker::new();
+        tracker.begin_run(start("p1"), 0);
+        tracker.observe_event(&event("p1", EventType::SessionStart), 1);
+        assert_eq!(
+            MAX_PR_NUMBERS_PER_RUN, 32,
+            "docs/telemetry.md and the changelog promise 32"
+        );
+        let count = 33;
+        for n in 1..=count {
+            tracker.observe_event(&pr_report("p1", Some(n), Some(n)), 10 + n);
+        }
+        tracker.end_run("p1", EndReason::Exited, None, 100);
+        let spans = tracker.take_finished();
+        let run = run_span_of(&spans);
+        let kept: String = (1..=32).map(|n| format!("{n},")).collect();
+        assert_eq!(
+            attr(run, AttrKey::PrNumbers),
+            Some(&AttrValue::Str(format!(",{kept}")))
+        );
+        assert_eq!(attr(run, AttrKey::PrNumber), Some(&AttrValue::Int(33)));
+    }
+
     fn agent_identity_of(attributes: &[Attribute]) -> Vec<Attribute> {
         attributes
             .iter()
@@ -4683,6 +5364,24 @@ pub(crate) mod tests {
             attr(run, AttrKey::AgentSource),
             Some(&AttrValue::Str("hook".into()))
         );
+    }
+
+    /// PRD #1889: a run's `agent.run` span carries the work its attempt
+    /// serves as `deck.work.id`, and a run with none carries no attribute.
+    #[test]
+    fn a_run_span_carries_its_work_id() {
+        let mut tracker = RunTracker::new();
+        let mut with = start("p1");
+        with.work_id = Some("w-deck-0123456789abcdef".into());
+        tracker.begin_run(with, 0);
+        tracker.begin_run(start("p2"), 0);
+        tracker.end_all(EndReason::Exited, 1);
+        let spans = tracker.take_finished();
+        assert_eq!(
+            attr(run_span_on(&spans, "p1"), AttrKey::WorkId),
+            Some(&AttrValue::Str("w-deck-0123456789abcdef".into()))
+        );
+        assert_eq!(attr(run_span_on(&spans, "p2"), AttrKey::WorkId), None);
     }
 
     /// Issue #1981 M6: the open runs not yet named list their generations,

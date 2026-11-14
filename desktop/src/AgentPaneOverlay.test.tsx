@@ -148,7 +148,7 @@ describe("agent pane overlay", () => {
     const before = screen.getByTestId("terminal-planner");
     expect(buildsFor("planner")).toBe(1);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(screen.getAllByTestId("terminal-planner")).toHaveLength(1);
     expect(screen.getByTestId("terminal-planner")).toBe(before);
@@ -180,7 +180,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(screen.getByTestId("reader-open-planner"));
     expect(screen.getByTestId("reader-planner")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     const overlay = screen.getByTestId("agent-pane-overlay");
     // Both halves, because hiding the button while still rendering the panel
     // would leave two `window` `keydown` listeners answering one `Escape`, and
@@ -208,7 +208,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(screen.getByTestId("reader-open-planner"));
     expect(screen.getByTestId("reader-planner")).toBeVisible();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Desktop implementation agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     // The discriminating assertion: dismissed on OPEN, not left mounted for
     // `Escape` to find.
@@ -232,7 +232,7 @@ describe("agent pane overlay", () => {
     const tile = screen.getByTestId("agent-tile-planner");
     expect(within(tile).getAllByRole("tab")).toHaveLength(5);
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     const overlay = screen.getByTestId("agent-pane-overlay");
     expect(within(overlay).getAllByRole("tab")).toHaveLength(5);
     expect(within(overlay).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
@@ -252,7 +252,7 @@ describe("agent pane overlay", () => {
     render(<DeckShell runtime={runtime()} />);
     expect(screen.getByTestId("agent-tile-planner")).toHaveAttribute("data-presentation", "tile");
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-tile-planner")).toHaveAttribute("data-presentation", "overlay");
     expect(screen.getByTestId("agent-tile-builder")).toHaveAttribute("data-presentation", "tile");
     // Opening SELECTS as well, which makes the pane's `selected` true rather
@@ -270,11 +270,11 @@ describe("agent pane overlay", () => {
     render(<DeckShell runtime={runtime()} />);
     expect(screen.queryByRole("button", { name: "Back to dashboard" })).not.toBeInTheDocument();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
-    expect(screen.queryByRole("button", { name: "Open Planner agent" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
+    expect(screen.queryByRole("button", { name: "Open Plan / architecture agent" })).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Back to dashboard" })).toBeVisible();
     // The tiles underneath keep theirs — the deck is mounted, not frozen.
-    expect(screen.getByRole("button", { name: "Open Builder agent" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Desktop implementation agent" })).toBeInTheDocument();
   });
 
   /**
@@ -290,7 +290,7 @@ describe("agent pane overlay", () => {
     expect(setShownTerminals).toHaveBeenLastCalledWith([{ deckId: FIXTURE_DAEMON_ID, agentId: "planner" }, { deckId: FIXTURE_DAEMON_ID, agentId: "builder" }, { deckId: FIXTURE_DAEMON_ID, agentId: "reviewer" }, { deckId: FIXTURE_DAEMON_ID, agentId: "tester" }]);
     setShownTerminals.mockClear();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open Planner agent" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Plan / architecture agent" }));
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(setShownTerminals).not.toHaveBeenCalled();
 
@@ -330,7 +330,7 @@ describe("agent pane overlay", () => {
     const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
     let settle!: (result: DeckActionResult) => void;
     const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
-    const previewWorktreeClose = vi.fn(async () => ({ path: "/remote/kept-dispatch", confirmed_dirty: true }));
+    const previewWorktreeClose = vi.fn(async () => ({ kept: { path: "/remote/kept-dispatch", confirmed_dirty: true }, keepWorktree: null }));
     const rt = { ...initial, snapshot, fleet: [snapshot], runAction, previewWorktreeClose };
     const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from };
     const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
@@ -365,6 +365,27 @@ describe("agent pane overlay", () => {
     expect(screen.getByRole("region", { name: "Agent dashboard" })).toBeVisible();
   });
 
+  /** Scenario (issue #1958): close the viewed dispatched agent with "Close agent, keep worktree". The daemon receives the captured stop with the keep, and once it is confirmed the pane returns to the dashboard as an ordinary close does. */
+  it("closes the viewed agent keeping its worktree and returns to the dashboard", async () => {
+    const initial = runtime();
+    const snapshot = { ...initial.snapshot, agents: initial.snapshot.agents.map((agent) => ({ ...agent, incarnation: "process-a", paneId: `pane-${agent.id}` })) };
+    let settle!: (result: DeckActionResult) => void;
+    const runAction = vi.fn(() => new Promise<DeckActionResult>((resolve) => { settle = resolve; }));
+    const previewWorktreeClose = vi.fn(async () => ({ kept: null, keepWorktree: "/remote/unit-1958" }));
+    const rt = { ...initial, snapshot, fleet: [snapshot], runAction, previewWorktreeClose };
+    const view = { kind: "agent" as const, deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", from: "overview" as const };
+    const { rerender } = render(<DeckShell runtime={rt} initialView={view} />);
+    fireEvent.click(within(screen.getByTestId("agent-pane-overlay")).getByRole("button", { name: "Close agent" }));
+    const dialog = screen.getByRole("alertdialog");
+    fireEvent.click(await within(dialog).findByRole("button", { name: "Close agent, keep worktree" }));
+    expect(runAction).toHaveBeenCalledExactlyOnceWith({ type: "stop_agent", deckId: FIXTURE_DAEMON_ID, agentId: "planner", incarnation: "process-a", keepWorktree: true });
+    const ended = { ...snapshot, agents: snapshot.agents.filter((agent) => agent.id !== "planner") };
+    rerender(<DeckShell runtime={{ ...rt, snapshot: ended, fleet: [ended] }} initialView={view} />);
+    await act(async () => settle({ ok: true }));
+    expect(screen.queryByTestId("agent-pane-overlay")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
   /** Scenario: an agent disappears while its close confirmation is awaiting a click. The pane and its confirmation close together, without sending the captured stop request. */
   it.each(["overview", "deck"] as const)("dismisses an unconfirmed close when its agent retires from %s", (from) => {
     const rt = runtime();
@@ -391,7 +412,7 @@ describe("agent pane overlay", () => {
     fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Cancel" }));
     if (differentPane) {
       fireEvent.keyDown(window, { key: "Escape" });
-      fireEvent.click(screen.getByRole("button", { name: "Open Builder agent" }));
+      fireEvent.click(screen.getByRole("button", { name: "Open Desktop implementation agent" }));
     }
     ask();
     expect(screen.getByRole("alertdialog")).toBeVisible();
@@ -674,10 +695,10 @@ describe("idle and needs input are two states (issue #1676)", () => {
 describe("background work on the tile and the agent screen", () => {
   const DECK_ID = "deck-000000000000dec1";
 
-  function backgroundSnapshot(background: DesktopAgentDto["background"], spawnedAtMs?: number) {
+  function backgroundSnapshot(background: DesktopAgentDto["background"], spawnedAtMs?: number, status: DesktopAgentDto["status"] = "idle") {
     return mapDesktopSnapshot({
       connection: { status: "connected", deckId: DECK_ID, socketPath: "/tmp/deck.sock", deckKind: "local", clientProtocolVersion: 8, serverProtocolVersion: 8, clientBuildVersion: "0.1.0", daemonBuildVersion: "0.1.0" },
-      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status: "idle", toolCount: 3, ...(spawnedAtMs === undefined ? {} : { spawnedAtMs }), ...(background ? { background } : {}), tab: { kind: "dashboard" } }],
+      agents: [{ id: "7", displayName: "Coder", cwd: "/tmp/project", rows: 32, cols: 120, agentType: "claude_code", status, toolCount: 3, ...(spawnedAtMs === undefined ? {} : { spawnedAtMs }), ...(background ? { background } : {}), tab: { kind: "dashboard" } }],
       protocolVersion: 8,
       source: "daemon",
     });
@@ -710,6 +731,38 @@ describe("background work on the tile and the agent screen", () => {
     render(<DeckShell runtime={liveRuntime({ commands: 2, subagents: 1, sinceMs })} initialView={{ kind: "agent", deckId: DECK_ID, agentId: "7", from: "overview" }} />);
     const pane = screen.getByTestId("agent-pane-overlay");
     expect(within(pane).getByTestId("background-work-7")).toHaveTextContent("Background: 2 commands, 1 subagent · 3h 12m");
+  });
+
+  /**
+   * Scenario (issue #1757): an agent whose turn ended while a command it
+   * started in that turn still runs. Its tile reads `waiting` — not `idle` —
+   * with `Background: 1 command · 5m` under it, the TUI card's Waiting and
+   * background line in the same words.
+   */
+  it("shows a Waiting agent as waiting with its background line", () => {
+    const sinceMs = Date.now() - (5 * 60_000 + 5_000);
+    const snapshot = backgroundSnapshot({ commands: 1, subagents: 0, sinceMs }, undefined, "waiting" as DesktopAgentDto["status"]);
+    render(<DeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} />);
+    const tile = screen.getByTestId("agent-tile-claude-code");
+    expect(within(tile).getByText("waiting")).toHaveClass("status-label");
+    expect(within(tile).queryByText("idle")).not.toBeInTheDocument();
+    expect(within(tile).getByTestId("background-work-7")).toHaveTextContent("Background: 1 command · 5m");
+  });
+
+  /**
+   * Scenario (issue #1757): open the agent dashboard on a daemon whose one
+   * agent is Waiting. The header's WAITING counter reads 1 and IDLE reads 0,
+   * as the TUI's stats bar reads `1 waiting` and no `idle` segment.
+   */
+  it("counts a Waiting agent under WAITING, not IDLE, in the dashboard header", () => {
+    const snapshot = backgroundSnapshot({ commands: 1, subagents: 0, sinceMs: Date.now() - 60_000 }, undefined, "waiting" as DesktopAgentDto["status"]);
+    render(<AppDeckShell runtime={runtime({ mode: "live", snapshot, fleet: [snapshot] })} initialView={{ kind: "overview" }} />);
+    const waiting = screen.getByTestId("overview-count-waiting");
+    expect(waiting).toHaveTextContent("WAITING");
+    expect(waiting).toHaveTextContent("1");
+    expect(waiting.querySelector("strong")).toHaveClass("count-waiting");
+    expect(screen.getByTestId("overview-count-idle")).toHaveTextContent("0");
+    expect(screen.getByTestId("overview-count-running")).toHaveTextContent("0");
   });
 
   /** Scenario: the same agent with nothing left running shows no background line at all. */

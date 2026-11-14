@@ -1049,6 +1049,7 @@ mod tests {
             dot_agent_deck::issue_dispatch_run::KeptWorktree {
                 path: "/tmp/wt".into(),
                 confirmed_dirty: true,
+                on_request: false,
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::WorktreeKept));
@@ -1177,6 +1178,7 @@ mod tests {
             commands,
             subagents,
             since_ms: Some(1_700_000_000_000),
+            awaited: 0,
         }
     }
 

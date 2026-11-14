@@ -100,10 +100,12 @@ pub enum FocusSignal {
 ///   releases, drags and the wheel. Mouse input counts because the product
 ///   owner's decision names it, and because clicking into a terminal that does
 ///   not report focus would otherwise claim nothing. Motion does not count:
-///   `EnableMouseCapture` turns on any-event tracking (`?1003h`), so the
-///   terminal reports the pointer merely **passing over** the window, focused
-///   or not. Counting that would let a pointer crossing the TUI on its way to
-///   the desktop take focus from the window the person is heading for.
+///   where any-event tracking (`?1003h`) is on, the terminal reports the
+///   pointer merely **passing over** the window, focused or not. The deck
+///   stopped requesting that mode (PRD #385 M4), but a Windows console reports
+///   motion regardless, and counting it would let a pointer crossing the TUI
+///   on its way to the desktop take focus from the window the person is
+///   heading for.
 /// - [`Event::FocusLost`] and [`Event::Resize`] say nothing about focus.
 pub fn focus_signal(event: &Event) -> Option<FocusSignal> {
     match event {

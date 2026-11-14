@@ -981,6 +981,14 @@ pub struct SpawnOptions<'a> {
     /// Every production spawn site with an orchestration membership passes
     /// one; `None` there answers a terminal report `report_pending`.
     pub origin: Option<crate::hook_provenance::InstanceOrigin>,
+    /// PRD #1889: the work this spawn serves, set by the daemon's own launch
+    /// paths and never taken from the wire: a respawn's pinned work, a
+    /// dispatched unit's, a scheduled fire's. For a role pane of an
+    /// orchestration it is instead the PARENT of the instance's work when the
+    /// spawn is the first the daemon sees of that instance. `None` makes the
+    /// spawn a pane of its own, with a fresh pane work. Handed to the child as
+    /// [`crate::work_journal::ENV_WORK_ID`] and pinned on its record.
+    pub work_id: Option<crate::work_journal::WorkId>,
 }
 
 impl Default for SpawnOptions<'_> {
@@ -995,6 +1003,7 @@ impl Default for SpawnOptions<'_> {
             tab_membership: None,
             agent_type: None,
             origin: None,
+            work_id: None,
         }
     }
 }
@@ -1798,6 +1807,9 @@ fn spawn_with_dir(
     // unfiltered inherit would tag every spawned agent with the
     // parent deck's id and the hook script would misroute events.
     cmd.env_remove(DOT_AGENT_DECK_AGENT_ID);
+    // PRD #1889: and for the work id. A daemon launched from another deck's
+    // pane would otherwise hand that pane's work to an agent it gave none.
+    cmd.env_remove(crate::work_journal::ENV_WORK_ID);
     // Issue #1077: same scrub-then-overlay rule for the hook capability token,
     // and the failure mode of NOT scrubbing it is the sharpest on this list. A
     // daemon launched from inside another deck's pane inherits that pane's
@@ -3275,6 +3287,15 @@ fn pump_reader(
         );
         termination
     });
+    // PRD #1889: the attempt this generation was ends, as the deck observed
+    // it. Best effort at a shutdown: this thread is detached, and the next
+    // run's startup recovery ends whatever it did not reach.
+    if let (Some(registry), Some(termination)) = (registry.upgrade(), termination.as_ref()) {
+        registry.work().attempt_ended(
+            &agent_id,
+            crate::work_tracking::AttemptEnd::of(termination, registry.is_shutting_down()),
+        );
+    }
     // PRD #1666 S3: whatever the exit, messages bound to this agent can no
     // longer reach it. Deliberate closes included: the entry is gone by now, but
     // its messages are not.
@@ -3676,6 +3697,15 @@ pub struct RunningAgent {
     /// when the command names a launcher script that `exec`s another binary
     /// (an old npm 1.x `bin/opencode`). Daemon-local, not on the wire.
     pub opencode_spawn_version: Option<crate::opencode_version::Version>,
+    /// Issue #1757: this generation's OpenCode 2 client and its private server,
+    /// as the daemon's OpenCode watch last identified them
+    /// ([`crate::opencode_mode::Watch::private_server`], set through
+    /// [`AgentPtyRegistry::publish_opencode_private_servers`]). The shell-activity
+    /// scan re-roots at that server instead of counting it as a background
+    /// command ([`crate::platform::proc::AgentServer`]). `None` until the watch
+    /// has looked, for every pane it identifies no server in, and after a look
+    /// that failed. Daemon-local, not on the wire.
+    pub opencode_private_server: Option<crate::platform::proc::AgentServer>,
     /// The full env vec passed to [`AgentPtyRegistry::spawn_agent`] at
     /// the original spawn, captured so
     /// [`AgentPtyRegistry::respawn_agent_for_pane`] can re-apply it on
@@ -3966,6 +3996,22 @@ fn shell_tool_shape_key(agent_type: Option<&AgentType>) -> Option<&'static str> 
     }
 }
 
+/// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
+/// under, whose nested sessions a card displays as one command
+/// ([`crate::platform::proc::command_sessions_in_pane`]). Only
+/// Codex's was measured, so only a pane the registry knows as Codex selects
+/// one; every other kind (and a pane whose kind is not known yet) selects none
+/// and counts every qualifying session as it always has. Keyed off the same
+/// observed agent kind as [`shell_tool_shape_key`].
+fn command_wrapper_of(
+    agent_type: Option<&AgentType>,
+) -> Option<crate::platform::proc::CommandWrapper> {
+    match agent_type {
+        Some(AgentType::Codex) => Some(crate::platform::proc::CommandWrapper::CodexLinuxSandbox),
+        _ => None,
+    }
+}
+
 /// One live pane a shell-activity sample could classify, resolved under the
 /// registry lock by [`AgentPtyRegistry::shell_activity_candidates`] and then
 /// classified without it by [`AgentPtyRegistry::classify_shell_activity`].
@@ -3992,6 +4038,14 @@ pub struct ShellActivityCandidate {
     /// Empty for every kind that has never been measured, which leaves the
     /// structural session-id test standing alone.
     pub shapes: Vec<crate::platform::proc::ShellToolShape>,
+    /// Issue #1757: *this* pane's agent's own server, as the daemon's OpenCode
+    /// watch identified it ([`RunningAgent::opencode_private_server`]), which
+    /// the scan re-roots at instead of counting as a background command. `None`
+    /// for every pane but an OpenCode 2 one whose server the watch identified.
+    pub server: Option<crate::platform::proc::AgentServer>,
+    /// Issue #1757: the sandbox wrapper *this* pane's agent runs each command
+    /// under ([`command_wrapper_of`]). `None` for every pane but a Codex one.
+    pub wrapper: Option<crate::platform::proc::CommandWrapper>,
 }
 
 impl crate::hook_provenance::HookTokenDirectory for AgentPtyRegistry {
@@ -8442,6 +8496,8 @@ pub struct AgentPtyRegistry {
     turn_replies: crate::turn_reply::TurnReplyHub,
     /// PRD #1666: see [`AgentPtyRegistry::inbox`].
     inbox: std::sync::OnceLock<Arc<crate::inbox_hub::InboxHub>>,
+    /// PRD #1889: see [`AgentPtyRegistry::work`].
+    work: crate::work_tracking::WorkTracker,
     /// PRD #1487 audit A2 test seam: when set, the next spawn reports that its
     /// child is forked and waits, before it takes the publishing lock — see
     /// [`Self::pause_next_publish_for_test`].
@@ -8626,6 +8682,11 @@ pub(crate) const FAULT_RESPAWN_BEFORE_PUBLISH_SECTION: &str = "respawn-before-pu
 /// PRD #1666 part 3, round 5: a spawn's fault point after its record is
 /// published and before it returns ((f2')'s seam).
 pub(crate) const FAULT_SPAWN_AFTER_INSERT: &str = "spawn-after-insert";
+
+/// PRD #1889: a spawn's pause point after its record is published and the
+/// registry lock released ([`AgentPtyRegistry::pause_at_sync_for_test`]), the
+/// window in which a concurrent stop can close the new generation's pane.
+pub(crate) const PAUSE_SPAWN_AFTER_PUBLISH: &str = "spawn-after-publish";
 
 /// PRD #1666 part 3, round 5: a spawn's fault point after its fork and before
 /// its record is published, with its reservation armed (`/057` (c)).
@@ -9978,6 +10039,13 @@ struct RegistryInner {
     /// [`SpawnReservation`] on both its release paths — so a token is
     /// resolvable from exactly one of the two maps at every instant.
     pending_hook_tokens: HashMap<String, String>,
+    /// Issue #2104: digests of the tokens of generations whose records were
+    /// lifted out of `agents` — by a close, a respawn or the shutdown drain —
+    /// read by [`AgentPtyRegistry::hook_token_was_retired`] so the hook loop
+    /// logs a dying agent's refused last report quietly. Never consulted by
+    /// [`AgentPtyRegistry::owner_of_hook_token`]: a retired token still
+    /// resolves to nothing. Bounded; see [`crate::hook_provenance::RetiredHookTokens`].
+    retired_hook_tokens: crate::hook_provenance::RetiredHookTokens,
     /// Issue #1612: the working directories of every spawn in
     /// [`Self::pending_spawns`] — its `cwd` and, for an orchestration role, its
     /// orchestration cwd — keyed by the same pre-allocated agent id, inserted
@@ -10526,10 +10594,13 @@ pub struct DeliveryNotice {
     /// conversation) carries no such constraint, because there is nothing to
     /// name.
     pub session_id: Option<String>,
-    /// FIXED, daemon-authored text. Nothing a repository, a prompt or a role
+    /// Daemon-authored text. Nothing a repository, a prompt or a role
     /// controls may be interpolated here — that rule outlives the transport,
-    /// because the text still reaches a human-readable surface.
-    pub detail: &'static str,
+    /// because the text still reaches a human-readable surface. Owned only so
+    /// a value the deck itself observed can be said, such as the exit code of
+    /// the command it started in the pane (issue #1933,
+    /// [`crate::inbox_display::PaneTermination::card_notice`]).
+    pub detail: std::borrow::Cow<'static, str>,
     /// PRD #1666 long-turn delivery: not a failure but the end of one — the
     /// inbox message an earlier notice reported not delivered was acknowledged
     /// after all, so the card's not-delivered `Error` is lifted
@@ -10588,6 +10659,7 @@ impl AgentPtyRegistry {
                 pane_generations: HashMap::new(),
                 pending_spawns: HashMap::new(),
                 pending_hook_tokens: HashMap::new(),
+                retired_hook_tokens: Default::default(),
                 pending_spawn_dirs: HashMap::new(),
                 pending_busy: HashSet::new(),
                 pending_turned: HashMap::new(),
@@ -10655,6 +10727,7 @@ impl AgentPtyRegistry {
             codex_rollout_arms: crate::codex_rollout_tail::CodexRolloutArms::default(),
             turn_replies: crate::turn_reply::TurnReplyHub::default(),
             inbox: std::sync::OnceLock::new(),
+            work: crate::work_tracking::WorkTracker::default(),
             #[cfg(test)]
             publish_pause: Mutex::new(None),
             #[cfg(test)]
@@ -10907,6 +10980,23 @@ impl AgentPtyRegistry {
             }
             hub
         })
+    }
+
+    /// PRD #1889: the work journal's bookkeeping — which work each spawn,
+    /// end, report and close belongs to. Records nothing until the daemon
+    /// installs its run's journal ([`crate::work_tracking::WorkTracker::install`]).
+    pub fn work(&self) -> &crate::work_tracking::WorkTracker {
+        &self.work
+    }
+
+    /// TEST: the environment generation `agent_id` was spawned with.
+    #[cfg(test)]
+    pub(crate) fn spawn_env_of_for_test(&self, agent_id: &str) -> Option<Vec<(String, String)>> {
+        self.inner
+            .lock()
+            .agents
+            .get(agent_id)
+            .map(|a| a.spawn_env.clone())
     }
 
     /// PRD #1666: install the daemon's inbox, built on its persisted deck id.
@@ -14356,6 +14446,29 @@ impl AgentPtyRegistry {
             }),
             _ => None,
         };
+        // Issue #2094: a worker role or a dispatched single agent is driven by
+        // another agent, so Claude Code's prompt suggestions are turned off.
+        crate::unattended_pane::apply(&mut opts.env, tab_membership.as_ref(), opts.origin);
+        // PRD #1889: the work this generation serves, decided before the fork
+        // so the child is handed it, and pinned on its reservation so a
+        // respawn keeps it. Taken with no registry lock held. The guard lives
+        // to the end of this spawn: a spawn refused or failed before its
+        // attempt is published forgets the work it minted.
+        let work_guard = self.work.resolve_spawn(
+            opts.work_id.as_ref(),
+            pane_id_env.as_deref(),
+            tab_membership.as_ref(),
+            cwd_stored.as_deref(),
+        );
+        let work = work_guard.work().cloned();
+        opts.work_id.clone_from(&work);
+        let journal_pane = pane_id_env.clone();
+        let journal_role = match tab_membership.as_ref() {
+            Some(TabMembership::Orchestration { role_name, .. }) if !role_name.is_empty() => {
+                Some(role_name.clone())
+            }
+            _ => None,
+        };
         let (preallocated_id, reservation) = self.reserve_spawn(
             &pane_id_env,
             &hook_token_for_record,
@@ -14365,10 +14478,21 @@ impl AgentPtyRegistry {
             admission.is_admitted_respawn(),
             seat,
             admission.replacement(),
+            work.clone(),
         )?;
         opts.env.retain(|(k, _)| k != DOT_AGENT_DECK_AGENT_ID);
         opts.env
             .push((DOT_AGENT_DECK_AGENT_ID.to_string(), preallocated_id.clone()));
+        // PRD #1889: strip, then set, as for the agent id: a respawn replays
+        // its predecessor's environment, which must not carry a stale work.
+        opts.env
+            .retain(|(k, _)| k != crate::work_journal::ENV_WORK_ID);
+        if let Some(work) = &work {
+            opts.env.push((
+                crate::work_journal::ENV_WORK_ID.to_string(),
+                work.to_string(),
+            ));
+        }
 
         // Issue #1077: hand the child the hook capability token minted above,
         // in the same breath as its agent id and for the same reason — the child's
@@ -15019,6 +15143,7 @@ impl AgentPtyRegistry {
             badge_command: spawn_command.clone(),
             spawn_command,
             opencode_spawn_version,
+            opencode_private_server: None,
             spawn_env: captured_env,
             hook_token: hook_token_for_record,
             pty_rows: captured_rows,
@@ -15088,6 +15213,18 @@ impl AgentPtyRegistry {
         // PRD #1741: under the lock that published the agent, so its reader's
         // EOF, which checks registration under it, is ordered after this.
         crate::telemetry::commit_spawn(telemetry_run);
+        // PRD #1889: the generation is published, so its attempt starts (and
+        // the work it serves opens, when this spawn minted it) — under the
+        // lock that publishes it, so a stop, which can only find the
+        // generation once it is published, closes the pane's work after its
+        // start is booked rather than before (a close that ran first would
+        // find nothing to close, and the late start would leave the work
+        // open). `attempt_started` takes only the work book's leaf mutex and
+        // queues its events: no file I/O under this lock.
+        if let Some(work) = &work {
+            self.work
+                .attempt_started(work, &id, journal_pane.as_deref(), journal_role.as_deref());
+        }
         // Signal *after* releasing the lock would be cleaner, but we still
         // hold `inner` here. Notify is cheap and a spurious wake-up is
         // harmless — the monitor will re-check counters anyway.
@@ -15096,6 +15233,9 @@ impl AgentPtyRegistry {
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);
+        // PRD #1889 test seam: the window, after publication, in which a
+        // concurrent stop can close the pane.
+        self.pause_point_sync(PAUSE_SPAWN_AFTER_PUBLISH);
         // PRD #1666 part 3 (Q35-14b): an installed generation's observer,
         // started with the registry lock released.
         #[cfg(target_os = "linux")]
@@ -15588,6 +15728,9 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(id)
                 .ok_or_else(|| AgentPtyError::NotFound(id.to_string()))?;
+            inner
+                .retired_hook_tokens
+                .record(&agent.hook_token, agent.pane_id_env.as_deref(), id);
             agent.removal.closed();
             // Issue #2028 (review): in the removing hold, so a reader that no
             // longer finds the record finds what it knew of its child.
@@ -15959,6 +16102,11 @@ impl AgentPtyRegistry {
                 .agents
                 .remove(&agent_id)
                 .expect("agent_id was just located inside the same lock hold");
+            inner.retired_hook_tokens.record(
+                &removed.hook_token,
+                removed.pane_id_env.as_deref(),
+                &agent_id,
+            );
             let removed_record = Self::cleanup_record(&agent_id, &removed);
             // PRD #1666 part 3, round 5-wake: under the lock hold that lifts the
             // record out; the ticket settles it.
@@ -16048,6 +16196,8 @@ impl AgentPtyRegistry {
             spawn_command: _,
             // The fresh generation's own spawn probes again.
             opencode_spawn_version: _,
+            // And the watch identifies the fresh generation's server afresh.
+            opencode_private_server: _,
             badge_command: previous_badge_command,
             spawn_env,
             // Issue #1077: the OLD generation's hook capability token is
@@ -16279,6 +16429,9 @@ impl AgentPtyRegistry {
             tab_membership,
             agent_type: respawn_agent_type,
             origin: previous_facts.seat.as_ref().and_then(|seat| seat.origin),
+            // PRD #1889: the pane's work, pinned on its predecessor: a new
+            // attempt of the same work.
+            work_id: previous_facts.work.clone(),
         };
         // PRD #1666 part 3, round 5 (plan D7): from here to the end of the
         // replacement's `publish` there is no `.await`, so the window runs as
@@ -16818,6 +16971,9 @@ impl AgentPtyRegistry {
             tab_membership: identity.tab_membership.clone(),
             agent_type,
             origin,
+            // PRD #1889: a re-created pane keeps the work its last generation
+            // served, so it is a new attempt of the same work.
+            work_id: self.work.work_of_pane(pane_id_env),
         })
     }
 
@@ -18654,6 +18810,25 @@ impl AgentPtyRegistry {
         Some(Self::classify_shell_activity(&candidates, &table))
     }
 
+    /// Issue #1757: record the OpenCode 2 clients and private servers the
+    /// daemon's OpenCode watch identified on its last look
+    /// ([`RunningAgent::opencode_private_server`]), by agent id, and clear
+    /// every other agent's, so an identity no look vouches for any more — the
+    /// watch failed, the client is gone or changed, the agent is no longer
+    /// watched — is not carried. An id no longer in the registry is ignored.
+    pub fn publish_opencode_private_servers(
+        &self,
+        servers: &[(String, crate::platform::proc::AgentServer)],
+    ) {
+        let mut inner = self.inner.lock();
+        for (agent_id, agent) in inner.agents.iter_mut() {
+            agent.opencode_private_server = servers
+                .iter()
+                .find(|(id, _)| id == agent_id)
+                .map(|(_, server)| *server);
+        }
+    }
+
     /// PRD #2050: the live agents whose pane runs OpenCode — by the type the
     /// spawn declared or a hook revealed, or else by its command's basename —
     /// with the pid their process tree hangs from, for the daemon's watch on
@@ -18725,6 +18900,8 @@ impl AgentPtyRegistry {
                     agent_id: agent_id.clone(),
                     shell_pid,
                     shapes,
+                    server: agent.opencode_private_server,
+                    wrapper: command_wrapper_of(agent.agent_type.as_ref()),
                 })
             })
             .collect()
@@ -18762,21 +18939,28 @@ impl AgentPtyRegistry {
     }
 
     /// Issue #1678 D4: [`Self::classify_shell_activity`] with the distinct
-    /// qualifying POSIX sessions behind each busy reading — the count a card
-    /// shows as background commands — paired with the candidate (and so the
-    /// spawn) it was classified for. A candidate the table cannot answer for is
-    /// dropped, never reported as zero.
+    /// qualifying POSIX sessions behind each busy reading — raw, each with its
+    /// own first-seen age downstream, plus the pairs the pane's wrapper says
+    /// are one command in the count a card shows (issue #1757,
+    /// [`crate::platform::proc::CommandSessions`]) — paired with the candidate
+    /// (and so the spawn) it was classified for. A candidate the table cannot
+    /// answer for is dropped, never reported as zero.
     pub fn classify_command_sessions<'c>(
         candidates: &'c [ShellActivityCandidate],
         table: &[crate::platform::proc::ProcessInfo],
-    ) -> Vec<(&'c ShellActivityCandidate, std::collections::HashSet<i32>)> {
+    ) -> Vec<(
+        &'c ShellActivityCandidate,
+        crate::platform::proc::CommandSessions,
+    )> {
         candidates
             .iter()
             .filter_map(|candidate| {
-                let sessions = crate::platform::proc::qualifying_command_sessions(
+                let sessions = crate::platform::proc::command_sessions_in_pane(
                     table,
                     candidate.shell_pid,
                     &candidate.shapes,
+                    candidate.server,
+                    candidate.wrapper,
                 )?;
                 Some((candidate, sessions))
             })
@@ -19030,6 +19214,7 @@ impl AgentPtyRegistry {
                 spawn_command: None,
                 badge_command: None,
                 opencode_spawn_version: None,
+                opencode_private_server: None,
                 spawn_env: Vec::new(),
                 // A synthetic agent holds no pane (`pane_id_env: None`), so its
                 // token can never attest a pane claim — but it still gets a real
@@ -19350,6 +19535,7 @@ impl AgentPtyRegistry {
         admitted_respawn: bool,
         seat: Option<crate::hook_provenance::Seat>,
         replacement: Option<&ReplacementTicket>,
+        work: Option<crate::work_journal::WorkId>,
     ) -> Result<(String, SpawnReservation<'_>), AgentPtyError> {
         let mut inner = self.inner.lock();
         // PRD #1589 D4: no pane joins an instance a `close` is taking down or
@@ -19432,6 +19618,7 @@ impl AgentPtyRegistry {
                 seat,
                 unit: None,
                 replacement_of: replacement.map(|ticket| ticket.id),
+                work,
             },
         );
         // PRD #1666 part 3, round 5 (plan D7): a replacement's successor is
@@ -19542,6 +19729,30 @@ impl AgentPtyRegistry {
             })
     }
 
+    /// Issue #2104: whether `token` belongs to a generation this registry took
+    /// down — closed, respawned away or drained at shutdown — and the claim is
+    /// that generation's own: `claimed_pane` is the pane it held (`None`: a
+    /// paneless generation) and `claimed_agent`, when given, is its id; a
+    /// paneless claim must give it. A retired token claiming any other pane
+    /// or agent answers `false`.
+    ///
+    /// For the hook loop's LOG LEVEL only: a dying agent's last report carries
+    /// its retired token and is refused as `unknown_token`, which is expected
+    /// and logged at `debug`. It is not evidence the sender may act — a token
+    /// answered `true` here still resolves to nothing in
+    /// [`Self::owner_of_hook_token`].
+    pub fn hook_token_was_retired(
+        &self,
+        token: &str,
+        claimed_pane: Option<&str>,
+        claimed_agent: Option<&str>,
+    ) -> bool {
+        self.inner
+            .lock()
+            .retired_hook_tokens
+            .contains(token, claimed_pane, claimed_agent)
+    }
+
     /// Test probe for one record's hook capability token.
     ///
     /// `#[cfg(test)]` on purpose, and that gate is load-bearing rather than
@@ -19583,6 +19794,7 @@ impl AgentPtyRegistry {
                 false,
                 None,
                 None,
+                None,
             )
             .expect("reserve a spawn");
         // Disarm the guard so the reservation outlives this call.
@@ -19608,6 +19820,7 @@ impl AgentPtyRegistry {
             vec![cwd.to_path_buf()],
             None,
             false,
+            None,
             None,
             None,
         )?;
@@ -20195,6 +20408,29 @@ impl AgentPtyRegistry {
         units.note_exited(&id);
     }
 
+    /// Whether a record of orchestration instance `instance` is still held,
+    /// published or not yet confirmed.
+    pub fn instance_has_records(&self, instance: &str) -> bool {
+        let inner = self.inner.lock();
+        inner.agents.values().any(|a| {
+            matches!(
+                &a.tab_membership,
+                Some(TabMembership::Orchestration {
+                    orchestration_id: Some(id),
+                    ..
+                }) if id == instance
+            )
+        }) || inner.unconfirmed_agents.values().any(|a| {
+            matches!(
+                &a.record.tab_membership,
+                Some(TabMembership::Orchestration {
+                    orchestration_id: Some(id),
+                    ..
+                }) if id == instance
+            )
+        })
+    }
+
     /// PRD #1589 D5: a member of a unit was deliberately stopped and its record
     /// removed. A single unit ends with its agent; an orchestration unit ends
     /// only once no pane of its instance remains — no record in this registry,
@@ -20215,26 +20451,9 @@ impl AgentPtyRegistry {
             }) => Some(id.clone()),
             _ => None,
         };
-        let instance_has_records = instance.as_deref().is_some_and(|instance| {
-            let inner = self.inner.lock();
-            inner.agents.values().any(|a| {
-                matches!(
-                    &a.tab_membership,
-                    Some(TabMembership::Orchestration {
-                        orchestration_id: Some(id),
-                        ..
-                    }) if id == instance
-                )
-            }) || inner.unconfirmed_agents.values().any(|a| {
-                matches!(
-                    &a.record.tab_membership,
-                    Some(TabMembership::Orchestration {
-                        orchestration_id: Some(id),
-                        ..
-                    }) if id == instance
-                )
-            })
-        });
+        let instance_has_records = instance
+            .as_deref()
+            .is_some_and(|instance| self.instance_has_records(instance));
         // Read and released before the registry lock is taken again below:
         // the ledger is never held while taking it.
         let (id, orchestration) = {
@@ -20715,10 +20934,13 @@ impl AgentPtyRegistry {
                 std::thread::sleep(FORCE_REAP_POLL_INTERVAL);
                 continue;
             }
-            let mut children: Vec<ShutdownChild> = inner
+            let fields = &mut *inner;
+            let retired = &mut fields.retired_hook_tokens;
+            let mut children: Vec<ShutdownChild> = fields
                 .agents
                 .drain()
-                .map(|(_, agent)| {
+                .map(|(id, agent)| {
+                    retired.record(&agent.hook_token, agent.pane_id_env.as_deref(), &id);
                     agent.removal.closed();
                     agent.into()
                 })
@@ -20817,6 +21039,10 @@ impl AgentPtyRegistry {
         // Issue #581: the kill pass and the reap pass are SEPARATE, and
         // [`Self::force_kill_and_reap_all`] documents why.
         Self::force_kill_and_reap_all(agents);
+
+        // PRD #1889: what the work journal's writer still holds, within a
+        // short bound, so a graceful stop leaves the journal current.
+        self.work.drain(crate::work_journal::SHUTDOWN_DRAIN);
 
         self.change_notify.notify_one();
     }
@@ -20958,6 +21184,44 @@ mod tests {
                 "idle member {id} holds a PTY master"
             );
         }
+    }
+
+    /// Issue #1757 (round-3 audit): each publish of the OpenCode watch's
+    /// identities replaces every agent's — an agent the look did not name, and
+    /// every agent after a failed look (an empty publish), keeps none, so a
+    /// stale client/server pair is never carried past a look that does not
+    /// vouch for it.
+    #[test]
+    fn publishing_opencode_private_servers_clears_every_unnamed_agent() {
+        use crate::platform::proc::AgentServer;
+        let registry = AgentPtyRegistry::new();
+        let a = registry.insert_idle_member_for_test("oc-a", "oc", true);
+        let b = registry.insert_idle_member_for_test("oc-b", "oc", false);
+        let server = |client_pid, server_pid| AgentServer {
+            client_pid,
+            server_pid,
+        };
+        let held = |id: &str| registry.inner.lock().agents[id].opencode_private_server;
+
+        registry.publish_opencode_private_servers(&[
+            (a.clone(), server(101, 102)),
+            (b.clone(), server(201, 202)),
+        ]);
+        assert_eq!(held(&a), Some(server(101, 102)));
+        assert_eq!(held(&b), Some(server(201, 202)));
+
+        // The next look names only `a`, with a new pair: `b`'s is cleared.
+        registry.publish_opencode_private_servers(&[
+            (a.clone(), server(103, 104)),
+            ("gone".to_string(), server(1, 2)),
+        ]);
+        assert_eq!(held(&a), Some(server(103, 104)));
+        assert_eq!(held(&b), None, "an agent the look did not name");
+
+        // A failed look publishes nothing: every identity is cleared.
+        registry.publish_opencode_private_servers(&[]);
+        assert_eq!(held(&a), None, "after a failed look");
+        assert_eq!(held(&b), None);
     }
 
     /// Issue #714 (review): a blocked-worker notice task is cancellable only
@@ -21123,6 +21387,27 @@ mod tests {
     /// statement here, which is what made a paneless daemon fork `ps -A` at 2Hz
     /// forever. `shell_activity_candidates` is asserted directly because it is
     /// the guard the early return is keyed off.
+    /// Issue #1757: only a pane the registry knows as Codex selects Codex's
+    /// sandbox wrapper; every other kind, and an unknown one, selects none, so
+    /// its nested sessions count exactly as before.
+    #[test]
+    fn only_a_codex_pane_selects_the_codex_sandbox_wrapper() {
+        assert_eq!(
+            command_wrapper_of(Some(&AgentType::Codex)),
+            Some(crate::platform::proc::CommandWrapper::CodexLinuxSandbox)
+        );
+        for other in [
+            AgentType::ClaudeCode,
+            AgentType::OpenCode,
+            AgentType::Pi,
+            AgentType::Devin,
+            AgentType::None,
+        ] {
+            assert_eq!(command_wrapper_of(Some(&other)), None, "{other:?}");
+        }
+        assert_eq!(command_wrapper_of(None), None);
+    }
+
     #[test]
     fn an_empty_registry_reports_no_shell_activity_without_sampling() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -22140,6 +22425,72 @@ mod spawn_tests {
         assert_eq!(registry.configured_launch_of(&shell), None);
         assert_eq!(registry.configured_launch_of("no-such-agent"), None);
         registry.shutdown_all();
+    }
+
+    /// Issue #2104: every path that takes a generation down — a respawn, a
+    /// close, the shutdown drain — remembers its token as retired, and a
+    /// retired token still resolves to nobody.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn teardown_paths_retire_the_outgoing_hook_token() {
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let first = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "pane-2104".to_string())],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn the pane");
+        let first_token = registry.hook_token_of(&first).expect("first token");
+        assert!(!registry.hook_token_was_retired(&first_token, Some("pane-2104"), Some(&first)));
+
+        let second = registry
+            .respawn_agent_for_pane("pane-2104", "cat")
+            .await
+            .expect("respawn the pane");
+        let second_token = registry.hook_token_of(&second).expect("second token");
+        assert!(
+            registry.hook_token_was_retired(&first_token, Some("pane-2104"), Some(&first)),
+            "respawn"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&first_token, Some("another-pane"), Some(&first)),
+            "a retired token claiming another pane is not its teardown"
+        );
+        assert!(registry.owner_of_hook_token(&first_token).is_none());
+        assert!(!registry.hook_token_was_retired(&second_token, Some("pane-2104"), Some(&second)));
+
+        registry.close_agent(&second).expect("close the pane");
+        assert!(
+            registry.hook_token_was_retired(&second_token, Some("pane-2104"), Some(&second)),
+            "close"
+        );
+        assert!(registry.owner_of_hook_token(&second_token).is_none());
+
+        let third = registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                ..SpawnOptions::default()
+            })
+            .expect("spawn a paneless agent");
+        let third_token = registry.hook_token_of(&third).expect("third token");
+        registry.shutdown_all();
+        assert!(
+            registry.hook_token_was_retired(&third_token, None, Some(&third)),
+            "shutdown"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&third_token, None, Some(&first)),
+            "a retired paneless token naming another agent is not its teardown"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&third_token, None, None),
+            "a paneless claim that names no agent is not its teardown"
+        );
+        assert!(
+            !registry.hook_token_was_retired(&first_token, Some("pane-2104"), Some(&second)),
+            "a retired token naming its successor is not its teardown"
+        );
     }
 
     /// Qodo, PR #1603: a respawn under a DIFFERENT command keeps the old badge
@@ -25237,6 +25588,102 @@ mod spawn_tests {
         panic!("child never reported its DOT_AGENT_DECK_SOCKET");
     }
 
+    /// What a child spawned with `membership` and `origin` sees as
+    /// `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION`, `<unset>` when absent.
+    fn child_observed_prompt_suggestion(
+        registry: &Arc<AgentPtyRegistry>,
+        pane_id: &str,
+        membership: Option<TabMembership>,
+        origin: Option<crate::hook_provenance::InstanceOrigin>,
+    ) -> String {
+        let dir = tempfile::tempdir().expect("create tempdir");
+        let out = dir.path().join("suggestion.txt");
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some(&format!(
+                    "sh -c 'printf \"%s\" \"${{{}:-<unset>}}\" > {}'",
+                    crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION,
+                    out.display()
+                )),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), pane_id.to_string())],
+                tab_membership: membership,
+                origin,
+                ..SpawnOptions::default()
+            })
+            .expect("spawn should succeed");
+        for _ in 0..200 {
+            if let Ok(v) = std::fs::read_to_string(&out)
+                && !v.is_empty()
+            {
+                return v;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("child never reported its prompt-suggestion setting");
+    }
+
+    /// Scenario: issue #2094. An orchestration worker role and a dispatched
+    /// single-agent pane are spawned with Claude Code's prompt suggestions off;
+    /// the orchestrator seat and a plain pane get nothing from the deck, so they
+    /// see whatever the daemon itself inherited.
+    #[test]
+    fn spawn_agent_turns_prompt_suggestions_off_only_in_unattended_panes() {
+        use crate::hook_provenance::InstanceOrigin;
+        let role = |is_start_role: bool| TabMembership::Orchestration {
+            name: "team".to_string(),
+            role_index: if is_start_role { 0 } else { 1 },
+            role_name: if is_start_role {
+                "orchestrator"
+            } else {
+                "coder"
+            }
+            .to_string(),
+            is_start_role,
+            orchestration_cwd: None,
+            display_title: None,
+            orchestration_id: Some("o-2094".to_string()),
+        };
+        let inherited = std::env::var(crate::unattended_pane::CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION)
+            .ok()
+            // The child's `${VAR:-<unset>}` reads an empty value as unset too.
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "<unset>".to_string());
+        let registry = Arc::new(AgentPtyRegistry::new());
+        let worker = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-worker",
+            Some(role(false)),
+            Some(InstanceOrigin::Direct),
+        );
+        let dispatched = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-dispatched",
+            None,
+            Some(InstanceOrigin::Dispatched),
+        );
+        let orchestrator = child_observed_prompt_suggestion(
+            &registry,
+            "pane-2094-orchestrator",
+            Some(role(true)),
+            Some(InstanceOrigin::Dispatched),
+        );
+        let plain = child_observed_prompt_suggestion(&registry, "pane-2094-plain", None, None);
+        registry.shutdown_all();
+        assert_eq!(
+            worker, "false",
+            "a worker role is driven by its orchestrator"
+        );
+        assert_eq!(
+            dispatched, "false",
+            "a dispatched unit is driven by its task"
+        );
+        assert_eq!(
+            orchestrator, inherited,
+            "the orchestrator seat is left alone"
+        );
+        assert_eq!(plain, inherited, "a plain pane is left alone");
+    }
+
     #[test]
     fn spawn_agent_injects_the_daemons_hook_socket_into_the_child() {
         let registry = Arc::new(AgentPtyRegistry::new());
@@ -27486,7 +27933,9 @@ mod spawn_tests {
         let typed = editor.typed();
         let line = typed_line(&typed).expect("the line was typed");
         assert!(
-            line.ends_with(" dot-agent-deck: message m-abcdefgh-0123456789abcdef waiting, run: dot-agent-deck inbox fetch"),
+            line.ends_with(&crate::doorbell::doorbell_line(
+                "m-abcdefgh-0123456789abcdef"
+            )),
             "{line}"
         );
         assert_eq!(
@@ -29708,7 +30157,12 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let editor = ModelEditor::spawn(&registry, "pane-ring-resize", OnEnter::Submit);
         let repaint = Arc::new(std::sync::Mutex::new(None));
-        const NARROWER: u16 = EDITOR_COLS - 10;
+        // Narrower by the least that is still a resize. Since issue #1730 the
+        // doorbell line names the deck by its absolute path, here the test
+        // binary's, so its length follows the checkout's path: ten columns
+        // less wrapped it in a long-named worktree, where the echo it waits
+        // for no longer matched.
+        const NARROWER: u16 = EDITOR_COLS - 1;
         editor.control.lock().unwrap().cols = NARROWER as usize;
         {
             let pusher = Arc::clone(&editor.bus);

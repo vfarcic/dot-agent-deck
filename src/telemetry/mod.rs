@@ -22,7 +22,10 @@
 //! each kept only when it has the shape of a command word, and never the first
 //! word of a program that prints or searches text, and the same two of each
 //! later command of a chained line and of the command a known wrapper runs
-//! ([`operation::describe`]). No other value on a span is
+//! ([`operation::describe`]). When that filter names no program, which of
+//! the deck's fixed decline names ([`operation::Decline`]) the span carries
+//! depends on the command's shape, but no character of the command is in it.
+//! No other value on a span is
 //! read from an event: the rest come from the
 //! spawn (its ids, role and orchestration), the deck's own counts and enum
 //! names, the configuration and host, and the git probes (a commit hash and the
@@ -72,6 +75,7 @@ pub mod propagation;
 pub mod resource;
 pub mod run_context;
 pub mod shim;
+pub mod skill;
 pub mod span;
 pub mod tracker;
 
@@ -262,13 +266,15 @@ fn prepare_run_for_spawn(
     membership: Option<&crate::agent_pty::TabMembership>,
 ) -> Option<PreparedRun> {
     let telemetry = telemetry?;
-    let start = RunStart::for_spawn(
+    let mut start = RunStart::for_spawn(
         pane_id?,
         agent_id,
         opts.agent_type.as_ref(),
         opts.command,
         membership,
     );
+    // PRD #1889: the work this attempt serves, decided by the spawn path.
+    start.work_id = opts.work_id.as_ref().map(ToString::to_string);
     let run = telemetry.prepare_run(start, &opts.env, opts.cwd.map(std::path::PathBuf::from))?;
     opts.env.extend(run.env.iter().cloned());
     Some(run)
@@ -419,7 +425,7 @@ pub fn observe_attach(telemetry: Option<Arc<Telemetry>>, took: std::time::Durati
 
 /// `deck.telemetry.schema_version`: bumped whenever the attribute set changes
 /// in a way that makes data recorded before and after it incomparable.
-pub const SCHEMA_VERSION: &str = "3";
+pub const SCHEMA_VERSION: &str = "5";
 
 /// The service name a span batch carries when `OTEL_SERVICE_NAME` is unset.
 pub const DEFAULT_SERVICE_NAME: &str = "dot-agent-deck";
@@ -454,6 +460,8 @@ pub const SPAN_NAMES: [&str; 7] = [
 pub const EVENT_STATUS_CHANGE: &str = "deck.status_change";
 pub const EVENT_INTERVENTION: &str = "deck.intervention";
 pub const EVENT_CI_CHANGE: &str = "deck.ci.change";
+/// Issue #2087: the agent loaded a skill ([`skill`]).
+pub const EVENT_SKILL: &str = "deck.skill";
 pub use accounting::EVENT_MODEL_USAGE;
 
 /// The span events the deck emits on `agent.handoff`: the worker took the
@@ -489,6 +497,8 @@ pub enum AttrKey {
     InvokingSkill,
     IssueNumber,
     PrNumber,
+    /// Issue #2096: every pull request a run saw, not only the last.
+    PrNumbers,
     EndReason,
     ExitCode,
     InterventionsCount,
@@ -502,9 +512,17 @@ pub enum AttrKey {
     OperationCommands,
     OperationWrappedProgram,
     OperationWrappedWord,
+    /// Issue #2088: why the first command names no program, and the syntax
+    /// that stopped it.
+    OperationDeclined,
+    OperationDeclinedSyntax,
     /// Issue #1981: why the deck ended an `agent.operation` itself.
     OperationEnd,
     OperationsCount,
+    /// Issue #2087: a defined skill's name, on a `deck.skill` event.
+    SkillName,
+    /// Issue #2087: how many skills the run loaded.
+    SkillsCount,
     CiFrom,
     CiTo,
     CiResult,
@@ -515,6 +533,9 @@ pub enum AttrKey {
     CiFailuresCount,
     AgentSource,
     DispatchName,
+    /// PRD #1889: the work the run's attempt serves, the agent's
+    /// `DOT_AGENT_DECK_WORK_ID`.
+    WorkId,
     /// Issue #1981 M7: an `agent.handoff`'s task id, the worker's run, how
     /// it ended and, when its task never reached the worker, why; and the
     /// reports an orchestrator run received that named no task.
@@ -569,6 +590,7 @@ impl AttrKey {
         AttrKey::InvokingSkill,
         AttrKey::IssueNumber,
         AttrKey::PrNumber,
+        AttrKey::PrNumbers,
         AttrKey::EndReason,
         AttrKey::ExitCode,
         AttrKey::InterventionsCount,
@@ -582,8 +604,12 @@ impl AttrKey {
         AttrKey::OperationCommands,
         AttrKey::OperationWrappedProgram,
         AttrKey::OperationWrappedWord,
+        AttrKey::OperationDeclined,
+        AttrKey::OperationDeclinedSyntax,
         AttrKey::OperationEnd,
         AttrKey::OperationsCount,
+        AttrKey::SkillName,
+        AttrKey::SkillsCount,
         AttrKey::CiFrom,
         AttrKey::CiTo,
         AttrKey::CiResult,
@@ -594,6 +620,7 @@ impl AttrKey {
         AttrKey::CiFailuresCount,
         AttrKey::AgentSource,
         AttrKey::DispatchName,
+        AttrKey::WorkId,
         AttrKey::HandoffId,
         AttrKey::HandoffWorkerRunId,
         AttrKey::HandoffOutcome,
@@ -637,6 +664,7 @@ impl AttrKey {
             AttrKey::InvokingSkill => "deck.invoking_skill",
             AttrKey::IssueNumber => "deck.issue.number",
             AttrKey::PrNumber => "deck.pr.number",
+            AttrKey::PrNumbers => "deck.pr.numbers",
             AttrKey::EndReason => "deck.run.end_reason",
             AttrKey::ExitCode => "deck.run.exit_code",
             AttrKey::InterventionsCount => "deck.interventions.count",
@@ -650,8 +678,12 @@ impl AttrKey {
             AttrKey::OperationCommands => "deck.operation.commands",
             AttrKey::OperationWrappedProgram => "deck.operation.wrapped.program",
             AttrKey::OperationWrappedWord => "deck.operation.wrapped.word",
+            AttrKey::OperationDeclined => "deck.operation.declined",
+            AttrKey::OperationDeclinedSyntax => "deck.operation.declined.syntax",
             AttrKey::OperationEnd => "deck.operation.end",
             AttrKey::OperationsCount => "deck.operations.count",
+            AttrKey::SkillName => "deck.skill.name",
+            AttrKey::SkillsCount => "deck.skills.count",
             AttrKey::CiFrom => "deck.ci.from",
             AttrKey::CiTo => "deck.ci.to",
             AttrKey::CiResult => "deck.ci.result",
@@ -662,6 +694,7 @@ impl AttrKey {
             AttrKey::CiFailuresCount => "deck.ci.failures.count",
             AttrKey::AgentSource => "deck.agent.source",
             AttrKey::DispatchName => "deck.dispatch.name",
+            AttrKey::WorkId => "deck.work.id",
             AttrKey::HandoffId => "deck.handoff.id",
             AttrKey::HandoffWorkerRunId => "deck.handoff.worker.run.id",
             AttrKey::HandoffOutcome => "deck.handoff.outcome",

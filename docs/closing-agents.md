@@ -2,7 +2,7 @@
 
 `dot-agent-deck close` stops agents from the command line: a unit a [dispatcher](dispatcher-mode.md) started, one agent, or a whole [orchestration](orchestration.md). It does what closing a card or a tab does in the TUI or the desktop app, and it works from a shell or from a dispatcher agent, so a dispatcher can tidy up the units it started when you ask it to.
 
-Closing a dispatched unit also removes its worktree when that worktree has no uncommitted changes. The unit's branch is always kept.
+By default, closing a dispatched unit also removes its worktree when that worktree has no uncommitted changes, unless you ask to keep it (see [Keep a worktree on purpose](#keep-a-worktree-on-purpose)). The unit's branch is always kept.
 
 ## Close from a shell
 
@@ -61,11 +61,11 @@ An agent running `close` is held to these rules, and `--force` does not change a
 ## Choosing what to close
 
 ```
-dot-agent-deck close <UNIT>... [--dry-run] [--force] [--json]
-dot-agent-deck close --unit-id <ID>... [--dry-run] [--force] [--json]
-dot-agent-deck close --pane <PANE_ID> [--dry-run] [--force] [--json]
-dot-agent-deck close --orchestration-of <PANE_ID> [--dry-run] [--force] [--json]
-dot-agent-deck close --all [--yes] [--dry-run] [--force] [--json]
+dot-agent-deck close <UNIT>... [--dry-run] [--force] [--keep-worktree] [--json]
+dot-agent-deck close --unit-id <ID>... [--dry-run] [--force] [--keep-worktree] [--json]
+dot-agent-deck close --pane <PANE_ID> [--dry-run] [--force] [--keep-worktree] [--json]
+dot-agent-deck close --orchestration-of <PANE_ID> [--dry-run] [--force] [--keep-worktree] [--json]
+dot-agent-deck close --all [--yes] [--dry-run] [--force] [--keep-worktree] [--json]
 ```
 
 | Argument | What it closes |
@@ -78,6 +78,7 @@ dot-agent-deck close --all [--yes] [--dry-run] [--force] [--json]
 | `--all --yes` | The units `--all` listed. |
 | `--dry-run` | Nothing: it shows what would be closed and what would be refused. |
 | `--force` | Also closes a unit that has not reported back, an agent that is busy, and one role of a running orchestration (see the next section). |
+| `--keep-worktree` | Closes the same things, but leaves each dispatched worktree on disk instead of removing it (see [Keep a worktree on purpose](#keep-a-worktree-on-purpose)). |
 | `--json` | Prints the report as JSON instead of text. |
 
 Pane ids appear in the `--all` list and in `dot-agent-deck daemon status`. There is no pattern or wildcard selector; name what you mean, or use `--all` and read the list. One command names at most 256 units.
@@ -89,7 +90,7 @@ Without a terminal you cannot be shown a confirmation dialog, so `close` refuses
 | Reason | What it means | What to do |
 |---|---|---|
 | `not-reported` | The unit has not reported back with `work-done --done`. It may still be working. | Wait for its report, or check its card. Pass `--force` to close it anyway. |
-| `busy` | One of the agents is Thinking, Working, Compacting, waiting for input (**Needs Input**) or Blocked, or is Idle with commands or subagents still running in the background (the **Background:** line on its card). | Let it finish its turn, or answer it. Pass `--force` to close it anyway, which also stops that background work. |
+| `busy` | One of the agents is Thinking, Working, Compacting, waiting for input (**Needs Input**), Blocked or **Waiting**, or is Idle with commands or subagents still running in the background (the **Background:** line on its card). | Let it finish its turn, or answer it. Pass `--force` to close it anyway, which also stops that background work. |
 | `strands-orchestration` | `--pane` named one role of a running orchestration, which would leave the rest of the team without it. | Close the whole team with `--orchestration-of <PANE_ID>`, or pass `--force`. |
 | `not-your-unit` | An agent asked to close something it did not dispatch. | Close it yourself from a shell, or ask the dispatcher that started it. |
 | `own-pane` | An agent asked to close itself or its own team. | Close it from a shell or a client. |
@@ -118,12 +119,30 @@ When the last agent of a dispatched unit is closed, whether you named the unit, 
 | Output | What happened |
 |---|---|
 | `removed (branch … kept)` | The worktree had no uncommitted changes and was removed. Its branch is kept, because it may hold committed work. |
+| `kept on request` | You passed `--keep-worktree`, so the worktree was left on disk whatever its state. The output also tells you how to find or remove it later. |
 | `kept: uncommitted changes` | The worktree is left on disk so the work can be recovered. |
 | `kept: could not check for uncommitted changes` | The deck could not tell whether the worktree was clean, so it kept it. |
 | `kept: removing it failed` | Removing the worktree failed; it is still on disk. |
 | `kept: still in use` | Something else was using the directory at the time. |
 | `cleanup still running: …` | The agents are stopped, but the removal had not finished within about 30 seconds. Check with `dot-agent-deck worktree list`. |
 | `not recorded by the daemon …` | The daemon has no record of this worktree, for example because it restarted after the unit started. |
+
+### Keep a worktree on purpose
+
+Removing a clean worktree also removes the files git ignores in it, such as the unit's `.dot-agent-deck/` (task files, saved reports, an orchestrator's notes) and its build cache. When you are stopping a unit to start it again in the same directory, for example to upgrade the deck in the middle of a long orchestration, add `--keep-worktree` and the deck leaves the worktree on disk whatever its state, clean or not:
+
+```bash
+dot-agent-deck close fix-auth-bug --keep-worktree
+dot-agent-deck close fix-auth-bug --keep-worktree --dry-run
+```
+
+`--keep-worktree` works with every way of choosing what to close: unit names, `--unit-id`, `--pane`, `--orchestration-of` and `--all --yes`. With `--dry-run` it shows `would be kept on request` instead of closing anything. The `worktrees:` section reports the directory as `kept on request` and reminds you how to find it again. If you close just one role of a running orchestration with `--keep-worktree` (`--pane <PANE_ID> --force`, since `close` otherwise refuses to leave the rest of the team without it), the worktree the roles share stays on disk even after you close the other roles without `--keep-worktree`. The TUI and the desktop app offer the same choice in their close confirmations (see [Closing in the TUI and the desktop app](#closing-in-the-tui-and-the-desktop-app)).
+
+A worktree kept this way is yours: closing a later agent you start in the same directory does not remove it. When you are done with it, `dot-agent-deck worktree list` shows it and `dot-agent-deck worktree reclaim` removes it under the same rules as any other leftover worktree, which keep a worktree whose pull request has not merged ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)); run both from the repository the worktree belongs to. To remove it before that, run `git worktree remove <directory>` there, adding `--force` to discard uncommitted changes in it.
+
+If the daemon you are running was started by an older version of the deck, it cannot keep a worktree on close. `close --keep-worktree` then refuses with `cannot keep a worktree on close; nothing was closed` and exits `2`, so nothing is closed and nothing is removed. Restart the daemon onto this version with `dot-agent-deck daemon restart` and run the command again. The TUI and the desktop app do not offer the choice against such a daemon.
+
+### Leftover worktrees
 
 To clean up worktrees the deck no longer knows about, such as after a daemon restart, use `dot-agent-deck worktree list` and `dot-agent-deck worktree reclaim` ([Dispatcher Mode → Finish up](dispatcher-mode.md#finish-up)). A kept branch blocks dispatching the same name again until you delete it (`git branch -D agent/dispatch-<name>`).
 
@@ -133,7 +152,7 @@ To clean up worktrees the deck no longer knows about, such as after a daemon res
 |---|---|
 | `0` | Everything named was closed, or listed. |
 | `1` | Something was refused, a close failed or was only partial, or the command was run with an incomplete deck environment (see below). |
-| `2` | The running daemon is too old for `close`. Nothing was closed. |
+| `2` | The running daemon is too old for `close`, or for `--keep-worktree`. Nothing was closed. |
 | `3` | No daemon is running. Nothing was closed. |
 
 `--json` prints the daemon's report with four lists added for scripts: `closed`, `refused`, `listed` and `worktrees`, plus `exit_code`. Each entry names the unit in `name` and gives its `unit_id`. In `closed`, `refused` and `worktrees`, a unit id the deck does not know is `null`, and a refusal of the whole command, rather than of one unit, is an entry in `refused` whose `name` and `unit_id` are both `null`. Entries in `listed` always carry `panes`, and carry `name`, `unit_id`, `reported`, `completed_at_ms`, `worktree`, `branch` and `clone` only when there is something to report, leaving each one out rather than setting it to `null`: `completed_at_ms`, for example, is missing for a unit that has not finished. With `--all --yes`, the list that was closed from is under `preview`. `truncated` is `true` when `--all` listed only the first 256 units. An entry of the report's `targets`, and of `listed`, carries its own `truncated: true` when one of its lists — the candidates of an `ambiguous` refusal, their panes, the units it left open, or its panes — shows only part of what there was, or when a report too large to send whole had its long fields shortened, each ending in `…`; the human output says so under that entry. A unit's `unit_id` is never shortened, so you can always pass it to `close --unit-id`. A shortened list or field changes only the report: every pane of a unit that was closed is stopped.
@@ -144,9 +163,9 @@ A script that closes the units whose pull requests merged can join `close --all 
 
 The TUI and the desktop app close the same things and clean up worktrees the same way, with a confirmation dialog instead of the refusals above.
 
-**TUI:** select the card on the dashboard, or go to the orchestration's tab, and press `Ctrl+W` in command mode, or click the card's `[Close]` button or the tab's `[×]`. Choose **Close** in the confirmation. If the unit's worktree has uncommitted changes, the confirmation says it will be kept and names it, and the status line reports what happened after the close. See [Keyboard Shortcuts](keyboard-shortcuts.md).
+**TUI:** select the card on the dashboard, or go to the orchestration's tab, and press `Ctrl+W` in command mode, or click the card's `[Close]` button or the tab's `[×]`. Choose **Close** in the confirmation. If the unit's worktree has uncommitted changes, the confirmation says it will be kept and names it, and the status line reports what happened after the close. To keep a dispatched unit's worktree whatever its state, choose **Close, keep worktree** instead: the status line then reads `Worktree kept on request:` followed by its directory. The choice appears only when the deck daemon you are attached to can keep a worktree; after an upgrade, restart the daemon to get it. See [Keyboard Shortcuts](keyboard-shortcuts.md).
 
-**Desktop:** press the stop control on the agent's row and then **Close agent**, or **Close** on an orchestration's group header and then **Close all N roles**. As in the TUI, the confirmation warns when uncommitted changes will keep a dispatched worktree and names its directory. After the close, a notice names the daemon and the directory actually kept; it stays until you dismiss it with its **×**. See [Desktop App → Dashboard](desktop/dashboard.md#closing-agents-and-orchestrations).
+**Desktop:** press the stop control on the agent's row and then **Close agent**, or **Close** on an orchestration's group header and then **Close all N roles**. As in the TUI, the confirmation warns when uncommitted changes will keep a dispatched worktree and names its directory. For a dispatched unit, the confirmation also offers **Close agent, keep worktree** or **Close all N roles, keep worktree**, which keep its worktree whatever its state; the notice then reads `Worktree kept on request:` followed by the directory. Choosing **Close agent, keep worktree** for one role of an orchestration keeps the worktree the roles share, even after you close the other roles with plain **Close agent** or **Close all N roles**. The TUI has no single-role close: closing a role's card closes its whole tab, so its keep choice keeps the worktree for every role at once. As in the TUI, the choice appears only when the daemon can keep a worktree. After the close, a notice names the daemon and the directory actually kept; it stays until you dismiss it with its **×**. See [Desktop App → Dashboard](desktop/dashboard.md#closing-agents-and-orchestrations).
 
 A unit closed with `close` disappears from both clients, and a unit closed in a client is gone from `close --all`.
 
@@ -159,6 +178,7 @@ Stopping an agent has a time limit. If its process does not confirm that it exit
 | `the running daemon (…) is too old for close; nothing was closed` | The daemon was started by an older version of the deck. | Restart it onto this version with `dot-agent-deck daemon restart`, or close from the TUI or the desktop app. |
 | `no daemon is running …; nothing was closed` | No daemon is running for this user. `close` never starts one. | Nothing is running, so there is nothing to close. |
 | `close: …` naming `DOT_AGENT_DECK_PANE_ID`, `DOT_AGENT_DECK_AGENT_ID` or `DOT_AGENT_DECK_PANE_CAPABILITY` | Some of the variables the deck sets in its panes are present and some are missing or empty, so `close` cannot tell whether a person or an agent is asking. It refuses rather than guess. | Run it from a terminal outside the deck, where none of them is set, or from the agent's own pane with the environment the deck gave it. |
+| `the running daemon (…) cannot keep a worktree on close; nothing was closed` | `--keep-worktree` was given, and the daemon was started by an older version of the deck. | Restart it onto this version with `dot-agent-deck daemon restart`, then run the command again. |
 | `PARTIALLY: still running: …` | Some agents of the unit stopped and some did not, or their exits could not be confirmed. | Inspect the named survivors. Close any still listed with `--pane`, or from a client. |
 | An agent's `close --all` lists nothing | That agent dispatched no units that are still running. | Close from a shell instead. |
 

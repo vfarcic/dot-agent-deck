@@ -925,6 +925,20 @@ pub const CAP_PREPARED_ROLE_COMMAND: &str = "prepared-role-command";
 /// directory on every platform this builds for.
 pub const CAP_LAST_COMMAND: &str = "last-command";
 
+/// Capability string for PRD #1885's approval of a project's orchestration
+/// commands and prompts: [`AttachRequest::ProjectTrustState`] and
+/// [`AttachRequest::ApproveProjectTrust`] — one feature, so one string.
+///
+/// Both are new request variants that every sender withholds until the daemon
+/// names this (CLAUDE.md rule 18's second rung), so no `PROTOCOL_VERSION` bump:
+/// an older daemon has no such variants and would refuse them with the generic
+/// `malformed request: …`. Held by
+/// [`crate::daemon_client::DaemonClient::project_trust_state`] and
+/// [`crate::daemon_client::DaemonClient::approve_project_trust`], so no call
+/// site checks it itself. Advertised on every platform: neither dispatch arm is
+/// `#[cfg]`-gated.
+pub const CAP_PROJECT_TRUST: &str = "project-trust";
+
 /// Capability string for [`AttachRequest::PostMessage`] (PRD #1666): a client
 /// hands a deck-generated message — a seed, an orchestrator's role context, the
 /// configuration prompt — to the daemon's inbox instead of typing it into the
@@ -1132,6 +1146,26 @@ pub const CAP_CLOSE_AGENTS: &str = "close-agents";
 /// sends its request that way, so the daemon that answers it is the one whose
 /// reply advertised [`CAP_CLOSE_AGENTS`]. Advertised on every platform.
 pub const CAP_HELLO_FOLLOW_ON: &str = "hello-follow-on";
+
+/// Capability string for the `keep_worktree` field of
+/// [`AttachRequest::StopAgent`] and [`AttachRequest::CloseAgents`] (issue
+/// #1958): close a dispatched unit, or an orchestration, and leave its worktree
+/// on disk whatever its state. Also names the
+/// [`AttachResponse::dispatched_worktree`] answer of
+/// [`AttachRequest::DispatchWorktreeClosePreview`], which is how a client knows
+/// to offer the choice.
+///
+/// **Every sender withholds the field unless the daemon advertised this.** An
+/// older daemon ignores an unknown field
+/// (`unknown_fields_are_ignored_so_a_newer_client_degrades_against_an_older_daemon`),
+/// so a keep sent to it would be read as a plain stop and REMOVE a clean
+/// worktree the user asked to keep. The check lives in the client library
+/// ([`crate::daemon_client::DaemonClient::stop_agent_keeping_worktree`],
+/// [`crate::daemon_client::DaemonClient::close_agents`]), which refuses hard and
+/// sends nothing rather than degrading to a plain close. No
+/// [`PROTOCOL_VERSION`] bump. Advertised on every platform: neither handler's
+/// keep path is `#[cfg]`-gated.
+pub const CAP_KEEP_WORKTREE: &str = "keep-worktree";
 
 /// Capability string for [`AttachRequest::ListOutcomes`] (PRD #1666 part 3,
 /// round 5, plan D10): the deck's recovery rows — reports and dispatch results
@@ -1343,6 +1377,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
     CAP_ADDRESSED_MESSAGE_AGENT,
+    CAP_KEEP_WORKTREE,
+    CAP_PROJECT_TRUST,
 ];
 #[cfg(not(unix))]
 pub const DAEMON_CAPABILITIES: &[&str] = &[
@@ -1368,6 +1404,8 @@ pub const DAEMON_CAPABILITIES: &[&str] = &[
     CAP_DECK_OUTCOMES,
     CAP_ADDRESSED_MESSAGE,
     CAP_ADDRESSED_MESSAGE_AGENT,
+    CAP_KEEP_WORKTREE,
+    CAP_PROJECT_TRUST,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1684,6 +1722,32 @@ pub const CONTRACT_BREAKS: &[&str] = &[
     // sender withholds until the daemon advertises `CAP_DECK_OUTCOMES`.
     // `changelog.d/1666-task-scoped-completion.breaking.md` is its fragment.
     "1666-task-scoped-completion-and-recovery",
+    // Issue #2260, without moving `PROTOCOL_VERSION`. A dispatched unit's
+    // terminal `work-done` whose body differs from the report it already
+    // sent was answered `already_accepted` with `differs` (or, on the legacy
+    // `work_done` verb, refused `report_differs`) and delivered nothing. It is
+    // now accepted and delivered to the dispatcher as a numbered update beside
+    // the first report, up to `MAX_REPORT_UPDATES`, and refused
+    // `report_updates_exhausted` after that. The reply gains the additive
+    // optional `update` field; what moved is that the same request is now
+    // delivered where an older daemon refused it.
+    // `changelog.d/2260.breaking.md` is its fragment.
+    "2260-work-done-report-updates",
+    // PRD #1885, at 12 without moving it -- the #1233/#555 shape. A daemon
+    // now refuses to run an orchestration whose project config (each role's
+    // command, prompt text and description, as resolved) is not approved as it
+    // now reads: `PrepareOrchestration` with `PROJECT_ERR_NOT_APPROVED`, the
+    // prepared start's re-read, `delegate` (every delegate, since it hands the
+    // worker the role's current prompt text), `pane restart`, `pane spawn`,
+    // `dispatch`, and a scheduled fire, Run now or issue dispatch. Every one of
+    // those requests, and its refusal channel, is unchanged on the wire, and
+    // the requests that read and grant an approval are capability-gated
+    // (`CAP_PROJECT_TRUST`). What changed is which requests are refused, which
+    // a version number cannot express: an older client against a newer daemon
+    // meets refusals it cannot resolve in-app, and the refusal names the
+    // `dot-agent-deck trust approve` command that does.
+    // `changelog.d/1885.breaking.md` is its fragment.
+    "1885-unapproved-project-config-refused",
 ];
 
 /// What comparing this build's [`CONTRACT_BREAKS`] against a peer's found.
@@ -1834,6 +1898,25 @@ pub const PROJECT_ERR_NO_ORCHESTRATION: &str = "no-such-orchestration";
 /// [`PROJECT_ERR_STALE_REVISION`], so a caller holding a stale revision is told
 /// to resolve again first.
 pub const PROJECT_ERR_AMBIGUOUS_ORCHESTRATION: &str = "ambiguous-orchestration";
+
+/// PRD #1885: the project resolved and defines the orchestration, but its
+/// commands and prompts are not approved — never, or not as they now read — so
+/// nothing was published and no token issued.
+///
+/// A client that advertises nothing new still shows the sentence after the
+/// code, which names the orchestration, the project and the
+/// `dot-agent-deck trust approve` command that approves it. A client that
+/// recognises the code asks the user instead, through
+/// [`AttachRequest::ProjectTrustState`] and [`AttachRequest::ApproveProjectTrust`]
+/// (withheld unless the daemon advertises [`CAP_PROJECT_TRUST`]), and prepares
+/// again once approved. Refused after [`PROJECT_ERR_STALE_REVISION`] and
+/// [`PROJECT_ERR_AMBIGUOUS_ORCHESTRATION`], before anything is written.
+pub const PROJECT_ERR_NOT_APPROVED: &str = "not-approved";
+
+/// PRD #1885: an [`AttachRequest::ApproveProjectTrust`] carried the digest of
+/// text that is no longer what the config says, so nothing was approved. The
+/// remedy is to fetch the trust state again and show the user the new text.
+pub const PROJECT_ERR_TRUST_TEXT_CHANGED: &str = "trust-text-changed";
 
 /// Issue #1233 item 4: the daemon did not finish a
 /// [`AttachRequest::PrepareOrchestration`] within
@@ -2275,6 +2358,20 @@ pub enum AttachRequest {
     },
     StopAgent {
         id: String,
+        /// Issue #1958: keep the dispatched worktree the stopped agent was
+        /// started in on disk, whatever its state and whatever else still runs
+        /// in it, by dropping the daemon's record of the tree before the agent
+        /// is stopped — so no later close, of a sibling role or of an agent
+        /// restarted in the same directory, can remove it. Reported once as a
+        /// `WorktreeKept` broadcast with `on_request`, by the stop that took
+        /// the record.
+        ///
+        /// **Withheld unless the daemon advertises [`CAP_KEEP_WORKTREE`]**: an
+        /// older daemon would drop the key and remove the tree. No
+        /// [`PROTOCOL_VERSION`] bump: an additive optional field, omitted when
+        /// `false`.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_worktree: bool,
     },
     /// PRD #1589: close dispatched units, one agent, or one orchestration
     /// instance — the `dot-agent-deck close` verb.
@@ -2304,6 +2401,14 @@ pub enum AttachRequest {
         /// Resolve and report, stop nothing.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         dry_run: bool,
+        /// Issue #1958: keep the worktree each closed target owns, whatever its
+        /// state and whatever else still runs in it, by dropping the daemon's
+        /// record of it before anything is stopped; reported as
+        /// [`WorktreeVerdictKind::KeptOnRequest`]. A dry run reports the keep
+        /// it would make and drops nothing. **Withheld unless the daemon
+        /// advertises [`CAP_KEEP_WORKTREE`]**, like `StopAgent`'s.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        keep_worktree: bool,
     },
     /// Issue #1947: message an orchestration's orchestrator (or a folder's
     /// one standalone agent) by address — `dot-agent-deck inbox send`.
@@ -3018,6 +3123,42 @@ pub enum AttachRequest {
     SeedLastCommand {
         command: String,
     },
+    /// PRD #1885: the trust state of orchestration `orchestration` of the
+    /// project config in `path` — whether its commands and prompts are the
+    /// approved text, the full text of every role (command, description,
+    /// prompt, and the other recorded fields), which roles changed, and a
+    /// SHA-256 digest of exactly that text. A client shows it to the user before
+    /// it starts the orchestration, and approves with
+    /// [`Self::ApproveProjectTrust`] carrying the digest.
+    ///
+    /// It hands back config CONTENT (the commands themselves), which
+    /// [`Self::ResolveProject`] deliberately withholds; showing that text is the
+    /// point of the prompt. Any peer that reaches this socket already runs as the
+    /// daemon's user (see [`Self::StartAgent`]'s trust-boundary note).
+    ///
+    /// The reply rides back on [`AttachResponse::project_trust`]. **Withheld
+    /// unless the daemon advertises [`CAP_PROJECT_TRUST`]**: an older daemon has
+    /// no such variant.
+    ProjectTrustState {
+        /// An absolute path to the directory holding `.dot-agent-deck.toml`.
+        path: String,
+        orchestration: String,
+    },
+    /// PRD #1885: approve orchestration `orchestration` of the project config in
+    /// `path`, but only if its text still hashes to `digest` — the digest of the
+    /// text [`Self::ProjectTrustState`] showed — so the daemon records exactly
+    /// what the user saw. A digest that no longer matches is refused with
+    /// [`PROJECT_ERR_TRUST_TEXT_CHANGED`] and records nothing. On success the
+    /// reply's [`AttachResponse::project_trust`] is the new state.
+    ///
+    /// The hook socket has no verb that approves: only a client, on a user's
+    /// answer, and the `dot-agent-deck trust approve` CLI do. **Withheld unless
+    /// the daemon advertises [`CAP_PROJECT_TRUST`]**.
+    ApproveProjectTrust {
+        path: String,
+        orchestration: String,
+        digest: String,
+    },
     /// PRD #1666: post a deck-generated message to `pane_id`'s inbox, bound to
     /// `expected_agent_id` (the pane's live agent when omitted). The reply
     /// carries the message id on [`AttachResponse::id`]; a refusal (no such
@@ -3720,6 +3861,10 @@ pub enum WorktreeVerdictKind {
     /// The agents are stopped, and the cleanup had not answered within the
     /// bound; it is still running and its outcome is unknown.
     TimedOut,
+    /// Issue #1958: kept because the close asked to keep it, whatever its
+    /// state. The daemon no longer records it, so it is `worktree reclaim`'s
+    /// to find. An older CLI decodes it as [`Self::Unknown`].
+    KeptOnRequest,
     #[serde(other)]
     Unknown,
 }
@@ -3812,6 +3957,17 @@ pub struct AttachResponse {
     /// with is owed to the new REQUEST variant beside it, not to this.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kept_worktree: Option<crate::issue_dispatch_run::KeptWorktree>,
+    /// Issue #1958: the other answer to
+    /// [`AttachRequest::DispatchWorktreeClosePreview`] — the dispatched
+    /// worktree the daemon has recorded for the panes being closed, whatever
+    /// its state and whatever its removal policy, so a client knows to offer
+    /// "close, keep worktree". Read from the registry alone, so it is filled
+    /// even when the dirtiness probe behind [`Self::kept_worktree`] times out.
+    /// `None` when the selection owns no recorded worktree, on every other
+    /// response, and from a daemon older than [`CAP_KEEP_WORKTREE`]. Additive
+    /// + optional, no [`PROTOCOL_VERSION`] bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatched_worktree: Option<String>,
     /// PRD #819 M2: the answer to [`AttachRequest::ListProjects`]. `None` on
     /// every other response. Additive + optional, so the field itself is
     /// forward-compatible in both directions; the `PROTOCOL_VERSION` bump this
@@ -3824,6 +3980,11 @@ pub struct AttachResponse {
     /// basis as [`Self::projects`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project: Option<crate::event::ResolvedProject>,
+    /// PRD #1885: the answer to [`AttachRequest::ProjectTrustState`] and
+    /// [`AttachRequest::ApproveProjectTrust`]. `None` on every other response
+    /// and on a refusal. Additive + optional, like [`Self::project`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_trust: Option<crate::project_trust::ProjectTrustView>,
     /// PRD #819 M2 / issue #1045: the answer to
     /// [`AttachRequest::PrepareOrchestration`]. `None` on every other response,
     /// and on a preparation that failed — a failed preparation publishes
@@ -5899,6 +6060,14 @@ pub(crate) async fn end_unit_if_last_pane(
             agent_id = %record.id,
             "dispatch: the unit's last pane closed; the unit has ended"
         );
+        // PRD #1889: the unit's work closes with it.
+        registry.work().unit_ended(&unit_id);
+    }
+    // PRD #1889: and an orchestration's work closes with its last role pane.
+    if let Some(instance) = instance.as_deref()
+        && !registry.instance_has_records(instance)
+    {
+        registry.work().orchestration_ended(instance);
     }
 }
 
@@ -6031,6 +6200,9 @@ pub(crate) async fn stop_agent_steps(
                 if let Some(record) = stopping_record {
                     crate::spawn::surface_attach_stopped_agent(event_tx, record, pane_id);
                 }
+                // PRD #1889: a pane's own work (or a plain fire's) closes
+                // with the pane.
+                registry.work().pane_closed(pane_id);
             }
             // PRD #1589 D5: the unit this agent belonged to ends once no pane
             // of it remains.
@@ -6941,6 +7113,10 @@ async fn handle_connection(
                 // PRD #1666 part 3, round 5 (plan D7): a client's start is an
                 // orchestration nobody dispatched.
                 origin: Some(crate::hook_provenance::InstanceOrigin::Direct),
+                // PRD #1889: a client's start is a pane of its own (a fresh
+                // pane work, minted by the spawn), or a role of its
+                // orchestration's work.
+                work_id: None,
             };
             #[cfg(unix)]
             let spawned = match prepared_dir.as_ref() {
@@ -7218,7 +7394,7 @@ async fn handle_connection(
                 }
             }
         }
-        AttachRequest::StopAgent { id } => {
+        AttachRequest::StopAgent { id, keep_worktree } => {
             // PRD #93 round-5: capture the agent's `pane_id_env` BEFORE
             // close_agent removes the registry entry, so we can clean up
             // the daemon's per-pane role-map entries after a successful
@@ -7291,6 +7467,44 @@ async fn handle_connection(
             let dispatched_worktree = stopping_record
                 .as_ref()
                 .and_then(crate::issue_dispatch_run::worktree_of_record);
+            // Issue #1958 (F1): a keep is latched HERE, before anything is
+            // stopped and whatever else still runs in the tree, by taking the
+            // registry entry. The deck's cleanups of a dispatched tree — a
+            // stop's, a close's and a failed dispatch's rollback — remove only a
+            // tree whose entry they took, so no later one — this stop's, a
+            // sibling role's earlier ordinary stop's, a close of an agent started
+            // in the same directory afterwards, or the rollback of a dispatch
+            // this stop ended while it was starting — removes it. Left to the cleanup after the stop, the keep
+            // was lost to whichever of those got there first.
+            //
+            // If the stop then fails, the agent keeps running in a tree the
+            // daemon no longer records: no close removes it, and the user finds
+            // and removes it with `dot-agent-deck worktree reclaim`. The entry is
+            // not put back — that would hand the tree to the next ordinary close.
+            //
+            // Round 2: a latch that finds no entry is NOT a keep and is not
+            // reported as one. The ordinary cleanups take the entry only once
+            // they see nothing running in the tree, so for an agent they saw
+            // running there it means an unrecorded tree or one another keep
+            // already holds. For an agent whose process had already exited, or
+            // one started in the tree after an ordinary stop's cleanup looked,
+            // it can also be a tree that cleanup already took for removal; that
+            // removal is not undone, and the cleanup that owns it reports what
+            // it did.
+            let kept_on_request = if keep_worktree {
+                let kept = dispatched_worktree.as_deref().and_then(|worktree| {
+                    crate::issue_dispatch_run::keep_on_request(&worktree_registry, worktree)
+                });
+                if kept.is_none() && dispatched_worktree.is_some() {
+                    tracing::info!(
+                        agent_id = %id,
+                        "stop: keep requested, but the deck holds no record of the agent's worktree to keep"
+                    );
+                }
+                kept
+            } else {
+                None
+            };
             // PRD #1589: the teardown itself is shared with `CloseAgents`, which
             // takes the same steps in the same order — see
             // [`stop_agent_steps`]. The existing teardown is unchanged. What the
@@ -7349,24 +7563,34 @@ async fn handle_connection(
                         // instead of leaving the user with the dialog's
                         // arm-time prediction.
                         let event_tx = event_tx.clone();
+                        // Issue #1958: a keep latched above has nothing left to
+                        // clean up; its report is broadcast from here, after
+                        // the stop, once — the same place an ordinary stop's
+                        // verdict comes from. A stop that ASKED to keep never
+                        // takes the ordinary removal path, whatever its latch
+                        // found: a latch that found no entry means another keep
+                        // already holds the tree, an ordinary cleanup already
+                        // owns its removal, or the deck never recorded it — and
+                        // an entry recorded again since is not this stop's to
+                        // remove. Only a latched keep is reported as one.
                         tokio::spawn(async move {
-                            if !crate::issue_dispatch_run::worktree_still_in_use(
-                                &registry.agent_records_for_worktree_cleanup(),
-                                &worktree,
-                            ) && let Some(entry) = crate::issue_dispatch_run::take_worktree(
-                                &worktree_registry,
-                                &worktree,
-                            ) && let Some(kept) = crate::issue_dispatch_run::remove_worktree(
-                                &worktree,
-                                &entry.clone_dir,
-                                entry.policy,
-                            )
-                            .await
-                            {
+                            registry.pause_point("stop-worktree-cleanup").await;
+                            let kept = if keep_worktree {
+                                kept_on_request
+                            } else {
+                                crate::issue_dispatch_run::cleanup_after_stop(
+                                    &registry.agent_records_for_worktree_cleanup(),
+                                    &worktree_registry,
+                                    &worktree,
+                                )
+                                .await
+                            };
+                            if let Some(kept) = kept {
                                 // Errs only when nothing is subscribed (a
                                 // standalone daemon), which is not a failure.
                                 let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
                             }
+                            registry.pause_point("stop-worktree-cleanup-done").await;
                         });
                     }
                     write_resp(&mut stream, &AttachResponse::ok()).await?
@@ -7374,6 +7598,11 @@ async fn handle_connection(
                 Err(msg) => {
                     // PRD #126: the close failed, so the agent is still live;
                     // `stop_agent_steps` has already rolled the closing mark back.
+                    // Issue #1958: a keep latched above stands (see there), so
+                    // it is reported here, the one report it gets.
+                    if let Some(kept) = kept_on_request {
+                        let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
+                    }
                     write_resp(&mut stream, &AttachResponse::err(msg)).await?
                 }
             };
@@ -7413,6 +7642,7 @@ async fn handle_connection(
             caller,
             force,
             dry_run,
+            keep_worktree,
         } => {
             // PRD #1589: resolve, authorize, refuse or close — see
             // `crate::close_agents`. Every outcome, refusals included, is a
@@ -7422,6 +7652,7 @@ async fn handle_connection(
                 caller,
                 force,
                 dry_run,
+                keep_worktree,
                 &registry,
                 &state,
                 &event_tx,
@@ -7830,6 +8061,24 @@ async fn handle_connection(
             .await;
             let mut resp = AttachResponse::ok();
             resp.kept_worktree = kept;
+            // Issue #1958: from the registry alone, after the probe and
+            // whatever it answered. F3: each pane's owner is resolved the way
+            // `StopAgent` resolves the agent it cleans up after — an exited
+            // generation still holding its pane counts, since closing that pane
+            // is what removes its tree — and through `agent_id_for_pane_any`,
+            // which skips a generation a successor has since been published
+            // over, so a retired agent does not answer for a reused pane.
+            let owners: Vec<crate::agent_pty::AgentRecord> = pane_ids
+                .iter()
+                .filter_map(|pane| registry.agent_id_for_pane_any(pane))
+                .filter_map(|id| registry.agent_record_any(&id))
+                .collect();
+            resp.dispatched_worktree = crate::issue_dispatch_run::dispatched_worktree_of_panes(
+                &owners,
+                &worktree_registry,
+                &pane_ids,
+            )
+            .map(|path| path.to_string_lossy().into_owned());
             write_resp(&mut stream, &resp).await?
         }
         // PRD #819 M3. `ListProjects` answers from what the daemon already
@@ -8121,6 +8370,65 @@ async fn handle_connection(
                         "new-agent-options: the daemon could not complete the request",
                     )
                 }
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        // PRD #1885: what a client shows before it starts an orchestration, and
+        // the approval it records on the user's answer. Both read the config
+        // through the bounded project reader, on the bounded project pool.
+        AttachRequest::ProjectTrustState {
+            path,
+            orchestration,
+        } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => project_trust_reply(
+                    crate::project_resolve::run_bounded(move || {
+                        let dir = trust_config_dir(&path)?;
+                        trust_view_now(&dir, &orchestration)
+                    })
+                    .await,
+                ),
+            };
+            write_resp(&mut stream, &resp).await?
+        }
+        AttachRequest::ApproveProjectTrust {
+            path,
+            orchestration,
+            digest,
+        } => {
+            let resp = match validate_project_path(&path) {
+                Err(message) => AttachResponse::err(message),
+                Ok(()) => project_trust_reply(
+                    crate::project_resolve::run_bounded(move || {
+                        let dir = trust_config_dir(&path)?;
+                        let store = crate::project_trust::TrustStore::default_location();
+                        match crate::project_trust::approve_if_unchanged_with(
+                            &store,
+                            &dir,
+                            &orchestration,
+                            &digest,
+                            &read_trust_config,
+                        )? {
+                            crate::project_trust::ApproveOutcome::Approved => {
+                                tracing::info!(
+                                    project = %dir.display(),
+                                    orchestration = %orchestration,
+                                    "a client approved the orchestration's commands and prompts"
+                                );
+                                trust_view_now(&dir, &orchestration)
+                            }
+                            crate::project_trust::ApproveOutcome::Stale => {
+                                Err(crate::project_trust::TrustError::Config(format!(
+                                    "{PROJECT_ERR_TRUST_TEXT_CHANGED}: the orchestration's \
+                                     commands or prompts changed since they were shown, so \
+                                     nothing was approved; show the new text and ask again"
+                                )))
+                            }
+                        }
+                    })
+                    .await,
+                ),
             };
             write_resp(&mut stream, &resp).await?
         }
@@ -8525,6 +8833,92 @@ fn sole_valid_pane_id_under(env: &[(String, String)], case_insensitive: bool) ->
         return None;
     }
     Some(value)
+}
+
+/// PRD #1885: the canonical directory a trust request names.
+fn trust_config_dir(path: &str) -> Result<std::path::PathBuf, crate::project_trust::TrustError> {
+    crate::project_resolve::canonicalize_project_dir(std::path::Path::new(path)).map_err(|_| {
+        crate::project_trust::TrustError::Config(format!(
+            "{PROJECT_ERR_UNRESOLVED}: that path is not a project directory"
+        ))
+    })
+}
+
+/// PRD #1885: read a trust request's config through the bounded project reader.
+/// Its errors are reduced to one sentence: the path is client-selected, and the
+/// parser's message quotes file content.
+fn read_trust_config(
+    dir: &std::path::Path,
+) -> Result<crate::project_config::ProjectConfig, crate::project_trust::TrustError> {
+    crate::project_resolve::read_project_config(dir).map_err(|e| {
+        warn!(project = %dir.display(), reason = %e, "project trust: the config did not read");
+        crate::project_trust::TrustError::Config(format!(
+            "{PROJECT_ERR_UNRESOLVED}: that project's config could not be read"
+        ))
+    })
+}
+
+/// PRD #1885: the trust view of `orchestration` in the config in `dir`, read
+/// now, carrying the [`crate::project_resolve::config_revision`] of the same
+/// bytes the roles were read from. A client that approves this text launches
+/// with that revision, so an approval of text the user was re-shown after it
+/// changed does not start against the revision listed before the change (and
+/// get refused as stale), while a config that moves again after this read is
+/// still refused by the launch's own revision check.
+fn trust_view_now(
+    dir: &std::path::Path,
+    orchestration: &str,
+) -> Result<crate::project_trust::ProjectTrustView, crate::project_trust::TrustError> {
+    let (config, revision) = crate::project_resolve::read_project_config_with_revision(dir)
+        .map_err(|e| {
+            warn!(project = %dir.display(), reason = %e, "project trust: the config did not read");
+            crate::project_trust::TrustError::Config(format!(
+                "{PROJECT_ERR_UNRESOLVED}: that project's config could not be read"
+            ))
+        })?;
+    let approvals = crate::project_trust::TrustStore::default_location()
+        .load()
+        .map_err(crate::project_trust::TrustError::Store)?;
+    let mut view =
+        crate::project_trust::inspect_config(&approvals, dir, &config, orchestration)?.view();
+    view.config_revision = Some(revision);
+    Ok(view)
+}
+
+/// PRD #1885: the reply to a trust request.
+fn project_trust_reply(
+    outcome: Result<
+        Result<crate::project_trust::ProjectTrustView, crate::project_trust::TrustError>,
+        crate::project_resolve::ProjectResolveError,
+    >,
+) -> AttachResponse {
+    match outcome {
+        Ok(Ok(view)) => {
+            let mut resp = AttachResponse::ok();
+            resp.project_trust = Some(view);
+            resp
+        }
+        Ok(Err(crate::project_trust::TrustError::Config(message))) => AttachResponse::err(message),
+        Ok(Err(crate::project_trust::TrustError::NoOrchestration { .. })) => {
+            AttachResponse::err(crate::project_resolve::no_such_orchestration_refusal())
+        }
+        Ok(Err(crate::project_trust::TrustError::NoConfig(_))) => AttachResponse::err(format!(
+            "{PROJECT_ERR_UNRESOLVED}: that directory holds no project config"
+        )),
+        Ok(Err(crate::project_trust::TrustError::Store(e))) => {
+            warn!(reason = %e, "project trust: the approval store could not be used");
+            AttachResponse::err(format!(
+                "{PROJECT_ERR_UNRESOLVED}: the approval store could not be read or written"
+            ))
+        }
+        Err(e) => {
+            warn!(reason = %e, "project trust could not complete");
+            AttachResponse::err(format!(
+                "{PROJECT_ERR_UNRESOLVED}: {}",
+                crate::project_resolve::ProjectResolveError::Internal.detail()
+            ))
+        }
+    }
 }
 
 fn validate_project_path(path: &str) -> Result<(), String> {
@@ -10054,6 +10448,44 @@ mod fence_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #1885 review (reviewer 4). Scenario: a client asks for the trust
+    /// view of an orchestration, then the project's config changes and it asks
+    /// again, as the review does after `trust-text-changed`. Each view carries
+    /// the config revision of the bytes it was read from — the one
+    /// `resolve-project` reports for the same bytes — so a launch after
+    /// approving the re-shown text sends the revision of that text instead of
+    /// the one listed before the change.
+    #[test]
+    fn trust_view_now_carries_the_revision_of_the_bytes_it_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = crate::project_resolve::canonicalize_project_dir(tmp.path()).unwrap();
+        let team = |command: &str| {
+            format!(
+                "[[orchestrations]]\nname = \"team\"\n\n[[orchestrations.roles]]\nname = \"orchestrator\"\ncommand = \"{command}\"\nstart = true\n"
+            )
+        };
+        std::fs::write(
+            dir.join(crate::project_config::CONFIG_FILE_NAME),
+            team("cat"),
+        )
+        .unwrap();
+        let first = trust_view_now(&dir, "team").unwrap();
+        let listed = crate::project_resolve::resolve_project(&dir).unwrap();
+        assert!(first.config_revision.is_some(), "{first:?}");
+        assert_eq!(first.config_revision, listed.config_revision);
+
+        std::fs::write(
+            dir.join(crate::project_config::CONFIG_FILE_NAME),
+            team("sh ./agent.sh"),
+        )
+        .unwrap();
+        let second = trust_view_now(&dir, "team").unwrap();
+        let relisted = crate::project_resolve::resolve_project(&dir).unwrap();
+        assert_ne!(second.config_revision, first.config_revision);
+        assert_eq!(second.config_revision, relisted.config_revision);
+        assert_eq!(second.roles[0].text.command, "sh ./agent.sh");
+    }
     use spec::spec;
 
     /// Audit F2: the attach `post-message` verb refuses a body over the inbox's
@@ -13166,6 +13598,125 @@ mod tests {
         let resp: AttachResponse = serde_json::from_str(r#"{"ok":true,"fieldFromTheFuture":true}"#)
             .expect("a response carrying unknown fields must still decode");
         assert!(resp.ok);
+    }
+
+    /// Issue #1958 (U1): `keep_worktree` is omitted from the wire when
+    /// `false`, so a plain stop or close is byte-for-byte what an older daemon
+    /// already reads, and a request without it decodes as `false`.
+    #[test]
+    fn keep_worktree_is_omitted_when_false_and_defaults_to_false() {
+        let plain = serde_json::to_value(AttachRequest::StopAgent {
+            id: "a1".into(),
+            keep_worktree: false,
+        })
+        .unwrap();
+        assert_eq!(plain, serde_json::json!({"op": "stop-agent", "id": "a1"}));
+        let keep = serde_json::to_value(AttachRequest::StopAgent {
+            id: "a1".into(),
+            keep_worktree: true,
+        })
+        .unwrap();
+        assert_eq!(
+            keep,
+            serde_json::json!({"op": "stop-agent", "id": "a1", "keep_worktree": true})
+        );
+        let old: AttachRequest = serde_json::from_str(r#"{"op":"stop-agent","id":"a1"}"#).unwrap();
+        assert!(matches!(
+            old,
+            AttachRequest::StopAgent {
+                keep_worktree: false,
+                ..
+            }
+        ));
+
+        let close = |keep_worktree| {
+            serde_json::to_value(AttachRequest::CloseAgents {
+                selector: CloseSelector::AllUnits,
+                caller: None,
+                force: false,
+                dry_run: true,
+                keep_worktree,
+            })
+            .unwrap()
+        };
+        assert!(close(false).get("keep_worktree").is_none());
+        assert_eq!(close(true)["keep_worktree"], true);
+        let decoded: AttachRequest = serde_json::from_value(close(false)).unwrap();
+        assert!(matches!(
+            decoded,
+            AttachRequest::CloseAgents {
+                keep_worktree: false,
+                ..
+            }
+        ));
+        let decoded: AttachRequest = serde_json::from_value(close(true)).unwrap();
+        assert!(matches!(
+            decoded,
+            AttachRequest::CloseAgents {
+                keep_worktree: true,
+                ..
+            }
+        ));
+    }
+
+    /// Issue #1958 (U1): the reporting half — the new verdict's wire name
+    /// (and that an unknown one still decodes, which is how an older CLI reads
+    /// it), `on_request` omitted when `false` and defaulted when absent, and
+    /// the preview's `dispatched_worktree` omitted when `None`.
+    #[test]
+    fn keep_on_request_reporting_is_additive_on_the_wire() {
+        assert_eq!(
+            serde_json::to_value(WorktreeVerdictKind::KeptOnRequest).unwrap(),
+            serde_json::json!("kept-on-request")
+        );
+        assert_eq!(
+            serde_json::from_str::<WorktreeVerdictKind>(r#""kept-on-request""#).unwrap(),
+            WorktreeVerdictKind::KeptOnRequest
+        );
+        assert_eq!(
+            serde_json::from_str::<WorktreeVerdictKind>(r#""kept-for-a-reason-from-the-future""#)
+                .unwrap(),
+            WorktreeVerdictKind::Unknown
+        );
+
+        let measured = KeptWorktree {
+            path: "/w".into(),
+            confirmed_dirty: true,
+            on_request: false,
+        };
+        assert_eq!(
+            serde_json::to_value(&measured).unwrap(),
+            serde_json::json!({"path": "/w", "confirmed_dirty": true})
+        );
+        let requested = KeptWorktree::on_request(std::path::Path::new("/w"));
+        assert_eq!(
+            serde_json::to_value(&requested).unwrap(),
+            serde_json::json!({"path": "/w", "confirmed_dirty": false, "on_request": true})
+        );
+        let old: KeptWorktree =
+            serde_json::from_str(r#"{"path":"/w","confirmed_dirty":true}"#).unwrap();
+        assert_eq!(old, measured);
+
+        let resp = serde_json::to_value(AttachResponse::ok()).unwrap();
+        assert!(resp.get("dispatched_worktree").is_none(), "{resp}");
+        let resp = AttachResponse {
+            dispatched_worktree: Some("/w".into()),
+            ..AttachResponse::ok()
+        };
+        let round: AttachResponse =
+            serde_json::from_value(serde_json::to_value(&resp).unwrap()).unwrap();
+        assert_eq!(round.dispatched_worktree.as_deref(), Some("/w"));
+        let old: AttachResponse = serde_json::from_str(r#"{"ok":true}"#).unwrap();
+        assert_eq!(old.dispatched_worktree, None);
+    }
+
+    /// Issue #1958 (U1): the keep is advertised on every platform, since
+    /// neither handler's keep path is `#[cfg]`-gated, under the name clients
+    /// check.
+    #[test]
+    fn keep_worktree_is_advertised() {
+        assert_eq!(CAP_KEEP_WORKTREE, "keep-worktree");
+        assert!(DAEMON_CAPABILITIES.contains(&CAP_KEEP_WORKTREE));
     }
 
     /// PRD #882 — an `AttachResponse` from a daemon that predates the policy

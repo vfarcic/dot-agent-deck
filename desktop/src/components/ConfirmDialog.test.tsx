@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import { OVERLAY_LAYER, topmostOverlayClose, useInertBackground, VOICE_PEER_PROPS } from "../hooks/useInertBackground";
 import { ConfirmDialog, type ConfirmState } from "./ConfirmDialog";
-import type { KeptWorktree } from "../lib/worktreeClose";
+import type { WorktreeCloseReport } from "../lib/worktreeClose";
 
 const STATE: ConfirmState = {
   title: "Close coder?",
@@ -24,9 +24,9 @@ function Page({ onClose }: { onClose: () => void }) {
 describe("ConfirmDialog on the overlay stack", () => {
   /** Scenario: while a worktree preview is pending, Cancel remains available but Close waits. Replacing that question ignores its late answer, and a failed preview lets the new close proceed without claiming that a worktree will be kept. */
   it("waits for the worktree hint without applying a cancelled hint to another close", async () => {
-    let settle!: (kept: KeptWorktree) => void;
+    let settle!: (report: WorktreeCloseReport) => void;
     const action = vi.fn(async () => {});
-    const first = { ...STATE, action, worktreePreview: () => new Promise<KeptWorktree>((resolve) => { settle = resolve; }) };
+    const first = { ...STATE, action, worktreePreview: () => new Promise<WorktreeCloseReport>((resolve) => { settle = resolve; }) };
     const onClose = vi.fn();
     const { rerender } = render(<ConfirmDialog state={first} onClose={onClose} />);
     const pending = screen.getByRole("button", { name: "Checking worktree…" });
@@ -37,11 +37,46 @@ describe("ConfirmDialog on the overlay stack", () => {
     expect(onClose).toHaveBeenCalledOnce();
     const second = { ...STATE, title: "Close tester?", action, worktreePreview: async () => { throw new Error("daemon unavailable"); } };
     rerender(<ConfirmDialog state={second} onClose={onClose} />);
-    await act(async () => settle({ path: "/old/dirty", confirmed_dirty: true }));
+    await act(async () => settle({ kept: { path: "/old/dirty", confirmed_dirty: true }, keepWorktree: "/old/dirty" }));
     expect(screen.getByRole("alertdialog")).not.toHaveTextContent("/old/dirty");
     expect(screen.getByRole("button", { name: "Close agent" })).toBeEnabled();
     await act(async () => fireEvent.click(screen.getByRole("button", { name: "Close agent" })));
     expect(action).toHaveBeenCalledOnce();
+  });
+
+  /**
+   * Scenario (issue #1958): a close whose preview names a worktree the deck can
+   * keep shows a third button after Cancel and the close; pressing it runs the
+   * keep action, not the close, and closes the confirmation. Without a named
+   * worktree — or with no keep action to run — the dialog stays two buttons.
+   */
+  it("offers the keep-worktree close only when the preview names a worktree to keep", async () => {
+    const action = vi.fn(async () => {});
+    const keepAction = vi.fn(async () => {});
+    const keepWorktree = { label: "Close agent, keep worktree", action: keepAction };
+    const offered: ConfirmState = { ...STATE, action, keepWorktree, worktreePreview: async () => ({ kept: null, keepWorktree: "/w/unit" }) };
+    const onClose = vi.fn();
+    const { rerender } = render(<ConfirmDialog state={offered} onClose={onClose} />);
+    expect(screen.queryByRole("button", { name: "Close agent, keep worktree" })).toBeNull();
+    const keep = await screen.findByRole("button", { name: "Close agent, keep worktree" });
+    expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent", "Close agent, keep worktree"]);
+    expect(keep).toHaveAttribute("title", "Keeps /w/unit");
+    await act(async () => fireEvent.click(keep));
+    expect(keepAction).toHaveBeenCalledOnce();
+    expect(action).not.toHaveBeenCalled();
+    expect(onClose).toHaveBeenCalledOnce();
+
+    for (const state of [
+      { ...STATE, action, keepWorktree, worktreePreview: async () => ({ kept: null, keepWorktree: null }) },
+      { ...STATE, action, keepWorktree, worktreePreview: async () => { throw new Error("daemon unavailable"); } },
+      { ...STATE, action, worktreePreview: async () => ({ kept: null, keepWorktree: "/w/unit" }) },
+      { ...STATE, action, keepWorktree },
+    ] satisfies ConfirmState[]) {
+      rerender(<ConfirmDialog state={state} onClose={onClose} />);
+      await screen.findByRole("button", { name: "Close agent" });
+      await act(async () => undefined);
+      expect(screen.getAllByRole("button").map((button) => button.textContent)).toEqual(["Cancel", "Close agent"]);
+    }
   });
 
   /** Scenario: With a confirmation open, the rest of the window is inert and voice's "close" is its Cancel; once it is gone the window is live again. */

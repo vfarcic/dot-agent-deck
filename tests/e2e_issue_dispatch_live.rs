@@ -4,13 +4,13 @@
 //! `issue_dispatch` task must surface its per-issue card LIVE on an
 //! ALREADY-ATTACHED TUI — the user-visible payoff the headless
 //! `scheduler/dispatch/001-009` family (run-now over the attach socket, no PTY)
-//! can't observe, and the clip the demo reel narrates.
+//! can't observe.
 //!
 //! Unlike `tests/e2e_issue_dispatch.rs` (headless `daemon serve`, asserts on the
 //! daemon's agent registry / on-disk worktrees), this drives the real
 //! `dot-agent-deck` binary inside an isolated PTY via the `TuiDeck` harness — the
 //! same harness `scheduler/live/*` uses — so the assertion lands on the RENDERED
-//! vt100 grid and a `full-stream.cast` is recorded for the reel.
+//! vt100 grid and a `full-stream.cast` is recorded.
 //!
 //! It composes both seams:
 //!   - the OFFLINE GitHub seam from `e2e_issue_dispatch.rs`: a stub `gh` on PATH
@@ -293,7 +293,7 @@ fn run_now(deck: &TuiDeck, name: &str) {
 /// (precondition), assert that a per-issue card surfaces LIVE on the rendered
 /// dashboard — its `Dir:` line shows the issue worktree basename `issue-7` and
 /// its title shows the schedule name `github-issues` — proving the dispatched
-/// issue is visible in the attached TUI (the showcase the demo reel narrates).
+/// issue is visible in the attached TUI.
 #[spec("scheduler/dispatch/011")]
 #[test]
 fn dispatch_011_card_surfaces_live_in_tui() {

@@ -1810,6 +1810,23 @@ fn build_event_typed_with_version(
         metadata.insert("bash_command".to_string(), cmd.to_string());
     }
 
+    // Issue #2087: the skill a skill-tool call loads, only when a skill
+    // directory defines it (`crate::telemetry::skill`).
+    if matches!(event_type, EventType::ToolStart)
+        && let Some(name) = crate::telemetry::skill::called_skill(
+            &agent_type,
+            tool_name.as_deref(),
+            tool_input.as_ref(),
+            cwd.as_deref(),
+            &crate::telemetry::skill::user_skill_roots(),
+        )
+    {
+        metadata.insert(
+            crate::telemetry::skill::SKILL_NAME_METADATA_KEY.to_string(),
+            name,
+        );
+    }
+
     // Issue #714: a Claude Code turn that an API error ended. Every `error`
     // kind maps to something — `StopFailure` replaces `Stop`, so an unmapped
     // kind would leave the card `Thinking` — and only a quota or credit refusal
@@ -2220,6 +2237,22 @@ pub(crate) fn build_opencode_event_with_question(
         && let Some(cmd) = tool_input.get("command").and_then(|v| v.as_str())
     {
         metadata.insert("bash_command".to_string(), cmd.to_string());
+    }
+
+    // Issue #2087: as for Claude Code, OpenCode's `skill` tool.
+    if matches!(event_type, EventType::ToolStart)
+        && let Some(name) = crate::telemetry::skill::called_skill(
+            &AgentType::OpenCode,
+            input.tool_name.as_deref(),
+            input.tool_input.as_ref(),
+            input.cwd.as_deref(),
+            &crate::telemetry::skill::user_skill_roots(),
+        )
+    {
+        metadata.insert(
+            crate::telemetry::skill::SKILL_NAME_METADATA_KEY.to_string(),
+            name,
+        );
     }
 
     // OpenCode publishes the user interrupting a turn as a `session.error`
@@ -3759,6 +3792,70 @@ mod tests {
         assert_eq!(map_event_type("SomethingElse"), None);
     }
 
+    /// Issue #2085: without its arm each name would read `None` and the event
+    /// would be dropped. No other test maps these two.
+    #[test]
+    fn map_compaction_events() {
+        assert_eq!(map_event_type("PreCompact"), Some(EventType::Compacting));
+        assert_eq!(map_event_type("PostCompact"), Some(EventType::Thinking));
+    }
+
+    /// Issue #2085: a structured tool reporting `failed` is a failure, as
+    /// `error` is.
+    #[test]
+    fn tool_response_with_failed_status_is_a_failure() {
+        assert!(tool_response_is_failure(
+            &serde_json::json!({"status": "failed"})
+        ));
+    }
+
+    /// Issue #2085: each named arm yields a detail the generic branch (the
+    /// first string value, cut at 80 bytes) would not: a value longer than 80,
+    /// only a multi-line command's first line, an argv array joined, a patch
+    /// envelope's file path.
+    #[test]
+    fn extract_tool_detail_named_arms_differ_from_the_generic_branch() {
+        let long = "x".repeat(100);
+        let cases = [
+            ("Read", serde_json::json!({"file_path": long}), long.clone()),
+            ("Edit", serde_json::json!({"file_path": long}), long.clone()),
+            (
+                "Write",
+                serde_json::json!({"file_path": long}),
+                long.clone(),
+            ),
+            ("Grep", serde_json::json!({"pattern": long}), long.clone()),
+            ("Glob", serde_json::json!({"pattern": long}), long.clone()),
+            (
+                "Agent",
+                serde_json::json!({"description": long}),
+                long.clone(),
+            ),
+            (
+                "shell",
+                serde_json::json!({"command": ["/bin/sh", "-lc", "touch x"]}),
+                "/bin/sh -lc touch x".to_string(),
+            ),
+            (
+                "apply_patch",
+                serde_json::json!({"command": "*** Add File: notes.txt\n+hello"}),
+                "notes.txt".to_string(),
+            ),
+            (
+                "exec",
+                serde_json::json!({"command": "make\nmake test"}),
+                "make".to_string(),
+            ),
+        ];
+        for (tool, input, expected) in cases {
+            assert_eq!(
+                extract_tool_detail(Some(tool), Some(&input)),
+                Some(expected),
+                "{tool}"
+            );
+        }
+    }
+
     /// Issue #622: the `agent-event` CLI's detail lands on the fields every
     /// other producer fills, bounded the same way.
     #[test]
@@ -5295,6 +5392,16 @@ mod tests {
         );
     }
 
+    /// Issue #2085: without its arm `waiting` would fall to the default and
+    /// read Thinking.
+    #[test]
+    fn map_opencode_session_status_waiting() {
+        assert_eq!(
+            map_opencode_event_type("session.status", Some("waiting")),
+            Some(EventType::WaitingForInput)
+        );
+    }
+
     #[test]
     fn map_opencode_tool_before() {
         assert_eq!(
@@ -5715,6 +5822,78 @@ mod tests {
             event.metadata.get("bash_command").map(String::as_str),
             Some(full_cmd),
         );
+    }
+
+    /// Issue #2087: a Claude Code `Skill` call and an OpenCode `skill` call
+    /// name a skill their project defines, and only that: not the tool's
+    /// arguments, not an undefined name, not on a call's end, not for another
+    /// agent's tool of the same name.
+    #[test]
+    fn a_skill_call_names_only_a_defined_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skill = dir
+            .path()
+            .join(".claude/skills")
+            .join("dad-hook-skill-2087");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::write(skill.join("SKILL.md"), "x").unwrap();
+        let cwd = dir.path().to_str().unwrap().to_string();
+        let key = crate::telemetry::skill::SKILL_NAME_METADATA_KEY;
+        let claude = |event: &str, agent: AgentType, name: &str| {
+            build_event_typed(
+                ClaudeCodeHookInput {
+                    session_id: "s1".into(),
+                    hook_event_name: event.into(),
+                    cwd: Some(cwd.clone()),
+                    tool_name: Some("Skill".into()),
+                    tool_input: Some(serde_json::json!({"skill": name, "args": "PRIVATE"})),
+                    ..Default::default()
+                },
+                agent,
+            )
+            .unwrap()
+            .metadata
+            .get(key)
+            .cloned()
+        };
+        assert_eq!(
+            claude("PreToolUse", AgentType::ClaudeCode, "dad-hook-skill-2087").as_deref(),
+            Some("dad-hook-skill-2087")
+        );
+        assert_eq!(
+            claude(
+                "PreToolUse",
+                AgentType::ClaudeCode,
+                "dad-hook-undefined-2087"
+            ),
+            None
+        );
+        assert_eq!(claude("PreToolUse", AgentType::ClaudeCode, "../x"), None);
+        assert_eq!(
+            claude("PostToolUse", AgentType::ClaudeCode, "dad-hook-skill-2087"),
+            None
+        );
+        assert_eq!(
+            claude("PreToolUse", AgentType::Codex, "dad-hook-skill-2087"),
+            None
+        );
+
+        let opencode = |tool: &str| {
+            build_opencode_event(OpenCodeHookInput {
+                session_id: "oc-1".into(),
+                event: "tool.execute.before".into(),
+                tool_name: Some(tool.into()),
+                tool_input: Some(serde_json::json!({"name": "dad-hook-skill-2087"})),
+                cwd: Some(cwd.clone()),
+                ..Default::default()
+            })
+            .unwrap()
+            .metadata
+            .get(key)
+            .cloned()
+        };
+        assert_eq!(opencode("skill").as_deref(), Some("dad-hook-skill-2087"));
+        assert_eq!(opencode("read"), None);
     }
 
     fn claude_payload(event: &str) -> ClaudeCodeHookInput {

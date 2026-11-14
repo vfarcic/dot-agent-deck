@@ -609,19 +609,29 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
    shape, so it reads as a distinct state beside a crashed agent. */
 .agent-state-mark.status-blocked { color: var(--red); background: transparent; box-shadow: inset 0 0 0 2px var(--red); }
 .agent-state-mark.status-needs_input, .agent-state-mark.status-queued { color: var(--amber); background: var(--amber); }
-.agent-title-line { display: flex; align-items: center; gap: 6px; }
+/* Issue #1757: Waiting — the turn ended while a command it started still runs.
+   Running's colour, hollow: its work is not done, but it is not working now. */
+.agent-state-mark.status-waiting { color: var(--teal); background: transparent; box-shadow: inset 0 0 0 2px var(--teal); }
+/* Issue #1798: one line while it fits. A tile crowded with badges wraps the
+   rest onto a second row rather than pushing the rename pencil, which ends the
+   line, out of the header. */
+.agent-title-line { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; }
 .agent-title-line h2 { margin: 0; font-size: 12px; font-weight: 720; }
 /* Issue #2001: the title is the agent's name, which can be long, so it is the
    one part of the line that gives way — cut with an ellipsis, the whole name in
    its tooltip — and the status and badges beside it keep their full width. */
 .agent-title-line h2 { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .agent-title-line > :not(h2) { flex: 0 0 auto; }
+/* Issue #1798: the muted facts beside the name (the binary, a renamed role's
+   role) give way after it, so the status and badges keep their full width. */
+.agent-title-line > .agent-identity-facts { flex: 0 1 auto; min-width: 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .agent-identity p { margin: 3px 0 0; overflow: hidden; color: var(--muted); font-family: "JetBrains Mono", monospace; font-size: 8.5px; text-overflow: ellipsis; white-space: nowrap; }
 .status-label { padding: 2px 4px; border-radius: 2px; color: var(--faint); background: var(--paper-sunken-strong); font-size: 7px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase; }
 .status-label.status-running { color: var(--teal); background: var(--teal-soft); }
 .status-label.status-passed { color: var(--green); background: var(--green-soft); }
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
+.status-label.status-waiting { color: var(--teal); background: transparent; outline: 1px dashed var(--teal); outline-offset: -1px; }
 .agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
 /* Issue #2075 — a question waiting, and for how long: the overview's ORCHESTRATOR
@@ -640,7 +650,9 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .agent-inbox-attention-actions button { padding: 2px 8px; border: 1px solid var(--line-strong); border-radius: var(--radius); color: var(--ink); background: var(--paper-strong); font: inherit; font-weight: 700; cursor: pointer; }
 .agent-inbox-attention-actions button:disabled { color: var(--faint); cursor: default; }
 .agent-inbox-attention-answer { display: block; margin-top: 3px; color: var(--ink); }
-.agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Issue #1933: the notice says how the agent's pane ended, its exit code last,
+   so it wraps rather than being cut, as the TUI card wraps it. */
+.agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: 8.5px; white-space: normal; overflow-wrap: anywhere; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
    about now, not a label. */
@@ -1114,7 +1126,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .danger-icon { width: 38px; height: 38px; margin: 2px auto 10px; display: grid; place-items: center; border-radius: 50%; color: var(--red); background: var(--red-soft); }
 .confirm-dialog h2 { margin: 0; font-size: 15px; }
 .confirm-dialog p { margin: 7px auto 16px; max-width: 320px; color: var(--muted); font-size: 9.5px; line-height: 1.5; overflow-wrap: anywhere; }
-.confirm-dialog > div:last-child { display: flex; justify-content: center; gap: 7px; }
+/* `flex-wrap`: a close that can keep its worktree adds a third, longer button (issue #1958), which wraps rather than overflowing the card. */
+.confirm-dialog > div:last-child { display: flex; flex-wrap: wrap; justify-content: center; gap: 7px; }
 .confirm-dialog.has-worktree-preview { display: flex; flex-direction: column; max-height: 100%; overflow-y: auto; }
 .confirm-dialog.has-worktree-preview > * { flex-shrink: 0; }
 .confirm-dialog .worktree-close-preview { min-height: 0; flex-shrink: 1; overflow-y: auto; }
@@ -1152,6 +1165,22 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .self-upgrade-actions > div { display: flex; justify-content: center; gap: 7px; }
 /* The actions block is the dialog's last child, so `.confirm-dialog > div:last-child` would lay its question and buttons out side by side. */
 .confirm-dialog.self-upgrade-dialog > div.self-upgrade-actions { display: block; }
+
+/* PRD #1885 — `Review project commands`: the confirm card, wider, with the
+   project's commands and prompts in a scrolling body that is read as text. */
+.trust-dialog { width: min(620px, 100%); max-height: calc(100vh - 11vh - 40px); display: flex; flex-direction: column; }
+.trust-dialog > * { flex-shrink: 0; }
+.confirm-dialog.trust-dialog .trust-body { min-height: 0; flex-shrink: 1; margin: 10px 0 12px; padding: 9px 11px; overflow: auto; text-align: left; font-size: 10px; line-height: 1.5; border: 1px solid var(--line); border-radius: 5px; background: var(--paper); }
+.trust-body .trust-field { overflow-wrap: anywhere; }
+.trust-body .trust-label { color: var(--muted); }
+.trust-body .trust-value { color: var(--ink); }
+.trust-body .trust-mark { color: var(--red); }
+.trust-body code.trust-value { font-size: 9.5px; white-space: pre-wrap; }
+.trust-body .trust-text { margin: 2px 0 0 12px; padding: 0; color: var(--ink); font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
+.confirm-dialog.trust-dialog .trust-intro { margin: 8px 0; max-width: none; color: var(--ink); }
+.trust-body .trust-role { margin-top: 9px; padding-top: 7px; border-top: 1px solid var(--line); }
+.confirm-dialog.trust-dialog .trust-notice, .confirm-dialog.trust-dialog .trust-error { margin: 0 auto 10px; max-width: none; }
+.confirm-dialog.trust-dialog .trust-error { color: var(--red); }
 
 /* PRD #1223 M4 — the New agent dialog. One card over the `.dialog-backdrop`
    scrim, as the palette and the confirmation are: a deck step, a directory step
@@ -1564,6 +1593,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .count-running { color: var(--teal); }
 .count-needs-input { color: var(--amber); }
 .count-failed { color: var(--red); }
+/* Issue #1757: Waiting's mark is hollow teal; its count reads in the same teal. */
+.count-waiting { color: var(--teal); }
 /* An unreadable fleet is not an empty one: the em dash says so and stays muted. */
 .overview-screen .count-unknown { color: var(--faint); }
 

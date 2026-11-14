@@ -15,7 +15,7 @@ fn payload_prompt(stem: &str) -> String {
     payload["prompt"].as_str().unwrap().to_string()
 }
 
-/// Scenario: Read the prompts Claude Code 2.1.310 and Codex 0.164.0 and 0.160.0 handed their UserPromptSubmit hooks for a submitted token-led doorbell line, and variants of them: with the user's text around the line, an older deck's line with no token, a malformed token, and an invalid message id. The submitted line alone is an exact ring with its token and message; around other text it is a ring with other text; the others are no ring.
+/// Scenario: Read the prompts Claude Code 2.1.310 and Codex 0.164.0 and 0.160.0 handed their UserPromptSubmit hooks for a submitted token-led doorbell line, and variants of them: with the user's text around the line, with the deck named by an absolute or a quoted path instead of the bare name, with a two-word command, an older deck's line with no token, a malformed token, and an invalid message id. The submitted line alone is an exact ring with its token and message, whichever deck it names; around other text it is a ring with other text; the others are no ring.
 #[spec("inbox/doorbell/046")]
 #[test]
 fn doorbell_046_the_ring_is_read_off_real_prompt_payloads() {
@@ -42,6 +42,23 @@ fn doorbell_046_the_ring_is_read_off_real_prompt_payloads() {
             let ring = ring_of(&merged).expect("the line is still there");
             assert_eq!(ring.shape, PromptShape::WithOtherText, "{merged:?}");
         }
+        // Issue #1730: a deck names itself by the path its daemon runs from,
+        // and the recorded lines name the bare `dot-agent-deck` an older
+        // deck typed; the hook reads the ring off either.
+        let bare = "run: dot-agent-deck inbox fetch";
+        assert!(prompt.contains(bare), "{stem}: {prompt:?}");
+        for word in [
+            "/home/me/.local/bin/dot-agent-deck",
+            "'/Users/me/My Apps/dot-agent-deck'",
+            r"'/w/it'\''s/dot-agent-deck'",
+        ] {
+            let named = prompt.replacen(bare, &format!("run: {word} inbox fetch"), 1);
+            let ring = ring_of(&named).unwrap_or_else(|| panic!("{stem}: no ring in {named:?}"));
+            assert_eq!(ring.shape, PromptShape::Exact, "{named:?}");
+            assert_eq!(&prompt[1..7], ring.token, "{named:?}");
+        }
+        let two_words = prompt.replacen(bare, "run: please run inbox fetch", 1);
+        assert_eq!(ring_of(&two_words), None, "a two-word command is no ring");
         let untokened = &prompt[8..];
         assert_eq!(
             ring_of(untokened),

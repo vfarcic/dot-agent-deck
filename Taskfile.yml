@@ -106,16 +106,6 @@ tasks:
     cmds:
       - bash "$DAD_TASKFILE_DIR/scripts/sandbox-run.sh" stop "$DAD_TASKFILE_DIR" "$DAD_RUN_DIR" "$DAD_RUN_SANDBOX" "$DAD_RUN_PROFILE" {{.CLI_ARGS}}
 
-  reel-smoke:
-    desc: Build a demo reel from a tiny fixture and assert the stitched MP4 with ffprobe (local-only; no network, no upload)
-    cmds:
-      - .claude/skills/demo-reel/tests/smoke.sh
-
-  reel-adapter-test:
-    desc: Assert the demo-reel adapter builds manifest.json in catalog order, excludes L1 (cast-less) and unmarked tests, refuses a cast whose provenance sidecar does not record a passing run at the current commit, and clean-skips with the right reason for each cause (no agg/ffmpeg, no network; the reel-path cases use git in a throwaway repo; CI-safe)
-    cmds:
-      - .claude/skills/demo-reel-adapter/tests/adapter_test.sh
-
   checksums:
     desc: Generate SHA256 checksums for release binaries
     dir: dist

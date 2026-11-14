@@ -462,6 +462,8 @@ pub struct TuiDeckBuilder {
     launch_subdir: Option<PathBuf>,
     launch_cargo_artifact: bool,
     keep_startup_hook_install: bool,
+    skip_trust_preapproval: bool,
+    trusted_projects: Vec<PathBuf>,
 }
 
 impl TuiDeckBuilder {
@@ -547,6 +549,23 @@ impl TuiDeckBuilder {
     /// `XDG_CONFIG_HOME` through [`Self::with_env`] is opted out already.
     pub fn keeping_the_startup_hook_install(mut self) -> Self {
         self.keep_startup_hook_install = true;
+        self
+    }
+
+    /// PRD #1885: opt out of the default pre-approval, so the fixture's
+    /// orchestrations start unapproved, exactly as a user's never-approved
+    /// project does. For the `config-trust/*` tests, whose subject is the gate.
+    pub fn without_trust_preapproval(mut self) -> Self {
+        self.skip_trust_preapproval = true;
+        self
+    }
+
+    /// PRD #1885: also approve the project at `dir` at launch, through the
+    /// same real `trust approve --yes` as the fixture's own pre-approval —
+    /// for a test whose orchestration lives outside the fixture (a session
+    /// restore's project dir).
+    pub fn trusting_project(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.trusted_projects.push(dir.into());
         self
     }
 
@@ -813,6 +832,9 @@ pub struct TuiDeck {
     /// dumped beside `daemon.log`. `None` when a test's `with_env` gave it a
     /// value that selects the host's default log (`1`, an empty string).
     deck_log_path: Option<PathBuf>,
+    /// The environment the deck was launched with, for
+    /// [`TuiDeck::approve_project_trust`] (PRD #1885).
+    launch_env: HashMap<String, String>,
 }
 
 /// Observable terminal-cell styling from the outer vt100 screen driven by the
@@ -1002,6 +1024,8 @@ impl TuiDeck {
             launch_subdir: None,
             launch_cargo_artifact: false,
             keep_startup_hook_install: false,
+            skip_trust_preapproval: false,
+            trusted_projects: Vec::new(),
         }
     }
 
@@ -1009,7 +1033,7 @@ impl TuiDeck {
         let test_name = current_test_name();
         // PR #805 audit blocker 3, and it comes before every side effect on
         // purpose: from here on the run can be killed at any instant, and
-        // whatever it does not overwrite is what a later reel build picks up.
+        // whatever it does not overwrite is left looking like this run's output.
         // See [`discard_previous_recording`].
         discard_previous_recording(&test_name);
 
@@ -1120,7 +1144,7 @@ impl TuiDeck {
                 // now returns redactions like the other three. It used to
                 // return none, on the ground that the credential set is "never
                 // rendered" — a convention, not a structural property, and the
-                // route most reel clips take. The run's credential source is
+                // route most real-agent tests take. The run's credential source is
                 // recorded in `CLAUDE_OAUTH_SEEDED` for
                 // `seed_claude_project_trust` below rather than threaded
                 // through every builder field.
@@ -1171,7 +1195,7 @@ impl TuiDeck {
         //     `--success-output=final` prints. Both sinks are LOCAL, because
         //     lane 2 runs on a developer's machine and nowhere in CI: what is
         //     at stake is that developer's terminal and scrollback, the `.cast`
-        //     the demo reel publishes, and whatever they paste onward. Nothing
+        //     they might share, and whatever they paste onward. Nothing
         //     downstream masks anything — and a log-masking layer covers a
         //     registered secret's exact value, never a 20-character derivative
         //     of it, which is why this suffix is registered in its own right.
@@ -1325,6 +1349,7 @@ impl TuiDeck {
             // Disable the idle-shutdown so the daemon does not race the
             // test by exiting after a brief detach.
             ("DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS", "0"),
+            ("DOT_AGENT_DECK_NATIVE_CLIPBOARD", "0"), // PRD #385: not the real clipboard
             // Leaked-daemon safety net: the deck lazy-spawns its daemon
             // DETACHED (its own session → parent is PID 1 from birth), so the
             // orphan watchdog can't be enabled here (it would fire instantly).
@@ -1446,6 +1471,16 @@ impl TuiDeck {
         {
             preinstall_deck_hooks(&deck_binary, &launch_dir, &final_env);
         }
+        // PRD #1885: start from the fixture's orchestrations approved, as a
+        // user who has approved their project once does, so a test about
+        // something else never meets the trust prompt. See
+        // `approve_project_trust_with`.
+        if !builder.skip_trust_preapproval && work.join(".dot-agent-deck.toml").is_file() {
+            preapprove_project_trust(&deck_binary, &work, &final_env);
+        }
+        for dir in &builder.trusted_projects {
+            approve_project_trust_with(&deck_binary, dir, &final_env);
+        }
         // Read AFTER the `with_env` layer, so a test that moves the state dir
         // still gets its own daemon's log dumped rather than a missing path.
         let daemon_log_path = final_env
@@ -1479,7 +1514,7 @@ impl TuiDeck {
                 }
             })
             .unwrap_or_else(|| home.clone());
-        for (k, v) in final_env {
+        for (k, v) in &final_env {
             cmd.env(k, v);
         }
 
@@ -1597,6 +1632,7 @@ impl TuiDeck {
             recording_redactions,
             daemon_log_path,
             deck_log_path,
+            launch_env: final_env,
         })
     }
 
@@ -2497,6 +2533,22 @@ impl TuiDeck {
         &self.home
     }
 
+    /// PRD #1885: approve every orchestration of the project at `dir` through
+    /// the real `dot-agent-deck trust approve <dir> --yes`, in this deck's
+    /// environment (so into its store). For a test that edits a running
+    /// orchestration's config as setup and then needs the edit to count as
+    /// approved. Panics when the approval fails.
+    pub fn approve_project_trust(&self, dir: &Path) {
+        approve_project_trust_with(contained_deck_binary(), dir, &self.launch_env);
+    }
+
+    /// PRD #1885: run `dot-agent-deck <args…>` in this deck's environment from
+    /// `cwd`, without a terminal, and return its output. The `trust` CLI is
+    /// what the `config-trust/*` tests drive through it.
+    pub fn run_deck_cli(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
+        deck_cli_output(contained_deck_binary(), cwd, &self.launch_env, args)
+    }
+
     /// Return the parsed grid contents — used by `wait_for_string`
     /// internally and by tests that want to assert on full-screen
     /// state.
@@ -2684,6 +2736,16 @@ impl TuiDeck {
         self.send_bytes(format!("\x1b[<0;{cx};{cy}m").as_bytes());
     }
 
+    /// Left-button drag from one 0-based cell to another as SGR reports:
+    /// press at `from`, motion with the button held (code 32) to `to`, then
+    /// release at `to`.
+    pub fn drag(&self, from: (u16, u16), to: (u16, u16)) {
+        let ((fx, fy), (tx, ty)) = ((from.0 + 1, from.1 + 1), (to.0 + 1, to.1 + 1));
+        self.send_bytes(
+            format!("\x1b[<0;{fx};{fy}M\x1b[<32;{tx};{ty}M\x1b[<0;{tx};{ty}m").as_bytes(),
+        );
+    }
+
     /// Send a mouse wheel scroll at the given 0-based grid cell as an SGR
     /// (1006) report (button code 64 = wheel up, 65 = wheel down), matching
     /// what crossterm decodes to `MouseEventKind::ScrollUp`/`ScrollDown`.
@@ -2865,7 +2927,7 @@ impl Drop for TuiDeck {
         let has_claude_sessions = recording_evidence::has_claude_sessions(&self.effective_home);
         let should_dump = panicking || self.record_on_success;
         if should_dump {
-            // The flat files are the current reel-compatible recording. The
+            // The flat files are the current recording. The
             // next launch archives them before clearing; later reruns cannot
             // overwrite the archived evidence (#1815).
             let recordings_dir =
@@ -2887,10 +2949,9 @@ impl Drop for TuiDeck {
             // starved 4-CPU runners it kept a test that panicked 5s in
             // alive past nextest's 180s timeout, so the run reported a
             // timeout instead of the panic. Nothing that reads a failure
-            // needs the doc: CI uploads no recordings, the demo-reel
-            // adapter refuses a recording whose provenance is not
-            // `passed`, and `cargo xtask docs --tests` rebuilds it on
-            // demand. `harness/teardown/001` pins this.
+            // needs the doc: CI uploads no recordings, and
+            // `cargo xtask docs --tests` rebuilds it on demand.
+            // `harness/teardown/001` pins this.
             if !panicking {
                 regenerate_paired_doc(&self.test_name);
             }
@@ -3332,7 +3393,7 @@ impl TuiDeck {
     /// `seed_claude_trust_in_home` is called after the launch by nine live tests,
     /// deliberately, because the trusted directory is only known then — reached
     /// the panic seam and never the `.cast`. That is backwards: the `.cast` is
-    /// the artifact the demo reel publishes. Every value in the global store is
+    /// the artifact most likely to be shared. Every value in the global store is
     /// a credential or identity value some harness path registered, and the
     /// per-deck set is already a subset of it in practice.
     ///
@@ -3449,10 +3510,10 @@ impl TuiDeck {
             }
         }
 
-        // provenance.json — issue #808. Written LAST on purpose: the adapter
-        // refuses a cast whose sidecar is absent, so a dump that dies partway
-        // (a full disk, a `?` on any write above) leaves a cast that cannot be
-        // published rather than one that can. `provenance.json` is FIRST in
+        // provenance.json — issue #808. Written LAST on purpose: a dump that
+        // dies partway (a full disk, a `?` on any write above) leaves a cast
+        // with no sidecar rather than one a sidecar vouches for.
+        // `provenance.json` is FIRST in
         // [`RECORDING_ARTIFACTS`] for the mirror-image reason, so the
         // launch-time discard removes the vouching sidecar before the artifact
         // it vouches for.
@@ -3460,26 +3521,24 @@ impl TuiDeck {
         Ok(())
     }
 
-    /// Write the `provenance.json` sidecar the demo-reel adapter checks before
-    /// it will publish a cast (issue #808).
+    /// Write the `provenance.json` sidecar that says which run produced a cast
+    /// (issue #808).
     ///
     /// # What each field is FOR, and what it does not establish
     ///
-    /// The adapter refuses a cast on three of these — an absent sidecar, an
-    /// `outcome` other than `passed`, and a `commit` that is not the revision
-    /// the reel is being built at. The rest are recorded for the audit trail and
-    /// reported by the adapter, and gate nothing. Both halves are deliberate:
+    /// Every field is recorded for whoever reads a recording later — to tell a
+    /// failure diagnostic from a passing run, and to know which revision drew
+    /// it:
     ///
-    /// * `schema` — lets the adapter refuse a sidecar shape it does not
-    ///   understand instead of misreading it. Bump it when a field's meaning
-    ///   changes, and teach `build.sh` the new value in the same commit.
+    /// * `schema` — lets a reader refuse a sidecar shape it does not understand
+    ///   instead of misreading it. Bump it when a field's meaning changes.
     /// * `outcome` — `passed` means **the harness was not unwinding a panic when
     ///   `TuiDeck` was dropped**, which is narrower than "nextest reported this
     ///   test as passed". A test that panics after its deck has already been
     ///   dropped, or that is killed outright (no `Drop`, so no dump at all),
     ///   is not observed here. What it does cover is the common case by far: the
     ///   dump that fires *because* the test panicked, which is a failure
-    ///   diagnostic and not a clip.
+    ///   diagnostic.
     /// * `commit` — the short sha the binary under test was BUILT from, parsed
     ///   out of the compile-time `DAD_BUILD_ID` rather than read from the tree
     ///   at dump time. That choice matters: a tree-time `git rev-parse HEAD`
@@ -3488,22 +3547,19 @@ impl TuiDeck {
     ///   disagree. One fact, sourced from the artifact's own producer.
     /// * `dirty` — `DAD_BUILD_ID`'s `-dirty` suffix. Recorded because it bounds
     ///   what `commit` proves: with a dirty tree, two different working states
-    ///   share one commit, so the adapter reports it loudly and refuses nothing.
+    ///   share one commit.
     /// * `build_id` — the whole `DAD_BUILD_ID` string, so the audit trail keeps
     ///   the version segment and the `-unknown` sentinel that `commit` drops.
     /// * `run_id` — `NEXTEST_RUN_ID`, which is one value for a whole nextest
-    ///   run, so clips recorded together share it. It gates nothing: a reel
-    ///   legitimately assembles clips from several filtered runs at one commit,
-    ///   so the adapter reports the ids and warns when they differ rather than
-    ///   refusing. `unknown` when the recording was not made under nextest.
+    ///   run, so recordings made together share it. `unknown` when the
+    ///   recording was not made under nextest.
     /// * `redaction_version` — bump [`RECORDING_REDACTION_VERSION`] whenever the
     ///   recording redaction changes materially. It gates nothing today because
     ///   `commit` already pins the redaction implementation to the one at that
     ///   revision; it is here for the case `commit` cannot pin, which is a
-    ///   `dirty` tree, and so that a future adapter can enforce a floor over
-    ///   casts kept across revisions.
+    ///   `dirty` tree.
     /// * `recorded_at_unix` — epoch seconds. Archive retention uses this to
-    ///   protect recent failures. The reel's publish checks impose no age limit.
+    ///   protect recent failures.
     /// * `claude_sessions` — session-transcript observations of permission mode,
     ///   Claude version and model; unknown observations remain null/empty.
     ///
@@ -3539,8 +3595,8 @@ impl TuiDeck {
         bytes.push(b'\n');
         // Session metadata is agent-produced. Apply the same registered-value
         // redactor as the other artifacts rather than assuming these fields
-        // cannot carry a credential. A match that corrupts the JSON makes the
-        // adapter refuse the clip.
+        // cannot carry a credential. A match that corrupts the JSON leaves a
+        // sidecar no reader can parse, which claims nothing.
         let bytes = redact_known_credentials_bytes(&bytes, redactions);
         atomic_write(&dir.join("provenance.json"), &bytes)
     }
@@ -3703,9 +3759,8 @@ artifact was replaced whole rather than written with bytes nothing examined \
 //     and at 8 KiB it is three orders of magnitude past any credential this
 //     harness registers.
 //
-// What actually stands between a credential and a public URL is the demo reel's
-// private-by-default upload plus the owner's review before flipping it — see
-// `docs/develop/demo-reel.md`.
+// What else stands between a credential and whoever receives a shared artifact
+// is the judgement of the person sharing it.
 //
 // WHAT IT DOES GUARANTEE, verified rather than argued. Every range constructed
 // here reproduces registered credential bytes exactly — a start range is a
@@ -3851,7 +3906,7 @@ const MAX_INDEX_NEEDLES: usize = 1 << 18;
 /// the right direction: a "credential" whose eight-byte windows appear a million
 /// times in one recording is either an adversarial artifact or a registration
 /// mistake, and both are cases for withholding the artifact rather than
-/// publishing it.
+/// writing it.
 const MAX_INDEX_OCCURRENCES: usize = 1 << 21;
 
 /// Bytes that mean "the writer moved to another row" — the only thing that
@@ -5377,6 +5432,79 @@ fn preinstall_deck_hooks(binary: &Path, cwd: &Path, env: &HashMap<String, String
         .status();
 }
 
+/// The pane-identity variables `trust approve` refuses under (PRD #1885),
+/// removed from every harness run of the CLI: a test's environment is the
+/// deck's, never a pane's.
+const PANE_IDENTITY_ENV: [&str; 3] = [
+    "DOT_AGENT_DECK_PANE_ID",
+    "DOT_AGENT_DECK_PANE_CAPABILITY",
+    "DOT_AGENT_DECK_AGENT_ID",
+];
+
+/// Run `binary <args…>` from `cwd` with exactly `env` (minus the pane
+/// identity) and no terminal on stdin.
+fn deck_cli_output<K, V>(
+    binary: &Path,
+    cwd: &Path,
+    env: impl IntoIterator<Item = (K, V)>,
+    args: &[&str],
+) -> std::process::Output
+where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let mut cmd = std::process::Command::new(binary);
+    cmd.args(args).current_dir(cwd).env_clear().envs(env);
+    for var in PANE_IDENTITY_ENV {
+        cmd.env_remove(var);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .output()
+        .expect("run the dot-agent-deck CLI")
+}
+
+/// PRD #1885: the launch default — [`approve_project_trust_with`], but a
+/// failure is only reported, not fatal: some fixtures carry a config that is
+/// deliberately malformed or declares no orchestration, which approves
+/// nothing and is the subject of their test.
+fn preapprove_project_trust(binary: &Path, dir: &Path, env: &HashMap<String, String>) {
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let output = deck_cli_output(binary, dir, env, &["trust", "approve", &dir_arg, "--yes"]);
+    if !output.status.success() {
+        eprintln!(
+            "note: harness pre-approval `trust approve {dir_arg} --yes` failed ({:?}); the \
+             fixture's orchestrations stay unapproved.\nstderr: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+/// PRD #1885: approve every orchestration of the project at `dir` by running
+/// the REAL `dot-agent-deck trust approve <dir> --yes` in `env` — the deck's
+/// or daemon's own environment, so the approval lands in that per-test state
+/// dir's store. No bypass: the harness approves exactly the way a user does.
+/// Panics when the approval fails, naming the CLI's output, because a test
+/// built on it would otherwise fail later at a refusal far from the cause.
+fn approve_project_trust_with<K, V>(
+    binary: &Path,
+    dir: &Path,
+    env: impl IntoIterator<Item = (K, V)>,
+) where
+    K: AsRef<std::ffi::OsStr>,
+    V: AsRef<std::ffi::OsStr>,
+{
+    let dir_arg = dir.to_string_lossy().into_owned();
+    let output = deck_cli_output(binary, dir, env, &["trust", "approve", &dir_arg, "--yes"]);
+    assert!(
+        output.status.success(),
+        "harness pre-approval `trust approve {dir_arg} --yes` failed ({:?})\nstdout: {}\nstderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// [`contained_deck_binary`] and the directory [`contain_path`] puts on `PATH`
 /// in place of cargo's build directory.
 struct ContainedDeck {
@@ -5470,8 +5598,41 @@ fn contained_deck() -> &'static ContainedDeck {
                 checkout_root().display(),
             );
         }
+        #[cfg(target_os = "macos")]
+        pay_first_launch(&binary);
         ContainedDeck { binary, path_dir }
     })
+}
+
+/// Issue #2237: macOS scans an executable the first time it is launched from
+/// a path it has not seen, a hard link to an already-run build included
+/// (measured on Darwin 25: 3.3 s for the first `--version` through a fresh
+/// link while XProtect was busy, 0.00 s for the second). The link above is
+/// new in every test process, so without this its first launch is whichever
+/// call a test makes first, inside that test's own budget: `inbox/doorbell/008`'s
+/// stand-in runs `inbox fetch` with 8 s, and timed out. Pay it here, once per
+/// process, bounded by the load-scaled boot ceiling; a launch that still has
+/// not answered by then is left to the test, which reports its own failure.
+#[cfg(target_os = "macos")]
+fn pay_first_launch(binary: &Path) {
+    let Ok(mut child) = std::process::Command::new(binary)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + child_boot_budget();
+    while std::time::Instant::now() < deadline {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Whether `path` is the developer's checkout or below it, lexically or through
@@ -5717,10 +5878,9 @@ pub fn current_test_recordings_dir() -> PathBuf {
 /// developer browsing it should not have it deleted under them.
 ///
 /// `provenance.json` is FIRST, and the order is load-bearing in the deletion
-/// direction (issue #808): it is the file the demo-reel adapter checks before it
-/// will publish the cast, so removing it before the cast means a discard that
-/// panics partway has already made whatever survives unpublishable. The dump
-/// writes it LAST for the mirror-image reason.
+/// direction (issue #808): it is the file that vouches for the cast, so removing
+/// it before the cast means a discard that panics partway leaves nothing vouched
+/// for. The dump writes it LAST for the mirror-image reason.
 const RECORDING_ARTIFACTS: [&str; 7] = [
     "provenance.json",
     "final-grid.txt",
@@ -5731,24 +5891,19 @@ const RECORDING_ARTIFACTS: [&str; 7] = [
     "deck.log",
 ];
 
-/// Schema version of the `provenance.json` sidecar (issue #808).
-///
-/// `.claude/skills/demo-reel-adapter/build.sh` refuses a sidecar whose `schema`
-/// is not the value it knows, so bumping this without teaching the adapter the
-/// new value stops the reel from selecting anything — loudly, and in the
-/// fail-closed direction. `tests/harness_isolation.rs` asserts the two agree.
+/// Schema version of the `provenance.json` sidecar (issue #808). Bump it when a
+/// field's meaning changes.
 const RECORDING_PROVENANCE_SCHEMA: u32 = 1;
 
 /// Version of the recording redaction implementation, recorded in
-/// `provenance.json` so a published clip carries which redaction produced it.
+/// `provenance.json` so a recording carries which redaction produced it.
 ///
 /// **Bump it whenever the redaction of the persisted artifacts changes
 /// materially** — a new matcher, a new registered-value source, a change to what
 /// counts as a hit. It gates nothing today: `commit` already pins the redaction
 /// implementation to the one at that revision, which is the stronger statement.
 /// It earns its place in the two spots `commit` cannot reach — a `dirty` tree,
-/// where one commit covers more than one working state, and any future adapter
-/// that enforces a floor over casts kept across revisions.
+/// where one commit covers more than one working state.
 ///
 /// Version 1 is the matcher issue #502/#785 landed, with the two reproduced gaps
 /// [#810](https://github.com/vfarcic/dot-agent-deck/issues/810) tracks: a
@@ -5759,14 +5914,14 @@ const RECORDING_REDACTION_VERSION: u32 = 1;
 /// What the `provenance.json` `outcome` field records.
 ///
 /// **The observation is narrower than the names suggest, and the doc says so
-/// because the field is a publish gate.** `Passed` means `std::thread::panicking()`
+/// because a reader takes the field at its word.** `Passed` means `std::thread::panicking()`
 /// was false when `TuiDeck` was dropped — not that nextest reported the test as
 /// passed. Three shapes it does not see: a test that panics after its deck has
 /// already been dropped; a test killed outright, which reaches no `Drop` and so
 /// writes no sidecar at all (the launch-time discard is what covers that route);
 /// and a test whose assertions were vacuous. What it does cover is the common
 /// case by far — the dump that fires *because* the test panicked, which is a
-/// failure diagnostic and never a clip.
+/// failure diagnostic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum RecordingOutcome {
     Passed,
@@ -5791,10 +5946,9 @@ impl RecordingOutcome {
 /// the version segment can legally contain one: a SemVer prerelease such as
 /// `0.25.0-gamma.1` would otherwise be mined for a sha. It is accepted only when
 /// what follows is at least git's minimum abbreviation of hex digits, so the
-/// `-unknown` sentinel and an arbitrary injected id both yield `None` — and the
-/// adapter refuses a sidecar whose `commit` is empty, which is the fail-closed
-/// direction: a binary that cannot say which commit it came from cannot support
-/// a provenance claim.
+/// `-unknown` sentinel and an arbitrary injected id both yield `None`, which is
+/// the fail-closed direction: a binary that cannot say which commit it came from
+/// cannot support a provenance claim.
 ///
 /// The `-dirty` suffix is reported separately rather than folded into the sha,
 /// because it is what bounds the sha's meaning: two different working states
@@ -5815,19 +5969,18 @@ pub fn recording_build_commit(build_id: &str) -> (Option<&str>, bool) {
 ///
 /// Git's auto-abbreviation floor is 7, so this rejects nothing a normal
 /// `git rev-parse --short HEAD` produces while refusing a `core.abbrev` low
-/// enough that a prefix match would be weak evidence rather than proof. The
-/// adapter applies the same floor to the value it compares against.
+/// enough that a prefix match would be weak evidence rather than proof.
 const MIN_BUILD_COMMIT_LEN: usize = 7;
 
 /// Archive the previous run, then clear the current artifacts before spawning
-/// (#1815). Clearing keeps interrupted or skipped runs from exposing an older
-/// cast at the reel's usual path (#805); archiving keeps failure diagnostics
+/// (#1815). Clearing keeps interrupted or skipped runs from leaving an older
+/// cast in the current view (#805); archiving keeps failure diagnostics
 /// available after reruns. Either operation failing aborts the launch.
 ///
 /// A filtered-out test does not reach this function, and a preflight expression
-/// can die before the skip helper calls it. The adapter's provenance checks
-/// remain necessary for those cases (#808). Archives are outside its flat
-/// selection paths; the paired `test.md` stays where the doc generator puts it.
+/// can die before the skip helper calls it. For those cases the provenance
+/// sidecar says which run produced a cast (#808). The paired `test.md` stays
+/// where the doc generator puts it.
 fn discard_previous_recording(test_name: &str) {
     // The panic below is the failure mode of this function, so it has to reach
     // the redacting output seam like every other harness panic. Cheap (a
@@ -5921,12 +6074,12 @@ pub(crate) fn render_grid_to_svg(grid: &str, cols: u16, rows: u16) -> String {
 /// the check and the scenario then failed deep inside a PTY wait with a
 /// confusing timeout. The extra checks below are all **cheap and offline** —
 /// no probe request, unlike [`check_codex_available`], because the equivalent
-/// `claude -p` round trip costs real tokens on every e2e run. Expiry is
-/// treated the way Claude Code itself treats it: an expired access token is
-/// fine while a live refresh token can still renew it, so only the case where
-/// BOTH are spent is reported as unusable — see [`claude_oauth_usable`], which
-/// holds that half as a pure function so `tests/real_agent_preflight.rs` can
-/// assert every accepted and rejected credential shape.
+/// `claude -p` round trip costs real tokens on every e2e run. Since issue
+/// #1731 a test HOME gets an access-only copy of the login, so the access token
+/// alone decides, and it must last [`SCRATCH_LOGIN_RUN_MARGIN`] — see
+/// [`claude_oauth_usable`], which holds that half as a pure function so
+/// `tests/real_agent_preflight.rs` can assert every accepted and rejected
+/// credential shape.
 ///
 /// PRD #386: the credential set is no longer necessarily a FILE. Claude Code
 /// 2.x on macOS keeps it in the login Keychain as the generic-password item
@@ -6261,11 +6414,22 @@ fn now_epoch_ms() -> i64 {
 /// buffer can; it is local, dropped when this returns, and never read except
 /// through `claude_oauth_usable`.
 fn claude_credential_document_usable(raw: &[u8]) -> bool {
-    serde_json::from_slice::<serde_json::Value>(raw)
-        .ok()
-        .as_ref()
-        .and_then(|parsed| parsed.get("claudeAiOauth"))
-        .is_some_and(|oauth| claude_oauth_usable(oauth, now_epoch_ms()).is_ok())
+    claude_credential_document_check(raw).is_ok()
+}
+
+/// [`claude_credential_document_usable`] with the reason, for the import's
+/// refusal. The message quotes no value from the document.
+fn claude_credential_document_check(raw: &[u8]) -> Result<(), String> {
+    let parsed = serde_json::from_slice::<serde_json::Value>(raw).map_err(|_| {
+        "Claude Code credentials at ~/.claude/.credentials.json are not valid JSON — \
+         log in again with `claude login`"
+            .to_string()
+    })?;
+    let oauth = parsed.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    claude_oauth_usable(oauth, now_epoch_ms())
 }
 
 /// Service name Claude Code 2.x files its OAuth credential set under in the
@@ -6414,44 +6578,86 @@ fn claude_keychain_credentials_export() -> Option<Vec<u8>> {
 /// was already spent — precisely the "credentials look fine, then the real agent
 /// fails deep inside a PTY wait" case this check exists to catch.
 ///
-/// Two deliberate decisions are preserved. An expired access token with a LIVE
-/// refresh token still passes, because Claude Code itself refreshes on that
-/// shape. And there is **no probe request**: revoked credentials and network
+/// **Issue #1731: the ACCESS token alone decides, and it must last the run.**
+/// A test HOME gets an access-only copy of the login ([`claude_scratch_login`]),
+/// so a refresh token no longer makes an expired or expiring access token
+/// usable: the copy has nothing to refresh with. The set is usable when its
+/// `accessToken` is non-empty and its `expiresAt` is at least
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now_ms`; an absent `expiresAt` is
+/// refused, because the harness cannot then tell whether the token lasts. This
+/// replaced PRD #126's acceptance of an expired access token beside a live
+/// refresh token, which was right for Claude Code on the host and is wrong for
+/// a copy that must never refresh.
+///
+/// There is still **no probe request**: revoked credentials and network
 /// failures remain an accepted false-positive class, since a live round trip
 /// would spend real tokens on every e2e run.
 pub fn claude_oauth_usable(oauth: &serde_json::Value, now_ms: i64) -> Result<(), String> {
+    const REMEDY: &str = "log in again with `claude login` (or `/login` inside `claude`) \
+                          to refresh the host login; the test copy carries no refresh token, \
+                          so it cannot refresh on its own";
     let non_empty = |key: &str| {
         oauth
             .get(key)
             .and_then(|v| v.as_str())
             .is_some_and(|v| !v.is_empty())
     };
-    if !non_empty("accessToken") && !non_empty("refreshToken") {
-        return Err(
-            "Claude Code credentials at ~/.claude/.credentials.json carry no access or refresh \
-             token — log in with `claude login`"
-                .into(),
-        );
+    if !non_empty("accessToken") {
+        if !non_empty("refreshToken") {
+            return Err(
+                "Claude Code credentials at ~/.claude/.credentials.json carry no access or \
+                 refresh token — log in with `claude login`"
+                    .into(),
+            );
+        }
+        return Err(format!(
+            "Claude Code credentials at ~/.claude/.credentials.json carry no access token, \
+             only a refresh token; {REMEDY}"
+        ));
     }
-    // Both timestamps are epoch MILLISECONDS. An absent field is treated as
-    // "no expiry information", never as expired.
-    let live = |key: &str| {
-        oauth
-            .get(key)
-            .and_then(|v| v.as_i64())
-            .is_none_or(|at| at > now_ms)
+    // Epoch MILLISECONDS.
+    let Some(expires_at) = oauth.get("expiresAt").and_then(serde_json::Value::as_i64) else {
+        return Err(format!(
+            "Claude Code credentials at ~/.claude/.credentials.json have no `expiresAt`, so \
+             the harness cannot tell whether the access token lasts the run; {REMEDY}"
+        ));
     };
-    // A token is usable only if it is BOTH present and unexpired; an expiry
-    // alone says nothing about a token that does not exist.
-    let usable = |token_key: &str, expiry_key: &str| non_empty(token_key) && live(expiry_key);
-    if !usable("accessToken", "expiresAt") && !usable("refreshToken", "refreshTokenExpiresAt") {
-        return Err(
-            "Claude Code credentials at ~/.claude/.credentials.json are expired and cannot be \
-             refreshed — log in again with `claude login`"
-                .into(),
-        );
+    scratch_login_lasts_the_run(
+        u128::try_from(expires_at).unwrap_or(0),
+        u128::try_from(now_ms).unwrap_or(0),
+        "the Claude Code login at ~/.claude/.credentials.json",
+        REMEDY,
+    )
+}
+
+/// The copy of a host Claude Code credentials `document` that a test HOME gets
+/// (issue #1731): `{"claudeAiOauth": …}` with every refresh-token key removed,
+/// and nothing else. `mcpOAuth` — MCP servers' OAuth logins, each with its own
+/// refresh token — is left out entirely, so a host MCP server that the test
+/// HOME's configuration still names starts unauthenticated there.
+/// Refused, with the remedy, by the [`claude_oauth_usable`] rule.
+///
+/// **Why no refresh token**, the reason [`pi_scratch_login`] gives: a refresh
+/// in the copy writes the new tokens only into the scratch HOME, which is
+/// deleted at teardown, and a provider that rotates refresh tokens leaves the
+/// host login holding a spent one. Measured on 2026-11-10 that Claude Code
+/// 2.1.322 authenticates from the access-only copy (`claude -p` on Haiku in a
+/// scratch HOME holding only this document) and writes no refresh token into
+/// it.
+pub(crate) fn claude_scratch_login(
+    document: &serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    let oauth = document.get("claudeAiOauth").ok_or(
+        "Claude Code credentials at ~/.claude/.credentials.json carry no `claudeAiOauth` \
+         entry — log in with `claude login`",
+    )?;
+    claude_oauth_usable(oauth, i64::try_from(epoch_ms(now)).unwrap_or(i64::MAX))?;
+    let mut oauth = oauth.clone();
+    if let Some(fields) = oauth.as_object_mut() {
+        fields.retain(|key, _| !is_refresh_token_key(key));
     }
-    Ok(())
+    Ok(serde_json::json!({ "claudeAiOauth": oauth }))
 }
 
 /// PRD #77 Decision 26 runtime-skip helper for OpenCode. Mirrors
@@ -6928,15 +7134,92 @@ fn host_pi_login(provider: &str) -> Option<serde_json::Value> {
         .filter(serde_json::Value::is_object)
 }
 
-/// How long a Pi OAuth access token must still be valid when a scratch copy is
-/// made of it ([`pi_scratch_login`]): the copy carries no refresh token, so a
-/// test that outlives the token fails rather than refreshing. One hour covers a
-/// lane-2 Pi test with its preflight many times over.
-const PI_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+/// How long an OAuth access token must still be valid when a scratch copy is
+/// made of it — Pi's ([`pi_scratch_login`]), Claude's ([`claude_scratch_login`]),
+/// Codex's ([`codex_scratch_login`]) and OpenCode's ([`opencode_scratch_auth`]).
+/// Each copy carries no refresh token (PRD #1666, issue #1731), so a test that
+/// outlives the token fails rather than refreshing. One hour covers a lane-2
+/// test with its preflight many times over: the copy is made when that one test
+/// starts, not when the run does.
+pub(crate) const SCRATCH_LOGIN_RUN_MARGIN: Duration = Duration::from_secs(3600);
+
+/// Whether an OAuth document key names a refresh token. Matched on the key, not
+/// the value, the way [`pi_scratch_login`] matches; `last_refresh` (Codex's
+/// timestamp of its last refresh, not a token) is the one exception.
+fn is_refresh_token_key(key: &str) -> bool {
+    key != "last_refresh" && key.to_ascii_lowercase().contains("refresh")
+}
+
+/// The `exp` claim (seconds since the epoch) of a JWT, read without verifying
+/// it: the harness only needs to know whether the token lasts the run, and the
+/// agent that receives it does the verifying. `None` for anything that is not a
+/// three-part token with a base64url JSON payload carrying a numeric `exp`.
+pub(crate) fn jwt_expiry_secs(token: &str) -> Option<u64> {
+    let mut parts = token.split('.');
+    let (_, payload, _) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(payload.len() * 3 / 4);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in payload.bytes() {
+        let v = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' | b'+' => 62,
+            b'_' | b'/' => 63,
+            b'=' => break,
+            _ => return None,
+        };
+        acc = (acc << 6) | u32::from(v);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            bytes.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()?
+        .get("exp")?
+        .as_u64()
+}
+
+/// Milliseconds since the epoch at `now`, `0` on a pre-epoch clock.
+fn epoch_ms(now: std::time::SystemTime) -> u128 {
+    now.duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_millis())
+        .unwrap_or(0)
+}
+
+/// `Err` naming how long is left when `expires_ms` is less than
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now_ms`. `what` names the login, and
+/// `remedy` how to refresh it on the host; the message quotes no secret.
+fn scratch_login_lasts_the_run(
+    expires_ms: u128,
+    now_ms: u128,
+    what: &str,
+    remedy: &str,
+) -> Result<(), String> {
+    let left_ms = expires_ms.saturating_sub(now_ms);
+    if left_ms < SCRATCH_LOGIN_RUN_MARGIN.as_millis() {
+        let when = if left_ms == 0 {
+            "has expired".to_string()
+        } else {
+            format!("expires in {} min", left_ms / 60_000)
+        };
+        return Err(format!(
+            "{what}'s access token {when}, less than the {} min a test run needs; {remedy}",
+            SCRATCH_LOGIN_RUN_MARGIN.as_secs() / 60
+        ));
+    }
+    Ok(())
+}
 
 /// The copy of the host's stored Pi login `entry` that a scratch agent
 /// directory gets: every refresh token taken out, and refused unless its access
-/// token is still valid for [`PI_LOGIN_RUN_MARGIN`] after `now`.
+/// token is still valid for [`SCRATCH_LOGIN_RUN_MARGIN`] after `now`.
 ///
 /// **Why no refresh token.** A refresh run in the scratch copy writes the new
 /// tokens only there, and they go when the directory does. On a provider that
@@ -6979,12 +7262,12 @@ pub(crate) fn pi_scratch_login(
         .map(|since| since.as_millis())
         .unwrap_or(0);
     let left_ms = u128::from(expires).saturating_sub(now_ms);
-    if left_ms < PI_LOGIN_RUN_MARGIN.as_millis() {
+    if left_ms < SCRATCH_LOGIN_RUN_MARGIN.as_millis() {
         return Err(format!(
             "the stored Pi login's access token expires in {} min, less than the {} min a \
              test run needs; {remedy}",
             left_ms / 60_000,
-            PI_LOGIN_RUN_MARGIN.as_secs() / 60
+            SCRATCH_LOGIN_RUN_MARGIN.as_secs() / 60
         ));
     }
     for key in refresh_keys {
@@ -7258,6 +7541,66 @@ pub const OPENCODE_TEST_BIN_V1: &str = "v1";
 /// owns `~/.opencode/bin/opencode`, so the 1.x half lives here.
 pub const OPENCODE_PINNED_V1: &str = ".local/share/dot-agent-deck/opencode-1/bin/opencode";
 
+/// The [`OPENCODE_TEST_BIN_ENV`] value naming the pinned OpenCode 2.x
+/// ([`OPENCODE_PINNED_V2`]), as [`OPENCODE_TEST_BIN_V1`] names the 1.x (issue
+/// #2051).
+pub const OPENCODE_TEST_BIN_V2: &str = "v2";
+
+/// Where `scripts/box/bootstrap.sh` installs the pinned OpenCode 2.x, relative
+/// to the home directory: npm's own link under its prefix, which bootstrap
+/// then links `~/.opencode/bin/opencode` to (issue #2051).
+pub const OPENCODE_PINNED_V2: &str =
+    ".local/share/dot-agent-deck/opencode-2/node_modules/.bin/opencode";
+
+/// Set (non-empty) where the pinned OpenCode binaries are known to be
+/// installed, as CI's lane-1 shards are (`scripts/install-pinned-opencode.sh`
+/// runs before them on both backends): [`pinned_opencode_bin`] then fails a
+/// test whose binary is missing instead of letting it skip (issue #2051).
+pub const REQUIRE_PINNED_OPENCODE_ENV: &str = "DAD_E2E_REQUIRE_PINNED_OPENCODE";
+
+/// The pinned real OpenCode `major`.x (1 or 2) under the host's home — the
+/// [`OPENCODE_TEST_BIN_V1`] / [`OPENCODE_TEST_BIN_V2`] choice of
+/// [`OPENCODE_TEST_BIN_ENV`], resolved directly so one test can run both — once
+/// its `--version` reports that major (issue #2051). `Err` says what is
+/// missing, for [`skip_unless!`]; with [`REQUIRE_PINNED_OPENCODE_ENV`] set it
+/// panics instead, so a CI shard missing its install goes red rather than
+/// green.
+pub fn pinned_opencode_bin(major: u32) -> Result<PathBuf, String> {
+    let (choice, rel) = match major {
+        1 => (OPENCODE_TEST_BIN_V1, OPENCODE_PINNED_V1),
+        2 => (OPENCODE_TEST_BIN_V2, OPENCODE_PINNED_V2),
+        _ => panic!("no pinned OpenCode {major}.x"),
+    };
+    let found = resolve_opencode_test_bin(choice, &host_home(), std::ffi::OsStr::new(""))
+        .ok_or_else(|| {
+            format!(
+                "the pinned OpenCode {major}.x is not installed at ~/{rel}; install it with \
+                 scripts/install-pinned-opencode.sh (or scripts/box/bootstrap.sh)"
+            )
+        })
+        .and_then(|bin| {
+            let output = std::process::Command::new(&bin)
+                .arg("--version")
+                .current_dir(std::env::temp_dir())
+                .stdin(std::process::Stdio::null())
+                .output()
+                .map_err(|e| format!("could not run `{} --version`: {e}", bin.display()))?;
+            match parse_opencode_version(&String::from_utf8_lossy(&output.stdout)) {
+                Some((found, _, _)) if found == major => Ok(bin),
+                other => Err(format!(
+                    "`{} --version` reports {other:?}, not OpenCode {major}.x",
+                    bin.display()
+                )),
+            }
+        });
+    if let Err(why) = &found
+        && std::env::var(REQUIRE_PINNED_OPENCODE_ENV).is_ok_and(|v| !v.trim().is_empty())
+    {
+        panic!("{REQUIRE_PINNED_OPENCODE_ENV} is set, so this is a failure, not a skip: {why}");
+    }
+    found
+}
+
 /// The OpenCode binary [`OPENCODE_TEST_BIN_ENV`] selects, resolved to a path:
 /// the variable's value (looked up on `PATH` when it has no `/`), else the
 /// first `opencode` on `PATH`. `None` when nothing resolves, which the
@@ -7283,17 +7626,23 @@ fn opencode_test_bin_choice() -> String {
         .unwrap_or_else(|| "opencode".to_string())
 }
 
-/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` is the
-/// pinned 1.x under `home`, a value with a `/` is a path, and anything else is
-/// a name looked up on `path`. Only an existing file resolves.
+/// [`opencode_test_bin`]'s resolution with its inputs passed in: `v1` and `v2`
+/// are the pinned 1.x and 2.x under `home`, a value with a `/` is a path, and
+/// anything else is a name looked up on `path`. Only an existing file
+/// resolves.
 pub(crate) fn resolve_opencode_test_bin(
     chosen: &str,
     home: &Path,
     path: &std::ffi::OsStr,
 ) -> Option<PathBuf> {
-    if chosen == OPENCODE_TEST_BIN_V1 {
-        let pinned = home.join(OPENCODE_PINNED_V1);
-        return pinned.is_file().then_some(pinned);
+    for (name, rel) in [
+        (OPENCODE_TEST_BIN_V1, OPENCODE_PINNED_V1),
+        (OPENCODE_TEST_BIN_V2, OPENCODE_PINNED_V2),
+    ] {
+        if chosen == name {
+            let pinned = home.join(rel);
+            return pinned.is_file().then_some(pinned);
+        }
     }
     if chosen.contains('/') {
         let path = PathBuf::from(chosen);
@@ -7307,10 +7656,16 @@ pub(crate) fn resolve_opencode_test_bin(
 /// Why [`opencode_test_bin`] found nothing, for a preflight's `SKIP:`: for
 /// `v1`, where the pinned 1.x belongs and the script that installs it.
 pub fn opencode_test_bin_missing() -> String {
-    if opencode_test_bin_choice() == OPENCODE_TEST_BIN_V1 {
+    let choice = opencode_test_bin_choice();
+    if choice == OPENCODE_TEST_BIN_V1 || choice == OPENCODE_TEST_BIN_V2 {
+        let rel = if choice == OPENCODE_TEST_BIN_V1 {
+            OPENCODE_PINNED_V1
+        } else {
+            OPENCODE_PINNED_V2
+        };
         format!(
-            "the pinned OpenCode 1.x that {OPENCODE_TEST_BIN_ENV}={OPENCODE_TEST_BIN_V1} names is \
-             not installed at ~/{OPENCODE_PINNED_V1}; install it with scripts/box/bootstrap.sh"
+            "the pinned OpenCode that {OPENCODE_TEST_BIN_ENV}={choice} names is not installed at \
+             ~/{rel}; install it with scripts/box/bootstrap.sh"
         )
     } else {
         format!(
@@ -7580,14 +7935,13 @@ pub fn check_codex_available() -> Result<(), String> {
         return Err("Codex CLI not installed (could not invoke `codex --version`)".into());
     }
 
-    // Both commands below read the home that `codex_test_model` and
-    // `import_codex_credentials` read, `~/.codex`, rather than an ambient
-    // `CODEX_HOME` the launched test never sees (the harness clears the
+    // Both commands below read the login that `codex_test_model` and
+    // `import_codex_credentials` read, `~/.codex/auth.json`, rather than an
+    // ambient `CODEX_HOME` the launched test never sees (the harness clears the
     // environment). Otherwise a host whose `CODEX_HOME` holds the other auth
     // mode would be probed with the wrong login and, since #656, fail on a
     // model refusal that the test itself would not meet.
-    let codex_home = host_home().join(".codex");
-    let auth_path = codex_home.join("auth.json");
+    let auth_path = host_home().join(".codex").join("auth.json");
     let auth_is_regular = std::fs::symlink_metadata(&auth_path)
         .map(|meta| meta.file_type().is_file())
         .unwrap_or(false);
@@ -7596,6 +7950,15 @@ pub fn check_codex_available() -> Result<(), String> {
             "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`".into(),
         );
     }
+    // Issue #1731: the probe runs in a scratch `CODEX_HOME` holding the same
+    // access-only copy a test gets ([`seed_codex_scratch_auth`]), not in the
+    // host's `~/.codex`. So it measures the login the test will run with, a
+    // login that would not last the run is a skip here rather than a panic at
+    // launch, and no probe — one per gated test, run concurrently — can
+    // refresh the developer's own login.
+    let probe_home = race_safe_tempdir();
+    let codex_home = probe_home.path().join(".codex");
+    seed_codex_scratch_auth(&codex_home).map_err(|e| e.to_string())?;
 
     let ceiling = load_scaled(CODEX_PREFLIGHT_BASE);
     let deadline = Instant::now() + ceiling;
@@ -7818,10 +8181,10 @@ fn cli_invocable(bin: &str) -> bool {
 ///
 /// A runtime skip prints `SKIP: [e2e] …` and RETURNS NORMALLY, so nextest reports a
 /// skipped real-agent test as **passed**. A pre-PR `cargo test-e2e` can
-/// therefore read fully green while a `[reel]`-marked scenario asserted
-/// nothing at all — and the demo reel then ships with that clip silently
-/// missing. Set this to a truthy value on any run whose whole point is that
-/// the real-agent coverage actually executed (release gates, reel builds);
+/// therefore read fully green while a real-agent scenario asserted nothing at
+/// all. Set this to a truthy value on any run whose whole point is that the
+/// real-agent coverage actually executed (release gates, a feature's lane-2
+/// verification);
 /// leave it unset for ad-hoc runs on a machine without the credentials, where
 /// the permissive skip is the useful behavior.
 pub const REQUIRE_REAL_E2E_ENV: &str = "DOT_AGENT_DECK_REQUIRE_REAL_E2E";
@@ -7940,6 +8303,13 @@ fn host_home() -> PathBuf {
 /// the test). M3.1 auditor S2 + S3: write the destination with mode
 /// 0o600 atomically; refuse source files that are symlinks.
 ///
+/// **The credentials file is an access-only copy (issue #1731)**: the
+/// `claudeAiOauth` login without its refresh token, and no `mcpOAuth`
+/// ([`claude_scratch_login`]). A login whose access token would not last
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] is refused with the remedy rather than copied.
+/// Every value of the source document, refresh tokens included, is registered
+/// for redaction before anything is written.
+///
 /// # Returns the credential values the recording must redact (issue #502/#785)
 ///
 /// Same contract as [`import_codex_credentials`], [`import_opencode_credentials`]
@@ -7952,13 +8322,11 @@ fn host_home() -> PathBuf {
 /// or an accidental `cat` of the file paints the document onto the terminal, and
 /// the Codex importer's own rationale already treats exactly that ("a test
 /// dumping the file") as a sink. The same reasoning applies here, and the stakes
-/// are higher rather than lower: reel-eligible tests deliberately drive real
-/// agents and publish their terminal capture to a YouTube URL linked from the
-/// public release notes, and most of them take the ordinary OAuth-backed Claude
-/// route — precisely the one that had no registration. (That upload is private by
-/// default since PR #805, so a human flip stands between such a video and a
-/// third party; this registration is what keeps the credential out of the bytes
-/// in the first place, and the two are not substitutes.)
+/// are higher rather than lower: lane-2 tests deliberately drive real agents and
+/// record their terminal capture, and most of them take the ordinary
+/// OAuth-backed Claude route — precisely the one that had no registration. This
+/// registration is what keeps the credential out of the bytes in the first
+/// place.
 ///
 /// Both copied documents go through [`collect_credential_values`], at DIFFERENT
 /// widths (see [`CredentialScope`]): the OAuth credential set is an auth
@@ -8044,9 +8412,17 @@ pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String
         Ok(bytes) => match claude_keychain_credentials_export() {
             Some(keychain) => Some(keychain),
             None if key_authorises => None,
-            // Unchanged: copy what we have and let it fail loudly rather than
-            // silently importing nothing.
-            None => Some(bytes),
+            // Issue #1731: this used to copy what we had and let it fail
+            // loudly. An unusable document cannot be turned into an access-only
+            // copy that lasts the run, so the import refuses with the reason —
+            // which `check_claude_available` has already given as a skip on
+            // every path that calls it first.
+            None => {
+                let reason = claude_credential_document_check(&bytes)
+                    .err()
+                    .unwrap_or_default();
+                return Err(std::io::Error::other(reason));
+            }
         },
         // A symlinked or unreadable source lands here too, and falls through to
         // the same alternatives the absent-file case does — the same posture the
@@ -8065,16 +8441,27 @@ pub fn import_claude_credentials(test_home: &Path) -> std::io::Result<Vec<String
     let seeded_oauth = creds_bytes.is_some();
     let _ = CLAUDE_OAUTH_SEEDED.set(seeded_oauth);
     if let Some(bytes) = creds_bytes {
-        // Registered from the bytes actually WRITTEN, not from a second read of
-        // the host — the Keychain fallback and the API-key branch mean the
-        // document that lands in the test HOME is not always the file this
-        // function started from.
-        redactions.extend(claude_recording_redactions(
+        // Registered from the SOURCE document the copy is made from, not from a
+        // second read of the host — the Keychain fallback and the API-key branch
+        // mean that is not always the file this function started from — and
+        // registered BEFORE anything is written: every value in it, the refresh
+        // tokens and `mcpOAuth` the copy leaves out included (issue #1731).
+        let host_values = claude_recording_redactions(
             &bytes,
             "~/.claude/.credentials.json",
             CredentialScope::AuthDocument,
-        )?);
-        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &bytes)?;
+        )?;
+        register_diagnostic_redactions(host_values.clone());
+        redactions.extend(host_values);
+        // Issue #1731: the test HOME gets an access-only copy
+        // ([`claude_scratch_login`]), never the host's refresh token. `bytes`
+        // parsed above, so the parse here cannot fail.
+        let document: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let scratch = claude_scratch_login(&document, std::time::SystemTime::now())
+            .map_err(std::io::Error::other)?;
+        let scratch_bytes = serde_json::to_vec_pretty(&scratch).map_err(std::io::Error::other)?;
+        write_credential_file_atomic_0o600(&dst_root.join(".credentials.json"), &scratch_bytes)?;
     }
 
     // settings.json: copy if present, with `hooks` stripped. Claude's
@@ -8378,10 +8765,8 @@ const CLAUDE_IDENTITY_KEY_FRAGMENTS: [&str; 3] = ["uuid", "email", "name"];
 /// suffix) is registered by [`api_key_recording_redactions`] instead. What
 /// changed is the consequence. This document is copied into every isolated HOME
 /// of every real-agent test, an interactive `claude` renders the account line
-/// into the pane, and that pane is what `full-stream.cast` captures and the demo
-/// reel publishes. Private-by-default upload drops that exposure a long way (see
-/// `docs/develop/demo-reel.md`), but "a human has to flip it before strangers can
-/// watch" is not a reason to leave a developer's email in the artifact when the
+/// into the pane, and that pane is what `full-stream.cast` captures. A
+/// developer's email does not belong in an artifact that gets shared when the
 /// alternative is a handful of field names.
 ///
 /// Deliberately NOT the [`CredentialScope::AuthDocument`] treatment. That would
@@ -9010,12 +9395,29 @@ pub(crate) fn minimal_opencode_config() -> String {
 /// may execute them, and the PTY stream is persisted as a recording artifact.
 /// Every source ancestor plus the auth leaf is checked without following
 /// symlinks; destination credentials are atomically created with mode 0o600.
+///
+/// The `auth.json` written carries no refresh token (issue #1731,
+/// [`opencode_scratch_auth`]); every value of the host file is registered for
+/// redaction before it is written. A login the copy leaves out is refused only
+/// when it is the test model's provider, no other auth file's copy kept a login
+/// for that provider, and no env key authorises that model.
 pub(crate) fn import_opencode_credentials_from(
     source_home: &Path,
     test_home: &Path,
 ) -> std::io::Result<Vec<String>> {
     let mut imported_auth = false;
     let mut recording_redactions = Vec::new();
+    // Issue #1731: the test model's provider, whether some file's copy kept a
+    // login for it, and why one was left out. Judged after every file is
+    // staged, so a stale login in one file cannot refuse a run that a lasting
+    // login in another authorises.
+    let needed = opencode_test_model()
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_string();
+    let mut needed_copied = false;
+    let mut needed_left_out: Option<String> = None;
     let credentials = [
         (
             source_home
@@ -9060,9 +9462,28 @@ pub(crate) fn import_opencode_credentials_from(
             &format!("OpenCode credentials not found at {redacted}"),
             redacted,
         )?;
+        // Issue #1731: every value of the HOST document, refresh tokens
+        // included, is registered before anything is written or refused.
+        let host_values = opencode_recording_redactions(&bytes, redacted)?;
+        register_diagnostic_redactions(host_values.clone());
+        recording_redactions.extend(host_values);
+        // `opencode_recording_redactions` refused anything that does not parse.
+        let auth: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+        let (scratch, dropped) = opencode_scratch_auth(auth.clone(), std::time::SystemTime::now());
+        if scratch.get(&needed).is_some() {
+            needed_copied = true;
+        }
+        if let Some((_, why)) = dropped.iter().find(|(provider, _)| *provider == needed) {
+            needed_left_out.get_or_insert_with(|| format!("{redacted}: {why}"));
+        }
+        let written = if scratch == auth {
+            bytes
+        } else {
+            serde_json::to_vec(&scratch).map_err(std::io::Error::other)?
+        };
         std::fs::create_dir_all(dst.parent().expect("OpenCode auth path has a parent"))?;
-        write_credential_file_atomic_0o600(&dst, &bytes)?;
-        recording_redactions.extend(opencode_recording_redactions(&bytes, redacted)?);
+        write_credential_file_atomic_0o600(&dst, &written)?;
         imported_auth = true;
     }
 
@@ -9081,11 +9502,82 @@ pub(crate) fn import_opencode_credentials_from(
                 .to_string(),
         ));
     }
+    if let Some(why) = needed_left_out
+        && !needed_copied
+        && !opencode_env_key_authorises()
+    {
+        return Err(std::io::Error::other(format!(
+            "OpenCode login for provider {needed:?} in {why}"
+        )));
+    }
     write_minimal_opencode_config(test_home)?;
 
     normalise_redactions(&mut recording_redactions);
     register_diagnostic_redactions(recording_redactions.clone());
     Ok(recording_redactions)
+}
+
+/// The copy of a host OpenCode `auth.json` that a test HOME gets (issue #1731),
+/// with the providers left out of it and why. Per provider entry, the
+/// [`pi_scratch_login`] rule: an entry with no refresh-token key (an API key)
+/// is kept as it is; an OAuth entry whose numeric `expires` (epoch
+/// milliseconds) is at least [`SCRATCH_LOGIN_RUN_MARGIN`] after `now` is kept
+/// with every refresh-token key blanked to `""`; any other OAuth entry is
+/// LEFT OUT rather than copied. Left out, not refused: a host with an expired
+/// login for a provider the test model does not use must still run, so the
+/// importer refuses only when the test model's own provider was left out.
+///
+/// **Blanked rather than removed** because OpenCode's stored-login schema
+/// requires the field, the shape Codex was measured to need
+/// ([`codex_scratch_login`]). That OpenCode then authenticates from the
+/// access-only entry is NOT measured: this host's only OpenCode OAuth login
+/// had expired when this was written, and the default test model is
+/// `anthropic/…` from `ANTHROPIC_API_KEY`, which no stored login affects.
+pub(crate) fn opencode_scratch_auth(
+    mut auth: serde_json::Value,
+    now: std::time::SystemTime,
+) -> (serde_json::Value, Vec<(String, String)>) {
+    const REMEDY: &str = "run `opencode auth login` to refresh the host login; the test \
+                          copy carries no refresh token, so it cannot refresh on its own";
+    let mut dropped = Vec::new();
+    let Some(providers) = auth.as_object_mut() else {
+        return (auth, dropped);
+    };
+    providers.retain(|provider, entry| {
+        let Some(fields) = entry.as_object_mut() else {
+            return true;
+        };
+        if !fields.keys().any(|key| is_refresh_token_key(key)) {
+            return true;
+        }
+        let verdict = match fields.get("expires").and_then(serde_json::Value::as_u64) {
+            None => Err(format!(
+                "it has a refresh token but no `expires` time, so the harness cannot tell \
+                 whether its access token lasts the run; {REMEDY}"
+            )),
+            Some(expires) => scratch_login_lasts_the_run(
+                u128::from(expires),
+                epoch_ms(now),
+                "the stored login",
+                REMEDY,
+            ),
+        };
+        match verdict {
+            Ok(()) => {
+                for (key, value) in fields.iter_mut() {
+                    if is_refresh_token_key(key) {
+                        *value = serde_json::Value::String(String::new());
+                    }
+                }
+                true
+            }
+            Err(why) => {
+                dropped.push((provider.clone(), why));
+                false
+            }
+        }
+    });
+    (auth, dropped)
 }
 
 /// The isolated OpenCode config every seeded HOME gets: the test model and
@@ -9142,18 +9634,12 @@ fn import_opencode_credentials(test_home: &Path) -> std::io::Result<Vec<String>>
 /// also not a state a working host reaches — `check_codex_available` ends in a
 /// live model probe against this very file, so a host that got here has one
 /// codex itself just authenticated from.
+///
+/// **The `auth.json` written is access-only (issue #1731)** — see
+/// [`seed_codex_scratch_auth`].
 pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>> {
-    let src = host_home().join(".codex").join("auth.json");
-    let bytes = read_credential_file_no_symlink(
-        &src,
-        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
-        "~/.codex/auth.json",
-    )?;
-    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
-    register_diagnostic_redactions(redactions.clone());
     let dst = test_home.join(".codex");
-    std::fs::create_dir_all(&dst)?;
-    write_credential_file_atomic_0o600(&dst.join("auth.json"), &bytes)?;
+    let redactions = seed_codex_scratch_auth(&dst)?;
 
     let project = test_home.parent().ok_or_else(|| {
         std::io::Error::other("isolated Codex HOME has no fixture working directory")
@@ -9186,6 +9672,94 @@ pub fn import_codex_credentials(test_home: &Path) -> std::io::Result<Vec<String>
     // be on, neither of which a test wants to inherit.
     let _ = std::fs::write(dst.join("version.json"), codex_update_notice_dismissal());
     Ok(redactions)
+}
+
+/// Write an access-only copy of the host's `~/.codex/auth.json` into
+/// `codex_dir` (a scratch `CODEX_HOME`), mode 0600, and return the values a
+/// recording must redact: every value of the HOST document, refresh token
+/// included, registered for diagnostic redaction before anything is written or
+/// refused. [`import_codex_credentials`] and [`check_codex_available`]'s probe
+/// both seed through here, so the probe measures the login a test gets.
+///
+/// An API-key login (no `tokens`) is copied byte for byte; a ChatGPT login goes
+/// through [`codex_scratch_login`].
+pub(crate) fn seed_codex_scratch_auth(codex_dir: &Path) -> std::io::Result<Vec<String>> {
+    let src = host_home().join(".codex").join("auth.json");
+    let bytes = read_credential_file_no_symlink(
+        &src,
+        "Codex credentials not found at ~/.codex/auth.json — log in with `codex login`",
+        "~/.codex/auth.json",
+    )?;
+    let redactions = codex_recording_redactions(&bytes, "~/.codex/auth.json")?;
+    register_diagnostic_redactions(redactions.clone());
+    // `codex_recording_redactions` refused anything that does not parse.
+    let auth: serde_json::Value = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
+    let scratch = codex_scratch_login(auth.clone(), std::time::SystemTime::now())
+        .map_err(std::io::Error::other)?;
+    let written = if scratch == auth {
+        bytes
+    } else {
+        serde_json::to_vec(&scratch).map_err(std::io::Error::other)?
+    };
+    std::fs::create_dir_all(codex_dir)?;
+    write_credential_file_atomic_0o600(&codex_dir.join("auth.json"), &written)?;
+    Ok(redactions)
+}
+
+/// The copy of a host Codex `auth.json` that a scratch `CODEX_HOME` gets (issue
+/// #1731): every refresh-token member of `tokens` blanked to `""`, and refused
+/// unless the `access_token`'s JWT `exp` is at least
+/// [`SCRATCH_LOGIN_RUN_MARGIN`] after `now`. A document with no `tokens` object
+/// (an API-key login) has nothing to refresh and comes back unchanged.
+///
+/// **Blanked, not removed, and measured** (codex-cli 0.164.0, 2026-11-10, a
+/// scratch `CODEX_HOME` holding a copy of a live ChatGPT login): with the
+/// member removed, `codex login status` fails on `missing field
+/// \`refresh_token\`` and `codex exec` answers 401; with it `""`, both succeed
+/// and a one-turn `codex exec` answers — including with `last_refresh` nine
+/// days old, so a stale `last_refresh` does not make Codex try a refresh it
+/// cannot make. The id token is left as it is: Codex accepted one already
+/// expired.
+///
+/// **Why no refresh token**, the reason [`pi_scratch_login`] gives: a refresh
+/// in the copy writes the rotated tokens only into the scratch home, which is
+/// deleted at teardown, leaving the host login holding a refresh token OpenAI
+/// has already spent — which Codex reports as "refresh token was already
+/// used". The refusal names no value from the document.
+pub(crate) fn codex_scratch_login(
+    mut auth: serde_json::Value,
+    now: std::time::SystemTime,
+) -> Result<serde_json::Value, String> {
+    const REMEDY: &str = "run `codex login` to refresh the host login; the test copy \
+                          carries no refresh token, so it cannot refresh on its own";
+    let Some(tokens) = auth
+        .get_mut("tokens")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return Ok(auth);
+    };
+    let Some(expires_secs) = tokens
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .and_then(jwt_expiry_secs)
+    else {
+        return Err(format!(
+            "the Codex login at ~/.codex/auth.json has no access token with a readable \
+             expiry, so the harness cannot tell whether it lasts the run; {REMEDY}"
+        ));
+    };
+    scratch_login_lasts_the_run(
+        u128::from(expires_secs) * 1000,
+        epoch_ms(now),
+        "the Codex login at ~/.codex/auth.json",
+        REMEDY,
+    )?;
+    for (key, value) in tokens.iter_mut() {
+        if is_refresh_token_key(key) {
+            *value = serde_json::Value::String(String::new());
+        }
+    }
+    Ok(auth)
 }
 
 /// The credential values inside a Codex `auth.json` that a recording must
@@ -11412,6 +11986,46 @@ pub fn spawn_daemon_serve_with_env(
     idle_shutdown_secs: &str,
     extra_env: &[(&str, &str)],
 ) -> DaemonProc {
+    spawn_daemon_serve_inner(initial_schedules_toml, idle_shutdown_secs, extra_env, true)
+}
+
+/// PRD #1885: [`spawn_daemon_serve_with_env`] WITHOUT its default
+/// pre-approval of each schedule's `working_dir`, so the projects start
+/// unapproved — for the `config-trust/*` tests, whose subject is the gate.
+#[cfg(unix)]
+#[allow(dead_code)]
+pub fn spawn_daemon_serve_untrusted(
+    initial_schedules_toml: Option<&str>,
+    idle_shutdown_secs: &str,
+    extra_env: &[(&str, &str)],
+) -> DaemonProc {
+    spawn_daemon_serve_inner(initial_schedules_toml, idle_shutdown_secs, extra_env, false)
+}
+
+/// The `working_dir` of every `[[scheduled_tasks]]` in `toml` that holds a
+/// project config: what [`spawn_daemon_serve_with_env`] pre-approves.
+#[cfg(unix)]
+fn schedule_project_dirs(toml: &str) -> Vec<PathBuf> {
+    let Ok(parsed) = toml::from_str::<toml::Value>(toml) else {
+        return Vec::new();
+    };
+    parsed
+        .get("scheduled_tasks")
+        .and_then(|tasks| tasks.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|task| task.get("working_dir")?.as_str().map(PathBuf::from))
+        .filter(|dir| dir.join(".dot-agent-deck.toml").is_file())
+        .collect()
+}
+
+#[cfg(unix)]
+fn spawn_daemon_serve_inner(
+    initial_schedules_toml: Option<&str>,
+    idle_shutdown_secs: &str,
+    extra_env: &[(&str, &str)],
+    preapprove: bool,
+) -> DaemonProc {
     let tempdir = race_safe_tempdir();
     let work = tempdir.path().to_path_buf();
     let home = work.join("home");
@@ -11512,6 +12126,20 @@ pub fn spawn_daemon_serve_with_env(
     {
         env.retain(|(k, _)| k != "PATH");
         env.push(("PATH".into(), path));
+    }
+
+    // PRD #1885: each scheduled project starts approved, as `TuiDeck`'s
+    // fixture does, through the real CLI and into this daemon's store. An
+    // issue dispatch's project is its clone, which does not exist before the
+    // first fire, so it is not covered: `DaemonProc::approve_project_trust`.
+    if preapprove {
+        let approve_env: HashMap<String, String> = env.iter().cloned().collect();
+        for dir in initial_schedules_toml
+            .map(schedule_project_dirs)
+            .unwrap_or_default()
+        {
+            preapprove_project_trust(bin, &dir, &approve_env);
+        }
     }
 
     let mut cmd = std::process::Command::new(bin);
@@ -11650,6 +12278,19 @@ impl DaemonProc {
         req: &dot_agent_deck::daemon_protocol::AttachRequest,
     ) -> std::io::Result<dot_agent_deck::daemon_protocol::AttachResponse> {
         attach_request_on(&self.attach_socket, req)
+    }
+
+    /// PRD #1885: approve every orchestration of the project at `dir` through
+    /// the real `trust approve <dir> --yes`, into this daemon's store. Panics
+    /// when the approval fails.
+    pub fn approve_project_trust(&self, dir: &Path) {
+        approve_project_trust_with(contained_deck_binary(), dir, self.env.iter().cloned());
+    }
+
+    /// PRD #1885: run `dot-agent-deck <args…>` with this daemon's env from
+    /// `cwd`, without a terminal.
+    pub fn run_deck_cli(&self, cwd: &Path, args: &[&str]) -> std::process::Output {
+        deck_cli_output(contained_deck_binary(), cwd, self.env.iter().cloned(), args)
     }
 
     /// Run `dot-agent-deck schedule <args…>` with the daemon's env, from the
@@ -13755,6 +14396,38 @@ pub struct InProcDaemon {
     handle: tokio::task::JoinHandle<()>,
 }
 
+/// PRD #1885: the state dir every in-process daemon of this test process keeps
+/// its approval store under (one per process, as the store's location is).
+#[cfg(unix)]
+fn inproc_trust_state_dir() -> &'static Path {
+    static DIR: OnceLock<PathBuf> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = harness_temp_root().join("inproc-trust-state");
+        std::fs::create_dir_all(&dir).expect("create the in-process trust state dir");
+        dir
+    })
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+impl InProcDaemon {
+    /// PRD #1885: approve every orchestration of the project at `dir` through
+    /// the real `trust approve <dir> --yes`, into the store this process's
+    /// in-process daemons read. Panics when the approval fails.
+    pub fn approve_project_trust(&self, dir: &Path) {
+        let state = inproc_trust_state_dir().to_string_lossy().into_owned();
+        let home = self._dir.path().to_string_lossy().into_owned();
+        let mut env = vec![
+            ("DOT_AGENT_DECK_STATE_DIR".to_string(), state),
+            ("HOME".to_string(), home),
+        ];
+        if let Ok(path) = std::env::var("PATH") {
+            env.push(("PATH".to_string(), path));
+        }
+        approve_project_trust_with(contained_deck_binary(), dir, env);
+    }
+}
+
 #[allow(dead_code)]
 impl Drop for InProcDaemon {
     fn drop(&mut self) {
@@ -13790,6 +14463,13 @@ pub async fn spawn_inprocess_daemon() -> InProcDaemon {
     use dot_agent_deck::daemon::{Daemon, run_daemon_with};
 
     init_test_env();
+    // PRD #1885: this daemon runs in the test process, whose own state dir is
+    // the developer's. Point its approval store at a per-process harness dir,
+    // so no test reads or writes the developer's approvals; a test approves a
+    // project into it with `InProcDaemon::approve_project_trust`.
+    let _ = dot_agent_deck::project_trust::TrustStore::use_state_dir_for_this_process(
+        inproc_trust_state_dir().to_path_buf(),
+    );
 
     // Issue prageethw/dot-agent-deck#253 round-4 verification, finding 1: `handle_delegate` run
     // through this in-process daemon executes in THIS test process, not the
@@ -14199,4 +14879,24 @@ impl Drop for AttachInput {
             let _ = drain.join();
         }
     }
+}
+
+/// PRD #1885: approve every orchestration of the config in `dir`, through the
+/// real store API, for an IN-PROCESS test whose subject is not the approval —
+/// the daemon's unattended paths (delegate to a `clear = true` role, `pane
+/// restart`, `pane spawn`, a dispatch, a prepared start) refuse an unapproved
+/// one. The store is pointed at a per-process directory under the harness root
+/// first, so a test never reads or writes the developer's own approvals. A
+/// subprocess deck has its own `DOT_AGENT_DECK_STATE_DIR`, and is approved
+/// through the CLI instead.
+#[allow(dead_code)]
+pub fn approve_project_fixture(dir: &Path) {
+    use dot_agent_deck::project_trust::{TrustStore, approve_all};
+    let state = harness_temp_root().join("trust-state");
+    std::fs::create_dir_all(&state).expect("create the per-process trust store dir");
+    harden_dir_0700(&state);
+    // The first call in this process wins; a later one keeps that directory.
+    let _ = TrustStore::use_state_dir_for_this_process(state);
+    approve_all(&TrustStore::default_location(), dir)
+        .unwrap_or_else(|e| panic!("fixture precondition: approve {}: {e}", dir.display()));
 }

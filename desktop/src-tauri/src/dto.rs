@@ -387,19 +387,28 @@ pub struct DesktopConnection {
     /// webview branches on it to disable **Stop daemon** and **Replace daemon**,
     /// and an absent field must not read as "local".
     pub deck_kind: &'static str,
-    /// Why the daemon-lifecycle controls are unavailable, when they are
-    /// (PRD #741 M7).
+    /// Why **Replace daemon** is unavailable, when it is (PRD #741 M7).
     ///
     /// `Some` exactly when [`Self::deck_kind`] is `"remote"`. The sentence is
-    /// `Endpoint::require_local("Stop daemon")`'s own — M2 made the operation
-    /// unreachable by type and wrote the refusal at the same time, so this is
-    /// rendering an error that already exists rather than inventing one. Stop
-    /// and Replace act on a process on *this* machine; against a deck on
-    /// another one they would either do nothing or, over a forwarded socket,
-    /// SIGTERM the local `ssh` client and report that a daemon had stopped
-    /// gracefully.
+    /// `Endpoint::require_local("Replace daemon")`'s own. Replace starts the
+    /// daemon bundled with this app, on *this* machine, so it has nothing to
+    /// offer a deck on another one — Upgrade is that deck's remedy. It named
+    /// Stop daemon too until issue #1073, which stops a remote deck over the
+    /// wire verb instead; [`Self::stop_daemon_reason`] is Stop's own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub local_only_reason: Option<String>,
+    /// Why **Stop daemon** cannot act on this deck while it answers, or `None`
+    /// when it can (issue #1073).
+    ///
+    /// The local deck can always be stopped: the pid stop reaches a daemon of
+    /// any version. A remote deck can be stopped only over the wire verb
+    /// (`AttachRequest::StopDaemon`, issue #1049), so this is `Some` for a
+    /// remote deck whose `Hello` did not advertise it — read from the same
+    /// capture as [`Self::project_actions_reason`]. `None` on a deck that is
+    /// not answering, where no Stop is offered at all. Omitted from the wire
+    /// when `None`, for that field's reason.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_daemon_reason: Option<String>,
     /// Why the app is talking to the local deck when the stored selection named
     /// another one (PRD #741 M7).
     ///
@@ -613,7 +622,7 @@ pub(crate) fn selection_fields(
         Endpoint::Remote(_) => "remote",
     };
     let local_only = endpoint
-        .require_local("Stop daemon")
+        .require_local("Replace daemon")
         .err()
         .map(|error| safe_display_text(error.to_string()));
     (kind, local_only, selected_deck().fallback)
@@ -1360,6 +1369,13 @@ pub enum DesktopAction {
         cols: Option<u16>,
     },
     ActivateOrchestration {
+        /// PRD #1885 review: the deck the Runs launch was started on, captured
+        /// by the webview when the user pressed Activate, so the review's
+        /// query, its approval and this activation all go to that one deck
+        /// even if the selection moves meanwhile. Absent from a webview built
+        /// before the field existed, which launches on the selected deck.
+        #[serde(default)]
+        deck_id: Option<String>,
         /// The orchestration name, as offered by the daemon's
         /// `resolve-project` reply for `cwd`.
         name: String,
@@ -1406,6 +1422,13 @@ pub enum DesktopAction {
         /// [`DesktopAgent::incarnation`], which the stop is bound to.
         #[serde(default)]
         incarnation: Incarnation,
+        /// Issue #1958: close and KEEP the agent's dispatched worktree, whatever
+        /// its state — the close dialog's "Close agent, keep worktree". Sent
+        /// through `DaemonClient::stop_agent_keeping_worktree`, which refuses
+        /// with nothing stopped when the deck cannot keep. Absent means false:
+        /// an ordinary stop.
+        #[serde(default)]
+        keep_worktree: bool,
     },
     /// PRD #1223 U4 — close a whole orchestration: stop every role the
     /// webview's fleet entry lists for it, on the deck `deck_id` names,
@@ -1415,8 +1438,20 @@ pub enum DesktopAction {
     StopOrchestration {
         deck_id: String,
         roles: Vec<StopOrchestrationRole>,
+        /// Issue #1958: keep the orchestration's dispatched worktree — "Close
+        /// all N roles, keep worktree". Applied to EVERY role's stop, because
+        /// the deck keeps the tree at whichever of them it handles first.
+        /// Absent means false.
+        #[serde(default)]
+        keep_worktree: bool,
     },
+    /// Stop the daemon of the deck `deck_id` names (issue #1073). It read the
+    /// applied selection until then, so the overview could not stop a deck it
+    /// was not on, and a remote deck could not be stopped at all. Required, for
+    /// [`Self::StopAgent`]'s reason: a stop with no deck is refused at decode
+    /// rather than defaulted to the selection.
     StopDaemon {
+        deck_id: String,
         #[serde(default)]
         force: bool,
     },
@@ -1472,6 +1507,22 @@ pub struct StopOrchestrationRole {
     /// which this role's stop is bound to.
     #[serde(default)]
     pub incarnation: Incarnation,
+}
+
+/// What the close dialog learns before it asks (issue #717 / #1958): the
+/// dispatched worktree a close would leave holding uncommitted work, and
+/// whether to offer "keep worktree".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorktreeCloseReport {
+    /// The worktree an ordinary close would KEEP because it holds (or may
+    /// hold) uncommitted work. `null` when it would keep none.
+    pub kept: Option<dot_agent_deck::daemon_protocol::KeptWorktree>,
+    /// Issue #1958: the dispatched worktree to offer "…, keep worktree" for —
+    /// set only when the deck advertises the keep AND the closed panes own a
+    /// recorded worktree, whatever its state. `null` means offer no such
+    /// choice, which is what an older deck always gets.
+    pub keep_worktree: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2276,6 +2327,8 @@ fn session_status_name(status: &SessionStatus) -> &'static str {
         SessionStatus::Idle => "idle",
         SessionStatus::Error => "error",
         SessionStatus::Blocked => "blocked",
+        // Issue #1757: its own word, never Needs input's `waiting_for_input`.
+        SessionStatus::Waiting => "waiting",
         SessionStatus::Unknown => "unknown",
     }
 }
@@ -3335,6 +3388,8 @@ pub(crate) fn disconnected_snapshot(
             build_stamp_mismatch_only: false,
             deck_kind,
             local_only_reason,
+            // Issue #1073: no Stop is offered on a deck that is not answering.
+            stop_daemon_reason: None,
             selection_fallback,
             // Nothing was advertised because nothing answered. A disconnected
             // screen is already saying the only thing there is to say.
@@ -3987,7 +4042,7 @@ mod tests {
         );
         let reason = local_only.expect("a remote deck must say why Stop and Replace are off");
         assert!(
-            reason.contains("Stop daemon") && reason.contains("deploy@build-box"),
+            reason.contains("Replace daemon") && reason.contains("deploy@build-box"),
             "the explanation must name the operation and the deck: {reason}"
         );
         assert!(
@@ -4971,6 +5026,34 @@ mod tests {
         );
     }
 
+    /// Issue #1757: a session whose turn ended while a command it started in
+    /// that turn still runs maps to its own `"waiting"` status, never
+    /// `"idle"` and never Needs input's `"waiting_for_input"`, and keeps its
+    /// background line. The status is read through its wire name so this
+    /// module compiles before `SessionStatus::Waiting` exists.
+    #[test]
+    fn waiting_status_maps_to_waiting_with_its_background() {
+        let waiting: SessionStatus = serde_json::from_value(serde_json::json!("Waiting")).unwrap();
+        let mut record = fixture_record();
+        let live = record.live.as_mut().unwrap();
+        live.status = waiting;
+        live.background = serde_json::from_value(serde_json::json!({
+            "commands": 1, "subagents": 0, "since_ms": 1_756_684_800_123_i64, "awaited": 1,
+        }))
+        .unwrap();
+        live.background_revision = Some(3);
+        let mapped = map_agent(record);
+        assert_eq!(mapped.status, "waiting");
+        assert_ne!(mapped.status, "waiting_for_input");
+        let value = serde_json::to_value(&mapped).unwrap();
+        assert_eq!(value["background"]["commands"], 1);
+        assert_eq!(
+            session_status_name(&SessionStatus::WaitingForInput),
+            "waiting_for_input",
+            "Needs input keeps its own word"
+        );
+    }
+
     /// Issue #1678: the daemon's background aggregate reaches the webview as
     /// counts and an instant under `background`, unclamped; an empty aggregate
     /// (the daemon's explicit clear) and a record with no live snapshot both
@@ -4984,6 +5067,7 @@ mod tests {
             commands: 2,
             subagents: 1,
             since_ms: Some(1_756_684_800_123),
+            awaited: 0,
         });
         live.background_revision = Some(7);
         let mapped = map_agent(record.clone());
@@ -5006,6 +5090,7 @@ mod tests {
             commands: 0,
             subagents: 3,
             since_ms: None,
+            awaited: 0,
         });
         let value = serde_json::to_value(map_agent(record.clone())).unwrap();
         assert_eq!(

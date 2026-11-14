@@ -15,7 +15,6 @@
     "mold":                         "3.0.0",
     "rustfmt":                      "1.99.0",
     "path:gcloud#google-cloud-sdk": "",
-    "asciinema-agg":                "1.9.0",
     "ffmpeg":                       "9.0.2",
     "jq":                           "1.8.2",
     "curl":                         "8.22.0",

@@ -65,7 +65,7 @@ dot-agent-deck config set bell.on_idle true            # also ring when an agent
 | --- | --- | --- |
 | `bell.enabled` | `true` | master switch; `false` silences every bell below |
 | `bell.on_waiting_for_input` | `true` | waiting for input |
-| `bell.on_idle` | `false` | idle |
+| `bell.on_idle` | `false` | idle, about a second and a half after its turn ends; not **Waiting**, which rings when it turns idle |
 | `bell.on_error` | `true` | errored, or blocked by a provider usage limit |
 
 Restart the TUI for a change to take effect.
@@ -188,6 +188,8 @@ The dialog opens only when you press `g` or click **Generate**. The dialog's hin
 
 Unknown keys are ignored without a warning, so a misspelled key silently keeps its default.
 
+**Each orchestration is reviewed before it runs.** The deck starts an orchestration only after you have approved its roles' `name`, `command`, `agent`, `start`, `clear`, `description` and `prompt_template` as they read now, and asks again when any of them changes. Edits to comments, to the top-level keys above, or to another orchestration do not ask again. See [Approving Project Commands](project-trust.md).
+
 **A top-level key must come before the first table header in the file.** TOML assigns every key after a header such as `[[orchestrations]]`, `[[orchestrations.roles]]` or `[features]` to that table, so a `worker_response_timeout_minutes` appended at the end of the file belongs to the last table, where nothing reads it. The file still parses, `validate` still prints `Config is valid.`, and the default stays in effect:
 
 ```toml
@@ -271,7 +273,7 @@ DOT_AGENT_DECK_LOG=1 dot-agent-deck           # the new TUI starts a new daemon 
 | `DOT_AGENT_DECK_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck.sock`; without `XDG_RUNTIME_DIR`, `<temp dir>/dot-agent-deck-<uid>/hook.sock` | every process | Socket agents' hooks and `work-done`/`delegate` send events to. The daemon passes its socket path to the agents it starts. |
 | `DOT_AGENT_DECK_ATTACH_SOCKET` | `$XDG_RUNTIME_DIR/dot-agent-deck-attach.sock`; without `XDG_RUNTIME_DIR`, `<temp dir>/dot-agent-deck-<uid>/attach.sock` | every process | Socket the TUI and the desktop app connect to. |
 | `DOT_AGENT_DECK_STATE_DIR` | `$XDG_STATE_HOME/dot-agent-deck`, else `~/.local/state/dot-agent-deck` (`%LOCALAPPDATA%\dot-agent-deck` on Windows) | the client that starts a daemon, and the daemon | Where a daemon started in the background writes `daemon.log` (its output) and `spawn.lock`, and where the daemon keeps its saved results (`retained-reports/`). An empty value counts as unset. |
-| `DOT_AGENT_DECK_BIN` | unset | each agent's hooks | The absolute path of a `dot-agent-deck` executable for agents' hooks to run instead of the installed one their hook settings name. Agents started from an environment that has it report through that binary; every other agent keeps using the installed one. Whoever sets it chooses the program those hooks run, so only an absolute path is honoured: an empty value, a bare name such as `dot-agent-deck` or a relative path such as `./dot-agent-deck` counts as unset, and the hooks run the installed binary. It applies once the hooks have been installed by a release that writes the variable into them (see [Troubleshooting › Hooks](troubleshooting.md#hooks)). On Windows, Claude Code and Codex hooks do not honour it and run the installed binary; the OpenCode plugin and the Pi extension do. |
+| `DOT_AGENT_DECK_BIN` | unset | each agent's hooks | The absolute path of a `dot-agent-deck` executable for agents' hooks to run instead of the installed one their hook settings name. Agents started from an environment that has it report through that binary; every other agent keeps using the installed one. Whoever sets it chooses the program those hooks run, so only an absolute path is honoured: an empty value, a bare name such as `dot-agent-deck` or a relative path such as `./dot-agent-deck` counts as unset, and the hooks run the installed binary. It applies once the hooks have been installed by a release that writes the variable into them (see [Troubleshooting › Hooks](troubleshooting.md#hooks)). On Windows, Claude Code and Codex hooks do not honour it and run the installed binary; the OpenCode plugin and the Pi extension do. It does not change the commands the deck writes for agents to run, such as the doorbell's `inbox fetch` or a task's `work-done`: those name the `dot-agent-deck` the deck daemon runs from. |
 | `DOT_AGENT_DECK_CONFIG`, `DOT_AGENT_DECK_SESSION`, `DOT_AGENT_DECK_KEYBINDINGS`, `DOT_AGENT_DECK_SCHEDULES`, `DOT_AGENT_DECK_REMOTES`, `DOT_AGENT_DECK_DESKTOP_CONFIG`, `DOT_AGENT_DECK_CONFIG_GEN_STATE`, `DOT_AGENT_DECK_STAR_PROMPT` | see [Where configuration lives](#where-configuration-lives) | the process reading that file | Full path of that file. |
 
 `<temp dir>` is `$TMPDIR` when set, else `/tmp`; on macOS `$TMPDIR` is normally a per-user directory under `/var/folders`. The deck creates `dot-agent-deck-<uid>` with mode `0700`. If another user already owns a directory of that name, the daemon uses a sibling named `dot-agent-deck-<uid>.` followed by 16 random hex digits instead, and clients find it without configuration. On Windows the endpoints are the named pipes `\\.\pipe\dot-agent-deck-<user>-hook` and `\\.\pipe\dot-agent-deck-<user>-attach`.
@@ -323,6 +325,8 @@ Agent messages use an inbox in both clients; no readiness delay or forced submis
 ### Set by the deck
 
 The deck puts these in each agent's environment; you do not set them. `DOT_AGENT_DECK_PANE_ID` names the pane and `DOT_AGENT_DECK_PANE_CAPABILITY` carries the token that lets that pane's `work-done`, `delegate`, `dispatch` and status updates be accepted. Running those commands in a shell the deck did not start (a plain terminal, or a tool that strips the environment) fails because these are missing; see [Orchestration](orchestration.md) and [Troubleshooting](troubleshooting.md).
+
+In a pane that another agent drives (an orchestration worker, or a single-agent unit started by `dispatch`) the deck also sets `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false`, which turns off Claude Code's prompt suggestions there: each one costs a model request, and that pane takes its work from the orchestrator or from its task rather than from you. The orchestrator, a dispatcher and the panes you open yourself keep Claude Code's own setting. Other agents start as before.
 
 ## `desktop.toml` reference
 

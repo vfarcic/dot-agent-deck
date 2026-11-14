@@ -16,8 +16,6 @@ Platform coverage column shorthand: **mac+linux** = macOS and Linux (Windows onc
 
 Tier vocabulary (issue #502, CLAUDE.md rule 5): L1 tests run in the fast tier, `cargo test-fast`. L2 tests are split by whether they reach a **real agent** — **lane 1** is the credential-free `tests/e2e_*.rs` files, `cargo test-e2e`, which CI runs on every PR; **lane-2** entries below are in a file gated `#![cfg(all(feature = "e2e", feature = "e2e-live"))]`, run by `cargo test-e2e-live`, which **runs on a developer's machine and nowhere in CI** — no e2e test reaches a real agent on a runner, and no test credential is registered on this repository (the separately credentialed agent PR reviewer is out of scope; see [`docs/develop/governance.md`](../docs/develop/governance.md#the-automated-reviewer)). Lane 2 is where the real-agent tests live and it is flaky-tolerant. Nothing here is a "pre-PR" tier any more — that obligation was removed with #502 — but this catalog is how you find the tests that cover what you changed, which rule 5 still requires you to run and to name. See [`docs/develop/e2e-lanes.md`](../docs/develop/e2e-lanes.md), and note that a lane-2 test whose preflight cannot be satisfied SKIPS and is counted as a pass.
 
-Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> — <headline>` line opts that test into the PRD #180 demo reel (`.claude/skills/demo-reel-adapter`). Eligibility is **opt-in** — the default (no marker) is *not* eligible even for a PTY-attached test that records a cast. Mark a test only if it validates the feature **as a user actually runs and sees it** — a real agent genuinely spinning up (spawn → agent → work) — never a synthetic/stand-in test (`cat`, scripted echo, recorder stubs, terminal-probe, or synthesized hook events). The adapter includes a marked test in the reel only when it *also* has a cast and its source changed on the branch.
-
 ### Telemetry export (PRD #1741)
 
 #### telemetry/resources
@@ -43,7 +41,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** background disk-walk cadence, hardlink or nested-repository traversal, exact total disk usage or disk attribution per run.
 - **Platform coverage:** Linux.
 
-##### telemetry/resources/004 — Real interactive Haiku resource figures join the deck run. [reel]
+##### telemetry/resources/004 — Real interactive Haiku resource figures join the deck run.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_resource_collector_live.rs`), developer machine only.
 - **Agent:** real interactive Claude Code on pinned Haiku with imported isolated credentials, onboarding and project trust.
 - **Asserts:** a directive visibly advances Thinking → Working/Bash → Idle and copies a uniquely named sentinel fixture while the collector runs. At least two samples arrive, with cumulative CPU growing above a pre-task baseline; named anon/file/shmem PSS points (positive anon, file and shmem may be zero) carry the same deck.run.id as the completed agent.run span.
@@ -75,15 +73,15 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 
 ##### telemetry/otlp/002 — Configured export describes the run and its status intervals.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
-- **Agent:** synthetic shell and cat with synthesized status hooks.
-- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver.
-- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry.
+- **Agent:** synthetic shell and cat with synthesized status hooks; and a clear=true orchestration worker that is a Pi stand-in shell reporting through the real in-pane `agent-event` CLI, as the bundled extension does (issue #2078).
+- **Asserts:** visible Thinking and Working transitions produce a completed agent.run with run/pane identity, agent kind, closed end reason, status child spans sharing its trace, status-change events, and service/version/host/schema resource attributes at the local HTTP/JSON receiver. In the Pi case a delegate respawns the worker, so its replacement's run sees no `SessionStart` at all (Pi sends none, and a respawn surfaces no placeholder); that run must still export thinking, working and idle `agent.status` spans beside its one bash `agent.operation` (the control).
+- **Does not assert:** a hosted collector, protobuf encoding or agent-native telemetry; the real `pi` runtime (`telemetry/otlp/019`).
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/003 — The spawned agent and exported run share the same run id.
+##### telemetry/otlp/003 — The spawned agent and exported run share the same run id and work id.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_export.rs`).
 - **Agent:** synthetic shell recording its environment.
-- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged.
+- **Asserts:** OTEL_RESOURCE_ATTRIBUTES contains a nonempty deck.run.id equal to the receiver's run for that pane, and the configured endpoint reaches the agent unchanged; the agent receives a `DOT_AGENT_DECK_WORK_ID` (PRD #1889), its OTEL_RESOURCE_ATTRIBUTES carries `deck.work.id` equal to it, and the exported `agent.run` span carries the same `deck.work.id`.
 - **Does not assert:** a real agent exporting its own telemetry (005).
 - **Platform coverage:** mac+linux.
 
@@ -94,7 +92,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** content policies for an external agent's own exporter or daemon log targets outside dot_agent_deck::telemetry and its submodules.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/005 — Real interactive Claude telemetry joins the deck run. [reel]
+##### telemetry/otlp/005 — Real interactive Claude telemetry joins the deck run.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
 - **Agent:** real interactive Claude Code on pinned Haiku, isolated credentials and project trust.
 - **Asserts:** a native inbox task visibly advances Thinking → Working/Bash → Idle and copies a unique fixture sentinel; Claude's own HTTP/JSON metrics or logs and the deck's completed run arrive at the local receiver with equal deck.run.id attributes. At least one trace request has service.name=dot-agent-deck, and those deck-owned requests exclude the task prompt, fixture file contents, sentinel/proof filenames and working-directory path.
@@ -108,7 +106,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** Claude's native exporter, other agent kinds or OpenCode's native export.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/007 — Real interactive OpenCode telemetry joins the deck run. [reel]
+##### telemetry/otlp/007 — Real interactive OpenCode telemetry joins the deck run.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
 - **Agent:** real interactive OpenCode on `common::opencode_test_model()` (default Haiku), a cheap mini or the subscription-compatible `openai/gpt-5.6-luna` override selected through `DOT_AGENT_DECK_OPENCODE_TEST_MODEL`, isolated imported credentials.
 - **Asserts:** a genuine interactive Bash turn visibly works, copies a unique fixture sentinel, replies and returns to Idle; the deck's completed run and OpenCode's own logs or traces arrive at the local receiver with matching deck.run.id, structurally read from their JSON or protobuf resource attributes and service.name=opencode. At least one trace request has service.name=dot-agent-deck, and those deck-owned requests exclude the task prompt, fixture file contents, sentinel/proof filenames and working-directory path.
@@ -185,21 +183,21 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** authenticated Devin delivery (020) or crash-recovery cleanup.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run. [reel]
+##### telemetry/otlp/018 — Real interactive Codex safely joins its own telemetry to the deck run.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
 - **Agent:** real Codex called by name inside a wrapper shell script on the auth-compatible cheap model (ChatGPT default gpt-5.6-luna).
 - **Asserts:** real shell copies a unique fixture, the pane completes and card settles, native traces/metrics carry the deck resource run id, Codex sends no logs (the deck's own `dot-agent-deck` log records, #1981 M8, are allowed) and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** Codex sandbox enforcement or native metric values.
 - **Platform coverage:** mac+linux when authenticated.
 
-##### telemetry/otlp/019 — Real interactive Pi Haiku exports metadata with the deck identity. [reel]
+##### telemetry/otlp/019 — Real interactive Pi Haiku exports metadata with the deck identity.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`).
 - **Agent:** real Pi on Anthropic claude-haiku-4-5, using the automatically bundled extension.
-- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run and prompt/file/output sentinels are absent from every captured body.
+- **Asserts:** an inbox directive makes real bash copy a unique fixture, the pane completes and card settles, Pi's own resource run id joins the deck run, the deck exports a busy and an idle `agent.status` span for the Pi run (issue #2078) and prompt/file/output sentinels are absent from every captured body.
 - **Does not assert:** provider fallback or exact token/cost values.
 - **Platform coverage:** mac+linux with Anthropic credentials.
 
-##### telemetry/otlp/020 — Authenticated real Devin exports metadata joined to the deck run. [reel]
+##### telemetry/otlp/020 — Authenticated real Devin exports metadata joined to the deck run.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`); authentication preflight becomes failure with DOT_AGENT_DECK_REQUIRE_REAL_E2E=1.
 - **Agent:** real Devin on its account-default model.
 - **Asserts:** a real exec writes a proof file, the pane visibly completes and native telemetry resources carry the deck run id without prompt/output sentinels.
@@ -250,7 +248,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** an external agent's own telemetry, unrelated daemon log targets or protobuf encoding.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/usage/007 — Real interactive Haiku exports model usage and completed termination. [reel]
+##### telemetry/usage/007 — Real interactive Haiku exports model usage and completed termination.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_export_live.rs`), developer machine only.
 - **Agent:** real interactive Claude Code on pinned Haiku, imported credentials and seeded trust.
 - **Asserts:** a directive inbox task visibly advances Thinking → Working/Bash → Idle and copies a unique fixture sentinel; normal Claude exit exports positive provider-reported input/output tokens, positive estimated cost and provider-reported completed termination, with a Haiku-family model usage event on agent.run.
@@ -269,6 +267,302 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Agent:** offline Pi/OpenCode stand-ins with export disabled and a plain command with export enabled.
 - **Asserts:** when the daemon inherits DOT_AGENT_DECK_USAGE_FILE, a spawn without an allocated channel receives an absent or empty value and its attempted reply append leaves the parent's file unchanged.
 - **Does not assert:** real extension/plugin callbacks, the allocated-channel case (covered by 002/003/008) or hosted ingestion.
+- **Platform coverage:** mac+linux.
+
+### Project config trust (PRD #1885)
+
+#### config-trust/cli
+
+##### config-trust/cli/001 — `trust approve --yes` prints what it approves and `trust list` shows it `current`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`): the real binary against an isolated HOME and state dir; no daemon.
+- **Agent:** none.
+- **Asserts:** with no approvals `list` exits 0 and names nothing; `approve <dir> --yes` exits 0 and prints each role's command, description and prompt text; `list` then shows one line for the project (canonical path) and orchestration whose state word is `current`.
+- **Does not assert:** the y/N question on a terminal (the `trust_cli` unit tests own it); the list line's exact layout.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/002 — Changing one character of a role's command reads as `changed`.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** after an approval, a one-character edit to a role `command` makes `list` show `changed`; restoring the text shows `current` again.
+- **Does not assert:** which other keys void an approval (unit tests own the field list).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/003 — `trust revoke` removes an approval and fails when there is nothing to revoke.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `revoke <dir>` exits 0 and the project leaves `list`; a second `revoke` exits non-zero with a message.
+- **Does not assert:** `--orchestration`-scoped revoke.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/004 — `trust approve` without a terminal and without `--yes` refuses.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** non-zero exit, a message naming `--yes`, and nothing stored.
+- **Does not assert:** the terminal question itself.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/005 — `trust approve` inside a deck pane refuses; `list` and `revoke` still run.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none; the pane identity is `DOT_AGENT_DECK_PANE_ID` in the CLI's environment.
+- **Asserts:** `approve --yes` with the pane identity exits non-zero with `run it from a terminal outside the deck` and stores nothing; `list` exits 0 and `revoke` removes an approval with the same identity present.
+- **Does not assert:** the other pane-identity variables, or a run from a real pane's shell.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/cli/006 — A linked git worktree shares its main checkout's approval.
+- **Layer:** L2 process integration, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** none.
+- **Asserts:** `approve <linked worktree> --yes` stores the approval under the main checkout (the list line names the main path, never the worktree's) as `current`, and `revoke <main checkout>` finds it.
+- **Does not assert:** a non-git project's identity (the canonical config directory).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/prompt
+
+##### config-trust/prompt/001 — The New Agent form asks before starting a never-approved orchestration.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), launched with `without_trust_preapproval`.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`).
+- **Asserts:** Ctrl+n + choosing the orchestration shows `Review project commands` with the project, the orchestration, `not approved before`, every role's command, description and prompt text and the footer `a approve and start · Esc cancel · ↑↓ scroll`, and no role is on the daemon; `Esc` closes it with nothing spawned; choosing again and pressing `a` starts both roles and `trust list` shows the approval `current`.
+- **Does not assert:** scrolling; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/002 — A changed role is marked `changed`, and Enter does not approve.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** after a one-character edit to an approved role's command, the prompt shows that role marked `changed` with its new command; Enter leaves the prompt open, spawns nothing, and the stored approval still reads `changed`.
+- **Does not assert:** the no-prompt open of an approved, unchanged orchestration (every other orchestration test opens one under the harness pre-approval).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/prompt/003 — The trust prompt's layout: state, role marks, removed roles, the restore footer and scrolling under a fixed footer.
+- **Layer:** L1 (`trust_prompt::render_to_buffer` + ratatui `TestBackend` + `insta`, `tests/render_trust_prompt.rs`), views built by `TrustCheck::evaluate(..).view()` against an in-memory `ApprovalStore`.
+- **Agent:** none.
+- **Asserts:** a never-approved orchestration shows `Review project commands`, the project, `not approved before`, every role's command, description and prompt with no mark, and the footer `a approve and start · Esc cancel · ↑↓ scroll`; a changed one shows `changed since you approved it`, the edited role marked `changed`, the added one `new`, the untouched one unmarked and `Removed since you approved it: <role>`; the restore variant's footer is `a approve and restore`; a long prompt in a short terminal keeps the footer on screen and shows `(more below)`, `(more above and below)` and `(more above)` at the top, middle and end; a first role whose prompt runs to 70,000 lines either leaves a later role's command reachable at the end or offers no `a approve`. Five snapshots pin the layout.
+- **Does not assert:** keys, approving or the spawned binary (`config-trust/prompt/001`/`002`, the `ui.rs` `prompt_004`–`006` unit tests); escaping of hostile config text (`trust_prompt` unit tests); the desktop dialog.
+- **Platform coverage:** mac+linux+windows.
+
+##### config-trust/prompt/004 — The trust prompt works with the mouse: clicking `a approve and start`/`a approve and restore` approves, clicking `Esc cancel` cancels, the wheel scrolls, and other clicks do nothing.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, four tests), SGR mouse reports through `TuiDeck::click`/`scroll_n`, each label located on the rendered grid; the restore test stages the `config-trust/restore/002` saved session.
+- **Agent:** stand-ins (`env TRUST_ROLE=<role> cat`, `sleep 600`).
+- **Asserts:** clicks on the prompt's title, on a role's description, on the deck left of the popup and on the dashboard's `[Quit Ctrl+C]` and `[New Agent Ctrl+N]` buttons behind it, and Enter, leave the prompt open, open no quit dialog and spawn nothing; a click on `a approve and start` starts both roles and `trust list` reads `current`; a click on `Esc cancel` closes the prompt, spawns nothing and stores nothing; the wheel over a review longer than the popup scrolls it to `(more above and below)`, to its last line and `(more above)`, and back to `(more below)`, without approving; on the restore prompt a click on `a approve and restore` restores the roles and `trust list` reads `current`.
+- **Does not assert:** that a click on the approve label before the prompt's first frame is refused (the `ui.rs` unit tests own that guard: the prompt opens on a daemon reply, so a PTY cannot order a click between its opening and its first frame); clicking `Esc cancel` on the restore prompt; the desktop dialog.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/restore
+
+##### config-trust/restore/001 — A restored orchestration whose command changed asks before restoring.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** on a daemon-empty start the prompt shows the orchestration, the changed command, `coder` marked `changed` and `a approve and restore`, with no role spawned; `a` restores the roles.
+- **Does not assert:** cancelling a restore prompt (restore/002 does); several restored orchestrations.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/002 — Cancelling the restore prompt leaves the orchestration unrestored and restores the rest of the session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): saved session holding the changed orchestration followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** `Esc` closes the `a approve and restore` prompt; the plain pane saved after the orchestration is restored (card on the grid, record on the daemon); none of the orchestration's roles start; `trust list` still reads `changed`, so the cancel stored nothing; after a detach-quit the saved `session.toml` still holds the `restore-orch` snapshot, and the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** that the orchestration can be reopened from the New Agent form afterwards; several restored orchestrations; a periodic (mid-session) save while the prompt is open.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/003 — A saved orchestration that can no longer be trust-checked does not fall through to a plain-pane restore.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`, three tests): saved session holding a never-approved orchestration whose saved orchestrator command writes a sentinel file, followed by a plain pane, staged through `DOT_AGENT_DECK_SESSION` with an empty approval store.
+- **Agent:** stand-ins (`sh -c 'touch <sentinel>; exec sleep 600'`, `sleep 600`).
+- **Asserts:** after (a) a worker role is removed from the config, (b) the orchestration is renamed, or (c) the config file is deleted, launching the TUI never writes the sentinel, restores no `orchestrator` pane and no pane in the project, starts no role, and still restores the plain pane (a trust prompt, if one appears, is cancelled first).
+- **Does not assert:** what the warning says; role reorder or role rename drift.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/004 — Quitting while a restore prompt is unanswered keeps the orchestration in the saved session.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): the `config-trust/restore/002` saved session (a changed orchestration, then a plain pane) staged through `DOT_AGENT_DECK_SESSION`, approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** with the restore prompt open and unanswered (the plain pane already restored), `Ctrl+C` and Detach quit the deck cleanly; the saved `session.toml` still holds the `restore-orch` orchestration snapshot; the next start on an empty daemon shows its restore prompt again.
+- **Does not assert:** a terminal hang-up (SIGHUP) rather than a detach; a periodic (mid-session) save while the prompt is open; the order in which several held-back restores are asked.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/restore/005 — Approving a held-back restore starts only the roles that were running when the session was saved (issue #929).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`): a changed orchestration's current (`version = 2`) snapshot listing `started_role_indices = [0, 1]`, staged through `DOT_AGENT_DECK_SESSION`; approval made by the real CLI into the state dir the deck is launched with; the deck is launched twice on the same session file.
+- **Agent:** stand-ins (`sleep 600`).
+- **Asserts:** quitting (`Ctrl+C`, Detach) with the restore prompt unanswered leaves the saved block at `version = 2` with `[0, 1]`, so a held restore keeps which roles were running; on the next start, `a` restores the orchestrator and `coder` on the daemon, no `reviewer` agent appears, and the restored tab still shows a `reviewer` card.
+- **Does not assert:** a restore that needed no approval (`session/restore/025`); an old (`version = 1`) snapshot, which starts every role (`config-trust/restore/001`, `session/restore/008`); a declined (`Esc`) restore's saved block; a periodic (mid-session) save while the prompt is open.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/respawn
+
+##### config-trust/respawn/001 — A delegate to a `clear = true` role refuses after its config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** the delegate exits non-zero with the refusal (orchestration, project, `changed since you approved it`, `dot-agent-deck trust approve … --orchestration trust-orch`), and coder keeps its agent id.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/002 — `pane restart` refuses after the role's config changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane restart coder --force` exits non-zero with the refusal text, and coder keeps its agent id.
+- **Does not assert:** a restart of a crashed pane.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/003 — `pane spawn` refuses after a role was added to the config.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`).
+- **Agent:** stand-ins.
+- **Asserts:** `pane spawn reviewer` exits non-zero with the refusal text, and no reviewer appears on the daemon.
+- **Does not assert:** spawning a role whose text is unchanged.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/respawn/004 — A delegate to a non-clear role refuses after only its prompt changed.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `delegate` CLI from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** with an approved orchestration open, changing only a non-clear `reviewer` role's `prompt_template` makes `delegate --to reviewer` exit non-zero with the refusal text (`changed since you approved it`, the approve command), and the task never reaches the reviewer's inbox.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/schedule
+
+##### config-trust/schedule/001 — A scheduled fire into a never-approved orchestration is refused and reported.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins.
+- **Asserts:** run-now spawns nothing and `schedule list` shows the refusal (`never approved`, the project, the approve command); after `trust approve`, the same run-now opens the orchestration.
+- **Does not assert:** the TUI schedule manager's rendering of the refusal (a `ui.rs` unit test owns it); a cron-driven fire.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/002 — An issue dispatch whose default branch changed a role is refused before the devbox warm-up.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins; a `devbox` stub on `PATH` records each warm-up.
+- **Asserts:** the first fire is refused `never approved` with no worktree and no warm-up; after approving the clone, a fire dispatches issue 7 and warms its worktree once; after the remote's default branch changes the role command by one character, the next fire is refused `changed since you approved it`, creates no worktree for issue 8, runs no further warm-up and spawns nothing.
+- **Does not assert:** the daemon log line.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/003 — A forged `.git` file does not borrow another checkout's approval.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`sh ./agent.sh`, `cat`).
+- **Asserts:** with repository A's `team` approved, a directory B holding byte-identical TOML, a different `agent.sh` and a `.git` file copied from A's legitimate linked worktree is refused on run-now: B's marker file is never written, `schedule list` reports the refusal with the approve command naming B, and nothing spawns in B; a run-now in A's real linked worktree still opens the orchestration.
+- **Does not assert:** the wording of the refusal reason; other forged geometries (a `.git` directory, a symlinked `.git`).
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/004 — A reattached issue branch with different role text is refused with a remedy that works.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the clone's default branch approved and a local `agent/issue-7` branch changing the role command, a fire for issue 7 is refused `changed since you approved it` and spawns nothing; every directory a printed `dot-agent-deck trust approve` command names exists after the fire; running each printed approve command (with `--yes`) succeeds, and a later fire for issue 8 on the default branch still dispatches.
+- **Does not assert:** the remedy's wording, or whether it prints an approve command at all; that issue 7 itself can be dispatched afterwards; a branch pushed to the remote rather than left in the clone.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/005 — A linked worktree shares its main checkout's approval of an unnamed orchestration.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), `spawn_daemon_serve_untrusted`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with a repository whose one orchestration has no `name` approved by `trust approve <main checkout> --yes`, a run-now schedule in the main checkout opens the orchestration, and one in a `git worktree add` linked worktree opens it too.
+- **Does not assert:** the approval's stored name; `trust list` output for an unnamed orchestration; a non-git project.
+- **Platform coverage:** mac+linux.
+
+##### config-trust/schedule/006 — An issue dispatch of an unnamed orchestration runs once its clone is approved.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`, beside its `gh` stub).
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** with the fixture remote's one orchestration unnamed and the scheduler's clone approved, a fire for issue 7 opens the orchestration in `<clone>/.worktrees/issue-7`.
+- **Does not assert:** the refusal for an unapproved unnamed orchestration; a reattached `agent/issue-<n>` branch (`config-trust/schedule/004`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/dispatch
+
+##### config-trust/dispatch/001 — `dispatch --orchestration` refuses until approved, then runs in a worktree that shares the approval.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_config_trust.rs`), real `dispatch` CLI from a plain pane.
+- **Agent:** stand-ins.
+- **Asserts:** from a never-approved project the refusal reaches the caller's inbox (where `dispatch` posts its outcome), no worktree is created and nothing spawns; after `trust approve` of the main checkout a second dispatch succeeds and the roles run in the unit's linked worktree.
+- **Does not assert:** `dispatch --single` or `--command` (not gated).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/rearm
+
+##### config-trust/rearm/001 — A warm reattach never re-arms the orchestrator with changed, unapproved instructions.
+- **Layer:** L2 headless `daemon serve` + `RunNow` with a PTY-attached TUI warm-reattaching to it, lane 1 (`tests/e2e_config_trust.rs`); synthetic `Compacting` and `/clear` `SessionStart` hook events under `DOT_AGENT_DECK_HOOK_PROVENANCE=warn`.
+- **Agent:** stand-ins (`cat`).
+- **Asserts:** after a schedule opens an approved orchestration and only its start role's `prompt_template` is edited to carry a sentinel (`trust list` reads `changed`), a TUI attaching to the warm daemon and then a compaction and a `/clear` on the start role publish no `.dot-agent-deck/orchestrator-context*` file and post no start-role inbox message containing the sentinel.
+- **Does not assert:** how the user is told (a prompt or a refusal); the re-arm of an unchanged orchestration (`orchestration/remit/*`).
+- **Platform coverage:** mac+linux.
+
+#### config-trust/escape
+
+##### config-trust/escape/001 — Refusals carry no raw terminal control characters from project-chosen names.
+- **Layer:** L2 headless `daemon serve` + `RunNow`, lane 1 (`tests/e2e_config_trust.rs`), with `DOT_AGENT_DECK_LOG` pointed into the test's tempdir and real agent-verb CLIs from the orchestrator's pane identity.
+- **Agent:** stand-ins.
+- **Asserts:** an orchestration named with an ESC clear-screen sequence and a right-to-left override is refused on run-now with no raw ESC or U+202E in the daemon's stderr and no raw ESC, BEL or bidi control in its log; after approving, opening it, changing a command and adding a role with an OSC-8/bidi name, the refused `delegate` and `pane restart` print no raw ESC, BEL or bidi control.
+- **Does not assert:** the escaped spelling; `schedule list` (already escaped) or the TUI schedule manager.
+- **Platform coverage:** mac+linux.
+
+#### config-trust/live
+
+##### config-trust/live/001 — A real agent starts only after the trust prompt is approved.
+- **Layer:** L2 PTY-attached, **lane 2** (`tests/e2e_config_trust_live.rs`).
+- **Agent:** real interactive Claude Code on Haiku (`--allowedTools Bash Read`), credentials imported, work dir trusted.
+- **Asserts:** Ctrl+n on a never-approved project shows `Review project commands` with the role's `claude …` command and nothing running; `a` starts the agent, which creates the uniquely named sentinel `config_trust_live_5e81c3.txt` its prompt asks for.
+- **Does not assert:** the agent's wording.
+- **Platform coverage:** mac+linux.
+
+### Work journal (PRD #1889)
+
+The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/work-journal.md`): a work per launch with its parent, refs and workspace, an attempt per agent generation, `DOT_AGENT_DECK_WORK_ID` in every spawned agent, and restart recovery. All entries are lane 1 with token-free stand-ins; they read the journal files and the stand-in's own environment from outside the daemon (`tests/support/work_journal.rs`). The `deck.work.id` telemetry attribute is covered by `telemetry/otlp/003`.
+
+#### journal/launch
+
+##### journal/launch/001 — A manual pane opens a work, its agent is told the work id, and closing it closes the work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in recording `DOT_AGENT_DECK_WORK_ID`.
+- **Asserts:** an `opened` line with the v1 envelope, `launch=pane`, `refs.pane`, no parent and `workspace` = the pane's cwd (home-relative as `~/…`); an `attempt_started` on that work naming the pane and agent with `attempt` = `<run>/<agent id>`; the agent's `DOT_AGENT_DECK_WORK_ID` equals the work id; closing the pane through the daemon (`StopAgent`) writes that attempt's `attempt_ended` and `closed how=pane_closed` on the pane's work.
+- **Does not assert:** saved-session restore or desktop `StartPreparedAgent` launches; compaction; which `how` the closed attempt's end carries.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/002 — A dispatch is a child work of its dispatcher's pane work, and its unit's report or silent end is recorded.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --single` CLI from a stand-in pane in a one-commit repository.
+- **Agent:** synthetic routing stand-in, as dispatcher and as the unit.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work, with `refs.branch` = `agent/dispatch-<slug>`, a `u-…` `refs.unit_id` and `workspace` = the unit's worktree; the unit agent's `attempt_started` is on the dispatch work and its `DOT_AGENT_DECK_WORK_ID` names it; the unit's `work-done --done` writes `reported` on the dispatch work with that `unit_id`, a `report_id`, `destination=inbox` and `to` = the dispatcher's work; a second unit from the same dispatcher, closed through the daemon before it reports, gets `closed how=unit_ended` and no `reported`; no task or report text reaches the journal.
+- **Does not assert:** an orchestration-shaped dispatch (journal/launch/006); a unit that ends by its agent exiting rather than by a close; whether a unit that did report also gets a `closed`.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/003 — An orchestration, a delegation and its report are recorded, and a clear respawn keeps the role's work.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-ins as a two-role orchestration whose worker has `clear = true`.
+- **Asserts:** `opened launch=orchestration` with `refs.orchestration_id`, `refs.orchestration` and `workspace` = `~` (the orchestration's cwd is the home directory); both role panes' attempts are on that work with their `role`, and both agents' `DOT_AGENT_DECK_WORK_ID` name it; a delegate opens a `launch=delegation` child with `refs.task_id` and `refs.role`; the clear respawn ends the old generation `how=replaced` and adds a new `attempt_started` for the same pane and role on the orchestration work, and the respawned generation's `DOT_AGENT_DECK_WORK_ID` is still the orchestration's work id (not the delegation's); the delegation gets an attempt on the bound generation; `work-done --task-id` writes `reported` on the delegation with `task_id`, `destination=inbox`, a `report_id` and `to` = the orchestration work, then `closed how=task_done`; no task or report text reaches the journal.
+- **Does not assert:** `pane restart`; an orchestration started by a dispatch (journal/launch/006).
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/004 — A plain scheduled fire opens a work per fire.
+- **Layer:** L2 headless `daemon serve` driven by `RunNow`, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in as the schedule's command.
+- **Asserts:** `opened launch=schedule_fire` with `refs.schedule`; the fired pane's `attempt_started` is on that work and its `DOT_AGENT_DECK_WORK_ID` names it.
+- **Does not assert:** a fire that re-posts into a reused pane; an orchestration-shaped fire.
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/005 — A scheduled issue dispatch opens one child work per issue, and its interrupted attempts still lead to the issue after a restart.
+- **Layer:** L2 headless `daemon serve` driven by `RunNow`, lane 1 (`tests/e2e_issue_dispatch.rs`), behind the offline stub `gh` of `scheduler/dispatch/*`; then a SIGTERM to that daemon's own pid and a second `daemon serve` on the same state directory.
+- **Agent:** none (the fixture orchestration role runs `cat`).
+- **Asserts:** `opened launch=schedule_fire` with `refs.schedule`, and as its child an `opened launch=issue_dispatch` with `refs.issue`, `refs.repo`, `refs.branch` = `agent/issue-<n>` and `workspace` = the issue's worktree; the dispatched pane's attempt is on the issue's work or on a work whose parent it is; after the restart every attempt that was live at the SIGTERM has `attempt_ended how=interrupted`, and walking up its work's `parent` chain reaches that issue's `launch=issue_dispatch` work with `refs.issue`, `refs.repo` and `refs.branch`.
+- **Does not assert:** the issue pane's `DOT_AGENT_DECK_WORK_ID` (`cat` records nothing); skipped issues; the interruption's cause; a SIGKILL'd daemon (journal/restart/002 covers recovery after one).
+- **Platform coverage:** mac+linux.
+
+##### journal/launch/006 — An orchestration started by a dispatch is a child work of that dispatch.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --orchestration=journal-team` CLI from a stand-in pane in a one-commit repository whose `.dot-agent-deck.toml` defines a one-role orchestration.
+- **Agent:** synthetic routing stand-in, as dispatcher and as the orchestrator role.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work and whose `workspace` is the unit's worktree; an `opened launch=orchestration` named `journal-team`, with a `refs.orchestration_id`, whose `parent` is that dispatch work; the orchestrator role's `attempt_started` is on the orchestration work with `role=orchestrator`, and its `DOT_AGENT_DECK_WORK_ID` names the orchestration work.
+- **Does not assert:** a multi-role dispatched team; the orchestration unit's terminal report.
+- **Platform coverage:** mac+linux.
+
+#### journal/restart
+
+##### journal/restart/001 — After a SIGTERM, a new daemon on the same state directory finds every launch and every live attempt interrupted.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`); the signal goes to the first daemon's own pid.
+- **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
+- **Asserts:** the new daemon creates its own `run-<id>.jsonl` (even with nothing to write) holding only its own run's lines; the pane's and the dispatch's `opened` lines (parent, refs, workspace) read back after the restart; both attempts have `attempt_ended how=interrupted` with cause `daemon_shutdown` or `daemon_gone`; the dead segment is byte for byte as left, or folded away into a `compacted-*.jsonl` that carries every one of its lines byte for byte.
+- **Does not assert:** which of the two causes is written (the shutdown write is best effort).
+- **Platform coverage:** mac+linux.
+
+##### journal/restart/002 — After a SIGKILL and a torn tail, recovery writes the interruptions without rewriting the dead segment.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
+- **Asserts:** with a half line (no newline) appended to the dead segment, the new daemon starts and serves; both open attempts get `attempt_ended how=interrupted cause=daemon_gone` in the new run's segment; the dead segment is byte for byte what was left, or folded away into a `compacted-*.jsonl` that carries every complete line of it byte for byte (the torn tail may be dropped).
+- **Does not assert:** compaction's retention rules.
+- **Platform coverage:** mac+linux.
+
+#### journal/compat
+
+##### journal/compat/001 — Lines of a newer schema or an unknown kind are skipped and kept.
+- **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`), on a state directory planted before it starts.
+- **Agent:** none.
+- **Asserts:** a dead segment with no held lock holding a v1 `opened` and `attempt_started`, a `"v":2` line and a v1 line of unknown `kind` (both shaped to end that attempt) does not stop the daemon starting; it writes `attempt_ended how=interrupted cause=daemon_gone` for the planted attempt; the v2 and unknown-kind lines remain byte for byte in the journal and the dead segment is not rewritten (or is folded into a `compacted-*.jsonl` carrying all its lines byte for byte).
+- **Does not assert:** a reader ignoring unknown fields on a known kind.
 - **Platform coverage:** mac+linux.
 
 ### Session pull requests
@@ -300,10 +594,10 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Layer:** L2 PTY-attached, lane 1 (deterministic).
 - **Agent:** none (synthetic cat agent, offline gh stub and BROWSER recorder).
 - **Asserts:** the real TUI displays `#1234 ⊙ ✓ ◉` for an open PR with passing CI awaiting review, with the review cell in inverse video and the CI cell not (issue #1781); o on the selected card invokes BROWSER with the exact PR URL; the same key on a default-branch card spawns no opener and leaves Help usable.
-- **Does not assert:** a real browser opening, real-agent execution or reel eligibility.
+- **Does not assert:** a real browser opening or real-agent execution.
 - **Platform coverage:** mac+linux.
 
-##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge. [reel]
+##### session/pr/005 — An interactive Haiku agent visibly works beside its pull request badge.
 - **Layer:** L2 PTY-attached, lane 2 (real agent).
 - **Agent:** Claude Code (interactive Haiku; strict offline gh stub).
 - **Asserts:** a genuine agent on a fixture PR branch lists the files and reveals a uniquely named sentinel omitted from its prompt; the attached TUI displays that filename together with `#1234 ⊙ ✓ ◉`.
@@ -621,7 +915,7 @@ Demo-reel eligibility marker: a trailing ` [reel]` on an entry's `##### <id> —
 - **Does not assert:** ratatui title placement or styling (covered by `/001` and `/002`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/card-stats/005 — A real interactive Haiku card keeps its height while opening its pane narrows the card and degrades the bottom-border counters. [reel]
+##### dashboard/card-stats/005 — A real interactive Haiku card keeps its height while opening its pane narrows the card and degrades the bottom-border counters.
 - **Layer:** L2 PTY-attached (the real `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with recording enabled for a `full-stream.cast`).
 - **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, with onboarding/project trust seeded and `--allowedTools Bash`; no `-p`. A second real client on the observer's daemon performs the ordinary Ctrl+N flow and types the prefix-only prompt after Claude's native editor becomes ready; the recorded client observes the live card and later attaches that same daemon pane on demand.
 - **Asserts:** the sentinel response and native Thinking/Working/Idle plus Bash hook prove the genuine spawn → agent → work path; at one fixed 68×16 recording size, the unattached card shows a nonzero, right-aligned full `Last: … Tools: …` label only in its bottom border, then attaching the real pane narrows the dashboard and selects the shorter `… · … tools` rung while preserving matching-weight intact bottom corners (`└`/`┘` or `┗`/`┛`), the tool count, the `Dir:`/`Prmt:`/`Bash` row offsets, and card height.
@@ -935,7 +1229,7 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Layer:** L2.
 - **Agent:** none.
 - **Asserts:** the real binary with its lazily spawned daemon renders numeric disk rows for Working root, Worktree parent and Temp root, with a numeric load-per-core row after `m`; Escape removes the overlay and restores the empty dashboard.
-- **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation; this synthetic PTY case is not a reel clip.
+- **Does not assert:** real-agent work, remote transport, or exact machine-specific utilisation.
 - **Timing:** the first wait (the empty dashboard painting after the lazy daemon spawn) has a load-scaled ceiling: 30 s on an idle box, up to 120 s. The deck's daemon-start bound is set 5 s under that ceiling, so a daemon that never binds still prints its error before the wait ends. A starved run once spent 13.6 s on the daemon's pre-bind alone and overran the fixed 30 s (issue #1665).
 - **Platform coverage:** mac+linux.
 
@@ -1161,7 +1455,6 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 ##### status/blocked/019 — OpenCode's plugin blocks on a marker, not a bare 429 (issue #714).
 - **Layer:** L2, lane 1, PTY-attached.
-- **Quarantined:** `#[ignore = "quarantined: vfarcic, #1664"]` (CLAUDE.md rule 6). Under load the daemon's hook listener can apply the marker session's QuotaBlocked before its own SessionStart, so the card stays Idle; #1664 has the evidence, the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** two synthetic OpenCode panes loading the installed plugin under Node; no provider credential.
 - **Asserts:** the marked error yields Blocked and the bare 429 yields Error.
 - **Does not assert:** a real OpenCode API request.
@@ -1441,10 +1734,10 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Does not assert:** the falling edge (`ShellIdle` once the command completes — that is `004`'s job against a stand-in, not repeated here against a real agent), the >120s-cap user-visible badge scenario (`status/shell-activity/006`, M6b), or no-false-positive-at-idle (`status/shell-activity/007`, M6c). The soft sentinel-content check on the model's final reply is logged, not gating — matching the model's free-text reply is more phrasing-sensitive than the two typed events the test actually gates on.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
-##### status/shell-activity/006 — After a real interactive Haiku Claude agent's Bash call crosses the 120s cap and its native Stop arrives, the rendered badge reads Idle with Background: 1 command while the ping is still running (#1678). [reel]
+##### status/shell-activity/006 — After a real interactive Haiku Claude agent's Bash call crosses the 120s cap and its native Stop arrives, the rendered badge reads Waiting with Background: 1 command while the ping is still running (#1678, #1757).
 - **Layer:** L2, PTY-attached, real agent (drives the actual `dot-agent-deck` binary, which lazily spawns its own daemon; no synthetic hook, no fabricated `SessionStart`, no hand-set `pane_id`).
 - **Agent:** a real interactive `claude --model claude-haiku-4-5-20251001 --allowedTools Bash` pane, spawned through the normal Ctrl+N new-pane flow with per-folder trust pre-seeded, exactly as a user would drive it.
-- **Asserts:** a directive prompt asks for one real Bash call running ping -c 200 against a unique sentinel with default settings, followed immediately by the end of the main turn without polling or inspecting the command. After ToolStart the test requires the real native Stop-mapped Idle event within 157 seconds and at least 120 seconds after ToolStart; absent hooks fail explicitly with PRECONDITION NOT MET and include the final pane for diagnosis. Once Stop arrives, the rendered card reads Idle with Background: 1 command and never Working. A process walk from this test's own pid independently confirms the sentinel-tagged tool shell and its ping are still live.
+- **Asserts:** a directive prompt asks for one real Bash call running ping -c 200 against a unique sentinel with default settings, followed immediately by the end of the main turn without polling or inspecting the command. After ToolStart the test requires the real native Stop-mapped Idle event within 157 seconds and at least 120 seconds after ToolStart; absent hooks fail explicitly with PRECONDITION NOT MET and include the final pane for diagnosis. Once Stop arrives, the rendered card reads Waiting (issue #1757: the ping was started in the turn that ended) with Background: 1 command and never Working. A process walk from this test's own pid independently confirms the sentinel-tagged tool shell and its ping are still live.
 - **Does not assert:** anything about the discriminator's internals (`descendant_shell_activity`, `003`) or the pane primitive in isolation (`004`) — this test observes the full pipeline's user-visible output. Does not assert the eventual falling edge once the 200s ping finishes. A `PRECONDITION NOT MET` panic is a setup failure requiring diagnosis; it asserts nothing about the rendered `Working`/`Idle` badge.
 - **Platform coverage:** mac+linux (real Claude Code interactive session; not run on Windows, and gated `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]` — lane 2, so it runs on a developer's machine and in no CI job (CLAUDE.md rule 5)).
 
@@ -1537,16 +1830,16 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Asserts:** subscribers receive count changes 1→2→1 despite unchanged busy=true; Idle+busy produces no repeated identical shell event for three seconds; replacing the spawn in the same pane cannot give its successor the old command aggregate or restamp observations with its identity.
 - **Does not assert:** a deterministically paused scan crossing replacement (there is no exposed deferred-sampler seam); real agent subprocess lifetime (007); desktop.
 
-##### status/background/007 — Real interactive Haiku background Bash work stays visible after Stop and clears on scoped kill (#1678). [reel]
+##### status/background/007 — Real interactive Haiku background Bash work reads Waiting after Stop and clears to Idle on scoped kill (#1678, #1757).
 - **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
 - **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
-- **Asserts:** directive prompt launches run_in_background Bash writing a unique sentinel; native Stop arrives; rendered card reads Idle and Background: 1 command; a live ping is located via a process walk from this test's own pid and killed by exact pid; the indicator disappears while Idle remains.
+- **Asserts:** directive prompt launches run_in_background Bash writing a unique sentinel; native Stop arrives; rendered card reads Waiting (issue #1757: the command was started in the turn that ended) and Background: 1 command; a live ping is located via a process walk from this test's own pid and killed by exact pid; the indicator disappears and the card reads Idle.
 - **Does not assert:** capped default-timeout behavior (status/shell-activity/006), subagents (008), desktop.
 
 ##### status/background/008 — Real interactive Haiku subagent work stays visible after the main Stop and clears on its paired stop (#1678).
 - **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
 - **Agent:** real interactive Claude Haiku plus one real Haiku subagent, onboarding/trust seeded and allowedTools Bash Agent.
-- **Asserts:** one background Agent receives three exact slow Bash commands writing unique start/completion sentinels at absolute paths in the fixture directory (the start timeout reports observed Bash hook commands and cwd); after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
+- **Asserts:** one background Agent receives three exact slow Bash commands writing unique start/completion sentinels at absolute paths in the fixture directory (the start timeout reports observed Bash hook commands and cwd); after main Stop the rendered card reads Idle with 1 subagent (command counts may coexist, and a subagent command first sampled within the main turn makes it read Waiting instead, issue #1757); only the matching SubagentStop ends the wait, tolerating unpaired internal stops; completion sentinel and cleared indicator follow.
 - **Does not assert:** exact Claude transcript phrasing, desktop, other agent integrations.
 
 ##### status/background/009 — A shell-activity sample that answers after its spawn was replaced touches neither the successor's card nor the broadcast (#1678).
@@ -1626,6 +1919,219 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 - **Verified load-bearing:** red with the snapshot overlay of `subagent_wait` disabled.
 - **Does not assert:** the attach protocol carrying the snapshot (`ListAgents` / `AgentRecord.live`, covered by the rehydration tests); the rendered badge.
 - **Platform coverage:** mac+linux.
+
+#### status/waiting
+
+##### status/waiting/001 — Only a command started in the turn that just ended counts as awaited, and that card reads Waiting (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; Claude-shaped turn reports and command samples fed to one pane's background record at fixed times, and to a daemon-owned `AppState` with an ownership stub.
+- **Asserts:** in a pane's first turn every sampled command counts; a command first sampled during an earlier turn does not; a command first sampled after Stop but at or after the turn's start does; only an ended turn followed by a new one moves the turn's start (a tool call inside the turn, a repeated Idle and a subagent's events do not); a subagent alone is never awaited. The daemon's card reads Waiting with `awaited` 1, returns to Idle when a sample shows the command gone, moves to Thinking on a new turn, and reads Idle with its background line when the command is carried over into a later turn's end.
+- **Does not assert:** the shell-activity monitor's sampling (`status/background/006`), a client's fold (002), rendering (004).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/002 — A client folds Idle plus an awaited command into Waiting, and back to Idle when a newer aggregate clears it (issue #1757).
+- **Layer:** L1 protocol/fold, fast tier (`waiting_status.rs`).
+- **Agent:** none; daemon-shaped broadcasts and a serialized snapshot applied to a fresh client `AppState`.
+- **Asserts:** Idle carrying `awaited` 1 reads Waiting; a repeated Idle without an aggregate keeps it; a newer empty aggregate returns it to Idle and an older replay cannot bring Waiting back; an aggregate counting the command with `awaited` 0 reads Idle with the background line; Thinking and a tool call move a Waiting card as they move an Idle one; a card hydrated from a Waiting snapshot reads Waiting and clears like a live one.
+- **Does not assert:** how the daemon decides `awaited` (001), rendering (004), the desktop.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/003 — Waiting and `awaited` keep the wire compatible in both directions (issue #1757).
+- **Layer:** L1 unit, fast tier (`waiting_status.rs`).
+- **Agent:** none.
+- **Asserts:** Waiting serializes as the bare string `"Waiting"`; a reader that predates it decodes the whole snapshot with the status as Unknown and keeps the background counts; an aggregate without `awaited` decodes to 0 and a client reading it shows Idle with the background line; `awaited` 0 is omitted, so that wire is byte-for-byte the older shape.
+- **Does not assert:** a full mixed-version daemon connection (CLAUDE.md rule 12's cross-version run).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/004 — The TUI card shows Waiting in its own colour above the background line, at Normal and Minimal density (issue #1757).
+- **Layer:** L1 widget, fixed-clock insta snapshot (`render_dashboard.rs`, fast tier).
+- **Agent:** none; snapshot-hydrated Waiting card rendered through the production card seam.
+- **Asserts:** the top border reads `● Waiting` in a colour that is not Idle's, Working's or Needs Input's; `Background: 1 command · 5m` sits beneath it; at Minimal the one content row is that background line (snapshots `status_waiting_004_normal_card`, `status_waiting_004_minimal_card`).
+- **Does not assert:** the live fold (002), Compact density, the desktop tile.
+- **Platform coverage:** mac+linux.
+
+##### status/waiting/005 — Every reader of busy-versus-idle decides Waiting by one rule: its prompt is free, but its work is not done (issue #1757).
+- **Layer:** L1 unit (`waiting_status.rs`, `render_dashboard.rs`, `src/doorbell.rs`, `src/daemon_status.rs`; fast tier).
+- **Agent:** none.
+- **Asserts:** the bell never rings for Waiting, even with every switch on; its card's status dot does not blink where an Idle card's does; the close refusal counts it as busy; it has its own colour and ranks between the working states and Idle; telemetry publishes `awaiting_command` while Needs input keeps `waiting`; `daemon status` prints and publishes `Waiting` with schema version 2; the doorbell treats a Waiting agent as idle, and its queued messages as a stalled wake rather than one its status explains.
+- **Does not assert:** the doorbell loop's `working` hold fact (no seam reaches it below the running loop), the bell firing on the later Waiting → Idle edge (010), the desktop or voice (desktop tests).
+- **Platform coverage:** mac+linux.
+
+##### status/waiting/006 — The deck's own inbox waiter is never a background command, so it cannot make a card read Waiting (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process-table fixtures with the measured Claude fingerprint.
+- **Asserts:** a Claude pane's `sh -c '<deck>' inbox wait --agent claude-code` waiter and its deck child in a session of their own yield no qualifying session; a real Bash-tool command beside it still counts, alone; a watcher left in the agent's own session yields none under the structural test alone (OpenCode, Pi).
+- **Does not assert:** a live waiter's process tree (only read from code: `src/hooks_manage.rs`, `src/inbox_receiver.js`), monitor timing.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/007 — An ended turn whose own command still runs reads Waiting on the attached card, then Idle when it exits; an earlier turn's command keeps Idle (issue #1757).
+- **Layer:** L2 synthetic, PTY-attached (`e2e_background_work.rs`, lane 1).
+- **Agent:** none; daemon-owned Python parent with real detached Bash sessions and Claude-shaped hooks through the real hook CLI.
+- **Asserts:** a turn that starts a command and ends while it runs reads Waiting in the daemon's snapshot (`awaited` 1) and `● Waiting` with `Background: 1 command` on the rendered card — each Stop sent only after the monitor's `ShellBusy` showed the daemon sampled the command during the live turn, so a slow start cannot push its first sample past the grace (that boundary is `status/waiting/015`); the command's exit returns it to Idle with no background line; a command started in one turn and still running when a later turn ends reads Idle with `Background: 1 command`.
+- **Does not assert:** a real agent, the desktop.
+- **Platform coverage:** mac+linux.
+
+##### status/waiting/008 — A real interactive Haiku Claude's own background Bash command reads Waiting after Stop, and Idle once it exits on its own (issue #1757).
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Claude Haiku, onboarding/trust seeded, allowedTools Bash Agent, spawned through Ctrl+N.
+- **Asserts:** a directive prompt launches one run_in_background Bash command (`ping -c 60 … && touch <unique sentinel>`) and the turn ends; after its native Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not Claude Code starts a turn to report the finished command. The events after the exit are printed, which records what a completion-wake turn sends first.
+- **Does not assert:** a command killed from outside (`status/background/007`), a command carried over from an earlier turn (`status/waiting/007`), desktop.
+- **Observed (Claude Code 2.1.322, Haiku 4.5, 2026-11-10):** Claude Code starts a turn to report the finished command. The first event it sends after the exit is a `Thinking` whose prompt is the `<task-notification>` it injects; the daemon's `ShellIdle` with an empty aggregate follows about 0.2 s later, and the turn ends with `Idle` about 2 s after that. The card reads Idle once the command's session is gone and again after that turn.
+- **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
+
+##### status/waiting/009 — A real interactive OpenCode's own background shell command reads Waiting after its turn ends, and Idle once it exits on its own (issue #1757).
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive OpenCode 2.x (the shell tool's `background` option exists only from 2) on the harness's cheap test model, spawned through Ctrl+N; skips on OpenCode 1.x.
+- **Asserts:** a directive prompt launches one background shell command (`ping -c 60 … && touch <unique sentinel>` in the fixture directory) and the turn ends; after OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not OpenCode starts a turn to report the finished command.
+- **Does not assert:** OpenCode 1.x, desktop.
+- **Found and fixed (OpenCode 2.2.5, 2026-11-10):** the card first read Waiting with `Background: 2 commands` for the one command started: `opencode --standalone` runs its server, `opencode serve --stdio --port 0`, in a POSIX session of its own below the pane, and the structural test counted it as a background command (and, first sampled in the pane's first turn, as awaited too). The scan now re-roots at that server on OpenCode 2 panes, once the deck's OpenCode watch has identified it as the client's own private server (`status/waiting/016`, `status/waiting/017`); the test passes locally. It prints every detached session below it at the Waiting check, which is how the cause was found.
+- **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
+
+##### status/waiting/010 — The bell does not ring on the step to Waiting, and rings on its later step to Idle (issue #1757).
+- **Layer:** L1 unit (`src/ui.rs`, fast tier).
+- **Agent:** none; session fixtures fed to the TUI's bell transition check.
+- **Asserts:** with the idle bell on, Working → Waiting rings nothing and the later Waiting → Idle rings.
+- **Does not assert:** the terminal bell write, the desktop's notifications.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/011 — A subagent's answered prompt returns a Waiting card to Waiting (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; Claude-shaped subagent frames applied to a client card folded into Waiting.
+- **Asserts:** a subagent's permission request moves a Waiting card to Needs Input, and that subagent's tool call ending returns it to Waiting rather than Thinking.
+- **Does not assert:** the daemon's own fold (001), a main-thread prompt.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/012 — Codex output moves a Waiting card as it moves an Idle one (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; a Codex wrapper output frame (prompt hook unavailable) applied to a client card folded into Waiting.
+- **Asserts:** the output frame classified as Thinking moves the Waiting card to Thinking.
+- **Does not assert:** the wrapper's classification, the shell-activity monitor's own `Idle`-or-Waiting re-emit check (no seam below the running monitor).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/013 — A kept card folds Idle and Waiting against the background copy a hydration snapshot leaves it with (issue #1757).
+- **Layer:** L1 protocol/fold, fast tier (`waiting_status.rs`).
+- **Agent:** none; daemon-shaped broadcasts at a millisecond-exact instant, then hydration snapshots for the card the client already holds.
+- **Asserts:** a Waiting card given a snapshot whose activity stamp equals (and, separately, predates) the card's — so its Idle status is refused — but whose newer background revision is cleared reads Idle with no background line; an Idle card given a newer revision that awaits a command reads Waiting; an older snapshot revision changes neither; a fresh card still hydrates Waiting.
+- **Does not assert:** the daemon building the snapshot, the attach protocol carrying it, rendering.
+- **Verified load-bearing:** red with the fold after `merge_snapshot_background` removed.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/014 — A new conversation starts a new turn clock, so the old conversation's command reads as an earlier turn's (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; Claude-shaped reports and command samples fed to one pane's background record at fixed times, and to a daemon-owned `AppState` with an ownership stub.
+- **Asserts:** after a turn that ends with its own command running (Waiting), a `SessionStart` under a new session id with no `SessionEnd` reads Idle with the old command's Background line and age kept, and so does that conversation's Idle with no prompt before it, even within the sampling grace of the old turn's end; a command started in a real turn of the new conversation reads Waiting again (two commands, one awaited); a new conversation started mid-turn moves the turn's start too.
+- **Does not assert:** a `SessionEnd` (covered by `status/background/012`), the hook path (`status/background/002`).
+- **Verified load-bearing:** red with the reset on a new conversation removed.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/015 — The sampling grace is a fixed classification window around the turn (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier).
+- **Agent:** none; one pane's background record driven at fixed times.
+- **Asserts:** with a turn from 1000 to 2000 ms, a command first sampled at 1000, 1500, 2000 or exactly 1000 ms (two polls) after the end is awaited; one first sampled at 999 ms or a millisecond past the grace is not; the grace is 1000 ms, below the lane-1 tests' `PAST_THE_TURN`.
+- **Does not assert:** when a real process started (the window classifies first samples, not start times), the monitor's timing.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/016 — An identified OpenCode 2 private server is not a background command, so it cannot make a card read Waiting (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process-table fixtures shaped as measured on OpenCode 2.2.5 (`<path>/opencode serve --stdio --port 0` as the client's direct child in a session of its own, the deck's inbox watcher in the server's session), with the client/server pair the OpenCode watch identifies passed in.
+- **Asserts:** with the identified pair the server and everything in its session yield no qualifying session (without it, the server's session counts, the defect `status/waiting/009` found); a backgrounded command below the server counts once; a `serve --stdio` a tool starts below the server, a sibling `serve --stdio` of the client, and a forged one a wrapper shell starts all count; an identity naming a pid whose parent is not the client, a server whose command line was not read (and a readable tool server below it), and a pid whose command line no longer reads as a server all count; with no identity (OpenCode 1.x, an unknown version) a shell command quoting `opencode serve --stdio` and a `serve --stdio` child of the client count exactly as before; the command-line re-check takes words in place (program, then `serve --stdio`), not substrings.
+- **Does not assert:** the watch's identification (`status/waiting/017`), the sampler reading the server's command line (`status/shell-activity/008` pins that session-boundary rows are read), a live OpenCode (`status/waiting/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/017 — The OpenCode watch names only a known OpenCode 2 client's own private server for the scan to exempt (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; process rows with executables and arguments, as the OpenCode watch samples them, shaped as measured on OpenCode 2.2.5.
+- **Asserts:** for a client whose version is known to be 2.x the watch names the client and its first direct child running the OpenCode executable with `serve --stdio`; it names nothing for OpenCode 1.x, an unknown version, a client whose only `serve --stdio` child is not an OpenCode executable, or once the client is gone; a second server child is not named; fed into the scan, the named server is exempt and a forged `serve --stdio` the wrapper shell started still counts.
+- **Does not assert:** the daemon storing the identity on the pane's agent and handing it to the scan (`run_monitor`, `shell_activity_candidates`), the watch's sampling, a live OpenCode (`status/waiting/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/018 — A client that replaces the one a direct OpenCode 2 spawn started does not inherit the spawn's version, so a tool's `serve --stdio` under it counts (issue #1757).
+- **Layer:** L1 pure data (`shell_activity.rs`, fast tier).
+- **Agent:** none; two-or-three-look sequences of process rows, as the OpenCode watch samples them, for one watched agent whose direct spawn was probed as 2.2.5.
+- **Asserts:** after the spawn's own 2.x client and its private server are named, a replacement client — a new pid running a binary recorded as 1.19.5, a new pid running a binary with no recorded version, or the same pid now running the 1.x binary (an `exec`), with or without a look at a pane running no client in between — gets no private server named and nothing to publish, and fed into the scan the `serve --stdio` its tool started as its direct child, and that command's session, count; the spawn's own client, looked at again, keeps its server named.
+- **Does not assert:** the daemon clearing the registry copy after a failed look (the `agent_pty` unit test `publishing_opencode_private_servers_clears_every_unnamed_agent` pins the registry half; `run_monitor`'s wiring is untested), a replacement that runs before the watch's first look (it is taken for the spawn's client), a reused pid that is again the client's direct `serve --stdio` child, a live OpenCode.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/019 — A turn that ends as Waiting rings the idle bell once, at its final Idle (issue #1757).
+- **Layer:** L1 unit (`src/ui.rs`, fast tier).
+- **Agent:** none; one session fixture fed to the TUI's bell transition check every 100 ms on an injected clock, following the daemon's sequence for a command first sampled after the turn's `Idle`.
+- **Asserts:** with the idle bell on, Working → Idle → (500 ms later) Waiting → Idle rings exactly once, at the final Idle; through the first Idle the card is held as settling, which draws a steady dot; a plain Working → Idle rings once it has stayed Idle for the settle window (`bell_respects_config_toggle_on`).
+- **Does not assert:** the terminal bell write, the rendered dot on a live grid (the settling card's lit tick is chosen at the grid's call site), the desktop app (it has no idle bell, blink or notification).
+- **Verified load-bearing:** red (two bells) with the settle window set to zero.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/020 — A close sent right after a worker's turn ends waits for the turn to settle, then refuses a card that turned Waiting (issue #1757).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames for the worker, then the monitor's command sample and `ShellBusy` applied 300 ms after the `Idle`.
+- **Asserts:** a close of the reported-done orchestration sent while the worker reads Idle is refused as busy with a message naming Waiting, and stops no pane.
+- **Does not assert:** the shell-activity monitor's own sampling (the sample is applied by hand), a close sent after the settle window (the existing background-work close tests).
+- **Verified load-bearing:** red (the close is not refused) with the settle wait removed from the close's fact reading.
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/021 — A close re-checks the settle window after each wait, so turns a worker ends while the close waits are waited out too (issue #1757, Qodo on PR #2250).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames for the worker: a turn ends just before the close, two more short turns end during its waits (at 1.1 s and 2.3 s), and the monitor's command sample and `ShellBusy` land at 2.9 s, after the second wait would have ended.
+- **Asserts:** the close of the reported-done orchestration is refused as busy with a message naming Waiting, and stops no pane.
+- **Does not assert:** the shell-activity monitor's own sampling (the sample is applied by hand), the cap (status/waiting/022).
+- **Verified load-bearing:** red (the worker is stopped) with the close waiting once per fact read instead of re-checking the window after each wait.
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/022 — A close stops waiting for a worker that keeps ending turns at its cap, and refuses it as busy (issue #1757, Qodo on PR #2250).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames ending a worker turn every 600 ms for three seconds past the cap.
+- **Asserts:** the close answers between the cap (`CLOSE_SETTLE_CAP`, three settle windows) and the cap plus 1.5 s, refused as busy with a message saying the worker kept ending turns, and stops no pane.
+- **Does not assert:** the exact cap value beyond the timing bounds, a forced close of such a worker (`--force` overrides any busy refusal).
+- **Verified load-bearing:** red with the re-check removed (the close stops the worker after one wait) and red with the cap removed (the close answers only after the worker stops).
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/023 — A close of a worker that stays quiet after its turn ends waits one settle window, not the cap (issue #1757).
+- **Layer:** L1 daemon-handler test (`src/close_agents.rs`, fast tier) through a real attach socket and `sleep` stand-in panes.
+- **Agent:** none; Claude-shaped hook frames ending one worker turn just before the close.
+- **Asserts:** the close of the reported-done orchestration closes it and stops both panes within one settle window plus 1.5 s, and before the cap.
+- **Does not assert:** a close sent after the settle window (the existing background-work close tests).
+- **Verified load-bearing:** red (the close answers at the cap) with each wait running to the cap instead of to the end of the window.
+- **Platform coverage:** mac+linux (the module is `cfg(unix)`).
+
+##### status/waiting/024 — A real interactive Codex's own background command reads Waiting after its turn ends, and Idle once it exits on its own (issue #1757).
+- **Layer:** L2 real agent, PTY-attached (`e2e_shell_activity_real_agent.rs`, lane 2; e2e + e2e-live + Unix).
+- **Agent:** real interactive Codex on the harness's cheap test model (`codex_test_model`), `--sandbox workspace-write --ask-for-approval never`, spawned through Ctrl+N; developer credentials required.
+- **Asserts:** a directive prompt starts one command with Codex's exec tool and a 1 s `yield_time_ms` (`sleep 60 && touch <unique sentinel>`), which leaves it running in a Codex background terminal past the turn, and the turn ends; after Codex's Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; the command exits by itself and writes the sentinel; the card then settles on Idle with no background line, whether or not Codex starts a turn to report the finished command. It prints every detached session below it at the Waiting check, and the events after the exit.
+- **Does not assert:** a command carried over from an earlier turn (`status/waiting/007`), Codex without a sandbox, macOS's sandbox, desktop.
+- **Found and fixed (Codex 0.164.0, 2026-11-11):** the card first read Waiting with `Background: 2 commands` for the one command: on Linux Codex runs it under `codex-linux-sandbox` in a session of its own, and the bubblewrap inside that starts a second session for the command. On a Codex pane the scan now counts that measured wrapper chain as one command (`status/waiting/025`); the test passes locally.
+- **Observed (Codex 0.164.0, `gpt-5.6-luna`, 2026-11-11):** Codex does not start a turn when the background command finishes: the only event after the exit is the daemon's `ShellIdle` with an empty aggregate, and no Thinking or tool call followed within 45 s of the card settling on Idle.
+- **Platform coverage:** linux (run locally; lane 2 runs nowhere in CI).
+
+##### status/waiting/025 — On a Codex pane, Codex's two-session Linux sandbox counts as one command, and only the measured wrapper chain is collapsed in the displayed count (issue #1757).
+- **Layer:** pure-data unit (`tests/shell_activity.rs`, fast tier).
+- **Agent:** none; a process table shaped like the Codex tree `status/waiting/024` printed (codex-cli 0.164.0, Linux, 2026-11-11), with the wrappers' command lines as measured: the outer stage's program is the path to the `codex-linux-sandbox` link Codex runs itself through (`<CODEX_HOME>/tmp/arg0-linux/codex-arg0<random>/`), the inner stage's the bare name bubblewrap's `--argv0` sets.
+- **Asserts:** on a Codex pane (`CommandWrapper::CodexLinuxSandbox`), `codex-linux-sandbox` (outer stage) in a session of its own as the agent's child, `bwrap` as its only child in that session, and `codex-linux-sandbox … --apply-seccomp-then-exec -- …` (inner stage) as bubblewrap's only child leading a second session count as one command in the displayed set (`qualifying_command_sessions_in_pane`: the outer session; both stay in the raw set the background ages are kept for, `status/waiting/028`); the sampler reads only the two wrappers' command lines; a second chain counts as a second; a session the command starts below the inner wrapper counts. The same table on a pane with no wrapper counts both sessions. A Codex pane counts both whenever a link differs: bubblewrap's session unreadable or a session of its own, no bubblewrap, an extra session between bubblewrap and the inner wrapper, a second child of bubblewrap, either wrapper's command line unread, the inner stage's option only after the `--`, an inner stage where the outer belongs, another program, a shell quoting the wrapper; the bare program name (as `codex sandbox` runs it) still collapses; a session nested below a user's `setsid` launcher counts, and so does a whole wrapper chain below one; the agent's own children count as none.
+- **Does not assert:** a live Codex (`status/waiting/024`), the pane's agent kind selecting the wrapper (`agent_pty::tests::only_a_codex_pane_selects_the_codex_sandbox_wrapper`), macOS's sandbox.
+- **Verified load-bearing:** red with the collapse removed (`{538581, 538586}`), with the bubblewrap link unchecked (`{538581}` where both should count), with the program word compared whole rather than by file name (`{538581, 538586}`: `status/waiting/024` read `Background: 2 commands` that way against a live Codex, whose outer stage runs from a path), and with 952bb2c7's general outermost-session filter restored (`{538581}` on a pane with no wrapper).
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/026 — A detached outer session that does not qualify as a command hides no command below it (issue #1757).
+- **Layer:** pure-data unit (`tests/shell_activity.rs`, fast tier).
+- **Agent:** none; a Claude pane whose Claude runs below a detached launcher, with the measured Bash-tool argv shape, and a Codex wrapper chain.
+- **Asserts:** with `CLAUDE_BASH_TOOL_SHAPE`, a Bash-tool session below a detached outer session whose command line does not match the shape, or was not read, counts and the pane reads busy; on a Codex pane, with a cross-check only the inner wrapper carries, the outer session does not qualify and the inner one stays counted (qualification comes before the collapse).
+- **Does not assert:** a live Claude below a launcher.
+- **Verified load-bearing:** red (`{}` for `{300}`) with 952bb2c7's general outermost-session filter restored, and red (`{}` for `{206}`) with the collapse not requiring the outer session to qualify.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/027 — A command a turn starts below an older, unrecognised detached session is awaited, so the card reads Waiting (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier), daemon-owned card.
+- **Agent:** none; an OpenCode pane's process table (`status/waiting/016`'s shapes) whose private server's command line was not read, classified by the real scan and folded into the daemon's background record.
+- **Asserts:** the server, sampled after turn 1 ended, counts as an earlier turn's command; turn 2's tool starts a command in a session of its own below the server and the turn ends while it runs; the card reads Waiting, with two commands, at least one awaited.
+- **Does not assert:** a live OpenCode (`status/waiting/009`), the TUI or desktop render (`status/waiting/004`).
+- **Verified load-bearing:** red (the card reads Idle; the scan returns only the server's session) with 952bb2c7's general outermost-session filter restored.
+- **Platform coverage:** mac+linux+windows.
+
+##### status/waiting/028 — On a Codex pane, a session paired with an older wrapper session but started this turn is awaited, so the card reads Waiting with one command (issue #1757).
+- **Layer:** L1 unit (`src/state.rs`, fast tier), daemon-owned card.
+- **Agent:** none; a Codex pane's process table with a forged wrapper chain: a self-titled outer stage, an arbitrary sole child whose command line is never read, and, from the second sample on, a self-titled inner stage below that child — classified by the real scan (`command_sessions_in_pane` with `CommandWrapper::CodexLinuxSandbox`) and folded into the daemon's background record.
+- **Asserts:** the outer session, sampled after turn 1 ended, counts as an earlier turn's command; in turn 2 the inner session appears and the turn ends while it runs; the scan keeps both sessions raw and pairs inner with outer for the displayed count only; the card reads Waiting with one command, one awaited. The measured chain with both stages first seen in one turn is likewise one command, one awaited.
+- **Does not assert:** a live Codex (`status/waiting/024`), the scan's link checks (`status/waiting/025`).
+- **Verified load-bearing:** red (the card reads Idle) with the background record fed the collapsed display set instead of the raw sessions.
+- **Platform coverage:** mac+linux+windows.
 
 ### Agent protocol
 
@@ -2013,7 +2519,7 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 ##### prompt/close-confirm/001 — Command-mode Ctrl+W opens a Cancel-default close confirmation.
 - **Layer:** L1 (in-process key mapper + close-confirm state + ratatui `TestBackend`).
 - **Agent:** none.
-- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default.
+- **Asserts:** Ctrl+W resolves `CloseSelected`, an available target opens the confirmation, both pane- and tab-scoped states render their exact blast-radius sentence/description without copy leakage, and `Cancel` remains selected by default; with no keep-worktree choice armed (nothing dispatched in the selection, or a daemon without the keep capability) neither scope draws a `keep worktree` choice, and Down twice from Cancel stops on Close, whose Enter is `ConfirmCloseSelected` (issue #1958).
 - **Does not assert:** daemon teardown after confirmation (covered by `lifecycle/stop/*` and `dashboard/pane/002`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -2074,6 +2580,27 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Asserts:** after Ctrl+W arms a card whose session id is `{pane_id}-session`, a second `SessionStart` under that SAME id differing ONLY in `agent_id` takes the pane; confirming surfaces `Nothing closed`, retains the card, and leaves the daemon agent alive rather than tearing down the replacement generation.
 - **Why it exists:** `prompt/close-confirm/005` proves the vanishing case through a session id that goes away, which is the easy half — the key stops resolving and the close cannot land anywhere. Pi's producer key is derived from the pane and is stable across respawns, so it never stops resolving, and an armed target keyed on the id alone resolved straight onto whichever generation currently occupied the pane. The fix arms on the generation (session id plus `agent_id`), which is only detectable because #284 refreshes `agent_id` in place on the surviving entry.
 - **Does not assert:** the state seam's own supersession rule (`status/supersede/005`); tab identity binding (`mouse/tabstrip/003`); that a `None` → `Some` identity transition is treated as the same card (a deliberate agreement with the state seam, unit-tested at `resolve_close_plan`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/011 — A close whose selection has a dispatched worktree the daemon can keep offers `Close, keep worktree` as a third choice (issue #1958).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`, plus `handle_close_confirm_key`).
+- **Agent:** none.
+- **Asserts:** a `CloseConfirmState` armed with `dispatched_worktree: Some(path)` draws Cancel, Close and `Close, keep worktree` top to bottom in both the pane scope and the tab scope (each with its own header and Close description), Cancel stays the default, and the keyboard hint is still inside the popup — also with the dirty-tree warning drawn above the choices; Down twice from Cancel reaches the keep choice and stops there, Enter on it returns `Action::ConfirmCloseKeepWorktree`, Enter on Close still returns `Action::ConfirmCloseSelected` and Enter on Cancel `Action::DismissModal`.
+- **Does not assert:** how the TUI decides to arm it (the daemon's `CAP_KEEP_WORKTREE` and the close preview's `dispatched_worktree`, unit-tested in `daemon_client`), the keep row's description, mouse buttons, or the close itself (`prompt/close-confirm/012`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/012 — Ctrl+W's `Close, keep worktree` closes a clean dispatched unit and keeps its worktree, saying so on the status line (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
+- **Agent:** none — identity-recording `cat` probe.
+- **Asserts:** with a clean dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its card selected, Ctrl+W draws Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes the agent, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk.
+- **Does not assert:** the tab/orchestration scope in the TUI (`prompt/close-confirm/013`), a daemon without the keep capability, or a real agent.
+- **Platform coverage:** mac+linux.
+
+##### prompt/close-confirm/013 — Ctrl+W's `Close, keep worktree` on a dispatched team's tab stops both roles and keeps their shared worktree (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --orchestration`).
+- **Agent:** none — identity-recording `cat` probes for both roles.
+- **Asserts:** with a clean two-role dispatched worktree (a file in its ignored `.dot-agent-deck/`, `git status` empty) and its tab active, Ctrl+W draws `Close this tab and all its agents?` with Cancel, Close and `Close, keep worktree` top to bottom; Down, Down, Enter removes both roles and the tab, the status line shows `Worktree kept on request:` with the worktree's path, and the worktree and its `.dot-agent-deck/` file are still on disk. Fails if `TabManager::close_tab_with` drops the keep on its fan-out.
+- **Does not assert:** a keep on one role of a team followed by an ordinary close of the other (the daemon-level `close_agents::tests::keeping_on_one_role_survives_an_ordinary_close_of_the_last`), a daemon without the keep capability, or a real agent.
 - **Platform coverage:** mac+linux.
 
 #### prompt/pane-input
@@ -2188,7 +2715,7 @@ Agent coverage (rule 20): Claude Code (001–003), Codex (004) and OpenCode (005
 
 Measured while writing these, against Claude Code 2.1.289 through this path, and worth knowing for whoever sends the clear key: **separate writes are not separate reads.** Two writes of 32 `Ctrl+U` sent back to back left Claude's prompt untouched, exactly as one write of 64 does (Claude ignores a read holding 64 or more); two 250 ms apart did too on a box at load 174; two 1 s apart cleared it; a single write of 32 always did. `DEL` × 100 in one write was exact, and on 2026-10-04 so were single writes of 400 and 800 `DEL`s against Claude Code 2.1.289, Codex 0.160.0 and OpenCode 1.18.34. The paste-collapse threshold applies to what the agent reads, not to one write: an 8-character write followed at once by an 800-character one was read by Claude as one 808-character paste and collapsed, so 003 writes its long dictation only once the prompt before it is on screen. An `Enter` written in the same burst as the text before it is taken as part of a paste and inserts a newline, so the tests let typed text settle before `Enter`.
 
-##### prompt/voice-keys/001 — The served interrupt key ends a REAL interactive Claude turn mid-task, keeps the agent running, and the agent answers the next prompt. [reel]
+##### prompt/voice-keys/001 — The served interrupt key ends a REAL interactive Claude turn mid-task, keeps the agent running, and the agent answers the next prompt.
 - **Layer:** L2 PTY-attached (the real binary in the vt100 `TuiDeck` harness; records a cast), lane 2.
 - **Agent:** REAL interactive Claude Code on `claude-haiku-4-5-20251001`, onboarding and project trust seeded, `--allowedTools Bash Read`; no `-p`.
 - **Asserts:** the daemon serves `prompt_keys` for the Claude pane and no interrupt step contains `0x03`; a directive long-list prompt written on the attach stream puts Claude visibly to work (`esc to interrupt`); writing the served interrupt steps (honouring each `pause_after_ms`) makes Claude show `Interrupted` with no working indicator, which stays away for 3 s; the agent record is still present and not `crashed`; and a follow-up prompt asking for the uniquely named fixture file `voicekeys_interrupt_sentinel_4e7b.txt` is answered with that name on screen.
@@ -2434,7 +2961,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** launch wrapping (covered by `codex/spawn/*` and `codex/live/001`); the desktop's voice `choose_agent_type`, which is the remaining way to set Command from an agent's registry default.
 - **Platform coverage:** mac+linux.
 
-##### prompt/new-pane/016 — Selecting the "dispatcher" option in the new-pane form opens a live dispatcher dashboard card whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220). [reel]
+##### prompt/new-pane/016 — Selecting the "dispatcher" option in the new-pane form opens a live dispatcher dashboard card whose real Claude agent, given a goal, invokes `dot-agent-deck dispatch` itself and the daemon creates the promised sibling git worktree (PRD #220).
 - **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with imported Claude credentials — records a `full-stream.cast`). The freshly-built binary's dir is prepended to the PATH the deck → daemon → agents inherit, so the agent's `dot-agent-deck dispatch` resolves to the build under test rather than a host-installed binary that predates the verb.
 - **Agent:** Claude Code (interactive `claude`, real Anthropic API — receives the dispatcher seed through its native inbox, acts on the typed goal, and runs the `dispatch` verb itself; no stand-in), pinned to Haiku (`--model claude-haiku-4-5-20251001`) and reached through `common::write_late_announcing_real_agent`: a `claude`-named launcher set as the deck's `default_command`, which declares the agent TYPE at exec with a `wrapper_fork`-origin `SessionStart`, withholds the real agent for 3 s, drains and records whatever the deck typed in the meantime, and only then `exec`s Claude. The dispatched unit inherits the same `default_command` — so the same 3 s, and the same model. Before issue #1013 the launcher `exec`'d a bare `claude`, which ran on whatever the host's managed settings selected (measured on the dev box: Opus 5 at xhigh reasoning effort) — silent, since nothing reports the model it picked.
 - **Asserts,** in the order they can fail: the dispatcher surfaces live as a single dashboard card within 60s of form submission (`1 agent(s)`, no tab strip); the pane's input queue was empty when the launcher handed over to Claude (`clean`); the dispatcher seed is acknowledged once, appears as an envelope label and stays out of user prompt history; then, after a one-unit goal is typed, the sibling worktree `../<repo>-dispatch-probe-unit` appears within 180s, proving agent → `dispatch` CLI → daemon → `git worktree add` end to end.
@@ -2520,7 +3047,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 ##### tabs/orchestration/001 — Selecting an orchestration on the new-pane form opens one pane per role and seats exactly one orchestrator: it has focus, its inbox receives the orchestrator prompt, and it is the one pane that may `delegate` (issue #523).
 - **Layer:** L2 (`tests/e2e_orchestrator_seat.rs`).
-- **Agent:** none (a two-role config written at runtime over the `minimal` fixture; both roles are `cat` stand-ins that print a ready sentinel and echo their PTY input, so "which pane received it" is a substring question. No LLM tokens, so deliberately unmarked for the reel).
+- **Agent:** none (a two-role config written at runtime over the `minimal` fixture; both roles are `cat` stand-ins that print a ready sentinel and echo their PTY input, so "which pane received it" is a substring question. No LLM tokens).
 - **Asserts:** for a config whose worker `coder` comes FIRST and whose second role is named `orchestrator` — once with `start = true` on it (the control) and once with no `start` anywhere (issue #523's config) — a keystroke typed on the freshly opened tab reaches `orchestrator`'s pane and not `coder`'s; the orchestrator prompt (the pointer to that tab's own `orchestrator-context-<32 hex>.md`, issue #1233) is posted to `orchestrator`'s inbox and not `coder`'s (PRD #1666: the deck posts rather than types it; read over the attach socket); the file it names carries `orchestrator`'s own `prompt_template` and lists only `coder` under the available agents; `daemon status --json` marks exactly one card `(orchestrator)`, the named one; `coder`'s `delegate` is refused and `orchestrator`'s task reaches `coder`'s inbox.
 - **Does not assert:** a real agent reading the prompt (stand-ins only); the dispatched/scheduled spawn path, whose seat is the same `OrchestrationConfig::orchestrator_role_index` rule and is covered at L1 (`spawn::tests::orchestrator_role_index_*`, `state::tests::register_orchestration_role_makes_orch_idx_the_orchestrator`); a config with `start = true` on a role beside a DIFFERENT role named `orchestrator` (L1: `tab::tests::orchestration_tab_seats_the_one_orchestrator_the_rule_names`); the reconnect rebuild of the tab.
 - **Platform coverage:** mac+linux.
@@ -2605,13 +3132,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 
 ##### tabs/orchestration/011 — In command mode `z` zooms the focused role pane to the whole frame with a `[Z]` marker on its kept border, while in PaneInput the same key is an ordinary character; every non-focused agent keeps running behind the zoom and a second `z` restores the previous view (PRD #313).
 - **Layer:** L2 (real-binary PTY via the vt100 `TuiDeck` harness, `tests/e2e_orchestration_pane_column.rs`).
-- **Agent:** none (`orch-focus-lifecycle` fixture — a 3-role orchestration of shell stand-ins; `beta` self-posts real `SessionStart`/`PreToolUse` hook events through the freshly built binary so its sidebar status transitions Idle -> Working. No LLM tokens spent, so this entry is deliberately UNMARKED for the demo reel per CLAUDE.md rule 4 — the reel clip comes from `tabs/orchestration/012`).
+- **Agent:** none (`orch-focus-lifecycle` fixture — a 3-role orchestration of shell stand-ins; `beta` self-posts real `SessionStart`/`PreToolUse` hook events through the freshly built binary so its sidebar status transitions Idle -> Working. No LLM tokens spent).
 - **Asserts:** opening a real orchestration tab on a 120-column PTY renders the role-pane column's left edge at the default 34%-width boundary (col 40/41); `z` pressed while still in PaneInput moves neither the boundary nor draws a marker, because there it is a plain character the agent is entitled to receive; after `Ctrl+d` to command mode, `z` moves the focused pane's box to column 0 — it still HAS a box, which is what the corner-glyph anchor proves, so the border that carries the title/focus/status channel survived the zoom — and its border title gains a `[Z]` marker; the sidebar (and with it `beta`'s status card) is no longer drawn; while zoomed the daemon's live agent registry still lists all three roles, so hiding a pane touched no agent's lifecycle; and a second `z` restores the 34/66 split with the marker gone and `beta`'s card back and still reading `Working`.
 - **Does not assert:** what a REAL agent does across the two PTY resizes (covered by `tabs/orchestration/012`); the per-tab scope of the zoom state across several open tabs (covered by `orchestration/layout/009`); the resolver/scoping of the key itself (covered by `orchestration/layout/007`); persistence across detach/reattach (out of scope per PRD #313 Open Question 5 — zoom is ephemeral).
 - **Platform coverage:** mac+linux.
 
-##### tabs/orchestration/012 — A REAL interactive Claude agent reflows and keeps working across a zoom and an unzoom, painting a sentinel it could only have discovered by running a tool (PRD #313). [reel]
-- **Layer:** L2 PTY-attached, real-agent tier (records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180). Runtime-skipped when the `claude` CLI or credentials are absent.
+##### tabs/orchestration/012 — A REAL interactive Claude agent reflows and keeps working across a zoom and an unzoom, painting a sentinel it could only have discovered by running a tool (PRD #313).
+- **Layer:** L2 PTY-attached, real-agent tier (records a `full-stream.cast`). Runtime-skipped when the `claude` CLI or credentials are absent.
 - **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`), FULLY INTERACTIVE — no `-p`, no stand-in — as the non-orchestrator `worker` role of the `orch-lock-live` fixture; the orchestrator stays `cat` so the run costs two short real turns. Launched WITHOUT `DOT_AGENT_DECK_EXPERIMENTAL`, so PRD #393's command-entry lock is absent and the directives typed at the worker reach it. Project trust is pre-seeded into the per-test HOME (`with_claude_trust_workdir`) so claude's first-run onboarding/trust gates clear with no keystroke.
 - **Asserts:** with the live agent's pane focused via the `2` role jump and rendered at the default 34/66 split, `z` in command mode moves its box to column 0 and marks its border `[Z]`; a directive typed into the ZOOMED pane — asking the agent to `ls` and name the only file ending in `.txt` — results in the sentinel `zoomlive_x7q2m.txt` painting inside the full-width pane column, which is only reachable if the agent survived the PTY resize, kept working, and kept rendering at the new width; a second `z` restores the 34/66 split; and a second directive naming the only `.log` file results in `zoomlive_k4v9p.log` painting after the downward resize too. Neither sentinel token appears in the directive that asks for it, so an echo of the user's own typing can never satisfy either assertion, and the wrap-insensitive search is cropped to the pane column so the sidebar's card text cannot splice a needle apart. This is PRD #313's "resize churn … the thing to verify with a real agent rather than a stand-in".
 - **Does not assert:** anything when skipped — where credentials are absent this test executes nothing, so `tabs/orchestration/011` carries the CI-visible coverage; scrollback preservation across the resize beyond the agent continuing to paint; the exact reflowed line breaks (LLM- and terminal-dependent).
@@ -3122,6 +3649,42 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** the 1.x TUI half and `tui.json` across the switch (unit-tested in `opencode_alternating_generations_rewrite_nothing`); that a real OpenCode 2 reloads on a rewrite; an in-place rewrite of the binary that keeps size, mtime and inode; a version change between two spawns of the same running agent; a daemon of another template revision (`an_older_deck_never_downgrades_a_newer_template`).
 - **Platform coverage:** mac+linux.
 
+#### hooks/opencode-real
+
+Issue #2051: the deck's OpenCode plugin under the real, pinned OpenCode binaries, in CI's lane 1 on both backends, with no model. The file header has the no-model guarantee in full and the measurements behind what each check reads.
+
+##### hooks/opencode-real/001 — A real OpenCode 1.x loads both halves of the deck's plugin, and a session it creates reaches the card (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 1.x (1.19.5 when written) (`scripts/opencode-pins/v1`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(1)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** the pane draws OpenCode's own `No provider selected`; the deck adds no `--standalone`; the plugin's server half (`inbox wait --doorbell-only`) and TUI half (`inbox wait` without it) run their watchers inside OpenCode, and `inbox_list` reports the pane armed by `opencode_plugin`; the card has no status until `POST /session` on OpenCode's loopback server (`--port`) creates a session, whose `SessionStart` arrives with that `ses_` id, owned by the pane's agent and pane, after which the card reads Idle in `daemon status --json` and on the dashboard; OpenCode reports no failed plugin.
+- **Does not assert:** a failed-plugin report from 1.x (1.19.5 reported a deliberately broken plugin nowhere, in its log or on screen, so the watchers are the evidence); a turn, a tool or a prompt (there is no model); delivery of a deck message (1.x's TUI half opens its "connect a provider" dialog instead).
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/002 — A real OpenCode 2.x gets `--standalone`, and its plugin runs with the pane's environment (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 2.x (2.2.5 when written) (`scripts/opencode-pins/v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** the deck starts it with `--standalone` exactly once; its private server (`serve --stdio`) carries the pane's `DOT_AGENT_DECK_PANE_ID` and `DOT_AGENT_DECK_AGENT_ID`, the server half's watcher runs under that server and the TUI half's under the client, and `inbox_list` reports the pane armed by `opencode_plugin`; a deck message posted to the pane starts a `ses_` session whose `SessionStart` and `Error` (the turn fails for want of a model) are owned by the pane's agent and pane, and the card goes from no status to Error in `daemon status --json` and on the dashboard; no `failed to load plugin` in OpenCode's log and no `Plugin failed` on screen.
+- **Does not assert:** the message being answered or acknowledged; OpenCode's shared background service (a real 2.x off `--standalone` would join the machine's one service on a fixed port; the stand-in `inbox/opencode/061` covers it); `mini`.
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/003 — A real OpenCode 2.x reports a broken plugin beside the deck's, so the failed-plugin check can fail (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent.
+- **Agent:** the pinned REAL OpenCode 2.x (`scripts/opencode-pins/v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** with a plugin that throws as it loads in the config root's `plugin/` beside the deck's, the deck's plugin still loads (watchers, armed) and OpenCode reports a failed plugin both in its log (`failed to load plugin`) and on screen (`Plugin failed`), every such log line naming the broken file and none naming a deck file.
+- **Does not assert:** 1.x (which reports such a plugin nowhere, measured on 1.19.5).
+- **Platform coverage:** linux.
+- **Cost:** none.
+
+##### hooks/opencode-real/004 — Switching one config root between real OpenCode 2.x, 1.x and 2.x again keeps the deck's plugin loading (#2051).
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_opencode_real_binary.rs`, Linux): a real `TuiDeck`, the pane started through the attach protocol's `start-agent` as a declared OpenCode agent. Three panes in turn, each stopped before the next starts.
+- **Agent:** the pinned REAL OpenCode 1.x and 2.x (`scripts/opencode-pins/v1` and `v2`, installed by `scripts/install-pinned-opencode.sh`; `common::pinned_opencode_bin(1)` / `(2)`) with NO model: `enabled_providers: []`, which also turns off OpenCode's free built-in models, no credential (`without_agent_credentials`, no auth file, no credential-shaped variable in any OpenCode process's `/proc` environment) and every proxy variable pointed at a listener in the test that answers nothing, which must see OpenCode's model-catalog fetch to show the variables are read (it observes only what takes the proxy). Not a real agent in CLAUDE.md rule 5's sense: there is no model for it to reach.
+- **Asserts:** each start loads the deck's plugin (watchers, armed) with no failed plugin reported; the first 2.x start leaves a deck entry in `cli.json` (the deck's 1.x TUI entry, which 2.x copies from `tui.json`; a precondition, so a 2.x that stops copying it fails rather than leaving the repair untested), after the 1.x start's install `cli.json` holds no deck entry, and the second 2.x start finds none; the deck's server module keeps its bytes, inode and mtime from the first start to the last.
+- **Does not assert:** one data root across the switch: each pane gets its own `XDG_DATA_HOME`, because after OpenCode 2.x has run, 1.19.5 refuses to start on the database 2.x migrated (`Database is not empty and has no session table`, measured), whatever the deck does; a switch while an agent runs.
+- **Platform coverage:** linux.
+- **Cost:** none.
+
 #### hooks/stale
 
 ##### hooks/stale/001 — The notice names the agents, binary, versions and remedy, keeping the agents and both versions at 60 columns.
@@ -3145,7 +3708,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** TUI rendering or real-agent work.
 - **Platform coverage:** mac+linux.
 
-##### hooks/stale/004 — A real interactive Haiku Claude works while the attached dashboard shows the old-hook notice. [reel]
+##### hooks/stale/004 — A real interactive Haiku Claude works while the attached dashboard shows the old-hook notice.
 - **Layer:** L2 PTY-attached, lane 2.
 - **Agent:** real Claude Code, interactive Haiku `claude-haiku-4-5-20251001`, with imported credentials, seeded project trust and Bash allowed.
 - **Asserts:** a pinned version-reporting wrapper forwards genuine hooks with only the two version stamp keys removed; the real card renders Working then Idle alongside the unreported-version notice, and the visible agent terminal contains a unique on-disk sentinel from its list-files task. Zoom hides the dashboard notice and returning restores it.
@@ -3324,6 +3887,20 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none (six hydrated orchestration role panes with staggered 150–400 ms synthetic close delays).
 - **Asserts:** the close completes below a 1.0-second wall-clock ceiling versus a 1.65-second sequential sum, reports closed pane ids in original role order rather than completion order, and removes the clean tab.
 - **Does not assert:** production daemon/RPC latency; the synthetic delays isolate fan-out semantics.
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/020 — "Close, keep worktree" carries the keep on the retry and on the replacement's stop (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon that answers a follow-on `Hello` and records each StopAgent's `keep_worktree`).
+- **Agent:** none (the original agent answers exact NotFound twice and ListAgents reports replacement B, which stops).
+- **Asserts:** an ordinary close sends its three stops (first try, retry, replacement) with no keep; `close_pane_keeping_worktree` sends the same three stops, each with `keep_worktree: true`.
+- **Does not assert:** what the daemon does with the keep (`close_agents::tests`), the tab fan-out (`prompt/close-confirm/013`).
+- **Platform coverage:** mac+linux.
+
+##### lifecycle/stop/021 — "Close, keep worktree" carries the keep on every stop of a chained slot handover (issue #1958).
+- **Layer:** L1 (real `EmbeddedPaneController` against a stateful synthetic Unix-socket daemon).
+- **Agent:** none (replacement B loses its slot to C while its stop is in flight; C stops).
+- **Asserts:** the keeping close chases the handover to C and every StopAgent it sends carries `keep_worktree: true`.
+- **Does not assert:** the slot-churn bounds (`lifecycle/stop/013`, `lifecycle/stop/014`).
 - **Platform coverage:** mac+linux.
 
 #### lifecycle/wire-restart
@@ -3889,6 +4466,27 @@ note).
 - **Does not assert:** the release-mode log-once line; the upstream sizing that produces the capped parser (covered by `resize/layout/002`); the general area-larger-than-screen `min` fallback with the guard OFF (covered by `render/widget/002`).
 - **Platform coverage:** mac+linux+windows.
 
+##### render/widget/004 — Every screen cell is drawn in its own column: a wide (two-column) glyph takes the two columns it has on the screen, and a cell is never joined with its neighbour (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` rendered into a `ratatui::buffer::Buffer`, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** with `你好AB` on a vt100 screen's first row, the inner area shows `你` in column 0, `好` in column 2, `A` in column 4 and `B` in column 5, the screen's own columns; for `👩‍💻AB` (a zero-width-joiner emoji the screen keeps as two two-column cells), `🇺🇸AB` (a flag kept as two one-column cells) and `你好AB`, every screen cell's own text is drawn in that cell's column.
+- **Does not assert:** a wide glyph cut by the pane's right edge (it is not drawn); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag; colours.
+- **Platform coverage:** mac+linux+windows.
+
+##### render/widget/005 — A cell that changes width between two frames is redrawn where a fresh render draws it, whether the host terminal draws an emoji-presentation (VS16) symbol two columns wide or one: a glyph turning wide does not shift the rest of its row or leave its second column stale (PRD #385 decision 6).
+- **Layer:** L1 (in-process `TerminalWidget` → ratatui's `Buffer::diff` → the deck's backend, `WideGlyphBackend` over `CrosstermBackend<Vec<u8>>` → a vt100 parser standing in for the host terminal, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** on a host that draws `☀️` two columns wide (vt100) and on one that draws it one column wide (vt100 reading the output without its VS16 characters, as xterm.js's Unicode 6/11 width tables draw it): after drawing `☀︎AB` and then `☀️AB`, and after `xZAB` is rewritten as `☀️AB`, `❤️AB` or `1️⃣AB`, the display is cell for cell (contents, wide continuation, inverse, underline, colours) the same as a fresh render of the second frame, so `A` and `B` are not shifted and the symbol's second column keeps nothing of the first frame; the same holds for CJK, zero-width-joiner and VS16 glyphs replaced by narrow text, styled wide glyphs replaced by narrow ones (the trailing column's colour is cleared), `ｶﾞ` and `⌚︎`/`🙂︎` (widths the screen and ratatui measure differently), the sun turning narrow again, and wide-to-wide replacements.
+- **Does not assert:** how a real host terminal or font draws these sequences (both displays are models built on vt100); transitions in rows other than the first; scrolled-back screens.
+- **Platform coverage:** mac+linux+windows.
+
+##### render/widget/006 — A selection made after a row turned wide highlights exactly the text it copied, whether the host terminal draws an emoji-presentation (VS16) symbol two columns wide or one (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam` frames → ratatui's `Buffer::diff` → `WideGlyphBackend` over `CrosstermBackend<Vec<u8>>` → the two vt100-based host displays of `render/widget/005`, `tests/render_terminal_widget.rs`).
+- **Agent:** none.
+- **Asserts:** a pane shows `xZAB`, a drag over `xZ` copies `xZ`, the row is rewritten as `☀️AB`, a click on a blank row, then a drag over `A` and `B` copies `AB`; after every frame of that sequence is drawn incrementally, the cells drawn with the selection's background on each host show `AB`, and the display matches a fresh render of the last frame.
+- **Does not assert:** a real host terminal or font; keyboard copy mode; selections spanning the wide glyph itself.
+- **Platform coverage:** mac+linux+windows.
+
 #### render/layout
 
 ##### render/layout/001 — After a tab/layout switch with N panes the embedded pane's bottom rows show correct (non-stale) content — no off-by-one row shift.
@@ -4322,7 +4920,7 @@ without depending on the config struct API.
 - **Does not assert:** the orchestrator pane's error-line rendering (L2 `orchestration/delegate/004`); the daemon-side log entry.
 - **Platform coverage:** mac+linux.
 
-##### orchestration/delegate/009 — A clear=true real Codex replacement acts on an inbox delegate. [reel]
+##### orchestration/delegate/009 — A clear=true real Codex replacement acts on an inbox delegate.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_codex_delegate.rs`).
 - **Agent:** interactive cheap-model Codex through the deck wrapper; a scripted orchestrator invokes the genuine delegate CLI.
 - **Asserts:** normal new-pane orchestration flow, visible real Codex before delegation, replacement generation, submit-hook inbox injection, acknowledgement, exact sentinel and envelope card.
@@ -4337,7 +4935,7 @@ without depending on the config struct API.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
-##### orchestration/delegate/014 — A clear=true inbox delegate reaches a real replacement Haiku worker. [reel]
+##### orchestration/delegate/014 — A clear=true inbox delegate reaches a real replacement Haiku worker.
 - **Layer:** L2 real agent, lane 2, PTY-attached (`tests/e2e_delegate_respawn_readiness.rs`).
 - **Agent:** Claude Code, Haiku.
 - **Asserts:** The real delegate CLI replaces the worker; the native task drives visible Thinking and Working with Bash, creates the sentinel, labels the event with ✉ and acknowledges one task bound to the replacement generation.
@@ -4409,7 +5007,7 @@ without depending on the config struct API.
 - **Does not assert:** WHY a real replacement dies — #584's own trigger was environment-side and is not reproduced here (see `orchestration/dispatch/003` for the parity control that rules out the reported hypothesis); any retry of the delegate, which this fix deliberately does not add; the daemon-log `warn!`, which carries the role and command the notice omits.
 - **Platform coverage:** mac+linux (unix-only — the stand-in is a POSIX shell script).
 
-##### orchestration/delegate/024 — A real Haiku orchestrator acts on an unacknowledged-worker inbox notice. [reel]
+##### orchestration/delegate/024 — A real Haiku orchestrator acts on an unacknowledged-worker inbox notice.
 - **Layer:** L2 real agent, lane 2, PTY-attached (`tests/e2e_idle_worker_detector.rs`).
 - **Agent:** Interactive Claude Code Haiku orchestrator and silent cat worker.
 - **Asserts:** A task left unacknowledged past the configured inbox deadline produces a native notice; the orchestrator visibly works on it, creates its action sentinel and acknowledges the notice once without human input.
@@ -4475,7 +5073,7 @@ without depending on the config struct API.
 - **Cost:** one cheap real-agent work turn.
 
 ##### orchestration/delegate/049 — A `delegate` to a worker that EXITED ON ITS OWN is reported as reaching no worker for a `clear = false` role, and is still delivered through a respawn for a `clear = true` one (issue #524).
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_exited_worker.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon, and the REAL `delegate` CLI over the deck's hook socket). Synthetic stand-ins, so deliberately NOT demo-reel-marked.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_exited_worker.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon, and the REAL `delegate` CLI over the deck's hook socket). Synthetic stand-ins.
 - **Agent:** none. The `delegate-exited-worker` fixture's orchestrator is `cat`; its two workers, `steady` (`clear = false`) and `fresh` (`clear = true`), run the fixture's `worker.py` stand-in, which logs every line it reads from its PTY to `<role>-received.log` and, on a trigger file the test creates, runs the branch's own `work-done` from inside its pane (so neither owes anything and a later delegate cannot be refused as busy for the wrong reason) and then exits. No `StopAgent` and no pane close anywhere.
 - **Asserts:** (PRD #1666 S5: the deck posts the prompt, task, remit or notice to the target pane's inbox instead of typing it, and the test reads that inbox over the attach socket; where this entry says it is delivered to, reaches or lands in a pane, read posted to that pane's inbox.) control first — `delegate --to steady` to the LIVE worker exits 0 and the worker reads the `worker-task-steady.md` pointer from its PTY, which still shows in its log after the test resizes the pane (issue #1539: a resize drops the pane's replay ring, and the TUI resizes every role pane when it lays out the new tab, so the pane snapshot is not evidence of delivery). Then `steady` reports and exits on its own, and `delegate --to steady` must exit NON-ZERO with stderr naming `steady` as a role that `reached no worker`. Then `fresh` exits the same way, and `delegate --to fresh` must exit 0 and the respawned `fresh` worker must read the `worker-task-fresh.md` pointer.
 - **Why it exists:** nothing on the natural-exit path takes a role pane out of the daemon's routing maps (a close does, as does a failed orchestration spawn's rollback), so a role whose worker crashed or quit still resolved and `delegate` exited 0 with nothing printed while the pointer write failed later inside the detached dispatch. Confirmed red on `main` at `c7ef92f9` (`exit=Some(0)` for the second `steady` delegate), and red again with only the daemon's exited-occupant check disabled. The `fresh` arm is the issue's own guard against the cheap fix: with the check applied to every exited pane regardless of `clear`, it fails at that arm with exit 1 (verified).
@@ -4492,7 +5090,7 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (unix-only — raw-mode shell observer).
 
 ##### orchestration/delegate/051 — On the REAL binary, `dot-agent-deck delegate` to a role whose previous worker EXITED ON ITS OWN owing a delegation, and whose pane now holds a different, live agent, exits 0 without `--supersede` and the successor reads the task (issue #1531).
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_exited_worker.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon, the REAL `delegate` CLI over the deck's hook socket, and the daemon's real `StartAgent` over the attach socket). Synthetic stand-ins, so deliberately NOT demo-reel-marked.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_delegate_exited_worker.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon, the REAL `delegate` CLI over the deck's hook socket, and the daemon's real `StartAgent` over the attach socket). Synthetic stand-ins.
 - **Agent:** none. The `delegate-exited-worker` fixture's `quitter` role (`clear = false`) runs `worker.py`, which exits on a trigger file WITHOUT reporting. The successor is `worker.py` too, started through `DaemonClient::start_agent` on the quitter's pane id and tab membership, and logs what it reads to `successor-received.log`.
 - **Asserts:** (PRD #1666 S5: the deck posts the prompt, task, remit or notice to the target pane's inbox instead of typing it, and the test reads that inbox over the attach socket; where this entry says it is delivered to, reaches or lands in a pane, read posted to that pane's inbox.) control first — `delegate --to quitter` exits 0 and the worker reads its pointer, and a second `delegate --to quitter` exits non-zero saying the worker `still owes a work-done`. The worker exits on its own, the successor becomes the role's live agent, and `delegate --to quitter` WITHOUT `--supersede` exits 0 and the successor reads the `worker-task-quitter.md` pointer.
 - **Why it exists:** the L2 counterpart of `orchestration/delegate/050`, through the real CLI's exit code. Confirmed red on `main` at `e0b143e9` (`exit=Some(1)`, "every worker it reached still owes a work-done for an earlier delegation").
@@ -4506,6 +5104,14 @@ without depending on the config struct API.
 - **Why it exists:** issue #1784. Confirmed red when written to assert what the user wanted (`left: "4"`, `right: "3"`: the agent that was working was replaced), and green with the same assertions on `clear = false`, so the restart comes from `clear = true` and not from `--supersede`. It pins `--supersede`'s meaning, which the issue keeps and the orchestrator's instructions warn about; an addendum that keeps a `clear = true` worker's agent needs its own path, which is scheduled after PRD #1666.
 - **Does not assert:** a real agent losing its conversation (a `cat` has none; the agent being replaced is what loses it); the orchestrator's instructions (`orchestrator_context` unit tests cover those); a `--supersede` before the worker took its task.
 - **Platform coverage:** mac+linux (unix-only PTYs).
+
+##### orchestration/delegate/053 — With two tabs of one orchestration running in the same daemon and folder, each with a worker named `coder`, each orchestrator's real `delegate --to coder` names the pane and task id of its OWN coder, and the task reaches only that coder (issue #545).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_route.rs`; the real binary's isolated daemon, both tabs started through the real `StartAgent` with distinct per-tab `orchestration_id`s and run titles, and the REAL `dot-agent-deck delegate` CLI run as each orchestrator's pane with its capability token).
+- **Agent:** none: the routing fixture's scripted stand-in (`tests/support/inbox_route.rs`), which runs the real `inbox fetch` on its doorbell. The question is what the deck routes and prints, not what an agent does with the task.
+- **Asserts:** for tab A then tab B: `delegate` exits 0; the task is posted to that tab's own coder and the other tab's coder holds no message with its id; stderr names the own coder's pane and task id inside the fenced `[UNTRUSTED-PANE-ID: … :END-UNTRUSTED-PANE-ID] as task <id>` form and never names the other coder's pane; the own coder fetches that task framed as from the orchestrator.
+- **Why it exists:** issue #545 reported a delegate from one of several concurrent orchestrations reaching another's worker, unnoticed because a successful `delegate` printed nothing. The routing half held on `main` at `364a3c54` (the inbox assertions passed); the output half was red there (`stderr=""`). The routing half stays as a guard against the reported mis-route.
+- **Does not assert:** a real agent reading the line (lane 2's `orchestration/route/001` drives real orchestrators through the same CLI); the cause of the cross-routing the issue observed, which this test could not reproduce; the `Delegated` wording beyond the fenced pane and task (`delegate_verdict` unit tests in `src/main.rs`); an older daemon, which names no pane (unit-tested there too).
+- **Platform coverage:** mac+linux (unix-only PTY/UDS, `python3` stand-in).
 
 #### orchestration/work-done
 
@@ -4798,7 +5404,7 @@ without depending on the config struct API.
 - **Asserts:** delegated a directive task with a unique sentinel file, the worker creates the file and reports with `work-done --task-id` as its instructions say; the orchestrator's inbox lists a report whose provenance is that task's id; a plain follow-up delegate to the worker is accepted.
 - **Test:** `work_done_037_a_real_worker_reports_the_task_it_was_given` in `tests/e2e_task_report_live.rs`.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §9, CLAUDE.md rule 4): the accounting a real agent drives — that a real worker follows the footer's `--task-id`, so its task is completed and its debt released.
-- **Does not assert:** the report rendered in an attached client, or a reel clip (round 6); Codex, OpenCode, Pi or Devin workers; the desktop app.
+- **Does not assert:** the report rendered in an attached client; Codex, OpenCode, Pi or Devin workers; the desktop app.
 - **Platform coverage:** mac+linux.
 
 ##### orchestration/work-done/038 — The answer is written only after the commit.
@@ -4979,7 +5585,7 @@ without depending on the config struct API.
 #### orchestration/provenance
 
 ##### orchestration/provenance/001 — On the REAL binary, under the DEFAULT policy, a `work-done` forged from outside a pane with nothing but that pane's id is refused and the refusal is reported to its sender, while the same verb issued from inside the pane still lands (issues #1077, #1129).
-- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with its lazy daemon). Lane 1 — no agent, no credential. Synthetic stand-ins, so deliberately NOT demo-reel-marked.
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness, with its lazy daemon). Lane 1 — no agent, no credential. Synthetic stand-ins.
 - **Agent:** none. The `hook-provenance` fixture's `orchestrator` is `cat`; its `worker` is a shell loop that runs the branch's own `dot-agent-deck work-done` binary (passed in as `$DAD_TEST_BIN` so an installed release on `PATH` cannot stand in for it) twice, each time gated on a trigger file the test creates. That is the one property that matters here: the worker's command is spawned BY THE DAEMON, so it inherits the per-spawn hook capability token exactly as a real agent does.
 - **Asserts:** three steps in a fixed order, because the assertion is an ABSENCE. (1) The worker's first own `work-done` reaches the orchestrator's inbox (PRD #1666: the report is posted, not typed, and the `cat` orchestrator never fetches it, so the test reads the inbox over the attach socket) — the legitimate path is live and the daemon's role maps are populated. (2) The real `work-done` CLI is run from the TEST process carrying only the worker's `DOT_AGENT_DECK_PANE_ID` and the hook socket path, which is issue #1077's forgery exactly; it exits NON-ZERO and its stderr names the daemon's reason, because since issue #1129 the daemon acknowledges this verb at the provenance gate (this assertion is the inverse of the one that stood here, which recorded the silence as the honest cost of the refusal). (3) The worker's second own `work-done` reaches the orchestrator's inbox — a LATER message has completed the whole round trip on the same path. Only then: no inbox in the deck holds a message carrying the forged report's sentinel. The deck does NOT use `impersonating_pane_signals()`, so this runs under the shipped `enforce` policy.
 - **Why the order:** the first cut of this test sent the forgery before anything had landed and passed with the gate disabled, because a forgery arriving before the role maps were populated is dropped as "unknown pane" — indistinguishable from a refusal. Step (1) removes that, and the test was re-run with `policy()` forced to `WarnOnly` to confirm it now fails (the forged report reached the orchestrator).
@@ -4987,7 +5593,7 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux (unix-only PTY/UDS, POSIX shell role).
 
 ##### orchestration/provenance/002 — On the REAL binary, under the DEFAULT policy, an orchestrator whose environment names ANOTHER live orchestrator's pane and agent id cannot route a `delegate` into that orchestration (issue #712).
-- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_hook_provenance.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon). Synthetic stand-ins, so deliberately NOT demo-reel-marked.
+- **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_hook_provenance.rs`; the REAL `dot-agent-deck` binary through the vt100 `TuiDeck` harness with its lazy daemon). Synthetic stand-ins.
 - **Agent:** none. The `stale-pane-identity` fixture is opened TWICE in one directory, so two orchestrators, A and B, are live at once (PRD #140's per-tab routing groups). Its orchestrator is a shell script that, on a trigger file named after its own pane id, runs the branch's real `delegate` with `DOT_AGENT_DECK_PANE_ID` and `DOT_AGENT_DECK_AGENT_ID` rewritten to A's — the stale pair #712 observed — and everything else, the daemon-issued hook token included, as spawned; then on a second trigger it delegates with its untouched environment. Workers are `cat`.
 - **Asserts:** the stale-identity delegate run inside B's pane exits non-zero and B's pane shows the daemon's refusal (`issued for a different pane`); then B's own delegate exits 0 and its task (`own-identity-task`) reaches B's worker's inbox — the control, and the later round trip that makes the next checks assertions rather than a fixed sleep; A's worker's inbox stays empty; and no inbox holds the refused `stale-identity-task` (PRD #1666: tasks are posted to the worker's inbox, not typed into its `cat`). Panes are resolved to their current agent at every read, because a role pane's agent can be replaced while the deck brings a tab up.
 - **Why it exists:** #712's delegate failed safe only because the stale pane no longer held an orchestration role; had it still been a live orchestrator, B's task would have been delivered to A's workers with exit 0. GREEN on `main` at `c7ef92f9`: the hook-token provenance gate (#1077) refuses a message whose token was minted for a different pane than the one it names. Verified load-bearing by admitting `Refusal::WrongPane` in `hook_provenance::admits`, which turns it red with `STALE-DELEGATE-EXIT=0`.
@@ -4996,7 +5602,7 @@ without depending on the config struct API.
 
 ##### orchestration/provenance/003 — An outside raw status or SessionStart cannot drive a deck-spawned pane's card (issue #318).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_hook_provenance.rs`).
-- **Agent:** none; shell role commands run the real status CLI inside daemon-spawned panes. Synthetic, deliberately not reel-marked.
+- **Agent:** none; shell role commands run the real status CLI inside daemon-spawned panes. Synthetic.
 - **Asserts:** the pane's own waiting/running/waiting statuses render Needs Input/Thinking/Needs Input; an outside token-less running CLI and forged SessionStart cannot change or retire that card or reach attach clients; its own later finished event still renders Idle. Uses the shipped enforce policy.
 - **Does not assert:** real-agent hook installation, credential propagation, or resistance to a same-uid sender stealing the capability.
 - **Platform coverage:** mac+linux (Unix PTY and hook socket).
@@ -5068,7 +5674,7 @@ without depending on the config struct API.
 
 ##### orchestration/identity/010 — On the real binary, a run title another client takes after the new-pane form opened is refused at submit, the form stays up with the collision warning, and a renamed submit then opens the tab (issue #555).
 - **Layer:** L2 (PTY + vt100 against the spawned binary and its lazily spawned daemon; `e2e` feature, lane 1).
-- **Agent:** none — the `orch-deck` fixture's `cat` roles, and a `cat` rival. Not demo-reel material: no real agent runs, so its entry carries no reel marker.
+- **Agent:** none — the `orch-deck` fixture's `cat` roles, and a `cat` rival.
 - **Asserts:** with the form open on `orch-deck` and the orchestration selected, the Name field shows `<folder>-orchestrator-1`; a rival `StartAgent` under exactly that title (same orchestration and canonical cwd, its own per-tab token) sent over the deck's attach socket succeeds; pressing Enter then brings up "already in use by a live orchestration" with the name still shown and `[Submit]` gone, and `ListAgents` holds no pane of ours under that title; typing `-b` clears the warning and Enter closes the form and starts the orchestration under `<folder>-orchestrator-1-b`. Verified load-bearing: with the daemon's check disabled the refusal never appears.
 - **Does not assert:** the concurrent-instant race (`/007`); the rival's own tab surfacing in this TUI; an older TUI against this daemon, which gets the refusal as a plain `Orchestration failed: …` status line (the cross-version run recorded on the PR).
 - **Platform coverage:** mac+linux (the L2 harness is unix-only).
@@ -5531,7 +6137,7 @@ without depending on the config struct API.
 - **Does not assert:** pane-id hand-over refusal (`dispatch/return/004`), the recovery row the completion becomes once task-scoped completion is active (`dispatch/return/009`), unit-pane close (the registry unit tests), daemon restart, exact completion-report wording, or the TUI close dialog.
 - **Platform coverage:** mac+linux (unix-only fast test — every observer is a POSIX-shell raw `cat`).
 
-##### dispatch/return/006 — A real dispatched single agent independently signals completion and its discovered sentinel report lands visibly in the real dispatcher's pane (PRD #220 M2.3/M4.2). [reel]
+##### dispatch/return/006 — A real dispatched single agent independently signals completion and its discovered sentinel report lands visibly in the real dispatcher's pane (PRD #220 M2.3/M4.2).
 - **Layer:** L2 PTY-attached, lane 2 (`TuiDeck` on `minimal`) driving the REAL new-pane dispatcher flow and two REAL interactive Claude Code panes through the branch binary. The dispatcher itself invokes `dot-agent-deck dispatch --single`; no test process invokes either `dispatch` or `work-done`. The freshly-built binary's directory is prepended to the PATH inherited by the deck, daemon and agents, and the fixture plus predicted sibling worktree are trusted in the isolated test HOME before either prompt is delivered.
 - **Agent:** REAL interactive Claude Code Haiku (`claude-haiku-4-5-20251001`) for both the dispatcher and the dispatched unit, with `--allowedTools Bash Read Write` so the dispatcher command, checkout inspection, report-file write and cleanup cannot stop on a permission prompt. Flaky-tolerant credentialed lane 2: run once with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`, never in CI. The caller is not a stand-in: it is the user-opened, seed-instructed dispatcher pane whose conversation receives the result.
 - **Fixture sentinel:** the committed `minimal` checkout gains `dispatch-return-live-sentinel-6f2c.txt`, while the unit task names only the prefix `dispatch-return-live-sentinel-`. The returned full filename therefore comes from the unit inspecting its isolated worktree, not from echoing a filename supplied in either agent's prompt.
@@ -5631,11 +6237,11 @@ without depending on the config struct API.
 - **Does not assert:** the hook socket's reply line itself (the arm writes the same code and sentence).
 - **Platform coverage:** mac+linux.
 
-##### dispatch/return/019 — A differing terminal repeat is not delivered.
+##### dispatch/return/019 — A differing terminal repeat is delivered as a labelled update, and the first report stands.
 - **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
 - **Agent:** none.
-- **Asserts:** `differs`, exit 1, one report.
-- **Why it exists:** PRD #1666 part 3, round 5 (plan D4): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
+- **Asserts:** the second, different report is accepted as update 1 under its own report id, posted as its own `dispatch report updated` turn that opens with the update wording and carries the untrusted-report markers, while the first report's turn and unit entry are unchanged and the store holds both files; identical repeats of either report answer `already_accepted` with that report's id and post nothing; the legacy verb's adapter acknowledges and delivers the update the same way.
+- **Why it exists:** issue #2260 (replacing PRD #1666 part 3a's refusal): a unit could not correct a report it knew was stale, and fell back to side channels the deck does not see.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
 
@@ -5658,7 +6264,7 @@ without depending on the config struct API.
 ##### dispatch/return/022 — Terminal retries after the route was consumed.
 - **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
 - **Agent:** none.
-- **Asserts:** For a single and an orchestration unit: identical repeat `already_accepted`, differing `differs`, after the close still answered through the index, a generation naming no unit `incompatible_mode`; one report.
+- **Asserts:** For a single and an orchestration unit: identical repeat `already_accepted`, differing delivered as update 1, after the close still answered through the index, a generation naming no unit `incompatible_mode`; one first report.
 - **Why it exists:** PRD #1666 part 3, round 5 (plan §2 step 2): a unit's terminal report is decided at the routes' linearization point and reaches the caller once.
 - **Does not assert:** a real agent; the CLI's own wording beyond `work_done_text`; the desktop app.
 - **Platform coverage:** mac+linux.
@@ -5716,6 +6322,48 @@ without depending on the config struct API.
 - **Does not assert:** the publication protection (exercised by `/026` (g)); a fresh report presenting the removed token (refused `unattested` before admission).
 - **Platform coverage:** mac+linux.
 
+##### dispatch/return/029 — A unit's updates to its report are bounded.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** after its first report a unit's next `MAX_REPORT_UPDATES` different reports are accepted as updates 1 to 3; one more different report is refused `report_updates_exhausted` with an exit-1 CLI line saying it was not delivered, and posts and saves nothing; an identical repeat of an earlier update still answers `already_accepted` with that update's id.
+- **Why it exists:** issue #2260: a unit that loops on `work-done` must not flood the conversation that dispatched it.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/031 — Reports that arrive while an update is being saved wait for it, then settle in order.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** with an update paused after its save, the unit entry records it in flight, and an identical repeat and a different report both wait rather than finish; released, the update is update 1, the repeat answers `already_accepted` with update 1's id and number and posts nothing, the different report becomes update 2, and the first report is unchanged.
+- **Why it exists:** issue #2260 (PR #2275 review): the in-flight state is what keeps a repeat from posting twice or racing the update it repeats.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/032 — A failed update save changes nothing, and a retry is accepted.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** an update whose save fails is refused `report_save_failed`; the unit entry, the saved files and the dispatcher's inbox are unchanged and no update is left in flight; the same update sent again is accepted as update 1.
+- **Why it exists:** issue #2260 (PR #2275 review): a failed update must neither touch the first report nor leave the unit unable to send an update.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/033 — An update sent after the dispatcher exited is kept for recovery, and its repeat says so.
+- **Layer:** fast unit (`src/agent_pty_terminal_tests.rs`, in-crate; real dispatched units through the real spawn path, `cat` stand-ins).
+- **Agent:** none.
+- **Asserts:** with the first report delivered to a live dispatcher, an update paused after its save while the dispatcher's agent exits is accepted with destination `recovery` and update 1, and the CLI line says it was update 1 and was saved; the first report's entry still reads `inbox`; an identical repeat of the update answers with the update's own destination and number.
+- **Why it exists:** issue #2260 (PR #2275 review): a repeat of an update used to answer with the first report's destination and no number.
+- **Does not assert:** a real agent; the desktop app.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/return/030 — A real dispatched single unit, told its report is out of date, sends an update, and the dispatcher receives it as a separate turn beside the first report.
+- **Layer:** L2 PTY-attached, lane 2 (`TuiDeck` on `minimal`, `tests/e2e_dispatcher_mode.rs`) driving the real new-pane dispatcher flow and two real interactive Claude Code panes through the branch binary; the dispatcher runs `dot-agent-deck dispatch --single` itself, and no test process runs `dispatch` or `work-done`.
+- **Agent:** REAL interactive Claude Code Haiku (`claude-haiku-4-5-20251001`) for the dispatcher and the unit, with `--allowedTools Bash Read Write`. Credentialed lane 2: run with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`, never in CI.
+- **Fixture sentinel:** `dispatch-update-live-first-3a1d.txt` is committed and the unit's task names only its prefix. Once the report is in the dispatcher's inbox, the user types into the unit's pane that the report is out of date and asks it to write the current Unix time to `dispatch-update-live-stamp.txt` and send an update giving it; the stamp did not exist when the unit reported. How to send an update comes only from the production `dispatch_prompt`. Three single-turn designs failed on the agent, not the deck: Haiku folded a later step into one combined report each time (twice), or waited before reporting through the `Monitor` tool and stalled on its permission prompt.
+- **Asserts:** the dispatcher's inbox holds exactly one acknowledged completion from the unit, whose untrusted-report frame carries the sentinel and not the stamp, and a separate acknowledged turn opening `dispatch: a unit you dispatched sent an update to its report` whose frame carries the stamp read back from the unit's worktree; at most `MAX_REPORT_UPDATES` updates; the dispatcher visibly relays the stamp.
+- **Why it exists:** issue #2260: the user-visible path of a unit correcting its report.
+- **Does not assert:** the update bound (`dispatch/return/029`); an orchestration unit's update; the agent's prose beyond the sentinel and the stamp.
+- **Platform coverage:** mac+linux (lane 2 is local-only).
+- **Cost note:** a few short interactive Haiku turns: the dispatcher's command, the unit's report, and the unit's stamp and update.
+
 ##### dispatch/close/001 — A dispatched single-agent card closes on the FIRST confirmed Ctrl+W, instead of surviving until the user closes it a second time (PRD #220 follow-up).
 - **Layer:** L2 PTY-attached (`TuiDeck` on the `minimal` fixture) driving the REAL `dot-agent-deck dispatch --single` CLI, then closing the resulting card through the production Ctrl+W → confirm path.
 - **Agent:** a REAL interactive Claude Code (Haiku) as the dispatched unit, launched through a **wrapper script** (`default_command = "agent-wrapper"`), never prompted — it only has to be running when the close lands, so the cost is one cold boot and no turns. The caller pane is started with no command (a shell); it is the caller, not the thing under test, and it has no command for the unit to copy, so the unit starts `default_command` (issue #1602). The wrapper is load-bearing, not convenience: it mirrors the reported config, where every command is `devbox run agent-<role>`, which the deck cannot infer an agent type from and therefore does not wrap. A bare `claude` IS recognised and takes a different path through the session machinery — which is exactly why an earlier `cat`-based version of this test passed while the reported bug was live.
@@ -5741,6 +6389,13 @@ without depending on the config struct API.
 - **Asserts:** a freshly dispatched worktree starts clean (the premise that makes the cleanup meaningful); the dialog warns while the tree is genuinely dirty; after the file is removed and the tree verified clean again, confirming REMOVES the worktree and the deck makes no `KEPT, not deleted` claim.
 - **Why it exists:** the close dialog's warning is necessarily a PREDICTION — the agent is still running while the modal is open. Reusing that frozen answer as the post-close report produces a confident lie in both directions: a "kept at `<path>`" message about a directory that was deleted, or silence about one that was newly dirtied and kept. This pins the fix, which is that the post-close report comes from the daemon's own post-cleanup verdict (`remove_worktree`'s return value, broadcast as `BroadcastMsg::WorktreeKept`), measured after `close_agent` reaped the agent so nothing can still be writing to the tree.
 - **Does not assert:** the newly-dirtied direction (the dialog stays silent and the daemon still keeps the tree — same mechanism, opposite sign); the warning's wording (`prompt/close-confirm/007`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close/004 — A real dispatched agent closed with `Close, keep worktree` leaves its clean worktree on disk, and the status line says it was kept on request and where (issue #1958).
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatcher_mode.rs`; `TuiDeck` on the `minimal` fixture driving the REAL `dot-agent-deck dispatch --single` CLI, then the production Ctrl+W → Down, Down, Enter path).
+- **Agent:** claude/haiku — a REAL interactive Claude Code (`claude --model claude-haiku-4-5-20251001`, no `-p`) as the dispatched unit; the caller pane is a shell, so the unit starts the deck's `default_command` (issue #1602).
+- **Asserts:** the agent does one directive, deterministic operation in its own worktree — writing a uniquely named sentinel file into the git-ignored `.dot-agent-deck/` — and goes Idle with the worktree clean (the premise: an ordinary Close would remove it, `dispatch/close/003`); the close confirmation offers `Close, keep worktree`; choosing it puts `Worktree kept on request:` and the worktree's path on the status line, removes the agent from the daemon, and leaves the worktree and the agent's sentinel on disk.
+- **Does not assert:** the tab/orchestration scope (the CLI's is `dispatch/close-verb/013`), a daemon without the keep capability, the desktop dialogs (`AgentOverviewStop.test.tsx`, `AgentPaneOverlay.test.tsx`), or `worktree reclaim` afterwards. The stand-in twin with no agent is `prompt/close-confirm/012`.
 - **Platform coverage:** mac+linux.
 
 #### dispatch/close-verb
@@ -5770,7 +6425,7 @@ without depending on the config struct API.
 - **Platform coverage:** mac+linux.
 
 ##### dispatch/close-verb/005 — A person shell closes a completed unit and its tab disappears from an already attached TUI.
-- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_close_verb.rs`); records a cast but is not reel eligible.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_close_verb.rs`); records a cast.
 - **Agent:** none — identity-recording `cat` roles; close runs with all three caller identity variables absent.
 - **Asserts:** the dispatched orchestration tab is visible before close; the person command exits 0 and the tab disappears from the same attached TUI; the roles disappear and the dispatcher remains registered.
 - **Platform coverage:** mac+linux.
@@ -5787,7 +6442,7 @@ without depending on the config struct API.
 - **Asserts:** existing `StopAgent` removes the completed team's orchestrator while its worker stays registered; close by dispatch name exits 0 and removes that worker while retaining the dispatcher.
 - **Platform coverage:** mac+linux.
 
-##### dispatch/close-verb/008 — An interactive Haiku dispatcher closes the completed single unit it dispatched, through the real close CLI. [reel]
+##### dispatch/close-verb/008 — An interactive Haiku dispatcher closes the completed single unit it dispatched, through the real close CLI.
 - **Layer:** L2 PTY-attached real-agent, lane 2, local only (`tests/e2e_dispatcher_mode.rs`).
 - **Agent:** real interactive Claude Code on Haiku for dispatcher and unit, with imported credentials, pre-seeded project trust and allowed Bash/Read/Write tools; no print mode.
 - **Asserts:** the dispatcher invokes `dispatch --single`; the isolated unit discovers a committed sentinel whose full filename was absent from its prompt; its completion appears in the dispatcher's rendered pane; a subsequent directive causes that dispatcher to invoke `close <name>` itself; the unit's card and worktree disappear while the original dispatcher remains registered. Shares the genuine return-path setup with `dispatch/return/006`.
@@ -5814,18 +6469,32 @@ without depending on the config struct API.
 - **Does not assert:** selector conflicts, ambiguous names or stale ids, which belong to CLI/daemon regression tests.
 - **Platform coverage:** mac+linux.
 
+##### dispatch/close-verb/012 — `close <unit> --keep-worktree` keeps a clean unit's worktree and reports it kept on request (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** two completed clean single units (each with a file in its ignored `.dot-agent-deck/`) closed by name with `--keep-worktree` both exit 0 and lose their agents but keep their worktrees and `.dot-agent-deck/` contents; the human report reads `<path>: kept on request` and names `dot-agent-deck worktree reclaim`, and the `--json` report carries one `kept-on-request` verdict for that path.
+- **Does not assert:** `--dry-run` wording, a dirty tree with keep, or the refusal against a daemon without the capability (unit-tested in `close_cli` / `daemon_client`).
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/013 — `close --orchestration-of <pane> --keep-worktree` keeps the worktree a team shared (issue #1958).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes in a two-role orchestration.
+- **Asserts:** closing a completed clean two-role unit through a worker's pane with `--keep-worktree --json` exits 0, removes both roles, keeps the shared worktree and its `.dot-agent-deck/` file, and reports one `kept-on-request` verdict for that path.
+- **Does not assert:** the TUI's tab-scope keep or a keep on a non-last role's StopAgent.
+- **Platform coverage:** mac+linux.
+
 #### dispatch/single
 
 ##### dispatch/single/001 — A `--single` unit runs the command its dispatcher was started with, as its dispatcher's agent, instead of the deck's `default_command` (issue #1602).
 - **Layer:** L2 PTY-attached, lane 1 (`TuiDeck` on the `minimal` fixture) driving the real new-pane form with a typed Command, then the REAL `dot-agent-deck dispatch --single` CLI through the deck's hook socket.
-- **Agent:** none. Two shell stand-ins that each record `<which>|<cwd>` to a launch log and then `exec cat`: the deck's `default_command`, and the caller's Command — a launcher whose name reveals no agent, standing in for `devbox run agent`, which announces itself as Claude Code through a real `dot-agent-deck hook` call only when an untracked marker sits in its directory. The marker is written after the fixture commit, so the caller announces and the unit, whose worktree is a HEAD checkout, does not. Not demo-reel-eligible.
+- **Agent:** none. Two shell stand-ins that each record `<which>|<cwd>` to a launch log and then `exec cat`: the deck's `default_command`, and the caller's Command — a launcher whose name reveals no agent, standing in for `devbox run agent`, which announces itself as Claude Code through a real `dot-agent-deck hook` call only when an untracked marker sits in its directory. The marker is written after the fixture commit, so the caller announces and the unit, whose worktree is a HEAD checkout, does not.
 - **Asserts:** precondition, the caller registers, prints its ready marker and is recorded as Claude Code; the dispatch CLI succeeds; the launcher starts in the unit's worktree and the default command never starts anywhere; the unit's `ListAgents` record carries `agent_type = claude_code`, which only the dispatcher could have supplied because the unit never announced. Verified RED against the code before the fix: the launch log read `default|<worktree>`.
 - **Does not assert:** that a scheduled (no-pane) single spawn still uses `default_command` — `scheduler/dispatch/004` pins that path, which does not go through `dispatch`; the precedence order itself (`dispatch::tests::a_single_unit_runs_its_dispatchers_command_as_its_dispatchers_agent`, `…_falls_back_to_default_then_claude`); that the registry keeps the configured command rather than the wrapped exec line (`agent_pty::spawn_tests::configured_launch_of_reports_the_configured_command_and_its_agent`); a real agent or a real `devbox run`.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; the stand-ins are POSIX shell).
 
 ##### dispatch/single/002 — `dispatch --command <cmd> --agent opencode` starts a unit whose pane runs `<cmd>` as OpenCode, from a dispatcher running Claude Code (issue #2172).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_dispatch_single.rs`, `TuiDeck` on the `minimal` fixture), the same setup as `dispatch/single/001`, then the REAL `dot-agent-deck dispatch --single --command … --agent opencode` CLI through the deck's hook socket, which asks the daemon whether it honours a chosen launch before sending the dispatch.
-- **Agent:** none. The three shell stand-ins each record `<which>|<cwd>` to one launch log and `exec cat`: the deck's `default_command`, the caller's launcher (announces itself as Claude Code), and the chosen command, a launcher that reveals no agent and never announces one, standing in for `devbox run oc-big`. Not demo-reel-eligible.
+- **Agent:** none. The three shell stand-ins each record `<which>|<cwd>` to one launch log and `exec cat`: the deck's `default_command`, the caller's launcher (announces itself as Claude Code), and the chosen command, a launcher that reveals no agent and never announces one, standing in for `devbox run oc-big`.
 - **Asserts:** the dispatch CLI succeeds; the unit's own pane shows the chosen stand-in's ready marker; the launch log records the chosen command starting in the unit's worktree, and neither the dispatcher's launcher nor the default command starting there; the unit's `ListAgents` record carries `agent_type = open_code`, which only `--agent` could have supplied, since the dispatcher is Claude Code and the chosen stand-in never announces.
 - **Does not assert:** the precedence order itself or the agent-name rules (`dispatch::tests::a_chosen_launch_*`); the refusal from an older daemon (`dispatch/single/003`); a real OpenCode or a real `devbox run`.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`; the stand-ins are POSIX shell).
@@ -5839,8 +6508,8 @@ without depending on the config struct API.
 
 ##### dispatch/single/004 — A real dispatcher told to dispatch with `--command <launcher> --agent claude` gets a real unit that runs that launcher and does its task (issue #2172).
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_dispatch_single_live.rs`, `#![cfg(all(feature = "e2e", feature = "e2e-live", unix))]`): a real interactive dispatcher opened through the new-pane form, which runs the real `dispatch` CLI itself.
-- **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree. Not marked `[reel]`.
-- **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's record is Claude Code.
+- **Agent:** Claude Code on Haiku, twice: the dispatcher and the unit. Each is started through its own launcher script that records `<which>|<cwd>|<CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION>` and execs `claude`; the unit's launcher name reveals no agent, so `--agent claude` is what gives it Claude Code's prompt-delivery path. Imported credentials and per-folder trust seeded for the unit's worktree.
+- **Asserts:** the dispatcher becomes ready with its seed acknowledged; after it is told to run the dispatch, the unit writes the uniquely named sentinel in its own worktree, which only a real agent that received its task can do; the launch log shows the unit's launcher, and not the dispatcher's, starting in that worktree; the unit's Claude started with `CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false` and the dispatcher's with the variable unset (issue #2094); the unit's record is Claude Code.
 - **Does not assert:** a unit on a different agent from its dispatcher (that is `dispatch/single/002`, with stand-ins, because the harness runs only Claude Code headless); the dispatcher choosing the flags from a request in plain words (the directive gives it the command line); the completion report back to the dispatcher (`dispatch/return/006`).
 - **Platform coverage:** mac+linux, on a developer's machine only (lane 2 runs nowhere in CI).
 
@@ -5884,7 +6553,7 @@ without depending on the config struct API.
 - **Asserts:** fallback delivery and success output naming the standalone recipient, then ambiguous refusal listing both pane ids after another standalone agent opens in that folder.
 - **Does not assert:** nearest-ancestor preference or a real orchestrator deciding to reply.
 
-##### orchestration/address/005 — Real interactive Haiku discovers and messages an outside orchestrator, which records and acknowledges the data. [reel]
+##### orchestration/address/005 — Real interactive Haiku discovers and messages an outside orchestrator, which records and acknowledges the data.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_orchestrator_address_live.rs`, `orchestration_address_005_real_haiku_discovers_and_messages_orchestrator`).
 - **Fixture:** `tests/fixtures/orchestrator-address`; trust is pre-seeded in the isolated HOME and the built binary is on PATH.
 - **Agent:** REAL Claude Code Haiku (`claude-haiku-4-5-20251001`), interactive standalone caller, orchestrator and waiting worker; Bash, Read and Write allowed. Runtime-skipped without CLI/credentials unless strict real-e2e enforcement is enabled.
@@ -5893,13 +6562,13 @@ without depending on the config struct API.
 
 ##### orchestration/address/006 — `--name` and `--pane` reach one of two standalone agents in a folder; the reply names its sender.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_inbox_send_by_name.rs`, `orchestration_address_006_name_and_pane_reach_one_of_two_standalone_agents`).
-- **Agent:** none; identity-recording Python probes that emit a synthetic Claude SessionStart hook and wait in cat. Not demo-reel-eligible.
+- **Agent:** none; identity-recording Python probes that emit a synthetic Claude SessionStart hook and wait in cat.
 - **Asserts:** with a caller, `dispatcher` and `observability` open as standalone agents in one folder, `inbox send --folder` is refused as ambiguous, naming both panes and `--name`; `--folder … --name dispatcher` and `--pane <observability>` each deliver to that agent alone; an unknown `--name` is refused and delivers nothing; `roles --json --name dispatcher` lists only the dispatcher; the reply command the deck wrote into the dispatcher's message carries `--name=caller`, and running it from the dispatcher's pane delivers to the caller alone.
 - **Does not assert:** an older daemon withholding the fields (`daemon_client::tests::an_address_naming_one_agent_is_withheld_from_a_daemon_without_the_field`); orchestrator-by-pane and worker refusals (`tests/orchestrator_address_agent.rs`); a real agent.
 
 #### orchestration/route
 
-##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1). [reel]
+##### orchestration/route/001 — Two tabs of the SAME orchestration opened in the SAME directory are separate routing groups: each orchestrator's delegate reaches only its own worker and each worker's work-done reaches only its own orchestrator, with no cross-delivery in either direction (PRD #140 M5.1).
 - **Layer:** L2 PTY-attached, lane 2, using the real binary through the vt100 `TuiDeck` harness. Both tabs open through the production new-pane flow against the same cwd; their distinct `orchestration_id`s round-trip through `StartAgent` and `ListAgents`. Each real orchestrator receives an inbox directive and shells `dot-agent-deck delegate`; its real worker consumes the framed task and reports work-done. The directive asks each orchestrator to quote its report's opening message line, whose `from` label names the worker role; `Sent by:` separately describes provenance as another agent. The visible reply therefore exposes the role even when Claude collapses native hook content. Per-pane evidence uses the daemon's `AttachRequest::Snapshot`, normalized across wrapping. The fresh binary is on the agents' PATH and project trust is seeded before the six interactive Claude panes start.
 - **Fixture:** `tests/fixtures/orchestration-route` — one `[[orchestrations]] name = "route-iso"` with THREE roles (`orchestrator` start + `coder` + `reviewer`), all REAL interactive Haiku `claude` (`--allowedTools Bash Read Write`, no `-p`), workers at `clear = false` so their agent ids and scrollback stay stable across the delegate. Three roles rather than two because `.dot-agent-deck/worker-task-{role}.md` / `work-done-{role}.md` are keyed by ROLE within a cwd (PRD #140 keeps that layer explicitly out of scope), so two same-cwd tabs sharing a role name share those files: driving tab A through `coder` and tab B through `reviewer` makes every no-cross-delivery check a presence/absence question about a pane that would otherwise have received NOTHING, and makes the two work-done feedback strings role-qualified and thus distinguishable inside one orchestrator pane — no occurrence-counting in a redrawing agent TUI.
 - **Agent:** REAL Claude Code (Haiku, `claude-haiku-4-5-20251001`) ×6 interactive role panes across two tabs, with Bash, Read and Write allowed in the isolated fixture. Two orchestrators delegate, two workers create one file each, and each orchestrator quotes its received report's opener. Local lane 2; runtime-skipped when the CLI or credentials are absent unless strict real-e2e enforcement is enabled.
@@ -5947,7 +6616,7 @@ without depending on the config struct API.
 
 ##### orchestration/orphan/005 — The orphaned-role badge reaches a REAL terminal, and a forged one does not (issue #770).
 - **Layer:** L2 (real-binary PTY + vt100; synthetic `SessionStart` hooks written to the deck's own hook socket).
-- **Agent:** none (two synthesized Claude Code `SessionStart` events — no credential, no spawned agent). Not demo-reel-eligible: a stand-in PTY test, deliberately unmarked.
+- **Agent:** none (two synthesized Claude Code `SessionStart` events — no credential, no spawned agent). A stand-in PTY test.
 - **Asserts:** a hook event from a plain pane id that FORGES `orchestration_orphaned` in its metadata renders no marker at all — pinning the daemon-authoritative strip through the unauthenticated same-uid socket, which is the only place that threat exists; then a hook from a role-shaped pane id the daemon holds no role for makes the `orphaned` title marker and the `Orphaned — delegation unavailable` row appear on the rendered grid, and exactly ONE card carries that row, so the genuine badge did not leak onto the forged card. Ordered clean-then-badged so both assertions are real transitions rather than vacuous matches.
 - **Does not assert:** the stamping decision matrix (`orchestration/orphan/001` owns the spawn-race, registered-role and TUI-pane-id arms at the seam); card geometry or styling (`orchestration/orphan/002`, `dashboard/pane/*`); the `daemon stop` refusal (`orchestration/orphan/003`, `orchestration/orphan/004`); re-registering the lost role, which issue #770 defers.
 - **Platform coverage:** linux+mac (`#![cfg(feature = "e2e")]`; the L2 PTY harness is Unix-only).
@@ -5994,43 +6663,43 @@ without depending on the config struct API.
 ##### session/restore/008 — A daemon-empty launch with an orchestration snapshot rebuilds the orchestration tab and replays the orchestrator prompt (PRD #89 Phase 2b M2b.3).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (the orchestration's `coder`/`reviewer` roles run `sleep 600`; the `orchestrator` role runs a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-orchestrator.log` — no LLM tokens; since PRD #1666 the replay is read from the role's inbox, not the recorder).
-- **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`.
-- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); the on-disk capture that produces the snapshot (`session/save/004`); the config-drift fallback (`session/restore/009`); the exact role-card styling / focus border.
+- **Asserts:** with a hand-staged `session.toml` whose single pane carries a `[panes.orchestration]` block (`config_name`/`project_path` pointing at a test-owned orchestration config, `orchestrator_prompt = "Build the feature end to end"`, `start_role_index = 0`) and an empty daemon, launching with NO `--continue` REBUILDS the orchestration tab: the `coder` and `reviewer` role panes appear as deck cards in their saved display order, and — unlike warm hydration (`session/restore/007`) — the saved `orchestrator_prompt` is replayed to the start (orchestrator) role and posted to its inbox, which also proves the start role was identified from `start_role_index`. The staged snapshot is an old (`version = 1`) one listing `started_role_indices = [0, 1]`, and every declared role, the unlisted `reviewer` included, still gets a daemon agent, because a version-1 list was always `[start_role_index]` and is no record of what ran (issue #929); a clean detach then re-saves the block as `version = 2` with `started_role_indices = [0, 1, 2]`.
+- **Does not assert:** the warm-daemon hydration path (`session/restore/007`); a current (`version = 2`) snapshot that leaves a role out (`session/restore/025`); the on-disk capture that produces the snapshot (`session/save/004`); a snapshot whose config no longer resolves, which is left unrestored (`session/restore/009`); a project whose orchestration is not approved (`config-trust/restore/*`) — this test pre-approves it through the harness's `trusting_project`; the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
-##### session/restore/009 — An orchestration snapshot whose config no longer resolves falls back to a plain dashboard pane with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift).
+##### session/restore/009 — An orchestration snapshot whose config no longer resolves is left unrestored, with a `session_warnings` message naming the missing orchestration (PRD #89 Phase 2b M2b.3 drift; PRD #1885 removed the plain-pane fallback).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon restores the saved pane as a plain dashboard card and emits a warning naming the missing orchestration.
+- **Agent:** none (the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with a hand-staged `session.toml` whose `[panes.orchestration]` block references `config_name = "tdd-cycle"` while the project config defines only `renamed-orch`, launching against an empty daemon lands on the empty dashboard (`No active agents`), no `orchestrator` card appears, the saved command's sentinel file is never written, and the teardown flushes a warning naming the missing orchestration and saying it `was not restored`. A plain-pane fallback would run the saved command with no trust check (PRD #1885).
 - **Does not assert:** the exact warning wording (only that it names the missing orchestration); the successful rebuild path (`session/restore/008`); which other panes survive when multiple are staged (only one is here).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration falls back to a plain dashboard pane with a warning, never panicking at startup (PRD #89 review-fix F2).
+##### session/restore/010 — A snapshot re-resolving to a zero-role orchestration is left unrestored with a warning, never panicking at startup (PRD #89 review-fix F2).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (the fallback pane runs `sleep 600`; no LLM).
-- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the saved pane restores as a PLAIN dashboard card (`orchestrator`) and a `session_warnings` message naming the orchestration (`tdd-cycle`) is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
-- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift fallback (`session/restore/009`).
+- **Agent:** none (the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with a project config that still names `tdd-cycle` but whittled to an EXPLICIT empty role set (`roles = []`, which `load_project_config` accepts since it runs no `config_validation`) and a hand-staged snapshot whose saved role set is also empty (so the name+order drift guard passes — `[] == []`) with a `start_role_index` of 0 that is out of range, launching against an empty daemon with no flag does NOT panic/crash-loop: the deck reaches its empty dashboard, no `orchestrator` card appears, the saved command's sentinel file is never written, and a `session_warnings` message naming the orchestration (`tdd-cycle`) and saying it `was not restored` is flushed to stderr on a clean detach-quit. Pins that an empty/no-start-role re-resolution is treated as drift, never indexed unguarded at the start cursor.
+- **Does not assert:** the exact warning wording (only that it names the orchestration); the successful rebuild path (`session/restore/008`); the non-empty role-set drift (`session/restore/009`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/011 — A saved `start_role_index` that differs from the config default is honored on restore: the orchestrator prompt is posted to the role at the saved index (PRD #89 review-fix F3).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (both roles run a recorder shell script that self-posts `SessionStart` and appends its stdin to an absolute `record-<role>.log` — no LLM tokens).
 - **Asserts:** with a `tdd-cycle` config whose default start role is `orchestrator` (index 0, `start = true`) and a recorder on BOTH roles, a hand-staged snapshot saving `start_role_index = 1` (`coder`) makes the replayed `orchestrator_prompt` land in the inbox of the role at the SAVED index (`coder`, index 1) — and NOT in the config-default start role's (`orchestrator`, index 0), checked after the positive one lands. Pins that restore reads `snap.start_role_index` rather than recomputing the start cursor from the live config's `start` flag. Since issue #523's review, also that the saved cursor is the tab's ONE seat: `daemon status --json` marks `coder (orchestrator)` and no other role, so the pane the prompt went to is the pane the daemon lets `delegate` (before, it kept registering the config's `start = true` role).
-- **Does not assert:** the drift/bounds handling when the saved index is out of range (`session/restore/010`); `started_role_indices` replay (captured but has no reader); the exact role-card styling / focus border.
+- **Does not assert:** the drift/bounds handling when the saved index is out of range (`session/restore/010`); which roles `started_role_indices` starts (`session/restore/008`, `session/restore/025`); the exact role-card styling / focus border.
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/012 — A snapshot whose `project_path` diverges from the saved pane `dir` does not auto-run the config planted at `project_path` (PRD #89 review-fix F1).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
-- **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — while the saved pane still restores as a PLAIN card (`orchestrator`). Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
-- **Does not assert:** which fix shape the coder chooses (drift fallback vs. re-resolving from `saved_pane.dir`) — only that the divergent config is not executed; path canonicalization edge cases (symlinks, `..`).
+- **Agent:** none (the planted config's roles run `sleep 600`; the saved command touches a sentinel file and then sleeps, and never runs; no LLM).
+- **Asserts:** with the saved pane `dir` pointing at a legitimate working dir (no orchestration config) while the `[panes.orchestration]` `project_path` points at a SEPARATE planted dir whose config defines a uniquely-named `phantom-reviewer` role, launching against an empty daemon with no flag does NOT execute the planted config — `phantom-reviewer` never materializes as a deck card — and, since PRD #1885, the saved pane is not restored as a plain `orchestrator` card either, and its saved command's sentinel file is never written; the teardown warning names `tdd-cycle` as `was not restored`, which proves the restore ran and refused. Pins that the un-cross-checked `project_path` cannot auto-run a config from an unexpected directory (capture always writes `project_path == saved_pane.dir`, so divergence only arises via tampering).
+- **Does not assert:** whether the refusal comes from re-resolving against `saved_pane.dir` or from cross-checking it against `project_path` — only that neither the divergent config nor the saved command runs; the exact warning wording; path canonicalization edge cases (symlinks, `..`).
 - **Platform coverage:** mac+linux.
 
-##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4, RED-pending-schema).
+##### session/restore/013 — A custom orchestration tab `display_title` saved in the snapshot is preserved on restore (PRD #89 review-fix F4).
 - **Layer:** L2 (real-binary PTY; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
 - **Agent:** none (roles run `sleep 600`; no LLM).
-- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. RED-pending-schema: `OrchestrationSnapshot` has no `display_title` field yet (the staged key parses but is dropped on load, since the struct sets no `deny_unknown_fields`) and restore passes `None` to `open_orchestration_tab`, so the tab comes back titled `tdd-cycle`; goes GREEN once the coder adds the field + capture + restore threading.
-- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the new field in isolation (a unit test the coder adds with the field).
+- **Asserts:** with a hand-staged snapshot carrying a custom `display_title` (`MYDECKTITLE`) distinct from the canonical config name, the daemon-empty rebuild shows the user's saved title in the tab bar, not the canonical `tdd-cycle` config/cwd name. It was written RED, before `OrchestrationSnapshot` carried a `display_title` field, when the staged key was dropped on load and the tab came back titled `tdd-cycle`.
+- **Does not assert:** the live-path title plumbing (already covered by the new-pane orchestration flow); the serde round-trip of the field in isolation (`src/config.rs` unit tests); an unapproved project (this test pre-approves it through the harness's `trusting_project`).
 - **Platform coverage:** mac+linux.
 
 ##### session/restore/014 — A restored pane whose command identifies a supported agent immediately shows that agent as Idle.
@@ -6106,6 +6775,13 @@ without depending on the config struct API.
 - **Agent:** none (`sleep 600`; no LLM).
 - **Asserts:** the first daemon, with no switch, refuses the start with an error starting `START_ERR_ORCHESTRATION_ID_REQUIRED` and naming `v0.35.0`, and runs no agent; against the second, the hydrated agent is a dashboard card (`No agent · old-orchestrator`, `1 agent(s)`), the orchestration name is absent from the screen (no tab was rebuilt), and the post-detach terminal stream carries the hydration `session_warnings` line naming the orchestration. Verified load-bearing: without the warning push the test fails.
 - **Does not assert:** a real pre-v0.35.0 TUI's display of the refusal (that binary is not built here); a live `OrchestrationSurface` with no token, which builds no tab and is only logged; routing for such a pane, which registers no role.
+- **Platform coverage:** mac+linux.
+
+##### session/restore/025 — A current (`version = 2`) snapshot restores only the roles that were running when it was saved; the others come back as empty role cards (issue #929).
+- **Layer:** L2 (real-binary PTY via `TuiDeck`, `tests/e2e_session_restore.rs`; `DOT_AGENT_DECK_SESSION` redirected to a test-owned path; daemon freshly spawned and empty).
+- **Agent:** none (all three roles run `session/restore/008`'s recorder shell script, which logs its own start to `started-<role>.log`, self-posts `SessionStart` and records its stdin; no LLM).
+- **Asserts:** with a hand-staged `version = 2` snapshot of a three-role orchestration listing `started_role_indices = [0, 1]`, the rebuilt tab shows the `coder` and `reviewer` cards, the daemon runs agents for the orchestrator and `coder`, there is no daemon agent for `reviewer` and its command never ran (`started-reviewer.log` absent, read after the `coder`'s start, which the same pass spawns); a clean detach then re-saves `version = 2` with the same `[0, 1]`, so the empty slot stays empty across another restart. Seen red before the fix at the `reviewer` agent assertion, with the rebuilt-tab precondition passing.
+- **Does not assert:** that `dot-agent-deck pane spawn reviewer` starts the empty role afterwards (`pane/spawn/*` covers spawning into a dead slot); the old-snapshot path (`session/restore/008`); an orchestration that is not approved, held for its trust prompt and then approved (`config-trust/restore/005`) — this test pre-approves it through the harness's `trusting_project`; the periodic flush's capture, which runs the same `record_started_roles` as the detach save but is not separately driven here; the empty card's styling.
 - **Platform coverage:** mac+linux.
 
 ### Live session status on reconnect (PRD #162)
@@ -6283,6 +6959,13 @@ These entries cover PRD #89 Phase 1: the saved-session snapshot must be kept con
 - **Does not assert:** the restore branch that consumes the metadata (`session/restore/008`–`009`); the serde round-trip of the schema in isolation (`config/saved-session/001`); the coalescing window (`session/save/003`).
 - **Platform coverage:** mac+linux.
 
+##### session/save/005 — Saving the workspace records which orchestration roles are running, by whether each role's slot holds a live pane (issue #929).
+- **Layer:** L1 (in-process unit test; `src/tab.rs`, `TabManager::record_started_roles` against a mock pane controller).
+- **Agent:** none.
+- **Asserts:** for a two-role tab whose saved block carries the old `version = 1` / `[0]`, recording stamps `ORCHESTRATION_SNAPSHOT_VERSION` and lists `[0, 1]` when both panes are live, `[0]` when the `coder` pane is missing from the daemon-managed set, `[0]` after the `coder` pane closed (its slot emptied), and `[0]` when the `coder` slot is a dead-slot placeholder even if that id were in the live set.
+- **Does not assert:** that both save paths call it (the detach save is driven by `session/restore/008` and `session/restore/025`); what restore does with the list (`config/saved-session/003`, `session/restore/025`).
+- **Platform coverage:** mac+linux+windows.
+
 ### Saved-session schema (orchestration metadata, PRD #89 Phase 2b)
 
 This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option<OrchestrationSnapshot>` (role order, `start_role_index`, `orchestrator_prompt`, resolved config name + project path, `version`, and which roles were started) so the daemon-empty restore path can rebuild an orchestration tab. The field is `Option` + `#[serde(default)]` so old `session.toml` files still parse.
@@ -6293,7 +6976,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::SavedSession` / `SavedPane` / `OrchestrationSnapshot`; no TUI harness, no I/O).
 - **Agent:** none.
 - **Asserts:** (a) a `SavedSession` whose pane carries an `OrchestrationSnapshot` (version, role order in display order, `start_role_index`, `orchestrator_prompt`, `config_name`, `project_path`, `started_role_indices`) serializes to TOML and deserializes back with every field intact; (b) a legacy `session.toml` string with no `orchestration` key parses with `orchestration == None` — the `#[serde(default)]` forward-compat guarantee for snapshots written before the field existed.
-- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot); any TUI rendering.
+- **Does not assert:** the snapshot-fallback restore branch that consumes the metadata (M2b.3 / `session/restore/008`–`009`); capture (populating the field when writing the snapshot, `session/save/005`); any TUI rendering.
 - **Platform coverage:** mac+linux+windows.
 
 ##### config/saved-session/002 — A `[focus]` table round-trips through TOML, a `session.toml` predating it loads as "nothing remembered", and a PARTIAL table does not take the saved panes down with it (issue #949).
@@ -6301,6 +6984,13 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Agent:** none.
 - **Asserts:** (a) a populated `SavedFocus` (`version`, `dashboard_active`, `active_pane`, `tab_panes`) serializes to TOML and deserializes back equal; (b) a legacy `session.toml` with no `[focus]` table parses with `focus == None`, which the restore path reads as "nothing remembered" and which therefore leaves the deck's own landing choice untouched; (c) a `[focus]` table carrying only ONE key still parses, the saved panes beside it survive, and the absent keys take their `#[serde(default)]` values. (d) the OTHER compatibility direction — an OLDER build reading what this one writes — checked by deserializing the new writer's output into a local struct carrying only the pre-issue-#949 fields, which must still recover the panes and `last_command`. (c) and (d) are the cases that matter most: `SavedSession::load` turns any TOML error into "no session at all", so an unrecognised `[focus]` table must never cost either build every pane. (d) is a claim about `deny_unknown_fields` being absent, which is the kind of thing worth checking rather than asserting.
 - **Does not assert:** the capture that populates the field or the restore that consumes it (`session/restore/017`–`018`); the user-visible detach/reattach cycle (`session/restore/016`); the file's on-disk permissions or atomic-rename write (`session/save/*`).
+- **Platform coverage:** mac+linux+windows.
+
+##### config/saved-session/003 — Restore believes `started_role_indices` only from a current (`version` 2 or later) snapshot, and always starts the start role (issue #929).
+- **Layer:** pure-data (in-crate `#[cfg(test)]` unit test on `config::OrchestrationSnapshot::roles_to_start_on_restore`; no TUI harness, no I/O).
+- **Agent:** none.
+- **Asserts:** a `version = 1` snapshot starts every role whether its list is `[0]`, `[0, 1]` or empty, and so does one whose `version` defaulted to 0; `ORCHESTRATION_SNAPSHOT_VERSION` is 2; a version-2 snapshot starts the listed roles (`[0, 1]` → coder started, reviewer not), adds the start role when the list leaves it out (start 1, list `[2]`), starts only the start role for an empty list, ignores an index past the role count, and a version-3 snapshot is read the same way.
+- **Does not assert:** that the restore path calls it (`session/restore/025`); the capture that writes the list (`session/save/005`).
 - **Platform coverage:** mac+linux+windows.
 
 ### CLI surface (PRD #89 Phase 3)
@@ -6418,7 +7108,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Layer:** L2 (lane 1, real CLI under portable-pty, real sandboxed daemon, SSH shell shim and deterministic download).
 - **Agent:** none.
 - **Asserts:** idle upgrade installs and restarts without asking; restarted summary names from/to versions; a different installed successor PID answers on the same endpoint.
-- **Does not assert:** independently compiled releases, SSH authentication, real-agent work or desktop UI. Old/new debug build stamps distinguish processes executing one retained Cargo build; synthetic PTY coverage is not reel-eligible.
+- **Does not assert:** independently compiled releases, SSH authentication, real-agent work or desktop UI. Old/new debug build stamps distinguish processes executing one retained Cargo build.
 - **Platform coverage:** linux+mac.
 
 ##### remote/upgrade/002 — Piped live upgrades install and keep the current daemon.
@@ -6453,7 +7143,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Layer:** L2 (lane 1, real CLI under portable-pty, sandboxed SSH installer and real daemon).
 - **Agent:** three synthetic cat stand-ins, including an orchestrator and coder role.
 - **Asserts:** installation finishes before the question; prompt names all labels, panes, roles, orchestration and orchestrator; Enter preserves the original daemon, agent identities/PIDs and role map; r stops the named work and replaces the daemon.
-- **Does not assert:** real SSH, release compatibility or real-agent work; no reel marker for stand-ins.
+- **Does not assert:** real SSH, release compatibility or real-agent work.
 - **Platform coverage:** linux+mac.
 
 ##### remote/upgrade/007 — An idle daemon restarts without a TTY.
@@ -6463,7 +7153,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Does not assert:** real SSH or independently compiled releases.
 - **Platform coverage:** linux+mac.
 
-##### remote/upgrade/008 — Interactive Haiku keeps working after Keep, then a named restart stops it. [reel]
+##### remote/upgrade/008 — Interactive Haiku keeps working after Keep, then a named restart stops it.
 - **Layer:** L2 (PTY-attached TUI and upgrade CLI; lane 2, real interactive Claude Haiku).
 - **Agent:** Claude Code (Haiku, interactive; imported credentials, onboarding and cwd trust seeded).
 - **Asserts:** unique file contents absent from the prompt render in the agent's live pane before upgrade; the restart question names that agent and pane; Keep preserves its identity and PID and it reads a new sentinel afterward; Restart now stops the sole disclosed agent, replaces the daemon build at the same endpoint, and connect renders the new empty dashboard.
@@ -6476,7 +7166,7 @@ This entry covers PRD #89 Phase 2b M2b.2: the saved-pane schema gains an `Option
 - **Layer:** L2 (lane 1, real connect and remote TUI under portable-pty, SSH shell shim, real daemon).
 - **Agent:** three synthetic cat stand-ins in the live cases.
 - **Asserts:** y at Upgrade and connect installs; live restart question names all agents and roles; Enter connects to the old daemon with preserved live work and renders its upgrade-team tab with lead and coder cards; r connects to a different successor at the installed build and renders its empty dashboard; neither asks a second remote handshake question and the shared outcome is visible.
-- **Does not assert:** private shared-function routing, independently compiled releases, SSH authentication, real-agent work or desktop UI; no reel marker for synthetic coverage.
+- **Does not assert:** private shared-function routing, independently compiled releases, SSH authentication, real-agent work or desktop UI.
 - **Platform coverage:** linux+mac.
 
 ##### remote/connect/002 — Declining the upgrade still connects to the existing daemon.
@@ -6917,6 +7607,13 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** the upper bound itself (`SPAWN_HOOKS_LIST_TIMEOUT`, 30 s), which a test would have to wait out; that the startup and CLI paths keep the 5 s bound; real Codex timing, which `question/live/004` exercises.
 - **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
 
+##### codex/trust/010 — A Codex command that sets its own `CODEX_HOME` or changes directory declares that no submitted-prompt report will come (issue #1703).
+- **Layer:** L1/fast real-binary subprocess integration: the real `wrap` inside a deck-managed pane (pane id set, so the trust step runs), a pinned Codex home, a seeded durable deck, and a real hook socket collecting every emitted event.
+- **Agent:** the `codex/trust/005` launcher script, with the healthy `codex` app-server stand-in on the wrapper's `PATH` (the deck's prompt hook listed and switched on, so trust is recorded), wrapped four ways: `/bin/sh -c '<launcher>'` (control), `/bin/sh -c 'CODEX_HOME=<other> <launcher>'`, `/bin/sh -c 'cd <other> && <launcher>'` and `env CODEX_HOME=<other> <launcher>`.
+- **Asserts:** the precondition that trust was recorded in the wrapper's home in every run; then that no event of the control run carries `wrapper_prompt_reports_unavailable`, and that EVERY event of the other three does. RED before issue #1703's fix, when the three re-homing runs declared nothing because the wrapper's own trust outcome was all the marker read.
+- **Does not assert:** a launcher script that sets `CODEX_HOME` or changes directory inside itself, which the wrapper cannot see and which stays a documented residual; real Codex loading another home, which needs a credential.
+- **Platform coverage:** mac+linux (the file is `#![cfg(unix)]`).
+
 #### codex/spawn
 
 ##### codex/spawn/001 — Plain restored Codex panes launch through the Wrapper strategy (PRD #20, blocker 3).
@@ -6999,8 +7696,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### codex/hooks
 
-##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7). [reel]
-- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+##### codex/hooks/001 — A real launcher-script interactive Codex turn reports native prompt/tool detail and becomes Idle without process exit (PRD #20 W1, R20-013/R20-014, §4.3.7).
+- **Layer:** L2 PTY-attached (`TuiDeck`); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
 - **Agent:** real interactive Codex on the cheap test model, launched through a recorder script named `codex` ahead of PATH with isolated credentials and a fresh Codex home, workspace-write sandbox, no approvals, network-enabled sandbox configuration, and low reasoning effort; launch passes through the normal Wrapper strategy seam.
 - **Asserts:** with the composer painted and no prompt sent, the dashboard card reads Idle and nothing else for 6 s (issue #1493: it read Working); the launcher handles both the deck's `app-server` trust probe and the interactive agent without receiving `--dangerously-bypass-hook-trust`; the fresh home trusts exactly the deck's ten scoped hook keys; the prompt is typed only after Codex's own composer placeholder paints, and the Enter is confirmed to have been taken as a submit (the placeholder returns) before any hook assertion begins; those hooks emit a prompt-bearing Thinking event, shell ToolStart/ToolEnd events with sentinel command detail, and Stop-hook Idle; the dashboard visibly retains prompt/tool detail and shows Idle, and keeps showing only Idle for 6 s after the turn, the requested sentinel contains exact known content, and the Codex pane is still alive because the test never sends `/exit`.
 - **Readiness gate (issue #730).** Until 2026-09-12 the pre-typing gate was the model name on the grid, which is not a Codex signal: traced byte-for-byte through the input chain it matched 5.6 ms after the new-pane form closed, 225 ms *before* the `wrap` process hosting Codex had even forked. The prompt was therefore typed into a pane whose PTY was still in cooked mode, so the line discipline echoed it back (satisfying the prompt-visible wait) and `ICANON`/`ICRNL` fused the whole 192-byte line onto a single LF, erasing `ui::SUBMIT_DEBOUNCE`'s 150 ms gap; Codex read that as newline-in-input, no turn started, and — since its interactive hooks fire at turn start — nothing fired. Observed submission rate 1 in 5. The gate is now Codex's composer placeholder, the same boundary `state::NO_SIGNAL_READINESS_BUFFER` measured for OpenCode. The Enter is additionally retried until the composer visibly empties: with the gate in place the deck was traced delivering a clean standalone `\r` 150 ms after the last prompt byte and Codex still ignored it, and a real `codex` 0.149.0 driven directly on a pty submits at every gap from 20 ms up, so the residual loss is Codex's own post-composer initialisation rather than anything in the deck's input chain.
@@ -7114,8 +7811,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### codex/live
 
-##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16). [reel]
-- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
+##### codex/live/001 — A real interactive cheap-model Codex run launched through the normal new-pane flow works visibly and reports live status (PRD #20, rule 4 / finding 16).
+- **Layer:** L2 PTY-attached (`TuiDeck`); runtime-skipped unless `check_codex_available` verifies the binary, persisted auth, and a live model request.
 - **Agent:** real interactive bare `codex` using `common::codex_test_model()`, isolated copied credentials, workspace-write sandbox, and low reasoning effort; automatic wrapping occurs at the normal pane spawn seam.
 - **Asserts:** the interactive pane becomes ready, accepts a typed prompt, uses the shell to list the fixture and writes a proof file naming `codex_sentinel_a7c91f.txt`; after detach, the visible Codex card has traversed Thinking → Idle.
 - **Does not assert:** exact model phrasing or token usage.
@@ -7165,8 +7862,8 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### devin/live
 
-##### devin/live/001 — A real interactive Devin turn drives the dashboard card live through the deck's own installed hooks. [reel]
-- **Layer:** L2 PTY-attached (`TuiDeck`, reel-eligible); runtime-skipped unless `check_devin_available` verifies the binary, persisted credentials, and a logged-in account.
+##### devin/live/001 — A real interactive Devin turn drives the dashboard card live through the deck's own installed hooks.
+- **Layer:** L2 PTY-attached (`TuiDeck`); runtime-skipped unless `check_devin_available` verifies the binary, persisted credentials, and a logged-in account.
 - **Quarantined:** `#[ignore = "quarantined: vfarcic, #1348"]` (CLAUDE.md rule 6). #488 reported it red and nobody available has a Devin account to re-triage it; #1348 has the command that runs it (`--run-ignored only`) and what lifts the quarantine.
 - **Agent:** real interactive `devin` restored into a pane, using the account's default (cheap SWE-family) model with isolated copied credentials, the setup wizard pre-satisfied, workspace trust waived, and `--permission-mode auto`; launch goes through the normal `NativeHooks` seam with no wrapper.
 - **Asserts:** the deck-written `"hooks"` block in Devin's own config is actually read and executed by the third-party binary — a typed prompt produces a Devin-stamped Thinking event and a visible Thinking card, an `exec` ToolStart carrying a non-empty tool detail, the pane showing `devin_live_sentinel_4c81de.txt`, and a Stop-driven Idle.
@@ -7176,7 +7873,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### chain-smoke/claude
 
-##### chain-smoke/claude/001 — Interactive Claude consumes an inbox task and drives the live card through Thinking → Working → Idle. [reel]
+##### chain-smoke/claude/001 — Interactive Claude consumes an inbox task and drives the live card through Thinking → Working → Idle.
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_chain_smoke_claude.rs`), attached PTY, imported isolated credentials and pre-seeded project trust.
 - **Agent:** Claude Code (`claude-haiku-4-5-20251001` per Decision 8).
 - **Asserts:** the live dashboard paints Thinking → Working with Bash → Idle after the inbox post; real Bash work copies the uniquely named fixture sentinel exactly; the interactive agent remains alive after completion.
@@ -7184,7 +7881,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (chain-smoke is local-only per Decision 8).
 - **Cost note:** one short interactive Haiku turn with one Bash call.
 
-##### chain-smoke/claude/002 — A delegate reaches a Claude worker whose input box the user typed into and cleared only after the deck's check reads the box empty, and is delivered once. [reel]
+##### chain-smoke/claude/002 — A delegate reaches a Claude worker whose input box the user typed into and cleared only after the deck's check reads the box empty, and is delivered once.
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_chain_smoke_claude.rs`, Linux only, as the check is), attached PTY: the orchestration is opened from the TUI's new-pane form and the user types into the focused worker through the TUI. Imported isolated credentials and pre-seeded project trust, as `scheduler/dispatch/013`. The orchestrator is a script that runs the real `dot-agent-deck delegate`; the worker is interactive Claude Code started directly in its pane (`Direct(Claude)`). The worker's native waiter is killed, so the doorbell is its wake path.
 - **Agent:** Claude Code (`claude-haiku-4-5-20251001`).
 - **Asserts:** the worker's editor-probe permission settles `Armable`; the typed draft is drawn and then deleted from the input box; after the delegate the log shows a probe settled with an empty read, the empty read applied, and only then `doorbell rang`; the delegate is acknowledged with exactly one delivery; the sentinel file the test created with `O_EXCL` holds exactly the one uniquely named line; the deleted draft never became a prompt.
@@ -7199,7 +7896,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_chain_smoke_codex.rs`, Linux), attached PTY: the orchestration is opened from the TUI's new-pane form and the user types into the focused worker through the TUI. The orchestrator is a script that runs the real `dot-agent-deck delegate`; the worker is interactive Codex started directly in its pane (`Direct(Codex)`), on the build's own Codex activation with no e2e assumption, in a fresh `CODEX_HOME` (Codex's first start there; `tests/support/codex_installed.rs`). The orchestration is opened in the fixture's `project` folder (picked in the TUI's directory picker), for the reason `inbox/probe/041` gives, and the TUI is 200 × 50: at 180 × 50 the worker's pane was 117 columns and the deck held the fresh worker unchecked and unrung (`Surface`, then `Layout`) until a first prompt, not taking its logo as a width witness; at 200 the pane is 130 columns. A test-owned client answers Codex's cursor position queries as a desktop would; it is disclosed here and in the Scenario as a stand-in, not C1 coverage.
 - **Agent:** Codex on `common::codex_test_model()`.
 - **Asserts:** the worker's editor-probe permission settles `Armable`; the typed draft is drawn and then deleted from the input box; after the delegate the log shows a probe settled with an empty read, the empty read applied, and only then `doorbell rang`; the delegate is acknowledged with exactly one delivery; the sentinel file the test created with `O_EXCL` holds exactly the one uniquely named line; the deleted draft never became a prompt.
-- **Status:** the Codex activation's lane-2 gate (Q35-29). No `[reel]` until its recording is reviewed.
+- **Status:** the Codex activation's lane-2 gate (Q35-29).
 - **Platform coverage:** linux.
 - **Cost note:** one short interactive Codex turn.
 
@@ -7449,7 +8146,7 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Layer:** L1/fast (same `TabManager`-only technique as `pane/spawn/009`).
 - **Agent:** none.
 - **Asserts:** two legs on the same fixture tab shape (`[orchestrator, coder]`). Leg 1 — with the current config reading `[orchestrator, coder, reviewer]`, growing with `reviewer` still lands it last (returned index 2, vectors `[orchestrator, coder, reviewer]`, `start_role_index` unmoved): the case that was accidentally correct before placement existed must stay correct. Leg 2 — with a current config that does not mention `reviewer` at all, the growth still succeeds and appends (returned index 2), so placement degrades to the pre-#1096 behaviour rather than panicking or picking an arbitrary slot.
-- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement and still falls back to a plain pane.
+- **Does not assert:** the mid-insert case (`pane/spawn/014` owns it); what the RESTORE path then does with a tab whose config dropped a live role — that drift is unrepairable by placement, and since PRD #1885 the snapshot is left unrestored with a warning rather than restored as a plain pane (`config-trust/restore/003`).
 - **Platform coverage:** mac+linux (unix-only).
 
 ##### pane/spawn/016 — A role inserted BEFORE the start role carries `start_role_index` along with it (issue #1096).
@@ -7461,14 +8158,14 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### pane/real-agent
 
-##### pane/real-agent/001 — `pane restart` of a Claude worker the user quit brings back a working Claude in the same pane (issue #1094). [reel]
+##### pane/real-agent/001 — `pane restart` of a Claude worker the user quit brings back a working Claude in the same pane (issue #1094).
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_pane_verbs_real_agent.rs`); real `pane restart` and `delegate` CLIs run with the orchestrator's pane id.
 - **Agent:** Claude Code, interactive Haiku (`--allowedTools Bash Read Write`), `clear = false`; the orchestrator is `cat`.
 - **Asserts:** with coder focused, two Ctrl+C quit the first Claude generation; `pane restart coder` without `--force` is accepted once the daemon has seen it exit; a new generation is listed on the same pane, recognized as Claude Code, and shows its composer in its own scrollback; a delegated task makes it write the uniquely named sentinel with exact contents, the attached TUI paints Thinking, Working and then Idle after the delegate, and the one inbox message carrying the task is bound to the new generation.
 - **Does not assert:** `--force` against a live Claude, the refusal paths (`pane/restart/002`-`008`), or a late hook from the replaced generation (`pane/restart/014`).
 - **Platform coverage:** mac+linux (unix-only).
 
-##### pane/real-agent/002 — `pane spawn` of a Claude role added mid-session puts a working Claude in the already-open tab (issue #1094). [reel]
+##### pane/real-agent/002 — `pane spawn` of a Claude role added mid-session puts a working Claude in the already-open tab (issue #1094).
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_pane_verbs_real_agent.rs`); real `pane spawn` and `delegate` CLIs run with the orchestrator's pane id.
 - **Agent:** Claude Code, interactive Haiku (`--allowedTools Bash Read Write`), `clear = false`, as the spawned `reviewer`; the orchestrator and coder are `cat`.
 - **Asserts:** after `reviewer` is appended to the running orchestration's config, `pane spawn reviewer` succeeds; reviewer is listed and recognized as Claude Code, its card joins the open tab, and focusing it draws Claude's composer in the attached TUI; a delegated task makes it write the uniquely named sentinel with exact contents, the TUI paints Thinking, Working and then Idle after the delegate, and the one inbox message carrying the task is bound to reviewer's generation.
@@ -7477,15 +8174,15 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 
 #### pi/live
 
-##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders the experimental-gated Pi identity plus a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4 + PRD #180 reel-eligibility).
-- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180, unlike the HEADLESS `chain-smoke/pi/001` + `scheduler/pi/001`). Mirrors `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs` and the reference `scheduler/dispatch/013`. The bundled extension is materialized into the per-test HOME BEFORE launch (`TuiDeckBuilder::with_pi_extension`) so the deck's lazy-spawned daemon — and the pi child it spawns, which inherits that HOME — auto-discovers it at boot; `ANTHROPIC_API_KEY` + the built-binary PATH are threaded into the deck via `with_env` (the key is never printed). Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
+##### pi/live/001 — A REAL `pi` agent runs LIVE in a PTY-attached pane and its card renders the experimental-gated Pi identity plus a real, extension-driven status TRANSITION on the vt100 grid, with NO hook (PRD #201, CLAUDE.md rule 4).
+- **Layer:** L2 PTY-attached (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness — records a `full-stream.cast`, unlike the HEADLESS `chain-smoke/pi/001` + `scheduler/pi/001`). Mirrors `e2e_issue_dispatch_real.rs` / `e2e_chain_smoke_claude.rs` and the reference `scheduler/dispatch/013`. The bundled extension is materialized into the per-test HOME BEFORE launch (`TuiDeckBuilder::with_pi_extension`) so the deck's lazy-spawned daemon — and the pi child it spawns, which inherits that HOME — auto-discovers it at boot; `ANTHROPIC_API_KEY` + the built-binary PATH are threaded into the deck via `with_env` (the key is never printed). Launched with `DOT_AGENT_DECK_EXPERIMENTAL=1`.
 - **Agent:** REAL `pi` on `common::pi_test_model()` (`openai-codex/gpt-5.6-luna` by default on the stored ChatGPT login, PRD #1666), `--approve`, as a single interactive pane restored from a staged saved session. Flaky-tolerant lane-2 tier (real LLM) — run once, not looped (rule 4/5). Runtime-skipped (Decision 26) when `pi` or its credential is absent; a refused model fails.
 - **Asserts (on the rendered vt100 grid):** after detaching to the dashboard, the Pi pane's card shows a REAL, extension-driven status TRANSITION with NO hook installed — `Thinking` (extension `agent_start`→running), an Idle → running transition the daemon never produces on its own for a hook-less Pi pane (a freshly-spawned pane defaults to Idle, and `session_start` now reports Idle for parity with Claude/OpenCode/Codex, so `Thinking` — not the retired `Needs Input` — is the extension-only proof), then a settle back to `Idle` (extension `agent_settled`→finished, polled on the CURRENT grid so it can only be the post-turn settled frame — this is the turn-end→Idle mapping the fix changed, so a regression to "Needs Input" fails here) — and the card title carries the experimental-flag-gated first-class Pi identity (`Pi ·`, the `AgentType` Display, which the lowercase `pi` command never produces). Issue #622: the SETTLED card, read off its own rectangle (the live pi pane prints its tool calls on the same rows), also carries `Dir:`, a `Prmt:` row, a `bash — <command>` tool line and `Tools: N` with N > 0 beside `Idle` — before the fix it kept only `Dir:` and read `Tools: 0` although pi visibly ran its shell tool. The `Thinking` step is scanned over the rolling byte history so a transient frame still matches; generous 180s ceilings sized to confidence (Design Decision #7).
 - **Does not assert:** the transient `Working` badge or the active-tool line while the tool runs (a sub-second shell call; the fast-tier `pi_agent_event_cli` tests pin both through the real CLI, and the extension's event mapping is pinned by its TS unit tests); the exact prompt text on the `Prmt:` row (it is cut to the card's width); the orchestrator→worker delegation chain (a single live Pi pane fully satisfies rule 4; the delegate route is pinned headless by `chain-smoke/pi/001` and live through the inbox by `pi/live/002`); any specific text pi prints; the directed sentinel file (`pi_live_sentinel_4b1a.txt`) is a best-effort/logged secondary signal, not a gate, since the rendered status transition already proves the pi turn ran.
 - **Platform coverage:** mac+linux (real-agent tier is local-only per Decision 8).
 - **Cost note:** one cheap Haiku directive turn (create one file) — well under Decision 23's <$0.05/run bound.
 
-##### pi/live/002 — Restored real Pi receives its seed through the inbox and delegates to real Claude Haiku on the live grid. [reel]
+##### pi/live/002 — Restored real Pi receives its seed through the inbox and delegates to real Claude Haiku on the live grid.
 - **Layer:** L2 lane 2 (`tests/e2e_pi_live.rs`), real binary and PTY-attached TuiDeck; production session restore and extension installation.
 - **Agent:** Real Pi orchestrator (GPT, `common::pi_test_model()`) and Claude Haiku worker with isolated configuration and imported credentials.
 - **Asserts:** The restored directive triggers delegation; the worker card labels its envelope task; the worker writes the sentinel and reports work-done.
@@ -7685,9 +8382,233 @@ These entries cover PRD #80 (mouse parity for keyboard actions): every keyboard-
 ##### mouse/help/001 — The `?` help overlay documents the canonical post-button-bar shortcut set.
 - **Layer:** L1.
 - **Agent:** none.
-- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively.
+- **Asserts:** the overlay documents the global commands the button bar advertises (Ctrl+N / Ctrl+W / Ctrl+T, `?`, Ctrl+C) plus the key dashboard / navigation actions, matched case-insensitively; its Mouse column has a `Drag` row reading `Select & copy` and a `Mouse click` row reading `Focus pane` (PRD #385 M7); the copy-mode row shows `v` by default and `x` once `[dashboard] copy_mode = "x"` is bound.
 - **Does not assert:** exact overlay layout / wording.
 - **Platform coverage:** mac+linux+windows.
+
+#### mouse/capture
+
+##### mouse/capture/001 — The deck does not ask its terminal for any-motion mouse tracking (PRD #385 M4).
+- **Layer:** L1 (pure byte output of the terminal-mode guard, `ui::tests`).
+- **Agent:** none.
+- **Asserts:** turning the deck's terminal modes on writes `?1000h`, `?1002h` and `?1006h` and nothing containing `1003`; turning them off writes `?1000l`, `?1002l`, `?1003l` and `?1006l`.
+- **Does not assert:** what a real terminal reports in each mode; the Windows console path, which sets mouse input through the console API rather than these sequences.
+- **Platform coverage:** mac+linux.
+
+#### mouse/select
+
+##### mouse/select/001 — A drag in a pane that is not focused focuses it and copies its text in one gesture (PRD #385 M2).
+- **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (two `bash` panes stand in for agents: one restored with `--continue`, one opened from the new-pane form with no command; each prints a shell-computed sentinel).
+- **Asserts:** with both panes tiled on the dashboard in command mode and the second one focused (thick `┃` border), one drag across the first pane's sentinel writes an OSC 52 sequence whose payload is exactly that sentinel and never the focused pane's, moves the thick border to the dragged pane, and shows the OSC 52-only status (`Sent to terminal clipboard (OSC 52)`), since the harness turns the native clipboard off.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); the native clipboard write or its status wording (`clipboard/*`); orchestration-tab panes; a real agent.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/002 — A press in a pane that is not focused focuses it, and the drag highlights that pane (PRD #385 M2).
+- **Layer:** L1 (`PaneSelectionSeam`: inert panes tiled over a `TestBackend` frame, driven through the live loop's mouse functions; `insta` snapshot of the frame with the highlighted cells marked).
+- **Agent:** none.
+- **Asserts:** with pane `a` focused, a left press on pane `b`'s first cell focuses `b`; dragging four cells right highlights exactly `bravo` inside `b`'s content area and no cell of `a`.
+- **Does not assert:** copy delivery (`mouse/select/001`, `clipboard/*`); multi-click word/paragraph selection; the stacked layout, which draws only the focused pane.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/003 — A drag selection stays after the release and is cleared by a press, typing into its pane, a tab switch or its pane closing (PRD #385 M3).
+- **Layer:** L1 (`PaneSelectionSeam`).
+- **Agent:** none.
+- **Asserts:** after a drag over `bravo` is released, `bravo` is copied once and stays highlighted; the next press (in another pane) removes it, and the plain click that press makes leaves no highlight; a lone `Esc` typed into the pane leaves it, while a typed `x` removes it; switching tab and back leaves none; closing the pane that owns it leaves none on the pane that remains.
+- **Does not assert:** the tab switch through the real tab manager and key path (`mouse/select/006`; the seam switches its own deck); paste, which goes through the same clearing function as typing; a press on a button, card or dialog (the seam draws none).
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/004 — A kept highlight never shows text other than what was copied (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, output fed straight into the panes' vt100 parsers).
+- **Agent:** none.
+- **Asserts:** after `bravo` is copied from pane `b`, output in pane `a` and output on another line of `b` keep the `bravo` highlight; after output that scrolls `b`, overwrites the selected cells, or clears the screen, the highlighted cells show either nothing or exactly `bravo`.
+- **Does not assert:** that the selection follows its text as it scrolls (the deck clears it instead: vt100 keeps no position for a scrolled line); a resize (`mouse/select/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/005 — A drag that starts in a pane and is released over a button or a card still copies, and fires nothing (PRD #385 M3).
+- **Layer:** L2 (real-binary PTY, SGR press / held-button motion / release, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent; it blanks itself and leaves a shell-computed sentinel on its bottom row, held there by `sleep`).
+- **Asserts:** in command mode, a drag from the end of the sentinel released over the bottom bar's `[New Agent n/Ctrl+N]` button writes an OSC 52 sequence whose payload is exactly the sentinel (the drag's end clamps to the pane's bottom row and first column), shows the OSC 52-only status, and opens no directory picker; after a plain click on a blank pane cell (so the next press is not a double-click), a second drag from the sentinel released over the pane's dashboard card writes an OSC 52 sequence carrying the blank rows from the card's row (or the pane's top) down to the sentinel, then the sentinel, and the deck stays in command mode.
+- **Does not assert:** the highlight's cells (`mouse/select/002`); a release over a tab header; a dialog opened mid-drag, which cancels the selection instead (`mouse/select/011`); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/006 — A real tab switch clears the selection even when the user is back before the next frame (PRD #385 M3).
+- **Layer:** L1 (`ui::tests`: a real `TabManager` with a dashboard and an orchestration tab, keys through the live loop's `handle_key_event`).
+- **Agent:** none.
+- **Asserts:** with a copied selection kept on a dashboard pane in pane input, Ctrl+PageDown then Ctrl+PageUp, handled with no frame drawn between them, leave no selection; Ctrl+PageUp on the first tab, and selecting the tab already active, keep it.
+- **Does not assert:** the highlight's cells (`mouse/select/003`); tab moves that do not go through `switch_tab_with_focus` (opening or closing a tab), which the check made before every frame still covers.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/007 — A pane whose screen is larger than the pane copies exactly what the highlight is drawn over (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam::tiled_with_screen`: the pane's vt100 screen sized apart from its pane, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** with a 28 x 6 pane over a 20 x 50 screen (cursor on row 19), a drag on the first drawn row and a drag across three drawn rows copy the text the pane shows at the top-left of its screen, and the kept highlight shows that same text; with a 6 x 50 screen, the three-row drag, a double-click on a word that runs past the pane's right edge and a triple-click on the paragraph each copy only the drawn columns, matching the highlight; the triple-click on the 20 x 50 screen copies the drawn rows only.
+- **Does not assert:** a screen smaller than its pane (the cells past it are blank and trimmed from the copy); an orchestration tab, which draws panes through the same function.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/008 — A selection through the COMMAND MODE banner or a cannot-scroll notice shows the pane's text, not the overlay's (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, command mode with the banner expanded, or the pane's cannot-scroll notice armed).
+- **Agent:** none.
+- **Asserts:** the overlay covers some of the pane's text before the drag; while a drag across the whole pane is held, and after its release, the highlighted cells show the pane's seven lines, and the release copies exactly those lines.
+- **Does not assert:** that the banner comes back once the selection is cleared (it decays on its own timer); dialogs, which take every click while they are open.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/009 — The stacked layout copies what is drawn, and a resize never leaves a highlight over other text (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, stacked layout and frame resizes with the panes' screens left at their size).
+- **Agent:** none.
+- **Asserts:** in the stacked layout, a drag on the first drawn row of a pane whose screen is larger than the pane copies `r00-ab` and the highlight shows the same; after `bravo` is copied, resizing the frame to 50 x 14, 30 x 8 or its own 40 x 12 leaves either no highlight or one showing exactly `bravo`.
+- **Does not assert:** that a selection survives a resize (it is cleared when its pane moves); the zoomed layout, which draws through the stacked one.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/010 — A drag over wide (two-column) glyphs copies exactly what its highlight shows (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam`, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** on a pane showing `你AB 漢字x`, drags forward and backward that start or end on either half of a glyph copy `你A`, `AB 漢字`, `你AB 漢字x` and `你AB 漢`, and the highlighted cells, read as a terminal draws them, show the same text; no space is copied for a glyph's second column; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) drags copy `AB` and `💻A`, and on `🇺🇸AB` they copy `🇸AB` and `AB`, each matching its highlight; whichever end the press is on, a drag whose leftmost cell is a glyph's second column leaves that glyph out of both the highlight and the copy (`AB`, `AB 漢`, `AB 漢字`, `💻A`, `💻`), and one whose rightmost cell is either column of a glyph highlights and copies the whole glyph (`AB 漢`, `AB 漢字`, `💻`).
+- **Does not assert:** double- and triple-click word and paragraph selection over wide glyphs; a glyph cut by the pane's edge.
+- **Platform coverage:** mac+linux+windows.
+
+##### mouse/select/011 — An overlay opened, or the terminal losing focus, mid-drag cancels the pane selection (PRD #385 decision 6).
+- **Layer:** L2 lane 1 (real-binary PTY, SGR press / held-button motion / release sent apart, `tests/e2e_mouse_select.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel).
+- **Asserts:** in command mode, a press and drag across the sentinel, then `?` with the button held and the release over the drawn Help overlay, write no OSC 52 sequence and show no copy status, and Help stays open; after Help closes, a click on `[New Agent n/Ctrl+N]` opens the directory picker; a press and drag followed by a terminal focus-out report (`CSI O`) and then the release write no OSC 52 sequence and show no copy status.
+- **Does not assert:** each other overlay and modal one by one (they share the check `overlay_blocks_mouse` decides); the unfinished highlight's cells while Help is open; a real agent.
+- **Platform coverage:** mac+linux.
+
+##### mouse/select/012 — A frame that draws no pane leaves nothing to select: a drag where a hidden pane was drawn copies nothing (PRD #385 decision 6).
+- **Layer:** L1 (`PaneSelectionSeam::render_frame`: the run loop's `draw_frame` with the production layout of the active tab, `tests/mouse_select.rs`).
+- **Agent:** none.
+- **Asserts:** two orchestration role panes are drawn on their tab; after a switch to the dashboard, whose whole frame draws no pane while both keep running, a press, drag and release over the second pane's former cells copy nothing, leave the first pane focused and highlight nothing; a drag under way in a dashboard pane when the panes move to an orchestration (so the next frame draws none) copies nothing on release.
+- **Does not assert:** the real binary; a pane hidden while other panes are still drawn (the same post-frame check covers it).
+- **Platform coverage:** mac+linux+windows.
+
+#### clipboard/deliver
+
+##### clipboard/deliver/001 — A copied selection goes to the native clipboard and as OSC 52, and the status line says only what happened (PRD #385 M1).
+- **Layer:** L1 pure data (`clipboard::tests`), against a fake `ClipboardBackend` and a fake `NativeSink`; no test writes a real clipboard.
+- **Agent:** none.
+- **Asserts:** a copy attempts the native write and always sends OSC 52; the status line reads "Copied to clipboard" only for a confirmed native write, the OSC 52 wording (pointing at Troubleshooting, never "Copied") when the native write was unavailable or failed, a not-copied line when neither went out, and for a native write that has not answered yet a pending wording (with OSC 52 sent) or a not-confirmed-yet wording (without), neither of which says "Copied" or "Not copied", and nothing for an empty selection; the native clipboard is opened lazily and once, a failed open is not retried, a refused write reports failed, a blocked write returns unconfirmed after the bounded wait without holding the caller and later writes land once it unblocks; `DOT_AGENT_DECK_NATIVE_CLIPBOARD` set to `0`/`false`/`off`/`no` turns the native write off.
+- **Does not assert:** that `arboard` reaches a real X11, Wayland or macOS clipboard; the mouse gesture that triggers a copy (that is the pane selection's own tests); an agent's own OSC 52 copy, which is `embed/clipboard/001`.
+- **Platform coverage:** mac+linux+windows.
+
+#### clipboard/native
+
+##### clipboard/native/001 — Copies made while the native write is stuck do not land out of order: the newest one wins (PRD #385).
+- **Layer:** L1 pure data (`clipboard::tests`), a fake `NativeSink` whose write blocks until released.
+- **Agent:** none.
+- **Asserts:** with a write of `A` in progress and blocked, copies `B` and then `C` return unconfirmed without waiting; once the sink is released the clipboard receives `A` then `C`, and `B` is never written.
+- **Does not assert:** that the in-progress write can be stopped (it cannot); a real X11, Wayland or macOS clipboard.
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/002 — Exit waits a bounded time for the native clipboard's handoff (PRD #385).
+- **Layer:** L1 pure data (`clipboard::tests`), a fake `NativeSink` whose `Drop` stands in for arboard's X11 clipboard-manager handoff.
+- **Agent:** none.
+- **Asserts:** shutting the native clipboard down waits for a handoff that finishes, which has finished when the shutdown returns; a handoff that never finishes makes the shutdown return `false` after its deadline instead of hanging; the exit wait constant is at most 300 ms.
+- **Does not assert:** that a real clipboard manager takes the copy; that `run_tui` calls the shutdown (it does so at its ordinary exit; the clipboard's `Drop` is the backstop).
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/003 — A panic on the native clipboard thread does not tear the terminal down (PRD #385).
+- **Layer:** L1 (`clipboard::tests`), the deck's own `ui::tui_panic_hook` installed with a recording teardown, and fake openers/sinks that panic.
+- **Agent:** none.
+- **Asserts:** a panic while opening the clipboard and a panic while writing to it each settle the native clipboard as unavailable (that copy and the next report it so) and do not reach the hook's teardown, and the warning the worker logs for a caught panic, built on a thread marked as the worker under that hook, carries the panic's message, the source location the hook noted and that native clipboard writes are disabled for the session; a control panic on an ordinary thread does reach the teardown.
+- **Does not assert:** a panic on a thread arboard starts for itself; the `panic = "abort"` build, where nothing is contained and the hook tears down; the hooks `run_tui` installs around this one (`clipboard/native/004` covers the assembled stack); that the warning reaches a log (no subscriber captures the worker thread).
+- **Platform coverage:** mac+linux+windows.
+
+##### clipboard/native/004 — A contained panic leaves the terminal set up under the deck's whole panic-hook stack, and any other panic hands it back (PRD #385).
+- **Layer:** L1 (`ui::panic_teardown_tests`, `src/ui_panic_teardown_tests.rs`): the test binary re-executed on a fresh pseudo-terminal in a session of its own, setting the terminal up with `ui::enter_tui_terminal`, the function `run_tui` calls (its panic hook, the terminal modes, then `wide_glyph_backend::init`); a fake clipboard opener that panics.
+- **Agent:** none.
+- **Asserts:** after a panic on the native clipboard's worker (opening the clipboard) and after a panic inside a guarded parser feed, the terminal is still in raw mode (no canonical input, no echo) and nothing written before the check left the alternate screen (`ESC [ ? 1049 l`); after a panic on an ordinary thread, the control, the alternate screen was left and raw mode is off.
+- **Does not assert:** the event loop or a real agent's output; the `panic = "abort"` build; a real clipboard (none is opened).
+- **Platform coverage:** mac+linux.
+
+#### copymode/keys
+
+##### copymode/keys/001 — `v` in command mode opens copy mode, which pages back to a line in the pane's history, selects it and yanks it (PRD #385 M5).
+- **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` stands in for an agent and prints a shell-computed sentinel, then 120 lines).
+- **Asserts:** with the sentinel scrolled out of view, `v` in command mode shows the ` COPY ` mode chip and a copy-mode cursor; `PageUp` pages back until the sentinel is on screen; moving the cursor onto it, `v`, moving across it and `y` writes exactly one OSC 52 sequence, whose payload is exactly the sentinel; the status line then reports the OSC 52-only send and the chip reads ` COMMAND ` again.
+- **Does not assert:** the native clipboard (the harness turns it off); the keys' L1 edge cases (`copymode/keys/002`); a real agent (`copymode/live/001` drives one).
+- **Platform coverage:** mac+linux.
+
+##### copymode/keys/002 — Leaving copy mode without a yank copies nothing and leaves the pane where it was; live output does not move copy mode's view; an empty pane and the alternate screen behave (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`: one inert pane and the bottom bar over a `TestBackend` frame, keys through the live loop's `handle_key_event`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** after paging and setting a selection, `Esc`, and `q` after the pane was first scrolled back in command mode, return to command mode with no copy and no status message, the pane at the scroll offset it had before and showing what it showed before; forty lines of output while copy mode is open leave its view unchanged, its bottom shows no new line and a yank copies none, and after leaving the pane shows the new output; on an empty pane copy mode opens with the cursor at the first cell, `PageUp` and `g` leave it there (no history) and `G` moves it to the last row, `y` with no selection keeps copy mode open, and an empty selection leaves it without a copy or a status; on a full-screen program's alternate screen copy mode has no history to page into and copies that screen's text; and copy mode closes, copying nothing, once the pane it is open on closes, the very first frame after the close already in command mode.
+- **Does not assert:** the real binary (`copymode/keys/001`); a pane that stays open but leaves the screen (the stacked layout giving its slot to another pane), which closes copy mode through the same not-drawn check.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/003 — Copy mode on a pane whose screen is larger than the pane keeps its cursor on drawn cells and yanks what is highlighted (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam::with_screen`: the pane's vt100 screen sized apart from its pane, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with a 28 x 9 pane over a 20 x 50 screen whose cursor is on row 19, `v` opens copy mode with exactly one cursor cell drawn; after moving and selecting across two lines with the cursor pushed far right, the cursor is still inside the pane, and `y` copies exactly the highlighted text, `abcdefghijklmnopqrstuvwx` and the next line's first 28 columns. With an 8 x 20 screen shown in a 3 x 8 content area (`VISIBLE0` to `VISIBLE2`), the cursor opens on a drawn row, `G` puts it on the last drawn row, and a two-row selection yanks `VISIBLE0` and `V` with no hidden suffix. With the frame shrunk while a selection is open, the very first frame after the shrink draws the cursor inside the smaller pane and the yank is exactly that frame's highlighted text. With a 4-row screen in a taller pane and the view scrolled into the history, a selection ending on the last drawn row yanks exactly the highlighted `L10-text` to `L13-text`, and a selection running on below the drawn rows marks no cell on the blank rows under the screen, its highlighted text being the part of the yank the pane draws.
+- **Does not assert:** a screen narrower than its pane; a grow while copy mode is open.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/004 — Copy mode closes when another client closes the last pane, and a pane reusing that id does not inherit it (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam::render_frame`: the run loop's `draw_frame` with the production layout over the dashboard tab, and the daemon's pane-closure report applied through `apply_pane_closure`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with copy mode open and a selection made on the dashboard's only pane, after the pane is closed externally the first whole frame shows the ` COMMAND ` chip, no copy-mode cursor and no selection, and a later `y` copies nothing (no OSC 52 send); when a new pane is attached under the closed pane's id before any frame is drawn, `y` copies nothing and the UI is in command mode; when the pane is only forgotten, with no closure handler leaving copy mode, the very first whole frame is still in command mode with no chip, cursor or selection, and `y` copies nothing, which pins the frame's own pre-draw check.
+- **Does not assert:** the real binary or a second client (the closure report is applied as the run loop applies it); an orchestration tab closing under copy mode, which leaves the pane undrawn and closes copy mode through the same pre-frame check.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/005 — Copy mode highlights and copies a wide (two-column) glyph whole (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** the row `你AB` is drawn with no gap after the glyph; `g l l`, select, yank copies `B` with `B` highlighted; a forward selection from the glyph copies `你A`, a backward one onto it `你AB`; a copy-mode cursor that opens on, or moves up onto, a glyph's right half is put on the glyph, so the selection copies `你A` and `你b`; on `👩‍💻AB` (a zero-width-joiner emoji kept as two cells) `g l l l` then yank copies `B`, and a selection over both emoji cells copies `👩‍💻A`; on `🇺🇸AB` a selection from the flag's second indicator copies `🇸A`; each time the highlighted text, read as a terminal draws it, is the copied text.
+- **Does not assert:** a glyph cut by the pane's right edge (it is not drawn and copies as nothing); combining marks; how a host terminal draws two adjacent cells that form one emoji or flag.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/006 — A remapped key that leaves copy mode is not also taken as a jump, and copy mode's entry key can be remapped (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam` with a card for the pane and keybindings parsed from TOML, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with `[global] jump_1 = "y"`, a yank copies once and leaves the deck in command mode with the card selection unchanged and no byte sent to the pane; with `jump_1 = "q"`, `q` leaves the same way without a copy; with `[dashboard] copy_mode = "x"`, `v` does not open copy mode and `x` does; binding `copy_mode` to the key `jump_1` has is reported as a conflict naming `copy_mode`, and then neither key opens copy mode.
+- **Does not assert:** the real binary; remapping copy mode's own keys, which are fixed.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/007 — A yank drops only the cells nothing was written to (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** a no-break space selected alone is copied; spaces the program wrote are kept on the row the selection ends on, `ab   `; a row the selection runs through to its end loses its trailing spaces, `ab` then `c`; a selection running into never-written cells copies the written text only, `cd`.
+- **Does not assert:** the mouse path's own cases (it shares the row extraction); tabs, which vt100 stores as cursor movement over unwritten cells.
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/008 — Nothing typed or pasted while copy mode is open reaches the pane's program, and Ctrl+C opens the quit dialog (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`, keys through `handle_key_event` and a paste through the run loop's `forward_paste`, with the pane's child-input recorder, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** while copy mode is open, unbound printable keys, a digit, `Ctrl+D`, `Ctrl+W`, the movement and selection keys, `Tab`, `Backspace`, `PageUp` and a paste send no byte to the pane and copy mode stays open; `Ctrl+C` then puts the UI in the quit dialog with no byte sent and nothing copied.
+- **Does not assert:** mouse reports and the real binary's event loop (`copymode/keys/009`).
+- **Platform coverage:** mac+linux+windows.
+
+##### copymode/keys/009 — Keys, a paste and mouse reports sent while copy mode is open reach no program, end to end (PRD #385 M5).
+- **Layer:** L2 lane 1 (real-binary PTY, `tests/e2e_copy_mode.rs`).
+- **Agent:** none (a `bash` pane restored with `--continue` runs `cat -v` with mouse reporting and bracketed paste turned on, so any byte it receives is shown).
+- **Asserts:** after copy mode receives printable keys, a digit, `Ctrl+D`, `Ctrl+W`, movement keys, `PageUp`, a bracketed paste and a mouse press, drag, release and wheel report, `q` returns to command mode and `Ctrl+D` to typing; `ENDMARK` typed then appears alone on its line in the program's output, no pasted text or escape sequence appears, and no OSC 52 copy was written.
+- **Does not assert:** the native clipboard (the harness turns it off); a real agent.
+- **Platform coverage:** mac+linux.
+
+##### copymode/keys/010 — A resize never lets a yank copy what the first frame after it did not highlight (PRD #385 decision 6).
+- **Layer:** L1 (`CopyModeSeam`: the frame resized with the pane's screen left at its size, one frame drawn, then the key, as the run loop draws on a resize before it handles a queued key, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** with columns 20 to 25 of one line selected and the pane narrowed to 10 content columns, the first frame highlights no cell, `y` copies nothing, sets no status and leaves copy mode open with its cursor on a drawn cell, and a selection made afterwards copies exactly what it highlights (`bcd`); a selection whose first line starts right of the new edge keeps its drawn part, so the frame highlights and the yank copies `row1`; after paging back and selecting on the view's last row, a height shrink that moves copy mode's view highlights and yanks exactly `row19-`.
+- **Does not assert:** the real binary's resize path; a grow while copy mode is open.
+- **Platform coverage:** mac+linux+windows.
+
+#### copymode/render
+
+##### copymode/render/001 — Copy mode shows its mode chip, its cursor and its selection on the focused pane (PRD #385 M5).
+- **Layer:** L1 (`CopyModeSeam`, `insta` snapshot of the frame with the cursor and selected cells marked, `tests/copy_mode.rs`).
+- **Agent:** none.
+- **Asserts:** `v` in command mode turns the bottom bar's chip from ` COMMAND ` to ` COPY ` and draws the cursor where the pane's own cursor is; after moving and selecting, exactly `line-28` is marked, with one cursor cell at its end; `y` copies `line-28`, sets the OSC 52 status message and removes the cursor and highlight.
+- **Does not assert:** exact colours beyond the cursor's yellow and the selection's light-cyan backgrounds; the stacked layout or an orchestration tab, which draw the focused pane through the same function.
+- **Platform coverage:** mac+linux+windows.
+
+#### copymode/live
+
+##### copymode/live/001 — Copy mode yanks what a live Claude Code agent printed (PRD #385 M5).
+- **Layer:** L2 lane 2 (`tests/e2e_copy_mode_live.rs`, `#![cfg(all(unix, feature = "e2e", feature = "e2e-live"))]`), attached PTY. Imported isolated credentials and pre-seeded project trust, as `scheduler/dispatch/013`; `--allowedTools Bash Read`.
+- **Agent:** interactive Claude Code on Haiku, started through the attach socket in a fixture directory whose one file is the sentinel.
+- **Asserts:** after the agent lists the directory and the sentinel file name is on screen, `Ctrl+D`, `v`, moving the copy-mode cursor onto the name, `v`, moving across it and `y` write an OSC 52 sequence carrying exactly the name; the status line reports the OSC 52-only send and the chip reads ` COMMAND `.
+- **Does not assert:** the native clipboard (the harness turns it off); paging, which `copymode/keys/001` covers.
+- **Platform coverage:** mac+linux.
 
 
 ### Theme contrast
@@ -7932,7 +8853,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** a genuine agent boot or agent response; real-agent cursor and scroll behavior (covered by `mode/live/002`); exact block-glyph shapes or subtitle position.
 - **Platform coverage:** mac+linux.
 
-##### mode/live/002 — A real interactive Haiku agent visibly traverses typing, command-mode reading and scrollback, then typing again. [reel]
+##### mode/live/002 — A real interactive Haiku agent visibly traverses typing, command-mode reading and scrollback, then typing again.
 - **Layer:** L2 PTY (the real `dot-agent-deck` binary in the isolated `TuiDeck` harness, asserted on the rendered vt100 grid and terminal attributes; flaky-tolerant lane-2 real-agent tier).
 - **Agent:** REAL interactive Claude Code on Haiku (`claude-haiku-4-5-20251001`, `--ax-screen-reader`, `--allowedTools Bash Read`, no `-p`), with isolated imported credentials plus onboarding/project trust seeded in the per-test HOME; the supported accessibility renderer keeps genuine interactive output in terminal scrollback instead of repainting it out of the vt100 history.
 - **Asserts:** the live prompt accepts typed keystrokes and exposes both cursor channels with ` TYPING `; the submitted prefix-glob directive makes Haiku inspect and visibly list a uniquely named fixture sentinel; Ctrl+D hides the hardware cursor and removes the painted block while retaining readable DIM output, the expanded banner, and ` COMMAND `; wheel-up reveals older real-agent filename output through deck scrollback rather than the child mouse path; Ctrl+D restores the cursor treatment and ` TYPING `.
@@ -8136,7 +9057,7 @@ Under PRD #13's terminal-relative color model there is no baked light/dark palet
 - **Does not assert:** the refcount/registry internals (counted at spawn, decremented per close) — only the observable last-close-removes contract; the single-role close path (covered by `scheduler/dispatch/006`).
 - **Platform coverage:** mac+linux.
 
-##### scheduler/dispatch/011 — A fired `issue_dispatch` task surfaces its per-issue card LIVE on an already-attached TUI — the user-visible showcase (and demo-reel clip) the headless `scheduler/dispatch/001-009` family can't observe (PRD #120 M2.3 live surfacing).
+##### scheduler/dispatch/011 — A fired `issue_dispatch` task surfaces its per-issue card LIVE on an already-attached TUI — the user-visible showcase the headless `scheduler/dispatch/001-009` family can't observe (PRD #120 M2.3 live surfacing).
 - **Layer:** L2 PTY (the real `dot-agent-deck` binary in an isolated PTY via the `TuiDeck` harness, asserted on the rendered vt100 grid — same harness as `scheduler/live/*`, NOT the headless `daemon serve` of `scheduler/dispatch/001-009`). Composes the OFFLINE GitHub seam (stub `gh` on PATH: `issue list`/`pr list` → canned JSON, `repo clone` → `git clone` of a local one-commit fixture remote with NO `.dot-agent-deck.toml`) with the live-fire seam (`DOT_AGENT_DECK_SCHEDULES` loaded by the lazily-spawned daemon; fire via the `RunNow` control message over the deck's attach socket). The dispatch behavior is ungated, so the env carries no `DOT_AGENT_DECK_EXPERIMENTAL`; `default_command = cat` (via `DOT_AGENT_DECK_CONFIG`) makes the dispatched single-agent card a long-lived `cat`.
 - **Agent:** none (run-now; the dispatched single-agent card runs `cat`, no real LLM, no real GitHub).
 - **Asserts:** after the fire the daemon registers the dispatched agent under the schedule's friendly name `github-issues` (precondition), then a per-issue card surfaces LIVE on the rendered dashboard — its `Dir:` line shows the issue worktree basename `issue-7` (the per-issue identity) and its title shows the schedule name `github-issues`.
@@ -8554,7 +9475,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** Real model compliance, covered by /012 and orchestration/delegate/024.
 - **Platform coverage:** mac+linux.
 
-##### scheduler/idle-worker/012 — Real Haiku visibly acts on an undelivered-worker inbox notice. [reel]
+##### scheduler/idle-worker/012 — Real Haiku visibly acts on an undelivered-worker inbox notice.
 - **Layer:** L2 PTY-attached, lane 2, tests/e2e_idle_worker_detector.rs.
 - **Agent:** Real interactive Claude Haiku orchestrator and a silent cat worker, with isolated credentials, trust and integration instructions.
 - **Asserts:** The real delegate CLI posts a worker task; the native undelivered notice is acknowledged once, contains the untrusted worker-role label, and triggers a visible NOTICE-RECEIVED response without a human keystroke.
@@ -8718,7 +9639,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 
 ##### scheduler/live/005 — Two schedules firing the same repository's orchestration at once open two tabs a user can tell apart, the second numbered (issue #1339).
 - **Layer:** L2 (real TUI driven via PTY; observed on the rendered vt100 tab strip, the grid's first row). Fixture global `schedules.toml` via `DOT_AGENT_DECK_SCHEDULES` holding two schedules with one `working_dir` (`shared-repo`), whose `.dot-agent-deck.toml` defines one orchestration `team`; both fired with `RunNow`, the second only once the first run's tab is in the strip, so which run carries the number is fixed. A 220-column PTY, so neither label is ellipsized into looking like the other.
-- **Agent:** none — two `cat` roles per run. The label is decided by the daemon's admission of the run and painted by the attached TUI; no agent participates. Not demo-reel material: no real agent runs, so its entry carries no reel marker.
+- **Agent:** none — two `cat` roles per run. The label is decided by the daemon's admission of the run and painted by the attached TUI; no agent participates.
 - **Asserts:** the strip shows `team · shared-repo` twice and `team · shared-repo · 2` exactly once — i.e. one unnumbered and one numbered tab — and no `· 3`. Verified red with the daemon stamping the derived title instead of the admitted one: both tabs read `team · shared-repo`.
 - **Does not assert:** the title after a detach/reattach, or a reattach with several runs (`orchestration/dispatch/005`); that a client start is refused against a numbered title, or that a run's title is freed when it ends (`orchestration/identity/008`); suffix ordering, the length cap and the canonical-name case (`a_daemon_spawned_run_takes_the_first_free_suffix_of_its_title` in `src/state.rs`); the desktop Dashboard's group titles, which read the same `display_title`.
 - **Platform coverage:** mac+linux.
@@ -8758,8 +9679,8 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** that a workflow deliberately spelled through a symlink keeps its aliased behaviour (the PRD records that as an accepted trade, not a property); whether the daemon refuses a symlinked `.dot-agent-deck.toml` or a symlinked `.dot-agent-deck` destination (M3/M4 hardening); non-UTF-8 paths, which fail the JSON frame decode before reaching the verb.
 - **Platform coverage:** mac+linux (`#![cfg(all(feature = "e2e", unix))]`).
 
-##### project/launch/003 — A REAL interactive Haiku coordinator reads the context the DAEMON published and visibly acts on the task it found there (PRD #819, CLAUDE.md rule 4's real-usage bar). [reel]
-- **Layer:** L2 PTY-attached, lane 2 (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with its lazy daemon; records a `full-stream.cast`, so it is demo-reel-eligible per PRD #180). Runtime-skipped when the `claude` CLI or credentials are absent. Runs on a developer's machine and **nowhere in CI** (rule 5): no e2e test that reaches a real agent runs on a runner, so this is the only thing that ever checks the claim.
+##### project/launch/003 — A REAL interactive Haiku coordinator reads the context the DAEMON published and visibly acts on the task it found there (PRD #819, CLAUDE.md rule 4's real-usage bar).
+- **Layer:** L2 PTY-attached, lane 2 (the REAL `dot-agent-deck` binary driven through the vt100 `TuiDeck` harness with its lazy daemon; records a `full-stream.cast`). Runtime-skipped when the `claude` CLI or credentials are absent. Runs on a developer's machine and **nowhere in CI** (rule 5): no e2e test that reaches a real agent runs on a runner, so this is the only thing that ever checks the claim.
 - **Agent:** one REAL fully interactive Claude Code pane pinned to Haiku (`claude --model claude-haiku-4-5-20251001 --allowedTools Bash Read`, no `-p`, no `cat` stand-in), spawned by the daemon into the canonical project directory the daemon itself named. The `project-launch-real` fixture's `context-handoff` orchestration declares that one `coordinator` start role plus a committed sentinel file; `--allowedTools` is part of the role's own `command`, not a harness flag. Credentials are imported into the per-test HOME and `with_claude_trust_workdir()` pre-trusts BOTH the raw and canonicalised work dir, because the daemon canonicalises the project path and claude matches its per-folder trust key verbatim — a symlinked temp root would otherwise park the agent on an unanswered approval prompt until the harness timeout.
 - **Asserts:** driving the desktop's own sequence over the attach socket — `ResolveProject`, `PrepareWorkflow`, `StartAgent`, then guarded `WriteAndSubmit` of the daemon's returned unique-file pointer — the fixture sentinel `context_proof_9d4f2a.txt` appears in the real coordinator's pane, matched on the deck's rendered grid of that pane or, for a listing already scrolled off it, on the pane's raw scrollback (issue #1396: the raw route alone misses characters Claude Code's differential redraw skips with cursor moves, so it reported a sentinel the screen showed as absent). The sentinel is absent from the published context, so reporting it requires reading that file and running a tool. The coordinator remains visible in the attached TUI. Preconditions distinguish a missing publish from a failed agent read.
 - **Does not assert:** the publish contract itself — path, reply shape, the failed-preparation case (`project/launch/001`); canonical-spelling propagation as a property (`project/launch/002`); the wire shape or boundary refusals (`tests/project_projection.rs`, `tests/daemon_protocol.rs`); the `prep_token`, which rides on the separate `start-prepared-agent` verb and is not presented here; delegation or work-done routing (`orchestration/route/001`, `scheduler/dispatch/013`); the desktop GUI half, for which no harness exists (PRD #819 *Testing: what rule 4 means here*); the sentinel reaching the deck's own vt100 stream, which is logged best-effort because a claude TUI can hard-wrap a filename across a row boundary.
@@ -8977,7 +9898,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 
 #### newagent/live
 
-##### newagent/live/001 — A REAL interactive Haiku agent visibly reports a unique sentinel from the ordinary directory selected through the desktop new-agent daemon sequence (PRD #1223, CLAUDE.md rule 4). [reel]
+##### newagent/live/001 — A REAL interactive Haiku agent visibly reports a unique sentinel from the ordinary directory selected through the desktop new-agent daemon sequence (PRD #1223, CLAUDE.md rule 4).
 - **Layer:** L2 lane 2, PTY-attached (the REAL `dot-agent-deck` binary rendered through the vt100 `TuiDeck` harness while raw attach frames drive the desktop's `ListDirectories` → `NewAgentOptions` → `StartAgent` sequence; records a `full-stream.cast`).
 - **Agent:** real interactive Claude Code on `claude-haiku-4-5-20251001`, with imported developer credentials, the daemon-returned canonical working directory pre-trusted in the isolated HOME, and `--allowedTools Bash`; spends one cheap list-directory turn and runtime-skips when the CLI or credential preflight is unavailable.
 - **Asserts:** an absent-path listing starts at the daemon's HOME; a child path copied verbatim from that reply browses into a fixture with no `.dot-agent-deck.toml` and `is_project: false`; the Claude registry entry's returned `default_command` forms the start command; `StartAgent` uses the second listing's canonical path; after readiness-gated prompt delivery, the unique on-disk filename omitted from the prompt appears in the real agent pane and on the attached TUI's rendered vt100 grid.
@@ -8995,7 +9916,7 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** provider speech, desktop summarisation or reading controls, genuine agent work, other-agent filtering, permission/error announcement text, Codex rollout tailing, or OpenCode reply capture.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
 
-##### voice/reading-reply/002 — A REAL interactive Claude Haiku turn delivers its discovered sentinel filename through the subscribed final-reply stream. [reel]
+##### voice/reading-reply/002 — A REAL interactive Claude Haiku turn delivers its discovered sentinel filename through the subscribed final-reply stream.
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine Claude Stop hook).
 - **Agent:** REAL interactive Claude Code on Haiku, using the `prompt/voice-keys/001` harness with imported credentials, seeded onboarding and per-folder trust, and `--allowedTools Bash Read`.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel file discovered by Claude; the sentinel is also visible in the attached pane and the agent remains running. The full filename is never supplied in the prompt, and reply phrasing is unconstrained.
@@ -9009,21 +9930,21 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** a real Codex process, a failed or quota-blocked Codex turn's reply, the desktop's handling of the ended stream, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`#[cfg(unix)]` inside the lane-1 `e2e`-gated hook-delivery file).
 
-##### voice/reading-reply/004 — A REAL interactive OpenCode turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+##### voice/reading-reply/004 — A REAL interactive OpenCode turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream.
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine OpenCode plugin events).
 - **Agent:** REAL interactive OpenCode on the cheap test model, using the `prompt/voice-keys/005` harness with imported credentials.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by OpenCode; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, subagent filtering, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local OpenCode authentication and runs nowhere in CI.
 
-##### voice/reading-reply/005 — A REAL interactive Codex turn delivers its discovered sentinel filename exactly once despite its Stop hook and rollout reporting completion. [reel]
+##### voice/reading-reply/005 — A REAL interactive Codex turn delivers its discovered sentinel filename exactly once despite its Stop hook and rollout reporting completion.
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, genuine Codex Stop hook and rollout tailer).
 - **Agent:** REAL interactive Codex on the cheap test model, using the `prompt/voice-keys/004` harness with imported credentials; the model follows the login's auth mode and `DOT_AGENT_DECK_CODEX_TEST_MODEL` overrides it.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 180 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Codex; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window spanning multiple rollout polls, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
 - **Does not assert:** desktop reading controls, summaries, speech, permission/error announcements, failed turns, either specific arrival order of hook and rollout, or other agents' reply sources.
 - **Platform coverage:** mac+linux (`e2e,e2e-live,unix`-gated `e2e_prompt_keys_live.rs`); requires local Codex authentication and runs nowhere in CI.
 
-##### voice/reading-reply/006 — A REAL interactive Pi (GPT, `common::pi_test_model()`) turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream. [reel]
+##### voice/reading-reply/006 — A REAL interactive Pi (GPT, `common::pi_test_model()`) turn delivers its discovered sentinel filename exactly once through the subscribed final-reply stream.
 - **Layer:** L2 lane 2, PTY-attached (real binary, isolated daemon, production client library, and genuine bundled Pi extension).
 - **Agent:** REAL interactive Pi on `common::pi_test_model()` (`openai-codex/gpt-5.6-luna` by default on the stored ChatGPT login, PRD #1666) with `--approve`, using the `pi/live/001` startup path where the daemon materializes the bundled extension in the isolated HOME.
 - **Asserts:** a client subscribes before submitting a directive to list fixture files; within 90 seconds it receives a successful final reply for the selected agent containing the uniquely named sentinel discovered by Pi; the sentinel is visible in the attached pane, no second reply arrives during a five-second observation window, and the agent remains running. The prompt supplies only a filename prefix; reply phrasing is unconstrained.
@@ -10012,7 +10933,7 @@ The typed-delivery entries `orchestration/delegate/040–041` and `orchestration
 ##### inbox/doorbell/001 — Only an Idle, unarmed pane with Queued work gets the token-led submitted line.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_doorbell.rs`), real binary and daemon-owned PTY, byte capture and vt100 replay.
 - **Agent:** none (the e2e stand-in profile's Python editor (selected by `DOT_AGENT_DECK_TEST_COMPOSER_PROFILE=standin` with `DOT_AGENT_DECK_TEST_COMPOSER_BINARY` naming the executable the pane runs); no agent executable or credential).
-- **Asserts:** An empty inbox receives nothing; one queued task receives exactly one token-led line (`(xxxxxx) dot-agent-deck: message <id> waiting, run: dot-agent-deck inbox fetch`, six lowercase letters in the token) plus one CR, with no body, paste markers, LF or extra submits, and stays Queued.
+- **Asserts:** An empty inbox receives nothing; one queued task receives exactly one token-led line (`(xxxxxx) dot-agent-deck: message <id> waiting, run: <deck> inbox fetch`, six lowercase letters in the token) plus one CR, with no body, paste markers, LF or extra submits, and stays Queued. The line's command word, run by `/bin/sh` with a stand-in `dot-agent-deck` first on `PATH`, runs the deck the daemon runs and never the stand-in (issue #1730).
 - **Does not assert:** a real agent editor or real-model response; native agent adapters and producer migration have separate coverage.
 - **Platform coverage:** mac+linux.
 
@@ -10268,7 +11189,7 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Layer:** Fast (`tests/doorbell_screen_profiles.rs`), pure, over raw captures of real launches replayed through the lossless grid (`src/doorbell_screen.rs`) and the release scanner (`src/release_scanner.rs`); the captures are under `tests/fixtures/codex-inbox/r5wake/` and `tests/fixtures/claude-inbox/r5wake/`. L2 lane 2 (`tests/e2e_claude_release_measure.rs`, `tests/e2e_codex_release_measure.rs`) records the installed Claude Code and Codex inside the private TUI harness, locally only; the committed captures were recorded on Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318 and Codex 0.164.0.
 - **Agent:** none for replay; the captures were taken from Codex 0.164.0 and 0.160.0 (direct, and the deck's own `devbox run codex-big` role fresh and respawned, and the staged composer series at 24 × 80, and the head-echo series under the deck's wrapper at 50 × 200 and 24 × 80) and Claude Code 2.1.310, 2.1.312, 2.1.317 and 2.1.318. The live Claude Code measurements use real interactive Haiku, with every submission blocked before a model turn; the live Codex head-echo measurements use real interactive Codex on `common::codex_test_model()` at low reasoning effort, and every submitted line is a real model turn.
 - **Live measurement:** ten fresh start-ups idle twenty seconds each with no post-ready dialog, raw input mode, thirty exact token-led echoes and submit-hook payloads over 24 × 80 and 50 × 200, transient transcript user echoes, six deletions leaving no placeholder, ten resizes and ten one-column nudges, and the nineteen Q32 compound-key sequences plus non-ASCII deletion followed by blank Enter and three literal spaces followed by Left three times. The executable is hashed before and after each captured child and the run fails if it changed, output roots are private, and teardown signals and reaps that captured child. The recorder preserves the harness's imported settings and uses M1's xterm-256color environment; it does not measure truecolor transcript recognition. The compound-key capture also replays the two-space reveal and blank-Enter premise in the fast tier.
-- **Asserts:** each capture's start-up header latches its release at the PTY reader's recorded split, one byte at a time, as one push and at pseudo-random splits; header-like text at another row or column, in another shape, unterminated or with a pre-release tag latches nothing, and a Claude Code version written in pieces latches once, complete. Codex's and Claude Code's profiles find the empty ready composer, the placeholder, the deck's line held exactly with the cursor after it, a prefix still arriving, and the submitted line as a transcript user message and not as composer text; after the deletes Codex's composer shows its placeholder again, while Claude Code's is blank with no placeholder, which reads as empty but cannot confirm a withdrawal. Codex's update, folder-trust and hooks-review dialogs are recognised by name, an unknown title with their shape is unrecognised, and transcript rows mentioning "update", "Update now", "login" or "trust" give no dialog verdict. The width witness holds at the drawn width, and not one column wider or narrower, on a Claude Code frame and a Codex dialog frame; it holds at the width in force and not two columns wider after each recorded resize and one-column nudge, before and after a first prompt, the frame taken five seconds after the edge; the recorded Codex 24 × 80 start-up frame, which draws no logo, has none. Each recorded edge's bytes contain the profile's full-redraw marker. The strict withdrawal recogniser counts the deletes for the exact line and refuses a dialog, a cursor off the line, owned text without a whole token and a pane narrower than the measurements. Over each Codex release's measured key effects, with every other measurement verified, its head echo included, every byte of the line's first stage (the token head) is inert, so the release is Go and staged; the same record with a token letter made to commit in folder trust is `first_stage_commits` naming that dialog and key, and without its head echo it is `missing_measurement`. The staged series recorded on Codex 0.164.0 and 0.160.0, read through the frame builder: after the head's one write the composer shows only the placeholder or a prefix of the head, never a dialog, until it holds exactly the eight-character head with the cursor after it; after the rest's write only prefixes of the line until it holds the whole line; after the Enter the line as a user message with the composer no longer holding it; and on each head-only trial the head held exactly, then the placeholder after the eight deletes. Read through the frame builder the doorbell's transaction reads, Claude Code's and Codex's recorded empty composer is empty and ready, a typed token-led line is held exactly with the cursor at its end and is no user message, the submitted line appears as a user message with the composer no longer holding it, and a frame from a state that is not Clean carries no composer and no dialog. On the recorded cleared Claude Code composer, redrawn as a real 2.1.310 session draws blanks (measured: a typed space writes no cell, only moves the cursor), three spaces with the cursor moved back to the start leave the cells exactly those of the empty composer, so the untouched frame reads empty and ready, as do the same spaces written as cells, which a real 2.1.310 session also draws for the empty box after `End` then `Ctrl+U` cleared spaces a repaint wrote (measured 2026-10-26); a blank line with text below it and the cursor back on the first row, a line of spaces under the prompt row, and a letter, a blank line and more text with the cursor after the letter each mark the composer hidden, which is never empty and never holds the letter alone. Every recorded empty Claude Code composer (fresh, cleared, deleted, resized at a covered size, nudged) reads empty and ready through the untouched-frame oracle. These screen witnesses do not authorize a touched box: `inbox/probe/024` and `025` exercise its actual empty/non-empty helper checks.
+- **Asserts:** each capture's start-up header latches its release at the PTY reader's recorded split, one byte at a time, as one push and at pseudo-random splits; header-like text at another row or column, in another shape, unterminated or with a pre-release tag latches nothing, and a Claude Code version written in pieces latches once, complete. Codex's and Claude Code's profiles find the empty ready composer, the placeholder, the deck's line held exactly with the cursor after it, a prefix still arriving, and the submitted line as a transcript user message and not as composer text; after the deletes Codex's composer shows its placeholder again, while Claude Code's is blank with no placeholder, which reads as empty but cannot confirm a withdrawal. A line naming the deck's absolute path, drawn over three rows as live Codex 0.164.0 wraps it (at a space, then right after a hyphen with no space there), is held exactly by Codex's profile and counts for the strict withdrawal (issue #1730). Codex's update, folder-trust and hooks-review dialogs are recognised by name, an unknown title with their shape is unrecognised, and transcript rows mentioning "update", "Update now", "login" or "trust" give no dialog verdict. The width witness holds at the drawn width, and not one column wider or narrower, on a Claude Code frame and a Codex dialog frame; it holds at the width in force and not two columns wider after each recorded resize and one-column nudge, before and after a first prompt, the frame taken five seconds after the edge; the recorded Codex 24 × 80 start-up frame, which draws no logo, has none. Each recorded edge's bytes contain the profile's full-redraw marker. The strict withdrawal recogniser counts the deletes for the exact line and refuses a dialog, a cursor off the line, owned text without a whole token and a pane narrower than the measurements. Over each Codex release's measured key effects, with every other measurement verified, its head echo included, every byte of the line's first stage (the token head) is inert, so the release is Go and staged; the same record with a token letter made to commit in folder trust is `first_stage_commits` naming that dialog and key, and without its head echo it is `missing_measurement`. The staged series recorded on Codex 0.164.0 and 0.160.0, read through the frame builder: after the head's one write the composer shows only the placeholder or a prefix of the head, never a dialog, until it holds exactly the eight-character head with the cursor after it; after the rest's write only prefixes of the line until it holds the whole line; after the Enter the line as a user message with the composer no longer holding it; and on each head-only trial the head held exactly, then the placeholder after the eight deletes. Read through the frame builder the doorbell's transaction reads, Claude Code's and Codex's recorded empty composer is empty and ready, a typed token-led line is held exactly with the cursor at its end and is no user message, the submitted line appears as a user message with the composer no longer holding it, and a frame from a state that is not Clean carries no composer and no dialog. On the recorded cleared Claude Code composer, redrawn as a real 2.1.310 session draws blanks (measured: a typed space writes no cell, only moves the cursor), three spaces with the cursor moved back to the start leave the cells exactly those of the empty composer, so the untouched frame reads empty and ready, as do the same spaces written as cells, which a real 2.1.310 session also draws for the empty box after `End` then `Ctrl+U` cleared spaces a repaint wrote (measured 2026-10-26); a blank line with text below it and the cursor back on the first row, a line of spaces under the prompt row, and a letter, a blank line and more text with the cursor after the letter each mark the composer hidden, which is never empty and never holds the letter alone. Every recorded empty Claude Code composer (fresh, cleared, deleted, resized at a covered size, nudged) reads empty and ready through the untouched-frame oracle. These screen witnesses do not authorize a touched box: `inbox/probe/024` and `025` exercise its actual empty/non-empty helper checks.
 - **Does not assert:** in the fast tier, a live agent's screen (the captures are replayed; the spaces redraws are synthesized on a capture, not recorded), a release other than those captured, or delivery driven by a live daemon; the transaction inputs are replayed offline. In lane 2, the exact palettes, executable hashes and durations of the recorded releases (for the installed one, palettes and durations are printed, and its executable hash is compared with the installed file's: always for Claude Code, and for Codex only when the `codex` on the `PATH` is the native executable rather than its npm launcher), or a release other than the one installed.
 - **Platform coverage:** mac+linux.
 
@@ -10339,7 +11260,7 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 ##### inbox/doorbell/046 — A prompt hook reports the ring token its prompt carried, and the daemon hands it to the pane.
 - **Layer:** Fast (`tests/doorbell_ring_evidence.rs`, pure, over real UserPromptSubmit payloads; `src/daemon.rs`, `hook_provenance_audit_tests`, the real hook socket; `tests/doorbell_txn.rs`, the latch cell, the attempt ring and the re-projection model, pure; `src/agent_pty.rs`, `spawn_tests`, a real `cat` generation and its writer, and a Claude Code 2.1.310 model editor with the real hook arm and publisher).
 - **Agent:** none at test time; the payloads are Claude Code 2.1.310's and Codex 0.164.0's and 0.160.0's, captured with the token-led line submitted.
-- **Asserts:** the token-led doorbell line is read off each agent's real prompt payload with its token and message, `exact` only when the whole prompt (whitespace aside) is that one line and `with_other_text` when it is among other text; an older deck's untokened line, a malformed token and an invalid message id are no ring. The hook's doorbell fetch carries the ring's token and shape only for the message the line named, and without a ring its wire is an older hook's; an unknown shape decodes as unknown. Through the real hook socket, a fetch carrying a ring reaches the pane's evidence channel with the generation its token attests, the message, the token and the shape, although its fetch granted nothing; a fetch from an older hook with no ring and one attested to another pane put nothing on the channel. A generation's latch cell moves only forward, each move on its own attempt: an attempt opens once, ends with nothing written, suspends, and is resolved by exact evidence (late, once suspended), by the user, by a withdrawal or a transcript echo; a move naming another attempt (an older one, or a later one's suspension, exact evidence, transcript echo or withdrawal on an open or a suspended cell), a backward move (`Resolved(a)` to `Suspended(a)`, a re-suspension, an older attempt reopening) and anything after retirement are refused, and retirement between an attempt's allocation and its Open move leaves it writing nothing. Attempt numbers started just below the reserved maximum use the last one once and then refuse (`attempt_exhausted`) without repeating. Exact evidence that reaches the hook arm before the suspension's compare-and-swap resolves the open attempt, the suspension then fails and the transaction reports Submitted with nothing shown. The ring correlates the last 64 attempts: the 65th evicts the first, whose late evidence is a miss, a copy taken before the eviction cannot move a later attempt's cell, an older attempt's token and a report with other text move nothing, and each entry is one packed store. A re-projection request held back past a user clear, late exact evidence or an in-pause resolution shows the state when it runs and never carries the suspension; one for a generation no longer current touches nothing, its own cell suspended or not, while the successor's shows its own state; the positive control shows the suspension, then the clear's request shows it cleared, each broadcast once. Through the real hook socket, with nothing listening on the pane's channel, a generation's own exact ring evidence moves its open attempt's latch cell to submitted on receipt, while evidence shaped with other text, or from another pane's hook, moves nothing. On the real writer, the user's own submit resolves a suspended attempt as the user's while the deck's own Enter lifts nothing, and closing the generation retires its cell for good. Through the real adapter, with a ring unresolved because the model editor dropped its Enter and a draft of the user's in the tracker, an older attempt's token reported exact moves nothing, while this attempt's token reported exact resolves it late (`late_exact`), lifts the suspension, clears the card and leaves the draft bit set.
+- **Asserts:** the token-led doorbell line is read off each agent's real prompt payload with its token and message, `exact` only when the whole prompt (whitespace aside) is that one line and `with_other_text` when it is among other text; the line naming the deck by an absolute path, a quoted path with a space or an escaped quote is the same exact ring as the recorded bare-name line (issue #1730), and one whose command is two words is no ring; an older deck's untokened line, a malformed token and an invalid message id are no ring. The hook's doorbell fetch carries the ring's token and shape only for the message the line named, and without a ring its wire is an older hook's; an unknown shape decodes as unknown. Through the real hook socket, a fetch carrying a ring reaches the pane's evidence channel with the generation its token attests, the message, the token and the shape, although its fetch granted nothing; a fetch from an older hook with no ring and one attested to another pane put nothing on the channel. A generation's latch cell moves only forward, each move on its own attempt: an attempt opens once, ends with nothing written, suspends, and is resolved by exact evidence (late, once suspended), by the user, by a withdrawal or a transcript echo; a move naming another attempt (an older one, or a later one's suspension, exact evidence, transcript echo or withdrawal on an open or a suspended cell), a backward move (`Resolved(a)` to `Suspended(a)`, a re-suspension, an older attempt reopening) and anything after retirement are refused, and retirement between an attempt's allocation and its Open move leaves it writing nothing. Attempt numbers started just below the reserved maximum use the last one once and then refuse (`attempt_exhausted`) without repeating. Exact evidence that reaches the hook arm before the suspension's compare-and-swap resolves the open attempt, the suspension then fails and the transaction reports Submitted with nothing shown. The ring correlates the last 64 attempts: the 65th evicts the first, whose late evidence is a miss, a copy taken before the eviction cannot move a later attempt's cell, an older attempt's token and a report with other text move nothing, and each entry is one packed store. A re-projection request held back past a user clear, late exact evidence or an in-pause resolution shows the state when it runs and never carries the suspension; one for a generation no longer current touches nothing, its own cell suspended or not, while the successor's shows its own state; the positive control shows the suspension, then the clear's request shows it cleared, each broadcast once. Through the real hook socket, with nothing listening on the pane's channel, a generation's own exact ring evidence moves its open attempt's latch cell to submitted on receipt, while evidence shaped with other text, or from another pane's hook, moves nothing. On the real writer, the user's own submit resolves a suspended attempt as the user's while the deck's own Enter lifts nothing, and closing the generation retires its cell for good. Through the real adapter, with a ring unresolved because the model editor dropped its Enter and a draft of the user's in the tracker, an older attempt's token reported exact moves nothing, while this attempt's token reported exact resolves it late (`late_exact`), lifts the suspension, clears the card and leaves the draft bit set.
 - **Does not assert:** a real agent's prompt hook reporting late.
 - **Platform coverage:** mac+linux.
 
@@ -10874,6 +11795,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_composer_check_codex_live.rs`, Linux): the TUI harness, one fresh deck per trial, a plain `codex …` pane with its agent declared (`Direct(Codex)`, `tests/support/codex_installed.rs`), the person typing through a client attached to the pane. It runs on the build's own Codex activation (Q35-29: `Direct(Codex)` in `INSTALL_ROLLOUT`, Codex's `editor_probe` verified) with no e2e assumption; `codex_installed::checkable` reports `SKIP:` on a build without it. Each deck's `CODEX_HOME` is fresh, so its pane is Codex's first start there, and Codex's own `config.toml` writes land during the trial (the key-binding guard accepts them; no warm-up start). Codex runs in a `project` folder of the fixture's working directory that doesn't hold the deck's HOME (`codex_installed::project_dir`): Codex writes its editor file under the first of `$CODEX_HOME`, `~/.codex` and `<cwd>/.codex` its sandbox can't write, and the deck reads only `$CODEX_HOME/editor`, so a HOME inside the folder Codex works in (the harness's default) made every check `NotOwned(Shape)`, `Uncertain` (cxact's first run; `docs/develop/doorbell-admission.md`, the Codex activation's item 8).
 - **Agent:** real interactive Codex on `common::codex_test_model()`, nothing submitted.
 - **Asserts:** Codex's box is checked only while Codex draws its placeholder (admission's `placeholder_empty` conjunct), so, unlike `040`, each trial starts from a box the person typed `BASE` into and deleted: with Codex's placeholder back over that touched box, a posted task brings the deck's check, and while that check's own helper (the trace's first branch after arming must be `Armed`) is held at its pause, `EARLY`, Ctrl+G and `LATE` are typed 250 ms apart. Every trial ends with exactly `EARLYLATE` in the box and, for three seconds more, the task undelivered: the check read a box the person has typed into since, so it rings nothing. Every trial also asserts the route: the person's editor ran exactly once, opened on `EARLY`, and read exactly `LATE` from its terminal. Four paths, `DAD_PROBE_041_TRIALS` trials each (20 by default), each asserting the helper exit that defines it: `probe_041_live_delayed_report_keeps_overlapping_typing` (held 1 s before its report: one exit, `Mine { read: Empty }` with `notice: false`), `probe_041_live_failed_report_with_notice_keeps_overlapping_typing` (2.5 s, past the exchange's 2 s bound: one exit with `notice: true`), `probe_041_live_late_helper_keeps_overlapping_typing` (11 s at its start, past the 10 s trigger wait: one exit, `Mine { read: Empty }`) and `probe_041_live_killed_helper_keeps_overlapping_typing` (SIGKILLed by captured pid 1 s in: no exit). `DAD_PROBE_041_OUT` appends each row as JSON.
+- **Quarantined:** `probe_041_live_late_helper_keeps_overlapping_typing` is `#[ignore = "quarantined: vfarcic, #2264"]` (CLAUDE.md rule 6): on 2026-11-10 it failed 3 of 5 runs on a late trial with the box at `EARLY`, the person's editor having read nothing of `LATE`; #2264 has the failing row and what lifts the quarantine. Run it with `--run-ignored only`.
 - **Does not assert:** a check over a visible draft (none is admitted); a second overlap in one pane (the person's own editor leaves the pane's writer scope open under `Hold`); Codex 0.160.0 (not installed here); the desktop client.
 - **Platform coverage:** Linux.
 
@@ -11063,7 +11985,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Agent:** native test executable with the reviewed F2 Python composer and real installed helper/editor; no real agent or credential.
 - **Asserts:** A PTY/vt100 TuiDeck attaches to the real sandbox daemon; paused-helper typing produces shared held-input words and release clears them. A second written probe holds distinct typing, whose retirement appears on the successor record as `input_discarded` naming the earlier generation and exact byte count; the attached card shows the shared first clause `not delivered: your held typing`, and the successor capture stays empty.
 - **Mutation pin (PRD #1666 part 3 mutation run, 2026-11-02):** `probe_046_a_later_notice_does_not_postpone_the_repeat` (fast, `src/agent_pty_segments.rs`, paused clock): a second display notice 20 s after the first leaves the repeat due 30 s after the first, so notices more often than every 30 s cannot hold it off (kills `watch_input_held`'s `noticed && repeat_at.is_none()` loosened to `||`).
-- **Does not assert:** The desktop client, S-21's mail hold reason, unreadable-export retention of mail, timing of the display thresholds, or a real-agent reel clip. The unsupported branch advances a recheck deadline, so it does not prove natural Empty settlement there.
+- **Does not assert:** The desktop client, S-21's mail hold reason, unreadable-export retention of mail, or timing of the display thresholds. The unsupported branch advances a recheck deadline, so it does not prove natural Empty settlement there.
 - **Platform coverage:** Linux.
 
 ##### inbox/probe/037 — Touched Claude and Codex boxes the deck doesn't check hold with their delivery-route explanations.
@@ -11812,11 +12734,11 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** desktop CSS layout.
 - **Platform coverage:** all.
 
-##### inbox/status/008 — TUI Error card explains an undeliverable inbox message.
-- **Layer:** L1 (`tests/render_dashboard.rs`), delivery_notice event + TestBackend + insta.
+##### inbox/status/008 — Error cards and tiles say how a worker's pane ended.
+- **Layer:** L1 (`tests/render_dashboard.rs`), in-memory InboxHub card-notice sink → delivery_notice event → TestBackend + insta; desktop component (`desktop/src/components/InboxSurfaces.test.tsx`), subscribed bridge and hydrated snapshot → real AgentTile.
 - **Agent:** none.
-- **Asserts:** Error and the not-delivered notice are visible on the card; wording shares the desktop fixture.
-- **Does not assert:** daemon generation of the notice.
+- **Asserts:** for each case in `tests/fixtures/inbox-termination-cards.json` (the pane's command exited with code 0, 7, or 23 reported by the wrapper; the connection ended; the pane was replaced, closed, or ended some unknown way), the real hub's card notice turns the TUI card to Error and the card shows `not delivered: ` plus that kind's words from `tests/fixtures/inbox-display.json`'s `terminations`, exit code included (issue #1933), whole on a 180-column card and wrapped over a 60-column one. The desktop tile shows Error and that same notice, streamed through the bridge and hydrated from a snapshot.
+- **Does not assert:** real PTY exit capture or wrapper attribution (`inbox/status/032`); that a real daemon delivers the notice to a card (measured on PR #2245: in `inbox/status/032`'s setup the exited worker's agent record is already gone, so no attached client receives it); CSS layout (the desktop wrap is `e2e/agent-tile-long-name.spec.ts`'s). The desktop half alone proves only that the tile prints the daemon's notice; that the daemon sends these words is the TUI half's assertion.
 - **Platform coverage:** all.
 
 ##### inbox/status/009 — TUI prompt line labels deck messages without replacing the last human prompt.
@@ -12128,7 +13050,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 
 ##### inbox/claude/009 — Native task notifications settle the message and show its subject without polluting human prompt history.
 - **Layer:** L2 lane 1 (`tests/e2e_inbox_claude.rs`), attached real TUI, daemon and hook/wait CLI children.
-- **Agent:** none (synthetic Claude parent; no credential; no reel marker).
+- **Agent:** none (synthetic Claude parent; no credential).
 - **Asserts:** Fetched waiter output wrapped as a task notification becomes Acknowledged after UserPromptSubmit commits its exact attempt (inbox/claude/016); the card displays `✉ native fixture`, first_prompts and last_user_prompt retain the prior human prompt, and raw task-notification markup is absent from the grid.
 - **Does not assert:** Actual asyncRewake delivery by Claude, a real-model action or lane-2 coverage.
 - **Platform coverage:** mac+linux.
@@ -12358,7 +13280,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** the stderr and exit status of the real hook (inbox/claude/028, /037, /043).
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/046 — Claude Code outside the deck's recorded process tree still takes and acknowledges its messages. [reel]
+##### inbox/claude/046 — Claude Code outside the deck's recorded process tree still takes and acknowledges its messages.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
 - **Asserts:** with the pane's process a `sleep` and Claude Code started by a subshell that exits, `ps` shows Claude outside that process's tree; an idle native waiter armed from Claude's own hook (outside the tree) wakes it for a posted task with no doorbell; the sentinel is appended once, the message is acknowledged after one hand-over and the card shows ✉ (PRD #1666 part 3, R-1).
@@ -12366,7 +13288,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **Does not assert:** Claude Code's own background session host or `/resume` (a stand-in that keeps the same process relationship and environment), or other agents.
 - **Platform coverage:** mac+linux.
 
-##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task. [reel]
+##### inbox/claude/011 — Idle interactive Haiku wakes natively, acts once and labels the deck task.
 - **Layer:** L2 real agent, lane 2 (PTY-attached).
 - **Agent:** Claude Code, Haiku.
 - **Asserts:** An idle native waiter wakes Claude without doorbell input; the sentinel is appended once, the message is acknowledged after one delivery, the card shows ✉ and user history excludes the task.
@@ -12515,7 +13437,7 @@ The composer probe (`src/composer_probe/`, PRD #1666 part 3, Q35): checking an a
 - **SC-00 safety preservation:** the dialog-on-head case also requires no byte before the measured settle; the unrecognised-screen, swallowed-Enter and harmless `Update now` transcript cases run on measured 0.164.0, so deleting inheritance deleted none of those safety checks. The two inherited-release (0.165.0) cases were deleted with inheritance.
 - **Layer:** L2 synthetic, lane 1 (`tests/e2e_inbox_codex_doorbell.rs`), the real wrapper, writer, hook CLI and daemon.
 - **Agent:** none (`tests/support/codex_composer.py`, a scripted screen drawing Codex 0.164.0's measured header, composer, transcript and dialogs, and running the real Codex prompt and Stop hooks on a submit). Synthetic readiness: each generation's own SessionStart and Stop are run by hand before a task is queued. Trusted hooks: a `codex app-server` stand-in (`tests/fixtures/codex-synthetic/codex`) lets the wrapper record the hooks' trust, so it reports nothing from the screen's output. The daemon reads Codex's shipped facts, `head_echo` included (6.69 s settle window); nothing is assumed.
-- **Asserts:** no byte before the settle window, then the token head alone, the rest once the head shows, and one Enter, with the task acknowledged through Codex's own prompt hook and WAKE naming `turn_end`; the update, folder-trust and hooks-review dialogs at admission each get no byte on the measured release, and the task is delivered once the dialog closes; a dialog opening on the head gets nothing more and the card says so; a doorbell-shaped line the deck did not type gets no byte, and once cleared, a box no check can read on this stand-in, the task holds with `cannot_type` and the user's own prompt hands it over; a draft Codex keeps on Enter holds the doorbell with its reason; a pane its hooks call Codex is rung. On measured 0.164.0 an unrecognised screen gets no byte, a swallowed Enter leaves the task queued with `no_submit_evidence`, and a harmless "Update now" transcript row permits delivery.
+- **Asserts:** no byte before the settle window, then the token head alone, the rest once the head shows, and one Enter, with the task acknowledged through Codex's own prompt hook and WAKE naming `turn_end`; the update, folder-trust and hooks-review dialogs at admission each get no byte on the measured release, and the task is delivered once the dialog closes; a dialog opening on the head gets nothing more and the card says so; a doorbell-shaped line the deck did not type gets no byte, and once cleared, a box no check can read on this stand-in, the task holds with `cannot_type` and the user's own prompt hands it over; a draft Codex keeps on Enter holds the doorbell with its reason; a pane its hooks call Codex is rung. On measured 0.164.0 an unrecognised screen gets no byte, a swallowed Enter leaves the task queued with `no_submit_evidence`, and a harmless "Update now" transcript row permits delivery. With Codex's hooks switched off (the stand-in's `.nohook`), a ring whose line names the deck's absolute path, wider than the row, ends Submitted on the wrapped line in Codex's transcript alone (issue #1730); the stand-in wraps its composer and transcript at a space or right after a hyphen, as live Codex 0.164.0 does.
 - **Does not assert:** a real Codex, a generation that has not reported (`inbox/codex/028`), or the untrusted-hooks path, where the wrapper reads the screen's output as activity.
 - **Platform coverage:** mac+linux for the retained staged-echo/dialog functions; Linux for the moved kept-on-Enter helper-check function.
 
@@ -12984,7 +13906,7 @@ The question an agent is waiting on — a permission prompt, a menu, a form — 
 - **Control:** `question_answer_023_released_client_open_control` runs the frozen sender without a fence, verifies one terminal digit, and checks that its request has no token and its snapshot has no settlement entry.
 - **Asserts:** `question_answer_023_released_voice_timeout_then_one_write` uses the hash-pinned `v0.49.2` request/timeout fixture, holds past its real 15-second timeout, checks its unconfirmed warning, refuses a repeat with existing `answer_in_progress`, ingests a tool-status hook during the hold and after timeout, then releases exactly one terminal digit. Its requests omit `client_token` and its snapshots have no settlement entry. `question_answer_023_released_answer_superseded_or_retired` replaces the question or retires/replaces the agent while held, checks no old answer reaches either recorder, and answers the fresh question once.
 - **Does not assert:** a whole previous-release desktop build, voice resolution, held hook-reply channels, remote admission, the TUI grid, or cross-version negotiation; the vendored adapter's scope and copied source ranges are in `tests/fixtures/released-answer-client/README.md` and `provenance.json`. On the S-16 baseline the missing generation-bound `fence` control is the expected RED prerequisite; the remaining assertions must pass after Q35-15/Q35-17 before claiming rule-12 evidence.
-- **Platform coverage:** Linux. CI lane 1 selects these tests; no reel marker.
+- **Platform coverage:** Linux. CI lane 1 selects these tests.
 
 ##### question/answer/025 — The answer sender names its token only to a daemon that advertises answer settlements.
 - **Layer:** L1/fast unit (`src/daemon_client.rs`, a scripted Unix-socket daemon that answers `Hello` with a chosen capability list and records every other request).
@@ -13219,7 +14141,7 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 - **Does not assert:** the parent-death exit of a holding producer, or Claude Code's own `timeout` (`hooks/install/018`).
 - **Platform coverage:** mac+linux.
 
-##### question/live/001 — A real Haiku permission is answered once and the command completes. [reel]
+##### question/live/001 — A real Haiku permission is answered once and the command completes.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_agent_questions.rs`).
 - **Agent:** real interactive Claude Code, pinned Haiku 4.5, imported developer credentials and pre-seeded project trust.
 - **Asserts:** Needs Input and a pending held Permission question; permission labels match the visible menu, and No's number matches the screen's, one higher where the screen leaves out "Yes, and switch to auto mode" (PR #1698: the payload does not say whether Claude draws it); no sentinel before approval; one client-library `AnswerQuestion` creates the unique sentinel and the agent finishes Idle.
@@ -13256,14 +14178,14 @@ The desktop half of answering by voice. These tests live in the desktop crate (`
 
 ##### question/live/006 — Pi answers another extension's selector without a model or credential.
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_pi_questions.rs`), offline and credential-free.
-- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call, not reel-eligible.
+- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call.
 - **Asserts:** the select dialog's real labels and pending question, a client answer resolves Blue to the asking extension, the dialog closes and Pi visibly reports the selected value.
 - **Does not assert:** a live model, confirm/input dialogs or Pi's undocumented API stability beyond this installed version.
 - **Platform coverage:** mac+linux; runtime skip when Pi is absent (failure with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
 
 ##### question/live/007 — An unanswered Pi question shows its age, notifies once and is still answered (issue #2075).
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_pi_questions.rs`), offline and credential-free.
-- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call, not reel-eligible.
+- **Agent:** real Pi TUI with the deck's production extension and a stand-in slash-command extension; no model call.
 - **Asserts:** with `notifications.question_after_minutes = 1`, the card shows `QUESTION` and the question's age; no OSC 9 notification before a minute, exactly one naming the question after it, and still one five seconds later; the question, still held, is answered Blue through the client and Pi receives it.
 - **Does not assert:** the desktop app's notification (`desktop/src`'s own tests), a terminal showing OSC 9, or a wait past the old one-hour cap.
 - **Platform coverage:** mac+linux; runtime skip when Pi is absent (failure with `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`).
@@ -13367,7 +14289,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 #### inbox/codex
 
-##### inbox/codex/009 — Real idle Codex, at whatever release is installed, is rung, and the doorbell delivers. [reel]
+##### inbox/codex/009 — Real idle Codex, at whatever release is installed, is rung, and the doorbell delivers.
 - **Layer:** L2 real agent, lane 2 (`tests/e2e_inbox_codex_live.rs`), attached interactive PTY.
 - **Agent:** Codex (the installed release, typed into on Codex's facts whatever its version; `SKIP:` only if those facts are not Go, UNVERIFIED under `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1`), cheap model from `codex_test_model()`, scratch HOME/CODEX_HOME and cwd outside the repository.
 - **Asserts:** with Codex idle and nothing typed into its pane, a posted task is delivered with no input from the test: the deck latched the installed release (`release=<codex --version>`), rang exactly once (`doorbell rang … rings=1`, one `doorbell attempt ended` with `outcome=Submitted`), logged no `missing_measurement` or `turned_off` clause and no `unknown_release` once the release latched (the one `unknown_release` line logged at spawn, before the header, is expected), Codex's prompt hook handed the task over (`DoorbellHook` in the deck log), and the exact sentinel contents and the acknowledgement by its receipt (`plugin_confirmed`) follow.
@@ -13764,7 +14686,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Cost:** none.
 
 
-##### inbox/opencode/015 — Real idle OpenCode receives a native delegate in its shown session. [reel]
+##### inbox/opencode/015 — Real idle OpenCode receives a native delegate in its shown session.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`).
 - **Agent:** interactive OpenCode 1.x or 2.x (`DOT_AGENT_DECK_OPENCODE_TEST_BIN`), Haiku from `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins.
 - **Asserts:** Idle with a prior prompt, same shown session, visible framed message and reply, exact sentinel, plugin-confirmed acknowledgement.
@@ -13820,7 +14742,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** what delivers the task once the user sends OpenCode a prompt, remote attach or non-TUI OpenCode commands.
 - **Cost:** cheap real-agent turns, sequential locally with strict preflight.
 
-##### inbox/opencode/060 — Real interactive OpenCode 2.x shows status and tool detail on its card and runs a delegate. [reel]
+##### inbox/opencode/060 — Real interactive OpenCode 2.x shows status and tool detail on its card and runs a delegate.
 - **Layer:** L2 PTY-attached real agent, lane 2 (`tests/e2e_inbox_opencode_live.rs`), through `tests/support/opencode_inbox_live.rs`.
 - **Agent:** interactive OpenCode 2.x (`opencode --standalone --auto`, the model from the scratch HOME's `opencode.json`), `opencode_test_model()`, scratch HOME/XDG and cwd outside the repository; real delegate CLI and branch-installed plugins. Skips unless `DOT_AGENT_DECK_OPENCODE_TEST_BIN` (or the `opencode` on `PATH`) is 2.x.
 - **Asserts:** a typed prompt that writes a uniquely named sentinel with the shell (a path relative to the project, so the deck's shortened tool detail still names it) turns the card Working, arrives as an OpenCode prompt event and a ToolStart whose detail names the sentinel, shows that detail on the card, writes the sentinel, and ends in an Idle event with the card reading Idle and still showing the prompt; then a genuine orchestrator delegate is acted on (a second sentinel), reads acknowledged, and the card settles Idle.
@@ -13853,7 +14775,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 #### inbox/pi
 
-##### inbox/pi/001 — Real idle Pi receives and acknowledges a native delegate in its attached pane. [reel]
+##### inbox/pi/001 — Real idle Pi receives and acknowledges a native delegate in its attached pane.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_pi_live.rs`), real binary and PTY-attached TuiDeck.
 - **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`), isolated HOME and PI_CODING_AGENT_DIR, genuine delegate CLI from a scripted orchestrator role.
 - **Asserts:** The task subject labels the card, real work appears in the pane, a sentinel is written, and the message is committed once and Acknowledged with ExtensionConfirmed and one delivery; no doorbell is logged.
@@ -14209,7 +15131,7 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Does not assert:** Claimant exit, covered by inbox/core/011.
 - **Platform coverage:** mac+linux.
 
-##### inbox/offer/006 — Interactive Haiku claims, executes and completes an offered job. [reel]
+##### inbox/offer/006 — Interactive Haiku claims, executes and completes an offered job.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_offer_live.rs`), real orchestration CLI and PTY-attached worker.
 - **Agent:** Claude Haiku, interactive; scripted orchestrator only posts the job.
 - **Asserts:** A role taking the review pool receives and claims the trusted offer, visibly performs its sentinel task exactly once, completes through its own CLI and puts a completion notice naming the id into the offerer's inbox.
@@ -14227,28 +15149,28 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 
 Manual merge gate: opt in with `DOT_AGENT_DECK_INBOX_LOAD_TEST=1` only when scheduled on the shared box. Use `cargo test-e2e-live --config-file tests/fixtures/inbox-load-nextest.toml --test e2e_inbox_load load_ --no-capture`; this dedicated configuration selects the four load cases, runs one at a time, and allows 12 minutes for fixture setup plus each case's absolute agent deadline. The ordinary nextest configuration stays unchanged. Without opt-in each case emits `SKIP:` before the agent preflight calls, fixture setup or CPU loops; `DOT_AGENT_DECK_REQUIRE_REAL_E2E=1` turns that skip into a failure.
 
-##### inbox/load/001 — Claude Haiku inbox delivery under deliberate CPU pressure. [reel]
+##### inbox/load/001 — Claude Haiku inbox delivery under deliberate CPU pressure.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_001_claude_acknowledges_seed_idle_busy_and_clear_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
 - **Agent:** Real interactive Claude Haiku, established inbox live fixtures, isolated HOME.
 - **Asserts:** 25 messages across genuine spawn seed, idle, a sleep-tool turn and /clear all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling. **One exception, accepted as model variance (issue #2133):** the first busy message is posted while Claude is in the user's `sleep 30` turn, and Claude sometimes receives it mid-turn and ends the turn without running its command. That message alone may have no sentinel file, and only when the deck still did its part: the message is acknowledged with `plugin_confirmed`, and the deck log shows it handed alone to a once-waiter during the turn, and exactly one commit, applying one attempt, logged before the next once-waiter batch (the commit line names no message, so a commit after the next hand-over does not count). A sentinel that does exist must still hold the exact text, and every other message (busy 1–9, seed, idle, /clear) must be acted on as before. Plain unit tests in the same file check that a lost delivery (not acknowledged, no such hand-over in the log, or a commit only after the next hand-over) still fails.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
 
-##### inbox/load/002 — OpenCode on opencode_test_model() (Haiku by default) inbox delivery under deliberate CPU pressure. [reel]
+##### inbox/load/002 — OpenCode on opencode_test_model() (Haiku by default) inbox delivery under deliberate CPU pressure.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_002_opencode_acknowledges_seed_idle_and_busy_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
 - **Agent:** Real interactive OpenCode on opencode_test_model() (Haiku by default), established inbox live fixtures, isolated HOME.
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
 
-##### inbox/load/003 — Pi inbox delivery under deliberate CPU pressure. [reel]
+##### inbox/load/003 — Pi inbox delivery under deliberate CPU pressure.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_003_pi_acknowledges_seed_idle_and_busy_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
 - **Agent:** Real interactive Pi (GPT, `common::pi_test_model()`), established inbox live fixtures, isolated HOME.
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn all become Acknowledged and create their unique sentinel files within a 240-second agent window. Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
 - **Does not assert:** Persistence across daemon restart, exact model prose, or load-test execution in normal verification; only the scheduled opt-in run exercises the loaded scenario.
 - **Platform coverage:** mac+linux, local credentials only; never CI.
 
-##### inbox/load/004 — Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL (gpt-5.6-luna on this host) inbox delivery under deliberate CPU pressure. [reel]
+##### inbox/load/004 — Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL (gpt-5.6-luna on this host) inbox delivery under deliberate CPU pressure.
 - **Layer:** L2 lane 2 (`tests/e2e_inbox_load.rs`, `load_004_codex_never_loses_seed_idle_or_busy_messages_under_cpu_pressure`), real binary and PTY-attached TuiDeck.
 - **Agent:** Real interactive Codex on DOT_AGENT_DECK_CODEX_TEST_MODEL (gpt-5.6-luna on this host), established inbox live fixtures, isolated HOME.
 - **Asserts:** 20 messages across genuine spawn seed, idle and a sleep-tool turn are acknowledged and acted on, and the actual inbox list CLI lists each as acknowledged, within a 300-second agent window; a message left queued fails it (until 2026-10-14 a queued message passed, so a run with nothing acknowledged was green). Three busy-loop processes per available CPU run throughout and are killed/reaped using captured children in Drop; PSI load context is emitted on success and failure; vt100 bottom rows contain no stranded doorbell line or message opener after settling.
@@ -14512,13 +15434,14 @@ PRD #1666 part 3, round 5: where the deck keeps a worker's report, or a dispatch
 - **Agent:** private native copies of the test executable named Claude/Codex, with the F2 composer and real installed helper; a Python launcher; for Codex, an npm-shaped entrypoint (a `#!/usr/bin/env python3` script standing in for npm's `#!/usr/bin/env node` `codex.js`); no real agent or credential.
 - **Missing pins:** for each agent, a declared launcher and a learned wrapper launch the genuine native copy by absolute path and claim its own kind while neither native name resolves at spawn; another learned case resolves only the other agent's name. Each must stay non-Armable with `executable not resolved: expected <agent_type>`, no `gen-G` and no helper check. The existing unarmed fixture controls also exercise these histories with visible human input; they certify the fixture rather than discovery.
 - **Identity authority:** pin once from the PATH the deck hands the PTY child when spawning the pane, recorded then, never anything the child sets later. Follow symlinks to `(dev, ino)` and never resolve again. A hard link to the pinned inode is accepted because its kernel identity is the same. The running old executable after an update matches only because its deleted inode still equals the saved pin; deletion itself grants no authority. That holds for a native agent, checked by its own executable. On the interpreter-hosted route the entrypoint's executable is the interpreter's, so validation also requires the script's path to still hold the pinned inode, as a refusal only; the windows that leaves are named in the discovery units' bullet below.
-- **Interpreter-hosted Codex (npm):** a declared Codex pane started by bare name, whose spawn PATH resolves `codex` only to an npm-style symlink to an interpreter-hosted script that spawns the native copy (on no PATH entry) as its child with its own arguments, binds that native child as `A`, becomes Armable and checks a touched empty box. Two controls, the plan's: the same pane's entrypoint process handed to a byte-identical script at another path under the same interpreter, and the genuine script handed to a copy of the interpreter at another inode, each spawning the genuine native child, are refused with `executable differs: expected codex`, no `gen-G` and no helper check. A fixture control certifies the three shapes from `/proc` without the discovery interfaces. What attests the native child below an attested entrypoint is Q35-22's to define; the tests pin the outcome.
+- **Interpreter-hosted Codex (npm):** a declared Codex pane started by bare name, whose spawn PATH resolves `codex` only to an npm-style symlink to an interpreter-hosted script that spawns the native copy (on no PATH entry) as its child with its own arguments, binds that native child as `A`, becomes Armable and checks a touched empty box. Two controls, the plan's: the same pane's entrypoint process handed to a byte-identical script at another path under the same interpreter, and the genuine script handed to a copy of the interpreter at another inode, each spawning the genuine native child, are refused with `executable differs: expected codex`, no `gen-G` and no helper check. A `devbox run codex-big`-shaped launcher (issue #2258: it prints its own line, puts a directory holding another python3 first on `PATH`, and runs a script through `sh -c` that runs a `codex --version` check and then `codex` by name with `-c` options that set no key binding) binds the native child, becomes Armable and checks a touched empty box: an `env NAME` interpreter is the one the entrypoint's own `PATH` resolves, not only the spawn's. Verified RED before the fix (`inert`, `executable differs: expected codex`, the live deck's state). The fast unit `probe_035_an_env_interpreter_is_found_on_the_entrypoints_own_path` pins the refusals (no `PATH` read, the spawn's interpreter first, another one earlier, a relative directory first). A fixture control certifies the four shapes from `/proc` without the discovery interfaces. What attests the native child below an attested entrypoint is Q35-22's to define; the tests pin the outcome.
 - **Retirement bound:** cancellation is measured from immediately before the stop request, before any successor startup. The harness scales the three-second base budget with load and caps it at twelve seconds, below the gate's fifteen-second expiry; completion must precede old-gate release and leave no timeout marker.
 - **Asserts:** declared launchers in exec and spawn forms and wrappers learned after spawn start Pending, then publish the native pid, birth identity and executable inode in `gen-G`, publish the agent's `kind-G`, become Armable and check a touched empty composer through the real helper. Declared and learned executable lookalikes with identical bytes, name and claimed argv but a different inode get no identity, permission or check; a learned lookalike claiming the other agent is refused against that agent's independently pinned executable, with a distinct expected-agent reason. Same-path installation replacements preserve a running old process's spawn-time inode, refuse a wrapper that execs the new inode after its pin, and let a fresh pane pin the new inode; both declared and learned routes are covered for Claude and Codex. Reparenting, exit, forced foreign-uid refusal and generation retirement pin distinct refusal reasons, with lifecycle/owner failures taking precedence over lookalike mismatches. Retired discovery must complete or cancel before its old gate is released, without waiting for the gate expiry or publishing an identity; a genuine successor needs its own discovery. Editor variables survive binding. Four fixture controls exercise ordinary unarmed editing through both launcher forms for declared/learned/lookalike commands (including other-agent claims), same-path updates with human input, and live reparenting, without the new discovery interfaces.
 - **Does not assert:** production installation/activation, an actual process owned by another OS uid, Q28(b)'s hook-trust transaction, a real agent's readiness, or a mail ring. The foreign-uid fault exercises the refusal branch only; the production validator on a genuinely foreign-uid pid is the fast unit `probe_035_a_genuinely_foreign_owner_is_refused` below, which runs only where another user owns PID 1. A symlink on the spawn PATH to the native executable itself, an interpreter-hosted Claude (whose `A` is the interpreter process: plan Q35-14b's npm `claude`), a real node interpreter and a real npm Codex remain owed Q35-22 acceptance work; the Python stand-in does not close those obligations. The assumed read-only status, sandbox-HOME-only bounded candidate barrier, refusal-only uid fault and one resolution at spawn from the saved spawn PATH to a kernel (dev, ino), with no later lookup, are documented in the module. Q35-22 must supply them without bypassing validation. These tests were the RED slice for Q35-22's discovery and its observation interface, GREEN since that commit. The fixture controls do not certify binding.
-- **Platform coverage:** Linux; process identities are read from `/proc` inside isolated harness homes. No macOS claim and no demo-reel marker.
+- **Platform coverage:** Linux; process identities are read from `/proc` inside isolated harness homes. No macOS claim.
 - **The discovery's own units (coder, Q35-22):** fast, `src/composer_probe/discovery.rs`, over a scripted process table and temporary directories: `probe_035_the_walk_finds_the_native_below_a_launcher` (the walk passes over the deck's wrapper and a launcher to the native named as an agent, attested by its pin); `probe_035_the_walk_passes_over_the_wrappers_fork_and_trust_probe` (a wrapper child still running the deck's executable, and the wrapper's genuine `codex app-server` probe, are not the agent); `probe_035_an_entrypoint_attests_only_its_shebang_shape` (the pinned interpreter running the script path as found, its components compared, with the wrapped arguments at its end and #2002's pair on one side only, attests its native child; another script or another interpreter is an executable mismatch); `probe_035_an_entrypoint_is_read_again_at_validation`; `probe_035_lifecycle_and_owner_refusals_come_before_a_mismatch` (exit, then a changed parent or broken ancestry, then another owner, then the executable); `probe_035_a_reused_root_pid_finds_nothing`; `probe_035_shebangs_as_the_kernel_and_env_read_them` (`env NAME` found on the PATH with argv `NAME`, an absolute interpreter with its one argument; `env -S`, an assignment, a relative interpreter or an unterminated line give none); `probe_035_pins_are_taken_from_the_spawn_path` (a launcher's name pinned through a symlink, passing over a deck telemetry shim; a direct pane's absolute program word; an undeclared wrapper's two names; a relative entry before the match or only a shim pins nothing; a direct Claude pins nothing here); `probe_035_a_genuinely_foreign_owner_is_refused`, the production validator on PID 1 read from `/proc` where another user owns it (skipped where it is the test user's); and, from the revs22 review, `probe_035_a_hosted_script_replaced_after_its_pin_is_refused` (real files: an npm-shaped script pinned with its interpreter binds, then replaced at the same path by a new inode before validation is refused `executable differs`), `probe_035_a_pin_reads_identity_and_shebang_from_one_open_file` (a script renamed over the path after the pin opened it gives neither its identity nor its interpreter to the pin, and the native below the entrypoint is then refused), `probe_035_the_published_executable_is_the_validated_one` (a candidate that `exec`s between validation's read and the identity's, or across the pidfd poll, is refused rather than published with an executable nothing compared) and `probe_035_a_pidfd_failure_is_an_exit_only_when_the_process_is_gone` (only a pidfd failure that says the process is gone reads `candidate exited`; any other is `candidate not held` with its errno), and, from the revs22fix review, `probe_035_an_unreadable_identity_is_not_an_exit` (an identity that can't be read for a candidate the poll still finds running is refused `no identity`; one the poll finds gone is `candidate exited`). Does not assert: the daemon's spawn path taking the pins, which the L2 tests above exercise. **What the hosted route leaves open**: the pin compares file identities, with three windows in what it compares, each needing a process that can already write the agent's installation as the user: the script's path is read at validation, not when the interpreter opened it, so a file swapped in and back between the two isn't seen; a pin is a file identity, not content, so a write into the pinned file that keeps its inode isn't seen (for a native's pin too); and the native below an attested entrypoint is attested by that parentage alone, its own executable compared with nothing, since its location is the script's run-time choice. Code the attested processes load from elsewhere or through their environment (modules `codex.js` requires; a preload via `NODE_OPTIONS=--require` on the interpreter, `LD_PRELOAD` on a native pin) is not compared.
 - **The harness's attach close:** dropping `common::AttachInput` ends its write half first and lets the daemon end the connection (within two seconds) before closing it outright. Closing both halves at once failed the daemon's attach reply with `EPIPE`, which then dropped the connection unread, so the refusal checks above, which type into the pane and drop the attach before asserting the echo, lost their input.
+- **Quarantined:** `probe_035_codex_fresh_spawn_pins_updated_inode` carries `#[ignore = "quarantined: vfarcic, #2243"]` (CLAUDE.md rule 6). Under io starvation its helper invocation was answered `Uncertain` and the empty observation never settled; #2243 has the evidence, and closing it means fixing that and removing the `#[ignore]`. Run it with `cargo test-e2e --run-ignored only probe_035_codex_fresh_spawn`.
 
 ##### inbox/probe/034 — Claude-style Bash tools recover the original editor state and then source the user's preset.
 
@@ -14650,7 +15573,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 - **Layer:** L2 PTY-attached, lane 1 (`tests/e2e_telemetry_span_identity.rs`).
 - **Agent:** two shell/cat stand-ins in one worktree with offline gh rollups.
-- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each; the receiver gets two CI intervals and four change events in total.
+- **Asserts:** both runs observe pending → failing → pending → passing and retain two observed rounds and one failure each, and each run's `deck.pr.numbers` names the PR (issue #2096); the receiver gets two CI intervals and four change events in total.
 - **Does not assert:** deduplication across daemons, different repositories with the same PR number or ownership handoff while checks are pending.
 - **Platform coverage:** mac+linux.
 
@@ -14786,6 +15709,14 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** a real agent's failed turn (the hook mapping is `status/blocked/011`, `/022`, `/023`, `/026`); the default 30-second debounce; a worker that starts working again inside the debounce (the episode's cancellation is the waiting notice's, `scheduler/idle-worker/021`); a report sent after the handoff ended.
 - **Platform coverage:** mac+linux.
 
+##### telemetry/otlp/048 — A skill call names the skill on the run only when a skill directory defines it (issue #2087).
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_skill.rs`); the real `hook --agent claude-code` CLI and a local OTLP/JSON receiver.
+- **Agent:** none; a `cat` stand-in receives synthetic Claude Code `Skill` `PreToolUse` hooks.
+- **Asserts:** with a skill defined at `<project>/.claude/skills/<name>/SKILL.md`, three `Skill` calls (that skill with free-text `args`, a name no directory holds, and a path-shaped name) export three `deck.skill` events on the run, only the first with `deck.skill.name`, and `deck.skills.count` of 3; no request body holds the arguments, the undefined name or the path. Before the fix the run had no `deck.skill` event.
+- **Does not assert:** a real agent calling its `Skill` tool; OpenCode's `skill` tool and user-level skill directories (unit tests in `src/telemetry/skill.rs` and `src/hook.rs`).
+- **Platform coverage:** mac+linux.
+
 ##### telemetry/otlp/041 — Periodic daemon health exports memory, open runs, hook latency summaries and span drops.
 
 - **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_daemon_health.rs`); local OTLP/JSON receiver and shortened health interval.
@@ -14844,10 +15775,26 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 - **Does not assert:** a real agent emitting the hook (`telemetry/otlp/046`), or the operation's duration.
 - **Platform coverage:** mac+linux.
 
-##### telemetry/otlp/046 — A command that fails in real interactive Claude Code ends its operation on time. [reel]
+##### telemetry/otlp/046 — A command that fails in real interactive Claude Code ends its operation on time.
 
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_failed_operation_live.rs`); local OTLP/JSON receiver.
 - **Agent:** real interactive Claude Code on Haiku, with the hooks the deck installs.
 - **Asserts:** Haiku runs one plain Bash command, `cp <sentinel> <proof>; exit 3`, which copies a unique sentinel and fails; the turn visibly goes Working/Bash → Idle; that command's operation (`deck.operation.program=cp`) exports while the run is open, without `deck.operation.end`, and ends before the run; the grid shows no Error. Skips, with the reason, when the installed Claude Code is below the hook's 2.1.78 floor.
 - **Does not assert:** that Claude Code fired `PostToolUseFailure` rather than another end (the hook is the only end it sends for a failed call, measured by hand on 2.1.314), other operations Haiku might run, or Claude Code's own success flag on its tool-result event.
+- **Platform coverage:** linux (lane 2 runs on a developer's machine).
+
+##### telemetry/otlp/049 — A call interrupted with Escape ends when the agent's next turn does, at the Escape (issue #2093).
+
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_failed_operation.rs`); real hook CLI, the TUI's own input path and a local OTLP/JSON receiver.
+- **Agent:** none; a raw-mode `cat` stand-in receives synthetic Claude Code hooks, in the sequence Claude Code 2.1.322 fires for a Bash call interrupted with Escape (`PreToolUse`, then nothing until the next turn's `UserPromptSubmit` and `Stop`).
+- **Asserts:** after a Bash `PreToolUse` and an Escape typed through the TUI, the next `UserPromptSubmit` exports nothing (checked once a later call that started and ended after it has exported); the following `Stop` exports the call's operation while the run is open, with `deck.operation.end=interrupted` and an end at the Escape, before the `Stop`. A second call left open with no Escape exports at its turn's `Stop` with `deck.operation.end=turn_end`.
+- **Does not assert:** a real agent's hooks (`telemetry/otlp/050`), subagent calls or the wrapper's output-derived Idle (unit tests `a_running_call_outlives_prompts_siblings_and_other_threads` in `src/telemetry/tracker.rs`), or Codex's, OpenCode's, Devin's or Pi's turn ends, which reach the same tracker path as `Idle`.
+- **Platform coverage:** mac+linux.
+
+##### telemetry/otlp/050 — A command interrupted with Escape in real interactive Claude Code ends its operation at the Escape.
+
+- **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_telemetry_failed_operation_live.rs`); local OTLP/JSON receiver.
+- **Agent:** real interactive Claude Code on Haiku, with the hooks the deck installs.
+- **Asserts:** Haiku runs a script in the foreground that writes a unique start marker and sleeps 20 s; once the marker appears, an Escape written through the attach input path interrupts it and Claude shows `Interrupted`; a reply request typed into the pane starts the next turn, after which the script's own operation (selected by the script's name in its program, word or commands) exports while the run is open, marked `deck.operation.end=interrupted`, ending within 5 s of the Escape; no operation is marked `run_end`; the script's finish marker is absent.
+- **Does not assert:** which hooks Claude Code fired (measured by hand on 2.1.322: none for the interrupted call), the card's status after the interrupt (it stays Working until the next turn, since Claude Code fires no `Stop` for an interrupted turn), or a deck message delivered after the interrupt (the deck holds it while the card is Working).
 - **Platform coverage:** linux (lane 2 runs on a developer's machine).

@@ -340,7 +340,10 @@ fn a_reply_to_one_of_two_standalone_agents_in_a_folder_names_it() {
     assert_eq!(reply, address(Some("/w/deck"), Some("dispatcher"), None));
     let text = attribution(Some(caller), "p-d", Some(&reply));
     assert!(
-        text.contains("reply with: dot-agent-deck inbox send --folder /w/deck --name=dispatcher --text '<your reply>'"),
+        text.contains(&format!(
+            "reply with: {} inbox send --folder /w/deck --name=dispatcher --text '<your reply>'",
+            dot_agent_deck::platform::paths::binary_name()
+        )),
         "{text}"
     );
     // A folder alone is still preferred when it reaches the sender alone.

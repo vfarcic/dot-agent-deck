@@ -46,6 +46,7 @@ mod selection_saves;
 mod self_upgrade;
 mod settings;
 mod terminal;
+mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
 // crate's shared upgrade procedure.
 mod upgrade;
@@ -73,7 +74,7 @@ use dot_agent_deck::daemon_client::{
     ClientError, DaemonClient, Endpoint, EventSubscription, GatedQuery, Incarnation,
     LastCommandKeeper, StartAgentOptions,
 };
-use dot_agent_deck::daemon_stop::{StopOutcome, run_daemon_stop};
+use dot_agent_deck::daemon_stop::{StopError, StopOutcome, WireStopOutcome, run_daemon_stop};
 use dot_agent_deck::event::{AgentType, BroadcastMsg, PreparedOrchestration, ProjectRole};
 use tauri::ipc::{Channel, Response};
 use tauri::{AppHandle, Emitter, Manager, State, Webview};
@@ -86,7 +87,7 @@ use crate::dto::{
     DesktopNewAgentOptions, DesktopNewAgentOrchestrations, DesktopProjectListing,
     DesktopResolvedProject, DesktopSnapshot, OrchestrationRoleInput, TerminalAttachResult,
     desktop_agent_registry, ensure_desktop_orchestration_platform_supported, map_project_listing,
-    map_resolved_project, mint_desktop_pane_id, safe_message, selected_endpoint, validate_agent_id,
+    map_resolved_project, mint_desktop_pane_id, safe_message, validate_agent_id,
     validate_dimensions, validate_orchestration_shape, validate_pasted_project_path,
     validate_start_fields,
 };
@@ -400,7 +401,14 @@ trait OrchestrationDaemon {
     /// The agent type the deck recorded for `agent_id` at spawn — for a
     /// configured role, the role's resolved type. `None` when it recorded none.
     async fn launched_agent_type(&self, agent_id: &str) -> Result<Option<AgentType>, String>;
-    async fn stop_orchestration_agent(&self, agent_id: &str) -> Result<(), String>;
+    /// Stop one role. `keep_worktree` (issue #1958) keeps the dispatched
+    /// worktree if this stop is the one that would remove it, and is refused
+    /// with nothing sent by a deck that cannot keep.
+    async fn stop_orchestration_agent(
+        &self,
+        agent_id: &str,
+        keep_worktree: bool,
+    ) -> Result<(), String>;
     async fn reconcile_orchestration_agent(
         &self,
         pane_id: &str,
@@ -480,10 +488,17 @@ impl OrchestrationDaemon for DaemonClient {
             })
     }
 
-    async fn stop_orchestration_agent(&self, agent_id: &str) -> Result<(), String> {
-        self.stop_agent(agent_id)
-            .await
-            .map_err(|error| safe_message(error.to_string()))
+    async fn stop_orchestration_agent(
+        &self,
+        agent_id: &str,
+        keep_worktree: bool,
+    ) -> Result<(), String> {
+        let stopped = if keep_worktree {
+            self.stop_agent_keeping_worktree(agent_id).await
+        } else {
+            self.stop_agent(agent_id).await
+        };
+        stopped.map_err(|error| safe_message(error.to_string()))
     }
 
     async fn reconcile_orchestration_agent(
@@ -639,7 +654,7 @@ async fn rollback_orchestration_agents<D: OrchestrationDaemon + Sync>(
 ) -> RollbackOutcome {
     let mut unconfirmed = Vec::new();
     for started_role in started.iter().rev() {
-        if let Some(stop) = bounded_role_stop(daemon, started_role).await {
+        if let Some(stop) = bounded_role_stop(daemon, started_role, false).await {
             unconfirmed.push(stop);
         }
     }
@@ -656,10 +671,11 @@ async fn rollback_orchestration_agents<D: OrchestrationDaemon + Sync>(
 async fn bounded_role_stop<D: OrchestrationDaemon + Sync>(
     daemon: &D,
     role: &StartedRole,
+    keep_worktree: bool,
 ) -> Option<UnconfirmedStop> {
     let reason = match tokio::time::timeout(
         ORCHESTRATION_ROLE_STOP_TIMEOUT,
-        daemon.stop_orchestration_agent(&role.agent_id),
+        daemon.stop_orchestration_agent(&role.agent_id, keep_worktree),
     )
     .await
     {
@@ -687,13 +703,18 @@ async fn bounded_role_stop<D: OrchestrationDaemon + Sync>(
 /// costs one bound for the whole close rather than one per role behind it.
 /// A handle per role because each is bound to the daemon process that listed
 /// that role (PRD #1666 part 2, G-fix4).
+///
+/// `keep_worktree` (issue #1958) goes on EVERY role's stop: the deck keeps the
+/// dispatched worktree at the first stop carrying the keep that it handles,
+/// and which one that is depends on how the concurrent stops land.
 async fn stop_roles_concurrently<D: OrchestrationDaemon + Sync>(
     roles: &[(&D, &StartedRole)],
+    keep_worktree: bool,
 ) -> Vec<Option<UnconfirmedStop>> {
     join_ordered(
         roles
             .iter()
-            .map(|(daemon, role)| bounded_role_stop(*daemon, role))
+            .map(|(daemon, role)| bounded_role_stop(*daemon, role, keep_worktree))
             .collect(),
     )
     .await
@@ -4978,6 +4999,7 @@ async fn rename_agent_action(
 }
 
 /// A best-effort hint on the close dialog, bounded like the TUI's preview.
+/// Issue #1958: also names the worktree to offer "keep worktree" for.
 #[tauri::command]
 async fn desktop_worktree_close_preview(
     webview: Webview,
@@ -4985,35 +5007,173 @@ async fn desktop_worktree_close_preview(
     deck_id: String,
     pane_ids: Vec<String>,
     incarnation: Incarnation,
-) -> Result<Option<dot_agent_deck::daemon_protocol::KeptWorktree>, String> {
+) -> Result<crate::dto::WorktreeCloseReport, String> {
     ensure_main_webview(&webview)?;
     Ok(worktree_close_preview_on(&state, &deck_id, pane_ids, incarnation).await)
 }
 
+/// The close dialog's preview: an empty report when it cannot be had within
+/// the bound, so the dialog still asks — without the hint and without the
+/// keep choice, which is offered only when the deck said it can keep.
 async fn worktree_close_preview_on(
     state: &DesktopState,
     deck_id: &str,
     pane_ids: Vec<String>,
     incarnation: Incarnation,
-) -> Option<dot_agent_deck::daemon_protocol::KeptWorktree> {
+) -> crate::dto::WorktreeCloseReport {
     if pane_ids.is_empty() {
-        return None;
+        return crate::dto::WorktreeCloseReport::default();
     }
     tokio::time::timeout(Duration::from_millis(500), async {
         let scope = crate::dto::DeckScope::resolve(Some(deck_id)).ok()?;
         let daemon = state.daemon.trusted(scope.endpoint()).await.ok()?;
         daemon.require_compatible().ok()?;
-        daemon
-            .client
-            .bound_to(incarnation)
-            .dispatch_worktree_close_preview(pane_ids)
-            .await
-            .ok()
-            .flatten()
+        let client = daemon.client.bound_to(incarnation);
+        let preview = client.worktree_close_preview(pane_ids).await.ok()?;
+        // The keep choice needs the deck's word that it can keep. A set that
+        // cannot be read offers no choice; the stop itself re-checks on its own
+        // connection either way.
+        let keep_worktree = match client.capabilities().await {
+            Ok(capabilities) => preview
+                .keep_worktree_choice(&capabilities)
+                .map(str::to_owned),
+            Err(_) => None,
+        };
+        Some(crate::dto::WorktreeCloseReport {
+            kept: preview.kept_worktree,
+            keep_worktree,
+        })
     })
     .await
     .ok()
     .flatten()
+    .unwrap_or_default()
+}
+
+/// Issue #1073 — stop the daemon of the deck `deck_id` names, which on the
+/// overview need not be the selected one.
+///
+/// The deck is resolved once, as [`stop_agent_action`] resolves it, and the
+/// path is chosen per deck:
+///
+/// - **The wire verb** (`AttachRequest::StopDaemon`, issue #1049) whenever the
+///   deck advertises it. The daemon runs the #770 refusal itself and stops
+///   itself, so nothing here reads a pid or sends a signal — which is why it
+///   is the only path that reaches a remote deck.
+/// - **The pid stop** ([`run_daemon_stop`]) for a local deck that predates the
+///   verb or does not answer the handshake, and for a forced stop of a local
+///   deck: escalating past a graceful stop needs a signal, which a caller on the
+///   wire does not have.
+/// - **A refusal** for a remote deck without the verb. The pid path takes a
+///   `LocalEndpoint`, and over a forwarded socket its peer-credential lookup
+///   would name the local `ssh` client (PRD #741 M2), so there is nothing safe
+///   to send.
+///
+/// A refused stop returns before anything is torn down, so the deck's link and
+/// terminals survive it, as they did when this arm stopped only the local deck.
+pub(crate) async fn stop_daemon_action(
+    state: &DesktopState,
+    deck_id: &str,
+    force: bool,
+) -> Result<(crate::dto::DeckScope, String), String> {
+    let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+    let endpoint = scope.endpoint().clone();
+    let local = endpoint.as_local();
+    let wire = match (force, local) {
+        (true, Some(_)) => None,
+        _ => match state.daemon.trusted(&endpoint).await {
+            Ok(daemon) => {
+                let supported = daemon
+                    .client
+                    .capabilities()
+                    .await
+                    .is_ok_and(|capabilities| {
+                        capabilities.supports(dot_agent_deck::daemon_protocol::CAP_STOP_DAEMON)
+                    });
+                supported.then_some(daemon)
+            }
+            // A local deck that does not answer is the pid path's to report —
+            // "no daemon was running" is its idempotent answer.
+            Err(_) if local.is_some() => None,
+            Err(error) => return Err(error),
+        },
+    };
+    let message = match (wire, local) {
+        (Some(daemon), _) => wire_stop_message(daemon.client.stop_daemon(force).await)?,
+        (None, Some(local)) => pid_stop_message(run_daemon_stop(local, force).await)?,
+        (None, None) => {
+            return Err(crate::daemon_bridge::stop_daemon_reason(&endpoint, false)
+                .unwrap_or_else(|| "This daemon cannot be stopped from this app.".into()));
+        }
+    };
+    // PRD #741 M4(a): the daemon this link was established against is going
+    // away, so the handshake held for it describes a process that is ending.
+    state.daemon.invalidate(&endpoint).await;
+    // PRD #1105: this deck's sessions only — every other deck's terminals
+    // belong to daemons this action never touched.
+    terminal::detach_deck(state, &endpoint).await;
+    Ok((scope, message))
+}
+
+/// The pid stop's outcome in the words the desktop shows.
+fn pid_stop_message(outcome: Result<StopOutcome, StopError>) -> Result<String, String> {
+    match outcome {
+        Ok(StopOutcome::NoDaemonRunning) => Ok("No daemon was running.".into()),
+        Ok(StopOutcome::Stopped { pid }) => Ok(format!("Daemon stopped gracefully (pid {pid}).")),
+        Ok(StopOutcome::ForceKilled { pid }) => Ok(format!("Daemon force-killed (pid {pid}).")),
+        Err(error) => Err(stop_refusal_message(&error)),
+    }
+}
+
+/// The wire stop's outcome in the words the desktop shows (issue #1073).
+///
+/// `AcceptedNotConfirmed` is reported as what it is: the daemon said yes and
+/// began stopping, and had not gone when the confirmation budget ran out.
+/// Calling it stopped is the PRD #741 cautionary case — a stop path that
+/// reported success for a daemon it had not seen go.
+pub(crate) fn wire_stop_message(
+    outcome: Result<WireStopOutcome, StopError>,
+) -> Result<String, String> {
+    match outcome {
+        Ok(WireStopOutcome::NoDaemonRunning) => Ok("No daemon was running.".into()),
+        Ok(WireStopOutcome::Stopped) => Ok("Daemon stopped gracefully.".into()),
+        Ok(WireStopOutcome::AcceptedNotConfirmed) => Ok(
+            "The daemon accepted the stop and is still shutting down; its agents are being closed."
+                .into(),
+        ),
+        Err(error) => Err(stop_refusal_message(&error)),
+    }
+}
+
+/// A refused stop in the app's words, from either path.
+///
+/// The daemon's own refusal ends in "pass --force", which is the CLI's way out
+/// and not one this app offers, so the two guards are worded here; every other
+/// error is the daemon's or the transport's own sentence.
+fn stop_refusal_message(error: &StopError) -> String {
+    use dot_agent_deck::daemon_protocol::StopRefusalReason;
+    let agents = |count: usize| {
+        format!(
+            "The daemon was not stopped: {count} agent{} still running on it. Close {} first, then stop the daemon.",
+            if count == 1 { " is" } else { "s are" },
+            if count == 1 { "it" } else { "them" },
+        )
+    };
+    let roles = |count: usize| {
+        format!(
+            "The daemon was not stopped: it runs orchestration roles ({count}) that would be left unable to delegate. Close the orchestration first, then stop the daemon."
+        )
+    };
+    match error {
+        StopError::LiveAgents { ids } => agents(ids.len()),
+        StopError::LiveOrchestrations { roles: held } => roles(held.len()),
+        StopError::Refused(refusal) => match refusal.reason {
+            StopRefusalReason::LiveOrchestrations => roles(refusal.roles.len()),
+            StopRefusalReason::LiveAgents => agents(refusal.agent_ids.len()),
+            StopRefusalReason::Unknown => safe_message(refusal.summary.clone()),
+        },
+        other => safe_message(other.to_string()),
+    }
 }
 
 /// Stop one agent on the selected deck, and tear down **that deck's** terminal
@@ -5058,11 +5218,20 @@ async fn worktree_close_preview_on(
 /// The stop is bounded by [`ORCHESTRATION_ROLE_STOP_TIMEOUT`], so a deck that takes
 /// the connection and never answers ends the action with a sentence rather
 /// than holding the confirmation open.
+///
+/// # Keeping the worktree (issue #1958)
+///
+/// `keep_worktree` sends the stop through
+/// `DaemonClient::stop_agent_keeping_worktree`, which refuses with nothing
+/// sent when the deck does not advertise the keep — so a deck that cannot keep
+/// stops nothing, rather than stopping the agent and removing the worktree the
+/// user asked to keep. The refusal comes back as this action's error.
 async fn stop_agent_action(
     state: &DesktopState,
     deck_id: &str,
     agent_id: &str,
     incarnation: &Incarnation,
+    keep_worktree: bool,
 ) -> Result<crate::dto::DeckScope, String> {
     validate_agent_id(agent_id)?;
     let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
@@ -5071,15 +5240,15 @@ async fn stop_agent_action(
     // PRD #1666 part 2 (G-fix4): bound to the daemon process that listed the
     // row, which may be long gone by the time a confirmation is accepted. A
     // successor that numbered an unrelated agent with this id is sent nothing.
-    match tokio::time::timeout(
-        ORCHESTRATION_ROLE_STOP_TIMEOUT,
-        daemon
-            .client
-            .bound_to(incarnation.clone())
-            .stop_agent(agent_id),
-    )
-    .await
-    {
+    let client = daemon.client.bound_to(incarnation.clone());
+    let stop = async {
+        if keep_worktree {
+            client.stop_agent_keeping_worktree(agent_id).await
+        } else {
+            client.stop_agent(agent_id).await.map(|_| ())
+        }
+    };
+    match tokio::time::timeout(ORCHESTRATION_ROLE_STOP_TIMEOUT, stop).await {
         Ok(Ok(_)) => {}
         Ok(Err(error)) => return Err(safe_message(error.to_string())),
         Err(_) => {
@@ -5101,6 +5270,17 @@ async fn stop_agent_action(
     Ok(scope)
 }
 
+/// Issue #1958: what an orchestration's keep close says when the daemon did not
+/// say within [`ORCHESTRATION_ROLE_STOP_TIMEOUT`] whether it can keep the
+/// worktree. Nothing was closed.
+fn keep_capability_unanswered_message() -> String {
+    format!(
+        "the daemon did not say within {}s whether it can keep the worktree, so no role was \
+         closed",
+        ORCHESTRATION_ROLE_STOP_TIMEOUT.as_secs()
+    )
+}
+
 /// PRD #1223 U4 — close a whole orchestration on the deck `deck_id` names:
 /// [`stop_roles_concurrently`] over every role the webview listed, then detach
 /// each confirmed role's terminal.
@@ -5113,10 +5293,19 @@ async fn stop_agent_action(
 /// A role whose stop was refused or not answered within the bound is named, as
 /// data, in the [`LaunchFailure`] — the same shape a launch's rollback reports,
 /// so the webview shows it with the same cleanup warning.
+///
+/// `keep_worktree` (issue #1958) keeps the orchestration's dispatched
+/// worktree: it goes on every role's stop. A deck whose capabilities say it
+/// cannot keep is refused before ANY role is stopped. Each stop also checks the
+/// capability on its own connection, which is bound to the process that listed
+/// its role, so a role's stop is never sent to a successor process. The
+/// fan-out is concurrent, so if the deck is replaced partway through, roles
+/// already stopped on the old process stay stopped.
 async fn stop_orchestration_action(
     state: &DesktopState,
     deck_id: &str,
     roles: &[crate::dto::StopOrchestrationRole],
+    keep_worktree: bool,
 ) -> (Option<crate::dto::DeckScope>, Result<(), LaunchFailure>) {
     if roles.is_empty() {
         return (
@@ -5142,6 +5331,29 @@ async fn stop_orchestration_action(
     if let Err(error) = daemon.require_compatible() {
         return (Some(scope), Err(error.into()));
     }
+    // Bounded like the role stops below (PR #2268 review): with the capability
+    // cache cleared, this is a fresh `Hello`, and a daemon that accepts the
+    // connection but never answers it would otherwise hold the close forever.
+    // A timeout refuses the close before any role is stopped. A transport
+    // error is left to the role stops, which each check on their own bounded
+    // connection.
+    if keep_worktree {
+        let refusal = match tokio::time::timeout(
+            ORCHESTRATION_ROLE_STOP_TIMEOUT,
+            daemon.client.capabilities(),
+        )
+        .await
+        {
+            Ok(Ok(capabilities)) if !capabilities.supports_keep_worktree() => {
+                Some(dot_agent_deck::daemon_client::KEEP_WORKTREE_UNSUPPORTED.to_string())
+            }
+            Ok(_) => None,
+            Err(_) => Some(keep_capability_unanswered_message()),
+        };
+        if let Some(refusal) = refusal {
+            return (Some(scope), Err(refusal.into()));
+        }
+    }
     // PRD #1666 part 2 (G-fix4): each stop bound to the daemon process that
     // listed its role, so a role listed before a restart is not stopped on a
     // successor that numbered an unrelated agent the same.
@@ -5157,7 +5369,7 @@ async fn stop_orchestration_action(
         })
         .collect();
     let stops: Vec<(&DaemonClient, &StartedRole)> = clients.iter().zip(&started).collect();
-    let outcomes = stop_roles_concurrently(&stops).await;
+    let outcomes = stop_roles_concurrently(&stops, keep_worktree).await;
     let mut unconfirmed = Vec::new();
     for ((role, listed), outcome) in started.iter().zip(roles).zip(outcomes) {
         match outcome {
@@ -5421,6 +5633,9 @@ struct StartedOrchestration {
 /// [`DesktopAction::ActivateOrchestration`]'s fields, unpacked for
 /// [`activate_orchestration_action`].
 struct ActivateOrchestrationRequest {
+    /// The deck the launch was started on (PRD #1885 review); `None` takes the
+    /// selected deck, refused under All Decks.
+    deck_id: Option<String>,
     name: String,
     /// The run's name (issue #1044), absent when the form's Name is empty.
     display_title: Option<String>,
@@ -5450,6 +5665,7 @@ async fn activate_orchestration_action(
     request: ActivateOrchestrationRequest,
 ) -> Result<OrchestrationLaunchResult, DesktopActionError> {
     let ActivateOrchestrationRequest {
+        deck_id,
         name,
         display_title,
         cwd,
@@ -5477,7 +5693,19 @@ async fn activate_orchestration_action(
     // The supported non-Pi coordinator still uses the readiness-gated,
     // identity-bound retry path in `launch_orchestration`; Pi is rejected
     // inside the preparation, before anything is spawned.
-    let daemon = trusted_daemon(&state.daemon).await?;
+    //
+    // PRD #1885 review: a launch that names its deck goes to that deck, the
+    // one its project-commands review was asked of and approved on, never to
+    // whatever is selected when it arrives. The id is resolved against the
+    // observed decks (`DeckScope::resolve`), so an id this app does not
+    // observe is refused before any deck is contacted.
+    let daemon = match deck_id.as_deref() {
+        Some(deck_id) => {
+            let scope = crate::dto::DeckScope::resolve(Some(deck_id))?;
+            state.daemon.trusted(scope.endpoint()).await?
+        }
+        None => trusted_daemon(&state.daemon).await?,
+    };
     daemon.require_compatible()?;
     ensure_daemon_can_prepare(daemon.client.cached_capabilities().as_ref())?;
     let launch_client = bind_launch(&daemon.client).await?;
@@ -6338,6 +6566,7 @@ async fn desktop_run_action(
             result_agent_ids = started.agent_ids;
         }
         DesktopAction::ActivateOrchestration {
+            deck_id,
             name,
             display_title,
             cwd,
@@ -6350,6 +6579,7 @@ async fn desktop_run_action(
             let launched = activate_orchestration_action(
                 &state,
                 ActivateOrchestrationRequest {
+                    deck_id,
                     name,
                     display_title,
                     cwd,
@@ -6373,8 +6603,10 @@ async fn desktop_run_action(
             deck_id,
             agent_id,
             incarnation,
+            keep_worktree,
         } => {
-            let scope = stop_agent_action(&state, &deck_id, &agent_id, &incarnation).await?;
+            let scope =
+                stop_agent_action(&state, &deck_id, &agent_id, &incarnation, keep_worktree).await?;
             // PRD #1223 U4: the TARGET deck, directly, for the StartAgent
             // arm's reason — the tail below refreshes only the selected one.
             if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
@@ -6383,8 +6615,13 @@ async fn desktop_run_action(
             state.request_refetch(&scope.identity());
             result_agent_id = Some(agent_id);
         }
-        DesktopAction::StopOrchestration { deck_id, roles } => {
-            let (scope, outcome) = stop_orchestration_action(&state, &deck_id, &roles).await;
+        DesktopAction::StopOrchestration {
+            deck_id,
+            roles,
+            keep_worktree,
+        } => {
+            let (scope, outcome) =
+                stop_orchestration_action(&state, &deck_id, &roles, keep_worktree).await;
             // Refreshed whatever the outcome: a close that could not confirm
             // every stop has still stopped the rest.
             if let Some(scope) = &scope {
@@ -6398,34 +6635,17 @@ async fn desktop_run_action(
             })?;
             result_agent_ids = roles.into_iter().map(|role| role.agent_id).collect();
         }
-        DesktopAction::StopDaemon { force } => {
-            // PRD #741 M2: `run_daemon_stop` takes a `LocalEndpoint`, so this
-            // cannot reach a remote deck even by accident — `require_local`
-            // is the only way to produce one and it refuses, naming the deck
-            // and the reason. (M7 renders this as a disabled button carrying
-            // the same explanation rather than a failed action.)
-            let endpoint = selected_endpoint();
-            let local = endpoint
-                .require_local("Stop daemon")
-                .map_err(|error| safe_message(error.to_string()))?;
-            let outcome = run_daemon_stop(local, force)
-                .await
-                .map_err(|error| safe_message(error.to_string()))?;
-            // PRD #741 M4(a): the daemon this link was established against is
-            // being terminated, so the handshake held for it describes a
-            // process that is going away. Drop it here rather than waiting for
-            // the watcher to notice its stream end.
-            state.daemon.invalidate(&endpoint).await;
-            // PRD #1105: this deck's sessions only. Stop is refused for
-            // anything but the local deck, so tearing down every deck's
-            // terminals would close panes on machines this action never
-            // touched.
-            terminal::detach_deck(&state, &endpoint).await;
-            result_message = Some(match outcome {
-                StopOutcome::NoDaemonRunning => "No daemon was running.".into(),
-                StopOutcome::Stopped { pid } => format!("Daemon stopped gracefully (pid {pid})."),
-                StopOutcome::ForceKilled { pid } => format!("Daemon force-killed (pid {pid})."),
-            });
+        DesktopAction::StopDaemon { deck_id, force } => {
+            // Issue #1073: the deck the control was pressed on, which on the
+            // overview need not be the selected one.
+            let (scope, message) = stop_daemon_action(&state, &deck_id, force).await?;
+            // The TARGET deck, directly, for the StopAgent arm's reason — the
+            // tail below refreshes only the selected one.
+            if let Some(snapshot) = target_deck_snapshot(&state.daemon, &scope).await {
+                emit_snapshot(&app, &snapshot);
+            }
+            state.request_refetch(&scope.identity());
+            result_message = Some(message);
         }
         DesktopAction::AllowBuildMismatch { deck_id } => {
             // Session-scoped and nothing else: no daemon call beyond a
@@ -6833,6 +7053,8 @@ pub fn run() {
             desktop_list_projects,
             desktop_resolve_project,
             desktop_new_agent_orchestrations,
+            trust_review::desktop_project_trust_state,
+            trust_review::desktop_approve_project_trust,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_new_agent_options,
@@ -9429,6 +9651,8 @@ mod tests {
         /// Every stop asked for, answered or not; `stopped` is only the ones
         /// that were confirmed.
         stop_attempts: Mutex<Vec<String>>,
+        /// Issue #1958: the stops asked to keep the dispatched worktree.
+        kept_stops: Mutex<Vec<String>>,
         /// Stops the deck never answers, and stops it refuses, by agent id.
         stop_hangs: Mutex<HashSet<String>>,
         stop_errors: Mutex<HashMap<String, String>>,
@@ -9461,6 +9685,7 @@ mod tests {
                 prepare_delay: Mutex::new(None),
                 start_hangs: Mutex::new(HashSet::new()),
                 stop_attempts: Mutex::new(Vec::new()),
+                kept_stops: Mutex::new(Vec::new()),
                 stop_hangs: Mutex::new(HashSet::new()),
                 stop_errors: Mutex::new(HashMap::new()),
                 bounds_preparation: AtomicBool::new(false),
@@ -9550,11 +9775,18 @@ mod tests {
             Ok(self.launched_type.lock().unwrap().clone())
         }
 
-        async fn stop_orchestration_agent(&self, agent_id: &str) -> Result<(), String> {
+        async fn stop_orchestration_agent(
+            &self,
+            agent_id: &str,
+            keep_worktree: bool,
+        ) -> Result<(), String> {
             self.stop_attempts
                 .lock()
                 .unwrap()
                 .push(agent_id.to_string());
+            if keep_worktree {
+                self.kept_stops.lock().unwrap().push(agent_id.to_string());
+            }
             let hangs = self.stop_hangs.lock().unwrap().contains(agent_id);
             if hangs {
                 std::future::pending::<()>().await;
@@ -10809,7 +11041,7 @@ command = "configured-planner"
         let began = tokio::time::Instant::now();
 
         let stops: Vec<_> = roles.iter().map(|role| (&daemon, role)).collect();
-        let outcomes = stop_roles_concurrently(&stops).await;
+        let outcomes = stop_roles_concurrently(&stops, false).await;
 
         let mut attempts = daemon.stop_attempts.lock().unwrap().clone();
         attempts.sort();
@@ -10845,14 +11077,17 @@ command = "configured-planner"
         assert!(outcomes[3].is_none());
     }
 
-    /// Scenario (PRD #1223 U4): the webview sends a `stop_agent` or a
-    /// `stop_orchestration` that names no deck. Both fail to decode, for
-    /// `start_agent`'s reason — a stop must never fall back to the selection.
+    /// Scenario (PRD #1223 U4, issue #1073): the webview sends a `stop_agent`,
+    /// a `stop_orchestration` or a `stop_daemon` that names no deck. All three
+    /// fail to decode, for `start_agent`'s reason — a stop must never fall back
+    /// to the selection.
     #[test]
     fn a_stop_without_a_deck_does_not_decode() {
         for action in [
             serde_json::json!({"type": "stop_agent", "agentId": "7"}),
             serde_json::json!({"type": "stop_orchestration", "roles": [{"agentId": "7", "name": "planner"}]}),
+            serde_json::json!({"type": "stop_daemon"}),
+            serde_json::json!({"type": "stop_daemon", "force": false}),
         ] {
             assert!(
                 serde_json::from_value::<DesktopAction>(action.clone()).is_err(),
@@ -10863,6 +11098,87 @@ command = "configured-planner"
             serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_agent", "deckId": "deck-000000000000dec1", "agentId": "7"})),
             Ok(DesktopAction::StopAgent { deck_id, agent_id, .. }) if deck_id == "deck-000000000000dec1" && agent_id == "7"
         ));
+        assert!(matches!(
+            serde_json::from_value::<DesktopAction>(serde_json::json!({"type": "stop_daemon", "deckId": "deck-000000000000dec1"})),
+            Ok(DesktopAction::StopDaemon { deck_id, force: false }) if deck_id == "deck-000000000000dec1"
+        ));
+    }
+
+    /// Scenario (issue #1958): the webview's "…, keep worktree" buttons send
+    /// `keepWorktree: true` on a `stop_agent` and a `stop_orchestration`, and
+    /// both decode with the keep; every action sent without the field — what
+    /// every caller sent before — decodes as an ordinary close.
+    #[test]
+    fn a_stop_decodes_its_keep_worktree_and_defaults_to_an_ordinary_close() {
+        let keep = |action: serde_json::Value| match serde_json::from_value::<DesktopAction>(action)
+        {
+            Ok(DesktopAction::StopAgent { keep_worktree, .. })
+            | Ok(DesktopAction::StopOrchestration { keep_worktree, .. }) => keep_worktree,
+            _ => panic!("a stop decodes"),
+        };
+        let agent = serde_json::json!({"type": "stop_agent", "deckId": "deck-000000000000dec1", "agentId": "7"});
+        let orchestration = serde_json::json!({"type": "stop_orchestration", "deckId": "deck-000000000000dec1", "roles": [{"agentId": "7", "name": "planner"}]});
+        for action in [agent, orchestration] {
+            assert!(
+                !keep(action.clone()),
+                "{action}: absent is an ordinary close"
+            );
+            let mut kept = action.clone();
+            kept["keepWorktree"] = true.into();
+            assert!(keep(kept), "{action}: the keep decodes");
+        }
+    }
+
+    /// Scenario (issue #1958): the close preview reaches the webview as
+    /// `{kept, keepWorktree}` — `null` for each when there is nothing to say,
+    /// which is what an older deck, or one past the bound, gives.
+    #[test]
+    fn the_close_preview_report_reaches_the_webview_in_its_own_words() {
+        assert_eq!(
+            serde_json::to_value(crate::dto::WorktreeCloseReport::default()).unwrap(),
+            serde_json::json!({"kept": null, "keepWorktree": null})
+        );
+        let report = crate::dto::WorktreeCloseReport {
+            kept: Some(dot_agent_deck::daemon_protocol::KeptWorktree {
+                path: "/w/unit".into(),
+                confirmed_dirty: true,
+                on_request: false,
+            }),
+            keep_worktree: Some("/w/unit".into()),
+        };
+        assert_eq!(
+            serde_json::to_value(report).unwrap(),
+            serde_json::json!({"kept": {"path": "/w/unit", "confirmed_dirty": true}, "keepWorktree": "/w/unit"})
+        );
+    }
+
+    /// Scenario (issue #1958): an orchestration close that keeps the worktree
+    /// asks EVERY role's stop to keep it, and a close without the keep asks
+    /// none.
+    #[tokio::test]
+    async fn closing_an_orchestration_keeping_its_worktree_keeps_on_every_role() {
+        let roles: Vec<StartedRole> = ["planner", "builder", "reviewer"]
+            .iter()
+            .enumerate()
+            .map(|(index, role)| StartedRole {
+                agent_id: format!("agent-{index}"),
+                role: role.to_string(),
+            })
+            .collect();
+        for keep in [true, false] {
+            let daemon = FakeOrchestrationDaemon::new([], Ok(()));
+            let stops: Vec<_> = roles.iter().map(|role| (&daemon, role)).collect();
+            let outcomes = stop_roles_concurrently(&stops, keep).await;
+            assert!(outcomes.iter().all(Option::is_none));
+            let mut kept = daemon.kept_stops.lock().unwrap().clone();
+            kept.sort();
+            let expected: &[&str] = if keep {
+                &["agent-0", "agent-1", "agent-2"]
+            } else {
+                &[]
+            };
+            assert_eq!(kept, expected, "keep {keep}");
+        }
     }
 
     /// Scenario (PRD #1223 audit F4): the Runs launch shares the rollback, and

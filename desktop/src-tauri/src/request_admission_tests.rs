@@ -68,8 +68,8 @@ enum SwapAt {
 fn capable(mut reply: AttachResponse) -> AttachResponse {
     use dot_agent_deck::daemon_protocol::{
         CAP_ANSWER_QUESTION, CAP_AUTHORING_KIND, CAP_HELLO_FOLLOW_ON, CAP_INBOX, CAP_INBOX_ACTIONS,
-        CAP_PREPARE_ORCHESTRATION, CAP_PREPARED_ROLE_COMMAND, CAP_START_PREPARED_AGENT,
-        CAP_TURN_REPLIES,
+        CAP_KEEP_WORKTREE, CAP_PREPARE_ORCHESTRATION, CAP_PREPARED_ROLE_COMMAND,
+        CAP_START_PREPARED_AGENT, CAP_TURN_REPLIES,
     };
     let capabilities = reply.capabilities.get_or_insert_with(Vec::new);
     for capability in [
@@ -82,6 +82,7 @@ fn capable(mut reply: AttachResponse) -> AttachResponse {
         CAP_START_PREPARED_AGENT,
         CAP_PREPARED_ROLE_COMMAND,
         CAP_AUTHORING_KIND,
+        CAP_KEEP_WORKTREE,
     ] {
         if !capabilities.iter().any(|held| held == capability) {
             capabilities.push(capability.to_string());
@@ -159,7 +160,9 @@ fn serve(op: &str) -> AttachResponse {
             reply.kept_worktree = Some(dot_agent_deck::daemon_protocol::KeptWorktree {
                 path: "/remote/project-dispatch".into(),
                 confirmed_dirty: true,
+                on_request: false,
             });
+            reply.dispatched_worktree = Some("/remote/project-dispatch".into());
             reply
         }
         "prepare-orchestration" => AttachResponse::prepared(
@@ -368,8 +371,11 @@ fn role_options() -> StartAgentOptions {
 }
 
 /// Scenario: a close preview is asked after the app classified a daemon, but
-/// the socket now serves another build. A refused build receives no preview;
-/// the compatible control returns the kept directory through the desktop bridge.
+/// the socket now serves another build. A refused build receives no preview
+/// and offers no keep choice; the compatible control returns the kept
+/// directory through the desktop bridge, and — the deck advertising the keep
+/// and naming the dispatched worktree — the worktree to offer "keep" for
+/// (issue #1958).
 #[tokio::test]
 async fn worktree_close_preview_is_admitted_and_returns_the_daemons_report() {
     let _selection = crate::dto::SELECTION_LOCK.lock().await;
@@ -380,13 +386,20 @@ async fn worktree_close_preview_is_admitted_and_returns_the_daemons_report() {
         crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let state = crate::terminal::DesktopState::default();
         let wire = crate::dto::deck_wire_id(&deck.endpoint());
-        let kept =
+        let preview =
             crate::worktree_close_preview_on(&state, &wire, vec![PANE.into()], listed_process())
                 .await;
+        let kept = preview.kept.as_ref();
         if served {
-            let report = kept.as_ref().expect("compatible daemon returns its report");
+            let report = kept.expect("compatible daemon returns its report");
             assert_eq!(report.path, "/remote/project-dispatch");
             assert!(report.confirmed_dirty);
+            assert_eq!(
+                preview.keep_worktree.as_deref(),
+                Some("/remote/project-dispatch")
+            );
+        } else {
+            assert_eq!(preview, crate::dto::WorktreeCloseReport::default());
         }
         let outcome = deck.finish();
         assert_admitted(
@@ -548,9 +561,10 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
         crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let state = crate::terminal::DesktopState::default();
         let wire = crate::dto::deck_wire_id(&deck.endpoint());
-        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID, &listed_process()).await;
+        let stopped =
+            crate::stop_agent_action(&state, &wire, REUSED_ID, &listed_process(), false).await;
         if served {
-            crate::stop_agent_action(&state, &wire, REUSED_ID, &listed_process())
+            crate::stop_agent_action(&state, &wire, REUSED_ID, &listed_process(), false)
                 .await
                 .expect("a repeated card stop against the same build");
         }
@@ -569,9 +583,9 @@ async fn a_stop_after_a_swap_cannot_hit_the_replacements_reused_id() {
         let links = DaemonLinks::default();
         let daemon = held(&links, &deck.endpoint()).await;
         let stopped =
-            OrchestrationDaemon::stop_orchestration_agent(&*daemon.client, REUSED_ID).await;
+            OrchestrationDaemon::stop_orchestration_agent(&*daemon.client, REUSED_ID, false).await;
         if served {
-            OrchestrationDaemon::stop_orchestration_agent(&*daemon.client, REUSED_ID)
+            OrchestrationDaemon::stop_orchestration_agent(&*daemon.client, REUSED_ID, false)
                 .await
                 .expect("a repeated rollback stop against the same build");
         }
@@ -823,7 +837,7 @@ async fn connect_anyway_admits_acting_requests_a_break_behind_but_not_another_pr
                 .await,
             Ok(AnswerReport::Answered)
         );
-        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID, &listed_process())
+        let stopped = crate::stop_agent_action(&state, &wire, REUSED_ID, &listed_process(), false)
             .await
             .is_ok();
         let outcome = deck.finish();

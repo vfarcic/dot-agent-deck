@@ -113,15 +113,35 @@ pub fn close_panes_concurrently(
     controller: &dyn PaneController,
     pane_ids: &[String],
 ) -> CloseTabOutcome {
+    close_panes_concurrently_with(controller, pane_ids, false)
+}
+
+/// Issue #1958: [`close_panes_concurrently`], keeping the dispatched worktree
+/// when `keep_worktree` is set — every pane goes through
+/// [`PaneController::close_pane_keeping_worktree`]: the daemon keeps the tree
+/// at the first stop that carries the keep, so carrying it on every stop keeps
+/// the tree whichever one the daemon handles first.
+pub fn close_panes_concurrently_with(
+    controller: &dyn PaneController,
+    pane_ids: &[String],
+    keep_worktree: bool,
+) -> CloseTabOutcome {
+    let close = move |id: &str| {
+        if keep_worktree {
+            controller.close_pane_keeping_worktree(id)
+        } else {
+            controller.close_pane(id)
+        }
+    };
     let mut outcome = CloseTabOutcome::default();
     match pane_ids {
         [] => {}
-        [only] => outcome.record(only.clone(), controller.close_pane(only)),
+        [only] => outcome.record(only.clone(), close(only)),
         many => {
             let results = std::thread::scope(|scope| {
                 let handles: Vec<_> = many
                     .iter()
-                    .map(|id| scope.spawn(move || controller.close_pane(id)))
+                    .map(|id| scope.spawn(move || close(id)))
                     .collect();
                 handles
                     .into_iter()
@@ -483,6 +503,22 @@ pub trait PaneController: Send + Sync {
     fn close_card(&self, card: &BoundPane) -> Result<(), PaneError> {
         self.close_pane(&card.pane_id)
     }
+    /// Issue #1958: [`Self::close_pane`], asking the daemon to keep the
+    /// dispatched worktree the pane's agent runs in instead of removing it.
+    /// A controller that cannot ask refuses with nothing closed — never a
+    /// plain close, which could remove the worktree the user asked to keep.
+    /// The default has no daemon behind it and refuses; the daemon-backed
+    /// `EmbeddedPaneController` overrides it.
+    fn close_pane_keeping_worktree(&self, _pane_id: &str) -> Result<(), PaneError> {
+        Err(PaneError::Refused(
+            "this deck cannot keep a worktree on close; nothing was closed".to_string(),
+        ))
+    }
+    /// Issue #1958: [`Self::close_card`], keeping the dispatched worktree —
+    /// see [`Self::close_pane_keeping_worktree`].
+    fn close_card_keeping_worktree(&self, card: &BoundPane) -> Result<(), PaneError> {
+        self.close_pane_keeping_worktree(&card.pane_id)
+    }
     /// PRD #1666 part 2 (G-fix7): focus the local pane behind a dashboard
     /// card, only when it is the card's — attached on the daemon process the
     /// card was learned from. The default is [`Self::focus_pane`], for
@@ -555,6 +591,39 @@ pub trait PaneController: Send + Sync {
         _origin: crate::inbox_hub::PostOrigin,
     ) -> Result<String, PaneError> {
         Err(PaneError::NotAvailable)
+    }
+    /// PRD #1885: the attached daemon's trust state of orchestration
+    /// `orchestration` of the project config in `dir` — whether its commands
+    /// and prompts are approved as they now read, the text to show, and the
+    /// digest an approval carries back. [`GatedQuery::Unsupported`] when the
+    /// daemon does not serve trust requests (an older daemon), which is also
+    /// the default for a controller with no daemon behind it; the caller then
+    /// decides without the daemon (`trust_prompt::decide`), never by assuming
+    /// approval.
+    ///
+    /// [`GatedQuery::Unsupported`]: crate::daemon_client::GatedQuery::Unsupported
+    fn project_trust_state(
+        &self,
+        _dir: &str,
+        _orchestration: &str,
+    ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+    {
+        Ok(crate::daemon_client::GatedQuery::Unsupported)
+    }
+    /// PRD #1885: approve `orchestration` of the project config in `dir` on the
+    /// user's answer to the trust prompt, carrying the `digest` of the text the
+    /// prompt showed. The daemon approves only while the config still hashes to
+    /// it; otherwise the error names
+    /// [`crate::daemon_protocol::PROJECT_ERR_TRUST_TEXT_CHANGED`] and nothing is
+    /// recorded. Answers the new state. The default approves nothing.
+    fn approve_project_trust(
+        &self,
+        _dir: &str,
+        _orchestration: &str,
+        _digest: &str,
+    ) -> Result<crate::daemon_client::GatedQuery<crate::project_trust::ProjectTrustView>, String>
+    {
+        Ok(crate::daemon_client::GatedQuery::Unsupported)
     }
     fn name(&self) -> &str;
     fn is_available(&self) -> bool;

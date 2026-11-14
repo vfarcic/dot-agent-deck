@@ -183,6 +183,7 @@ fn close(deck: &TuiDeck, record: &AgentRecord) {
         deck.attach_socket_path(),
         &AttachRequest::StopAgent {
             id: record.id.clone(),
+            keep_worktree: false,
         },
     )
     .unwrap();
@@ -430,7 +431,7 @@ fn telemetry_otlp_024_child_spans_and_events_carry_run_identity() {
     );
 }
 
-/// Scenario: Start two stand-in panes in one worktree and let both observe pending, failing, pending and passing checks for the same offline PR. Closing both panes must export two CI intervals and four CI-change events in total, while each run retains its own two observed rounds and one observed failure.
+/// Scenario: Start two stand-in panes in one worktree and let both observe pending, failing, pending and passing checks for the same offline PR. Closing both panes must export two CI intervals and four CI-change events in total, while each run retains its own two observed rounds and one observed failure and names the PR in its `deck.pr.numbers`.
 #[spec("telemetry/otlp/025")]
 #[test]
 fn telemetry_otlp_025_shared_pr_exports_ci_history_once() {
@@ -474,6 +475,11 @@ fn telemetry_otlp_025_shared_pr_exports_ci_history_once() {
     let runs = [receiver.run(&first), receiver.run(&second)];
     for run in &runs {
         assert_eq!(integer(run, "deck.pr.number"), PR);
+        assert_eq!(
+            string(run, "deck.pr.numbers"),
+            format!(",{PR},"),
+            "issue #2096: the run's list of pull requests reaches the wire"
+        );
         assert_eq!(
             integer(run, "deck.ci.rounds.count"),
             2,

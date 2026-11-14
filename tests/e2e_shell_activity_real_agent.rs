@@ -138,7 +138,7 @@ fn background_live_fixture(suffix: &str) -> (TuiDeck, common::EventSub, String) 
     (deck, events, id)
 }
 
-/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then ask for one Bash run_in_background ping writing a unique sentinel. After its native Stop the rendered card stays Idle with one background command; kill only that command found in this test's descendant tree and watch the indicator disappear.
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded, then ask for one Bash run_in_background ping writing a unique sentinel. After its native Stop the rendered card reads Waiting (issue #1757: the command was started in the turn that just ended) with one background command; kill only that command found in this test's descendant tree and watch the card return to Idle with the indicator gone.
 #[spec("status/background/007")]
 #[test]
 fn background_007_real_background_command_clears_after_scoped_kill() {
@@ -179,11 +179,14 @@ fn background_007_real_background_command_clears_after_scoped_kill() {
     );
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
+    // Issue #1757: the turn that started the command ended while it runs, so
+    // the card reads Waiting rather than Idle.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid
+            .contains("Waiting")
             && grid.contains("Background: 1 command")
             && !grid.contains("Working")),
-        "ended turn and live command must both be visible:\n{}",
+        "ended turn and live command must both be visible as Waiting:\n{}",
         deck.snapshot_grid()
     );
 
@@ -221,8 +224,9 @@ fn background_007_real_background_command_clears_after_scoped_kill() {
     dot_agent_deck::platform::proc::force_kill_pid(ping as u32).expect("kill this test's own ping");
     assert!(
         deck.wait_for_grid_predicate_within(Duration::from_secs(30), |grid| grid.contains("Idle")
+            && !grid.contains("Waiting")
             && !grid.contains("Background:")),
-        "indicator did not clear after command ended:\n{}",
+        "indicator did not clear, or the card stayed Waiting, after command ended:\n{}",
         deck.snapshot_grid()
     );
 }
@@ -309,8 +313,13 @@ fn background_008_real_background_subagent_clears_on_paired_stop() {
     }
     deck.send_keys(b"\x04");
     deck.wait_for_string("Dir:");
+    // Issue #1757: the subagent's own commands are counted as background
+    // commands too, and one first sampled before the main turn ended (or just
+    // after it) was started in that turn, so the card may read Waiting.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid.contains("Idle")
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| (grid
+            .contains("Idle")
+            || grid.contains("Waiting"))
             && grid
                 .lines()
                 .any(|line| line.contains("Background:") && line.contains("1 subagent"))
@@ -530,7 +539,7 @@ fn shell_activity_005_real_claude_bash_child_trips_the_descendant_scan() {
         (shell_busy.timestamp - tool_start.timestamp).num_milliseconds()
     );
 
-    // Soft, reel-style confirmation that the observed ping really was the
+    // Soft confirmation that the observed ping really was the
     // one the prompt asked for — logged, not gating, since matching the
     // model's final free-text reply is inherently more phrasing-sensitive
     // than the two typed hook/synthetic events above.
@@ -572,7 +581,7 @@ const MEASURED_TOOL_START_TO_IDLE_SECS: u64 = 127;
 /// unreasonably long wait.
 const IDLE_WAIT_MARGIN_SECS: u64 = 30;
 
-/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then direct it to make one default-settings Bash call running a sentinel-tagged ping and finish its turn immediately when Bash returns. Require its real Stop-mapped Idle hook after the 120-second cap (PRECONDITION NOT MET if absent), then assert the rendered badge reads Idle with Background: 1 command while the sentinel-tagged shell and its ping remain live.
+/// Scenario: Launch real interactive Haiku Claude with seeded trust and allowedTools Bash, then direct it to make one default-settings Bash call running a sentinel-tagged ping and finish its turn immediately when Bash returns. Require its real Stop-mapped Idle hook after the 120-second cap (PRECONDITION NOT MET if absent), then assert the rendered badge reads Waiting (issue #1757: the turn that started the ping is the one that ended) with Background: 1 command while the sentinel-tagged shell and its ping remain live.
 #[spec("status/shell-activity/006")]
 #[test]
 fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_background() {
@@ -740,11 +749,14 @@ fn shell_activity_006_real_claude_bash_call_crossing_the_cap_shows_idle_and_back
     deck.wait_for_string("Dir:");
 
     // The turn ended, while its command is still alive: both facts must be
-    // presented together rather than conflated into a Working badge.
+    // presented together rather than conflated into a Working badge. Issue
+    // #1757: the ping was started in the turn that ended, so the card reads
+    // Waiting, not Idle.
     assert!(
-        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid.contains("Idle")
+        deck.wait_for_grid_predicate_within(Duration::from_secs(10), |grid| grid
+            .contains("Waiting")
             && grid.contains("Background: 1 command")),
-        "after the real Stop the card must read Idle with Background: 1 command:\n{}",
+        "after the real Stop the card must read Waiting with Background: 1 command:\n{}",
         deck.snapshot_grid()
     );
     assert!(
@@ -1041,4 +1053,486 @@ fn shell_activity_007_real_claude_idle_with_live_mcp_servers_stays_idle() {
          classify this real idle agent as NOT busy — every one of its live children must share \
          its own POSIX session"
     );
+}
+
+/// One line per event the agent sent since `since`, for the D2(c) record of
+/// what a completion-wake turn reports first (issue #1757).
+fn describe_events_since(
+    events: &common::EventSub,
+    agent_id: &str,
+    since: chrono::DateTime<chrono::Utc>,
+) -> Vec<String> {
+    events
+        .snapshot()
+        .into_iter()
+        .filter(|event| event.agent_id.as_deref() == Some(agent_id) && event.timestamp >= since)
+        .map(|event| {
+            format!(
+                "{} {:?} tool={:?} prompt={:?} background={:?}",
+                event.timestamp.format("%H:%M:%S%.3f"),
+                event.event_type,
+                event.tool_name,
+                event
+                    .user_prompt
+                    .as_deref()
+                    .map(|p| p.chars().take(80).collect::<String>()),
+                event.background,
+            )
+        })
+        .collect()
+}
+
+/// Whether `grid` shows the card settled: Idle, and neither Waiting, a
+/// working state nor a background line.
+fn card_settled_idle(grid: &str) -> bool {
+    grid.contains("Idle")
+        && !grid.contains("Waiting")
+        && !grid.contains("Background:")
+        && !grid.contains("Working")
+        && !grid.contains("Thinking")
+}
+
+/// Every detached session leader (a session of its own, no controlling
+/// terminal) below this test process, with its own and its children's command
+/// lines: what the deck's background count is made of. A diagnostic for the
+/// count a real agent's card shows.
+fn detached_sessions_report() -> Vec<String> {
+    let root = std::process::id() as i32;
+    let Some(table) = process_table(&[root]) else {
+        return vec!["process table unavailable".into()];
+    };
+    let rows = descendants(&table, root);
+    let argv = command_lines_of(&rows.iter().map(|row| row.pid).collect::<Vec<_>>());
+    rows.iter()
+        .filter(|row| row.session_leader && !row.has_controlling_tty)
+        .map(|row| {
+            let children: Vec<String> = descendants(&table, row.pid)
+                .into_iter()
+                .map(|child| {
+                    format!(
+                        "{} {}",
+                        child.pid,
+                        argv.get(&child.pid).map_or("?", String::as_str)
+                    )
+                })
+                .collect();
+            format!(
+                "session {} (ppid {}): {} | children: {children:?}",
+                row.pid,
+                row.ppid,
+                argv.get(&row.pid).map_or("?", String::as_str)
+            )
+        })
+        .collect()
+}
+
+/// Once the awaited command has exited: the card must leave Waiting for Idle
+/// with no background line, then — D2(c), issue #1757 — whether the agent
+/// starts a completion-wake turn to report the finished command is watched for
+/// 45 s past the settle and printed with every event since `running_at`, and
+/// the card must end Idle either way.
+///
+/// `running_at` is a watermark the caller took while the command still ran
+/// (just before checking that the sentinel is absent, so it precedes the
+/// exit), so a wake the agent sent between the exit and this helper noticing the
+/// sentinel is still in the retained interval; the subscription keeps every
+/// event, and this only filters by that watermark. The sentinel's observation
+/// time is printed too: it is when the poll saw the file, not when the
+/// command exited.
+fn settle_after_exit(
+    deck: &TuiDeck,
+    events: &common::EventSub,
+    agent_id: &str,
+    label: &str,
+    running_at: chrono::DateTime<chrono::Utc>,
+) {
+    let sentinel_seen_at = chrono::Utc::now();
+    let settled = deck.wait_for_grid_predicate_within(Duration::from_secs(120), card_settled_idle);
+    let after = describe_events_since(events, agent_id, running_at);
+    assert!(
+        settled,
+        "the card must leave Waiting and settle on Idle with no background line once the \
+         command it was waiting on has exited; events since the command was last seen \
+         running: {after:#?}\n{}",
+        deck.snapshot_grid()
+    );
+    // A completion-wake turn shows up as an agent-sent event after the exit:
+    // a Thinking (prompt-carrying or not), a tool call or a compaction. Looked
+    // for from the watermark, which precedes the exit.
+    let woke = events.try_wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(agent_id)
+                && event.timestamp >= running_at
+                && matches!(
+                    event.event_type,
+                    EventType::Thinking | EventType::ToolStart | EventType::Compacting
+                )
+        },
+        Duration::from_secs(45),
+    );
+    if let Some(wake) = &woke {
+        events.wait_for(
+            |event| {
+                event.agent_id.as_deref() == Some(agent_id)
+                    && event.event_type == EventType::Idle
+                    && event.timestamp >= wake.timestamp
+            },
+            Duration::from_secs(120),
+        );
+    }
+    let after = describe_events_since(events, agent_id, running_at);
+    let wake_seen = woke.as_ref().map_or_else(
+        || "not seen within 45s of the settle".to_string(),
+        |wake| format!("STARTED ({:?} at {})", wake.event_type, wake.timestamp),
+    );
+    eprintln!(
+        "{}",
+        common::redact_credentials_for_output(&format!(
+            "{label} D2(c): completion-wake turn {wake_seen}; command last seen running at \
+             {running_at}, sentinel observed at {sentinel_seen_at} (observation, not exit, \
+             time); events since the command was last seen running ({}):\n{}",
+            after.len(),
+            after.join("\n")
+        ))
+    );
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(30), card_settled_idle),
+        "the card must end Idle with no background line after the command exited; events \
+         since the command was last seen running: {after:#?}\n{}",
+        deck.snapshot_grid()
+    );
+}
+
+/// Scenario: Start real interactive Haiku Claude through Ctrl+N with trust/onboarding seeded and ask for one Bash run_in_background command that pings for about a minute and then touches a uniquely named sentinel, ending the turn without waiting. After its native Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn Claude Code starts to report the finished command).
+#[spec("status/waiting/008")]
+#[test]
+fn status_waiting_008_real_claude_background_command_reads_waiting_until_it_exits() {
+    skip_unless!(common::check_claude_available());
+    const SENTINEL: &str = "waiting-008-done-5b1e07c2.txt";
+    let (deck, events, agent_id) = background_live_fixture("waiting-008-haiku");
+    let sentinel_path = deck
+        .workdir()
+        .canonicalize()
+        .expect("absolute fixture directory")
+        .join(SENTINEL);
+    // `ping`, not `sleep`: Claude Code blocks a long `sleep` at the tool layer
+    // (PRD #386). Sixty pings leave about a minute for the Stop and the
+    // Waiting check before the command exits. The sentinel is named relative
+    // to the fixture directory, where Bash runs: an absolute path's length
+    // varies with the temp root, and where it wraps in Claude Code's input it
+    // split the sentinel the prompt helper looks for across two rows (first
+    // run, 2026-11-10: `PROMPT NOT DELIVERED`).
+    let prompt = format!(
+        "Use Bash exactly once as your first action, with run_in_background=true, to execute exactly: ping -c 60 127.0.0.1 > /dev/null && touch {SENTINEL} . Do not use timeout. Do not call TaskOutput, wait, inspect or stop the command. Immediately finish your turn with the single word STARTED after Bash returns the background task id."
+    );
+    let submitted = deck.submit_claude_prompt(&events, &agent_id, &prompt, SENTINEL);
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::ToolStart
+                && event.tool_name.as_deref() == Some("Bash")
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= submitted.timestamp
+        },
+        Duration::from_secs(90),
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    assert!(
+        deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| grid
+            .contains("Waiting")
+            && grid.contains("Background: 1 command")
+            && !grid.contains("Working")),
+        "the turn that started the command ended while it runs, so the card must read Waiting \
+         with its background line:\n{}",
+        deck.snapshot_grid()
+    );
+    // The watermark the completion-wake observation keeps events from, taken
+    // before the sentinel is found absent below, so it precedes the exit.
+    let running_at = chrono::Utc::now();
+    assert!(
+        !sentinel_path.exists(),
+        "the Waiting card was only checked once the command had already finished — the run \
+         proves nothing about Waiting while it runs"
+    );
+
+    assert!(
+        common::wait_for_path(&sentinel_path, Duration::from_secs(120)),
+        "the background command never finished on its own:\n{}",
+        deck.snapshot_grid()
+    );
+    settle_after_exit(&deck, &events, &agent_id, "status-waiting-008", running_at);
+}
+
+/// Scenario: Start real interactive OpenCode on the harness's cheap test model through Ctrl+N and ask it to run one shell command with the shell tool's background option — a minute of pings, then touching a uniquely named sentinel — and to end its turn at once. After OpenCode's idle report the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn OpenCode starts to report the finished command).
+#[spec("status/waiting/009")]
+#[test]
+fn status_waiting_009_real_opencode_background_command_reads_waiting_until_it_exits() {
+    use dot_agent_deck::event::AgentType;
+
+    skip_unless!(common::check_opencode_available());
+    // The shell tool's `background` option exists only from OpenCode 2.
+    skip_unless!(common::require_opencode_major(2));
+    const NAME: &str = "waiting-009-opencode";
+    const SENTINEL: &str = "waiting-009-done-8c4d2a91.txt";
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 45)
+        .with_imported_opencode_credentials()
+        .launch_with_fixture("minimal");
+    assert!(deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)));
+    let sentinel_path = deck.workdir().join(SENTINEL);
+    let events = deck.subscribe_events();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(NAME.as_bytes());
+    deck.send_keys(b"\t");
+    deck.send_keys(common::opencode_interactive_command(false, false, "").as_bytes());
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    assert!(
+        deck.wait_for_grid_string_within("Ask anything", Duration::from_secs(90))
+            && deck.wait_for_grid_string_within(
+                common::OPENCODE_SUBMIT_READY,
+                Duration::from_secs(45)
+            ),
+        "interactive OpenCode not ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let agent_id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.display_name.as_deref().is_some_and(|n| n.ends_with(NAME)))
+        .expect("the OpenCode agent's record")
+        .id;
+    // A relative path: the command runs in the fixture directory, and a path
+    // outside it would make OpenCode ask an external-directory question first.
+    let prompt = format!(
+        "Use your shell tool exactly once as your first action, with background set to true, to run exactly: ping -c 60 127.0.0.1 > /dev/null && touch {SENTINEL} . Do not wait for it, poll it, read its output or stop it. As soon as the tool returns, finish your turn by replying with the single word STARTED."
+    );
+    let typed_at = chrono::Utc::now();
+    deck.send_keys(prompt.as_bytes());
+    assert!(
+        deck.wait_for_grid_string_within(SENTINEL, Duration::from_secs(20)),
+        "the prompt never rendered in OpenCode's composer:\n{}",
+        deck.snapshot_grid()
+    );
+    deck.send_keys(b"\r");
+    let started = events
+        .try_wait_for(
+            |event| {
+                event.agent_id.as_deref() == Some(&agent_id)
+                    && event.agent_type == AgentType::OpenCode
+                    && event.event_type == EventType::ToolStart
+                    && event.timestamp >= typed_at
+            },
+            Duration::from_secs(120),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "PROMPT NOT DELIVERED or no tool call: OpenCode made no tool call; events: {:#?}\n{}",
+                describe_events_since(&events, &agent_id, typed_at),
+                deck.snapshot_grid()
+            )
+        });
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= started.timestamp
+        },
+        Duration::from_secs(120),
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    let waiting = deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| {
+        grid.contains("Waiting") && grid.contains("Background: 1 command")
+    });
+    let sessions = detached_sessions_report();
+    eprintln!(
+        "status-waiting-009: detached sessions at the Waiting check ({}):\n{}",
+        sessions.len(),
+        sessions.join("\n")
+    );
+    assert!(
+        waiting,
+        "the turn that started the command ended while it runs, so the card must read Waiting \
+         with its background line; detached sessions: {sessions:#?}; events: {:#?}\n{}",
+        describe_events_since(&events, &agent_id, typed_at),
+        deck.snapshot_grid()
+    );
+    // The watermark the completion-wake observation keeps events from, taken
+    // before the sentinel is found absent below, so it precedes the exit.
+    let running_at = chrono::Utc::now();
+    assert!(
+        !sentinel_path.exists(),
+        "the Waiting card was only checked once the command had already finished — the run \
+         proves nothing about Waiting while it runs"
+    );
+
+    assert!(
+        common::wait_for_path(&sentinel_path, Duration::from_secs(120)),
+        "the background command never finished on its own:\n{}",
+        deck.snapshot_grid()
+    );
+    settle_after_exit(&deck, &events, &agent_id, "status-waiting-009", running_at);
+}
+
+/// Codex's empty-composer placeholder — see `CODEX_COMPOSER_READY` in
+/// `tests/e2e_codex_hooks.rs` for why it is a sound readiness gate.
+const CODEX_COMPOSER_READY: &str = "Ask Codex to do anything";
+
+/// The footer Codex shows while it holds a submit for its own startup — see
+/// `CODEX_STARTUP_HOLD` in `tests/e2e_codex_hooks.rs`.
+const CODEX_STARTUP_HOLD: &str = "Waiting for startup";
+
+/// Scenario: Start real interactive Codex on the harness's cheap test model through Ctrl+N and ask it to start one command with its exec tool and a short yield, so the command keeps running in a Codex background terminal — a minute of sleep, then touching a uniquely named sentinel — and to end its turn at once. After Codex's Stop the rendered card reads Waiting with `Background: 1 command` while the sentinel is still absent; once the command exits on its own and writes the sentinel, the card settles on Idle with the background line gone (after any turn Codex starts to report the finished command).
+#[spec("status/waiting/024")]
+#[test]
+fn status_waiting_024_real_codex_background_command_reads_waiting_until_it_exits() {
+    use dot_agent_deck::event::AgentType;
+
+    skip_unless!(common::check_codex_available());
+    const NAME: &str = "waiting-024-codex";
+    const SENTINEL: &str = "waiting-024-done-3f9a6e17.txt";
+    let deck = TuiDeck::builder()
+        .with_pty_size(180, 45)
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_imported_codex_credentials()
+        .launch_with_fixture("codex-live");
+    assert!(deck.wait_for_grid_string_within("No active agents", Duration::from_secs(30)));
+    let sentinel_path = deck.workdir().join(SENTINEL);
+    let events = deck.subscribe_events();
+    deck.send_keys(b"\x0e");
+    deck.wait_for_string("Select Directory");
+    deck.send_keys(b" ");
+    deck.wait_for_string("┌ New Agent");
+    deck.send_keys(b"\t");
+    deck.send_keys(NAME.as_bytes());
+    deck.send_keys(b"\t");
+    deck.send_keys(
+        format!(
+            "codex --model {} --sandbox workspace-write --ask-for-approval never -c 'model_reasoning_effort=\"low\"'",
+            common::codex_test_model()
+        )
+        .as_bytes(),
+    );
+    let (col, row) = deck.wait_for_in_grid("[Submit]");
+    deck.click(col, row);
+    assert!(
+        deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(90)),
+        "interactive Codex not ready:\n{}",
+        deck.snapshot_grid()
+    );
+    let agent_id = common::agent_records_on(deck.attach_socket_path())
+        .into_iter()
+        .find(|r| r.display_name.as_deref().is_some_and(|n| n.ends_with(NAME)))
+        .expect("the Codex agent's record")
+        .id;
+    // `sleep`, not `ping`: Codex does not block a long `sleep` (Claude Code
+    // does, hence `ping` in status/waiting/008), and `ping` needs a raw or
+    // ICMP socket the workspace-write sandbox may refuse. The yield is what
+    // backgrounds it: Codex's exec tool returns once the yield passes and
+    // keeps the process running in a background terminal of its own, past
+    // the end of the turn. The sentinel is relative: the command runs in the
+    // fixture directory, which the sandbox lets it write.
+    let prompt = format!(
+        "Use your exec_command tool exactly once as your first action, with yield_time_ms set to 1000, to run exactly: sleep 60 && touch {SENTINEL} . It keeps running in the background after the tool returns. Do not wait for it, poll it, write to it, read its output or stop it. As soon as the tool returns, finish your turn by replying with the single word STARTED."
+    );
+    deck.send_keys(prompt.as_bytes());
+    assert!(
+        deck.wait_for_grid_string_within(SENTINEL, Duration::from_secs(20)),
+        "the prompt never rendered in Codex's composer:\n{}",
+        deck.snapshot_grid()
+    );
+    let typed_at = chrono::Utc::now();
+    // Codex can hold a submit while its startup finishes and say so in its
+    // footer; an Enter is re-sent only when it shows neither the empty
+    // composer nor that hold (`codex_hooks_001` measured both).
+    let submit_deadline = std::time::Instant::now() + common::load_scaled(Duration::from_secs(60));
+    let mut enters = 0_usize;
+    let composer_emptied = loop {
+        if enters == 0 || !deck.snapshot_grid().contains(CODEX_STARTUP_HOLD) {
+            deck.send_keys(b"\r");
+            enters += 1;
+        }
+        if deck.wait_for_grid_string_within(CODEX_COMPOSER_READY, Duration::from_secs(2)) {
+            break true;
+        }
+        if std::time::Instant::now() >= submit_deadline {
+            break false;
+        }
+    };
+    assert!(
+        composer_emptied,
+        "PROMPT NOT DELIVERED: after {enters} Enter(s) the prompt is still in Codex's \
+         composer:\n{}",
+        deck.snapshot_grid()
+    );
+    let started = events
+        .try_wait_for(
+            |event| {
+                event.agent_id.as_deref() == Some(&agent_id)
+                    && event.agent_type == AgentType::Codex
+                    && event.event_type == EventType::ToolStart
+                    && event.timestamp >= typed_at
+            },
+            Duration::from_secs(120),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "Codex made no tool call; events: {:#?}\n{}",
+                describe_events_since(&events, &agent_id, typed_at),
+                deck.snapshot_grid()
+            )
+        });
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(&agent_id)
+                && event.event_type == EventType::Idle
+                && event.timestamp >= started.timestamp
+        },
+        Duration::from_secs(120),
+    );
+    deck.send_keys(b"\x04");
+    deck.wait_for_string("Dir:");
+    let waiting = deck.wait_for_grid_predicate_within(Duration::from_secs(20), |grid| {
+        grid.contains("Waiting") && grid.contains("Background: 1 command")
+    });
+    let sessions = detached_sessions_report();
+    eprintln!(
+        "status-waiting-024: detached sessions at the Waiting check ({}):\n{}",
+        sessions.len(),
+        sessions.join("\n")
+    );
+    assert!(
+        waiting,
+        "the turn that started the command ended while it runs, so the card must read Waiting \
+         with its background line; detached sessions: {sessions:#?}; events: {:#?}\n{}",
+        describe_events_since(&events, &agent_id, typed_at),
+        deck.snapshot_grid()
+    );
+    // The watermark the completion-wake observation keeps events from, taken
+    // before the sentinel is found absent below, so it precedes the exit.
+    let running_at = chrono::Utc::now();
+    assert!(
+        !sentinel_path.exists(),
+        "the Waiting card was only checked once the command had already finished — the run \
+         proves nothing about Waiting while it runs"
+    );
+
+    assert!(
+        common::wait_for_path(&sentinel_path, Duration::from_secs(120)),
+        "the background command never finished on its own:\n{}",
+        deck.snapshot_grid()
+    );
+    settle_after_exit(&deck, &events, &agent_id, "status-waiting-024", running_at);
 }

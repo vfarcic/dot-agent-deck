@@ -1,0 +1,40 @@
+---
+source: tests/render_trust_prompt.rs
+expression: changed
+---
+
+
+
+  ┌ Review project commands ─────────────────────────────────────────────────────────────────────┐
+  │ Project: /work/demo-project                                                                  │
+  │ Orchestration: team                                                                          │
+  │ State: changed since you approved it                                                         │
+  │                                                                                              │
+  │ Starting it runs these commands and gives these prompts to its agents. Approve only what you │
+  │ trust.                                                                                       │
+  │                                                                                              │
+  │ Role: orchestrator                                                                           │
+  │   command: claude                                                                            │
+  │   start: true — the orchestration starts with this role                                      │
+  │   clear: false — keeps running between tasks                                                 │
+  │   description: The orchestrator of the team                                                  │
+  │   prompt: Coordinate the team.                                                               │
+  │                                                                                              │
+  │ Role: coder  changed                                                                         │
+  │   command: claude --model opus                                                               │
+  │   start: false                                                                               │
+  │   clear: false — keeps running between tasks                                                 │
+  │   description: The coder of the team                                                         │
+  │   prompt: Write the code.                                                                    │
+  │                                                                                              │
+  │ Role: tester  new                                                                            │
+  │   command: opencode                                                                          │
+  │   start: false                                                                               │
+  │   clear: false — keeps running between tasks                                                 │
+  │   description: The tester of the team                                                        │
+  │   prompt: Write the failing test first.                                                      │
+  │                                                                                              │
+  │ Removed since you approved it: reviewer                                                      │
+  │                                                                                              │
+  │ a approve and start · Esc cancel · ↑↓ scroll                                                 │
+  └──────────────────────────────────────────────────────────────────────────────────────────────┘

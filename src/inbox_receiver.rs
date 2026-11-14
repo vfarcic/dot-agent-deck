@@ -24,8 +24,10 @@ pub const PI_MODULE_DTS_PATH: &str = "pi-extension/src/inbox-receiver.d.ts";
 
 /// `js` with the deck's values in place of its placeholders: the framing every
 /// hand-over starts with ([`crate::inbox_hub::AGENT_FRAMING`]), the doorbell
-/// line's two halves ([`crate::doorbell::LINE_PREFIX`],
-/// [`crate::doorbell::LINE_SUFFIX`]), the adapter integration the watcher
+/// line's fixed parts ([`crate::doorbell::LINE_PREFIX`],
+/// [`crate::doorbell::LINE_WAITING`], [`crate::doorbell::LINE_FETCH`]) and the
+/// pattern of the command word between them
+/// ([`crate::doorbell::COMMAND_WORD_PATTERN`]), the adapter integration the watcher
 /// declares and the keepalives before the deck retires a closed stream.
 pub(crate) fn fill_placeholders(js: &str) -> String {
     let json = |text: &str| {
@@ -37,8 +39,16 @@ pub(crate) fn fill_placeholders(js: &str) -> String {
             &json(crate::doorbell::LINE_PREFIX.trim()),
         )
         .replace(
-            "__DOORBELL_SUFFIX_JSON__",
-            &json(crate::doorbell::LINE_SUFFIX),
+            "__DOORBELL_WAITING_JSON__",
+            &json(crate::doorbell::LINE_WAITING),
+        )
+        .replace(
+            "__DOORBELL_COMMAND_WORD_JSON__",
+            &json(crate::doorbell::COMMAND_WORD_PATTERN),
+        )
+        .replace(
+            "__DOORBELL_FETCH_JSON__",
+            &json(crate::doorbell::LINE_FETCH),
         )
         .replace(
             "__ADAPTER_INTEGRATION__",

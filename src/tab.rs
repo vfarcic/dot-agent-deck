@@ -7,7 +7,7 @@ use thiserror::Error;
 use crate::agent_pty::TabMembership;
 use crate::event::AgentType;
 use crate::pane::{
-    AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError, close_panes_concurrently,
+    AgentSpawnOptions, CloseTabOutcome, PaneController, PaneError, close_panes_concurrently_with,
 };
 use crate::project_config::{
     OrchestrationConfig, OrchestrationRoleConfig, resolve_orchestration_name,
@@ -833,6 +833,27 @@ impl TabManager {
         config: &OrchestrationConfig,
         cwd: &str,
         orchestrator_prompt: Option<String>,
+        display_title: Option<&str>,
+        spawn_dims: (u16, u16),
+        seat: Option<usize>,
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_orchestration_tab_inner(
+            config,
+            cwd,
+            orchestrator_prompt,
+            display_title,
+            spawn_dims,
+            seat,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn open_orchestration_tab_inner(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        orchestrator_prompt: Option<String>,
         // PRD #107 / orchestration-identity fix: the user's form name (the
         // name typed or accepted in the new-pane form — usually the dir
         // basename). Routed to the tab TITLE only (`Tab::Orchestration.name`,
@@ -853,6 +874,10 @@ impl TabManager {
         // active tab's focus state) on the first frame.
         spawn_dims: (u16, u16),
         seat: Option<usize>,
+        // Issue #929: which roles to start, by index (`None` = every role).
+        // A role left out gets a dead-slot card instead of a pane; the seated
+        // start role is started whatever this says.
+        start_roles: Option<&[bool]>,
     ) -> Result<(usize, Vec<String>), TabError> {
         let mut role_pane_ids: Vec<String> = Vec::with_capacity(config.roles.len());
         let (spawn_rows, spawn_cols) = spawn_dims;
@@ -934,6 +959,21 @@ impl TabManager {
         // `list_agents` and the TUI rebuilds the orchestration tab on
         // reconnect instead of stranding all role panes on the dashboard.
         for (role_index, role) in config.roles.iter().enumerate() {
+            // Issue #929: a role the restored snapshot did not record as running
+            // keeps its card, as a dead slot named by this tab's identity, and
+            // starts no process. The start role always starts.
+            let start_this_role = role_index == orch_idx
+                || start_roles.is_none_or(|start| start.get(role_index).copied().unwrap_or(true));
+            if !start_this_role {
+                role_pane_ids.push(crate::ui::dead_slot_pane_id(
+                    &crate::state::OrchestrationIdentity {
+                        id: orchestration_id.clone(),
+                        name: resolved_name.clone(),
+                    },
+                    role_index,
+                ));
+                continue;
+            }
             let opts = AgentSpawnOptions {
                 display_name: Some(role.name.as_str()),
                 tab_membership: Some(TabMembership::Orchestration {
@@ -987,8 +1027,12 @@ impl TabManager {
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    // Clean up any panes already created.
-                    for id in &role_pane_ids {
+                    // Clean up any panes already created (a dead slot has
+                    // none).
+                    for id in role_pane_ids
+                        .iter()
+                        .filter(|id| !crate::ui::is_dead_slot_pane_id(id))
+                    {
                         let _ = self.pane_controller.close_pane(id);
                     }
                     return Err(TabError::Pane(e));
@@ -1009,7 +1053,17 @@ impl TabManager {
             // `resolved_name`.
             name: title,
             role_pane_ids: role_pane_ids.clone(),
-            role_statuses: vec![OrchestrationRoleStatus::Waiting; config.roles.len()],
+            // Issue #929: a dead slot reads `Failed`, as on a rebuilt tab.
+            role_statuses: role_pane_ids
+                .iter()
+                .map(|id| {
+                    if crate::ui::is_dead_slot_pane_id(id) {
+                        OrchestrationRoleStatus::Failed
+                    } else {
+                        OrchestrationRoleStatus::Waiting
+                    }
+                })
+                .collect(),
             cwd: cwd.to_string(),
             focused_role_pane_id: None,
             start_role_index,
@@ -1057,6 +1111,77 @@ impl TabManager {
     ) {
         if let Some(Tab::Orchestration { context_path, .. }) = self.tabs.get_mut(index) {
             *context_path = path;
+        }
+    }
+
+    /// Issue #929: [`Self::open_orchestration_tab_seated`] for the daemon-empty
+    /// session restore, starting only the roles `start_roles` marks (see
+    /// [`crate::config::OrchestrationSnapshot::roles_to_start_on_restore`]).
+    /// Each other role keeps its card as a dead slot, as on a tab rebuilt from
+    /// a daemon whose agent for that role is gone; the returned ids hold that
+    /// slot's synthetic id, which is no pane and must not be registered as one.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_orchestration_tab_restoring(
+        &mut self,
+        config: &OrchestrationConfig,
+        cwd: &str,
+        orchestrator_prompt: Option<String>,
+        display_title: Option<&str>,
+        spawn_dims: (u16, u16),
+        seat: Option<usize>,
+        start_roles: &[bool],
+    ) -> Result<(usize, Vec<String>), TabError> {
+        self.open_orchestration_tab_inner(
+            config,
+            cwd,
+            orchestrator_prompt,
+            display_title,
+            spawn_dims,
+            seat,
+            Some(start_roles),
+        )
+    }
+
+    /// Issue #929: before a saved-session snapshot is written, record on each
+    /// orchestration tab's saved block (keyed by its start role's pane) which
+    /// roles are running: those whose slot holds a pane in `live_panes`, the
+    /// daemon-managed set the snapshot is built from. An emptied slot or a
+    /// dead-slot placeholder is not running. The block is stamped with
+    /// [`crate::config::ORCHESTRATION_SNAPSHOT_VERSION`], which is what tells a
+    /// restore the list can be believed. A tab with no saved block is left
+    /// alone, as the grow path leaves it (issue #868).
+    pub fn record_started_roles(
+        &self,
+        pane_metadata: &mut HashMap<String, crate::config::SavedPane>,
+        live_panes: &HashSet<String>,
+    ) {
+        for tab in &self.tabs {
+            let Tab::Orchestration {
+                role_pane_ids,
+                start_role_index,
+                ..
+            } = tab
+            else {
+                continue;
+            };
+            let Some(snapshot) = role_pane_ids
+                .get(*start_role_index)
+                .and_then(|start_pane| pane_metadata.get_mut(start_pane))
+                .and_then(|saved| saved.orchestration.as_mut())
+            else {
+                continue;
+            };
+            snapshot.version = crate::config::ORCHESTRATION_SNAPSHOT_VERSION;
+            snapshot.started_role_indices = role_pane_ids
+                .iter()
+                .enumerate()
+                .filter(|(_, id)| {
+                    !id.is_empty()
+                        && !crate::ui::is_dead_slot_pane_id(id)
+                        && live_panes.contains(id.as_str())
+                })
+                .map(|(index, _)| index)
+                .collect();
         }
     }
 
@@ -1484,7 +1609,7 @@ impl TabManager {
     /// can retry" — with nothing left to press `Ctrl+W` on. Now:
     ///
     /// * every pane closes first (concurrently — see
-    ///   [`close_panes_concurrently`]);
+    ///   [`close_panes_concurrently`](crate::pane::close_panes_concurrently));
     /// * `outcome.is_clean()` removes the tab, exactly as before;
     /// * any failure keeps the tab, and the panes that DID close are
     ///   forgotten from it via [`Self::forget_closed_panes`].
@@ -1494,6 +1619,18 @@ impl TabManager {
     /// only what could not be stopped, which is both the honest state
     /// and the one where a retry re-attempts exactly the failures.
     pub fn close_tab(&mut self, index: usize) -> Result<CloseTabOutcome, TabError> {
+        self.close_tab_with(index, false)
+    }
+
+    /// Issue #1958: [`Self::close_tab`], keeping the dispatched worktree the
+    /// tab's roles share when `keep_worktree` is set — every role pane's stop
+    /// carries the keep, because the daemon keeps the tree at the first stop
+    /// that carries it, whichever one it handles first.
+    pub fn close_tab_with(
+        &mut self,
+        index: usize,
+        keep_worktree: bool,
+    ) -> Result<CloseTabOutcome, TabError> {
         if index == 0 {
             return Err(TabError::CannotCloseDashboard);
         }
@@ -1522,7 +1659,8 @@ impl TabManager {
             Tab::Dashboard { .. } => Vec::new(),
         };
 
-        let outcome = close_panes_concurrently(self.pane_controller.as_ref(), &pane_ids);
+        let outcome =
+            close_panes_concurrently_with(self.pane_controller.as_ref(), &pane_ids, keep_worktree);
 
         if !outcome.is_clean() {
             // At least one agent is still alive on the daemon. Keep the tab so
@@ -2067,6 +2205,126 @@ mod tests {
             } => assert_eq!(
                 *orchestrator_prompt, None,
                 "a natively seeded prompt is not also injected"
+            ),
+            _ => panic!("expected an orchestration tab"),
+        }
+    }
+
+    /// A saved orchestration block for `orch_config("team")`'s two roles, as the
+    /// tab-open path captures it: the old `[start]` list under version 1.
+    fn captured_block(pane_id: &str) -> (String, crate::config::SavedPane) {
+        (
+            pane_id.to_string(),
+            crate::config::SavedPane {
+                dir: "/work".into(),
+                name: "orchestrator".into(),
+                command: "echo orch".into(),
+                mode: None,
+                orchestration: Some(crate::config::OrchestrationSnapshot {
+                    version: 1,
+                    roles: vec!["orchestrator".into(), "coder".into()],
+                    start_role_index: 0,
+                    orchestrator_prompt: String::new(),
+                    config_name: "team".into(),
+                    project_path: "/work".into(),
+                    started_role_indices: vec![0],
+                    display_title: None,
+                }),
+            },
+        )
+    }
+
+    /// Scenario: Open a two-role orchestration tab, then take the saved-session
+    /// snapshot three ways: with both role panes live, after the `coder` pane
+    /// was closed (its slot emptied), and with the `coder` slot a dead-slot
+    /// placeholder. The saved block lists, under the current version, exactly
+    /// the roles whose panes were live: both, then only the orchestrator twice.
+    #[spec("session/save/005")]
+    #[test]
+    fn save_005_snapshot_records_the_roles_whose_panes_are_live() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc);
+        let (idx, ids) = tm
+            .open_orchestration_tab(&orch_config("team"), "/work", None, None, (24, 80))
+            .expect("open the tab");
+        let started = |tm: &TabManager, live: &[&str]| {
+            let mut metadata: HashMap<_, _> = [captured_block(&ids[0])].into_iter().collect();
+            let live: HashSet<String> = live.iter().map(|s| s.to_string()).collect();
+            tm.record_started_roles(&mut metadata, &live);
+            let block = metadata[&ids[0]].orchestration.clone().unwrap();
+            (block.version, block.started_role_indices)
+        };
+
+        assert_eq!(
+            started(&tm, &[&ids[0], &ids[1]]),
+            (crate::config::ORCHESTRATION_SNAPSHOT_VERSION, vec![0, 1]),
+            "both role panes are live"
+        );
+        // A pane the daemon no longer manages is not running, even if the tab
+        // still names it.
+        assert_eq!(
+            started(&tm, &[&ids[0]]),
+            (crate::config::ORCHESTRATION_SNAPSHOT_VERSION, vec![0]),
+            "the coder pane is gone from the live set"
+        );
+        // The coder pane closed: its slot is emptied.
+        tm.forget_closed_panes(idx, std::slice::from_ref(&ids[1]));
+        assert_eq!(
+            started(&tm, &[&ids[0], &ids[1]]),
+            (crate::config::ORCHESTRATION_SNAPSHOT_VERSION, vec![0]),
+            "an emptied slot is not a started role"
+        );
+
+        // A dead-slot placeholder is not a started role either.
+        let identity = crate::state::OrchestrationIdentity {
+            id: "orch-test-0".to_string(),
+            name: "team".into(),
+        };
+        let dead = crate::ui::dead_slot_pane_id(&identity, 1);
+        let mut tm = TabManager::new(Arc::new(MockPaneController::new()));
+        tm.open_orchestration_tab_with_existing_role_panes(
+            &orch_config("team"),
+            "/work",
+            vec![Some("lead-pane".into()), Some(dead.clone())],
+            None,
+            None,
+        )
+        .expect("open the tab");
+        let mut metadata: HashMap<_, _> = [captured_block("lead-pane")].into_iter().collect();
+        let live: HashSet<String> = ["lead-pane".to_string(), dead].into_iter().collect();
+        tm.record_started_roles(&mut metadata, &live);
+        let block = metadata["lead-pane"].orchestration.clone().unwrap();
+        assert_eq!(block.started_role_indices, vec![0]);
+    }
+
+    /// Issue #929: a restore that starts only some roles spawns exactly those,
+    /// always including the start role, and gives every other role a dead-slot
+    /// card rather than a pane.
+    #[test]
+    fn restoring_open_starts_only_the_listed_roles_and_always_the_start_role() {
+        let pc = Arc::new(MockPaneController::new());
+        let mut tm = TabManager::new(pc.clone());
+        // The list leaves the start role (index 0) out; it starts anyway.
+        let (idx, ids) = tm
+            .open_orchestration_tab_restoring(
+                &orch_config("team"),
+                "/work",
+                None,
+                None,
+                (24, 80),
+                None,
+                &[false, false],
+            )
+            .expect("open the tab");
+        assert_eq!(pc.memberships.lock().unwrap().len(), 1, "one pane spawned");
+        assert!(!crate::ui::is_dead_slot_pane_id(&ids[0]));
+        assert!(crate::ui::is_dead_slot_pane_id(&ids[1]), "{ids:?}");
+        assert_eq!(tm.all_managed_pane_ids(), vec![ids[0].clone()]);
+        match &tm.tabs()[idx] {
+            Tab::Orchestration { role_statuses, .. } => assert_eq!(
+                role_statuses[1],
+                OrchestrationRoleStatus::Failed,
+                "the empty role reads as a dead slot"
             ),
             _ => panic!("expected an orchestration tab"),
         }

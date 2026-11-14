@@ -25,9 +25,11 @@ export type RunHealth = "healthy" | "attention" | "failed" | "idle";
 /**
  * The status an agent is shown in. `needs_input` and `idle` are the TUI's
  * Needs Input and Idle (issue #1676): an agent waiting on the user and one that
- * finished its turn are two states, never one.
+ * finished its turn are two states, never one. `waiting` is the TUI's Waiting
+ * (issue #1757): the agent's turn ended while a command it started in that turn
+ * still runs — its work is not done, but nothing needs the user.
  */
-export type AgentStatus = "queued" | "running" | "needs_input" | "idle" | "passed" | "failed" | "stopped" | "blocked";
+export type AgentStatus = "queued" | "running" | "needs_input" | "waiting" | "idle" | "passed" | "failed" | "stopped" | "blocked";
 
 /**
  * The words a status is shown as. Each is its own id except Needs input, whose
@@ -39,7 +41,7 @@ export function statusLabel(status: AgentStatus): string {
 }
 
 /** The daemon's own status words (`DesktopAgentDto["status"]`), which `AgentStatus` merges. */
-export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "idle" | "error" | "blocked" | "unknown";
+export type DaemonAgentStatus = "running" | "thinking" | "working" | "compacting" | "waiting_for_input" | "waiting" | "idle" | "error" | "blocked" | "unknown";
 
 /**
  * Issue #714: why an agent is `blocked` — the agent reported that its provider
@@ -293,16 +295,22 @@ export interface ConnectionView {
    */
   deckKind?: "local" | "remote";
   /**
-   * Why the daemon-lifecycle controls are unavailable, when they are — present
-   * exactly when `deckKind` is `"remote"`.
+   * Why Replace daemon is unavailable, when it is — present exactly when
+   * `deckKind` is `"remote"`.
    *
-   * `Endpoint::require_local("Stop daemon")`'s own sentence, not one written on
-   * this side. Stop and Replace act on a process on *this* machine, and over a
-   * forwarded socket `run_daemon_stop`'s peer-credential lookup names the local
-   * `ssh` client — so pressing Stop would tear the tunnel down and report that a
-   * daemon had stopped gracefully.
+   * `Endpoint::require_local("Replace daemon")`'s own sentence, not one written
+   * on this side. Replace starts the daemon bundled with this app on *this*
+   * machine; a remote deck's remedy is Upgrade. Stop daemon has its own reason,
+   * `stopDaemonReason`, since issue #1073 stops a remote deck over the wire.
    */
   localOnlyReason?: string;
+  /**
+   * Why Stop daemon cannot act on this deck while it answers, when it cannot
+   * (issue #1073): a remote deck whose daemon is too old to be stopped from the
+   * app. Absent for the local deck, which can always be stopped, and for a deck
+   * that is not answering, where no Stop is offered.
+   */
+  stopDaemonReason?: string;
   /**
    * Why the app is talking to the local deck when the stored selection named
    * another one (PRD #741 M7). "That deck is gone" and "that deck has no socket
@@ -1319,7 +1327,12 @@ export type DeckAction =
    * show otherwise.
    */
   | { type: "start_daemon"; deckId?: string }
-  | { type: "stop_daemon"; force?: boolean }
+  /**
+   * Stop the daemon of the deck `deckId` names (issue #1073) — on the overview,
+   * the card it was pressed on, which need not be the selected deck. Required,
+   * for `stop_agent`'s reason: the crate refuses a stop that names no deck.
+   */
+  | { type: "stop_daemon"; deckId: string; force?: boolean }
   /**
    * Connect anyway (issue #801). `deckId` names the deck whose refusal the
    * user pressed it on (issue #1472); the crate connects to THAT deck and
@@ -1334,7 +1347,7 @@ export type DeckAction =
    * `displayTitle` is the run's name — absent when the form's Name is empty, so
    * the run takes the orchestration's name, as `start_orchestration`'s does.
    */
-  | { type: "activate_orchestration"; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
+  | { type: "activate_orchestration"; deckId?: string; name: string; displayTitle?: string; cwd: string; taskPrompt: string; roles: OrchestrationLaunchRole[]; rows: number; cols: number; configRevision?: string }
   /**
    * Start one plain agent on the deck `deckId` names (PRD #1223 M3) — the
    * wire `connection.deckId` of the target, captured once when the user picks
@@ -1370,7 +1383,7 @@ export type DeckAction =
    * resolves as it resolves a start's: never from the selection, so an agent on
    * another deck can be stopped from the overview under All Decks.
    */
-  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string }
+  | { type: "stop_agent"; deckId: string; agentId: string; incarnation?: string; keepWorktree?: boolean }
   /**
    * PRD #1223 U4 — close a whole orchestration: stop every one of `roles` on the
    * deck `deckId` names, concurrently. There is no orchestration-wide daemon
@@ -1379,7 +1392,7 @@ export type DeckAction =
    * rejection, which arrives as a `LaunchCleanupError`; `name` is what it is
    * named as.
    */
-  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[] }
+  | { type: "stop_orchestration"; deckId: string; roles: { agentId: string; name: string; incarnation?: string }[]; keepWorktree?: boolean }
   | { type: "rename_agent"; agentId: string; displayName: string; incarnation?: string };
 
 /**
@@ -1715,6 +1728,15 @@ export interface DeckRuntimeState {
    * runtime without it offers no orchestration chips.
    */
   newAgentOrchestrations?: (deckId: string, path: string) => Promise<NewAgentOrchestrations>;
+  /**
+   * PRD #1885 — whether an orchestration's commands and prompts are approved
+   * on the deck its launch goes to, and the text the review dialog shows when
+   * they are not; and the user's approval of exactly that text. Optional for
+   * the reason the three above are, and a runtime without them starts no
+   * orchestration (`useProjectTrustReview` refuses).
+   */
+  projectTrustState?: (target: import("./lib/projectTrust").ProjectTrustTarget) => Promise<import("./lib/projectTrust").ProjectTrust>;
+  approveProjectTrust?: (target: import("./lib/projectTrust").ProjectTrustTarget, digest: string) => Promise<import("./lib/projectTrust").ProjectTrust>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /**

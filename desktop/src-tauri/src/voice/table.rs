@@ -154,7 +154,7 @@ impl fmt::Display for Screen {
 /// dashboard filter's two closed sets (issue #1496): what kind of agent a row
 /// is (an orchestration role, a single agent, or one of the dispatcher,
 /// schedule and schedule: issues modes) and what it is doing (working,
-/// thinking, needs input, idle, blocked, error). They are this app's own
+/// thinking, needs input, waiting, idle, blocked, error). They are this app's own
 /// vocabulary rather than names it observed, so they resolve against a fixed
 /// list, and an [`ParamKind::AgentTypeRef`] on a row that is not the New agent
 /// form's resolves against the agent types the deck knows the same way.
@@ -1383,6 +1383,11 @@ mod tests {
                 ("start_new_agent", "startNewAgent", vec!["overview"]),
                 // The dialog's Discard (#1247): the one close that keeps no draft.
                 ("discard_new_agent", "discardNewAgent", vec!["overview"]),
+                (
+                    "approve_project_commands",
+                    "approveProjectCommands",
+                    vec!["deck", "overview"],
+                ),
                 // PRD #802 D5's set: each only opens a confirmation.
                 ("stop_agent", "confirmStopAgent", vec!["overview", "agent"]),
                 (
@@ -2276,7 +2281,10 @@ mod tests {
                 "reading_off",
                 "hush_reading",
                 "next_page",
-                "previous_page"
+                "previous_page",
+                // PRD #1885: the review dialog's approve, where it opens (the
+                // Runs screen); with none open the app says so.
+                "approve_project_commands"
             ]
         );
         assert_eq!(
@@ -2306,6 +2314,8 @@ mod tests {
                 "scroll_to_bottom",
                 // PRD #1401: the pull request of the agent it names (or the only one).
                 "open_pr",
+                // PRD #1885: over the New agent dialog.
+                "approve_project_commands",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2992,9 +3002,11 @@ mod tests {
     }
 
     /// The rows carrying a refuse-only `must_name` guard (PRD #1733;
-    /// `heard_as_also` under PRD #1223, D1), pinned with their words: exactly
+    /// `heard_as_also` under PRD #1223, D1), pinned with their words:
     /// `close_orchestration`, the row that stops several agents at once, whose
-    /// verbs are also the words a user closes a view with.
+    /// verbs are also the words a user closes a view with, and PRD #1885's
+    /// `approve_project_commands`, which approves project commands only when
+    /// the user said "approve".
     #[test]
     fn voice_table_conjunctive_rows_are_the_deliberate_set() {
         let conjunctive: Vec<(&str, Vec<&str>)> = super::table()
@@ -3010,16 +3022,22 @@ mod tests {
             .collect();
         assert_eq!(
             conjunctive,
-            vec![(
-                "close_orchestration",
-                vec![
-                    "orchestration",
-                    "run",
-                    "every role",
-                    "all roles",
-                    "all the roles"
-                ]
-            )]
+            vec![
+                // PRD #1885: a start that never said "approve" ("start it",
+                // "go ahead") is `start_new_agent`'s and must not approve
+                // project commands.
+                ("approve_project_commands", vec!["approve"]),
+                (
+                    "close_orchestration",
+                    vec![
+                        "orchestration",
+                        "run",
+                        "every role",
+                        "all roles",
+                        "all the roles"
+                    ]
+                )
+            ]
         );
     }
 

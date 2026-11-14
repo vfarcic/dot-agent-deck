@@ -12,7 +12,10 @@
 //! so they pin "these shortcuts are documented" without being brittle to
 //! layout or label wording.
 
-use dot_agent_deck::ui::render_help_overlay_to_buffer;
+use dot_agent_deck::keybindings::KeybindingConfig;
+use dot_agent_deck::ui::{
+    render_help_overlay_to_buffer, render_help_overlay_with_bindings_to_buffer,
+};
 use spec::spec;
 
 /// Flatten the rendered buffer to one lowercased string of cell symbols
@@ -36,7 +39,9 @@ fn buffer_text_lower(buffer: &ratatui::buffer::Buffer) -> String {
 /// Quit Ctrl+C) and the key dashboard / navigation actions (filter `/`,
 /// rename, generate, tab switching, card nav). The labels must name agents
 /// and the schedule manager consistently. Ctrl+D is documented under Global as
-/// "Toggle command / pane".
+/// "Toggle command / pane". The Mouse column says a drag selects and copies
+/// and a click focuses a pane, and the dashboard keys list copy mode under its
+/// bound key, `v` by default and the remapped key when `copy_mode` is rebound.
 /// Substring checks are
 /// case-insensitive so a `Ctrl+n` vs `Ctrl+N` casing difference between the
 /// overlay and the buttons does not fail the test — it pins that each
@@ -86,6 +91,38 @@ fn help_001_overlay_documents_canonical_shortcut_set() {
             "help overlay must show {label:?}\n{buf}"
         );
     }
+
+    // PRD #385 M7: the copy gestures.
+    let row_with = |buf: &str, needle: &str| -> String {
+        buf.lines()
+            .find(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("help overlay must show {needle:?}\n{buf}"))
+            .to_string()
+    };
+    for (key, label) in [("drag", "select & copy"), ("mouse click", "focus pane")] {
+        let row = row_with(&buf, label);
+        assert!(
+            row.contains(key),
+            "the {label:?} row must name {key:?}: {row:?}\n{buf}"
+        );
+    }
+    let copy_row = row_with(&buf, "copy mode");
+    assert!(
+        copy_row.split_whitespace().any(|word| word == "v"),
+        "help must show the default v copy-mode key: {copy_row:?}\n{buf}"
+    );
+    let (config, warnings) =
+        KeybindingConfig::from_toml_str("[dashboard]\ncopy_mode = \"x\"\n").expect("parses");
+    assert!(warnings.is_empty(), "{warnings:?}");
+    let remapped = buffer_text_lower(&render_help_overlay_with_bindings_to_buffer(
+        &config, 110, 60,
+    ));
+    let copy_row = row_with(&remapped, "copy mode");
+    assert!(
+        copy_row.split_whitespace().any(|word| word == "x")
+            && !copy_row.split_whitespace().any(|word| word == "v"),
+        "help must show the remapped copy-mode key: {copy_row:?}\n{remapped}"
+    );
 }
 
 /// Scenario: Render the default help overlay into a `TestBackend` buffer and snapshot its complete text. The Ctrl+D row must describe a bidirectional command-mode / pane-input toggle, and the dashboard shortcuts must advertise the `m` host-metrics overlay.

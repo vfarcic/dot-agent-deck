@@ -8,10 +8,11 @@
 //! 5-wake, plan §1.2):
 //!
 //! ```text
-//! (abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch
+//! (abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: /home/me/.local/bin/dot-agent-deck inbox fetch
 //! ```
 //!
-//! The content itself is never typed.
+//! The command names the deck the daemon runs from, as an absolute path
+//! ([`doorbell_line`], issue #1730). The content itself is never typed.
 //!
 //! **When it rings** — every condition below, re-checked on each tick:
 //!
@@ -99,12 +100,52 @@ pub const DEFAULT_WAKE_STALL_AFTER: Duration = Duration::from_secs(120);
 /// The fixed line, before its id.
 pub const LINE_PREFIX: &str = " dot-agent-deck: message ";
 
-/// The fixed line, after its id.
-pub const LINE_SUFFIX: &str = " waiting, run: dot-agent-deck inbox fetch";
+/// The fixed line, between its id and the command word that names the deck.
+pub const LINE_WAITING: &str = " waiting, run: ";
 
-/// The doorbell line naming message `id`.
+/// The fixed line, after the command word: the subcommand the agent runs.
+pub const LINE_FETCH: &str = " inbox fetch";
+
+/// The doorbell line naming message `id`, telling the agent to run `inbox
+/// fetch` with the deck this daemon runs from
+/// ([`crate::platform::paths::binary_name`]).
+///
+/// Issue #1730: a bare `dot-agent-deck` here was resolved by the agent's own
+/// tool shell, whose `$PATH` can reach a different (older) copy than the one
+/// the daemon runs — one without `inbox fetch` at all, so the message stayed
+/// waiting and the deck kept ringing. The footers, orchestrator context and
+/// inbox instructions already name the deck by the same word.
 pub fn doorbell_line(id: &str) -> String {
-    format!("{LINE_PREFIX}{id}{LINE_SUFFIX}")
+    doorbell_line_naming(id, &crate::platform::paths::binary_name())
+}
+
+/// The doorbell line naming message `id`, with `command` as the command word.
+/// [`doorbell_line`] passes the running deck's; a deck before issue #1730
+/// typed the bare `dot-agent-deck`, which every recogniser still accepts.
+pub fn doorbell_line_naming(id: &str, command: &str) -> String {
+    format!("{LINE_PREFIX}{id}{LINE_WAITING}{command}{LINE_FETCH}")
+}
+
+/// A regular expression, in the syntax both Rust's `regex` and JavaScript
+/// share, matching one POSIX shell word as
+/// [`crate::platform::paths::binary_name`] spells it: unquoted characters
+/// other than whitespace, `'` and `\`, single-quoted runs, and
+/// backslash-escaped characters, so `/opt/deck/dot-agent-deck`,
+/// `'/Users/me/My Apps/dot-agent-deck'` and an older deck's bare
+/// `dot-agent-deck` all match, and a run of words does not.
+pub const COMMAND_WORD_PATTERN: &str = r"(?:'[^'\r\n]*'|\\.|[^\s'\\])+";
+
+/// A regular-expression fragment matching the doorbell line after its id:
+/// [`LINE_WAITING`], one command word ([`COMMAND_WORD_PATTERN`]), then
+/// [`LINE_FETCH`]. The command word is whatever deck the line's author named
+/// — the absolute path a deck since issue #1730 types, or an older deck's
+/// bare name — so a recogniser built on it takes both.
+pub fn line_tail_pattern() -> String {
+    format!(
+        "{}{COMMAND_WORD_PATTERN}{}",
+        regex::escape(LINE_WAITING),
+        regex::escape(LINE_FETCH)
+    )
 }
 
 /// The doorbell's timings.
@@ -626,7 +667,9 @@ pub(crate) fn ring_effect(outcome: RingOutcome, cr_reached: bool) -> RingEffect 
 
 /// Whether an agent in `status` is doing something the user can already see,
 /// so its messages waiting is not a stalled wake: working, compacting,
-/// waiting on the user's answer, or blocked by a usage limit.
+/// waiting on the user's answer, or blocked by a usage limit. Not Idle, and
+/// not Waiting (issue #1757): a Waiting agent's prompt is free as an Idle one's
+/// is, so messages sitting unread beside it are a stalled wake.
 fn status_explains_waiting(status: Option<&crate::state::SessionStatus>) -> bool {
     use crate::state::SessionStatus;
     matches!(
@@ -697,8 +740,24 @@ pub(crate) fn test_control_dir(var: &str) -> Option<std::path::PathBuf> {
         return None;
     }
     let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("fixture HOME"));
-    let root = home.join(root);
+    control_dir_under(&home, &root)
+}
+
+/// `home/name`, created if missing. Split out of [`test_control_dir`] so a
+/// test can hand it a directory in the state the umask race leaves.
+#[cfg(feature = "e2e")]
+fn control_dir_under(home: &std::path::Path, name: &std::path::Path) -> Option<std::path::PathBuf> {
+    let root = home.join(name);
     std::fs::create_dir_all(&root).ok()?;
+    // The daemon's socket binding sets the process umask to `0o177` for a
+    // moment (`with_socket_umask`), so whichever thread created this
+    // directory may have left it at `0o600`, with no search bit. A mode set
+    // with chmod is not filtered by the umask, so restate it on every call.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).ok()?;
+    }
     let canonical = root.canonicalize().ok()?;
     if !canonical.starts_with(home.canonicalize().expect("fixture HOME exists")) {
         return None;
@@ -711,12 +770,17 @@ pub(crate) fn test_control_dir(var: &str) -> Option<std::path::PathBuf> {
 pub(crate) fn record_for_test(event: &str) {
     use std::io::Write;
     if let Some(root) = test_control_root() {
-        let mut file = std::fs::OpenOptions::new()
+        // A seam that cannot record must not take the daemon under test down
+        // with it: the test then fails on the observation it waits for, which
+        // names the seam, instead of on an attach EOF (#2280).
+        let written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(root.join("observations"))
-            .expect("open test observations");
-        writeln!(file, "{event}").expect("record test observation");
+            .and_then(|mut file| writeln!(file, "{event}"));
+        if let Err(error) = written {
+            tracing::error!(%error, event, "could not record a test observation");
+        }
     }
 }
 
@@ -929,10 +993,13 @@ async fn run_tick(
             if !queued || slot.nudged.is_some_and(|turns| turns != input.turns) {
                 slot.nudged = None;
             }
+            // Issue #1757: Waiting is not working — its prompt is free, as an
+            // Idle agent's is.
             let working = !matches!(
                 status,
                 Some(
                     crate::state::SessionStatus::Idle
+                        | crate::state::SessionStatus::Waiting
                         | crate::state::SessionStatus::WaitingForInput
                 )
             );
@@ -1154,6 +1221,41 @@ async fn run_tick(
 
 #[cfg(test)]
 mod tests {
+    // Issue #2091: lane 1's shards select a test that exists only in the `e2e`
+    // build by this module's name (`scripts/e2e-shard.sh`, linkage-check rule 19).
+    #[cfg(feature = "e2e")]
+    mod e2e_only {
+        /// Issue #2280: the daemon's socket binding sets the process umask to
+        /// `0o177` for a moment, so a control directory another thread creates in
+        /// that window has no search bit, and opening `observations` in it failed
+        /// with PermissionDenied and took the daemon down. The directory is built
+        /// here in exactly that state rather than by racing the umask.
+        #[cfg(unix)]
+        #[test]
+        fn a_control_dir_created_under_the_socket_umask_is_usable() {
+            use std::os::unix::fs::PermissionsExt;
+            let home = tempfile::tempdir().unwrap();
+            let masked = home.path().join("ring-barriers");
+            std::fs::create_dir(&masked).unwrap();
+            std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let root = crate::doorbell::control_dir_under(
+                home.path(),
+                std::path::Path::new("ring-barriers"),
+            );
+            let opened = root.as_ref().map(|root| {
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(root.join("observations"))
+            });
+            let _ = std::fs::set_permissions(&masked, std::fs::Permissions::from_mode(0o700));
+            assert!(
+                matches!(opened, Some(Ok(_))),
+                "a control dir left at 0o600 must still take observations: {opened:?}"
+            );
+        }
+    }
+
     use super::*;
     use spec::spec;
 
@@ -1531,6 +1633,23 @@ mod tests {
         }
     }
 
+    /// Scenario: Ask the doorbell whether an agent that is Waiting — its turn ended while a command it started still runs — explains the messages queued for it. It does not: a Waiting agent's prompt is free, as an Idle one's is, so messages that sit unread beside it are a stalled wake rather than an agent visibly busy.
+    #[spec("status/waiting/005")]
+    #[test]
+    fn status_waiting_005_waiting_does_not_explain_waiting_messages() {
+        use crate::state::SessionStatus;
+        // Issue #1757: read through the wire name so this module compiles
+        // before the variant exists; `Unknown` until then, which would pass
+        // this assertion by accident.
+        let waiting: SessionStatus = serde_json::from_value(serde_json::json!("Waiting")).unwrap();
+        assert_ne!(
+            waiting,
+            SessionStatus::Unknown,
+            "issue #1757: SessionStatus::Waiting does not exist yet"
+        );
+        assert!(!status_explains_waiting(Some(&waiting)));
+    }
+
     #[test]
     fn the_wake_stall_window_reads_from_the_environment() {
         let config = DoorbellConfig::from_lookup(|name| {
@@ -1769,8 +1888,17 @@ mod tests {
         ]));
         assert_eq!(bad, DoorbellConfig::default());
         assert_eq!(
+            doorbell_line_naming("m-k3xzq2ab-0f3c9a71d2e4b850", "/opt/deck/dot-agent-deck"),
+            " dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: /opt/deck/dot-agent-deck inbox fetch"
+        );
+        // Issue #1730: the line names the deck this daemon runs from, the
+        // word every other instruction to an agent uses, never a bare name
+        // the agent's own `$PATH` resolves.
+        let bin = crate::platform::paths::binary_name();
+        assert!(bin.contains('/'), "{bin}");
+        assert_eq!(
             doorbell_line("m-k3xzq2ab-0f3c9a71d2e4b850"),
-            " dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: dot-agent-deck inbox fetch"
+            doorbell_line_naming("m-k3xzq2ab-0f3c9a71d2e4b850", &bin)
         );
     }
 }

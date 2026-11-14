@@ -360,15 +360,19 @@ pub fn first_stage_bytes() -> impl Iterator<Item = u8> {
 }
 
 /// The bytes after the first stage: [`crate::doorbell::LINE_PREFIX`], a
-/// message id's alphabet (`m-`, base-32 letters and digits, `-`, hex digits)
-/// and [`crate::doorbell::LINE_SUFFIX`].
+/// message id's alphabet (`m-`, base-32 letters and digits, `-`, hex digits),
+/// [`crate::doorbell::LINE_WAITING`], the command word naming the running deck
+/// ([`crate::platform::paths::binary_name`], issue #1730) and
+/// [`crate::doorbell::LINE_FETCH`].
 fn later_stage_bytes() -> impl Iterator<Item = u8> {
     crate::doorbell::LINE_PREFIX
         .bytes()
         .chain(b'a'..=b'z')
         .chain(b'0'..=b'9')
         .chain(std::iter::once(b'-'))
-        .chain(crate::doorbell::LINE_SUFFIX.bytes())
+        .chain(crate::doorbell::LINE_WAITING.bytes())
+        .chain(crate::platform::paths::binary_name().into_bytes())
+        .chain(crate::doorbell::LINE_FETCH.bytes())
 }
 
 /// Rule 3 for one agent's facts: `Go` when every required fact is verified,

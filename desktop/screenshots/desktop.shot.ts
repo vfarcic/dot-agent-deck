@@ -86,8 +86,10 @@ desktopScenario("restart-notice", async (page) => {
 });
 
 /** Select the fixture project's directory in the shared New agent form. */
-async function projectInNewAgent(page: Page): Promise<void> {
-  await overview(page, "docs");
+async function projectInNewAgent(page: Page, query = ""): Promise<void> {
+  await page.goto(`/?fixture=1&state=docs${query}`);
+  await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+  await page.getByTestId("open-overview").click();
   await page.getByTestId("overview-new-agent").click();
   await expect(page.getByTestId("new-agent-current-path")).toHaveText("/home/dev");
   await page.keyboard.press("Enter");
@@ -112,6 +114,25 @@ desktopScenario("orchestration", async (page) => {
   await page.keyboard.press("Escape");
   await expect(page.getByText("ORCHESTRATOR", { exact: true })).toBeVisible();
   await expect(page.locator(".overview-row")).toHaveCount(6);
+});
+
+// PRD #1885 — the same review the TUI `project-trust` image shows: `team` in
+// `demo-project`, changed since it was approved (`?trust=changed`, whose roles
+// are `DOCS_TRUST_ROLES` in `desktop/src/data/fixture.ts`), opened by starting
+// it from the New agent dialog.
+desktopScenario("project-trust", async (page) => {
+  await projectInNewAgent(page, "&trust=changed");
+  await page.getByTestId("new-agent-mode-orch:team").click();
+  await page.getByTestId("new-agent-name").fill("team");
+  await page.getByTestId("new-agent-start").click();
+  const dialog = page.getByTestId("project-trust-dialog");
+  await expect(dialog).toBeVisible();
+  await expect(page.getByTestId("project-trust-state")).toHaveText("changed since you approved it");
+  await expect(page.getByTestId("project-trust-deck")).toBeVisible();
+  await expect(page.getByTestId("project-trust-role")).toHaveCount(3);
+  await expect(page.getByTestId("project-trust-removed")).toContainText("reviewer");
+  await expect(page.getByTestId("project-trust-removed")).toBeInViewport();
+  await expect(dialog.getByRole("button", { name: "Approve and start" })).toBeVisible();
 });
 
 desktopScenario("agent-pane", async (page) => {

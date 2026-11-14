@@ -946,7 +946,10 @@ pub const WRAPPER_OUTPUT_CLASSIFIED_METADATA_VALUE: &str = "1";
 /// and it fails on an ordinary launcher configuration — `codex` reachable only
 /// inside `devbox run codex-big`, so the wrapper's own `codex app-server` is
 /// `NotFound`. Nothing will then announce a turn, so the deck reads the
-/// wrapper's classified output as the pane's status (issue #1493).
+/// wrapper's classified output as the pane's status (issue #1493). The wrapper
+/// also declares it when the wrapped command can set its own `CODEX_HOME` or
+/// working directory (issue #1703), since the trust it recorded is then for a
+/// home or directory Codex may not use.
 ///
 /// Read by [`AgentEvent::declares_prompt_reports_unavailable`]. Any value
 /// counts. It is not, and must not be treated as, an authentication marker: its
@@ -1256,6 +1259,25 @@ pub struct BackgroundWork {
     /// the daemon's clock. `None` when the daemon has no start for any of them.
     #[serde(default)]
     pub since_ms: Option<i64>,
+    /// Issue #1757: how many of [`Self::commands`] the agent started in the
+    /// turn that just ended — first sampled at or after that turn's start (and
+    /// no later than shortly after its end, the sampling grace). A client folds
+    /// an `Idle` card with `awaited > 0` into
+    /// [`crate::state::SessionStatus::Waiting`]. Counts commands only, never
+    /// subagents.
+    ///
+    /// The additive rung of CLAUDE.md rule 18, so no `PROTOCOL_VERSION` bump:
+    /// `#[serde(default)]` reads an older daemon's aggregate as 0 (the card
+    /// stays Idle with its Background line, today's behaviour), and zero is
+    /// omitted on the wire, so an aggregate with nothing awaited is
+    /// byte-for-byte the pre-#1757 shape an older reader already decodes.
+    /// Pinned by `status_waiting_003_wire_stays_compatible_both_ways`.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub awaited: u32,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }
 
 impl BackgroundWork {
@@ -2789,6 +2811,34 @@ pub struct DelegateResponse {
     /// `dot-agent-deck inbox list`. Additive on the hook socket.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub message_ids: Vec<String>,
+    /// Issue #545: the worker pane each dispatched role resolved to, one entry
+    /// per pane in fan-out order, so `delegate` can tell the orchestrator which
+    /// worker the task was queued for. The same claim as [`Self::delivered`]:
+    /// queued to a pane that resolved at delegate time, not yet read by it. Without it a delegate that reached the wrong
+    /// worker was as silent as one that reached the right one, and the
+    /// orchestrator found out only if the eventual report looked wrong.
+    ///
+    /// Additive on the hook socket like every field of this reply (that socket
+    /// is not versioned by [`crate::daemon_protocol::PROTOCOL_VERSION`]): an
+    /// older daemon never writes it, so the CLI prints no pane for it, and an
+    /// older CLI ignores the key.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub delivered_panes: Vec<DeliveredPane>,
+}
+
+/// Issue #545: one worker pane a delegate was dispatched to. See
+/// [`DelegateResponse::delivered_panes`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeliveredPane {
+    /// The `--to` role the pane is registered for.
+    pub role: String,
+    /// The pane's `DOT_AGENT_DECK_PANE_ID` — the id `daemon status` prints in
+    /// its PANE column and a worker's report names.
+    pub pane_id: String,
+    /// The inbox id of the task message queued for this pane, the same id
+    /// [`DelegateResponse::message_ids`] carries for it.
+    #[serde(default)]
+    pub message_id: String,
 }
 
 /// Issue #714: one delegate target whose worker appears blocked by a provider
@@ -2842,6 +2892,7 @@ impl Default for DelegateResponse {
             superseded: Vec::new(),
             blocked: Vec::new(),
             message_ids: Vec::new(),
+            delivered_panes: Vec::new(),
         }
     }
 }
@@ -4660,6 +4711,11 @@ pub struct WorkDoneTaskReply {
     /// A repeat whose body differs from the report already taken.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub differs: bool,
+    /// Issue #2260: an accepted terminal report that was delivered as update
+    /// number `update` (from 1) to the unit's earlier report, which stands.
+    /// An older daemon never sets it, and an older CLI ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4675,6 +4731,7 @@ impl WorkDoneTaskReply {
             report_id: None,
             destination: None,
             differs: false,
+            update: None,
             code: Some(code.to_string()),
             message: Some(message.to_string()),
         }

@@ -1128,7 +1128,8 @@ pub fn codex_composer_on_screen(rows: &[String]) -> bool {
 /// composer is found from the bottom instead: the lowest `›` row that is not a
 /// numbered choice, at most [`CODEX_STRANDED_LINE_MAX_ROWS_ABOVE_BOTTOM`] rows
 /// above the last row with text. Its text, with any wrapped rows below it
-/// joined up to the first blank row, must be `line` exactly, message id
+/// joined up to the first blank row as Codex wrapped them
+/// ([`crate::doorbell_screen::codex_join_wrapped`]), must be `line` exactly, message id
 /// included; a row with text must follow below the cursor (Codex's model
 /// line); and the cursor must sit at the end of the composer's last text
 /// row, or on the blank row directly below it at
@@ -1170,8 +1171,7 @@ pub fn codex_composer_holds_doorbell_line(
         .to_string();
     let mut last = prompt;
     for row in rows[prompt + 1..].iter().take_while(|row| !row.is_empty()) {
-        text.push(' ');
-        text.push_str(row.trim());
+        crate::doorbell_screen::codex_join_wrapped(&mut text, row.trim());
         last += 1;
     }
     if text != line.trim() {

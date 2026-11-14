@@ -111,6 +111,8 @@ os.execvp("cat", ["cat"])
             ),
         )
         .expect("write two-role stand-in orchestration");
+        // PRD #1885: the team this test dispatches is approved, as the user's is.
+        deck.approve_project_trust(deck.workdir());
         common::commit_fixture_repo(deck.workdir());
         Self {
             deck,
@@ -600,8 +602,12 @@ fn orchestration_address_001_folder_delivers_untrusted_only_to_orchestrator() {
     let sender = framed
         .find(&format!("sender folder: {}", folder(&caller).display()))
         .expect("sender folder inside untrusted frame");
+    // Issue #1730: the reply command names the deck the daemon runs from.
     let reply = framed
-        .find("reply with: dot-agent-deck inbox send --folder ")
+        .find(&format!(
+            "reply with: {} inbox send --folder ",
+            common::contained_deck_binary().display()
+        ))
         .expect("reply command inside untrusted frame");
     let message = framed.find(sentinel).expect("sentinel inside frame");
     assert!(

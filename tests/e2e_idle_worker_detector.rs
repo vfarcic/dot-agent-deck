@@ -251,6 +251,9 @@ fn idle_worker_012_real_orchestrator_visibly_receives_idle_nudge() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())
@@ -356,6 +359,9 @@ fn delegate_024_real_orchestrator_acts_on_submitted_silence_notice() {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())
@@ -572,6 +578,9 @@ fn real_worker_stop_is_reported(stop: RealWorkerStop) {
     let deck = TuiDeck::builder()
         .impersonating_pane_signals()
         .with_pty_size(200, 50)
+        // PRD #1885: the restored orchestration's project starts approved, so
+        // the restore opens it with no trust prompt.
+        .trusting_project(project_dir.clone())
         .with_imported_claude_credentials()
         .with_claude_project_trust(project_str.clone())
         .with_env("PATH", common::path_with_binary_dir())
