@@ -2290,6 +2290,32 @@ async fn desktop_bootstrap(
     Ok(snapshot)
 }
 
+/// Reconnect the one deck named by `deck_id`, and leave every other deck alone
+/// (issue #1994).
+///
+/// The webview's per-deck Reconnect, the button on a deck's own banner or
+/// dashboard section. [`desktop_bootstrap`] stays the whole-fleet statement the
+/// app starts from, and Refresh and an `[endpoints]` save still use it.
+///
+/// The deck is resolved against the observed set, as `desktop_start_daemon`
+/// resolves its own: an id this app is not observing is refused before any
+/// deck is contacted.
+#[tauri::command]
+async fn desktop_reconnect_deck(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+) -> Result<DesktopSnapshot, String> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let snapshot =
+        crate::daemon_bridge::reconnect_and_snapshot(scope.endpoint(), &state.daemon).await;
+    emit_snapshot(&app, &snapshot);
+    ensure_snapshot_watchers(&app, &state);
+    Ok(snapshot)
+}
+
 #[tauri::command]
 // Nine, and the shape is the IPC boundary's rather than a design choice: Tauri
 // deserialises a command's arguments from the webview's payload by NAME, so each
@@ -7059,6 +7085,7 @@ pub fn run() {
             desktop_inbox_action,
             desktop_new_agent_options,
             desktop_bootstrap,
+            desktop_reconnect_deck,
             desktop_start_daemon,
             desktop_terminal_attach,
             desktop_terminal_write,

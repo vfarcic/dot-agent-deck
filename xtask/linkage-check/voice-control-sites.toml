@@ -89,8 +89,8 @@ reason = "Connection banner Connect anyway: overrides a compatibility refusal. A
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
-code = "() => void runtime.reconnect()"
-reason = "Connection banner Reconnect: retries the daemon connection. A recovery click shown only while the deck is disconnected."
+code = "() => void runtime.reconnect(snapshot.connection.deckId)"
+reason = "Connection banner Reconnect: retries this deck's daemon connection, and no other deck's (issue #1994). A recovery click shown only while the deck is disconnected."
 
 [[site]]
 file = "desktop/src/App.tsx"

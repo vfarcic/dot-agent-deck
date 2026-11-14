@@ -1907,10 +1907,25 @@ export interface DeckBridge {
    * before calling it. The desktop crate pushes a per-deck snapshot but no
    * "this deck left the fleet" event, so the set of decks the bridge knows
    * about is the set seen since the last connect. Everything that can change
-   * which decks are observed therefore goes through here: app start, Reconnect,
-   * and a settings save that touched `[endpoints]` (see `saveSettings`).
+   * which decks are observed therefore goes through here: app start, the
+   * dashboard's Refresh, and a settings save that touched `[endpoints]` (see
+   * `saveSettings`). One deck's own Reconnect does NOT: that is
+   * {@link reconnectDeck}.
    */
   connect(): Promise<DeckFleet>;
+  /**
+   * Reconnect ONE deck, named by its id, and answer the fleet with that deck's
+   * fresh snapshot folded in (issue #1994).
+   *
+   * What a deck's own Reconnect button calls — its banner's, its empty
+   * screen's, its dashboard section's. It used to call {@link connect}, so one
+   * deck's button reset the whole fleet around the SELECTED deck: every other
+   * deck dropped off the screen until its watcher reported again, and the deck
+   * whose button it was was never reconnected at all unless it was the
+   * selected one. This touches the named deck alone and leaves every other
+   * deck as it is, as the TUI's reconnect leaves every daemon but its own.
+   */
+  reconnectDeck(deckId: string): Promise<DeckFleet>;
   subscribe(onFleet: FleetListener, onTerminal: TerminalListener, onWorktreeKept?: WorktreeKeptListener): Promise<Unsubscribe>;
   previewWorktreeClose: import("./worktreeClose").WorktreeClosePreview;
   runAction(action: DeckAction): Promise<DeckActionResult>;
@@ -3203,6 +3218,12 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   async connect(): Promise<DeckFleet> {
+    await Promise.resolve();
+    return structuredClone(this.fleet);
+  }
+
+  async reconnectDeck(_deckId: string): Promise<DeckFleet> {
+    // The fixture fleet has no links to drop; its decks are as they were.
     await Promise.resolve();
     return structuredClone(this.fleet);
   }
@@ -4517,16 +4538,26 @@ export class TauriDeckBridge implements DeckBridge {
    * waiting on the invocation that never settles.
    *
    * So it is cleared exactly where a whole-bridge restart happens — `connect()`
-   * and `dispose()` — and nowhere else. Both mean the frontend is starting its
-   * relationship with the daemon over, which is the only moment at which
+   * and `dispose()` — and, for one deck's agents alone, where that deck is
+   * reconnected (`reconnectDeck`, issue #1994). Each means the frontend is
+   * starting its relationship with a daemon over, which is the only moment at which
    * forgetting an outstanding command is a fresh start rather than an
    * unbounded queue: it costs at most one extra queued command per Reconnect,
    * bounded by a deliberate user action, against a pane that is otherwise dead
    * until the app restarts.
    */
-  private clearAttachSuppression(): void {
-    this.attachInvocations.clear();
-    this.attachRequested.clear();
+  private clearAttachSuppression(deckId?: string): void {
+    if (deckId === undefined) {
+      this.attachInvocations.clear();
+      this.attachRequested.clear();
+      return;
+    }
+    // Issue #1994: one deck's Reconnect starts that deck's relationship over
+    // and no other's, so it forgets that deck's outstanding attaches alone.
+    // Every key here is `boundAgentKey`, which leads with the deck.
+    const prefix = agentKey(deckId, "");
+    for (const key of this.attachInvocations) if (key.startsWith(prefix)) this.attachInvocations.delete(key);
+    for (const key of this.attachRequested.keys()) if (key.startsWith(prefix)) this.attachRequested.delete(key);
   }
 
   private async attachAgents(targets: AgentTarget[], expectedLifecycle = this.lifecycle): Promise<void> {
@@ -5017,6 +5048,15 @@ export class TauriDeckBridge implements DeckBridge {
     this.adoptUnconfigured(dto);
     this.adoptObserved(dto);
     return this.fleetView();
+  }
+
+  async reconnectDeck(deckId: string): Promise<DeckFleet> {
+    this.clearAttachSuppression(deckId);
+    const invoke = await this.getInvoke();
+    const dto = await invoke<DesktopSnapshotDto>("desktop_reconnect_deck", { deckId });
+    // A FOLD, not `connect()`'s reset: the answer is one deck's, and every
+    // other deck's entry is as true as it was before the click.
+    return this.foldSnapshot(dto);
   }
 
   /**

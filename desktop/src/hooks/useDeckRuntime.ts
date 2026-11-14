@@ -227,22 +227,51 @@ export function useDeckRuntime(): DeckRuntimeState {
     setFleet(next);
   }, []);
 
-  const reconnect = useCallback(async () => {
+  /**
+   * Replace ONE deck, found by its id, and leave the rest of the fleet where
+   * it is (issue #1994) — {@link updateSelected}'s sibling for a deck that need
+   * not be the selected one. An id the fleet does not hold changes nothing.
+   */
+  const updateDeck = useCallback((deckId: string, update: (current: DeckSnapshot) => DeckSnapshot) => {
+    setFleet((current) => {
+      const at = current.findIndex((deck) => deck.connection.deckId === deckId);
+      if (at < 0) return current;
+      const next = [...current];
+      next[at] = update(current[at]);
+      return next;
+    });
+  }, []);
+
+  /**
+   * Reconnect. With a `deckId`, THAT deck alone (issue #1994): the button on a
+   * deck's own banner or dashboard section names its deck, and only that deck
+   * is marked "Reconnecting…", reconnected and, on a failure, marked failed.
+   * Every other deck stays as it is, as the TUI's reconnect touches only the
+   * one daemon it is attached to.
+   *
+   * Without one, the whole fleet is re-established from the bridge's
+   * `connect()` — the dashboard's Refresh, and the reload after an
+   * orchestration is activated.
+   */
+  const reconnect = useCallback(async (deckId?: string) => {
     setError(undefined);
-    updateSelected((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
+    const update = deckId === undefined ? updateSelected : (change: (current: DeckSnapshot) => DeckSnapshot) => updateDeck(deckId, change);
+    update((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
-      const connected = await bridge.connect();
+      const connected = deckId === undefined ? await bridge.connect() : await bridge.reconnectDeck(deckId);
       adoptFleet(connected);
     } catch (cause) {
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
-      updateSelected((current) => ({
-        ...current,
-        health: "failed",
-        connection: { status: "error", message },
-      }));
+      update((current) => {
+        // A named deck keeps the fields that say WHICH deck it is, so its
+        // section stays its own and its next Reconnect still names it.
+        const { deckId: id, socketPath, name, deckKind } = current.connection;
+        const identity = deckId === undefined ? {} : { deckId: id, socketPath, name, deckKind };
+        return { ...current, health: "failed", connection: { status: "error", message, ...identity } };
+      });
     }
-  }, [adoptFleet, bridge, updateSelected]);
+  }, [adoptFleet, bridge, updateDeck, updateSelected]);
 
   useEffect(() => {
     let active = true;

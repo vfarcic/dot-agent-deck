@@ -4473,6 +4473,39 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
   });
 
   /**
+   * Issue #1994: one deck's Reconnect names that deck to the crate and folds
+   * its answer into the fleet. `connect()` would have cleared the fleet and
+   * re-learnt it from the SELECTED deck's bootstrap, so the local deck would
+   * have dropped off the screen and the remote deck would not have been asked
+   * anything at all.
+   */
+  /** Scenario: Reconnecting one deck asks the crate for that deck alone and keeps every other deck in the fleet. */
+  it("reconnects one deck by id and keeps the rest of the fleet", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+    const bootstraps = () => invoke.mock.calls.filter(([command]) => command === "desktop_bootstrap").length;
+    const before = bootstraps();
+    const reconnected = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder", "Remote tester"]);
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_reconnect_deck") return reconnected;
+      if (command === "desktop_bootstrap") return local;
+      return { ok: true };
+    });
+
+    const fleet = await bridge.reconnectDeck(remoteId);
+
+    expect(invoke).toHaveBeenCalledWith("desktop_reconnect_deck", { deckId: remoteId });
+    expect(bootstraps()).toBe(before);
+    expect(fleet.map((deck) => deck.connection.deckId)).toEqual([localId, remoteId]);
+    expect(fleet[0].agents.map((agent) => agent.displayName)).toEqual(["Local coder", "Local reviewer"]);
+    expect(fleet[1].agents.map((agent) => agent.displayName)).toEqual(["Remote builder", "Remote tester"]);
+    await bridge.dispose();
+  });
+
+  /**
    * A departing deck's own last emit does not reinstate it.
    *
    * The watcher for a daemon being torn down can still land one snapshot after

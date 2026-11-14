@@ -2240,6 +2240,28 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
     start_and_snapshot(scope.endpoint(), links).await.1
 }
 
+/// Reconnect ONE deck: drop the link held for it and snapshot it afresh
+/// (issue #1994).
+///
+/// What a deck's own Reconnect button does. It used to reach [`bootstrap`],
+/// which answers the selected deck whichever deck's button was pressed, and
+/// the webview then reset its whole fleet around that answer. This names its
+/// deck and touches that deck's link alone: every other deck keeps its held
+/// link and its watcher, as the TUI's reconnect leaves every daemon but the
+/// one it is attached to.
+///
+/// The invalidation is the "re" in reconnect: a held link can describe a
+/// daemon that has since gone or wedged, and the user pressed the button
+/// because the deck looked wrong, so the snapshot below handshakes against
+/// whatever answers at the address now.
+pub(crate) async fn reconnect_and_snapshot(
+    endpoint: &Endpoint,
+    links: &DaemonLinks,
+) -> DesktopSnapshot {
+    links.invalidate(endpoint).await;
+    snapshot_of(endpoint, links).await
+}
+
 /// The allowance switches' test guard, for `terminal`'s tests of the held
 /// client's admission under Connect anyway.
 #[cfg(test)]
@@ -3868,6 +3890,62 @@ mod tests {
             "the re-establishment must really have reconnected"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scenario: two decks each hold a link, and Reconnect is pressed on one of
+    /// them. That deck handshakes again and reports Connected; the other deck's
+    /// held link is the same object afterwards and no handshake was spent on it
+    /// (issue #1994).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnecting_one_deck_re_handshakes_that_deck_and_leaves_the_other_held() {
+        let (dir_a, socket_a) = scratch_socket("issue-1994-a");
+        let (dir_b, socket_b) = scratch_socket("issue-1994-b");
+        let daemon_a = tokio::spawn(scripted_daemon_sequence(
+            bind_trusted(&socket_a),
+            vec![
+                matching_hello(),
+                matching_hello(),
+                AttachResponse::agent_records(vec![listed_agent("1", "pane-1")]),
+            ],
+        ));
+        let daemon_b = tokio::spawn(scripted_daemon_sequence(
+            bind_trusted(&socket_b),
+            vec![matching_hello()],
+        ));
+
+        let links = DaemonLinks::default();
+        let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
+        let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
+        let held_a = links.trusted(&deck_a).await.expect("establish deck A");
+        let held_b = links.trusted(&deck_b).await.expect("establish deck B");
+        assert_eq!(links.handshake_count(), 2);
+
+        let snapshot = reconnect_and_snapshot(&deck_a, &links).await;
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot.connection.deck_id, deck_wire_id(&deck_a));
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(
+            links.handshake_count(),
+            3,
+            "the reconnected deck handshakes once more, and nothing else does"
+        );
+        let after_a = links.trusted(&deck_a).await.expect("deck A is held again");
+        assert!(
+            !Arc::ptr_eq(&held_a, &after_a),
+            "the reconnected deck must not keep the link it had"
+        );
+        let after_b = links.trusted(&deck_b).await.expect("deck B is still held");
+        assert!(
+            Arc::ptr_eq(&held_b, &after_b),
+            "the other deck's link must survive another deck's Reconnect"
+        );
+        assert_eq!(links.handshake_count(), 3);
+        assert_eq!(daemon_a.await.expect("deck A's daemon must not panic"), 3);
+        assert_eq!(daemon_b.await.expect("deck B's daemon must not panic"), 1);
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
     }
 
     /// `invalidate_all` is the whole-store form, used where the reason to
