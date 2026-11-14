@@ -61,7 +61,7 @@ tasks:
     use: rust
     run: |
       mkdir -p "$HOME/.cargo/bin"
-      curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
+      curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "$HOME/.cargo/bin"
       cargo nextest --version
 
   # Some fast-tier tests run `node` (e.g. tests/pi_native_observer.rs); GitHub's
@@ -70,7 +70,7 @@ tasks:
   - key: node
     call: nodejs/install 1.2.0
     with:
-      node-version: "26.13.0"
+      node-version: "26.13.1"
 
   # cargo-mutants, for `/code-cleanup`'s tests mode
   # (`.claude/skills/code-cleanup/find-targets.sh tests`), so a mutation run,
