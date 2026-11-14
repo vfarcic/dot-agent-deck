@@ -1308,21 +1308,23 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
    * Scenario (Greptile's review of PR #1235): press Start and let the daemon hold
    * its answer. Every control in the dialog is disabled at once, so no tab stop
    * is left inside it and none outside either — the background is inert — and
-   * the dialog itself is the focus target that is left. The sentence explaining
+   * the dialog itself is the focus target that is left; once the daemon refuses
+   * the start, focus goes back to the Name field it was taken from. The sentence explaining
    * why nothing answers is a live region, which is the only way a screen reader
    * learns it: a disabled close button announces neither itself nor the `title` that
    * carries the same explanation for a sighted user.
    *
-   * **What this tier proves is the markup, not the focus outcome.** Measured by
-   * disabling the hook: this test still passes without it, because jsdom does
-   * not blur an element that becomes disabled, so focus simply stays on the
-   * Start button that was pressed. In a real engine that button is blurred and
-   * `useInertBackground` — which re-marks on every commit and moves focus back
-   * inside when it has left — is what stops focus landing on `<body>` behind an
-   * inert screen. The assertion below is therefore that focus is still in the
-   * dialog, which holds in both, and the fence itself is pinned where it is
-   * observable: `AgentOverviewNewAgent.test.tsx` for the marking, and
-   * `desktop/e2e/new-agent.spec.ts` for what the marking does.
+   * **Focus is asserted to BE the dialog, not merely inside it, and that is
+   * what makes this deterministic.** jsdom 31 implements the browser's focus
+   * fixup: a focused control that becomes disabled is blurred to `<body>` at
+   * jsdom's next rendering tick (a 16 ms interval), not at once. "Inside the
+   * dialog" therefore held or failed depending on whether that tick fell
+   * before the assertion — red 7 times in 60 runs of this file under load, and
+   * once in CI on PR #2294. The control that had focus here is the Name field
+   * `reachForm` left it in, and it is inside the dialog until the tick and on
+   * `<body>` after it, so with focus left on it this fails on either side of
+   * the tick; the dialog itself stays focusable, so the fixup never moves
+   * focus off it.
    */
   it("keeps focus and an announcement in the dialog while every control is disabled", async () => {
     const held = heldStart();
@@ -1339,11 +1341,13 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
     expect(focusable.length).toBeGreaterThan(0);
     expect(focusable.every((control) => control.hasAttribute("disabled"))).toBe(true);
     expect(flow).toHaveAttribute("tabindex", "-1");
-    expect(flow.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(flow);
 
     await act(async () => held.settle().reject(new Error("the daemon did not answer the start within 15s")));
     await screen.findByTestId("new-agent-error");
     expect(screen.getByRole("button", { name: "Close new agent" })).toBeEnabled();
+    // Back on the field the start was made from, not left on the dialog's frame.
+    expect(document.activeElement).toBe(screen.getByTestId("new-agent-name"));
   });
 
   /**
