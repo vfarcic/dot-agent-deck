@@ -37,6 +37,11 @@ const STILL_ADMITTED_EVERY: Duration = Duration::from_millis(50);
 /// released when the publisher is not contended (plan §2.4).
 const REPROJECT_WAIT: Duration = Duration::from_millis(100);
 
+/// Test seam: the longest a re-projection waits at the publisher's write
+/// hold. Past the 10 s the tests poll for, under nextest's 60 s slow mark.
+#[cfg(test)]
+const PUBLISHER_WRITE_GATE_CAP: Duration = Duration::from_secs(20);
+
 /// The most a transaction step waits between looks at the pane.
 const STEP: Duration = Duration::from_millis(10);
 
@@ -1329,15 +1334,26 @@ impl AgentPtyRegistry {
 
     /// Test seam: while held, a re-projection that has read its inputs
     /// waits here, before its hub write, and says it got there.
+    ///
+    /// The wait is bounded by [`PUBLISHER_WRITE_GATE_CAP`]: it blocks the
+    /// publisher's runtime worker, so a test that fails with the hold still
+    /// set would otherwise leave a worker the runtime's shutdown never gets
+    /// back, and hang until nextest kills it instead of failing.
     #[cfg(test)]
     fn publisher_write_gate_wait(&self) {
         let (held, reached) = &*self.publisher_write_gate;
-        let mut held_now = held.lock().unwrap();
+        let held_now = held.lock().unwrap();
         if *held_now {
             reached.store(true, Ordering::SeqCst);
         }
-        while *held_now {
-            held_now = self.publisher_write_released.wait(held_now).unwrap();
+        let (_held_now, waited) = self
+            .publisher_write_released
+            .wait_timeout_while(held_now, PUBLISHER_WRITE_GATE_CAP, |held| *held)
+            .unwrap();
+        if waited.timed_out() {
+            eprintln!(
+                "publisher write hold still set after {PUBLISHER_WRITE_GATE_CAP:?}; the run goes on"
+            );
         }
     }
 
@@ -1347,10 +1363,18 @@ impl AgentPtyRegistry {
     #[cfg(test)]
     pub(crate) fn hold_publisher_write(&self, held: bool) {
         let (gate, reached) = &*self.publisher_write_gate;
-        *gate.lock().unwrap() = held;
+        let mut gate = gate.lock().unwrap();
+        // Cleared under the gate's lock, before the hold is visible: a run
+        // that reaches the hold once it is set records `reached` after this,
+        // never before it. Cleared after the unlock, a run already queued
+        // could reach the hold in between and have its `reached` wiped, and
+        // the test would wait for a run that is already parked there.
         if held {
             reached.store(false, Ordering::SeqCst);
-        } else {
+        }
+        *gate = held;
+        drop(gate);
+        if !held {
             self.publisher_write_released.notify_all();
         }
     }
