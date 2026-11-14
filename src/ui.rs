@@ -7516,7 +7516,13 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     let nested = if shown.is_empty() {
         String::new()
     } else {
-        format!(" (holds: {})", shown.join(", "))
+        // At the daemon's cap there may be more than it named.
+        let more = if shown.len() >= crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED {
+            ", and maybe more"
+        } else {
+            ""
+        };
+        format!(" (holds: {}{more})", shown.join(", "))
     };
     ui.status_message = Some((
         format!(
@@ -7594,8 +7600,14 @@ fn kept_worktree_nested_lines(kept: &KeptWorktree) -> Vec<String> {
         .map(|nested| format!("holds: {nested}"))
         .collect();
     if shown.len() > KEPT_NESTED_DIALOG_LINES {
+        // At the daemon's cap there may be more than it named.
+        let at_least = if shown.len() >= crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED {
+            "at least "
+        } else {
+            ""
+        };
         lines.push(format!(
-            "holds: … and {} more",
+            "holds: … and {at_least}{} more",
             shown.len() - KEPT_NESTED_DIALOG_LINES
         ));
     }

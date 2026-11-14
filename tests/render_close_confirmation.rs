@@ -377,6 +377,7 @@ fn close_confirm_015_a_worktree_holding_others_warns_and_names_them() {
     }
     assert!(!text.contains("feat-4"), "{text}");
     assert!(text.contains("holds: … and 2 more"), "{text}");
+    assert!(!text.contains("at least"), "{text}");
     assert!(
         text.contains("  Close"),
         "the choices are still drawn\n{text}"

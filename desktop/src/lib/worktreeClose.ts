@@ -54,6 +54,9 @@ export function worktreeKeptNotice(payload: unknown): WorktreeKeptNotice | undef
   return { deckId: event.deck, path: event.path, confirmed_dirty: event.confirmed_dirty, ...(event.on_request === true ? { on_request: true } : {}), ...(nested.length ? { nested_worktrees: nested } : {}) };
 }
 
+/** Issue #2285: the most nested worktrees the daemon names (`MAX_NESTED_WORKTREES_REPORTED` in `src/issue_dispatch_run.rs`); at it there may be more. */
+export const MAX_NESTED_WORKTREES_REPORTED = 16;
+
 /** Issue #2285: the worktrees that keep `kept`, each relative to it where it can be, as the TUI shows them. */
 export function nestedWorktreesShown(kept: KeptWorktree): string[] {
   const parent = kept.path.replace(/\/+$/, "");

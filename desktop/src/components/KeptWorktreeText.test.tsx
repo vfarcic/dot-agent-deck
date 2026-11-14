@@ -13,6 +13,11 @@ describe("a kept worktree that holds other worktrees", () => {
     const { container, rerender } = render(<KeptWorktreeText kept={kept} />);
     expect(container.textContent).toBe("Holds other worktrees, so it is KEPT: /w/unit (holds: .worktrees/feat-1, /elsewhere/odd)");
 
+    // At the daemon's cap of 16 there may be more than it named.
+    const capped = { path: "/w/unit", confirmed_dirty: false, nested_worktrees: Array.from({ length: 16 }, (_, i) => `/w/unit/.worktrees/f${i}`) };
+    rerender(<KeptWorktreeText kept={capped} />);
+    expect(container.textContent).toMatch(/\.worktrees\/f15, and maybe more\)$/);
+
     rerender(<KeptWorktreeText kept={{ path: "/w/unit", confirmed_dirty: true }} />);
     expect(container.textContent).toBe("Uncommitted work here is KEPT, not deleted: /w/unit");
   });
