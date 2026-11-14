@@ -984,7 +984,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       # The Pi extension's Node suites run from the fast tier
@@ -1117,7 +1117,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: false
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       # The Pi extension's Node suites in the lib tier, as in `test`.
@@ -1280,7 +1280,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       # The same Linux deps `clippy` installs, for the same reason: the archive
@@ -1353,7 +1353,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1
         with:
           toolchain: 1.99.1
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       # The desktop crate's test binaries link these libraries at run time.
@@ -1780,7 +1780,7 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}  # see the cache note above `jobs:`
-      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+      - uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       - run: cargo build
@@ -1934,13 +1934,13 @@ jobs:
       # failure fails the job.
       - id: nextest
         continue-on-error: true
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       - if: steps.nextest.outcome == 'failure'
         run: sleep 60
       - if: steps.nextest.outcome == 'failure'
-        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2
+        uses: taiki-e/install-action@4a76afe23f9e08d2d9550fb56e556444e8611d21 # v2
         with:
           tool: cargo-nextest@0.9.149
       # `--workspace` (issue #489), for the reason spelled out on the
