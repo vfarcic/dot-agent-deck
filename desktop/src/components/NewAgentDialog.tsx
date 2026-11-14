@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useId, useMemo, useRef, useState, type KeyboardEvent } from "react";
+import { Fragment, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { ArrowUp, Check, Folder, FolderGit2, Loader2, Plus, Server, Trash2, X } from "lucide-react";
 import { LaunchCleanupError } from "../lib/actionError";
 import { CleanupWarning } from "./CleanupWarning";
@@ -1747,6 +1747,23 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
     }
     setFocusRequest(undefined);
   }, [focusRequest, listing, listingState]);
+  /**
+   * A start in flight disables every control in the dialog at once (audit F5),
+   * including the one that had focus — the pressed Start, or the Name field a
+   * start by Enter left it in. A browser then blurs that control to `<body>`
+   * at its next rendering update, AFTER the commit, and nothing commits again
+   * until the daemon answers, so `useInertBackground`'s per-commit check never
+   * sees focus leave: it sat on `<body>` behind an `aria-modal` dialog for the
+   * whole start. Moving it to the dialog itself here, in the commit that
+   * disables the controls and before that rendering update, keeps it on the
+   * one element still focusable. Focus elsewhere — the voice surface, a review
+   * dialog beside this one — is left where it is.
+   */
+  useLayoutEffect(() => {
+    if (!starting) return;
+    const node = dialogRef.current;
+    if (node && node !== document.activeElement && node.contains(document.activeElement)) node.focus();
+  }, [starting, dialogRef]);
   const activeRowId = `${titleId}-row-${cursor}`;
   useEffect(() => {
     document.getElementById(activeRowId)?.scrollIntoView?.({ block: "nearest" });
@@ -2202,9 +2219,10 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
           deck field, the directory panel, Discard, Start and the fields all at once —
           and a disabled button is neither focusable nor announced, so the
           close button's `title` explaining the block is invisible to a screen
-          reader. Focus falls back to the dialog itself (see `tabIndex` below,
-          and `useInertBackground`, which moves it there when the pressed Start
-          is blurred), and this is what tells a listener why nothing answers.
+          reader. Focus moves to the dialog itself (see `tabIndex` below, and
+          the layout effect beside the focus effect, which moves it there before
+          the disabled control is blurred), and this is what tells a listener
+          why nothing answers.
           There is no Cancel button (PRD #1223 U2): it was the same close as the
           header's X, and no other dialog here has both. Discard (#1247) is not
           one: since every close keeps the form as a draft, it is the one
