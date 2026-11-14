@@ -537,7 +537,7 @@ tasks:
     tool-cache: ci-devbox-v1
     env:
       NIX_CONFIG: experimental-features = nix-command flakes
-      DEVBOX_USE_VERSION: 0.19.0
+      DEVBOX_USE_VERSION: 0.21.0
     run: |
       scripts/check-pin-lockstep.sh
       # The release binary, checked against its published SHA-256 (the
@@ -554,7 +554,7 @@ tasks:
       # same flags.
       curl -fsSL --retry 5 --retry-all-errors --retry-max-time 120 -o /tmp/devbox.tar.gz \
         "https://github.com/jetify-com/devbox/releases/download/${DEVBOX_USE_VERSION}/devbox_${DEVBOX_USE_VERSION}_linux_amd64.tar.gz"
-      echo "13a9c9ca15ffef279f5c37694e7feeeeaed93d7ab7b0a69c7b4301a06bcd21ba  /tmp/devbox.tar.gz" | sha256sum -c -
+      echo "9afb537352f3466d59c0316524fc03ee722eea6d54c0ee9ec6e2afc53a70a92c  /tmp/devbox.tar.gz" | sha256sum -c -
       sudo tar -xzf /tmp/devbox.tar.gz -C /usr/local/bin devbox
       devbox run -- bash scripts/devbox-smoke.sh
 
