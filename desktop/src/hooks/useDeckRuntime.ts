@@ -232,7 +232,6 @@ export function useDeckRuntime(): DeckRuntimeState {
    * it is (issue #1994) — {@link updateSelected}'s sibling for a deck that need
    * not be the selected one. An id the fleet does not hold changes nothing.
    */
-  const reconnectAttemptsRef = useRef(new Map<string, number>());
   const updateDeck = useCallback((deckId: string, update: (current: DeckSnapshot) => DeckSnapshot) => {
     setFleet((current) => {
       const at = current.findIndex((deck) => deck.connection.deckId === deckId);
@@ -242,6 +241,9 @@ export function useDeckRuntime(): DeckRuntimeState {
       return next;
     });
   }, []);
+
+  /** Each named deck's latest Reconnect attempt, so a late failure of an earlier one is dropped. */
+  const reconnectAttemptsRef = useRef(new Map<string, number>());
 
   /**
    * Reconnect. With a `deckId`, THAT deck alone (issue #1994): the button on a
