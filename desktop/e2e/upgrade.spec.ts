@@ -80,6 +80,26 @@ test.describe("Upgrade a daemon from the dashboard", () => {
     await expect(card(page, BUILD_BOX).getByTestId("overview-first-run")).toBeVisible();
   });
 
+  /** Scenario: in a short window, start Upgrade on the busy remote and reach its restart question. The dialog stays inside the window and scrolls, so Restart now and Keep current daemon can both be brought fully on screen (issue #2312). */
+  test("keeps the restart question's buttons reachable in a short window", async ({ page }) => {
+    await page.setViewportSize({ width: 1280, height: 420 });
+    await openUpgradeFleet(page);
+    await card(page, BUILD_BOX).getByTestId("daemon-upgrade").click();
+    await page.getByTestId("upgrade-start").click();
+    await expect(page.getByTestId("upgrade-decision")).toBeVisible();
+    await expect(page.getByTestId("upgrade-at-stake").getByRole("listitem").first()).toBeVisible();
+
+    const dialog = page.getByTestId("upgrade-dialog");
+    const box = await dialog.boundingBox();
+    expect(box, "the upgrade dialog has no layout box").not.toBeNull();
+    expect(box!.y + box!.height, "the dialog runs past the bottom of the window").toBeLessThanOrEqual(420 + 0.5);
+    for (const id of ["upgrade-restart-now", "upgrade-keep-current"]) {
+      const button = page.getByTestId(id);
+      await button.scrollIntoViewIfNeeded();
+      await expect(button, `${id} cannot be brought fully on screen`).toBeInViewport({ ratio: 1 });
+    }
+  });
+
   /** Scenario: choose Keep at the busy remote's question and read the installed-but-kept outcome; its agents and Upgrade offer remain visible. */
   test("Keep current daemon stops nothing and says so", async ({ page }) => {
     await openUpgradeFleet(page);
