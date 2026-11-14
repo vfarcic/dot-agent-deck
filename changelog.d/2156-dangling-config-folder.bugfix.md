@@ -1,0 +1,3 @@
+## A config folder linked to a missing folder holds the doorbell off
+
+When the deck's config folder, such as `~/.config/dot-agent-deck` or `~/.config` itself, is a link to a folder that is no longer there (moved, or on a drive that isn't mounted), the deck now treats its `config.toml` as a config it can't use: it holds the doorbell off for both Claude Code and Codex for the agents it starts, and the deck log names the folder, instead of turning the doorbell on as if there were no config at all. A config folder that doesn't exist yet, as on a first run, still means the defaults. `DOT_AGENT_DECK_DOORBELL_CLAUDE` and `DOT_AGENT_DECK_DOORBELL_CODEX` still win over it.

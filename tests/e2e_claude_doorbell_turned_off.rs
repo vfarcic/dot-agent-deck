@@ -355,3 +355,111 @@ fn doorbell_062_a_config_link_whose_target_is_missing_holds_a_started_claude_off
         "still nothing typed into the held Claude Code"
     );
 }
+
+/// Scenario: In a PTY-attached deck whose config folder, `~/.config/dot-agent-deck`, is a symlink to a folder that is not there (a dotfiles folder that moved, or a volume that is not mounted), a scripted Claude Code drawing a release nobody measured is started and a message is queued for it while it is Idle at its empty composer. Its doorbell is held off as if the config had turned it off: nothing is typed, no doorbell rings, the agent record and its card show the cannot_type words, `daemon status` shows WAKE none, the deck log names the folder link whose target is missing and a `doorbell off` line naming turned_off, and the message stays queued. With the link removed so the config folder does not exist at all, as on a first run, a second scripted worker drawing the same header is rung: WAKE doorbell, one ring, and its message fetched.
+#[spec("inbox/doorbell/064")]
+#[test]
+fn doorbell_064_a_config_folder_link_whose_target_is_missing_holds_a_started_claude_off() {
+    const LOG_064: &str = "deck-064.log";
+    let deck = TuiDeck::builder()
+        .with_pty_size(200, 50)
+        .with_env("DOT_AGENT_DECK_DOORBELL_TICK_MS", "25")
+        .with_env("DOT_AGENT_DECK_DOORBELL_SCHEDULE_MS", "30000")
+        .with_env("DOT_AGENT_DECK_INBOX_WAKE_STALL_AFTER_MS", "1000")
+        .with_env("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1")
+        .with_env("DOT_AGENT_DECK_LOG", LOG_064)
+        .launch_with_fixture("minimal");
+    deck.wait_for_string("No active agents");
+    let log = || std::fs::read_to_string(deck.workdir().join(LOG_064)).unwrap_or_default();
+
+    // The deck's config folder is a link whose target is missing. Whatever the
+    // deck already keeps there is moved aside, as a dotfiles folder would be.
+    let folder = deck.home_dir().join(".config/dot-agent-deck");
+    std::fs::create_dir_all(folder.parent().unwrap()).unwrap();
+    if folder.symlink_metadata().is_ok() {
+        std::fs::rename(
+            &folder,
+            deck.home_dir().join(".config/dot-agent-deck.moved"),
+        )
+        .unwrap();
+    }
+    std::os::unix::fs::symlink(deck.workdir().join("unmounted/dot-agent-deck"), &folder).unwrap();
+    let config = folder.join("config.toml");
+    assert!(
+        folder.symlink_metadata().is_ok() && !folder.exists() && !config.exists(),
+        "the config folder is a dangling link"
+    );
+
+    let held = claude(&deck, "dangling-folder-coder", UNMEASURED, json!({}));
+    status(&deck, &held, "session_start", "claude_code");
+    status(&deck, &held, "idle", "claude_code");
+    let id = enqueue(&deck, &held, BODY);
+    assert!(
+        common::wait_until(WAIT, || record(&deck, &held)["inbox"]["wake_hold"]
+            .to_string()
+            .contains("cannot_type")),
+        "the record holds the message as cannot_type: {}",
+        record(&deck, &held)
+    );
+    assert!(
+        deck.wait_for_grid_string_within(
+            dot_agent_deck::inbox_display::WAKE_HOLD_CANNOT_TYPE,
+            WAIT
+        ),
+        "the card on the screen shows the words: {}",
+        deck.snapshot_grid()
+    );
+    assert_eq!(status_wake(&deck, &held), "none");
+    unchanged(&held, Duration::from_millis(1500));
+    assert!(
+        bytes(&held).is_empty(),
+        "nothing typed into the held Claude Code"
+    );
+    assert!(!log().contains("doorbell rang"), "no doorbell rang");
+    let named = format!(
+        "the folder {} is a link whose target is missing",
+        folder.display()
+    );
+    assert!(
+        log().contains(&named),
+        "the daemon read the dangling config folder at the agent's start: {}",
+        log()
+    );
+    assert!(
+        log()
+            .lines()
+            .any(|line| line.contains("doorbell off") && line.contains("turned_off")),
+        "the log names the cause: {}",
+        log()
+    );
+    state(&deck, &held, &id, "queued");
+
+    // The control: no config folder at all, as on a first run, so the doorbell
+    // is on for an agent started now.
+    std::fs::remove_file(&folder).unwrap();
+    assert!(
+        folder
+            .symlink_metadata()
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound),
+        "no config folder"
+    );
+    let control = claude(&deck, "first-run-coder", UNMEASURED, json!({}));
+    status(&deck, &control, "session_start", "claude_code");
+    status(&deck, &control, "idle", "claude_code");
+    assert!(
+        common::wait_until(WAIT, || status_wake(&deck, &control) == "doorbell"),
+        "with no config folder the unmeasured release's WAKE is the doorbell"
+    );
+    let control_id = enqueue(&deck, &control, BODY);
+    assert!(
+        common::wait_until(WAIT, || rung_line(&control, &control_id).is_some()),
+        "with no config folder the unmeasured release is rung: {:?}",
+        String::from_utf8_lossy(&bytes(&control))
+    );
+    state(&deck, &control, &control_id, "acknowledged");
+    assert_eq!(rings(&control).len(), 1, "one ring");
+    assert!(
+        bytes(&held).is_empty(),
+        "still nothing typed into the held Claude Code"
+    );
+}

@@ -14,7 +14,8 @@
 //! (`crate::composer_probe::install::at_spawn`), and the generation keeps the
 //! value for its life, so a change applies to agents started after it. A
 //! `config.toml` that is there but cannot be used (malformed, a wrong-typed
-//! value, too large, unreadable, a link whose target is missing) holds the doorbell off for both agents rather
+//! value, too large, unreadable, a link whose target is missing, or in a config folder that is
+//! such a link) holds the doorbell off for both agents rather
 //! than falling back to the default of on: the file may be the one that turned
 //! an agent off, and the variables still win over it. Off,
 //! the generation's verdict is `turned_off` (`NoGo::TurnedOff`), whatever its
@@ -312,6 +313,98 @@ mod tests {
                 DoorbellSwitch {
                     claude: true,
                     codex: false
+                },
+                "{name}: the variable still wins"
+            );
+        }
+    }
+
+    /// Scenario: Read the doorbell switch from a `config.toml` whose config folder, or a folder above it, is a symlink: to a missing target (absolute, relative, through a second link, or two folders up), to a regular file, and to a real folder that holds no config yet, next to config folders that simply do not exist. A link to a missing folder or to a file is a config that is there but can't be used, with one warning naming the folder, and holds the doorbell off for both agents, a variable still winning over it; a link to a real folder, and missing folders under a real one, read as absent and leave both agents on.
+    #[spec("inbox/doorbell/063")]
+    #[cfg(unix)]
+    #[test]
+    fn doorbell_063_a_config_folder_link_whose_target_is_missing_holds_the_doorbell_off() {
+        use crate::config::{ConfigFile, DashboardConfig};
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let none = |_: &str| None;
+        let off = DoorbellSwitch {
+            claude: false,
+            codex: false,
+        };
+
+        // First runs: the config folder, and the folders above it, are simply
+        // not there, or a linked folder that exists does not hold one yet.
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let to_real = dir.path().join("to-real");
+        symlink(&real, &to_real).unwrap();
+        for path in [
+            dir.path().join("config/dot-agent-deck/config.toml"),
+            to_real.join("config.toml"),
+            to_real.join("dot-agent-deck/config.toml"),
+        ] {
+            let load = DashboardConfig::load_bounded_status_from(&path);
+            assert_eq!(load.file, ConfigFile::Absent, "{}", path.display());
+            assert!(load.warnings.is_empty(), "{:?}", load.warnings);
+            assert_eq!(
+                DoorbellSwitch::from_load(&load, none),
+                DoorbellSwitch::default()
+            );
+        }
+
+        // `~/.config/dot-agent-deck` linked to a folder that moved, or that is
+        // on a volume that is not mounted.
+        let dangling = dir.path().join("dangling");
+        symlink(dir.path().join("unmounted/dot-agent-deck"), &dangling).unwrap();
+        let dangling_relative = dir.path().join("dangling-relative");
+        symlink("moved-away", &dangling_relative).unwrap();
+        let chained = dir.path().join("chained");
+        symlink(&dangling, &chained).unwrap();
+        // `~/.config` itself linked to a folder that is gone.
+        let dotconfig = dir.path().join("dotconfig");
+        symlink(dir.path().join("gone"), &dotconfig).unwrap();
+        // A folder link to a regular file.
+        let file = dir.path().join("a-file");
+        std::fs::write(&file, "").unwrap();
+        let to_file = dir.path().join("to-file");
+        symlink(&file, &to_file).unwrap();
+
+        for (name, path, warning) in [
+            ("dangling", dangling.join("config.toml"), Some(&dangling)),
+            (
+                "dangling-relative",
+                dangling_relative.join("config.toml"),
+                Some(&dangling_relative),
+            ),
+            ("chained", chained.join("config.toml"), Some(&chained)),
+            (
+                "two folders up",
+                dotconfig.join("dot-agent-deck/config.toml"),
+                Some(&dotconfig),
+            ),
+            ("to-file", to_file.join("config.toml"), None),
+        ] {
+            let load = DashboardConfig::load_bounded_status_from(&path);
+            assert_eq!(load.file, ConfigFile::Failed, "{name}");
+            assert_eq!(load.warnings.len(), 1, "{name}: {:?}", load.warnings);
+            if let Some(folder) = warning {
+                let expected = format!(
+                    "the folder {} is a link whose target is missing",
+                    folder.display()
+                );
+                assert!(
+                    load.warnings[0].contains(&expected),
+                    "{name}: {:?}",
+                    load.warnings
+                );
+            }
+            assert_eq!(DoorbellSwitch::from_load(&load, none), off, "{name}");
+            assert_eq!(
+                DoorbellSwitch::from_load(&load, |var| (var == CODEX_ENV).then(|| "1".into())),
+                DoorbellSwitch {
+                    claude: false,
+                    codex: true
                 },
                 "{name}: the variable still wins"
             );
