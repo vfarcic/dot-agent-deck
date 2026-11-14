@@ -1945,52 +1945,106 @@ fn expand_env_vars(input: &str) -> String {
 
 const STAR_PROMPT_INTERVAL: u64 = 10;
 
-fn star_prompt_path() -> PathBuf {
+/// Where the star-prompt state lives: `star-prompt-state.json` in the
+/// platform config dir, or the file `DOT_AGENT_DECK_STAR_PROMPT` names.
+///
+/// PRD #2174: the TUI and the desktop app both read and write this one file,
+/// so a launch of either counts and a choice made in either holds in both.
+pub fn star_prompt_path() -> PathBuf {
     if let Ok(p) = std::env::var("DOT_AGENT_DECK_STAR_PROMPT") {
         return PathBuf::from(p);
     }
     config_dir().join("star-prompt-state.json")
 }
 
+/// The star-repo reminder's state (PRD #37), shared by the TUI and the
+/// desktop app (PRD #2174).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StarPromptState {
     pub launch_count: u64,
     pub permanently_dismissed: bool,
     pub last_prompt_at_launch: u64,
+    /// The file this state is read from and saved to. Not serialised: it is
+    /// where the state lives, not part of it.
+    #[serde(skip)]
+    path: Option<PathBuf>,
+}
+
+/// What the file at a path holds: a state, nothing yet, or something that
+/// could not be read (said once, by [`StarPromptState::load_from`]).
+enum StarPromptRead {
+    State(StarPromptState),
+    Missing,
+    Unreadable(String),
+}
+
+fn read_star_prompt(path: &Path) -> StarPromptRead {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => match serde_json::from_str::<StarPromptState>(&contents) {
+            Ok(state) => StarPromptRead::State(state),
+            Err(err) => StarPromptRead::Unreadable(format!(
+                "Invalid star prompt state at {}: {err}",
+                path.display()
+            )),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => StarPromptRead::Missing,
+        Err(err) => StarPromptRead::Unreadable(format!(
+            "Failed to read star prompt state at {}: {err}",
+            path.display()
+        )),
+    }
 }
 
 impl StarPromptState {
+    /// The state at [`star_prompt_path`].
     pub fn load() -> Self {
-        let path = star_prompt_path();
-        match std::fs::read_to_string(&path) {
-            Ok(contents) => match serde_json::from_str(&contents) {
-                Ok(state) => state,
-                Err(err) => {
-                    eprintln!("Invalid star prompt state at {}: {err}", path.display());
-                    Self::default()
-                }
-            },
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(err) => {
-                eprintln!(
-                    "Failed to read star prompt state at {}: {err}",
-                    path.display()
-                );
-                Self::default()
-            }
-        }
+        Self::load_from(star_prompt_path())
     }
 
+    /// The state at `path`; the default when the file is missing or cannot be
+    /// read (saying why on stderr for the second).
+    pub fn load_from(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let mut state = match read_star_prompt(&path) {
+            StarPromptRead::State(state) => state,
+            StarPromptRead::Missing => Self::default(),
+            StarPromptRead::Unreadable(why) => {
+                eprintln!("{why}");
+                Self::default()
+            }
+        };
+        state.path = Some(path);
+        state
+    }
+
+    fn path(&self) -> PathBuf {
+        self.path.clone().unwrap_or_else(star_prompt_path)
+    }
+
+    /// Write the state to its file.
+    ///
+    /// PRD #2174: written to a sibling temporary file and renamed over the
+    /// old one, so a reader — the other client starting at the same moment —
+    /// sees the old state or the new one, never a half-written file. An
+    /// unreadable file reads as "never dismissed", which would ask again
+    /// someone who had said "Don't ask again".
     pub fn save(&self) -> Result<(), String> {
-        let path = star_prompt_path();
+        let path = self.path();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("Failed to create star prompt directory: {e}"))?;
         }
         let contents = serde_json::to_string_pretty(self)
             .map_err(|e| format!("Failed to serialize star prompt state: {e}"))?;
-        std::fs::write(&path, contents).map_err(|e| {
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "star-prompt-state.json".to_string());
+        let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
+        let written = std::fs::write(&temp, contents).and_then(|()| std::fs::rename(&temp, &path));
+        written.map_err(|e| {
+            let _ = std::fs::remove_file(&temp);
             format!(
                 "Failed to write star prompt state at {}: {e}",
                 path.display()
@@ -1998,19 +2052,47 @@ impl StarPromptState {
         })
     }
 
+    /// Fold in what the file holds now, before a choice is saved.
+    ///
+    /// PRD #2174: the other client may have written the file since this one
+    /// read it — counted a launch, or been told "Don't ask again". Every
+    /// field only ever grows (a count, a flag that is never unset, the launch
+    /// a reminder was last shown at), so keeping the larger of each never
+    /// undoes a choice made in the other client. Quiet on purpose: the TUI
+    /// calls this while it owns the terminal, where stderr would draw over
+    /// the screen, and the startup read has already said what it found.
+    fn refresh(&mut self) {
+        if let StarPromptRead::State(disk) = read_star_prompt(&self.path()) {
+            self.launch_count = self.launch_count.max(disk.launch_count);
+            self.permanently_dismissed |= disk.permanently_dismissed;
+            self.last_prompt_at_launch = self.last_prompt_at_launch.max(disk.last_prompt_at_launch);
+        }
+    }
+
+    /// Whether this launch is one the reminder is shown at.
+    pub fn is_due(&self) -> bool {
+        !self.permanently_dismissed
+            && self.launch_count.saturating_sub(self.last_prompt_at_launch) >= STAR_PROMPT_INTERVAL
+    }
+
+    /// Count this launch, save it, and answer whether to show the reminder.
     pub fn increment_and_check(&mut self) -> bool {
         self.launch_count += 1;
         let _ = self.save();
-        !self.permanently_dismissed
-            && self.launch_count - self.last_prompt_at_launch >= STAR_PROMPT_INTERVAL
+        self.is_due()
     }
 
+    /// Remind me later: ask again after another [`STAR_PROMPT_INTERVAL`]
+    /// launches of either client.
     pub fn snooze(&mut self) {
+        self.refresh();
         self.last_prompt_at_launch = self.launch_count;
         let _ = self.save();
     }
 
+    /// Star on GitHub, or Don't ask again: never ask again, in either client.
     pub fn dismiss_permanently(&mut self) {
+        self.refresh();
         self.permanently_dismissed = true;
         let _ = self.save();
     }
@@ -3682,6 +3764,7 @@ command = "vim"
             launch_count: 42,
             permanently_dismissed: true,
             last_prompt_at_launch: 30,
+            ..StarPromptState::default()
         };
         let json = serde_json::to_string(&state).unwrap();
         let loaded: StarPromptState = serde_json::from_str(&json).unwrap();
@@ -3763,6 +3846,7 @@ command = "vim"
             launch_count: 15,
             permanently_dismissed: false,
             last_prompt_at_launch: 10,
+            ..StarPromptState::default()
         };
         state.save().unwrap();
 
@@ -3789,6 +3873,124 @@ command = "vim"
                 None => std::env::remove_var("DOT_AGENT_DECK_STAR_PROMPT"),
             }
         }
+    }
+
+    /// PRD #2174: a state written by a build before the shared reminder
+    /// carries over unchanged — its count and its "Don't ask again" — and is
+    /// saved back with the same three keys and nothing else.
+    #[test]
+    fn star_prompt_saved_state_from_an_older_build_carries_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star-prompt-state.json");
+        std::fs::write(
+            &path,
+            "{\n  \"launch_count\": 23,\n  \"permanently_dismissed\": true,\n  \"last_prompt_at_launch\": 20\n}",
+        )
+        .unwrap();
+
+        let mut state = StarPromptState::load_from(&path);
+        assert_eq!(state.launch_count, 23);
+        assert!(state.permanently_dismissed);
+        assert_eq!(state.last_prompt_at_launch, 20);
+        assert!(!state.increment_and_check(), "a dismissed state never asks");
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved,
+            serde_json::json!({
+                "launch_count": 24,
+                "permanently_dismissed": true,
+                "last_prompt_at_launch": 20
+            })
+        );
+    }
+
+    /// PRD #2174: a save replaces the file whole, through a sibling temporary
+    /// file, and leaves nothing else behind in the directory.
+    #[test]
+    fn star_prompt_save_replaces_the_file_and_leaves_no_temporary_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("star.json");
+        let mut state = StarPromptState::load_from(&path);
+        for _ in 0..3 {
+            state.increment_and_check();
+        }
+        let names: Vec<String> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["star.json".to_string()]);
+        assert_eq!(StarPromptState::load_from(&path).launch_count, 3);
+    }
+
+    /// PRD #2174: two clients share one file. Launches of either count
+    /// towards the reminder, which shows on the tenth whichever client it is.
+    #[test]
+    fn star_prompt_launches_of_either_client_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        for launch in 1..=9 {
+            // Alternate the two clients; each reads the file at its start.
+            let mut client = StarPromptState::load_from(&path);
+            assert!(!client.increment_and_check(), "launch {launch} asks");
+        }
+        let mut tenth = StarPromptState::load_from(&path);
+        assert!(tenth.increment_and_check(), "the tenth launch asks");
+    }
+
+    /// PRD #2174: a client that is showing the reminder when the other one
+    /// is told "Don't ask again" keeps that answer when it is answered
+    /// "Later" — a choice saves what the file holds now, not what it held
+    /// when the client started.
+    #[test]
+    fn star_prompt_later_keeps_a_dismissal_the_other_client_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        let mut seed = StarPromptState::load_from(&path);
+        for _ in 0..9 {
+            seed.increment_and_check();
+        }
+
+        let mut tui = StarPromptState::load_from(&path);
+        assert!(tui.increment_and_check(), "launch 10 asks the TUI");
+        let mut desktop = StarPromptState::load_from(&path);
+        assert!(
+            desktop.increment_and_check(),
+            "launch 11 asks the desktop app"
+        );
+
+        desktop.dismiss_permanently();
+        tui.snooze();
+
+        let after = StarPromptState::load_from(&path);
+        assert!(after.permanently_dismissed, "Later undid Don't ask again");
+        assert_eq!(after.launch_count, 11, "Later lost the desktop's launch");
+        let mut next = StarPromptState::load_from(&path);
+        for _ in 0..20 {
+            assert!(!next.increment_and_check());
+        }
+    }
+
+    /// PRD #2174: "Later" in one client pushes the next reminder in both
+    /// another ten launches away.
+    #[test]
+    fn star_prompt_later_delays_both_clients_ten_launches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        let mut seed = StarPromptState::load_from(&path);
+        for _ in 0..9 {
+            seed.increment_and_check();
+        }
+        let mut asked = StarPromptState::load_from(&path);
+        assert!(asked.increment_and_check());
+        asked.snooze();
+        for launch in 11..=19 {
+            let mut client = StarPromptState::load_from(&path);
+            assert!(!client.increment_and_check(), "launch {launch} asks");
+        }
+        let mut twentieth = StarPromptState::load_from(&path);
+        assert!(twentieth.increment_and_check(), "launch 20 asks again");
     }
 
     /// Issue #519: a `config.toml` written before the idle-art removal still

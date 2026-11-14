@@ -113,6 +113,12 @@ reason = "Dismisses the toast naming the agents a deck restart stopped: a dismis
 [[site]]
 file = "desktop/src/App.tsx"
 handler = "onClick"
+code = "onDismissStar"
+reason = "Dismisses the toast with the star reminder's sentence (thanks, or where to star): a dismissal. The reminder's three buttons are voice rows of their own (PRD #2174)."
+
+[[site]]
+file = "desktop/src/App.tsx"
+handler = "onClick"
 code = "onClose"
 reason = "Events drawer close X: a dismissal (the drawer's opening half is VOICE_ACTIONS.toggleEvidenceDrawer)."
 

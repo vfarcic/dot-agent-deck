@@ -1737,6 +1737,13 @@ export interface DeckRuntimeState {
    */
   projectTrustState?: (target: import("./lib/projectTrust").ProjectTrustTarget) => Promise<import("./lib/projectTrust").ProjectTrust>;
   approveProjectTrust?: (target: import("./lib/projectTrust").ProjectTrustTarget, digest: string) => Promise<import("./lib/projectTrust").ProjectTrust>;
+  /**
+   * PRD #2174 — whether this launch shows the star reminder, and the user's
+   * choice in it. Optional for the reason the two above are; a runtime
+   * without them never shows the reminder.
+   */
+  starPromptLaunch?: () => Promise<boolean>;
+  starPromptChoose?: (choice: import("./lib/starPrompt").StarChoice) => Promise<string | undefined>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /**

@@ -197,6 +197,8 @@ pub mod state;
 pub mod submitted_prompt;
 // PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
 pub mod system_browser;
+// PRD #2174: the star reminder's words, shared by the TUI and the desktop app.
+pub mod star_prompt;
 pub mod tab;
 pub mod tab_layout;
 pub mod task_completion;

@@ -7,6 +7,7 @@ import { voiceDeckStep } from "../lib/newAgent";
 import { agentKey, boundAgentKey } from "../lib/agentKey";
 import { LaunchCleanupError } from "../lib/actionError";
 import type { ProjectTrustTarget } from "../lib/projectTrust";
+import type { StarChoice } from "../lib/starPrompt";
 import { applyTerminalChunk } from "../lib/terminalBuffer";
 import { deckName } from "../lib/displayText";
 import type { WorktreeKeptEntry } from "../lib/worktreeClose";
@@ -415,6 +416,10 @@ export function useDeckRuntime(): DeckRuntimeState {
   // launching screen's to say, not the global toast's.
   const projectTrustState = useCallback((target: ProjectTrustTarget) => bridge.projectTrustState(target), [bridge]);
   const approveProjectTrust = useCallback((target: ProjectTrustTarget, digest: string) => bridge.approveProjectTrust(target, digest), [bridge]);
+  // PRD #2174: the star reminder. A bridge without the calls (some test
+  // doubles) leaves both absent, and the app never shows the reminder.
+  const starPromptLaunch = useMemo(() => (typeof bridge.starPromptLaunch === "function" ? () => bridge.starPromptLaunch!() : undefined), [bridge]);
+  const starPromptChoose = useMemo(() => (typeof bridge.starPromptChoose === "function" ? (choice: StarChoice) => bridge.starPromptChoose!(choice) : undefined), [bridge]);
   // PRD #1487 M5: Upgrade and Replace daemon. Their outcome — kept running,
   // failed while installing — is the dialog's to show, not the global error
   // toast's, so these bypass `runAction` too. A bridge without the verbs (some
@@ -519,6 +524,8 @@ export function useDeckRuntime(): DeckRuntimeState {
     newAgentOrchestrations,
     projectTrustState,
     approveProjectTrust,
+    ...(starPromptLaunch ? { starPromptLaunch } : {}),
+    ...(starPromptChoose ? { starPromptChoose } : {}),
     getSettings,
     saveSettings,
     testEndpoint,

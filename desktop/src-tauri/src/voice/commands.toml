@@ -2065,6 +2065,58 @@ asks_to     = "approve the project commands on screen and start the orchestratio
 try_saying  = "approve and start"
 must_name   = ["approve"]
 
+# PRD #2174 — the star reminder's three buttons. The app shows the reminder at
+# startup about once every ten launches, over whichever screen comes up, so the
+# rows run on every screen the app opens on; each chooses only while the
+# reminder is showing and nothing is drawn over it, and with no reminder showing
+# the app says so and does nothing (`chooseShownStarPrompt`). Voice may press
+# them for the reason it may press any button of a dialog the user is looking
+# at: none starts or stops anything. "Cancel", "close" and "never mind" are
+# `close`'s, which closes the reminder as the overlay on top — Later, as `Esc`
+# is in both clients.
+[[commands]]
+id          = "star_repo"
+description = """Star the dot-agent-deck repository from the star reminder — the reminder's Star
+button. It opens the repository page on GitHub in the browser and stops the reminder asking again.
+Use for star, star it, star the repo, star the repository, star dot-agent-deck, star on GitHub, or
+open the repo to star it. It runs only while the star reminder ("Enjoying dot-agent-deck?") is
+showing; with none showing the app says so. Asking to be reminded later is `remind_star_later`,
+and asking never to be asked again is `dismiss_star_prompt`."""
+invoke      = "starRepo"
+screens     = ["deck", "overview", "agent"]
+unavailable_hint = "starring works while the star reminder is showing"
+report      = "Opening the repository to star it."
+asks_to     = "star the repository"
+try_saying  = "star the repo"
+
+[[commands]]
+id          = "remind_star_later"
+description = """Close the star reminder and ask again later — the reminder's Later button: it asks
+again after another ten launches of the app or the TUI. Use for later, remind me later,
+ask me later, not now, maybe later, or snooze it. It runs only while the star reminder
+("Enjoying dot-agent-deck?") is showing; with none showing the app says so. Starring is
+`star_repo`, and never being asked again is `dismiss_star_prompt`."""
+invoke      = "remindStarLater"
+screens     = ["deck", "overview", "agent"]
+unavailable_hint = "reminding later works while the star reminder is showing"
+report      = "The star reminder will ask again later."
+asks_to     = "be reminded about starring later"
+try_saying  = "remind me later"
+
+[[commands]]
+id          = "dismiss_star_prompt"
+description = """Stop the star reminder for good — the reminder's Don't ask again button: neither the
+app nor the TUI asks again. Use for don't ask again, do not ask again, never ask again,
+don't ask me again, stop asking, or dismiss the reminder. It runs only while the star reminder
+("Enjoying dot-agent-deck?") is showing; with none showing the app says so. Starring is
+`star_repo`, and being asked again later is `remind_star_later`."""
+invoke      = "dismissStarPrompt"
+screens     = ["deck", "overview", "agent"]
+unavailable_hint = "dismissing the star reminder works while it is showing"
+report      = "The star reminder will not ask again."
+asks_to     = "never be asked to star the repository again"
+try_saying  = "don't ask again"
+
 # PRD #1223 x PRD #802 D5 — the two rows that STOP something, and the one rule
 # they share: **each terminates at a `ConfirmDialog`, never at a direct
 # dispatch.** D5 requires confirmation "regardless of model confidence, because

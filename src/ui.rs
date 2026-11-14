@@ -7926,13 +7926,10 @@ fn star_repo_and_report() -> String {
 }
 
 /// The status message for a star attempt, split out from the browser call so
-/// the exact bytes are testable without launching anything.
+/// the exact bytes are testable without launching anything. The desktop app
+/// says the same (PRD #2174), so the words live in [`crate::star_prompt`].
 fn star_message(opened: bool) -> String {
-    if opened {
-        "Thanks for starring! ⭐".to_string()
-    } else {
-        format!("Visit {} to star ⭐", repo_identity::DISPLAY)
-    }
+    crate::star_prompt::star_message(opened)
 }
 
 /// PRD #1885: open the trust prompt for `view`. Nothing it was opened for is
@@ -21523,8 +21520,8 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
 
     let text = vec![
         Line::from(""),
-        Line::styled("  If you find dot-agent-deck useful,", text_primary()),
-        Line::styled("  please consider starring the repo!", text_primary()),
+        Line::styled(format!("  {}", crate::star_prompt::BODY[0]), text_primary()),
+        Line::styled(format!("  {}", crate::star_prompt::BODY[1]), text_primary()),
         Line::from(""),
         Line::styled(
             format!("  {}", repo_identity::DISPLAY),
@@ -21540,7 +21537,7 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     let key_line = u16::try_from(text.len() - 1).ok();
 
     let block = Block::default()
-        .title(" ⭐ Enjoying dot-agent-deck? ")
+        .title(format!(" ⭐ {} ", crate::star_prompt::TITLE))
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -29707,6 +29704,25 @@ mod tests {
     /// into a `format!` over `repo_identity::DISPLAY`, so the bytes it renders
     /// are asserted against the literal it replaced. The success message never
     /// named the repo and is here only to pin the other branch.
+    /// PRD #2174: the prompt's key line names the choices in the words the
+    /// desktop app's dialog uses too, which live in `crate::star_prompt`.
+    #[test]
+    fn star_prompt_key_line_uses_the_shared_words() {
+        use crate::star_prompt::{DONT_ASK_AGAIN, LATER, STAR};
+        assert_eq!(
+            STAR_PROMPT_KEYS.0,
+            format!("s {STAR}  l {LATER}  d {DONT_ASK_AGAIN}")
+        );
+        assert_eq!(
+            STAR_PROMPT_KEYS.1,
+            [
+                format!("s {STAR}").as_str(),
+                format!("l {LATER}").as_str(),
+                format!("d {DONT_ASK_AGAIN}").as_str()
+            ]
+        );
+    }
+
     #[test]
     fn star_message_is_byte_identical_to_the_literals_it_replaced() {
         assert_eq!(star_message(true), "Thanks for starring! ⭐");

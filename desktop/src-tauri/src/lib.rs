@@ -45,6 +45,7 @@ mod selection_saves;
 // (the app and the CLI beside it) on the root crate's shared core.
 mod self_upgrade;
 mod settings;
+mod star_prompt;
 mod terminal;
 mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
@@ -7055,6 +7056,8 @@ pub fn run() {
             desktop_new_agent_orchestrations,
             trust_review::desktop_project_trust_state,
             trust_review::desktop_approve_project_trust,
+            star_prompt::desktop_star_prompt_launch,
+            star_prompt::desktop_star_prompt_choose,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_new_agent_options,

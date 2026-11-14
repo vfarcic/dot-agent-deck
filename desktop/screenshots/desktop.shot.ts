@@ -135,6 +135,15 @@ desktopScenario("project-trust", async (page) => {
   await expect(dialog.getByRole("button", { name: "Approve and start" })).toBeVisible();
 });
 
+// PRD #2174 — the star reminder the TUI `star-prompt` image shows, on a launch
+// it shows at (`?star=1`), over the empty dashboard.
+desktopScenario("star-prompt", async (page) => {
+  await page.goto("/?fixture=1&state=empty&star=1");
+  const dialog = page.getByRole("alertdialog", { name: "Enjoying dot-agent-deck?" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "s Star" })).toBeInViewport();
+});
+
 desktopScenario("agent-pane", async (page) => {
   await overview(page, "docs");
   await page.getByRole("button", { name: "Open Desktop implementation agent" }).click();

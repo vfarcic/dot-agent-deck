@@ -17945,6 +17945,8 @@ mod tests {
     const PROJECT_TRUST_TS: &str = include_str!("../../../src/lib/projectTrust.ts");
     const PROJECT_TRUST_DIALOG_TSX: &str =
         include_str!("../../../src/components/ProjectTrustDialog.tsx");
+    /// PRD #2174 — the star reminder's words, which its buttons render.
+    const STAR_PROMPT_TS: &str = include_str!("../../../src/lib/starPrompt.ts");
     /// The one rail, shown beside the overview as well as the deck (#1197).
     const NAVIGATION_RAIL_TSX: &str = include_str!("../../../src/components/NavigationRail.tsx");
     const NEW_AGENT_TS: &str = include_str!("../../../src/lib/newAgent.ts");
@@ -17973,7 +17975,30 @@ mod tests {
     /// included — whose control has a voice row, with that row. `docs/develop/voice-first-design.md`
     /// section 5 has the rule; the labels left out on purpose are listed there
     /// with their reasons.
-    const CONTROL_LABELS: [ControlLabel; 28] = [
+    const CONTROL_LABELS: [ControlLabel; 31] = [
+        // PRD #2174 — the star reminder's three buttons, each its own row.
+        // Shown at startup over the dashboard, never over the New agent form.
+        ControlLabel {
+            source: "STAR = \"Star\"",
+            file: STAR_PROMPT_TS,
+            said: "Star",
+            row: "star_repo",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "LATER = \"Later\"",
+            file: STAR_PROMPT_TS,
+            said: "Later",
+            row: "remind_star_later",
+            over_the_form: false,
+        },
+        ControlLabel {
+            source: "DONT_ASK_AGAIN = \"Don't ask again\"",
+            file: STAR_PROMPT_TS,
+            said: "Don't ask again",
+            row: "dismiss_star_prompt",
+            over_the_form: false,
+        },
         // PRD #1885 — the Review project commands dialog, over the New agent
         // form (and over the Runs screen): Approve and start is its own row,
         // and Cancel is `close`, which cancels the dialog on top.
@@ -18409,6 +18434,11 @@ mod tests {
             ("close", "close resource usage"),
             ("close", "hide resource usage"),
             ("close", "close the host figures"),
+            // PRD #2174 — the star reminder's buttons, and the words the
+            // user docs give for them.
+            ("star_repo", "star the repo"),
+            ("remind_star_later", "remind me later"),
+            ("dismiss_star_prompt", "don't ask again"),
         ] {
             // A description wraps across lines, so compare word runs.
             let description = spoken_words(&table().row(row).expect("present").description);
