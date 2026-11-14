@@ -70,7 +70,7 @@ tasks:
   - key: node
     call: nodejs/install 1.2.0
     with:
-      node-version: "26.13.0"
+      node-version: "26.13.1"
 
   # cargo-mutants, for `/code-cleanup`'s tests mode
   # (`.claude/skills/code-cleanup/find-targets.sh tests`), so a mutation run,
