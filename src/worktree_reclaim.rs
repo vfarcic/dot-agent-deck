@@ -265,9 +265,9 @@ pub(crate) fn paths_inside<'a>(dir: &Path, all: &'a [PathBuf]) -> Vec<&'a PathBu
         .collect()
 }
 
-/// Enumerate linked worktrees (excludes the main working tree) for the repo
-/// rooted at or above `repo_dir`.
-fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
+/// Enumerate every worktree of the repo rooted at or above `repo_dir`, the
+/// main working tree first (git's documented order).
+fn list_all_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
     let out = git_at(repo_dir)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
@@ -278,11 +278,7 @@ fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let mut all = parse_worktree_porcelain(&out.stdout);
-    if !all.is_empty() {
-        all.remove(0); // the main working tree
-    }
-    Ok(all)
+    Ok(parse_worktree_porcelain(&out.stdout))
 }
 
 /// Outcome of probing a worktree's cleanliness. `Unresolvable` is distinct
@@ -564,8 +560,13 @@ fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
 /// scenario via worktree-scoped remotes — the common config's value always
 /// wins.)
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
-    let raw = list_linked_worktrees(repo_dir)?;
+    let mut raw = list_all_worktrees(repo_dir)?;
+    // Issue #2285: the main working tree is never a candidate, but it counts
+    // as one a candidate could hold, so containment reads the whole listing.
     let all_paths = existing_paths(raw.iter().map(|wt| wt.path.clone()));
+    if !raw.is_empty() {
+        raw.remove(0); // the main working tree
+    }
     let mut reports = Vec::with_capacity(raw.len());
     for wt in raw {
         let cleanliness = check_cleanliness(&wt.path);
@@ -597,13 +598,16 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
     Ok(reports)
 }
 
-/// Issue #2285: the listed worktree paths whose directories still exist. One
-/// that is gone (git's `prunable`) has nothing left to lose, so it keeps no
-/// parent, as for close.
+/// Issue #2285: the listed worktree paths, less those whose directories are
+/// confirmed gone. One that is gone (git's `prunable`) has nothing left to
+/// lose, so it keeps no parent, as for close; one that cannot be looked at
+/// for any other reason is kept, since it may hold work.
 fn existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     paths
         .into_iter()
-        .filter(|p| p.symlink_metadata().is_ok())
+        .filter(
+            |p| !matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        )
         .collect()
 }
 
@@ -867,6 +871,58 @@ mod tests {
         std::fs::remove_dir_all(&live).unwrap();
         let all = existing_paths([unit.clone(), live]);
         assert!(paths_inside(&unit, &all).is_empty());
+    }
+
+    /// Issue #2285 (review): the main working tree is never a reclaim
+    /// candidate, but a linked worktree holding it is kept, since removing
+    /// that worktree would delete the main checkout with it.
+    #[test]
+    fn a_linked_worktree_holding_the_main_checkout_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = tmp.path();
+        let main = sandbox.join("outer").join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::git_env::fixture_git(dir, sandbox)
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&main, &["init", "-q", "."]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // The containment set comes from the whole listing, so the main
+        // checkout counts as held by any candidate directory around it — here
+        // `outer`, its parent, stands in for such a candidate.
+        let linked = sandbox.join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "l",
+                &linked.to_string_lossy(),
+            ],
+        );
+        let all = existing_paths(
+            list_all_worktrees(&main)
+                .unwrap()
+                .into_iter()
+                .map(|wt| wt.path),
+        );
+        let main_real = std::fs::canonicalize(&main).unwrap();
+        assert!(
+            all.contains(&main_real),
+            "the listing keeps the main tree: {all:?}"
+        );
+        let parent = main_real.parent().unwrap();
+        assert_eq!(paths_inside(parent, &all), vec![&main_real]);
+        assert!(matches!(
+            keep_if_it_holds_worktrees(Verdict::Remove, &paths_inside(parent, &all)),
+            Verdict::Keep(_)
+        ));
     }
 
     #[test]
@@ -1249,7 +1305,7 @@ mod tests {
 
         use crate::git_env::fixture_git;
         use crate::worktree_reclaim::{
-            Cleanliness, check_cleanliness, list_linked_worktrees, remove_worktree_dir,
+            Cleanliness, check_cleanliness, list_all_worktrees, remove_worktree_dir,
         };
 
         /// Marker in the child's environment: this process is the re-exec'd half
@@ -1574,7 +1630,9 @@ mod tests {
             // 2. READ — the enumeration `examine_worktrees` makes its removal
             //    decision from. The decoy has a linked worktree of its own, so a
             //    steered answer is available and wrong.
-            let listed = list_linked_worktrees(&clone).expect("list the clone's linked worktrees");
+            let listed = list_all_worktrees(&clone)
+                .expect("list the clone's worktrees")
+                .split_off(1);
             let paths: Vec<PathBuf> = listed
                 .iter()
                 .map(|w| std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()))

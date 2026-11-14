@@ -267,8 +267,13 @@ pub async fn nested_worktrees(
         .map_err(|e| format!("could not resolve {}: {e}", worktree_dir.display()))?;
     let mut resolved = Vec::new();
     for listed in crate::worktree_reclaim::worktree_paths_from_porcelain_z(&output.stdout) {
-        if let Ok(path) = tokio::fs::canonicalize(&listed).await {
-            resolved.push(path);
+        match tokio::fs::canonicalize(&listed).await {
+            Ok(path) => resolved.push(path),
+            // Gone: nothing left to lose.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            // Any other failure may hide live work, so the question was not
+            // answered and the caller keeps the tree.
+            Err(e) => return Err(format!("could not resolve {}: {e}", listed.display())),
         }
     }
     // Named under `worktree_dir` as the deck holds it, so a report puts each
@@ -303,15 +308,21 @@ pub enum TreeKeepCheck {
 /// The ONE question a `KeepIfDirty` removal and the close preview ask before
 /// deleting a tree, so they cannot disagree: does it hold uncommitted work
 /// ([`worktree_is_dirty`]), and failing that, other worktrees
-/// ([`nested_worktrees`])? `Err` when either could not be asked.
+/// ([`nested_worktrees`])? `Err` when either could not be asked. The two read
+/// git concurrently, so the close preview's deadline covers one round trip
+/// rather than two.
 pub async fn worktree_keep_check(
     worktree_dir: &Path,
     clone_dir: &Path,
 ) -> Result<TreeKeepCheck, String> {
-    if worktree_is_dirty(worktree_dir).await? {
+    let (dirty, nested) = tokio::join!(
+        worktree_is_dirty(worktree_dir),
+        nested_worktrees(worktree_dir, clone_dir)
+    );
+    if dirty? {
         return Ok(TreeKeepCheck::Dirty);
     }
-    let nested = nested_worktrees(worktree_dir, clone_dir).await?;
+    let nested = nested?;
     Ok(if nested.is_empty() {
         TreeKeepCheck::Clean
     } else {
@@ -5562,6 +5573,31 @@ mod tests {
             "with nothing inside it, the unit is removed as before"
         );
         assert!(!unit.exists());
+    }
+
+    /// Issue #2285 (review): a listed nested worktree that exists but cannot
+    /// be resolved (here, behind a directory with no search permission) may
+    /// hold work, so the question is unanswered and the removal KEEPS the
+    /// tree, rather than reading the unresolvable entry as gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unresolvable_nested_worktree_keeps_the_tree() {
+        use std::os::unix::fs::PermissionsExt;
+        // SAFETY: geteuid has no preconditions. Permissions do not bind for
+        // root, which can resolve the path anyway.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let (repo, unit, _nested) = init_unit_with_nested_worktree(tmp.path());
+        let blocked = unit.join(".worktrees");
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let answer = nested_worktrees(&unit, &repo).await;
+        let outcome = remove_worktree_outcome(&unit, &repo, RemovalPolicy::KeepIfDirty).await;
+        std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(answer.is_err(), "{answer:?}");
+        assert_eq!(outcome, WorktreeRemoval::KeptCouldNotCheck);
+        assert!(unit.join(".worktrees/feat-1-demo/wip.txt").is_file());
     }
 
     /// Issue #2285: the close preview asks the same question as the removal,
