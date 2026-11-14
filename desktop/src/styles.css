@@ -658,7 +658,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .status-label.status-failed { color: var(--red); background: var(--red-soft); }
 .status-label.status-blocked { color: var(--red); background: var(--red-soft); outline: 1px dashed var(--red); outline-offset: -1px; }
 .status-label.status-waiting { color: var(--teal); background: transparent; outline: 1px dashed var(--teal); outline-offset: -1px; }
-.agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Wraps rather than eliding (issue #2312): at the type scale's sizes a provider
+   limit's label can fill a half-width tile's line, and the reset countdown that
+   follows it is the part a person needs. */
+.agent-identity p.agent-blocked-reason, .agent-blocked-reason { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 /* PRD #1666: the inbox line beside the status, and the undelivered-message notice under it. */
 /* Issue #2075 — a question waiting, and for how long: the overview's ORCHESTRATOR
    chip's shape in the Needs Input colour, since this one is asking for a person. */
