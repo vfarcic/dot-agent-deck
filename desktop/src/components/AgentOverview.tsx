@@ -1317,7 +1317,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     Daemon selector's Add a daemon… entry is there for everyone, always.
   */
   const openAddDaemon = useContext(AddDaemonOpener);
-  const onlyLocalDaemon = settings?.loaded === true && !settings.settings.endpoints?.remote.length;
+  /* `chosen`, not `loaded`: a settings read that failed is loaded with the
+     defaults standing in, and those say nothing about which daemons the user
+     has (Qodo, PR #2319). */
+  const onlyLocalDaemon = settings?.chosen === true && !settings.settings.endpoints?.remote.length;
   const addDaemon = openAddDaemon && onlyLocalDaemon ? () => VOICE_ACTIONS.addDaemon.run({ openAddDaemon }) : undefined;
   /**
    * `Ctrl+N` / `Cmd+N`, the TUI's `Ctrl+n` (PRD #1223 M4) — on this screen only,

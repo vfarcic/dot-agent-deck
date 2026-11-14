@@ -17,6 +17,15 @@ import type { DeckRuntimeState, DeckSnapshot, DeckView } from "../types";
 import { DeckShell } from "../App";
 import { AddDaemonDialog } from "./AddDaemonDialog";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
+import { SettingsBridgeProvider, type SettingsBridge } from "../lib/settingsBridge";
+
+/** A bridge with no keychain, for the cases that need only the name check. */
+const NO_SECRETS: SettingsBridge = {
+  testEndpoint: vi.fn(),
+  secretStatus: vi.fn(),
+  storeSecret: vi.fn(),
+  forgetSecret: vi.fn(),
+};
 
 vi.mock("./TerminalViewport", () => ({
   TerminalViewport: ({ agentId }: { agentId: string }) => <pre data-testid={`terminal-${agentId}`}>terminal</pre>,
@@ -169,6 +178,15 @@ describe("the empty-agents note", () => {
     expect(screen.getByRole("dialog", { name: "Add a daemon" })).toBeVisible();
   });
 
+  /// Scenario: the settings file cannot be read, so the app does not know which daemons are configured. The empty-agents note offers no Add a daemon rather than assuming this machine is the only one; the Daemon selector still offers Add a daemon….
+  it("offers nothing extra when the settings could not be read", async () => {
+    await mountShell(runtime(createFixtureSnapshot("empty"), settingsWith(), { getSettings: vi.fn(async () => { throw new Error("unreadable"); }) }));
+    const note = screen.getByTestId("overview-first-run");
+
+    expect(within(note).queryByTestId("overview-first-run-add-daemon")).toBeNull();
+    expect(within(await openMenu()).getByTestId("deck-selector-add")).toBeVisible();
+  });
+
   /// Scenario: a remote daemon is already configured and this machine has no agents. Its empty-agents note shows no Add a daemon button or hint; the Daemon selector still offers Add a daemon….
   it("offers nothing extra once another daemon is configured", async () => {
     await mountShell(runtime(createFixtureSnapshot("empty"), settingsWith(oneRemote())));
@@ -182,19 +200,53 @@ describe("the empty-agents note", () => {
 });
 
 describe("AddDaemonDialog", () => {
-  /// Scenario: press Add this daemon and have the save refused. The dialog stays open with the draft and the reason under it, rather than closing on a daemon that was not stored.
-  it("keeps the form when the save fails", async () => {
+  /// Scenario: press Add this daemon and have the save come back with the file on disk not holding the daemon (its name was taken in a terminal meanwhile). The dialog stays open with the draft and the reason under it, rather than closing on a daemon that was not stored.
+  it("keeps the form when the file on disk did not take the daemon", async () => {
     const onClose = vi.fn();
-    const save = vi.fn(async () => ({ saved: false as const }));
+    const save = vi.fn(async () => ({ saved: false as const, disk: settingsWith() }));
     const { rerender } = render(<AddDaemonDialog settings={{ settings: settingsWith(), save }} onClose={onClose} />);
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
     fireEvent.click(screen.getByTestId("add-daemon-save"));
     await waitFor(() => expect(save).toHaveBeenCalled());
-    rerender(<AddDaemonDialog settings={{ settings: settingsWith(), save, saveError: "Saving your settings failed: disk full." }} onClose={onClose} />);
+    rerender(<AddDaemonDialog settings={{ settings: settingsWith(), save, saveError: "The daemon list changed outside the app; nothing was written." }} onClose={onClose} />);
 
     await waitFor(() => expect(screen.getByLabelText("Host")).toHaveValue("build-box"));
-    expect(screen.getByTestId("add-daemon-error")).toHaveTextContent("disk full");
+    expect(screen.getByTestId("add-daemon-error")).toHaveTextContent("nothing was written");
     expect(onClose).not.toHaveBeenCalled();
+  });
+
+  /// Scenario: press Add this daemon and have the write fail with the change still applied, as a Settings save that fails is. The dialog closes: the daemon is added for this session and the next save writes it, exactly as when it is added from Settings.
+  it("closes when the save is applied but not yet written, as Settings does", async () => {
+    const onClose = vi.fn();
+    const save = vi.fn(async () => ({ saved: false as const }));
+    render(<AddDaemonDialog settings={{ settings: settingsWith(), save }} onClose={onClose} />);
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.click(screen.getByTestId("add-daemon-save"));
+    await waitFor(() => expect(onClose).toHaveBeenCalled());
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  /// Scenario: type a host and a name, press Add this daemon, and have the dialog close while the name is still being checked. When the check then comes back clean, nothing is stored.
+  it("stores nothing when the dialog closes while the name is being checked", async () => {
+    let answer: (refusal: string | null) => void = () => undefined;
+    const checkDeckName = vi.fn(() => new Promise<string | null>((resolve) => { answer = resolve; }));
+    const save = vi.fn(async () => ({ saved: true as const }));
+    const view = render(
+      <SettingsBridgeProvider value={{ ...NO_SECRETS, checkDeckName }}>
+        <AddDaemonDialog settings={{ settings: settingsWith(), save }} onClose={vi.fn()} />
+      </SettingsBridgeProvider>,
+    );
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.change(screen.getByLabelText("Deck name"), { target: { value: "build" } });
+    await act(async () => { answer(null); await Promise.resolve(); });
+    fireEvent.click(screen.getByTestId("add-daemon-save"));
+    expect(checkDeckName).toHaveBeenCalledTimes(2);
+    // Gone by a route that is not this dialog's own Cancel — the screen
+    // under it switched, say — while the final name check is still out.
+    view.unmount();
+    await act(async () => { answer(null); await Promise.resolve(); });
+
+    expect(save).not.toHaveBeenCalled();
   });
 
   /// Scenario: the Add this daemon button stays disabled until a host is typed, so an empty daemon can never be stored.

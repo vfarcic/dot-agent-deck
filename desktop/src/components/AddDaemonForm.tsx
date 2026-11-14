@@ -69,11 +69,18 @@ export function saveEndpointSection(onSave: SettingsPanelProps["onSave"], docume
 
 /** How {@link NewDaemon.confirm} ended. */
 export type ConfirmResult =
-  /** Stored and selected, or the save is out of this form's hands. */
+  /**
+   * Stored and selected. That includes a save the settings hook kept on screen
+   * after its write failed: `useDesktopSettings` applies the change, says the
+   * write failed, and carries the edit into the next save, so the daemon is
+   * added in this session exactly as it is from Settings.
+   */
   | "added"
-  /** Nothing stored: the draft is back on screen, with the reason beside it or in the save error. */
+  /** Nothing stored: the name was refused, and the reason is beside the field. */
   | "kept"
-  /** There was nothing valid to store. */
+  /** Nothing stored: the save ran and the file on disk shows the daemon is not in it; the draft is back, and the save error says why. */
+  | "restored"
+  /** There was nothing valid to store, or the add was cancelled before its save started. */
   | "none";
 
 export interface NewDaemon {
@@ -109,12 +116,9 @@ export interface NewDaemon {
  * it was there**.
  *
  * `startOpen` starts with a draft already being filled in, for a surface that
- * is the form and nothing else (the dialog). `keepOnFailedSave` brings the
- * draft back after ANY failed save rather than only after one the disk shows
- * did not store the row: Settings shows the save error under the chooser it
- * stays on, while a dialog that closed would leave the user nothing to read.
+ * is the form and nothing else (the dialog).
  */
-export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanelProps["onSave"], { startOpen = false, keepOnFailedSave = false }: { startOpen?: boolean; keepOnFailedSave?: boolean } = {}): NewDaemon {
+export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanelProps["onSave"], { startOpen = false }: { startOpen?: boolean } = {}): NewDaemon {
   // `undefined` wherever no provider is mounted — a form rendered standalone.
   // The name field is then absent, and a save stores no name (the library
   // derives one); see `lib/settingsBridge.tsx`.
@@ -135,6 +139,18 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
   /** The draft as of the latest edit, for the confirmation that resolves after an `await`. */
   const latestDraft = useRef(draft);
   latestDraft.current = draft;
+  /**
+   * Whether the surface holding this form is still mounted. A dialog closed
+   * while the name check is in flight unmounts with the confirmation still
+   * awaiting; it must not then store the daemon the user walked away from
+   * (Greptile and Qodo, PR #2319). Set in an effect rather than at render so
+   * a StrictMode remount sets it back.
+   */
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => { alive.current = false; };
+  }, []);
   /**
    * What the library said about the last name checked, keyed by the draft it
    * was checked for and the exact text. A verdict for any other text is stale
@@ -196,6 +212,9 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
   };
 
   const cancel = () => {
+    // The ref too, at once: a confirmation awaiting the name check reads it
+    // next, possibly before (or without) another render.
+    latestDraft.current = undefined;
     setDraft(undefined);
     setNameState("");
   };
@@ -245,9 +264,10 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
       }
     }
     // The draft as it is NOW, which the user may have edited while the check
-    // ran; abandoned meanwhile means there is nothing to store.
+    // ran; abandoned meanwhile — cancelled, or its surface closed — means there
+    // is nothing to store.
     const now = latestDraft.current;
-    if (!now || now.id !== asked.id || rowProblems(now).length > 0) return "none";
+    if (!alive.current || !now || now.id !== asked.id || rowProblems(now).length > 0) return "none";
     const document = latest.current;
     const current = sectionOf(document);
     const row: RemoteEndpointDto = chosen ? { ...now, name: chosen } : now;
@@ -259,16 +279,19 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
     } finally {
       setPending(undefined);
     }
-    if (!outcome || outcome.saved) return "added";
-    if (outcome.disk && sectionOf(outcome.disk).remote.some((stored) => stored.id === row.id)) return "added";
-    if (!outcome.disk && !keepOnFailedSave) return "added";
+    // A failure with no document from disk leaves the change applied and
+    // carried into the next save (`useDesktopSettings`), so the daemon IS
+    // added for this session; bringing the draft back would offer to add it a
+    // second time over a list that already holds it (Qodo, PR #2319).
+    if (!outcome || outcome.saved || !outcome.disk) return "added";
+    if (sectionOf(outcome.disk).remote.some((stored) => stored.id === row.id)) return "added";
     // Another draft started meanwhile is the user's newer intent; leave it.
-    if (latestDraft.current) return "kept";
+    if (latestDraft.current) return "restored";
     setDraft(now);
     setNameState(chosen);
     touched.current = Boolean(chosen);
     setNameCheck(undefined);
-    return "kept";
+    return "restored";
   };
 
   return {

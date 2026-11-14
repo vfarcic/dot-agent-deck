@@ -29,7 +29,7 @@ The app reaches a remote daemon through an ssh tunnel, using the `ssh` program o
    Fill in the fields (below), check the **Deck name** the app suggests or type your own, and press **Add this daemon**. The daemon is added and chosen, and the Dashboard shows it; from then on, changes to its fields are saved in **Settings → Daemons** as you make them. From the Dashboard the form opens in a dialog over the screen you were on: **Cancel**, `Escape` or a click outside closes it without adding anything. If you registered the host with `dot-agent-deck remote add` while the app was open, restart the app to see it; it is then already listed.
 
    ![The Add a daemon dialog over the empty Dashboard: Deck name, Host filled in as build-box, User as dev, Port 22, Key file, Jump host and Daemon socket, with Cancel and Add this daemon](/img/add-daemon-desktop.png)
-4. **Press Test connection.** It checks the daemon and, when **Daemon socket** is empty, finds the socket path on the host and saves it.
+4. **Press Test connection.** It is in **Settings → Daemons**: open **Settings** in the rail, choose **Daemons**, and choose the daemon you added (it is already chosen when you added it there). **Test connection** checks the daemon and, when **Daemon socket** is empty, finds the socket path on the host and saves it.
 5. **Choose the daemon** in the Dashboard's **Daemon** selector, or choose **All daemons**.
 
 **Check it worked:** **Test connection** reports `<daemon> answered and is compatible with this app.`, and on the Dashboard the daemon's section lists its agents (or **No agents are running yet**) instead of a title such as **Daemon disconnected**.

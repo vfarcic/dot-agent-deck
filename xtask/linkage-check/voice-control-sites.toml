@@ -169,13 +169,13 @@ reason = "Keyboard shortcut sheet close: a dismissal."
 [[site]]
 file = "desktop/src/components/AddDaemonDialog.tsx"
 handler = "onMouseDown"
-code = "onClose"
+code = "() => void dismiss()"
 reason = "A click outside the Add a daemon dialog dismisses it, storing nothing; voice's `close` dismisses it too, through the overlay stack."
 
 [[site]]
 file = "desktop/src/components/AddDaemonDialog.tsx"
 handler = "onClick"
-code = "onClose"
+code = "() => void dismiss()"
 reason = "The Add a daemon dialog's Cancel: a dismissal that stores nothing; voice's `close` does the same."
 
 [[site]]
