@@ -1414,11 +1414,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   */
   /* PRD #2174 — the star reminder waits while something more important is
      open over the app at startup (a confirmation such as the upgrade the app
-     offers when it starts, the newer-release dialog, the New agent dialog,
+     offers when it starts, or is waiting to offer, the newer-release dialog, the New agent dialog,
      Settings, the pull request browser), and comes up once it closes. Under
      the New agent dialog it would leave voice's `close` closing the form
      behind it (Greptile, PR #2321). */
-  const starShown = star.due && !confirmationOpen && !selfUpgradeOpen && !newAgentOpen && !overlaysOpen.settings && !prBrowser;
+  const starShown = star.due && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>

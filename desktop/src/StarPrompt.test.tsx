@@ -11,6 +11,7 @@ import {
   STAR,
   STAR_BODY_FIRST,
   STAR_BODY_SECOND,
+  STAR_KEYS_ARM_MS,
   STAR_PROMPT_COVERED,
   STAR_REPO_DISPLAY,
   STAR_THANKS,
@@ -58,6 +59,11 @@ function runtimeOf(star: Partial<DeckRuntimeState>): DeckRuntimeState {
   } as unknown as DeckRuntimeState;
 }
 
+/** Wait until the dialog's keys choose (`STAR_KEYS_ARM_MS` after it is drawn). */
+async function keysReady(dialog: HTMLElement): Promise<void> {
+  await waitFor(() => expect(dialog).toHaveAttribute("data-keys-ready", "true"), { timeout: STAR_KEYS_ARM_MS * 5 });
+}
+
 /** An overlay drawn over the reminder, standing in for any dialog opened after it. */
 function Above() {
   const ref = useInertBackground<HTMLDivElement>(true, OVERLAY_LAYER.dialog);
@@ -77,11 +83,13 @@ describe("the star reminder dialog", () => {
     expect(within(dialog).getByRole("button", { name: `d ${DONT_ASK_AGAIN}` })).toBeVisible();
   });
 
-  /** Scenario: with the dialog open the user presses `s`, `l`, `Esc` and `d`, and clicks each button. Each key and each button makes the TUI's choice; other keys, and the keys with a modifier held, make none. */
-  it.each<[string, StarChoice]>([["s", "star"], ["l", "later"], ["Escape", "later"], ["d", "dismiss"]])("makes the TUI's choice for %s", (key, choice) => {
+  /** Scenario: with the dialog open the user presses `s`, `l`, `Esc` and `d`, and clicks each button. Each key and each button makes the TUI's choice; other keys, the keys with a modifier held, and a held key's repeats make none. */
+  it.each<[string, StarChoice]>([["s", "star"], ["l", "later"], ["Escape", "later"], ["d", "dismiss"]])("makes the TUI's choice for %s", async (key, choice) => {
     const onChoose = vi.fn();
     render(<StarPromptDialog onChoose={onChoose} />);
     const dialog = screen.getByRole("alertdialog");
+    await keysReady(dialog);
+    fireEvent.keyDown(dialog, { key, repeat: true });
     fireEvent.keyDown(dialog, { key: "x" });
     fireEvent.keyDown(dialog, { key, ctrlKey: true });
     fireEvent.keyDown(dialog, { key: "Enter" });
@@ -95,6 +103,19 @@ describe("the star reminder dialog", () => {
     render(<StarPromptDialog onChoose={onChoose} />);
     fireEvent.click(screen.getByRole("button", { name: new RegExp(`${label}$`) }));
     expect(onChoose).toHaveBeenCalledExactlyOnceWith(choice);
+  });
+
+  /** Scenario: the dialog opens while the user is typing, and the next keys they type are `d` and `s`. Neither answers it; once it has been on screen a moment, `d` does. */
+  it("lets no key typed as it opens answer it", async () => {
+    const onChoose = vi.fn();
+    render(<StarPromptDialog onChoose={onChoose} />);
+    const dialog = screen.getByRole("alertdialog");
+    fireEvent.keyDown(dialog, { key: "d" });
+    fireEvent.keyDown(dialog, { key: "s" });
+    expect(onChoose).not.toHaveBeenCalled();
+    await keysReady(dialog);
+    fireEvent.keyDown(dialog, { key: "d" });
+    expect(onChoose).toHaveBeenCalledExactlyOnceWith("dismiss");
   });
 
   /** Scenario: the dialog takes the keyboard when it opens, so `s`, `l` and `d` reach it without a click. */
@@ -187,6 +208,7 @@ describe("the star reminder in the app", () => {
     const starPromptChoose = vi.fn(async () => undefined);
     render(<DeckShell runtime={runtimeOf({ starPromptLaunch: vi.fn(async () => true), starPromptChoose })} initialView={{ kind: "overview" }} />);
     const dialog = await screen.findByTestId("star-prompt-dialog");
+    await keysReady(dialog);
     fireEvent.keyDown(dialog, { key: "d" });
     await waitFor(() => expect(screen.queryByTestId("star-prompt-dialog")).toBeNull());
     expect(starPromptChoose).toHaveBeenCalledExactlyOnceWith("dismiss");

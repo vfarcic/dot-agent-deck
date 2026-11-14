@@ -2158,9 +2158,16 @@ impl StarPromptState {
     }
 
     /// Count this launch, save it, and answer whether to show the reminder.
-    /// A launch that cannot be saved still answers from what was read.
+    /// A launch that cannot be saved still counts once, in what this client
+    /// answers from — whether the save failed before the count was made (the
+    /// lock) or after it (the write; Qodo, PR #2321).
     pub fn increment_and_check(&mut self) -> bool {
-        if self.update(|state| state.launch_count += 1).is_err() {
+        let mut counted = false;
+        let _ = self.update(|state| {
+            state.launch_count += 1;
+            counted = true;
+        });
+        if !counted {
             self.launch_count += 1;
         }
         self.is_due()
@@ -4244,6 +4251,33 @@ command = "vim"
         assert!(
             after.permanently_dismissed,
             "a racing save undid Don't ask again"
+        );
+    }
+
+    /// PRD #2174 (Qodo, PR #2321): a launch whose save fails after the count
+    /// was made — the state file is read-only — counts once, not twice.
+    #[cfg(unix)]
+    #[test]
+    fn star_prompt_a_launch_that_cannot_be_saved_counts_once() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("star.json");
+        let mut seed = StarPromptState::load_from(&path);
+        for _ in 0..8 {
+            seed.increment_and_check();
+        }
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        if std::fs::OpenOptions::new().write(true).open(&path).is_ok() {
+            println!("SKIP: a read-only file is still writable here (running as root)");
+            return;
+        }
+        let mut launch = StarPromptState::load_from(&path);
+        assert!(!launch.increment_and_check(), "launch 9 asked");
+        assert_eq!(launch.launch_count, 9);
+        assert_eq!(
+            StarPromptState::load_from(&path).launch_count,
+            8,
+            "the save went through"
         );
     }
 

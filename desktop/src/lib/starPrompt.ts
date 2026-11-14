@@ -35,6 +35,13 @@ export const DONT_ASK_AGAIN = "Don't ask again";
 /** What Star reports: the TUI's status-line sentences. */
 export const STAR_THANKS = "Thanks for starring! ⭐";
 export const STAR_VISIT = "Visit github.com/vfarcic/dot-agent-deck to star ⭐";
+/**
+ * How long the dialog's keys wait after it is drawn before they choose. The
+ * dialog opens on its own, at startup or when the dialog in front of it
+ * closes, so a key the user was already typing elsewhere must not answer it —
+ * the TUI's confirmations drop typed-ahead keys for the same reason.
+ */
+export const STAR_KEYS_ARM_MS = 400;
 /** What a spoken choice answers while the reminder is not showing. */
 export const NO_STAR_PROMPT = "The star reminder is not showing.";
 /** What a spoken choice answers while something is drawn over the reminder. */

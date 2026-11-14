@@ -15,6 +15,8 @@ test.describe("the star reminder", () => {
     await expect(dialog).toContainText("please consider starring the repo!");
     await expect(dialog).toContainText("github.com/vfarcic/dot-agent-deck");
     for (const name of ["s Star", "l Later", "d Don't ask again"]) await expect(dialog.getByRole("button", { name })).toBeInViewport({ ratio: 1 });
+    // Its keys choose once it has been on screen a moment, so a key typed as it opened does not answer it.
+    await expect(dialog).toHaveAttribute("data-keys-ready", "true");
     await page.keyboard.press("l");
     await expect(dialog).toBeHidden();
     await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();

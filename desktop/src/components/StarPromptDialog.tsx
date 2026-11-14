@@ -9,6 +9,7 @@ import {
   STAR,
   STAR_BODY_FIRST,
   STAR_BODY_SECOND,
+  STAR_KEYS_ARM_MS,
   STAR_PROMPT_COVERED,
   STAR_REPO_DISPLAY,
   STAR_TITLE,
@@ -49,11 +50,26 @@ export function StarPromptDialog({ onChoose }: { onChoose: (choice: StarChoice) 
     },
   }), [onChoose, ref]);
 
-  /* The keys reach the dialog wherever focus was when it opened. */
-  useEffect(() => { ref.current?.focus(); }, [ref]);
+  /* The keys reach the dialog wherever focus was when it opened, but choose
+     only once it has been on screen for `STAR_KEYS_ARM_MS`: it opens on its
+     own, so a key already being typed elsewhere must not answer it (Qodo,
+     PR #2321). A held key's repeats never choose. */
+  const [keysReady, setKeysReady] = useState(false);
+  useEffect(() => {
+    ref.current?.focus();
+    const timer = window.setTimeout(() => setKeysReady(true), STAR_KEYS_ARM_MS);
+    return () => window.clearTimeout(timer);
+  }, [ref]);
 
   const onKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     if (event.ctrlKey || event.metaKey || event.altKey) return;
+    if (!keysReady || event.repeat) {
+      if (KEYS[event.key]) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
     const choice = KEYS[event.key];
     if (!choice) return;
     event.preventDefault();
@@ -76,6 +92,7 @@ export function StarPromptDialog({ onChoose }: { onChoose: (choice: StarChoice) 
       aria-labelledby="star-title"
       aria-describedby="star-body"
       data-testid="star-prompt-dialog"
+      data-keys-ready={keysReady}
       onMouseDown={(event) => event.stopPropagation()}
       onKeyDown={onKeyDown}
     >
