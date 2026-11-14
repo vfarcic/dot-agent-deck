@@ -40,6 +40,7 @@ import { AgentTile, shownPanelTab, type AgentTileProps } from "./components/Agen
 import { ConfirmDialog, type ConfirmState } from "./components/ConfirmDialog";
 import { UpgradeDialog, type UpgradeTarget } from "./components/UpgradeDialog";
 import { DeckSelector, chooseDeckSelection } from "./components/DeckSelector";
+import { AddDaemonDialog, AddDaemonOpener } from "./components/AddDaemonDialog";
 import { HandoffRail } from "./components/HandoffRail";
 import { DeckAttention } from "./components/DeckAttention";
 import { deckAttentionText } from "./lib/inboxWords";
@@ -466,6 +467,15 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     },
     closeOverlays: () => closeOverlays(screen),
   }), [closeOverlays, screen, setOverlay]);
+  /**
+   * PRD #2274 — the Add a daemon dialog opens over whichever screen is up, as
+   * Settings does, so finishing or cancelling it returns to that screen. The
+   * Daemon selector's entry, the empty-agents note and voice's `add_daemon`
+   * all reach it through `VOICE_ACTIONS.addDaemon`.
+   */
+  // voice-registry-exempt: this IS the dispatch context's `openAddDaemon`, which every control reaches through `VOICE_ACTIONS.addDaemon`
+  const openAddDaemon = useCallback(() => setOverlay(screen, "addDaemon", true), [screen, setOverlay]);
+  const closeAddDaemon = useCallback(() => setOverlay(screen, "addDaemon", false), [screen, setOverlay]);
   /**
    * `Escape` closes Settings over the overview. The deck's own blanket
    * dismissal covers it there, and the overview has no such handler.
@@ -1240,6 +1250,8 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       ...(prBrowser && !pullRequestBrowserCovered() ? { closePullRequest: pullRequestContext.closePullRequest } : {}),
       /* The Deck selector's own write, which its menu calls too (PRD #1195). */
       switchDeck: (selection, identity) => chooseDeckSelection(latestSettings.current, selection, identity),
+      /* The selector's Add a daemon… entry opens the same dialog (PRD #2274). */
+      openAddDaemon,
       /* The page of whichever list on screen pages (PR #1451 round 3, change 4).
          The agent dashboard scrolls instead of paging (issue #1492), so with
          nothing over it, a page turn there scrolls it by about a screen. */
@@ -1397,6 +1409,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>
+      <AddDaemonOpener.Provider value={openAddDaemon}>
       <VoiceNumberingContext.Provider value={numbering}>
       <VoicePagingContext.Provider value={paging}>
       <DialogNumbered.Provider value={dialogNumbered}>
@@ -1410,7 +1423,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         {/* The newer-release dialog asks before upgrading anything, so it counts as a confirmation for voice too (issue #1635). */}
         {/* PRD #1401: with the pull request browser open, voice is on the browser's screen. */}
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
-        <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
+        <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} addDaemonOpen={overlaysOpen.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
         {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
         {prBrowser && (
@@ -1432,6 +1445,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       </DialogNumbered.Provider>
       </VoicePagingContext.Provider>
       </VoiceNumberingContext.Provider>
+      </AddDaemonOpener.Provider>
     </VoiceOn.Provider>
     </OpenPullRequest.Provider>
   );
@@ -1677,13 +1691,16 @@ export function ControlDeck(props: { runtime: DeckRuntimeState; orchestrationPla
     openOverlay: (overlay) => setOverlay("deck", overlay, true),
     closeOverlays: () => closeOverlays("deck"),
   };
+  // voice-registry-exempt: the standalone deck's opener for `AddDaemonOpener`, which its selector reaches through `VOICE_ACTIONS.addDaemon`
+  const openAddDaemon = useCallback(() => setOverlay("deck", "addDaemon", true), [setOverlay]);
+  const closeAddDaemon = useCallback(() => setOverlay("deck", "addDaemon", false), [setOverlay]);
   return (
-    <>
+    <AddDaemonOpener.Provider value={openAddDaemon}>
       {/* voice-registry-exempt: the rail's shortcut-sheet button — the sheet is a `ShellOverlay`, not a `DeckOverlay`, and no registry entry opens it */}
       <NavigationRail screen="deck" overlays={open} context={context} connection={props.runtime.snapshot.connection} features={desktopFeaturesOf(props.runtime)} onShowShortcuts={() => setOverlay("deck", "shortcuts", true)} />
       <DeckSurface {...props} settings={settings} overlays={deck} />
-      <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} />
-    </>
+      <ShellSettings runtime={props.runtime} settings={settings} open={open.settings ?? false} onClose={() => setOverlay("deck", "settings", false)} addDaemonOpen={open.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
+    </AddDaemonOpener.Provider>
   );
 }
 
@@ -2907,7 +2924,7 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
  * holds the runtime, so this is where the bridge is; see
  * `lib/settingsBridge.tsx` for why it is a context and not a fifth panel prop.
  */
-function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; open: boolean; onClose: () => void }) {
+function ShellSettings({ runtime, settings, open, onClose, addDaemonOpen = false, onCloseAddDaemon }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; open: boolean; onClose: () => void; addDaemonOpen?: boolean; onCloseAddDaemon?: () => void }) {
   // Memoised so the context value is stable across renders; `runtime.testEndpoint`
   // is itself stable for the lifetime of the bridge.
   //
@@ -2956,6 +2973,9 @@ function ShellSettings({ runtime, settings, open, onClose }: { runtime: DeckRunt
         loaded={settings.loaded}
         mode={runtime.mode}
       />
+      {/* PRD #2274 — under the same bridge, because it is the same form:
+          the name it suggests and checks comes from the same library calls. */}
+      {addDaemonOpen && onCloseAddDaemon && <AddDaemonDialog settings={settings} onClose={onCloseAddDaemon} />}
     </SettingsBridgeProvider>
   );
 }

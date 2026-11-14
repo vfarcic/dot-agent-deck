@@ -327,6 +327,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "add_daemon",
                 "show_host_metrics",
                 "switch_deck",
                 "voice_off",

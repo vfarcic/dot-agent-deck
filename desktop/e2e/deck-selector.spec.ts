@@ -188,6 +188,49 @@ for (const screen of SCREENS) {
       await expect(page.getByTestId("deck-selector-current")).toHaveText("vf@build-box.example.com");
     });
 
+    /*
+      PRD #2274 — the menu's last entry opens the add form Settings uses, in a
+      dialog over this screen. Adding stores and chooses the daemon as Settings
+      does, so the selector names it and a reload comes back on it.
+    */
+    test("Add a daemon… adds a daemon from the menu, and it survives a reload", async ({ page }) => {
+      await screen.open(page);
+      const menu = await openMenu(page);
+      await expect(menu.getByRole("button").last()).toHaveText("Add a daemon…");
+
+      await menu.getByTestId("deck-selector-add").click();
+
+      await expect(menu).toBeHidden();
+      const dialog = page.getByRole("dialog", { name: "Add a daemon" });
+      await expect(dialog).toBeVisible();
+      await expect(dialog.getByLabel("Host", { exact: true })).toBeFocused();
+      await dialog.getByLabel("Host", { exact: true }).fill("new-box.example.com");
+      await dialog.getByLabel("User", { exact: true }).fill("dev");
+      await dialog.getByTestId("add-daemon-save").click();
+
+      await expect(dialog).toBeHidden();
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("dev@new-box.example.com");
+      await page.reload();
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("dev@new-box.example.com");
+    });
+
+    /* PRD #2274 — Cancel and Escape close the dialog, store nothing, and leave the screen as it was. */
+    test("cancelling the Add a daemon dialog changes nothing", async ({ page }) => {
+      await screen.open(page);
+      for (const dismiss of ["cancel", "escape"] as const) {
+        await (await openMenu(page)).getByTestId("deck-selector-add").click();
+        const dialog = page.getByRole("dialog", { name: "Add a daemon" });
+        await dialog.getByLabel("Host", { exact: true }).fill("never-stored");
+        if (dismiss === "cancel") await dialog.getByTestId("add-daemon-cancel").click();
+        else await page.keyboard.press("Escape");
+        await expect(dialog).toBeHidden();
+      }
+      await expect(page.getByTestId("deck-selector-current")).toHaveText("This machine");
+      await expect.poll(() => storedSelection(page)).toBe("local");
+      // The two seeded daemons, All daemons and This machine: nothing was added.
+      await expect((await openMenu(page)).getByRole("radio")).toHaveCount(4);
+    });
+
     test("opens under its trigger, floats over the screen, and toggles rather than reopening", async ({ page }) => {
       await screen.open(page);
       const toggle = page.getByTestId("deck-selector-toggle");

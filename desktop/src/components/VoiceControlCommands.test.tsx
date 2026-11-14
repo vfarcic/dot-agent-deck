@@ -879,6 +879,34 @@ describe("Settings from the overview by voice", () => {
   });
 });
 
+describe("Add a daemon by voice (PRD #2274)", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => vi.useRealTimers());
+
+  /**
+   * Scenario: on the agent dashboard, say "add a deck". The voice action opens
+   * the same Add a daemon dialog the Daemon selector's entry and the empty-agents
+   * note open, and stores nothing until the form is confirmed.
+   */
+  it("opens the Add a daemon dialog from the dashboard", async () => {
+    const voice = microphone(["add a deck"]);
+    const resolveVoice: ResolveVoice = vi.fn(async () => dispatch("add_daemon", "addDaemon", "Opening the Add a daemon form.", "add a deck"));
+    const shell = runtime(resolveVoice, voice);
+    render(<DeckShell runtime={shell} initialView={{ kind: "overview" }} />);
+
+    await turnVoiceOn();
+    await completeUtterance();
+
+    expect(resolveVoice).toHaveBeenCalledWith("add a deck");
+    expect(screen.getByRole("dialog", { name: "Add a daemon" })).toBeVisible();
+    expect(shell.saveSettings).not.toHaveBeenCalled();
+  });
+});
+
 describe("what can I say?", () => {
   beforeEach(() => {
     window.localStorage.clear();
