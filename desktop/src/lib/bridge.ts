@@ -5917,12 +5917,16 @@ export class TauriDeckBridge implements DeckBridge {
 
   async starPromptLaunch(): Promise<boolean> {
     const invoke = await this.getInvoke();
-    return invoke<boolean>("desktop_star_prompt_launch");
+    /* Only a literal `true` shows the reminder: an answer of any other shape
+       (an older crate, a mocked IPC that answers every command alike) must
+       not put a dialog over the app. */
+    return (await invoke<unknown>("desktop_star_prompt_launch")) === true;
   }
 
   async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
     const invoke = await this.getInvoke();
-    return (await invoke<string | null>("desktop_star_prompt_choose", { choice })) ?? undefined;
+    const message = await invoke<unknown>("desktop_star_prompt_choose", { choice });
+    return typeof message === "string" ? message : undefined;
   }
 
   async dispose(): Promise<void> {
