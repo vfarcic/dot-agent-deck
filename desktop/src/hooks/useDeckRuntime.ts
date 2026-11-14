@@ -261,29 +261,20 @@ export function useDeckRuntime(): DeckRuntimeState {
     // lands after a later attempt on the same deck was started is not applied.
     const attempt = deckId === undefined ? 0 : (reconnectAttemptsRef.current.get(deckId) ?? 0) + 1;
     if (deckId !== undefined) reconnectAttemptsRef.current.set(deckId, attempt);
-    // The deck as the last render had it, before this attempt marked it: a
-    // DIFFERENT object later that is not "Reconnecting…" is a report that
-    // arrived while the call was out.
-    const before = deckId === undefined ? undefined : fleetRef.current.find((deck) => deck.connection.deckId === deckId);
     update((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = deckId === undefined ? await bridge.connect() : await bridge.reconnectDeck(deckId);
       adoptFleet(connected);
     } catch (cause) {
-      if (deckId !== undefined) {
-        if (reconnectAttemptsRef.current.get(deckId) !== attempt) return;
-        // Already reported by its watcher since: no toast for a failure the
-        // screen has moved past.
-        const now = fleetRef.current.find((deck) => deck.connection.deckId === deckId);
-        if (now && now !== before && now.connection.status !== "loading") return;
-      }
+      // A deck its watcher reported while the call was out never gets here:
+      // the bridge, which sees each deck's own snapshots, answers that with
+      // the fleet instead (`reconnectDeck`). The runtime sees whole fleets,
+      // where another deck's report replaces this deck's "Reconnecting…" too,
+      // so the deck's status is no evidence either way (PR #2322 review).
+      if (deckId !== undefined && reconnectAttemptsRef.current.get(deckId) !== attempt) return;
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
       update((current) => {
-        // A named deck whose "Reconnecting…" was already replaced — its
-        // watcher reported it, connected or not, while this call was out —
-        // keeps what it reported: that is newer than this failure.
-        if (deckId !== undefined && current.connection.status !== "loading") return current;
         // A named deck keeps the fields that say WHICH deck it is, so its
         // section stays its own and its next Reconnect still names it.
         const { deckId: id, socketPath, name, deckKind } = current.connection;

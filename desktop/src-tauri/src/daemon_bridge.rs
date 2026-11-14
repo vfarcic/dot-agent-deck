@@ -2263,14 +2263,30 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
 /// answered by the very state they pressed it to replace. A deck in its
 /// retry wait has no subscription and no view to refresh; its next
 /// establishment lists afresh anyway.
+///
+/// # The fleet can change while the handshake is out
+///
+/// `scope` is revalidated before and after, as `target_deck_snapshot` does
+/// (PR #2322 review): an `[endpoints]` save that drops this deck while the
+/// handshake is out has already torn its link and its tunnel down, and the
+/// snapshot below would put a fresh link back for a deck nothing observes.
+/// So a scope that no longer holds drops the link this re-opened, releases the
+/// transport when the deck left the fleet, and publishes nothing.
 pub(crate) async fn reconnect_and_snapshot(
-    endpoint: &Endpoint,
+    scope: &crate::dto::DeckScope,
     state: &crate::terminal::DesktopState,
-) -> DesktopSnapshot {
+) -> Result<DesktopSnapshot, String> {
+    scope.revalidate()?;
+    let endpoint = scope.endpoint();
     state.daemon.invalidate(endpoint).await;
     let snapshot = snapshot_of(endpoint, &state.daemon).await;
+    if let Err(moved) = scope.revalidate() {
+        state.daemon.invalidate(endpoint).await;
+        crate::endpoint_test::release_if_not_observed(&state.tunnels, endpoint).await;
+        return Err(moved);
+    }
     state.request_refetch(&endpoint.identity());
-    snapshot
+    Ok(snapshot)
 }
 
 /// The allowance switches' test guard, for `terminal`'s tests of the held
@@ -3937,7 +3953,10 @@ mod tests {
         let nudge_a = state.refetch_signal(&deck_a.identity());
         let nudge_b = state.refetch_signal(&deck_b.identity());
 
-        let snapshot = reconnect_and_snapshot(&deck_a, &state).await;
+        let scope = crate::dto::DeckScope::capturing(deck_a.clone());
+        let snapshot = reconnect_and_snapshot(&scope, &state)
+            .await
+            .expect("nothing left the fleet");
 
         assert!(
             nudge_a
@@ -3975,6 +3994,64 @@ mod tests {
         assert_eq!(daemon_b.await.expect("deck B's daemon must not panic"), 1);
         let _ = std::fs::remove_dir_all(dir_a);
         let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Scenario: Reconnect is pressed on a remote deck, and while its handshake
+    /// is held a settings save drops that deck from the fleet. The reconnect
+    /// reports that the deck left, and leaves neither a link nor a transport
+    /// held for it (issue #1994, PR #2322 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_whose_deck_left_the_fleet_meanwhile_keeps_nothing_for_it() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (dir, socket) = scratch_socket("issue-1994-left");
+        let listener = bind_trusted(&socket);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+            // The handshake, held until the fleet has moved…
+            let (stream, _peer) = listener.accept().await.expect("accept the handshake");
+            let (mut reader, mut writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            let encoded = serde_json::to_vec(&matching_hello()).expect("serialize the reply");
+            let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+            // …then the listing, answered as a healthy deck answers it.
+            scripted_daemon_sequence(
+                listener,
+                vec![AttachResponse::agent_records(vec![listed_agent(
+                    "1", "pane-1",
+                )])],
+            )
+            .await
+        });
+
+        let (settings, remote) = all_decks_with_one_remote_row("build-box.example.com");
+        crate::dto::apply_settings_selection(&settings);
+        let state = crate::terminal::DesktopState::default();
+        state.tunnels.insert_route(&remote, &socket).await;
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_wire_id(&remote)))
+            .expect("the remote row is observed");
+
+        let (outcome, ()) = tokio::join!(reconnect_and_snapshot(&scope, &state), async {
+            accepted_rx.await.expect("the handshake reached the daemon");
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let _ = release_tx.send(());
+        });
+        let _ = daemon.await;
+
+        let refusal =
+            outcome.expect_err("a deck that left the fleet is not reported as reconnected");
+        assert!(refusal.contains("left the fleet"), "{refusal}");
+        assert_eq!(
+            state.daemon.held().await,
+            0,
+            "the link the handshake re-opened must not stay held for a deck nothing observes"
+        );
+        assert_eq!(state.tunnels.held().await, 0, "nor its transport");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// `invalidate_all` is the whole-store form, used where the reason to

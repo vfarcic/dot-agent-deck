@@ -225,33 +225,36 @@ describe("useDeckRuntime", () => {
     expect(result.current.fleet[0].connection).toMatchObject({ status: "connected", deckId: FIXTURE_DAEMON_ID });
   });
 
-  /** Scenario: A named deck's reconnect is still out when its watcher reports it connected, and the reconnect then fails: the deck stays connected and no error is shown (PR #2322 review). */
-  it("keeps a deck its watcher connected while a failing reconnect was out", async () => {
+  /** Scenario: Reconnect is pressed on two decks at once; the first succeeds and its fleet replaces the second's "Reconnecting…", then the second fails: the second deck shows its failure (PR #2322 review). */
+  it("puts a deck's failure on it even after another deck's reconnect answered first", async () => {
     const fleet = createFixtureFleet("fleet");
     bridge.connect.mockResolvedValue(fleet);
-    let onFleet: ((fleet: DeckFleet) => void) | undefined;
-    bridge.subscribe.mockImplementation(async (listener: (fleet: unknown) => void) => {
-      onFleet = listener as (fleet: DeckFleet) => void;
-      return () => {};
-    });
-    let reject: ((cause: unknown) => void) | undefined;
-    bridge.reconnectDeck.mockImplementationOnce(() => new Promise((_resolve, fail) => { reject = fail; }));
+    let answerRemote: ((fleet: DeckFleet) => void) | undefined;
+    let rejectUnreachable: ((cause: unknown) => void) | undefined;
+    bridge.reconnectDeck.mockImplementation((deckId: string) => new Promise((resolve, reject) => {
+      if (deckId === FIXTURE_REMOTE_DAEMON_ID) answerRemote = resolve;
+      else rejectUnreachable = reject;
+    }));
     const { result } = renderHook(() => useDeckRuntime());
-    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(2));
     const deckOf = (deckId: string) => result.current.fleet.find((deck) => deck.connection.deckId === deckId);
 
-    let pending: Promise<void> | undefined;
-    act(() => { pending = result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID); });
-    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection.status).toBe("loading");
-    const recovered = fleet.map((deck) => deck.connection.deckId === FIXTURE_UNREACHABLE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, status: "connected" as const } } : deck);
-    act(() => onFleet?.(recovered));
+    let remote: Promise<void> | undefined;
+    let unreachable: Promise<void> | undefined;
+    act(() => { remote = result.current.reconnect(FIXTURE_REMOTE_DAEMON_ID); });
+    act(() => { unreachable = result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID); });
     await act(async () => {
-      reject?.(new Error("the host is not answering"));
-      await pending;
+      answerRemote?.(fleet);
+      await remote;
+    });
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection.status).not.toBe("loading");
+    await act(async () => {
+      rejectUnreachable?.(new Error("the host is not answering"));
+      await unreachable;
     });
 
-    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection.status).toBe("connected");
-    expect(result.current.error).toBeUndefined();
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection).toMatchObject({ status: "error", message: "the host is not answering" });
+    expect(result.current.error).toBe("the host is not answering");
   });
 
   /** Scenario: Two Reconnects on one deck, the first failing after the second started: only the second decides what the deck shows (PR #2322 review). */

@@ -4530,6 +4530,43 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     await bridge.dispose();
   });
 
+  /** Scenario: A deck's reconnect is refused after its watcher has reported the deck connected: the reconnect answers the fleet, with the deck as its watcher reported it, instead of failing (PR #2322 review). */
+  it("answers a refused reconnect with the deck its watcher reported meanwhile", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    let refuse: ((cause: unknown) => void) | undefined;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_reconnect_deck") return new Promise((_resolve, reject) => { refuse = reject; });
+      return { ok: true };
+    });
+
+    const reconnecting = bridge.reconnectDeck(remoteId);
+    await vi.waitFor(() => expect(refuse).toBeDefined());
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+    refuse?.(new Error("the fleet changed while this operation was in flight"));
+    const fleet = await reconnecting;
+
+    expect(fleet.find((deck) => deck.connection.deckId === remoteId)?.connection.status).toBe("connected");
+    await bridge.dispose();
+  });
+
+  /** Scenario: A deck's reconnect is refused and nothing arrived for the deck meanwhile: the refusal reaches the caller. */
+  it("passes a refused reconnect on when nothing arrived for the deck", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_reconnect_deck") throw new Error("that daemon is not one this app is observing");
+      return { ok: true };
+    });
+
+    await expect(bridge.reconnectDeck(remoteId)).rejects.toThrow("not one this app is observing");
+    await bridge.dispose();
+  });
+
   /**
    * A departing deck's own last emit does not reinstate it.
    *

@@ -5061,7 +5061,19 @@ export class TauriDeckBridge implements DeckBridge {
     this.clearAttachSuppression(deckId);
     const invoke = await this.getInvoke();
     const foldsBefore = this.foldsOf.get(deckId) ?? 0;
-    const dto = await invoke<DesktopSnapshotDto>("desktop_reconnect_deck", { deckId });
+    const reported = () => (this.foldsOf.get(deckId) ?? 0) !== foldsBefore;
+    let dto: DesktopSnapshotDto;
+    try {
+      dto = await invoke<DesktopSnapshotDto>("desktop_reconnect_deck", { deckId });
+    } catch (cause) {
+      // The crate emits nothing before it refuses, so a snapshot of this deck
+      // folded during a refused call is its watcher's report, and newer than
+      // the refusal: the deck answers with it rather than with a failure the
+      // screen has moved past (PR #2322 review). Only this bridge can tell,
+      // because it alone sees each deck's folds; the runtime sees whole fleets.
+      if (reported()) return this.fleetView();
+      throw cause;
+    }
     /*
       The crate EMITS this snapshot before it answers, and the event and the
       answer reach the webview separately. When any snapshot of this deck was
@@ -5074,7 +5086,7 @@ export class TauriDeckBridge implements DeckBridge {
       A FOLD, not `connect()`'s reset, either way: the answer is one deck's,
       and every other deck's entry is as true as it was before the click.
     */
-    if ((this.foldsOf.get(deckId) ?? 0) !== foldsBefore) return this.fleetView();
+    if (reported()) return this.fleetView();
     return this.foldSnapshot(dto);
   }
 
