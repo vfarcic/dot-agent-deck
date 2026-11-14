@@ -326,6 +326,7 @@ test.describe("the voice row is reserved space", () => {
         label: parseFloat(getComputedStyle(label).fontSize),
         sentences: [...row.querySelectorAll<HTMLElement>(".voice-sentence")].map((sentence) => parseFloat(getComputedStyle(sentence).fontSize)),
         reserved: parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--voice-row-height")),
+        base: parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--text-base")),
       };
     });
   }
@@ -352,7 +353,8 @@ test.describe("the voice row is reserved space", () => {
     expect(on.button.height).toBeCloseTo(off.button.height, 0);
     expect(on.height, "the voice row holds empty space").toBeLessThanOrEqual(on.tallest + on.padding + 1);
     expect(on.sentences.length).toBeGreaterThan(0);
-    for (const size of on.sentences) expect(size).toBeCloseTo(16.5, 2);
+    // Half as large again as the resting `--text-base` step (issue #2312).
+    for (const size of on.sentences) expect(size).toBeCloseTo(off.base * 1.5, 2);
     expect(on.reserved).toBeCloseTo(on.height, 0);
 
     await voiceButton(page).click();
@@ -361,7 +363,7 @@ test.describe("the voice row is reserved space", () => {
     expect(again.height).toBeCloseTo(40, 0);
     expect(again.reserved).toBe(40);
     expect(again.label).toBe(off.label);
-    for (const size of again.sentences) expect(size).toBeCloseTo(11, 2);
+    for (const size of again.sentences) expect(size).toBeCloseTo(off.base, 2);
   });
 
   /**

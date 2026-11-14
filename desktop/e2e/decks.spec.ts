@@ -134,11 +134,14 @@ test.describe("the Daemons settings section", () => {
     // class.
     expect(first.controlLeft - first.labelLeft).toBe(148);
     for (const row of rows) expect(row.firstTrack).toBe("132px");
-    // The row label is a 13px/650 sub-header, which is part of the convention:
-    // a panel whose labels are 11px next to another panel's 13px is the same
-    // setting rendered at two different weights.
+    // The row label is a `--text-xl`/650 sub-header, which is part of the
+    // convention: a panel whose labels are a step smaller than another panel's
+    // is the same setting rendered at two different weights. Read from the
+    // type scale (issue #2312) rather than spelled as a number here.
+    const labelSize = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--text-xl").trim());
+    expect(labelSize).not.toBe("");
     for (const row of rows) {
-      expect(row.fontSize).toBe("13px");
+      expect(row.fontSize).toBe(labelSize);
       expect(row.fontWeight).toBe("650");
     }
   });

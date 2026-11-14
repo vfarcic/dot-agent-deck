@@ -119,8 +119,11 @@ desktopScenario("orchestration", async (page) => {
 // PRD #1885 — the same review the TUI `project-trust` image shows: `team` in
 // `demo-project`, changed since it was approved (`?trust=changed`, whose roles
 // are `DOCS_TRUST_ROLES` in `desktop/src/data/fixture.ts`), opened by starting
-// it from the New agent dialog.
+// it from the New agent dialog. A taller window than the other scenes, because
+// at the type scale's sizes (issue #2312) the review of four roles scrolls in a
+// 1280×800 one, and the image has to show every role, the removed one included.
 desktopScenario("project-trust", async (page) => {
+  await page.setViewportSize({ width: 1280, height: 1000 });
   await projectInNewAgent(page, "&trust=changed");
   await page.getByTestId("new-agent-mode-orch:team").click();
   await page.getByTestId("new-agent-name").fill("team");

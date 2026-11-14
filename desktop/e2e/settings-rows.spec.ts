@@ -135,12 +135,15 @@ test.describe("the two-column settings row", () => {
     // class. This is the number that goes wrong under WebKit when the label is
     // not a grid item: the control lands in column one, beside its label.
     expect(first.controlLeft - first.labelLeft).toBe(148);
+    const labelSize = await page.evaluate(() => getComputedStyle(document.documentElement).getPropertyValue("--text-xl").trim());
+    expect(labelSize).not.toBe("");
     for (const row of rows) {
       expect(row.firstTrack, `“${row.text}” (${row.section}) is not on the 132px column`).toBe("132px");
-      // The row label is a 13px/650 sub-header, which is part of the convention:
-      // a panel whose labels are 11px next to another panel's 13px is the same
-      // setting rendered at two different weights.
-      expect(row.fontSize, `“${row.text}” (${row.section}) is not a 13px label`).toBe("13px");
+      // The row label is a `--text-xl`/650 sub-header, which is part of the
+      // convention: a panel whose labels are a step smaller than another
+      // panel's is the same setting rendered at two different weights. Read
+      // from the type scale (issue #2312) rather than spelled as a number here.
+      expect(row.fontSize, `“${row.text}” (${row.section}) is not a --text-xl label`).toBe(labelSize);
       expect(row.fontWeight, `“${row.text}” (${row.section}) is not a 650 label`).toBe("650");
     }
   });

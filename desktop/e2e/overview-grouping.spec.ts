@@ -337,16 +337,18 @@ test.describe("the fleet view (PRD #742 M4)", () => {
   });
 
   /*
-    Issue #1676. Between 961px and 1260px the header has room for five
+    Issue #1676. Between 1241px and 1480px the header has room for five
     counters, and which five is named, not positional: NEEDS INPUT and FAILED
     stay, because a person has to act on them, and IDLE and GROUPS give way.
+    The range was 961px to 1260px until the type scale (issue #2312) made the
+    counters and the header's buttons larger.
   */
-  test.describe("between 961px and 1260px", () => {
-    /// Scenario: open the fleet dashboard in a 1200px window, then narrow it to 961px, the narrowest width before the counters go. At both widths NEEDS INPUT and FAILED are among the counters shown, IDLE and GROUPS are not, the counters stop short of the header's buttons, and nothing runs off the right edge.
+  test.describe("between 1241px and 1480px", () => {
+    /// Scenario: open the fleet dashboard in a 1480px window, then narrow it to 1241px, the narrowest width before the counters go. At both widths NEEDS INPUT and FAILED are among the counters shown, IDLE and GROUPS are not, the counters stop short of the header's buttons, and nothing runs off the right edge.
     test("keeps the counters a person acts on and drops idle and groups", async ({ page }) => {
-      await page.setViewportSize({ width: 1200, height: 800 });
+      await page.setViewportSize({ width: 1480, height: 800 });
       await openOverview(page, "fleet");
-      for (const width of [1200, 961]) {
+      for (const width of [1480, 1241]) {
         await page.setViewportSize({ width, height: 800 });
         for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
           await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at ${width}px`).toBeVisible();

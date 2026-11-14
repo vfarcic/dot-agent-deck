@@ -1216,8 +1216,8 @@ describe("AgentOverview", () => {
 
     const region = screen.getByTestId("overview-table-region");
     const track = region.querySelector(".overview-table-track") as HTMLElement;
-    expect(track.style.getPropertyValue("--overview-grid")).toBe("minmax(150px, 1.3fr) 78px 40px");
-    expect(gridTemplateFor(["displayName", "cli", "toolCount"])).toBe("minmax(150px, 1.3fr) 78px 40px");
+    expect(track.style.getPropertyValue("--overview-grid")).toBe("minmax(150px, 1.3fr) 110px 56px");
+    expect(gridTemplateFor(["displayName", "cli", "toolCount"])).toBe("minmax(150px, 1.3fr) 110px 56px");
 
     // The scroll is on the region, not on a card: per-card scrolling would let
     // two cards sit at different offsets and the columns would desynchronise.

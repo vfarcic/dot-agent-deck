@@ -444,18 +444,22 @@ interface OverviewColumnSpec {
    * sum of these minimums, so `min-width: min-content` on the scroll track
    * gives a real overflow instead of columns crushed to nothing. A `minmax(0,
    * …)` track would shrink to zero and the scrollbar would never appear.
+   * The fixed widths are sized for the type scale in `styles.css` (issue
+   * #2312), so a status badge or a legend at that size fits its column; the
+   * flexible minimums stayed where they were, so nine columns still fit a
+   * 1280px window.
    */
   track: string;
 }
 
 const OVERVIEW_COLUMNS: Record<OverviewColumnId, OverviewColumnSpec> = {
-  status: { label: "Status", legend: "STATUS", track: "82px" },
+  status: { label: "Status", legend: "STATUS", track: "120px" },
   displayName: { label: "Agent", legend: "AGENT", track: "minmax(150px, 1.3fr)" },
-  lastActivityMs: { label: "Last activity", legend: "LAST ACTIVITY", track: "58px" },
-  spawnedAtMs: { label: "Uptime", legend: "UPTIME", track: "48px" },
-  cli: { label: "CLI", legend: "CLI", track: "78px" },
+  lastActivityMs: { label: "Last activity", legend: "LAST ACTIVITY", track: "84px" },
+  spawnedAtMs: { label: "Uptime", legend: "UPTIME", track: "70px" },
+  cli: { label: "CLI", legend: "CLI", track: "110px" },
   activeTool: { label: "Active tool", legend: "ACTIVE TOOL", track: "minmax(130px, 1.3fr)" },
-  toolCount: { label: "Tools", legend: "TOOLS", track: "40px" },
+  toolCount: { label: "Tools", legend: "TOOLS", track: "56px" },
   cwd: { label: "Working directory", legend: "WORKING DIRECTORY", track: "minmax(130px, 1.3fr)" },
   lastUserPrompt: { label: "Last prompt", legend: "LAST PROMPT", track: "minmax(150px, 1.7fr)" },
 };
