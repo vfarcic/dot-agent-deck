@@ -11386,8 +11386,16 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Layer:** Fast (`src/doorbell_switch.rs`, `src/config.rs`), temp files and symlinks.
 - **Agent:** none.
 - **Asserts:** the daemon's bounded config read reports a `config.toml` under folders that do not exist, under a link to a real folder, and in a missing folder below such a link, as absent, with no warning, and both agents on; and a `config.toml` whose config folder is a link whose target is missing (absolute, relative, or reached through a second link), whose folder two levels up is such a link, or whose folder is a link to a regular file, each as failed with one warning (naming the dangling folder, for the dangling ones), holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CODEX=1` still turns Codex back on over it and leaves Claude Code off.
-- **Does not assert:** that the daemon calls this read at each spawn (`inbox/doorbell/062`, for a link at the file), a race between the read and the folder changing (`a_missing_config_folder_is_absent_only_below_a_real_folder` covers each verdict), `config get` through such a folder, or an unmounted mount point that is still a real, empty folder (it reads as no config).
+- **Does not assert:** that the daemon calls this read at each spawn (`inbox/doorbell/064`), a race between the read and the folder changing (`a_missing_config_folder_is_absent_only_below_a_real_folder` covers each verdict), `config get` through such a folder, or an unmounted mount point that is still a real, empty folder (it reads as no config).
 - **Platform coverage:** unix (the test creates symlinks).
+
+##### inbox/doorbell/064 — A Claude Code started while the deck's config folder is a link to a missing folder is held off, and with no config folder at all it is rung.
+- **Layer:** L2 lane 1 (`tests/e2e_claude_doorbell_turned_off.rs`), PTY-attached real TUI, its lazy-spawned daemon, the deck's config folder (`.config/dot-agent-deck`) in its sandbox `HOME` replaced by a symlink to a path that does not exist, `daemon status --json`, and the deck's log.
+- **Agent:** none (`tests/support/claude_composer.py`, the scripted Claude Code screen `inbox/doorbell/062` uses, drawing the header of Claude Code 2.1.399, a release nobody measured; no model or credential).
+- **Asserts:** with the config folder a dangling link, a scripted Claude Code started under the daemon and Idle at its empty composer with a message queued is held: the agent record names `cannot_type`, the card on the screen shows the cannot_type words, `daemon status` shows WAKE `none`, over 1.5 s nothing reaches the pane, no `doorbell rang` is logged, the log carries the config read's warning naming the folder as a link whose target is missing and a `doorbell off` line naming `turned_off`, and the message stays queued. With the link removed so there is no config folder at all (a first run), a second worker started afterwards with the same header shows WAKE `doorbell`, is rung once, and its message is fetched and acknowledged, while the held pane still received nothing. Red when the config read stops checking the folders above a missing `config.toml`.
+- **Does not assert:** Codex (the same switch read, `inbox/doorbell/063`), a real Claude Code, a dangling link two folders up (`inbox/doorbell/063`), or `config get` / `config set` through such a folder.
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
 
 #### inbox/probe
 
