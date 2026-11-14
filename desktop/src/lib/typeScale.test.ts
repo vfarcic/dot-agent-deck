@@ -31,7 +31,12 @@ describe("the app's type scale", () => {
   it("sizes every rule from a step rather than a one-off value", () => {
     const sizes = [...css.matchAll(/font-size:\s*([^;}]+)/g)].map((match) => match[1].trim());
     expect(sizes.length).toBeGreaterThan(0);
-    const oneOff = sizes.filter((size) => !/^(calc\()?var\(--text-(xs|sm|base|lg|xl|2xl)\)/.test(size));
+    // The whole value: a bare step, or a step times the voice row's own scale
+    // and nothing else, so `calc(var(--text-base) * 0.1)` cannot slip under
+    // the floor by starting with a step.
+    const step = "var\\(--text-(?:xs|sm|base|lg|xl|2xl)\\)";
+    const allowed = new RegExp(`^(?:${step}|calc\\(${step} \\* var\\(--voice-on-text-scale\\)\\))(?: !important)?$`);
+    const oneOff = sizes.filter((size) => !allowed.test(size));
     expect(oneOff).toEqual([]);
   });
 });

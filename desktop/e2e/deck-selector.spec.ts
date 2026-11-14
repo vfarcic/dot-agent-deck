@@ -270,6 +270,17 @@ test.describe("the Deck selector's state line", () => {
     await expect(state).toBeVisible();
     expect((await state.innerText()).trim().length, "the state line rendered no text").toBeGreaterThan(0);
 
+    // Issue #2312: the state line is a fourth line in the top bar, and at the
+    // type scale's sizes it does not fit the bar's resting 72px. The bar grows
+    // to hold it instead of the stack spilling over its top and bottom edges.
+    const fit = await page.evaluate(() => {
+      const bar = document.querySelector<HTMLElement>(".topbar")!.getBoundingClientRect();
+      const stack = [...document.querySelectorAll<HTMLElement>(".topbar .repo-context > *")].map((node) => node.getBoundingClientRect());
+      return { barTop: bar.top, barBottom: bar.bottom, top: Math.min(...stack.map((box) => box.top)), bottom: Math.max(...stack.map((box) => box.bottom)) };
+    });
+    expect(fit.top, "the top bar's title stack starts above the bar").toBeGreaterThanOrEqual(fit.barTop - 0.5);
+    expect(fit.bottom, "the state line runs below the top bar").toBeLessThanOrEqual(fit.barBottom + 0.5);
+
     // Not blanked: the daemon is still named, the selector still opens, and the
     // rest of the shell is still there.
     await expect(page.getByTestId("deck-selector-current")).toHaveText("vf@build-box.example.com");
