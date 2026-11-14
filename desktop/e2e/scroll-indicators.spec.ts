@@ -140,4 +140,55 @@ test.describe("scroll indicators", () => {
     await page.waitForTimeout(500);
     expect(await top()).toBe(before);
   });
+
+  /** Scenario: two scroll keys pressed together, before the first has moved the dashboard: End then Page Up leaves it a screen above the bottom, and Page Down twice leaves it two screens down. Each key counts from where the last one's smooth scroll is heading. */
+  test("a scroll key pressed before the last one has moved the dashboard still counts", async ({ page }) => {
+    // Issue #2306: the dashboard read its position from `scrollTop`, which a
+    // smooth scroll leaves unchanged until its first frame. A Page Up pressed
+    // in that window answered "already at the top" and was dropped, and in
+    // CI's WebKit, whose first frame often reads 1, the spec above pressed it
+    // there. Both keys are dispatched in one task here, so neither engine can
+    // have drawn a frame between them, and the result is read once the
+    // dashboard's own `scrollend` says the scroll is over.
+    const fromTheTop = async (keys: string[]) => {
+      await openDashboard(page, 300);
+      await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+      return page.locator(".overview-body").evaluate((region, keys) => new Promise<{ top: number; room: number; height: number }>((done) => {
+        if (region.scrollTop !== 0) throw new Error(`the dashboard opened at ${region.scrollTop}, not at the top`);
+        region.addEventListener("scrollend", () => done({ top: region.scrollTop, room: region.scrollHeight - region.clientHeight, height: region.clientHeight }), { once: true });
+        for (const key of keys) window.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
+      }), keys);
+    };
+
+    // Dropped, the Page Up left it at the bottom.
+    const up = await fromTheTop(["End", "PageUp"]);
+    // More room than one region's height, so both cases below can tell a
+    // dropped or miscounted key from a counted one.
+    expect(up.room).toBeGreaterThan(up.height);
+    expect(up.top).toBeGreaterThan(0);
+    expect(up.top).toBeLessThan(up.room - 1);
+
+    // Counted from the top, the second Page Down left it one screen down,
+    // and a screen is less than the region's height.
+    const down = await fromTheTop(["PageDown", "PageDown"]);
+    expect(down.top).toBeGreaterThan(down.height);
+
+    // Where a finished scroll was heading is forgotten: End, then the wheel
+    // halfway back up, and Page Down still moves it down rather than reading
+    // "already at the bottom" from End's destination.
+    // From the top, so the wheel's position is inside the span End covered.
+    const end = await fromTheTop(["End"]);
+    expect(end.top).toBeGreaterThanOrEqual(end.room - 1);
+    const region = page.locator(".overview-body");
+    const top = () => region.evaluate((element) => element.scrollTop);
+    await region.hover();
+    await page.mouse.wheel(0, -Math.round(end.room / 2));
+    await expect.poll(top).toBeLessThan(end.room - 1);
+    await expect.poll(top).toBeGreaterThan(1);
+    await expect.poll(async () => { const before = await top(); await page.waitForTimeout(150); return before === (await top()); }).toBe(true);
+    const halfway = await top();
+    await page.evaluate(() => (document.activeElement as HTMLElement | null)?.blur());
+    await page.keyboard.press("PageDown");
+    await expect.poll(top).toBeGreaterThan(halfway);
+  });
 });

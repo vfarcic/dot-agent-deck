@@ -765,25 +765,84 @@ export const DASHBOARD_COVERED = "Something is open over the dashboard, so it wa
 export const DASHBOARD_FITS = "The whole dashboard is already on screen, so there is nothing to scroll.";
 
 /**
+ * Issue #2306 — where the dashboard's own smooth scroll is heading, by region:
+ * the position it started from and the one it was sent to.
+ */
+const dashboardHeading = new WeakMap<HTMLElement, { from: number; to: number }>();
+
+/** The regions {@link watchDashboardHeading} already listens on. */
+const dashboardWatched = new WeakSet<HTMLElement>();
+
+/**
+ * Issue #2306 — forget where the dashboard's own smooth scroll was heading as
+ * soon as it gets there, and when the user starts moving the region
+ * themselves: a wheel, a pointer press or a touch on it, or a key pressed
+ * inside it. Without this a destination outlived its scroll, and a Page Down
+ * after End and then a wheel halfway back up did nothing.
+ */
+function watchDashboardHeading(region: HTMLElement): void {
+  if (dashboardWatched.has(region)) return;
+  dashboardWatched.add(region);
+  const forget = () => dashboardHeading.delete(region);
+  region.addEventListener("scroll", () => {
+    const heading = dashboardHeading.get(region);
+    if (heading && Math.abs(region.scrollTop - heading.to) <= 1) forget();
+  }, { passive: true });
+  for (const type of ["wheel", "pointerdown", "touchstart", "keydown"]) region.addEventListener(type, forget, { passive: true });
+}
+
+/**
+ * Issue #2306 — the dashboard's position for the next scroll: where its own
+ * smooth scroll is heading while that scroll is still on the way there, and
+ * `scrollTop` otherwise. Until a smooth scroll has drawn a frame or two,
+ * `scrollTop` still reads where it started, so a Page Up pressed straight
+ * after a Page Down read "already at the top" and was dropped, and the Page
+ * Down then finished a screen down. A scroll counts as on the way while
+ * `scrollTop` lies between its start and its destination, has not reached the
+ * destination, and the destination is still within the region's room (a
+ * resize can shrink it); otherwise `scrollTop` is the position again.
+ */
+function dashboardPosition(region: HTMLElement, room: number): number {
+  const at = region.scrollTop;
+  const heading = dashboardHeading.get(region);
+  if (heading && heading.to <= room + 1 && Math.abs(at - heading.to) > 1 && at >= Math.min(heading.from, heading.to) - 1 && at <= Math.max(heading.from, heading.to) + 1) return heading.to;
+  dashboardHeading.delete(region);
+  return at;
+}
+
+/**
+ * Issue #2306 — the dashboard was moved by something other than one of its
+ * own smooth scrolls (an arrow key's step), so where the last one was heading
+ * no longer says where it is.
+ */
+function forgetDashboardHeading(region: HTMLElement): void {
+  dashboardHeading.delete(region);
+}
+
+/**
  * Issue #1492 — scroll the dashboard by voice. The daemons scroll in their own
  * region, `.overview-body`, between the top bar and the voice row. A screen is
  * that region's height less a little overlap, so the row that was at the
  * bottom edge is still in sight at the top after "scroll down". Answers
- * `undefined` when it scrolled, or why it did not.
+ * `undefined` when it scrolled, or why it did not. A scroll asked for while
+ * the last one is still moving counts from where that one is heading (issue
+ * #2306, `dashboardPosition`).
  */
 function scrollDashboard(region: HTMLElement | null, move: DashboardScroll): string | undefined {
   const room = region ? region.scrollHeight - region.clientHeight : 0;
   if (!region || room <= 1) return DASHBOARD_FITS;
   const behavior: ScrollBehavior = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
-  const at = region.scrollTop;
+  const at = dashboardPosition(region, room);
   if ((move === "down" || move === "bottom") && at >= room - 1) return DASHBOARD_AT_BOTTOM;
   if ((move === "up" || move === "top") && at <= 1) return DASHBOARD_AT_TOP;
-  if (move === "top" || move === "bottom") {
-    region.scrollTo({ top: move === "top" ? 0 : room, behavior });
-    return undefined;
-  }
   const screen = Math.max(DASHBOARD_SCROLL_MIN, region.clientHeight - DASHBOARD_SCROLL_OVERLAP);
-  region.scrollBy({ top: move === "down" ? screen : -screen, behavior });
+  const to = move === "top" ? 0 : move === "bottom" ? room : Math.min(room, Math.max(0, at + (move === "down" ? screen : -screen)));
+  const from = region.scrollTop;
+  region.scrollTo({ top: to, behavior });
+  if (behavior === "smooth" && Math.abs(from - to) > 1) {
+    watchDashboardHeading(region);
+    dashboardHeading.set(region, { from, to });
+  } else forgetDashboardHeading(region);
   return undefined;
 }
 
@@ -1386,8 +1445,10 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       const region = bodyRef.current;
       if (scroll === undefined || !region) return;
       event.preventDefault();
-      if (typeof scroll === "number") region.scrollBy({ top: scroll });
-      else scrollDashboard(region, scroll);
+      if (typeof scroll === "number") {
+        forgetDashboardHeading(region);
+        region.scrollBy({ top: scroll });
+      } else scrollDashboard(region, scroll);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
