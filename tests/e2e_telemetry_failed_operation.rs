@@ -13,6 +13,7 @@ mod telemetry_operation_receiver;
 use common::TuiDeck;
 use dot_agent_deck::agent_pty::AgentRecord;
 use dot_agent_deck::daemon_protocol::AttachRequest;
+use dot_agent_deck::event::EventType;
 use serde_json::json;
 use spec::spec;
 use std::io::Write;
@@ -162,7 +163,7 @@ fn unix_nanos_now() -> u64 {
         .as_nanos() as u64
 }
 
-/// Scenario: Send a Bash start hook to an attached stand-in pane, press Escape in the TUI as a person interrupting the call would, then send the next turn's `UserPromptSubmit`, a short call that starts and ends, and its `Stop` — the hooks Claude Code fires when Escape interrupts a running Bash call, which fires no end of its own. The operation must export when that turn ends, while the run is still open, marked `interrupted` and ending at the Escape rather than at the `Stop`; a second call left open with no Escape ends at its turn's `Stop`, marked `turn_end`.
+/// Scenario: Send a Bash start hook to an attached stand-in pane and, once the daemon has broadcast it, press Escape in the TUI as a person interrupting the call would, then send the next turn's `UserPromptSubmit`, a short call that starts and ends, and its `Stop` — the hooks Claude Code fires when Escape interrupts a running Bash call, which fires no end of its own. The operation must export when that turn ends, while the run is still open, marked `interrupted` and ending at the Escape rather than at the `Stop`; a second call left open with no Escape ends at its turn's `Stop`, marked `turn_end`.
 #[spec("telemetry/otlp/049")]
 #[test]
 fn telemetry_otlp_049_interrupted_call_ends_with_its_turn() {
@@ -193,6 +194,13 @@ fn telemetry_otlp_049_interrupted_call_ends_with_its_turn() {
             .find(|op| attribute(op, "deck.operation.program") == Some(program))
     };
 
+    // The hook CLI returns once it has written its line, before the daemon has
+    // broadcast the event. Telemetry places a key by how far the broadcast had
+    // got when the pane took it, so an Escape pressed before the `make` call's
+    // ToolStart is broadcast counts before that call opens, and does not mark
+    // it. Wait for the broadcast itself, as a person sees the card turn
+    // Working before reaching for Escape.
+    let events = deck.subscribe_events();
     send_hook(
         &deck,
         &agent,
@@ -200,6 +208,13 @@ fn telemetry_otlp_049_interrupted_call_ends_with_its_turn() {
         "make",
         "PreToolUse",
         json!({}),
+    );
+    events.wait_for(
+        |event| {
+            event.agent_id.as_deref() == Some(agent.id.as_str())
+                && event.event_type == EventType::ToolStart
+        },
+        EXPORT_WAIT,
     );
     let started = unix_nanos_now();
     deck.send_bytes(b"\x1b");
