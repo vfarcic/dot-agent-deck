@@ -27933,8 +27933,9 @@ mod spawn_tests {
         let typed = editor.typed();
         let line = typed_line(&typed).expect("the line was typed");
         assert!(
-            line.ends_with(&crate::doorbell::doorbell_line(
-                "m-abcdefgh-0123456789abcdef"
+            line.ends_with(&crate::doorbell::doorbell_line_naming(
+                "m-abcdefgh-0123456789abcdef",
+                doorbell_ring::TEST_DOORBELL_COMMAND
             )),
             "{line}"
         );
@@ -30157,11 +30158,7 @@ mod spawn_tests {
         let registry = Arc::new(AgentPtyRegistry::new());
         let editor = ModelEditor::spawn(&registry, "pane-ring-resize", OnEnter::Submit);
         let repaint = Arc::new(std::sync::Mutex::new(None));
-        // Narrower by the least that is still a resize. Since issue #1730 the
-        // doorbell line names the deck by its absolute path, here the test
-        // binary's, so its length follows the checkout's path: ten columns
-        // less wrapped it in a long-named worktree, where the echo it waits
-        // for no longer matched.
+        // Narrower by the least that is still a resize.
         const NARROWER: u16 = EDITOR_COLS - 1;
         editor.control.lock().unwrap().cols = NARROWER as usize;
         {
