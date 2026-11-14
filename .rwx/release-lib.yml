@@ -116,7 +116,7 @@ tasks:
     use: rust
     run: |
       mkdir -p "$HOME/.cargo/bin"
-      curl -LsSf https://get.nexte.st/0.9.146/linux | tar zxf - -C "$HOME/.cargo/bin"
+      curl -LsSf https://get.nexte.st/0.9.149/linux | tar zxf - -C "$HOME/.cargo/bin"
       cargo nextest --version
 
   # The Pi extension's Node suites in the lib tier, as in `.rwx/ci.yml`'s
