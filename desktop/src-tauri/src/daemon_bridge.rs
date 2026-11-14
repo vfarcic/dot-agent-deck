@@ -2266,24 +2266,29 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
 ///
 /// # The fleet can change while the handshake is out
 ///
-/// `scope` is revalidated before and after, as `target_deck_snapshot` does
-/// (PR #2322 review): an `[endpoints]` save that drops this deck while the
-/// handshake is out has already torn its link and its tunnel down, and the
-/// snapshot below would put a fresh link back for a deck nothing observes.
-/// So a scope that no longer holds drops the link this re-opened, releases the
-/// transport when the deck left the fleet, and publishes nothing.
+/// An `[endpoints]` save that drops this deck while the handshake is out has
+/// already torn its link and its tunnel down, and the snapshot below would put
+/// a fresh link back for a deck nothing observes (PR #2322 review). So when
+/// the deck is no longer in the fleet afterwards, the link this re-opened is
+/// dropped, the transport is released, and nothing is published.
+///
+/// The check is the deck's own MEMBERSHIP ([`crate::dto::DeckScope::still_in_fleet`]),
+/// not the fleet's epoch that `target_deck_snapshot` compares. The snapshot
+/// describes this deck alone, so another deck leaving meanwhile says nothing
+/// against it: refusing then would fail a healthy deck, and dropping its link
+/// could take one its watcher had just re-established.
 pub(crate) async fn reconnect_and_snapshot(
     scope: &crate::dto::DeckScope,
     state: &crate::terminal::DesktopState,
 ) -> Result<DesktopSnapshot, String> {
-    scope.revalidate()?;
+    scope.still_in_fleet()?;
     let endpoint = scope.endpoint();
     state.daemon.invalidate(endpoint).await;
     let snapshot = snapshot_of(endpoint, &state.daemon).await;
-    if let Err(moved) = scope.revalidate() {
+    if let Err(left) = scope.still_in_fleet() {
         state.daemon.invalidate(endpoint).await;
         crate::endpoint_test::release_if_not_observed(&state.tunnels, endpoint).await;
-        return Err(moved);
+        return Err(left);
     }
     state.request_refetch(&endpoint.identity());
     Ok(snapshot)
@@ -3927,6 +3932,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn reconnecting_one_deck_re_handshakes_that_deck_and_leaves_the_other_held() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
         let (dir_a, socket_a) = scratch_socket("issue-1994-a");
         let (dir_b, socket_b) = scratch_socket("issue-1994-b");
         let daemon_a = tokio::spawn(scripted_daemon_sequence(
@@ -3953,7 +3959,11 @@ mod tests {
         let nudge_a = state.refetch_signal(&deck_a.identity());
         let nudge_b = state.refetch_signal(&deck_b.identity());
 
-        let scope = crate::dto::DeckScope::capturing(deck_a.clone());
+        // Deck A is the fleet's local deck, so it is observed.
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&socket_a);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_wire_id(&deck_a)))
+            .expect("deck A is observed");
         let snapshot = reconnect_and_snapshot(&scope, &state)
             .await
             .expect("nothing left the fleet");
@@ -4051,6 +4061,72 @@ mod tests {
             "the link the handshake re-opened must not stay held for a deck nothing observes"
         );
         assert_eq!(state.tunnels.held().await, 0, "nor its transport");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scenario: the control for the test above. Reconnect is pressed on one
+    /// remote deck, and while its handshake is held a settings save drops a
+    /// DIFFERENT deck. The reconnected deck is still in the fleet, so it reports
+    /// Connected and keeps its fresh link and its transport (PR #2322 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_survives_another_deck_leaving_the_fleet_meanwhile() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (dir, socket) = scratch_socket("issue-1994-stays");
+        let listener = bind_trusted(&socket);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+            let (stream, _peer) = listener.accept().await.expect("accept the handshake");
+            let (mut reader, mut writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            let encoded = serde_json::to_vec(&matching_hello()).expect("serialize the reply");
+            let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+            scripted_daemon_sequence(
+                listener,
+                vec![AttachResponse::agent_records(vec![listed_agent(
+                    "1", "pane-1",
+                )])],
+            )
+            .await
+        });
+
+        let (smaller, remote) = all_decks_with_one_remote_row("build-box.example.com");
+        let mut larger = smaller.clone();
+        let other = add_remote_row(&mut larger, "laptop.example.com");
+        crate::dto::apply_settings_selection(&larger);
+        assert!(
+            crate::dto::deck_is_observed(&other),
+            "fixture: two remote decks are observed"
+        );
+        let state = crate::terminal::DesktopState::default();
+        state.tunnels.insert_route(&remote, &socket).await;
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_wire_id(&remote)))
+            .expect("the remote row is observed");
+
+        let (outcome, ()) = tokio::join!(reconnect_and_snapshot(&scope, &state), async {
+            accepted_rx.await.expect("the handshake reached the daemon");
+            crate::dto::apply_settings_selection(&smaller);
+            let _ = release_tx.send(());
+        });
+        let _ = daemon.await;
+
+        assert!(
+            !crate::dto::deck_is_observed(&other),
+            "fixture: the other deck left"
+        );
+        let snapshot = outcome.expect("another deck leaving says nothing against this one");
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            state.daemon.held().await,
+            1,
+            "the reconnected deck keeps its fresh link"
+        );
+        assert_eq!(state.tunnels.held().await, 1, "and its transport");
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let _ = std::fs::remove_dir_all(dir);
     }
 
