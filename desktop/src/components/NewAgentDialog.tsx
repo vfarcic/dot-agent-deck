@@ -1758,12 +1758,29 @@ export function NewAgentDialog({ runtime, initialDeckId, draft, onClose, onAppea
    * disables the controls and before that rendering update, keeps it on the
    * one element still focusable. Focus elsewhere — the voice surface, a review
    * dialog beside this one — is left where it is.
+   *
+   * A start that ends back in the form (refused, failed) gives focus back to
+   * the control that had it, so the user carries on from there rather than
+   * Tabbing in from the dialog's frame (PR #2301 review). Only while focus is
+   * still on the frame and that control is still there and enabled: a review
+   * dialog that took focus, or a refusal that cleared the form, keeps its own.
    */
+  const focusBeforeStart = useRef<HTMLElement | null>(null);
   useLayoutEffect(() => {
-    if (!starting) return;
     const node = dialogRef.current;
-    if (node && node !== document.activeElement && node.contains(document.activeElement)) node.focus();
-  }, [starting, dialogRef]);
+    if (!node) return;
+    if (starting) {
+      const active = document.activeElement;
+      if (active instanceof HTMLElement && active !== node && node.contains(active)) {
+        focusBeforeStart.current = active;
+        node.focus();
+      }
+      return;
+    }
+    const before = focusBeforeStart.current;
+    focusBeforeStart.current = null;
+    if (phase === "idle" && before?.isConnected && !before.matches(":disabled") && document.activeElement === node) before.focus();
+  }, [starting, phase, dialogRef]);
   const activeRowId = `${titleId}-row-${cursor}`;
   useEffect(() => {
     document.getElementById(activeRowId)?.scrollIntoView?.({ block: "nearest" });

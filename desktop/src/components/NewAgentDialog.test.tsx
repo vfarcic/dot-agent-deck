@@ -1308,7 +1308,8 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
    * Scenario (Greptile's review of PR #1235): press Start and let the daemon hold
    * its answer. Every control in the dialog is disabled at once, so no tab stop
    * is left inside it and none outside either — the background is inert — and
-   * the dialog itself is the focus target that is left. The sentence explaining
+   * the dialog itself is the focus target that is left; once the daemon refuses
+   * the start, focus goes back to the Name field it was taken from. The sentence explaining
    * why nothing answers is a live region, which is the only way a screen reader
    * learns it: a disabled close button announces neither itself nor the `title` that
    * carries the same explanation for a sighted user.
@@ -1345,7 +1346,8 @@ describe("New agent dialog — a start in flight (PRD #1223 audit F5)", () => {
     await act(async () => held.settle().reject(new Error("the daemon did not answer the start within 15s")));
     await screen.findByTestId("new-agent-error");
     expect(screen.getByRole("button", { name: "Close new agent" })).toBeEnabled();
-    expect(flow.contains(document.activeElement)).toBe(true);
+    // Back on the field the start was made from, not left on the dialog's frame.
+    expect(document.activeElement).toBe(screen.getByTestId("new-agent-name"));
   });
 
   /**
