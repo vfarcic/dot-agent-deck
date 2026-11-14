@@ -1706,9 +1706,8 @@ pub(crate) async fn connect_anyway(links: &DaemonLinks, endpoint: &Endpoint) -> 
 /// is the sentence for the button the user just pressed, so it says what went
 /// wrong and what to do rather than repeating the handshake.
 pub(crate) fn connect_anyway_failure(connection: &DesktopConnection) -> Option<String> {
-    // No sentence sends the user to Reconnect: on the overview that button
-    // re-establishes the SELECTED deck, which in a fleet is usually not this
-    // one. What retries this deck is its own watcher, every
+    // No sentence sends the user to Reconnect, because it is not needed:
+    // what retries this deck is its own watcher, every
     // `WATCH_RETRY_DELAY`, under the allowance just armed — so a deck that
     // starts answering connects without another click, and the sentence says
     // so. A `Disconnected` here is either the handshake or the agent-list
@@ -2254,12 +2253,24 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
 /// daemon that has since gone or wedged, and the user pressed the button
 /// because the deck looked wrong, so the snapshot below handshakes against
 /// whatever answers at the address now.
+///
+/// And the deck's watcher is told to answer its next emit from a fresh
+/// listing (PR #2322 review). Its subscription is a connection of its own and
+/// is left running: while it is open it is the answering daemon's, since a
+/// replaced daemon closes it and the watcher then starts its view over. What
+/// the nudge removes is a watcher emitting its incrementally folded list
+/// after this fresh snapshot, which would let the user's Reconnect be
+/// answered by the very state they pressed it to replace. A deck in its
+/// retry wait has no subscription and no view to refresh; its next
+/// establishment lists afresh anyway.
 pub(crate) async fn reconnect_and_snapshot(
     endpoint: &Endpoint,
-    links: &DaemonLinks,
+    state: &crate::terminal::DesktopState,
 ) -> DesktopSnapshot {
-    links.invalidate(endpoint).await;
-    snapshot_of(endpoint, links).await
+    state.daemon.invalidate(endpoint).await;
+    let snapshot = snapshot_of(endpoint, &state.daemon).await;
+    state.request_refetch(&endpoint.identity());
+    snapshot
 }
 
 /// The allowance switches' test guard, for `terminal`'s tests of the held
@@ -3893,9 +3904,10 @@ mod tests {
     }
 
     /// Scenario: two decks each hold a link, and Reconnect is pressed on one of
-    /// them. That deck handshakes again and reports Connected; the other deck's
-    /// held link is the same object afterwards and no handshake was spent on it
-    /// (issue #1994).
+    /// them. That deck handshakes again, reports Connected and has its watcher
+    /// told to list afresh; the other deck's held link is the same object
+    /// afterwards, no handshake was spent on it and its watcher was told nothing
+    /// (issue #1994, PR #2322 review).
     #[cfg(unix)]
     #[tokio::test]
     async fn reconnecting_one_deck_re_handshakes_that_deck_and_leaves_the_other_held() {
@@ -3914,14 +3926,31 @@ mod tests {
             vec![matching_hello()],
         ));
 
-        let links = DaemonLinks::default();
+        let state = crate::terminal::DesktopState::default();
+        let links = &state.daemon;
         let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
         let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
         let held_a = links.trusted(&deck_a).await.expect("establish deck A");
         let held_b = links.trusted(&deck_b).await.expect("establish deck B");
         assert_eq!(links.handshake_count(), 2);
+        // Each deck's watcher subscribes to its refetch nudge.
+        let nudge_a = state.refetch_signal(&deck_a.identity());
+        let nudge_b = state.refetch_signal(&deck_b.identity());
 
-        let snapshot = reconnect_and_snapshot(&deck_a, &links).await;
+        let snapshot = reconnect_and_snapshot(&deck_a, &state).await;
+
+        assert!(
+            nudge_a
+                .has_changed()
+                .expect("deck A's nudge sender is held"),
+            "the reconnected deck's watcher must list afresh rather than emit its folded view"
+        );
+        assert!(
+            !nudge_b
+                .has_changed()
+                .expect("deck B's nudge sender is held"),
+            "another deck's watcher is not told anything"
+        );
 
         assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
         assert_eq!(snapshot.connection.deck_id, deck_wire_id(&deck_a));
@@ -8725,8 +8754,8 @@ start = true
         let failure = connect_anyway_failure(&snapshot.connection).expect("a failure is reported");
         assert!(failure.contains("did not respond"), "{failure}");
         assert!(failure.contains("keeps trying"), "{failure}");
-        // The overview's Reconnect re-establishes the SELECTED deck, so the
-        // sentence must not send the user to it for this one.
+        // The deck's watcher retries it on its own, so the sentence says that
+        // rather than sending the user to a button.
         assert!(!failure.contains("Reconnect"), "{failure}");
         let _ = std::fs::remove_dir_all(dir);
     }

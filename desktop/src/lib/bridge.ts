@@ -4168,6 +4168,13 @@ export class TauriDeckBridge implements DeckBridge {
    * without this would trade an unbounded queue for a dead terminal.
    */
   private attachRequested = new Map<string, AgentTarget>();
+  /**
+   * How many snapshots of each deck {@link foldSnapshot} has folded, so
+   * `reconnectDeck` can tell whether its answer is still the newest word on
+   * its deck (PR #2322 review). A count, never cleared: it is only ever
+   * compared with itself across one call.
+   */
+  private foldsOf = new Map<string, number>();
   private terminalListener?: TerminalListener;
   /**
    * The fold every `desktop://snapshot` lands in (PRD #742 M4): one entry per
@@ -5053,9 +5060,21 @@ export class TauriDeckBridge implements DeckBridge {
   async reconnectDeck(deckId: string): Promise<DeckFleet> {
     this.clearAttachSuppression(deckId);
     const invoke = await this.getInvoke();
+    const foldsBefore = this.foldsOf.get(deckId) ?? 0;
     const dto = await invoke<DesktopSnapshotDto>("desktop_reconnect_deck", { deckId });
-    // A FOLD, not `connect()`'s reset: the answer is one deck's, and every
-    // other deck's entry is as true as it was before the click.
+    /*
+      The crate EMITS this snapshot before it answers, and the event and the
+      answer reach the webview separately. When any snapshot of this deck was
+      folded while the call was out, it is either this one already or a newer
+      one from the deck's watcher, and folding the answer over it would roll
+      the deck back (PR #2322 review). The answer is folded only when nothing
+      arrived for the deck, which keeps a bridge whose events are not flowing
+      answered too.
+
+      A FOLD, not `connect()`'s reset, either way: the answer is one deck's,
+      and every other deck's entry is as true as it was before the click.
+    */
+    if ((this.foldsOf.get(deckId) ?? 0) !== foldsBefore) return this.fleetView();
     return this.foldSnapshot(dto);
   }
 
@@ -5070,6 +5089,7 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private foldSnapshot(dto: DesktopSnapshotDto): DeckFleet {
     const deckId = dto.connection.deckId;
+    this.foldsOf.set(deckId, (this.foldsOf.get(deckId) ?? 0) + 1);
     /*
       PRD #742 M5: the selection comes off the wire now, and it is read BEFORE
       the fold because `selected` below decides which deck gets the evidence

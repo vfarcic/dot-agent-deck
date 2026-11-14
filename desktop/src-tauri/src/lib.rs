@@ -2309,8 +2309,7 @@ async fn desktop_reconnect_deck(
 ) -> Result<DesktopSnapshot, String> {
     ensure_main_webview(&webview)?;
     let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
-    let snapshot =
-        crate::daemon_bridge::reconnect_and_snapshot(scope.endpoint(), &state.daemon).await;
+    let snapshot = crate::daemon_bridge::reconnect_and_snapshot(scope.endpoint(), &state).await;
     emit_snapshot(&app, &snapshot);
     ensure_snapshot_watchers(&app, &state);
     Ok(snapshot)

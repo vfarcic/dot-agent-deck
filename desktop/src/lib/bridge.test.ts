@@ -4505,6 +4505,31 @@ describe("TauriDeckBridge across a fleet (PRD #742 M4/M5)", () => {
     await bridge.dispose();
   });
 
+  /** Scenario: While one deck's reconnect is out, its watcher folds a newer snapshot of it; the reconnect's older answer then arrives and does not roll the deck back (PR #2322 review). */
+  it("does not fold a reconnect's answer over a newer snapshot of the deck", async () => {
+    const { TauriDeckBridge } = await import("./bridge");
+    const bridge = new TauriDeckBridge();
+    await bridge.subscribe(vi.fn(), vi.fn());
+    await bridge.connect();
+    listeners.get("desktop://snapshot")?.({ payload: remote });
+    const older = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder"]);
+    const newer = deckSnapshot(remoteId, remoteDeck, "remote", ["Remote builder", "Remote tester", "Remote reviewer"]);
+    let answer: ((dto: DesktopSnapshotDto) => void) | undefined;
+    invoke.mockImplementation(async (command: string) => {
+      if (command === "desktop_reconnect_deck") return new Promise<DesktopSnapshotDto>((resolve) => { answer = resolve; });
+      return { ok: true };
+    });
+
+    const reconnecting = bridge.reconnectDeck(remoteId);
+    await vi.waitFor(() => expect(answer).toBeDefined());
+    listeners.get("desktop://snapshot")?.({ payload: newer });
+    answer?.(older);
+    const fleet = await reconnecting;
+
+    expect(fleet.find((deck) => deck.connection.deckId === remoteId)?.agents.map((agent) => agent.displayName)).toEqual(["Remote builder", "Remote tester", "Remote reviewer"]);
+    await bridge.dispose();
+  });
+
   /**
    * A departing deck's own last emit does not reinstate it.
    *

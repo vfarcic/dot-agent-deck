@@ -232,6 +232,7 @@ export function useDeckRuntime(): DeckRuntimeState {
    * it is (issue #1994) — {@link updateSelected}'s sibling for a deck that need
    * not be the selected one. An id the fleet does not hold changes nothing.
    */
+  const reconnectAttemptsRef = useRef(new Map<string, number>());
   const updateDeck = useCallback((deckId: string, update: (current: DeckSnapshot) => DeckSnapshot) => {
     setFleet((current) => {
       const at = current.findIndex((deck) => deck.connection.deckId === deckId);
@@ -256,14 +257,33 @@ export function useDeckRuntime(): DeckRuntimeState {
   const reconnect = useCallback(async (deckId?: string) => {
     setError(undefined);
     const update = deckId === undefined ? updateSelected : (change: (current: DeckSnapshot) => DeckSnapshot) => updateDeck(deckId, change);
+    // PR #2322 review: a named deck's attempt is numbered, so a failure that
+    // lands after a later attempt on the same deck was started is not applied.
+    const attempt = deckId === undefined ? 0 : (reconnectAttemptsRef.current.get(deckId) ?? 0) + 1;
+    if (deckId !== undefined) reconnectAttemptsRef.current.set(deckId, attempt);
+    // The deck as the last render had it, before this attempt marked it: a
+    // DIFFERENT object later that is not "Reconnecting…" is a report that
+    // arrived while the call was out.
+    const before = deckId === undefined ? undefined : fleetRef.current.find((deck) => deck.connection.deckId === deckId);
     update((current) => ({ ...current, connection: { ...current.connection, status: "loading", message: "Reconnecting…" } }));
     try {
       const connected = deckId === undefined ? await bridge.connect() : await bridge.reconnectDeck(deckId);
       adoptFleet(connected);
     } catch (cause) {
+      if (deckId !== undefined) {
+        if (reconnectAttemptsRef.current.get(deckId) !== attempt) return;
+        // Already reported by its watcher since: no toast for a failure the
+        // screen has moved past.
+        const now = fleetRef.current.find((deck) => deck.connection.deckId === deckId);
+        if (now && now !== before && now.connection.status !== "loading") return;
+      }
       const message = cause instanceof Error ? cause.message : String(cause);
       setError(message);
       update((current) => {
+        // A named deck whose "Reconnecting…" was already replaced — its
+        // watcher reported it, connected or not, while this call was out —
+        // keeps what it reported: that is newer than this failure.
+        if (deckId !== undefined && current.connection.status !== "loading") return current;
         // A named deck keeps the fields that say WHICH deck it is, so its
         // section stays its own and its next Reconnect still names it.
         const { deckId: id, socketPath, name, deckKind } = current.connection;
