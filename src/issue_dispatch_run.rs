@@ -234,6 +234,9 @@ pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
 /// no longer exists is left out: git reports it `prunable`, and removing the
 /// parent cannot lose files that are already gone.
 ///
+/// At most [`MAX_NESTED_WORKTREES_REPORTED`] are answered: one is enough to
+/// keep the tree, and the list rides in a close report and a broadcast.
+///
 /// `Err` is "could not ask", which the callers treat as a reason to KEEP, as
 /// they do a failed `git status`.
 pub async fn nested_worktrees(
@@ -272,6 +275,7 @@ pub async fn nested_worktrees(
     // one beside the path it already shows for the tree itself.
     Ok(crate::worktree_reclaim::paths_inside(&own, &resolved)
         .into_iter()
+        .take(MAX_NESTED_WORKTREES_REPORTED)
         .map(|p| {
             p.strip_prefix(&own)
                 .map_or_else(|_| p.clone(), |inner| worktree_dir.join(inner))
@@ -280,6 +284,10 @@ pub async fn nested_worktrees(
         })
         .collect())
 }
+
+/// Issue #2285: how many of the worktrees inside a tree [`nested_worktrees`]
+/// names.
+pub const MAX_NESTED_WORKTREES_REPORTED: usize = 16;
 
 /// Issue #2285: what [`worktree_keep_check`] found in a `KeepIfDirty` tree.
 #[derive(Debug, Clone, PartialEq, Eq)]

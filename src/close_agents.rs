@@ -308,9 +308,17 @@ fn fit_deliverable(report: &mut CloseReport) {
 }
 
 fn shed_lists(target: &mut CloseTarget) {
+    // Issue #2285: the worktrees that kept a tree are a list too; the verdict
+    // itself survives, so the report still says why it was kept.
+    let nested = target
+        .worktree_verdict
+        .as_mut()
+        .map(|verdict| std::mem::take(&mut verdict.nested_worktrees))
+        .unwrap_or_default();
     let had = !target.panes.is_empty()
         || !target.open_descendants.is_empty()
-        || !target.candidates.is_empty();
+        || !target.candidates.is_empty()
+        || !nested.is_empty();
     target.panes = Vec::new();
     target.open_descendants = Vec::new();
     target.candidates = Vec::new();
@@ -5795,10 +5803,11 @@ mod tests {
             pane_id: big.clone(),
             agent_id: big.clone(),
         });
-        t.worktree_verdict = Some(WorktreeVerdict::new(
-            big.clone(),
-            WorktreeVerdictKind::Removed,
-        ));
+        t.worktree_verdict = Some(WorktreeVerdict {
+            path: big.clone(),
+            verdict: WorktreeVerdictKind::KeptHoldsWorktrees,
+            nested_worktrees: vec![big.clone(); copies],
+        });
         t.panes = vec![
             ClosePane {
                 agent_id: big.clone(),
@@ -5841,6 +5850,12 @@ mod tests {
         shed_lists(&mut target);
         clip_fields(&mut target);
         assert!(target.truncated);
+        let verdict = target.worktree_verdict.as_ref().unwrap();
+        assert!(
+            verdict.nested_worktrees.is_empty(),
+            "issue #2285: the nested worktree list is shed with the other lists"
+        );
+        assert_eq!(verdict.verdict, WorktreeVerdictKind::KeptHoldsWorktrees);
         assert_eq!(
             target.unit_id.as_deref(),
             Some(longest_unit_id().as_str()),

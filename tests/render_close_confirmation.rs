@@ -354,4 +354,31 @@ fn close_confirm_015_a_worktree_holding_others_warns_and_names_them() {
     let cancel_at = text.find("> Cancel").expect("Cancel rendered");
     assert!(named_at < cancel_at, "{text}");
     assert!(text.contains("  Close"), "{text}");
+
+    // Several are listed one per line, so a long one cannot hide the others,
+    // and past three the dialog says how many more there are.
+    let many = CloseConfirmState {
+        kept_worktree: Some(KeptWorktree {
+            path: PATH.to_string(),
+            confirmed_dirty: false,
+            on_request: false,
+            nested_worktrees: (1..=5)
+                .map(|n| format!("{PATH}/.worktrees/feat-{n}"))
+                .collect(),
+        }),
+        ..CloseConfirmState::default()
+    };
+    let text = buffer_to_text(&render_close_confirm_to_buffer(&many, 80, 30));
+    for n in 1..=3 {
+        assert!(
+            text.contains(&format!("holds: .worktrees/feat-{n}")),
+            "nested worktree {n} must have its own line\n{text}"
+        );
+    }
+    assert!(!text.contains("feat-4"), "{text}");
+    assert!(text.contains("holds: … and 2 more"), "{text}");
+    assert!(
+        text.contains("  Close"),
+        "the choices are still drawn\n{text}"
+    );
 }

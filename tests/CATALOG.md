@@ -2606,7 +2606,7 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 ##### prompt/close-confirm/015 — A close that would leave a dispatched worktree on disk because other worktrees lie inside it says so, naming them, before the user answers (issue #2285).
 - **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`).
 - **Agent:** none.
-- **Asserts:** a `KeptWorktree` with `nested_worktrees` renders `Holds other worktrees, so it is KEPT:`, the path, and `holds: .worktrees/feat-1-demo` (the nested path relative to the kept one) above Cancel, never the `Uncommitted work` wording, and the Close choice is still drawn.
+- **Asserts:** a `KeptWorktree` with `nested_worktrees` renders `Holds other worktrees, so it is KEPT:`, the path, and `holds: .worktrees/feat-1-demo` (the nested path relative to the kept one) above Cancel, never the `Uncommitted work` wording, and the Close choice is still drawn; with five nested worktrees, the first three each get their own `holds:` line and a fourth line reads `holds: … and 2 more`.
 - **Does not assert:** where the report comes from (`issue_dispatch_run::kept_worktree_preview_reports_a_tree_that_holds_other_worktrees`) or the close itself (`prompt/close-confirm/014`).
 - **Platform coverage:** mac+linux+windows.
 

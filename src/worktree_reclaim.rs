@@ -565,7 +565,7 @@ fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
 /// wins.)
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
     let raw = list_linked_worktrees(repo_dir)?;
-    let all_paths: Vec<PathBuf> = raw.iter().map(|wt| wt.path.clone()).collect();
+    let all_paths = existing_paths(raw.iter().map(|wt| wt.path.clone()));
     let mut reports = Vec::with_capacity(raw.len());
     for wt in raw {
         let cleanliness = check_cleanliness(&wt.path);
@@ -595,6 +595,16 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         });
     }
     Ok(reports)
+}
+
+/// Issue #2285: the listed worktree paths whose directories still exist. One
+/// that is gone (git's `prunable`) has nothing left to lose, so it keeps no
+/// parent, as for close.
+fn existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(|p| p.symlink_metadata().is_ok())
+        .collect()
 }
 
 /// Issue #2285: a worktree that other worktrees lie inside is kept whatever
@@ -839,6 +849,24 @@ mod tests {
             keep_if_it_holds_worktrees(Verdict::Remove, &[]),
             Verdict::Remove
         );
+    }
+
+    /// Issue #2285 (review): a listed worktree whose directory is already
+    /// gone keeps no parent, so a nested directory deleted by hand does not
+    /// leave reclaim refusing the parent until `git worktree prune`.
+    #[test]
+    fn a_deleted_nested_worktree_keeps_no_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("unit");
+        let live = unit.join(".worktrees").join("live");
+        let gone = unit.join(".worktrees").join("gone");
+        std::fs::create_dir_all(&live).unwrap();
+        let all = existing_paths([unit.clone(), live.clone(), gone]);
+        assert_eq!(all, vec![unit.clone(), live.clone()]);
+        assert_eq!(paths_inside(&unit, &all), vec![&live]);
+        std::fs::remove_dir_all(&live).unwrap();
+        let all = existing_paths([unit.clone(), live]);
+        assert!(paths_inside(&unit, &all).is_empty());
     }
 
     #[test]

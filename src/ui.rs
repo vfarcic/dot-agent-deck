@@ -7512,9 +7512,12 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     let Some(kept) = state.blocking_write().take_worktree_kept() else {
         return; // a concurrent path took it between the peek and here
     };
-    let nested = kept_worktree_nested_line(&kept)
-        .map(|line| format!(" ({line})"))
-        .unwrap_or_default();
+    let shown = kept_worktree_nested_shown(&kept);
+    let nested = if shown.is_empty() {
+        String::new()
+    } else {
+        format!(" (holds: {})", shown.join(", "))
+    };
     ui.status_message = Some((
         format!(
             "{} {}{nested}",
@@ -7559,16 +7562,11 @@ fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
     }
 }
 
-/// Issue #2285: the line naming the worktrees that keep `kept`, each relative
-/// to it where it can be, so the user knows what to remove first. `None` when
-/// none did.
-fn kept_worktree_nested_line(kept: &KeptWorktree) -> Option<String> {
-    if kept.nested_worktrees.is_empty() {
-        return None;
-    }
+/// Issue #2285: the worktrees that keep `kept`, each relative to it where it
+/// can be, so the user knows what to remove first. Empty when none did.
+fn kept_worktree_nested_shown(kept: &KeptWorktree) -> Vec<String> {
     let parent = std::path::Path::new(&kept.path);
-    let shown: Vec<String> = kept
-        .nested_worktrees
+    kept.nested_worktrees
         .iter()
         .map(
             |nested| match std::path::Path::new(nested).strip_prefix(parent) {
@@ -7578,8 +7576,30 @@ fn kept_worktree_nested_line(kept: &KeptWorktree) -> Option<String> {
                 _ => nested.clone(),
             },
         )
+        .collect()
+}
+
+/// Issue #2285: the most nested worktrees the close dialog lists one per line;
+/// past it, one more line says how many it left out.
+const KEPT_NESTED_DIALOG_LINES: usize = 3;
+
+/// Issue #2285: the close dialog's lines naming the worktrees that keep
+/// `kept`, one each, so a long name is clipped on its own line rather than
+/// hiding the others.
+fn kept_worktree_nested_lines(kept: &KeptWorktree) -> Vec<String> {
+    let shown = kept_worktree_nested_shown(kept);
+    let mut lines: Vec<String> = shown
+        .iter()
+        .take(KEPT_NESTED_DIALOG_LINES)
+        .map(|nested| format!("holds: {nested}"))
         .collect();
-    Some(format!("holds: {}", shown.join(", ")))
+    if shown.len() > KEPT_NESTED_DIALOG_LINES {
+        lines.push(format!(
+            "holds: … and {} more",
+            shown.len() - KEPT_NESTED_DIALOG_LINES
+        ));
+    }
+    lines
 }
 
 /// PRD #241: the resolved shape of a confirmed close — see
@@ -21317,12 +21337,10 @@ fn render_close_confirm(
     // The path is the actionable half — the user has to `cd` to it — so the
     // popup WIDENS to fit it rather than truncating by default, and only falls
     // back to a head-truncation when the terminal itself is too narrow.
-    // Issue #2285: one more line when other worktrees inside it keep it.
-    let kept_lines = match state.kept_worktree.as_ref() {
-        Some(kept) if kept_worktree_nested_line(kept).is_some() => 4,
-        Some(_) => 3,
-        None => 0,
-    };
+    // Issue #2285: plus one line per worktree inside it that keeps it.
+    let kept_lines: u16 = state.kept_worktree.as_ref().map_or(0, |kept| {
+        3 + u16::try_from(kept_worktree_nested_lines(kept).len()).unwrap_or(0)
+    });
     // Saturating rather than `as u16`: the path arrives over the wire, and a
     // wrapping cast would turn an absurd length into a tiny popup instead of a
     // wide one clamped to the terminal.
@@ -21371,9 +21389,9 @@ fn render_close_confirm(
             format!("    {}", truncate_path_head(&kept.path, inner_width)),
             text_primary(),
         ));
-        if let Some(nested) = kept_worktree_nested_line(kept) {
+        for nested in kept_worktree_nested_lines(kept) {
             text.push(Line::styled(
-                format!("    {}", truncate_with_ellipsis(&nested, inner_width)),
+                format!("    {}", truncate_path_head(&nested, inner_width)),
                 text_primary(),
             ));
         }
