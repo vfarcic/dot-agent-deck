@@ -1050,6 +1050,7 @@ mod tests {
                 path: "/tmp/wt".into(),
                 confirmed_dirty: true,
                 on_request: false,
+                nested_worktrees: Vec::new(),
             },
         ));
         assert_eq!(view.needs_fetch(now), Some(FetchReason::WorktreeKept));

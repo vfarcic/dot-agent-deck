@@ -6,6 +6,8 @@ export interface KeptWorktree {
   confirmed_dirty: boolean;
   /** Issue #1958: kept because the close asked to keep it. Absent means false. */
   on_request?: boolean;
+  /** Issue #2285: kept because these other worktrees lie inside it. Absent means none. */
+  nested_worktrees?: string[];
 }
 
 /**
@@ -48,5 +50,12 @@ export function worktreeKeptNotice(payload: unknown): WorktreeKeptNotice | undef
   if (!payload || typeof payload !== "object") return undefined;
   const event = payload as Record<string, unknown>;
   if (event.kind !== "worktree_kept" || typeof event.deck !== "string" || typeof event.path !== "string" || typeof event.confirmed_dirty !== "boolean") return undefined;
-  return { deckId: event.deck, path: event.path, confirmed_dirty: event.confirmed_dirty, ...(event.on_request === true ? { on_request: true } : {}) };
+  const nested = Array.isArray(event.nested_worktrees) ? event.nested_worktrees.filter((p): p is string => typeof p === "string") : [];
+  return { deckId: event.deck, path: event.path, confirmed_dirty: event.confirmed_dirty, ...(event.on_request === true ? { on_request: true } : {}), ...(nested.length ? { nested_worktrees: nested } : {}) };
+}
+
+/** Issue #2285: the worktrees that keep `kept`, each relative to it where it can be, as the TUI shows them. */
+export function nestedWorktreesShown(kept: KeptWorktree): string[] {
+  const parent = kept.path.replace(/\/+$/, "");
+  return (kept.nested_worktrees ?? []).map((nested) => nested.startsWith(`${parent}/`) && nested.length > parent.length + 1 ? nested.slice(parent.length + 1) : nested);
 }

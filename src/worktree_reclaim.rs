@@ -248,6 +248,23 @@ fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<RawWorktree> {
     result
 }
 
+/// Issue #2285: every worktree path in a `git worktree list --porcelain -z`
+/// listing, the main working tree included, through the one parser.
+pub(crate) fn worktree_paths_from_porcelain_z(bytes: &[u8]) -> Vec<PathBuf> {
+    parse_worktree_porcelain(bytes)
+        .into_iter()
+        .map(|wt| wt.path)
+        .collect()
+}
+
+/// Issue #2285: the paths in `all` that lie strictly inside `dir`, compared
+/// as git lists them (real paths), so a worktree is never its own nested one.
+pub(crate) fn paths_inside<'a>(dir: &Path, all: &'a [PathBuf]) -> Vec<&'a PathBuf> {
+    all.iter()
+        .filter(|p| p.as_path() != dir && p.starts_with(dir))
+        .collect()
+}
+
 /// Enumerate linked worktrees (excludes the main working tree) for the repo
 /// rooted at or above `repo_dir`.
 fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
@@ -548,6 +565,7 @@ fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
 /// wins.)
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
     let raw = list_linked_worktrees(repo_dir)?;
+    let all_paths: Vec<PathBuf> = raw.iter().map(|wt| wt.path.clone()).collect();
     let mut reports = Vec::with_capacity(raw.len());
     for wt in raw {
         let cleanliness = check_cleanliness(&wt.path);
@@ -562,7 +580,10 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             Some(branch) => resolve_pr_state(&wt.path, branch),
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
         };
-        let verdict = decide(&pr_state, &cleanliness, ownership);
+        let verdict = keep_if_it_holds_worktrees(
+            decide(&pr_state, &cleanliness, ownership),
+            &paths_inside(&wt.path, &all_paths),
+        );
         reports.push(WorktreeReport {
             path: wt.path,
             branch: wt.branch,
@@ -574,6 +595,22 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         });
     }
     Ok(reports)
+}
+
+/// Issue #2285: a worktree that other worktrees lie inside is kept whatever
+/// [`decide`] said, because `git worktree remove` deletes the whole directory,
+/// theirs included, with their uncommitted work, and `check_cleanliness`
+/// cannot see one under a git-ignored directory. A `Keep` stays the `Keep` it
+/// was: its reason already blocks the removal.
+fn keep_if_it_holds_worktrees(verdict: Verdict, nested: &[&PathBuf]) -> Verdict {
+    if nested.is_empty() || matches!(verdict, Verdict::Keep(_)) {
+        return verdict;
+    }
+    let names: Vec<String> = nested.iter().map(|p| display_path(p)).collect();
+    Verdict::Keep(format!(
+        "holds other worktrees, which removing it would delete: {}; remove them first",
+        names.join(", ")
+    ))
 }
 
 /// Render a worktree path for human output as an **injective** escape: two
@@ -770,6 +807,38 @@ mod tests {
     fn decide_merged_clean_foreign_asks() {
         let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Foreign);
         assert!(matches!(v, Verdict::Ask(_)));
+    }
+
+    /// Issue #2285: a candidate that other worktrees lie inside is kept, and
+    /// the reason names them; one already kept keeps its own reason, and one
+    /// with nothing inside it keeps its verdict. Only paths strictly inside
+    /// count — not the worktree itself, and not a sibling sharing its prefix.
+    #[test]
+    fn a_candidate_holding_other_worktrees_is_kept_and_names_them() {
+        let all = vec![
+            PathBuf::from("/w/unit"),
+            PathBuf::from("/w/unit/.worktrees/feat-1"),
+            PathBuf::from("/w/unit-2"),
+        ];
+        let nested = paths_inside(Path::new("/w/unit"), &all);
+        assert_eq!(nested, vec![&all[1]]);
+        assert!(paths_inside(Path::new("/w/unit-2"), &all).is_empty());
+
+        for verdict in [Verdict::Remove, Verdict::Ask("foreign".into())] {
+            let kept = keep_if_it_holds_worktrees(verdict, &nested);
+            assert!(
+                matches!(&kept, Verdict::Keep(r) if r.contains("holds other worktrees") && r.contains("feat-1")),
+                "{kept:?}"
+            );
+        }
+        assert_eq!(
+            keep_if_it_holds_worktrees(Verdict::Keep("dirty".into()), &nested),
+            Verdict::Keep("dirty".into())
+        );
+        assert_eq!(
+            keep_if_it_holds_worktrees(Verdict::Remove, &[]),
+            Verdict::Remove
+        );
     }
 
     #[test]

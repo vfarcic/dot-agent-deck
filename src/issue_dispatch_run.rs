@@ -121,7 +121,8 @@ pub struct WorktreeEntry {
 pub enum RemovalPolicy {
     /// Remove unconditionally (`--force`), discarding uncommitted changes.
     Force,
-    /// Refuse to remove a worktree with uncommitted changes; leave it in place
+    /// Refuse to remove a worktree with uncommitted changes, or with other
+    /// worktrees of the repository inside it (issue #2285); leave it in place
     /// and log so the user can recover the work.
     KeepIfDirty,
 }
@@ -220,6 +221,96 @@ pub async fn worktree_is_dirty(worktree_dir: &Path) -> Result<bool, String> {
     Ok(!output.trim().is_empty())
 }
 
+/// Issue #2285: the other git worktrees of `clone_dir`'s repository whose
+/// directories lie inside `worktree_dir`, each named under `worktree_dir`.
+///
+/// `git worktree remove <worktree_dir>` deletes the whole directory, a nested
+/// worktree's uncommitted and untracked files included, and a nested worktree
+/// under a git-ignored directory is invisible to [`worktree_is_dirty`]'s
+/// `git status`. So a removal has to ask this as well.
+///
+/// Both sides are compared canonicalised, because git lists real paths while
+/// the deck may hold the directory through a symlink. An entry whose directory
+/// no longer exists is left out: git reports it `prunable`, and removing the
+/// parent cannot lose files that are already gone.
+///
+/// `Err` is "could not ask", which the callers treat as a reason to KEEP, as
+/// they do a failed `git status`.
+pub async fn nested_worktrees(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let clone = clone_dir.to_string_lossy();
+    // `-z`, as `worktree reclaim` lists them: the text form C-quotes a path
+    // holding a newline or a quote, which would then match nothing.
+    let args = ["-C", &clone, "worktree", "list", "--porcelain", "-z"];
+    let output = output_within(
+        crate::git_env::git_async(),
+        crate::git_env::GIT,
+        &args,
+        SUBPROCESS_TIMEOUT,
+    )
+    .await?;
+    if !output.status.success() {
+        return Err(format!(
+            "`git {}` failed ({}): {}",
+            args.join(" "),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let own = tokio::fs::canonicalize(worktree_dir)
+        .await
+        .map_err(|e| format!("could not resolve {}: {e}", worktree_dir.display()))?;
+    let mut resolved = Vec::new();
+    for listed in crate::worktree_reclaim::worktree_paths_from_porcelain_z(&output.stdout) {
+        if let Ok(path) = tokio::fs::canonicalize(&listed).await {
+            resolved.push(path);
+        }
+    }
+    // Named under `worktree_dir` as the deck holds it, so a report puts each
+    // one beside the path it already shows for the tree itself.
+    Ok(crate::worktree_reclaim::paths_inside(&own, &resolved)
+        .into_iter()
+        .map(|p| {
+            p.strip_prefix(&own)
+                .map_or_else(|_| p.clone(), |inner| worktree_dir.join(inner))
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect())
+}
+
+/// Issue #2285: what [`worktree_keep_check`] found in a `KeepIfDirty` tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeKeepCheck {
+    /// Nothing that removing the tree would lose.
+    Clean,
+    /// `git status --porcelain` reported uncommitted work.
+    Dirty,
+    /// Other worktrees of the repository lie inside it; their paths.
+    HoldsWorktrees(Vec<String>),
+}
+
+/// The ONE question a `KeepIfDirty` removal and the close preview ask before
+/// deleting a tree, so they cannot disagree: does it hold uncommitted work
+/// ([`worktree_is_dirty`]), and failing that, other worktrees
+/// ([`nested_worktrees`])? `Err` when either could not be asked.
+pub async fn worktree_keep_check(
+    worktree_dir: &Path,
+    clone_dir: &Path,
+) -> Result<TreeKeepCheck, String> {
+    if worktree_is_dirty(worktree_dir).await? {
+        return Ok(TreeKeepCheck::Dirty);
+    }
+    let nested = nested_worktrees(worktree_dir, clone_dir).await?;
+    Ok(if nested.is_empty() {
+        TreeKeepCheck::Clean
+    } else {
+        TreeKeepCheck::HoldsWorktrees(nested)
+    })
+}
+
 /// Issue #717: the close-confirmation dialog's advance warning that a
 /// dispatched worktree is about to be KEPT rather than removed.
 ///
@@ -250,6 +341,12 @@ pub struct KeptWorktree {
     /// keep-on-request reads an unmeasured keep, which is still true.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub on_request: bool,
+    /// Issue #2285: kept because other worktrees of the repository lie inside
+    /// it, which removing it would delete; their paths. `confirmed_dirty` is
+    /// then `false`. Additive, omitted when empty, so an older client reads an
+    /// unmeasured keep, which is still true.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_worktrees: Vec<String>,
 }
 
 impl KeptWorktree {
@@ -259,6 +356,7 @@ impl KeptWorktree {
             path: worktree_dir.to_string_lossy().into_owned(),
             confirmed_dirty: false,
             on_request: true,
+            nested_worktrees: Vec::new(),
         }
     }
 }
@@ -362,12 +460,12 @@ pub async fn kept_worktree_preview(
         worktrees,
         pane_ids,
         probe_timeout,
-        worktree_is_dirty,
+        worktree_keep_check,
     )
     .await
 }
 
-/// [`kept_worktree_preview`] with the dirtiness probe passed in, so a test can
+/// [`kept_worktree_preview`] with the keep probe passed in, so a test can
 /// hand it a probe that never answers. A real `git status` cannot make the
 /// deadline win deterministically: `tokio::time::timeout` polls the probe
 /// before its timer, so a probe that has already finished when the timer fires
@@ -377,7 +475,7 @@ async fn kept_worktree_preview_with(
     worktrees: &WorktreeRegistry,
     pane_ids: &[String],
     probe_timeout: Duration,
-    probe: impl AsyncFn(&Path) -> Result<bool, String>,
+    probe: impl AsyncFn(&Path, &Path) -> Result<TreeKeepCheck, String>,
 ) -> Option<KeptWorktree> {
     let mut seen: Vec<PathBuf> = Vec::new();
     for pane_id in pane_ids {
@@ -394,45 +492,54 @@ async fn kept_worktree_preview_with(
             continue;
         }
         seen.push(worktree.clone());
-        let policy = worktrees
+        let clone_dir = worktrees
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&worktree)
-            .map(|entry| entry.policy);
-        if policy != Some(RemovalPolicy::KeepIfDirty) {
+            .filter(|entry| entry.policy == RemovalPolicy::KeepIfDirty)
+            .map(|entry| entry.clone_dir.clone());
+        let Some(clone_dir) = clone_dir else {
             continue;
-        }
-        let confirmed_dirty = match tokio::time::timeout(probe_timeout, probe(&worktree)).await {
-            Ok(Ok(true)) => true,
-            // Clean: this tree is about to be REMOVED, and saying so would be
-            // the noise that makes the warning worth ignoring. Say nothing.
-            Ok(Ok(false)) => continue,
-            // A failed probe is what `remove_worktree` itself treats as a
-            // reason to keep, so report the path — under wording that does not
-            // claim more than was measured.
-            Ok(Err(e)) => {
-                tracing::debug!(
-                    worktree = %worktree.display(),
-                    error = %e,
-                    "close preview: could not check worktree status"
-                );
-                false
-            }
-            // A blown deadline is not an answer either way: the removal path
-            // runs the same probe with no deadline and may still find it clean.
-            // Report conditionally rather than dropping the path.
-            Err(_) => {
-                tracing::debug!(
-                    worktree = %worktree.display(),
-                    "close preview: worktree status probe timed out"
-                );
-                false
-            }
         };
+        let mut nested_worktrees = Vec::new();
+        let confirmed_dirty =
+            match tokio::time::timeout(probe_timeout, probe(&worktree, &clone_dir)).await {
+                Ok(Ok(TreeKeepCheck::Dirty)) => true,
+                // Issue #2285: removing it would delete the worktrees inside it.
+                Ok(Ok(TreeKeepCheck::HoldsWorktrees(nested))) => {
+                    nested_worktrees = nested;
+                    false
+                }
+                // Clean: this tree is about to be REMOVED, and saying so would be
+                // the noise that makes the warning worth ignoring. Say nothing.
+                Ok(Ok(TreeKeepCheck::Clean)) => continue,
+                // A failed probe is what `remove_worktree` itself treats as a
+                // reason to keep, so report the path — under wording that does not
+                // claim more than was measured.
+                Ok(Err(e)) => {
+                    tracing::debug!(
+                        worktree = %worktree.display(),
+                        error = %e,
+                        "close preview: could not check worktree status"
+                    );
+                    false
+                }
+                // A blown deadline is not an answer either way: the removal path
+                // runs the same probe with no deadline and may still find it clean.
+                // Report conditionally rather than dropping the path.
+                Err(_) => {
+                    tracing::debug!(
+                        worktree = %worktree.display(),
+                        "close preview: worktree status probe timed out"
+                    );
+                    false
+                }
+            };
         return Some(KeptWorktree {
             path: worktree.to_string_lossy().into_owned(),
             confirmed_dirty,
             on_request: false,
+            nested_worktrees,
         });
     }
     None
@@ -471,38 +578,41 @@ pub async fn remove_worktree(
 /// tree ends up kept told apart — [`KeptWorktree`] folds a failed status probe
 /// and a failed removal into one `confirmed_dirty: false`, which is enough for
 /// a warning and not for the `close` verb's report.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorktreeRemoval {
     /// Removed; the clone and the branch are kept.
     Removed,
     /// Kept: `git status --porcelain` reported uncommitted work.
     KeptDirty,
-    /// Kept: the status probe failed, so dirtiness is unknown.
+    /// Kept: the status probe or the worktree listing failed, so whether
+    /// removing it would lose anything is unknown.
     KeptCouldNotCheck,
     /// Kept: `git worktree remove` failed.
     RemoveFailed,
+    /// Issue #2285: kept because other worktrees of the repository lie inside
+    /// it; their paths.
+    KeptHoldsWorktrees(Vec<String>),
 }
 
 impl WorktreeRemoval {
     /// The issue #717 report of this outcome: `None` when the tree was
     /// removed.
-    pub fn kept(self, worktree_dir: &Path) -> Option<KeptWorktree> {
+    pub fn kept(&self, worktree_dir: &Path) -> Option<KeptWorktree> {
         let path = worktree_dir.to_string_lossy().into_owned();
-        match self {
-            WorktreeRemoval::Removed => None,
-            WorktreeRemoval::KeptDirty => Some(KeptWorktree {
-                path,
-                confirmed_dirty: true,
-                on_request: false,
-            }),
+        let (confirmed_dirty, nested_worktrees) = match self {
+            WorktreeRemoval::Removed => return None,
+            WorktreeRemoval::KeptDirty => (true, Vec::new()),
             WorktreeRemoval::KeptCouldNotCheck | WorktreeRemoval::RemoveFailed => {
-                Some(KeptWorktree {
-                    path,
-                    confirmed_dirty: false,
-                    on_request: false,
-                })
+                (false, Vec::new())
             }
-        }
+            WorktreeRemoval::KeptHoldsWorktrees(nested) => (false, nested.clone()),
+        };
+        Some(KeptWorktree {
+            path,
+            confirmed_dirty,
+            on_request: false,
+            nested_worktrees,
+        })
     }
 }
 
@@ -525,15 +635,25 @@ pub async fn remove_worktree_outcome(
     };
     let shown_worktree = logged(&worktree);
     if policy == RemovalPolicy::KeepIfDirty {
-        match worktree_is_dirty(worktree_dir).await {
-            Ok(true) => {
+        match worktree_keep_check(worktree_dir, clone_dir).await {
+            Ok(TreeKeepCheck::Dirty) => {
                 tracing::warn!(
                     worktree = %shown_worktree,
                     "dispatch: worktree has uncommitted changes; leaving in place"
                 );
                 return WorktreeRemoval::KeptDirty;
             }
-            Ok(false) => {}
+            // Issue #2285: `git worktree remove` would delete these with the
+            // directory, their uncommitted work included, and exit 0.
+            Ok(TreeKeepCheck::HoldsWorktrees(nested)) => {
+                tracing::warn!(
+                    worktree = %shown_worktree,
+                    nested = %logged(&nested.join(", ")),
+                    "dispatch: other worktrees lie inside the worktree; leaving in place"
+                );
+                return WorktreeRemoval::KeptHoldsWorktrees(nested);
+            }
+            Ok(TreeKeepCheck::Clean) => {}
             Err(e) => {
                 tracing::warn!(
                     worktree = %shown_worktree,
@@ -5263,7 +5383,7 @@ mod tests {
             &reg,
             &["pane-1".to_string()],
             Duration::from_millis(1),
-            async |_: &Path| std::future::pending().await,
+            async |_: &Path, _: &Path| std::future::pending().await,
         )
         .await
         .expect("an unanswered probe must still report the path");
@@ -5364,6 +5484,157 @@ mod tests {
             "nothing measured the user's edits, so nothing may claim them"
         );
         assert!(wt.is_dir());
+    }
+
+    /// The issue #2285 fixture: `repo` ignores `/.worktrees/`, `unit` is a
+    /// worktree of it, and `nested` is another worktree of it inside `unit`'s
+    /// ignored `.worktrees/`, holding an untracked file.
+    fn init_unit_with_nested_worktree(sandbox: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let repo = sandbox.join("repo");
+        let unit = sandbox.join("repo-dispatch-demo");
+        init_repo_with_worktree(sandbox, &repo, &unit);
+        let run = |dir: &Path, args: &[&str]| {
+            let out = crate::git_env::fixture_git(dir, sandbox)
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        std::fs::write(unit.join(".gitignore"), "/.worktrees/\n").unwrap();
+        run(&unit, &["add", ".gitignore"]);
+        run(&unit, &["commit", "-qm", "ignore .worktrees/"]);
+        let nested = unit.join(".worktrees").join("feat-1-demo");
+        run(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feat/1-demo",
+                &nested.to_string_lossy(),
+            ],
+        );
+        std::fs::write(nested.join("wip.txt"), "wip").unwrap();
+        (repo, unit, nested)
+    }
+
+    /// Issue #2285: a unit worktree holding another worktree under a
+    /// git-ignored directory reads clean to `git status`, and `git worktree
+    /// remove` would delete the nested one's uncommitted work with it. The
+    /// `KeepIfDirty` removal keeps it and names the nested worktree; once the
+    /// nested one is gone, the same removal removes it.
+    #[tokio::test]
+    async fn a_worktree_holding_an_ignored_nested_worktree_is_kept_and_names_it() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let (repo, unit, nested) = init_unit_with_nested_worktree(tmp.path());
+        assert_eq!(
+            worktree_is_dirty(&unit).await,
+            Ok(false),
+            "the premise: `git status` cannot see the nested worktree"
+        );
+        let outcome = remove_worktree_outcome(&unit, &repo, RemovalPolicy::KeepIfDirty).await;
+        assert_eq!(
+            outcome,
+            WorktreeRemoval::KeptHoldsWorktrees(vec![nested.to_string_lossy().into_owned()])
+        );
+        assert!(nested.join("wip.txt").is_file(), "the nested work survives");
+        let kept = outcome.kept(&unit).expect("a kept tree is reported");
+        assert!(!kept.confirmed_dirty);
+        assert_eq!(kept.nested_worktrees.len(), 1);
+
+        let out = crate::git_env::fixture_git(&repo, tmp.path())
+            .args(["worktree", "remove", "--force", &nested.to_string_lossy()])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            remove_worktree_outcome(&unit, &repo, RemovalPolicy::KeepIfDirty).await,
+            WorktreeRemoval::Removed,
+            "with nothing inside it, the unit is removed as before"
+        );
+        assert!(!unit.exists());
+    }
+
+    /// Issue #2285: the close preview asks the same question as the removal,
+    /// so the dialog warns about the nested worktree before the close.
+    #[tokio::test]
+    async fn kept_worktree_preview_reports_a_tree_that_holds_other_worktrees() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let (repo, unit, _nested) = init_unit_with_nested_worktree(tmp.path());
+        let reg = new_worktree_registry();
+        record_worktree(&reg, &unit, &repo, RemovalPolicy::KeepIfDirty);
+        let records = vec![pane_in("pane-1", &unit)];
+
+        let kept = kept_worktree_preview(&records, &reg, &["pane-1".to_string()], PROBE)
+            .await
+            .expect("a tree holding another worktree must be previewed as kept");
+        assert_eq!(kept.path, unit.to_string_lossy());
+        assert!(!kept.confirmed_dirty);
+        assert_eq!(kept.nested_worktrees.len(), 1, "{kept:?}");
+        assert!(
+            kept.nested_worktrees[0].ends_with("feat-1-demo"),
+            "{kept:?}"
+        );
+    }
+
+    /// Issue #2285: only worktrees strictly INSIDE the tree count — not the
+    /// tree itself, not the main checkout beside it, not a sibling whose name
+    /// merely shares the prefix — and one whose directory is already gone
+    /// (git's `prunable`) has nothing left to lose. A listing that cannot be
+    /// taken is an `Err`, which the removal reads as a reason to keep.
+    #[tokio::test]
+    async fn nested_worktrees_counts_only_live_trees_strictly_inside() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        let unit = tmp.path().join("repo-dispatch-x");
+        init_repo_with_worktree(tmp.path(), &repo, &unit);
+        let run = |args: &[&str]| {
+            let out = crate::git_env::fixture_git(&repo, tmp.path())
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        let prefix_sibling = tmp.path().join("repo-dispatch-x-2");
+        run(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "sib",
+            &prefix_sibling.to_string_lossy(),
+        ]);
+        assert_eq!(nested_worktrees(&unit, &repo).await, Ok(vec![]));
+
+        let gone = unit.join("gone");
+        run(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "gone",
+            &gone.to_string_lossy(),
+        ]);
+        assert_eq!(nested_worktrees(&unit, &repo).await.unwrap().len(), 1);
+        std::fs::remove_dir_all(&gone).unwrap();
+        assert_eq!(nested_worktrees(&unit, &repo).await, Ok(vec![]));
+
+        assert!(
+            nested_worktrees(&unit, &tmp.path().join("no-repo"))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            remove_worktree_outcome(
+                &unit,
+                &tmp.path().join("no-repo"),
+                RemovalPolicy::KeepIfDirty
+            )
+            .await,
+            WorktreeRemoval::KeptCouldNotCheck
+        );
+        assert!(unit.is_dir());
     }
 
     #[tokio::test]

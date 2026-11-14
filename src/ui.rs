@@ -7512,9 +7512,12 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     let Some(kept) = state.blocking_write().take_worktree_kept() else {
         return; // a concurrent path took it between the peek and here
     };
+    let nested = kept_worktree_nested_line(&kept)
+        .map(|line| format!(" ({line})"))
+        .unwrap_or_default();
     ui.status_message = Some((
         format!(
-            "{} {}",
+            "{} {}{nested}",
             kept_worktree_headline(&kept).trim_start_matches("! "),
             kept.path
         ),
@@ -7546,11 +7549,37 @@ fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
         // Issue #1958: the user chose `Close, keep worktree` — the same words
         // as the desktop's notice.
         "Worktree kept on request:"
+    } else if !kept.nested_worktrees.is_empty() {
+        // Issue #2285: removing it would delete the worktrees inside it.
+        "! Holds other worktrees, so it is KEPT:"
     } else if kept.confirmed_dirty {
         "! Uncommitted work here is KEPT, not deleted:"
     } else {
         "! Uncommitted work here, if any, is KEPT:"
     }
+}
+
+/// Issue #2285: the line naming the worktrees that keep `kept`, each relative
+/// to it where it can be, so the user knows what to remove first. `None` when
+/// none did.
+fn kept_worktree_nested_line(kept: &KeptWorktree) -> Option<String> {
+    if kept.nested_worktrees.is_empty() {
+        return None;
+    }
+    let parent = std::path::Path::new(&kept.path);
+    let shown: Vec<String> = kept
+        .nested_worktrees
+        .iter()
+        .map(
+            |nested| match std::path::Path::new(nested).strip_prefix(parent) {
+                Ok(relative) if !relative.as_os_str().is_empty() => {
+                    relative.to_string_lossy().into_owned()
+                }
+                _ => nested.clone(),
+            },
+        )
+        .collect();
+    Some(format!("holds: {}", shown.join(", ")))
 }
 
 /// PRD #241: the resolved shape of a confirmed close — see
@@ -21288,7 +21317,12 @@ fn render_close_confirm(
     // The path is the actionable half — the user has to `cd` to it — so the
     // popup WIDENS to fit it rather than truncating by default, and only falls
     // back to a head-truncation when the terminal itself is too narrow.
-    let kept_lines = if state.kept_worktree.is_some() { 3 } else { 0 };
+    // Issue #2285: one more line when other worktrees inside it keep it.
+    let kept_lines = match state.kept_worktree.as_ref() {
+        Some(kept) if kept_worktree_nested_line(kept).is_some() => 4,
+        Some(_) => 3,
+        None => 0,
+    };
     // Saturating rather than `as u16`: the path arrives over the wire, and a
     // wrapping cast would turn an absurd length into a tiny popup instead of a
     // wide one clamped to the terminal.
@@ -21337,6 +21371,12 @@ fn render_close_confirm(
             format!("    {}", truncate_path_head(&kept.path, inner_width)),
             text_primary(),
         ));
+        if let Some(nested) = kept_worktree_nested_line(kept) {
+            text.push(Line::styled(
+                format!("    {}", truncate_with_ellipsis(&nested, inner_width)),
+                text_primary(),
+            ));
+        }
         text.push(Line::from(""));
     }
 

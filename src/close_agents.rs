@@ -1367,10 +1367,10 @@ async fn close_one(
                 .unwrap_or_else(|e| e.into_inner())
                 .contains_key(&worktree)
         {
-            out.worktree_verdict = Some(WorktreeVerdict {
-                path: worktree.to_string_lossy().into_owned(),
-                verdict: WorktreeVerdictKind::KeptOnRequest,
-            });
+            out.worktree_verdict = Some(WorktreeVerdict::new(
+                worktree.to_string_lossy().into_owned(),
+                WorktreeVerdictKind::KeptOnRequest,
+            ));
         }
         return Attempt::Done(out);
     }
@@ -1775,10 +1775,10 @@ async fn close_one(
     // to, since the tree is kept either way, and broadcast once; a close asked
     // to keep never removes, even a tree it found no record of at the latch.
     if let Some(kept) = kept_on_request {
-        out.worktree_verdict = Some(WorktreeVerdict {
-            path: kept.path.clone(),
-            verdict: WorktreeVerdictKind::KeptOnRequest,
-        });
+        out.worktree_verdict = Some(WorktreeVerdict::new(
+            kept.path.clone(),
+            WorktreeVerdictKind::KeptOnRequest,
+        ));
         let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
     } else if out.outcome == CloseOutcome::Closed {
         let worktree = target_worktree(target, &members);
@@ -1801,10 +1801,10 @@ async fn close_one(
                 // The latch found no record of it — never recorded, held by
                 // another keep, or taken by an ordinary cleanup that owns its
                 // removal — so this close kept nothing and removes nothing.
-                WorktreeVerdict {
-                    path: worktree.to_string_lossy().into_owned(),
-                    verdict: WorktreeVerdictKind::NotRecorded,
-                }
+                WorktreeVerdict::new(
+                    worktree.to_string_lossy().into_owned(),
+                    WorktreeVerdictKind::NotRecorded,
+                )
             } else {
                 cleanup_worktree(worktree, registry, worktrees, event_tx).await
             });
@@ -1853,7 +1853,7 @@ pub async fn cleanup_worktree(
             .unwrap_or_else(|e| e.into_inner())
             .contains_key(&worktree);
         if !recorded {
-            return WorktreeVerdictKind::NotRecorded;
+            return (WorktreeVerdictKind::NotRecorded, Vec::new());
         }
         registry.pause_point("close-worktree-cleanup").await;
         // Issue #1958 round 2: the hold comes BEFORE the entry is taken. Taking
@@ -1868,11 +1868,11 @@ pub async fn cleanup_worktree(
         let Some(_removal_hold) = registry.hold_dir_for_removal(&worktree) else {
             // Something still runs in it; the entry stays for the close that
             // stops it.
-            return WorktreeVerdictKind::StillInUse;
+            return (WorktreeVerdictKind::StillInUse, Vec::new());
         };
         let Some(entry) = crate::issue_dispatch_run::take_worktree(&worktrees, &worktree) else {
             // A keep took it between the look above and the hold.
-            return WorktreeVerdictKind::NotRecorded;
+            return (WorktreeVerdictKind::NotRecorded, Vec::new());
         };
         // Issue #1958 round 4 test seam: this cleanup now owns the tree and
         // has neither probed nor removed it yet.
@@ -1886,26 +1886,33 @@ pub async fn cleanup_worktree(
         if let Some(kept) = removal.kept(&worktree) {
             let _ = event_tx.send(BroadcastMsg::WorktreeKept(kept));
         }
+        use crate::issue_dispatch_run::WorktreeRemoval;
         match removal {
-            crate::issue_dispatch_run::WorktreeRemoval::Removed => WorktreeVerdictKind::Removed,
-            crate::issue_dispatch_run::WorktreeRemoval::KeptDirty => WorktreeVerdictKind::KeptDirty,
-            crate::issue_dispatch_run::WorktreeRemoval::KeptCouldNotCheck => {
-                WorktreeVerdictKind::KeptCouldNotCheck
+            WorktreeRemoval::Removed => (WorktreeVerdictKind::Removed, Vec::new()),
+            WorktreeRemoval::KeptDirty => (WorktreeVerdictKind::KeptDirty, Vec::new()),
+            WorktreeRemoval::KeptCouldNotCheck => {
+                (WorktreeVerdictKind::KeptCouldNotCheck, Vec::new())
             }
-            crate::issue_dispatch_run::WorktreeRemoval::RemoveFailed => {
-                WorktreeVerdictKind::RemoveFailed
+            WorktreeRemoval::RemoveFailed => (WorktreeVerdictKind::RemoveFailed, Vec::new()),
+            WorktreeRemoval::KeptHoldsWorktrees(nested) => {
+                (WorktreeVerdictKind::KeptHoldsWorktrees, nested)
             }
         }
     });
-    let verdict = match tokio::time::timeout(WORKTREE_CLEANUP_TIMEOUT, task).await {
-        Ok(Ok(verdict)) => verdict,
-        Ok(Err(join_error)) => {
-            tracing::warn!(error = %join_error, "close: the worktree cleanup task failed");
-            WorktreeVerdictKind::RemoveFailed
-        }
-        Err(_) => WorktreeVerdictKind::TimedOut,
-    };
-    WorktreeVerdict { path, verdict }
+    let (verdict, nested_worktrees) =
+        match tokio::time::timeout(WORKTREE_CLEANUP_TIMEOUT, task).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(join_error)) => {
+                tracing::warn!(error = %join_error, "close: the worktree cleanup task failed");
+                (WorktreeVerdictKind::RemoveFailed, Vec::new())
+            }
+            Err(_) => (WorktreeVerdictKind::TimedOut, Vec::new()),
+        };
+    WorktreeVerdict {
+        path,
+        verdict,
+        nested_worktrees,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -3644,10 +3651,10 @@ mod tests {
         assert_eq!(target.outcome, CloseOutcome::Listed, "{target:?}");
         assert_eq!(
             target.worktree_verdict,
-            Some(WorktreeVerdict {
-                path: wt.to_string_lossy().into_owned(),
-                verdict: WorktreeVerdictKind::KeptOnRequest,
-            })
+            Some(WorktreeVerdict::new(
+                wt.to_string_lossy().into_owned(),
+                WorktreeVerdictKind::KeptOnRequest
+            ))
         );
         assert!(deck.live(&agent), "a dry run stops nothing");
         assert!(deck.worktrees.lock().unwrap().contains_key(&wt));
@@ -3898,10 +3905,10 @@ mod tests {
         assert!(sentinel.exists(), "the ignored sentinel survives");
         assert_eq!(
             target.worktree_verdict,
-            Some(WorktreeVerdict {
-                path: wt.to_string_lossy().into_owned(),
-                verdict: WorktreeVerdictKind::KeptOnRequest,
-            })
+            Some(WorktreeVerdict::new(
+                wt.to_string_lossy().into_owned(),
+                WorktreeVerdictKind::KeptOnRequest
+            ))
         );
         deck.shutdown().await;
     }
@@ -4223,10 +4230,10 @@ mod tests {
         assert_eq!(target.outcome, CloseOutcome::Failed, "{target:?}");
         assert_eq!(
             target.worktree_verdict,
-            Some(WorktreeVerdict {
-                path: other_wt.to_string_lossy().into_owned(),
-                verdict: WorktreeVerdictKind::KeptOnRequest,
-            })
+            Some(WorktreeVerdict::new(
+                other_wt.to_string_lossy().into_owned(),
+                WorktreeVerdictKind::KeptOnRequest
+            ))
         );
         assert!(deck.live(&other));
         assert!(other_wt.exists());
@@ -5788,10 +5795,10 @@ mod tests {
             pane_id: big.clone(),
             agent_id: big.clone(),
         });
-        t.worktree_verdict = Some(WorktreeVerdict {
-            path: big.clone(),
-            verdict: WorktreeVerdictKind::Removed,
-        });
+        t.worktree_verdict = Some(WorktreeVerdict::new(
+            big.clone(),
+            WorktreeVerdictKind::Removed,
+        ));
         t.panes = vec![
             ClosePane {
                 agent_id: big.clone(),
