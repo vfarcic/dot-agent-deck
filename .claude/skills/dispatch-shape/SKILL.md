@@ -55,7 +55,7 @@ From the 2026-09-19 `/issue-queue` loop. `--single`: a mixed-separator path fix 
 
 Two PRDs, one on each side, because a PRD is not a team by being a PRD:
 
-- **`--single`: PRD #2174**, a star-repo reminder dialog in the desktop app that reuses the TUI's existing schedule and choices. One dialog on one surface, plus one decision (the two clients share one reminder state), with no daemon or protocol change — two agents would collide in the same component.
+- **`--single`: PRD #2174**, a star-repo reminder dialog in the desktop app that copies the TUI's existing schedule, choices and keys. Its scope has several pieces — the dialog, reminder state the TUI and the desktop share, voice commands for the dialog's three buttons, and a docs update — but each is small and all of them hang off the one dialog, with one decision to settle (how the two clients share the state) and no daemon or protocol change. None of those pieces is substantial enough to progress on its own, so splitting them would put agents in the same few files.
 - **`--orchestration 'mixed'`: a PRD that spans the daemon, the TUI and the desktop**, such as a new daemon verb that both clients send, gated on a capability, and owing its own cross-version verification (CLAUDE.md rule 12). The daemon half, each client's half and the cross-version run can progress independently, and the gating is a decision worth arguing before any of them is written.
 
 ## Record the choice with a one-line reason
