@@ -100,7 +100,7 @@ There is exactly ONE user gate in this workflow: the merge confirmation (step 6)
 
 ## Notifications (PRD #126)
 
-**You are the only agent that notifies the user, and the only one that ever waits on the user.** Workers never notify and never block on a reply — a blocked or needs-input worker returns its question through `work-done`, and you turn it into one notification and pause. Send by running `scripts/notify.sh "<message>"` from the repo root, and never through any other Telegram tool: the script always sends to the explicit `TELEGRAM_CHAT_ID` (skipping the send when it is unset) and has no inbound path to read. Why it replaced the Telegram MCP server: `docs/develop/notifications-dogfood.md`, section "The script came back (2026-09-11)".
+**You are the only agent that notifies the user, and the only one that ever waits on the user.** Workers never notify and never block on a reply — a blocked or needs-input worker returns its question through `work-done`, and you turn it into one notification and pause. Send by running `scripts/notify.sh "<message>"` from the repo root: the script always sends to the explicit `TELEGRAM_CHAT_ID` (skipping the send when it is unset) and has no inbound path to read. If you ever use a Telegram tool other than this script, both properties are yours to keep again: pass an explicit `chat_id`, and never read inbound updates such as `get_updates`. Why it replaced the Telegram MCP server: `docs/develop/notifications-dogfood.md`, section "The script came back (2026-09-11)".
 
 **Fire-and-forget.** Send and continue — NEVER wait for an acknowledgment, never poll for delivery, never retry, and never let a send result change what you do next. A failed send is a lost notification, not a workflow event.
 
