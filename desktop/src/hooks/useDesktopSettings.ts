@@ -264,7 +264,12 @@ export function useDesktopSettings(runtime: DeckRuntimeState): DesktopSettingsSt
           // edit is not carried: the next save diffs against what is on screen.
           if (cause instanceof PartialSettingsSaveError) {
             carried.current = undefined;
-            if (newest.current !== ticket) return { saved: false };
+            // Superseded: the screen is the newer save's to set, but the caller
+            // still learns what is on disk, so a daemon add whose row is not
+            // there does not count it stored. The newer save was diffed against
+            // a base that already held that row, so it would not write it
+            // either (Qodo, PR #2319).
+            if (newest.current !== ticket) return { saved: false, disk: cause.written };
             setSettings(cause.written);
             setSaveFailure(cause.message);
             return { saved: false, disk: cause.written };

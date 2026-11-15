@@ -196,6 +196,19 @@ desktopScenario("settings-daemons", async (page) => {
   await expect(page.getByLabel("Deck name")).toHaveValue("build");
 });
 
+// PRD #2274 — desktop-only: the TUI attaches to one daemon at a time. The
+// empty Dashboard of a fresh install, with only this machine configured, and
+// the Add a daemon dialog its empty-agents note opens, filled in.
+desktopScenario("add-daemon", async (page) => {
+  await overview(page, "empty");
+  await page.getByTestId("overview-first-run-add-daemon").click();
+  const dialog = page.getByRole("dialog", { name: "Add a daemon" });
+  await expect(dialog).toBeVisible();
+  await dialog.getByLabel("Host", { exact: true }).fill("build-box");
+  await dialog.getByLabel("User", { exact: true }).fill("dev");
+  await expect(dialog.getByTestId("add-daemon-save")).toBeEnabled();
+});
+
 // PRD #1487 — Upgrade on a remote daemon older than the app, stopped at the
 // question the daemon asks while agents are running: the fixture's `upgrade`
 // fleet, whose dev@build-box deck runs an older release with agents on it.

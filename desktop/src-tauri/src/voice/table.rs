@@ -1297,6 +1297,7 @@ mod tests {
                 // between that overlay and an agent pane is decided at dispatch.
                 ("close", "closeTopmost", vec![]),
                 ("open_settings", "openSettings", vec!["deck", "overview"]),
+                ("add_daemon", "addDaemon", vec!["deck", "overview"]),
                 ("show_host_metrics", "showHostMetrics", vec!["overview"]),
                 (
                     "show_dashboard_counters",
@@ -2292,6 +2293,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "add_daemon",
                 "switch_deck",
                 "voice_off",
                 "list_commands",
@@ -2320,6 +2322,7 @@ mod tests {
                 "open_deck",
                 "close",
                 "open_settings",
+                "add_daemon",
                 "show_host_metrics",
                 "show_dashboard_counters",
                 "switch_deck",

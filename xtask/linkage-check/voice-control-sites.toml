@@ -170,7 +170,89 @@ handler = "onClick"
 code = "onClose"
 reason = "Keyboard shortcut sheet close: a dismissal."
 
+# --- desktop/src/components/AddDaemonDialog.tsx ---
+
+[[site]]
+file = "desktop/src/components/AddDaemonDialog.tsx"
+handler = "onMouseDown"
+code = "() => void dismiss()"
+reason = "A click outside the Add a daemon dialog dismisses it, storing nothing; voice's `close` dismisses it too, through the overlay stack."
+
+[[site]]
+file = "desktop/src/components/AddDaemonDialog.tsx"
+handler = "onClick"
+code = "() => void dismiss()"
+reason = "The Add a daemon dialog's Cancel: a dismissal that stores nothing; voice's `close` does the same."
+
+[[site]]
+file = "desktop/src/components/AddDaemonDialog.tsx"
+handler = "onClick"
+code = "() => void add()"
+reason = "The Add a daemon dialog's Add this daemon: saves the address typed into the form; part of a typed form, as in Settings → Daemons. Voice opens the form with `add_daemon`."
+
+[[site]]
+file = "desktop/src/components/AddDaemonDialog.tsx"
+handler = "onChange"
+code = "form.edit"
+reason = "Typing a new daemon's address fields in the Add a daemon dialog: field editing."
+
+# --- desktop/src/components/AddDaemonForm.tsx ---
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "form.setName"
+reason = "Typing a new daemon's name in the add form (Settings → Daemons, or the Add a daemon dialog): field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(host) => onChange({ host })"
+reason = "Typing a daemon's SSH host in the add-a-daemon fields: field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(user) => onChange({ user: user || undefined })"
+reason = "Typing a daemon's SSH user in the add-a-daemon fields: field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(event) => onChange({ port: Number(event.target.value) })"
+reason = "Typing a daemon's SSH port in the add-a-daemon fields: field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(identity) => onChange({ identity: identity || undefined })"
+reason = "Typing a daemon's SSH key file in the add-a-daemon fields: field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(jump) => onChange({ jump: jump || undefined })"
+reason = "Typing a daemon's SSH jump host in the add-a-daemon fields: field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(socket) => onChange({ socket: socket || undefined })"
+reason = "Typing a daemon's socket path in the add-a-daemon fields: field editing."
+
+[[site]]
+file = "desktop/src/components/AddDaemonForm.tsx"
+handler = "onChange"
+code = "(event) => onChange(event.target.value)"
+reason = "`TextRow` forwards a text input's edits to its `onChange` prop: field editing."
+
 # --- desktop/src/components/AgentOverview.tsx ---
+
+[[site]]
+file = "desktop/src/components/AgentOverview.tsx"
+handler = "onClick"
+code = "onAddDaemon"
+reason = "The empty-agents note's Add a daemon button forwards a prop the overview builds as one `VOICE_ACTIONS.addDaemon.run(…)` call (PRD #2274); voice reaches the same dialog through `add_daemon`."
 
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
@@ -733,6 +815,12 @@ reason = "The dashboard's counters button. Voice-reachable: `show_dashboard_coun
 [[site]]
 file = "desktop/src/components/DeckSelector.tsx"
 handler = "onClick"
+code = "addDaemon"
+reason = "The Daemon selector's Add a daemon… entry: closes the menu, then dispatches `VOICE_ACTIONS.addDaemon` (PRD #2274); voice reaches the same dialog through `add_daemon`."
+
+[[site]]
+file = "desktop/src/components/DeckSelector.tsx"
+handler = "onClick"
 code = "() => setOpen((wasOpen) => !wasOpen)"
 reason = "Opens/closes the daemon chooser menu; voice switches daemon directly with `switch_deck` and needs no menu."
 
@@ -746,15 +834,15 @@ reason = "Picks a daemon in the chooser menu; voice reaches the same choice thro
 
 [[site]]
 file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onClick"
-code = "addDeck"
-reason = "Settings → Daemons Add a daemon: starts a new endpoint form of host, user, port and key fields that is typed, not spoken."
+handler = "onChange"
+code = "(change) => editDeck(selected.id, change)"
+reason = "Typing a daemon's address fields (host, user, port, key file, jump host, socket) in Settings → Daemons: field editing."
 
 [[site]]
 file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(name) => { draftNameTouched.current = true; setDraftName(name); }"
-reason = "Typing a new daemon's name in Settings → Daemons: field editing."
+handler = "onClick"
+code = "addDeck"
+reason = "Settings → Daemons Add a daemon: starts a new endpoint form of host, user, port and key fields that is typed, not spoken."
 
 [[site]]
 file = "desktop/src/components/EndpointsPanel.tsx"
@@ -767,42 +855,6 @@ file = "desktop/src/components/EndpointsPanel.tsx"
 handler = "onClick"
 code = "() => void rename(selected.id, renameValue)"
 reason = "Settings → Daemons Rename: commits the name typed in the field beside it; part of a typed form."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(host) => editDeck(selected.id, { host })"
-reason = "Typing a daemon's SSH host in Settings → Daemons: field editing."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(user) => editDeck(selected.id, { user: user || undefined })"
-reason = "Typing a daemon's SSH user in Settings → Daemons: field editing."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(event) => editDeck(selected.id, { port: Number(event.target.value) })"
-reason = "Typing a daemon's SSH port in Settings → Daemons: field editing."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(identity) => editDeck(selected.id, { identity: identity || undefined })"
-reason = "Typing a daemon's SSH identity file in Settings → Daemons: field editing."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(jump) => editDeck(selected.id, { jump: jump || undefined })"
-reason = "Typing a daemon's SSH jump host in Settings → Daemons: field editing."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(socket) => editDeck(selected.id, { socket: socket || undefined })"
-reason = "Typing a daemon's socket path in Settings → Daemons: field editing."
 
 [[site]]
 file = "desktop/src/components/EndpointsPanel.tsx"
@@ -827,12 +879,6 @@ file = "desktop/src/components/EndpointsPanel.tsx"
 handler = "onClick"
 code = "onRemove"
 reason = "Settings → Daemons Remove: deletes a saved endpoint; kept off voice so a misheard utterance cannot delete configuration."
-
-[[site]]
-file = "desktop/src/components/EndpointsPanel.tsx"
-handler = "onChange"
-code = "(event) => onChange(event.target.value)"
-reason = "`TextRow` forwards a text input's edits to its `onChange` prop: field editing."
 
 # --- desktop/src/components/GitHubPanel.tsx ---
 

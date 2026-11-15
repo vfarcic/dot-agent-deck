@@ -369,7 +369,7 @@ The desktop app shows a remote daemon's agents alongside the local ones, reached
 
 1. Install the deck on the host, most simply with `dot-agent-deck remote add my-vm deck@198.51.100.10` from a machine with the CLI.
 2. Keep a daemon running on the host. A daemon with no agents exits about 30 seconds after its last client disconnects, so either leave agents running under it (start them with `connect` and detach), or run the daemon as a service with `~/.local/bin/dot-agent-deck daemon install` on the host, as [Run the Daemon as a Service](daemon-service.md) shows.
-3. In the app, open **Settings → Daemons**, press **Add a daemon**, fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), check the suggested **Deck name**, and press **Add this daemon**. Then press **Test connection**, which also finds the daemon's socket.
+3. In the app, choose **Add a daemon…** at the bottom of the Dashboard's **Daemon** selector (or open **Settings → Daemons** and press **Add a daemon**), fill in **Host** (and **User**, **Port**, **Key file** or **Jump host** as needed), check the suggested **Deck name**, and press **Add this daemon**. Then, in **Settings → Daemons** with the new daemon chosen, press **Test connection**, which also finds the daemon's socket.
 4. Pick the daemon in the **Daemon** selector on the Dashboard, or **All daemons**.
 
 ![Settings → Daemons with a remote daemon named build, its address build-box beside the name, chosen in the Daemon row beside All daemons and This machine; below it the Deck name field reads build with a Rename button, Host is filled in, the other fields show their placeholders, and Test connection is not yet pressed](/img/settings-daemons-desktop.png)

@@ -366,6 +366,24 @@ describe("useDesktopSettings save outcomes and rename refusal", () => {
     expect(await ordinaryFailure).toEqual({ saved: false });
   });
 
+  /// Scenario: two saves are queued and the first is refused because the deck list changed on disk. Its caller is told what is on disk, so a daemon it added is not counted stored, and the screen is left to the newer save (Qodo, PR #2319).
+  it("tells a superseded partial failure's caller what is on disk", async () => {
+    const { pending, saveSettings } = deferredSaves();
+    const { result } = await loadedHook(saveSettings);
+
+    let first!: ReturnType<typeof result.current.save>;
+    await act(async () => { first = result.current.save(withMode("dark")); });
+    await act(async () => { result.current.save(withMode("light")); });
+    const onDisk = { ...withMode("system"), zoom: { level: 1.5 } };
+    await act(async () => { pending[0].reject(new PartialSettingsSaveError("Deck list changed", onDisk)); });
+
+    expect(await first).toEqual({ saved: false, disk: onDisk });
+    expect(result.current.settings).toEqual(withMode("light"));
+    expect(result.current.saveError).toBeUndefined();
+    await waitFor(() => expect(pending).toHaveLength(2));
+    await act(async () => { pending[1].resolve(withMode("light")); });
+  });
+
   /// Scenario: A stale rename fails while another window changes the deck list, so this window shows the disk list and the caller receives the refusal.
   it("adopts a partial rename refusal's disk document and rethrows it", async () => {
     const { result } = await loadedHook(vi.fn(async (settings: DesktopSettingsDto) => settings));

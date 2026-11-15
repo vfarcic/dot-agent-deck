@@ -582,15 +582,40 @@ whole_while = "new_agent_dialog"
 id          = "open_settings"
 description = """Open the app's Settings sheet: appearance, the daemons this app connects to, voice,
 zoom, and notifications. Use when the user asks for settings, preferences, options, configuration, or asks where
-to change how the app looks, where to add or edit a daemon (or deck), where to put an API key, or when
+to change how the app looks, where to edit or remove a daemon (or deck), where to put an API key, or when
 the app notifies them about a question an agent is waiting on. This only
-opens the sheet — it changes no setting by itself."""
+opens the sheet — it changes no setting by itself. Adding a daemon is
+`add_daemon`, not this."""
 invoke      = "openSettings"
 screens     = ["deck", "overview"]
 unavailable_hint = "settings open from the rail once the agent's pane is closed"
 report      = "Opening settings."
 asks_to     = "open settings"
 try_saying  = "open settings"
+
+# PRD #2274 — the Add a daemon dialog, by voice. The Daemon selector's "Add a
+# daemon…" entry and the empty-agents note's "Add a daemon" button dispatch the
+# same registry entry (`addDaemon`), so this row exposes those clicks rather
+# than a second route to the form. A user may still call a daemon a deck
+# (`docs/develop/glossary.md`), so the description names both words.
+#
+# `screens` is `open_settings`'s, for the same reason: the selector sits on the
+# deck and on the overview, and not on the agent screen, whose rail and top bar
+# sit inert behind the modal pane. Opening the dialog stores nothing; the user
+# fills the form in and confirms it there.
+[[commands]]
+id          = "add_daemon"
+description = """Open the Add a daemon form, to add a daemon on another machine (also called a deck, a
+remote, a server or a box) so its agents show on this dashboard. Use when the user asks to add,
+connect or set up another daemon, deck, machine or remote. This only opens the form — the user fills
+in the host and confirms it there. It is not `switch_deck`, which changes which daemon is shown, and
+not `open_settings`."""
+invoke      = "addDaemon"
+screens     = ["deck", "overview"]
+unavailable_hint = "a daemon is added from the dashboard once the agent's pane is closed"
+report      = "Opening the Add a daemon form."
+asks_to     = "add a daemon"
+try_saying  = "add a deck"
 
 # PR #1672 — the Host button beside each daemon's name on the agent dashboard
 # (PRD #1258), by voice. The button dispatches through the same registry entry

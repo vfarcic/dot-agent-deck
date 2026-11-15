@@ -76,42 +76,21 @@ import { LOCAL_ENDPOINT_SELECTION } from "../lib/bridge";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
 import {
   ALL_ENDPOINT_SELECTION,
-  blankEndpoint,
   deckChoices,
   endpointAddress,
-  endpointSectionToSave,
-  FIELD_PLACEHOLDERS,
-  hostProblem,
-  identityProblem,
-  jumpProblem,
-  portProblem,
   rowProblems,
-  socketProblem,
-  userProblem,
 } from "../lib/endpoints";
 import { useSettingsBridge } from "../lib/settingsBridge";
 import type { SettingsPanelProps } from "../lib/settingsContract";
+import { DaemonAddressFields, DaemonNameRow, Problem, refusalText, saveEndpointSection, sectionOf, TextRow, useNewDaemon } from "./AddDaemonForm";
 
-/**
- * How the panel READS the document's endpoint section.
- *
- * The `??` is a render-time stand-in and nothing else: a document with no
- * `[endpoints]` section still has a local deck and still has to draw a chooser.
- * It must never reach a save on its own — `remote: []` is the assertion "this
- * user has no decks", and PRD #742 M6 routes every write through
- * {@link endpointSectionToSave}, which is where that rule is written down.
- * M8 closed the one exception: {@link runTest}'s write-back wrote directly and
- * was protected only by its own find-guard.
- */
-function sectionOf(settings: DesktopSettingsDto): EndpointSettingsDto {
-  return settings.endpoints ?? { remote: [], selection: LOCAL_ENDPOINT_SELECTION };
-}
-
-/** A rejection as the sentence to show: the bridge rejects with a plain string. */
-function refusalText(cause: unknown): string {
-  if (typeof cause === "string") return cause;
-  return cause instanceof Error ? cause.message : String(cause);
-}
+/*
+  How the panel READS the document's endpoint section is `sectionOf`, in
+  `AddDaemonForm.tsx` beside the form it shares with the dialog (PRD #2274).
+  Its `??` is a render-time stand-in and nothing else; it must never reach a
+  save on its own. PRD #742 M8 closed the one exception: {@link runTest}'s
+  write-back wrote directly and was protected only by its own find-guard.
+*/
 
 export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPanelProps) {
   // `undefined` wherever no provider is mounted — a panel rendered standalone,
@@ -119,7 +98,6 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   // rather than present and broken; see `lib/settingsBridge.tsx`.
   const bridge = useSettingsBridge();
   const onTest = bridge?.testEndpoint;
-  const defaultDeckName = bridge?.defaultDeckName;
   const checkDeckName = bridge?.checkDeckName;
   const renameDeck = bridge?.renameDeck;
   const section = sectionOf(settings);
@@ -127,37 +105,21 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const [reports, setReports] = useState<Record<string, EndpointTestReportDto>>({});
   const [testing, setTesting] = useState<string>();
   /**
-   * A deck being added, held HERE until it is storable (PRD #741, Greptile P2
-   * on #1035).
-   *
-   * `addDeck` used to write the blank row straight into the document. Rust's
-   * `Hostname` refuses an empty string, so `desktop_set_settings` rejected the
-   * whole document — which meant the row lived only in this component's
-   * optimistic state and vanished on restart, AND that **every unrelated save
-   * failed for as long as it was there**: an appearance change made while a
-   * half-filled deck row sat in the list could not be persisted either.
+   * A daemon being added, held until it is storable (PRD #741, Greptile P2 on
+   * #1035) — by {@link useNewDaemon}, the same state and confirmation the
+   * dashboard's Add a daemon dialog uses (PRD #2274).
    *
    * A draft is not in the document, so it cannot be named by
    * `section.selection` either — {@link shown} is what the panel focuses
    * instead, and the stored selection only moves when the row commits.
    */
-  const [draft, setDraft] = useState<RemoteEndpointDto>();
+  const adding = useNewDaemon(settings, onSave);
+  const draft = adding.draft;
   /**
-   * The name the draft will be stored under (issue #1426), held beside it
-   * rather than in it so a pre-fill can arrive without the draft's fields
-   * moving. Empty means "the one the library derives", which is what a save
-   * without a name gets.
-   */
-  const [draftName, setDraftName] = useState("");
-  /** Once the user types a name, a later pre-fill must not overwrite it. */
-  const draftNameTouched = useRef(false);
-  /** The draft as of the latest edit, for the confirmation that resolves after an `await`. */
-  const latestDraft = useRef(draft);
-  latestDraft.current = draft;
-  /**
-   * What the library said about the last name checked, keyed by the row it was
-   * checked for and the exact text. A verdict for any other text is stale and
-   * is neither shown nor acted on.
+   * What the library said about the last name checked for a STORED daemon's
+   * rename, keyed by the row it was checked for and the exact text. A verdict
+   * for any other text is stale and is neither shown nor acted on. A draft's
+   * name is checked by {@link useNewDaemon}.
    */
   const [nameCheck, setNameCheck] = useState<{ id: string; name: string; refusal: string | null }>();
   /**
@@ -168,7 +130,6 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const [renameEdit, setRenameEdit] = useState<{ id: string; from: string; value: string }>();
   const [renameRefusal, setRenameRefusal] = useState<{ id: string; message: string }>();
   const [renaming, setRenaming] = useState(false);
-  const [confirming, setConfirming] = useState(false);
 
   /**
    * The document as of the latest render, for a write-back that happens after
@@ -220,9 +181,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const renameValue = selected && !draft && renameEdit?.id === selected.id && renameEdit.from === storedName
     ? renameEdit.value
     : storedName;
-  /** The name field's text for the row on screen: the draft's, or the stored row's edit. */
-  const nameValue = draft ? draftName : renameValue;
-  const verdict = selected && nameCheck?.id === selected.id && nameCheck.name === nameValue ? nameCheck.refusal : undefined;
+  const verdict = selected && !draft && nameCheck?.id === selected.id && nameCheck.name === renameValue ? nameCheck.refusal : undefined;
   const nameRefusal = (selected && renameRefusal?.id === selected.id ? renameRefusal.message : undefined) ?? verdict ?? undefined;
   /**
    * A rename refused because its deck left the deck list (removed in a
@@ -235,45 +194,24 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
     : undefined;
 
   /*
-    Issue #1426: pre-fill a draft's name with the one the library would derive
-    for it, as soon as it has an address to derive from — and only until the
-    user types one of their own. A stale answer (the host changed again while
-    it was in flight) is dropped.
+    Check a stored daemon's new name with the library as it is typed, so a
+    refused one is said beside the field and cannot be confirmed. Its own
+    current name is not checked: it is the name it already has. A draft's name
+    is checked by `useNewDaemon`.
   */
-  const draftId = draft?.id;
-  const draftHost = draft?.host ?? "";
-  const draftUser = draft?.user;
-  useEffect(() => {
-    if (!draftId || !defaultDeckName || draftNameTouched.current) return;
-    if (hostProblem(draftHost) || userProblem(draftUser ?? "")) return;
-    let current = true;
-    defaultDeckName(draftHost, draftUser || undefined)
-      .then((name) => {
-        if (current && !draftNameTouched.current) setDraftName(name);
-      })
-      .catch(() => undefined);
-    return () => { current = false; };
-  }, [draftId, draftHost, draftUser, defaultDeckName]);
-
-  /*
-    Check the name on screen with the library as it is typed, so a refused one
-    is said beside the field and cannot be confirmed. The stored row's own
-    current name is not checked: it is the name it already has.
-  */
-  const checkedId = selected?.id;
-  const isDraft = draft !== undefined;
-  const checkWanted = Boolean(checkedId && nameValue && (isDraft || nameValue !== storedName));
+  const checkedId = selected && !draft ? selected.id : undefined;
+  const checkWanted = Boolean(checkedId && renameValue && renameValue !== storedName);
   useEffect(() => {
     if (!checkWanted || !checkedId || !checkDeckName) return;
     let current = true;
-    const name = nameValue;
-    checkDeckName(name, isDraft ? undefined : checkedId)
+    const name = renameValue;
+    checkDeckName(name, checkedId)
       .then((refusal) => {
         if (current) setNameCheck({ id: checkedId, name, refusal: refusal || null });
       })
       .catch(() => undefined);
     return () => { current = false; };
-  }, [checkWanted, checkedId, nameValue, isDraft, checkDeckName]);
+  }, [checkWanted, checkedId, renameValue, checkDeckName]);
 
   /**
    * Write a new endpoint section back into `document`. The whole document goes,
@@ -294,15 +232,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
    * is what lets both use the same gate rather than the doc-comment asserting
    * they do.
    */
-  const saveSectionOf = (document: DesktopSettingsDto, next: EndpointSettingsDto) => {
-    const write = endpointSectionToSave(document.endpoints, next);
-    if (!write) return undefined;
-    // `document` is named as what this edit was made against (issue #828): for
-    // `runTest`'s write-back it is `latest.current`, which can trail the
-    // document on screen by a render, and measuring the edit against the newer
-    // one would write this snapshot's stale fields over it.
-    return onSave({ ...document, endpoints: write }, document);
-  };
+  const saveSectionOf = (document: DesktopSettingsDto, next: EndpointSettingsDto) => saveEndpointSection(onSave, document, next);
 
   /** {@link saveSectionOf} against the document this render was given. */
   const saveSection = (next: EndpointSettingsDto) => saveSectionOf(settings, next);
@@ -311,67 +241,16 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
     // Focused on creation, but NOT stored and NOT selected: an added deck the
     // user then has to select is two steps for one intent, and a deck with no
     // host is not one the app can be pointed at yet.
-    setDraft(blankEndpoint());
-    setDraftName("");
+    adding.start();
     setRenameRefusal(undefined);
-    draftNameTouched.current = false;
   };
 
   /**
-   * Store the draft and select it (issue #1426) — the confirmation that used to
-   * happen on its own the moment the row was valid, and is now the user's, so
-   * the pre-filled name can be changed first.
-   *
-   * The name is checked once more at the moment of confirming, because the
-   * verdict on screen may still be in flight; a refusal is shown and nothing is
-   * stored. An empty name stores none, and the library derives one. The Deck
-   * name field is locked (`confirming`) while that check runs, so the name
-   * captured here is the one checked, saved and on screen — an edit made during
-   * the check used to be dropped in favour of this earlier value.
-   *
-   * The name can still be taken between that check and the save (a `remote
-   * add` in a terminal). The save then writes nothing and the window is shown
-   * the list as it is on disk, without this deck — so the draft comes back,
-   * name and all, and the name check beside the field says why, for the user
-   * to choose another name and add it again.
+   * Store the draft and select it (issue #1426), through
+   * {@link useNewDaemon}'s confirmation, which carries the name check and the
+   * name-taken-meanwhile recovery for every surface that adds a daemon.
    */
-  const confirmDraft = async () => {
-    const pending = latestDraft.current;
-    if (!pending || rowProblems(pending).length > 0) return;
-    const name = draftName;
-    if (name && checkDeckName) {
-      setConfirming(true);
-      let refusal: string | null;
-      try {
-        refusal = await checkDeckName(name, undefined);
-      } catch (cause) {
-        refusal = refusalText(cause);
-      } finally {
-        setConfirming(false);
-      }
-      if (refusal) {
-        setNameCheck({ id: pending.id, name, refusal });
-        return;
-      }
-    }
-    // The draft as it is NOW, which the user may have edited while the check
-    // ran; abandoned meanwhile means there is nothing to store.
-    const now = latestDraft.current;
-    if (!now || now.id !== pending.id || rowProblems(now).length > 0) return;
-    const document = latest.current;
-    const current = sectionOf(document);
-    const row: RemoteEndpointDto = name ? { ...now, name } : now;
-    setDraft(undefined);
-    const outcome = await saveSectionOf(document, { remote: [...current.remote, row], selection: row.id });
-    if (!outcome || outcome.saved || !outcome.disk) return;
-    if (sectionOf(outcome.disk).remote.some((stored) => stored.id === row.id)) return;
-    // Another draft started meanwhile is the user's newer intent; leave it.
-    if (latestDraft.current) return;
-    setDraft(now);
-    setDraftName(name);
-    draftNameTouched.current = Boolean(name);
-    setNameCheck(undefined);
-  };
+  const confirmDraft = () => adding.confirm();
 
   /** Rename the stored deck on screen (issue #1426); never through `onSave`. */
   const rename = async (id: string, name: string) => {
@@ -407,7 +286,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
   const chooseDeck = (id: string) => {
     if (draft?.id === id) return;
     setRenameRefusal(undefined);
-    setDraft(undefined);
+    adding.cancel();
     saveSection({ ...section, selection: id });
   };
 
@@ -420,8 +299,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
 
   const removeDeck = (id: string) => {
     if (draft?.id === id) {
-      setDraft(undefined);
-      setDraftName("");
+      adding.cancel();
       forgetReport(id);
       return;
     }
@@ -438,7 +316,7 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
       // Held until the user confirms it (`confirmDraft`), which is when it goes
       // into the document and becomes the selection. Until then nothing is
       // written, so no save fails.
-      setDraft({ ...draft, ...change });
+      adding.edit(change);
       return;
     }
     saveSection({
@@ -565,22 +443,9 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
 
       {selected && (
         <div className="deck-detail" data-testid="deck-detail">
-          {draft && (defaultDeckName || checkDeckName) && (
-            <TextRow
-              id={`deck-name-${selected.id}`}
-              label="Deck name"
-              value={draftName}
-              placeholder="derived from the address"
-              problem={nameRefusal}
-              // Locked while Add this daemon re-checks it, so the name saved is
-              // the one that was checked and is on screen.
-              disabled={confirming}
-              onChange={(name) => {
-                draftNameTouched.current = true;
-                setDraftName(name);
-              }}
-            />
-          )}
+          {/* Locked while Add this daemon re-checks it, so the name saved is
+              the one that was checked and is on screen. */}
+          {draft && adding.naming && <DaemonNameRow id={selected.id} form={adding} />}
           {!draft && renameDeck && (
             <>
               <TextRow
@@ -608,65 +473,13 @@ export function EndpointsPanel({ settings, onSave, saveError, mode }: SettingsPa
               </div>
             </>
           )}
-          <TextRow
-            id={`deck-host-${selected.id}`}
-            label="Host"
-            value={selected.host}
-            placeholder={FIELD_PLACEHOLDERS.host}
-            problem={hostProblem(selected.host)}
-            onChange={(host) => editDeck(selected.id, { host })}
-          />
-          <TextRow
-            id={`deck-user-${selected.id}`}
-            label="User"
-            value={selected.user ?? ""}
-            placeholder={FIELD_PLACEHOLDERS.user}
-            problem={userProblem(selected.user ?? "")}
-            onChange={(user) => editDeck(selected.id, { user: user || undefined })}
-          />
-          <div className="settings-row">
-            <label htmlFor={`deck-port-${selected.id}`}>Port</label>
-            <input
-              id={`deck-port-${selected.id}`}
-              className="settings-input is-narrow"
-              type="number"
-              min={1}
-              max={65535}
-              value={selected.port}
-              onChange={(event) => editDeck(selected.id, { port: Number(event.target.value) })}
-            />
-          </div>
-          <Problem text={portProblem(selected.port)} />
-          <TextRow
-            id={`deck-identity-${selected.id}`}
-            label="Key file"
-            value={selected.identity ?? ""}
-            placeholder={FIELD_PLACEHOLDERS.identity}
-            problem={identityProblem(selected.identity ?? "")}
-            onChange={(identity) => editDeck(selected.id, { identity: identity || undefined })}
-          />
-          <TextRow
-            id={`deck-jump-${selected.id}`}
-            label="Jump host"
-            value={selected.jump ?? ""}
-            placeholder={FIELD_PLACEHOLDERS.jump}
-            problem={jumpProblem(selected.jump ?? "")}
-            onChange={(jump) => editDeck(selected.id, { jump: jump || undefined })}
-          />
-          <TextRow
-            id={`deck-socket-${selected.id}`}
-            label="Daemon socket"
-            value={selected.socket ?? ""}
-            placeholder={FIELD_PLACEHOLDERS.socket}
-            problem={socketProblem(selected.socket ?? "")}
-            onChange={(socket) => editDeck(selected.id, { socket: socket || undefined })}
-          />
+          <DaemonAddressFields row={selected} onChange={(change) => editDeck(selected.id, change)} />
           {draft && (
             <div className="deck-row-actions">
               <button
                 className="button primary compact"
                 data-testid="save-new-deck"
-                disabled={confirming || rowProblems(draft).length > 0 || Boolean(verdict)}
+                disabled={!adding.canConfirm}
                 onClick={() => void confirmDraft()}
               >
                 <Check size={13} /> Add this daemon
@@ -736,60 +549,6 @@ function DeckChoice({ id, label, address, selected, onSelect, onRemove }: {
   );
 }
 
-/** A two-column text row, in the same shape as every other settings row. */
-function TextRow({ id, label, value, placeholder, problem, disabled, onChange }: {
-  id: string;
-  label: string;
-  value: string;
-  placeholder: string;
-  problem: string | undefined;
-  disabled?: boolean;
-  onChange: (value: string) => void;
-}) {
-  return (
-    <>
-      <div className="settings-row">
-        <label htmlFor={id}>{label}</label>
-        <input
-          id={id}
-          className="settings-input"
-          type="text"
-          spellCheck={false}
-          autoComplete="off"
-          value={value}
-          placeholder={placeholder}
-          disabled={disabled}
-          aria-invalid={problem ? true : undefined}
-          onChange={(event) => onChange(event.target.value)}
-        />
-      </div>
-      <Problem text={problem} />
-    </>
-  );
-}
-
-/**
- * What is wrong with a field, said only when something is.
- *
- * It earns its row by being actionable: the charsets are Rust's and a save
- * would otherwise fail with a serde message the panel cannot explain.
- */
-function Problem({ text }: { text: string | undefined }) {
-  if (!text) return null;
-  return <p className="settings-hint is-problem" role="alert">{text}</p>;
-}
-
-/**
- * What a `Test connection` found.
- *
- * The whole point of M10 is that this is a **named state** and not one
- * "failed", so the sentence, the remedy and the forwards each render only when
- * there is one — an empty block under a button that has not been pressed is
- * chrome, and a remedy printed for a state that has none is noise.
- *
- * The screen must not blank while a deck is unreachable, which is why this is a
- * block inside the panel rather than anything that replaces it.
- */
 function TestResult({ report, mode }: { report: EndpointTestReportDto | undefined; mode: string }) {
   if (!report) return null;
   return (

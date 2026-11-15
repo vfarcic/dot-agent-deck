@@ -7,9 +7,11 @@ export type RailScreen = "deck" | "overview";
 /**
  * Everything the rail can show as open over a screen: the deck's overlays, and
  * the shortcut sheet its bottom button opens. The sheet is not a
- * {@link DeckOverlay} because no registry entry opens it.
+ * {@link DeckOverlay} because no registry entry opens it. The Add a daemon
+ * dialog (PRD #2274) is not one either: it opens over either screen, through
+ * its own registry entry and context member (`addDaemon`, `openAddDaemon`).
  */
-export type ShellOverlay = DeckOverlay | "shortcuts";
+export type ShellOverlay = DeckOverlay | "shortcuts" | "addDaemon";
 
 export type ShellOverlayState = Partial<Record<ShellOverlay, boolean>>;
 

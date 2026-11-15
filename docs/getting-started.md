@@ -57,7 +57,7 @@ On startup the deck installs its status hooks for the agents it detects (see [In
 
 **Desktop app instead:** install it ([Installation → Desktop app](installation.md#desktop-app)), keep a daemon running (the TUI above is enough; see [How the desktop app gets a daemon](installation.md#how-the-desktop-app-gets-a-daemon)) and open **Agent Deck**. **Check:** the Dashboard says **No agents are running yet** and offers **New agent**. If it says **Daemon disconnected** with **Start daemon**, no daemon is running; press **Start daemon** and confirm.
 
-![The desktop app's dashboard with no agents: “No agents are running yet” and a New agent button](/img/dashboard-empty-desktop.png)
+![The desktop app's dashboard with no agents: “No agents are running yet”, with New agent and Add a daemon](/img/dashboard-empty-desktop.png)
 
 ## Step 3: Start an agent
 
