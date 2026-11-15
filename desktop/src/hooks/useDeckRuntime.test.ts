@@ -17,6 +17,7 @@ const { bridge } = vi.hoisted(() => ({
   bridge: {
     mode: "fixture",
     connect: vi.fn(),
+    reconnectDeck: vi.fn(),
     // Typed with the real two-callback shape rather than as a nullary stub, so
     // a test can capture the terminal channel the hook subscribes with.
     subscribe: vi.fn(async (_onFleet: (fleet: unknown) => void, _onTerminal: (event: TerminalChunk) => void) => () => {}),
@@ -171,6 +172,135 @@ describe("useDeckRuntime", () => {
 
     expect(result.current.error).toBe("the daemon is not answering");
     expect(result.current.cleanupWarnings?.map((warning) => warning.stops)).toEqual([["planner"]]);
+  });
+
+  /**
+   * Issue #1994: a deck's own Reconnect names its deck. Only that deck is
+   * marked "Reconnecting…", the bridge is asked to reconnect it by id and not
+   * to re-establish the fleet, and the selected deck — the one the unnamed
+   * reconnect would have marked — is never touched.
+   */
+  /** Scenario: Reconnects the named deck and leaves the selected deck alone. */
+  it("reconnects the named deck and leaves the selected deck alone", async () => {
+    const fleet = createFixtureFleet("fleet");
+    bridge.connect.mockResolvedValue(fleet);
+    let answer: ((fleet: DeckFleet) => void) | undefined;
+    bridge.reconnectDeck.mockImplementationOnce(() => new Promise((resolve) => { answer = resolve; }));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+    const statusOf = (deckId: string) => result.current.fleet.find((deck) => deck.connection.deckId === deckId)?.connection;
+    expect(result.current.fleet[0].connection.deckId).toBe(FIXTURE_DAEMON_ID);
+    const before = statusOf(FIXTURE_DAEMON_ID);
+
+    let pending: Promise<void> | undefined;
+    act(() => { pending = result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID); });
+
+    expect(statusOf(FIXTURE_UNREACHABLE_DAEMON_ID)).toMatchObject({ status: "loading", message: "Reconnecting…" });
+    expect(statusOf(FIXTURE_DAEMON_ID)).toBe(before);
+    expect(bridge.reconnectDeck).toHaveBeenCalledWith(FIXTURE_UNREACHABLE_DAEMON_ID);
+    expect(bridge.connect).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      answer?.(fleet);
+      await pending;
+    });
+    expect(statusOf(FIXTURE_DAEMON_ID)?.status).toBe("connected");
+  });
+
+  /** Scenario: A named deck's failed reconnect marks that deck failed, keeps naming it, and leaves the selected deck connected. */
+  it("puts a named deck's failed reconnect on that deck alone", async () => {
+    bridge.connect.mockResolvedValue(createFixtureFleet("fleet"));
+    bridge.reconnectDeck.mockRejectedValueOnce(new Error("the host is not answering"));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+    const deckOf = (deckId: string) => result.current.fleet.find((deck) => deck.connection.deckId === deckId);
+
+    await act(async () => {
+      await result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID);
+    });
+
+    expect(result.current.error).toBe("the host is not answering");
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection).toMatchObject({ status: "error", message: "the host is not answering", deckId: FIXTURE_UNREACHABLE_DAEMON_ID });
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.health).toBe("failed");
+    expect(result.current.fleet[0].connection).toMatchObject({ status: "connected", deckId: FIXTURE_DAEMON_ID });
+  });
+
+  /** Scenario: Reconnect is pressed on two decks at once; the first succeeds and its fleet replaces the second's "Reconnecting…", then the second fails: the second deck shows its failure (PR #2322 review). */
+  it("puts a deck's failure on it even after another deck's reconnect answered first", async () => {
+    const fleet = createFixtureFleet("fleet");
+    bridge.connect.mockResolvedValue(fleet);
+    let answerRemote: ((fleet: DeckFleet) => void) | undefined;
+    let rejectUnreachable: ((cause: unknown) => void) | undefined;
+    bridge.reconnectDeck.mockImplementation((deckId: string) => new Promise((resolve, reject) => {
+      if (deckId === FIXTURE_REMOTE_DAEMON_ID) answerRemote = resolve;
+      else rejectUnreachable = reject;
+    }));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(2));
+    const deckOf = (deckId: string) => result.current.fleet.find((deck) => deck.connection.deckId === deckId);
+
+    let remote: Promise<void> | undefined;
+    let unreachable: Promise<void> | undefined;
+    act(() => { remote = result.current.reconnect(FIXTURE_REMOTE_DAEMON_ID); });
+    act(() => { unreachable = result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID); });
+    await act(async () => {
+      answerRemote?.(fleet);
+      await remote;
+    });
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection.status).not.toBe("loading");
+    await act(async () => {
+      rejectUnreachable?.(new Error("the host is not answering"));
+      await unreachable;
+    });
+
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection).toMatchObject({ status: "error", message: "the host is not answering" });
+    expect(result.current.error).toBe("the host is not answering");
+  });
+
+  /** Scenario: Two Reconnects on one deck, the first failing after the second started: only the second decides what the deck shows (PR #2322 review). */
+  it("applies only the latest reconnect of a deck", async () => {
+    const fleet = createFixtureFleet("fleet");
+    bridge.connect.mockResolvedValue(fleet);
+    let rejectFirst: ((cause: unknown) => void) | undefined;
+    let answerSecond: ((fleet: DeckFleet) => void) | undefined;
+    bridge.reconnectDeck
+      .mockImplementationOnce(() => new Promise((_resolve, fail) => { rejectFirst = fail; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { answerSecond = resolve; }));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+    const deckOf = (deckId: string) => result.current.fleet.find((deck) => deck.connection.deckId === deckId);
+
+    let first: Promise<void> | undefined;
+    let second: Promise<void> | undefined;
+    act(() => { first = result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID); });
+    act(() => { second = result.current.reconnect(FIXTURE_UNREACHABLE_DAEMON_ID); });
+    await act(async () => {
+      rejectFirst?.(new Error("the first attempt timed out"));
+      await first;
+    });
+    expect(result.current.error).toBeUndefined();
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection.status).toBe("loading");
+
+    const recovered = fleet.map((deck) => deck.connection.deckId === FIXTURE_UNREACHABLE_DAEMON_ID ? { ...deck, connection: { ...deck.connection, status: "connected" as const } } : deck);
+    await act(async () => {
+      answerSecond?.(recovered);
+      await second;
+    });
+    expect(deckOf(FIXTURE_UNREACHABLE_DAEMON_ID)?.connection.status).toBe("connected");
+  });
+
+  /** Scenario: Reconnect with no deck named still re-establishes the whole fleet, as the dashboard's Refresh does. */
+  it("re-establishes the whole fleet when no deck is named", async () => {
+    bridge.connect.mockResolvedValue(createFixtureFleet("fleet"));
+    const { result } = renderHook(() => useDeckRuntime());
+    await waitFor(() => expect(result.current.fleet.length).toBeGreaterThan(1));
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+
+    expect(bridge.connect).toHaveBeenCalledTimes(2);
+    expect(bridge.reconnectDeck).not.toHaveBeenCalled();
   });
 
   /**
