@@ -1695,7 +1695,11 @@ export interface DeckRuntimeState {
    * another, and both declarations travel in the same array.
    */
   setShownTerminals: (targets: AgentTarget[]) => Promise<void>;
-  reconnect: () => Promise<void>;
+  /**
+   * Reconnect the deck named by `deckId` and no other (issue #1994), or, with
+   * no id, re-establish the whole fleet (the dashboard's Refresh).
+   */
+  reconnect: (deckId?: string) => Promise<void>;
   /**
    * PRD #819 M6: the projects the connected daemon knows about. There is no
    * client-side list to fall back to — an unreachable daemon means no projects

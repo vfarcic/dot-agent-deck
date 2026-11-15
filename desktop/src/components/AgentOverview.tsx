@@ -1575,7 +1575,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
         try {
           // The crate handshakes the deck again and emits its snapshot, so the
           // group turns into the connected deck on its own; no reconnect, which
-          // would re-establish the whole fleet to show one deck.
+          // would spend a second handshake on a deck this one already redid.
           await runtime.runAction({ type: "allow_build_mismatch", ...(refused.deckId === undefined ? {} : { deckId: refused.deckId }) });
         } catch (cause) {
           setOverrideError({ deckId: refused.deckId, message: cause instanceof Error ? cause.message : String(cause) });
@@ -1824,7 +1824,8 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               onReconnect={() => {
                 setOverrideError(undefined);
                 setStartError(deck.snapshot.connection.deckId, undefined);
-                void runtime.reconnect();
+                // Issue #1994: this deck's section, so this deck alone.
+                void runtime.reconnect(deck.snapshot.connection.deckId);
               }}
               onStartDaemon={mode === "live" && deck.snapshot.connection.disconnectedReason?.action === "start-daemon" ? () => requestStartDaemon(deck.snapshot.connection) : undefined}
               startError={startErrors.get(startErrorKey(deck.snapshot.connection.deckId))}
@@ -2185,7 +2186,7 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
     It is stated as what it is rather than as a failure, in the register the
     overview's empty state uses, and it offers no button — unlike the
     disconnected note, there is nothing for the reader to do and Reconnect would
-    re-establish the whole fleet to hurry one deck that is already coming.
+    only hurry one deck that is already coming.
   */
   if (connection.pending) {
     return (

@@ -1706,9 +1706,8 @@ pub(crate) async fn connect_anyway(links: &DaemonLinks, endpoint: &Endpoint) -> 
 /// is the sentence for the button the user just pressed, so it says what went
 /// wrong and what to do rather than repeating the handshake.
 pub(crate) fn connect_anyway_failure(connection: &DesktopConnection) -> Option<String> {
-    // No sentence sends the user to Reconnect: on the overview that button
-    // re-establishes the SELECTED deck, which in a fleet is usually not this
-    // one. What retries this deck is its own watcher, every
+    // No sentence sends the user to Reconnect, because it is not needed:
+    // what retries this deck is its own watcher, every
     // `WATCH_RETRY_DELAY`, under the allowance just armed — so a deck that
     // starts answering connects without another click, and the sentence says
     // so. A `Disconnected` here is either the handshake or the agent-list
@@ -2238,6 +2237,61 @@ pub(crate) async fn bootstrap(options: &BootstrapOptions, links: &DaemonLinks) -
         return current;
     }
     start_and_snapshot(scope.endpoint(), links).await.1
+}
+
+/// Reconnect ONE deck: drop the link held for it and snapshot it afresh
+/// (issue #1994).
+///
+/// What a deck's own Reconnect button does. It used to reach [`bootstrap`],
+/// which answers the selected deck whichever deck's button was pressed, and
+/// the webview then reset its whole fleet around that answer. This names its
+/// deck and touches that deck's link alone: every other deck keeps its held
+/// link and its watcher, as the TUI's reconnect leaves every daemon but the
+/// one it is attached to.
+///
+/// The invalidation is the "re" in reconnect: a held link can describe a
+/// daemon that has since gone or wedged, and the user pressed the button
+/// because the deck looked wrong, so the snapshot below handshakes against
+/// whatever answers at the address now.
+///
+/// And the deck's watcher is told to answer its next emit from a fresh
+/// listing (PR #2322 review). Its subscription is a connection of its own and
+/// is left running: while it is open it is the answering daemon's, since a
+/// replaced daemon closes it and the watcher then starts its view over. What
+/// the nudge removes is a watcher emitting its incrementally folded list
+/// after this fresh snapshot, which would let the user's Reconnect be
+/// answered by the very state they pressed it to replace. A deck in its
+/// retry wait has no subscription and no view to refresh; its next
+/// establishment lists afresh anyway.
+///
+/// # The fleet can change while the handshake is out
+///
+/// An `[endpoints]` save that drops this deck while the handshake is out has
+/// already torn its link and its tunnel down, and the snapshot below would put
+/// a fresh link back for a deck nothing observes (PR #2322 review). So when
+/// the deck is no longer in the fleet afterwards, the link this re-opened is
+/// dropped, the transport is released, and nothing is published.
+///
+/// The check is the deck's own MEMBERSHIP ([`crate::dto::DeckScope::still_in_fleet`]),
+/// not the fleet's epoch that `target_deck_snapshot` compares. The snapshot
+/// describes this deck alone, so another deck leaving meanwhile says nothing
+/// against it: refusing then would fail a healthy deck, and dropping its link
+/// could take one its watcher had just re-established.
+pub(crate) async fn reconnect_and_snapshot(
+    scope: &crate::dto::DeckScope,
+    state: &crate::terminal::DesktopState,
+) -> Result<DesktopSnapshot, String> {
+    scope.still_in_fleet()?;
+    let endpoint = scope.endpoint();
+    state.daemon.invalidate(endpoint).await;
+    let snapshot = snapshot_of(endpoint, &state.daemon).await;
+    if let Err(left) = scope.still_in_fleet() {
+        state.daemon.invalidate(endpoint).await;
+        crate::endpoint_test::release_if_not_observed(&state.tunnels, endpoint).await;
+        return Err(left);
+    }
+    state.request_refetch(&endpoint.identity());
+    Ok(snapshot)
 }
 
 /// The allowance switches' test guard, for `terminal`'s tests of the held
@@ -3867,6 +3921,212 @@ mod tests {
             2,
             "the re-establishment must really have reconnected"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scenario: two decks each hold a link, and Reconnect is pressed on one of
+    /// them. That deck handshakes again, reports Connected and has its watcher
+    /// told to list afresh; the other deck's held link is the same object
+    /// afterwards, no handshake was spent on it and its watcher was told nothing
+    /// (issue #1994, PR #2322 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reconnecting_one_deck_re_handshakes_that_deck_and_leaves_the_other_held() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (dir_a, socket_a) = scratch_socket("issue-1994-a");
+        let (dir_b, socket_b) = scratch_socket("issue-1994-b");
+        let daemon_a = tokio::spawn(scripted_daemon_sequence(
+            bind_trusted(&socket_a),
+            vec![
+                matching_hello(),
+                matching_hello(),
+                AttachResponse::agent_records(vec![listed_agent("1", "pane-1")]),
+            ],
+        ));
+        let daemon_b = tokio::spawn(scripted_daemon_sequence(
+            bind_trusted(&socket_b),
+            vec![matching_hello()],
+        ));
+
+        let state = crate::terminal::DesktopState::default();
+        let links = &state.daemon;
+        let deck_a = Endpoint::Local(LocalEndpoint::at(&socket_a));
+        let deck_b = Endpoint::Local(LocalEndpoint::at(&socket_b));
+        let held_a = links.trusted(&deck_a).await.expect("establish deck A");
+        let held_b = links.trusted(&deck_b).await.expect("establish deck B");
+        assert_eq!(links.handshake_count(), 2);
+        // Each deck's watcher subscribes to its refetch nudge.
+        let nudge_a = state.refetch_signal(&deck_a.identity());
+        let nudge_b = state.refetch_signal(&deck_b.identity());
+
+        // Deck A is the fleet's local deck, so it is observed.
+        let _local_deck = crate::local_deck::test_override::point_local_deck_at(&socket_a);
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_wire_id(&deck_a)))
+            .expect("deck A is observed");
+        let snapshot = reconnect_and_snapshot(&scope, &state)
+            .await
+            .expect("nothing left the fleet");
+
+        assert!(
+            nudge_a
+                .has_changed()
+                .expect("deck A's nudge sender is held"),
+            "the reconnected deck's watcher must list afresh rather than emit its folded view"
+        );
+        assert!(
+            !nudge_b
+                .has_changed()
+                .expect("deck B's nudge sender is held"),
+            "another deck's watcher is not told anything"
+        );
+
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert_eq!(snapshot.connection.deck_id, deck_wire_id(&deck_a));
+        assert_eq!(snapshot.agents.len(), 1);
+        assert_eq!(
+            links.handshake_count(),
+            3,
+            "the reconnected deck handshakes once more, and nothing else does"
+        );
+        let after_a = links.trusted(&deck_a).await.expect("deck A is held again");
+        assert!(
+            !Arc::ptr_eq(&held_a, &after_a),
+            "the reconnected deck must not keep the link it had"
+        );
+        let after_b = links.trusted(&deck_b).await.expect("deck B is still held");
+        assert!(
+            Arc::ptr_eq(&held_b, &after_b),
+            "the other deck's link must survive another deck's Reconnect"
+        );
+        assert_eq!(links.handshake_count(), 3);
+        assert_eq!(daemon_a.await.expect("deck A's daemon must not panic"), 3);
+        assert_eq!(daemon_b.await.expect("deck B's daemon must not panic"), 1);
+        let _ = std::fs::remove_dir_all(dir_a);
+        let _ = std::fs::remove_dir_all(dir_b);
+    }
+
+    /// Scenario: Reconnect is pressed on a remote deck, and while its handshake
+    /// is held a settings save drops that deck from the fleet. The reconnect
+    /// reports that the deck left, and leaves neither a link nor a transport
+    /// held for it (issue #1994, PR #2322 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_whose_deck_left_the_fleet_meanwhile_keeps_nothing_for_it() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (dir, socket) = scratch_socket("issue-1994-left");
+        let listener = bind_trusted(&socket);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+            // The handshake, held until the fleet has moved…
+            let (stream, _peer) = listener.accept().await.expect("accept the handshake");
+            let (mut reader, mut writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            let encoded = serde_json::to_vec(&matching_hello()).expect("serialize the reply");
+            let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+            // …then the listing, answered as a healthy deck answers it.
+            scripted_daemon_sequence(
+                listener,
+                vec![AttachResponse::agent_records(vec![listed_agent(
+                    "1", "pane-1",
+                )])],
+            )
+            .await
+        });
+
+        let (settings, remote) = all_decks_with_one_remote_row("build-box.example.com");
+        crate::dto::apply_settings_selection(&settings);
+        let state = crate::terminal::DesktopState::default();
+        state.tunnels.insert_route(&remote, &socket).await;
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_wire_id(&remote)))
+            .expect("the remote row is observed");
+
+        let (outcome, ()) = tokio::join!(reconnect_and_snapshot(&scope, &state), async {
+            accepted_rx.await.expect("the handshake reached the daemon");
+            crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
+            let _ = release_tx.send(());
+        });
+        let _ = daemon.await;
+
+        let refusal =
+            outcome.expect_err("a deck that left the fleet is not reported as reconnected");
+        assert!(refusal.contains("left the fleet"), "{refusal}");
+        assert_eq!(
+            state.daemon.held().await,
+            0,
+            "the link the handshake re-opened must not stay held for a deck nothing observes"
+        );
+        assert_eq!(state.tunnels.held().await, 0, "nor its transport");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Scenario: the control for the test above. Reconnect is pressed on one
+    /// remote deck, and while its handshake is held a settings save drops a
+    /// DIFFERENT deck. The reconnected deck is still in the fleet, so it reports
+    /// Connected and keeps its fresh link and its transport (PR #2322 review).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reconnect_survives_another_deck_leaving_the_fleet_meanwhile() {
+        let _selection = crate::dto::SELECTION_LOCK.lock().await;
+        let (dir, socket) = scratch_socket("issue-1994-stays");
+        let listener = bind_trusted(&socket);
+        let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let daemon = tokio::spawn(async move {
+            use dot_agent_deck::daemon_protocol::{KIND_RESP, read_frame, write_frame};
+            let (stream, _peer) = listener.accept().await.expect("accept the handshake");
+            let (mut reader, mut writer) = stream.into_split();
+            let _ = read_frame(&mut reader).await;
+            let _ = accepted_tx.send(());
+            let _ = release_rx.await;
+            let encoded = serde_json::to_vec(&matching_hello()).expect("serialize the reply");
+            let _ = write_frame(&mut writer, KIND_RESP, &encoded).await;
+            scripted_daemon_sequence(
+                listener,
+                vec![AttachResponse::agent_records(vec![listed_agent(
+                    "1", "pane-1",
+                )])],
+            )
+            .await
+        });
+
+        let (smaller, remote) = all_decks_with_one_remote_row("build-box.example.com");
+        let mut larger = smaller.clone();
+        let other = add_remote_row(&mut larger, "laptop.example.com");
+        crate::dto::apply_settings_selection(&larger);
+        assert!(
+            crate::dto::deck_is_observed(&other),
+            "fixture: two remote decks are observed"
+        );
+        let state = crate::terminal::DesktopState::default();
+        state.tunnels.insert_route(&remote, &socket).await;
+        let scope = crate::dto::DeckScope::resolve(Some(&deck_wire_id(&remote)))
+            .expect("the remote row is observed");
+
+        let (outcome, ()) = tokio::join!(reconnect_and_snapshot(&scope, &state), async {
+            accepted_rx.await.expect("the handshake reached the daemon");
+            crate::dto::apply_settings_selection(&smaller);
+            let _ = release_tx.send(());
+        });
+        let _ = daemon.await;
+
+        assert!(
+            !crate::dto::deck_is_observed(&other),
+            "fixture: the other deck left"
+        );
+        let snapshot = outcome.expect("another deck leaving says nothing against this one");
+        assert_eq!(snapshot.connection.status, ConnectionStatus::Connected);
+        assert_eq!(
+            state.daemon.held().await,
+            1,
+            "the reconnected deck keeps its fresh link"
+        );
+        assert_eq!(state.tunnels.held().await, 1, "and its transport");
+        crate::dto::apply_settings_selection(&crate::settings::DesktopSettings::default());
         let _ = std::fs::remove_dir_all(dir);
     }
 
@@ -8647,8 +8907,8 @@ start = true
         let failure = connect_anyway_failure(&snapshot.connection).expect("a failure is reported");
         assert!(failure.contains("did not respond"), "{failure}");
         assert!(failure.contains("keeps trying"), "{failure}");
-        // The overview's Reconnect re-establishes the SELECTED deck, so the
-        // sentence must not send the user to it for this one.
+        // The deck's watcher retries it on its own, so the sentence says that
+        // rather than sending the user to a button.
         assert!(!failure.contains("Reconnect"), "{failure}");
         let _ = std::fs::remove_dir_all(dir);
     }

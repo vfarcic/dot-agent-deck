@@ -3080,6 +3080,24 @@ impl DeckScope {
         })
     }
 
+    /// Whether THIS deck is still in the fleet — membership, not the fleet's
+    /// epoch that [`Self::revalidate`] compares (issue #1994, PR #2322 review).
+    ///
+    /// For an operation whose result is still right as long as its own deck is
+    /// observed, whatever else the fleet did meanwhile: a Reconnect's snapshot
+    /// describes this deck alone, so another deck leaving says nothing against
+    /// it, and refusing on the epoch would fail a healthy deck for it. A fresh
+    /// read on purpose — the question is about the present.
+    pub(crate) fn still_in_fleet(&self) -> Result<(), String> {
+        if deck_is_observed(&self.endpoint) {
+            return Ok(());
+        }
+        Err(format!(
+            "that daemon left the fleet while this operation was in flight: {}",
+            safe_display_text(self.endpoint.describe())
+        ))
+    }
+
     /// A scope over `endpoint` captured **now**, for a test pinning something
     /// other than this boundary.
     ///
