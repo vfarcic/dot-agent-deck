@@ -2653,10 +2653,10 @@ describe("ControlDeck", () => {
 
   /**
    * Scenario: render the daemon against a snapshot mapped from a real daemon DTO
-   * — the live path, not the fixture. Every place the daemon used to assert an
-   * attempt count now shows the em dash it shows for anything else the daemon
-   * does not report, and the branch chip is gone rather than printing the
-   * literal "Unavailable" where a branch name belongs (PRD #745 M8).
+   * — the live path, not the fixture. No attempt count is shown anywhere: the
+   * topbar has no ATTEMPT reading, the tile no ATT, and the run-graph node no
+   * "att". The branch chip is gone rather than printing the literal
+   * "Unavailable" where a branch name belongs (PRD #745 M8).
    */
   it("asserts no attempt count and no branch in live mode", async () => {
     const { mapDesktopSnapshot } = await import("./lib/bridge");
@@ -2670,10 +2670,9 @@ describe("ControlDeck", () => {
 
     // The topbar instrument, the run-graph node and the tile — the three places
     // the fabricated `1` used to surface.
-    expect(screen.getByText("ATTEMPT").parentElement).toHaveTextContent("—");
+    expect(screen.queryByText("ATTEMPT")).not.toBeInTheDocument();
     expect(screen.getByTestId("workflow-node-agent-7")).not.toHaveTextContent("att");
-    expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("—");
-    expect(container.querySelector(".agent-attempt")).toHaveAttribute("title", "No attempt count is reported by the daemon");
+    expect(screen.queryByText("ATT")).not.toBeInTheDocument();
 
     // No branch chip at all, and nothing standing in for one.
     expect(container.querySelector(".branch-line svg")).toBeNull();
@@ -3039,14 +3038,12 @@ describe("ControlDeck", () => {
     expect(await screen.findByText(same)).toBeInTheDocument();
   });
   /**
-   * The fixture keeps its own attempt counts: they are legitimate fixture data,
-   * and M8's claim is about what LIVE mode presents as fact.
+   * The fixture's run graph keeps its own attempt counts: they are legitimate
+   * fixture data, and M8's claim is about what LIVE mode presents as fact.
    */
-  it("still shows the fixture's own attempt counts", () => {
+  it("still shows the fixture's own attempt counts on the run graph", () => {
     const { container } = render(<ControlDeck runtime={runtime()} />);
 
-    expect(screen.getByText("ATTEMPT").parentElement).toHaveTextContent("01");
-    expect(container.querySelector(".agent-attempt strong")?.textContent).toBe("01");
     expect(screen.getByTestId("workflow-node-build")).toHaveTextContent("att 2");
     expect(container.querySelector(".branch-line")).toHaveTextContent("codex/visual-control-deck");
   });

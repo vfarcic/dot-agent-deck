@@ -712,9 +712,6 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 */
 .status-label.is-held { color: var(--faint); background: var(--paper-sunken-strong); }
 .agent-state-mark.is-held { color: var(--faint); background: transparent; }
-.agent-attempt { width: 38px; height: 33px; display: grid; grid-template-columns: 1fr; place-items: center; border-left: 1px solid var(--line); }
-.agent-attempt span { color: var(--faint); font-size: var(--text-xs); letter-spacing: .08em; }
-.agent-attempt strong { font-family: "JetBrains Mono", monospace; font-size: var(--text-base); }
 /* Issue #2000: each label sits on its value's first line rather than on a row
    of its own. A prompt that wraps hangs under its own first word, as the TUI
    card's `Prmt:` does; the min-height is the two-line clamp, so a one-line
