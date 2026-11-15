@@ -122,7 +122,7 @@ When the last agent of a dispatched unit is closed, whether you named the unit, 
 | `kept on request` | You passed `--keep-worktree`, so the worktree was left on disk whatever its state. The output also tells you how to find or remove it later. |
 | `kept: uncommitted changes` | The worktree is left on disk so the work can be recovered. |
 | `kept: holds other worktrees` | Other worktrees of the repository are inside it, for example ones an agent created under a git-ignored directory such as `.worktrees/`. Removing it would delete them along with their uncommitted work, so it is kept. The output names up to 16 of them under `holds worktree`, and `git worktree list`, run in the repository, shows them all. Remove those first (`git worktree remove <path>`), then this worktree. |
-| `kept: could not check for uncommitted changes` | The deck could not tell whether the worktree was clean, so it kept it. |
+| `kept: could not check for uncommitted changes or worktrees inside it` | The deck could not tell whether the worktree was clean, or whether other worktrees lie inside it, so it kept it. |
 | `kept: removing it failed` | Removing the worktree failed; it is still on disk. |
 | `kept: still in use` | Something else was using the directory at the time. |
 | `cleanup still running: …` | The agents are stopped, but the removal had not finished within about 30 seconds. Check with `dot-agent-deck worktree list`. |

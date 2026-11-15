@@ -546,7 +546,7 @@ async fn kept_worktree_preview_with(
                     tracing::debug!(
                         worktree = %worktree.display(),
                         error = %e,
-                        "close preview: could not check worktree status"
+                        "close preview: could not check worktree status or the worktrees inside it"
                     );
                     false
                 }
@@ -684,7 +684,7 @@ pub async fn remove_worktree_outcome(
                 tracing::warn!(
                     worktree = %shown_worktree,
                     error = %logged(&e.to_string()),
-                    "dispatch: could not check worktree status; leaving in place"
+                    "dispatch: could not check worktree status or the worktrees inside it; leaving in place"
                 );
                 return WorktreeRemoval::KeptCouldNotCheck;
             }

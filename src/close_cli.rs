@@ -394,7 +394,9 @@ fn verdict_text(kind: WorktreeVerdictKind) -> &'static str {
     match kind {
         WorktreeVerdictKind::Removed => "removed",
         WorktreeVerdictKind::KeptDirty => "kept: uncommitted changes",
-        WorktreeVerdictKind::KeptCouldNotCheck => "kept: could not check for uncommitted changes",
+        WorktreeVerdictKind::KeptCouldNotCheck => {
+            "kept: could not check for uncommitted changes or worktrees inside it"
+        }
         WorktreeVerdictKind::RemoveFailed => "kept: removing it failed",
         WorktreeVerdictKind::StillInUse => "kept: still in use",
         WorktreeVerdictKind::NotRecorded => {
