@@ -7512,9 +7512,21 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     let Some(kept) = state.blocking_write().take_worktree_kept() else {
         return; // a concurrent path took it between the peek and here
     };
+    let shown = kept_worktree_nested_shown(&kept);
+    let nested = if shown.is_empty() {
+        String::new()
+    } else {
+        // At the daemon's cap there may be more than it named.
+        let more = if shown.len() >= crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED {
+            ", and maybe more"
+        } else {
+            ""
+        };
+        format!(" (holds: {}{more})", shown.join(", "))
+    };
     ui.status_message = Some((
         format!(
-            "{} {}",
+            "{} {}{nested}",
             kept_worktree_headline(&kept).trim_start_matches("! "),
             kept.path
         ),
@@ -7546,11 +7558,60 @@ fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
         // Issue #1958: the user chose `Close, keep worktree` — the same words
         // as the desktop's notice.
         "Worktree kept on request:"
+    } else if !kept.nested_worktrees.is_empty() {
+        // Issue #2285: removing it would delete the worktrees inside it.
+        "! Holds other worktrees, so it is KEPT:"
     } else if kept.confirmed_dirty {
         "! Uncommitted work here is KEPT, not deleted:"
     } else {
         "! Uncommitted work here, if any, is KEPT:"
     }
+}
+
+/// Issue #2285: the worktrees that keep `kept`, each relative to it where it
+/// can be, so the user knows what to remove first. Empty when none did.
+fn kept_worktree_nested_shown(kept: &KeptWorktree) -> Vec<String> {
+    let parent = std::path::Path::new(&kept.path);
+    kept.nested_worktrees
+        .iter()
+        .map(
+            |nested| match std::path::Path::new(nested).strip_prefix(parent) {
+                Ok(relative) if !relative.as_os_str().is_empty() => {
+                    relative.to_string_lossy().into_owned()
+                }
+                _ => nested.clone(),
+            },
+        )
+        .collect()
+}
+
+/// Issue #2285: the most nested worktrees the close dialog lists one per line;
+/// past it, one more line says how many it left out.
+const KEPT_NESTED_DIALOG_LINES: usize = 3;
+
+/// Issue #2285: the close dialog's lines naming the worktrees that keep
+/// `kept`, one each, so a long name is clipped on its own line rather than
+/// hiding the others.
+fn kept_worktree_nested_lines(kept: &KeptWorktree) -> Vec<String> {
+    let shown = kept_worktree_nested_shown(kept);
+    let mut lines: Vec<String> = shown
+        .iter()
+        .take(KEPT_NESTED_DIALOG_LINES)
+        .map(|nested| format!("holds: {nested}"))
+        .collect();
+    if shown.len() > KEPT_NESTED_DIALOG_LINES {
+        // At the daemon's cap there may be more than it named.
+        let at_least = if shown.len() >= crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED {
+            "at least "
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "holds: … and {at_least}{} more",
+            shown.len() - KEPT_NESTED_DIALOG_LINES
+        ));
+    }
+    lines
 }
 
 /// PRD #241: the resolved shape of a confirmed close — see
@@ -21300,7 +21361,10 @@ fn render_close_confirm(
     // The path is the actionable half — the user has to `cd` to it — so the
     // popup WIDENS to fit it rather than truncating by default, and only falls
     // back to a head-truncation when the terminal itself is too narrow.
-    let kept_lines = if state.kept_worktree.is_some() { 3 } else { 0 };
+    // Issue #2285: plus one line per worktree inside it that keeps it.
+    let kept_lines: u16 = state.kept_worktree.as_ref().map_or(0, |kept| {
+        3 + u16::try_from(kept_worktree_nested_lines(kept).len()).unwrap_or(0)
+    });
     // Saturating rather than `as u16`: the path arrives over the wire, and a
     // wrapping cast would turn an absurd length into a tiny popup instead of a
     // wide one clamped to the terminal.
@@ -21349,6 +21413,12 @@ fn render_close_confirm(
             format!("    {}", truncate_path_head(&kept.path, inner_width)),
             text_primary(),
         ));
+        for nested in kept_worktree_nested_lines(kept) {
+            text.push(Line::styled(
+                format!("    {}", truncate_path_head(&nested, inner_width)),
+                text_primary(),
+            ));
+        }
         text.push(Line::from(""));
     }
 

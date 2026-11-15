@@ -161,6 +161,7 @@ fn serve(op: &str) -> AttachResponse {
                 path: "/remote/project-dispatch".into(),
                 confirmed_dirty: true,
                 on_request: false,
+                nested_worktrees: Vec::new(),
             });
             reply.dispatched_worktree = Some("/remote/project-dispatch".into());
             reply

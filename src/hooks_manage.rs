@@ -2765,48 +2765,100 @@ mod tests {
     /// a background child holding its stdout open, having printed no complete
     /// line. The probe answers unknown within its bound instead of waiting for
     /// EOF, and the helper holding the pipe is killed with the probe's group.
+    ///
+    /// Issue #2212: the checks are of what the probe does, not of how fast a
+    /// loaded box carries it out. The helper is killed once the probe's
+    /// `SIGKILL` reaches it, so that is what is checked, not that it has
+    /// finished exiting: on a 4-CPU box under CPU and fsync load a killed
+    /// helper outlived a flat 5 s wait for it to exit (1 run in 1540). A
+    /// deadline that passes before the stand-in has written the helper's pid
+    /// leaves the test without its premise, so that attempt is checked for its
+    /// answer and bound, then repeated with a longer deadline.
     #[cfg(unix)]
     #[test]
     fn the_version_probe_is_bounded_when_a_descendant_holds_stdout_open() {
         let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("helper.pid");
-        let claude = stand_in_claude(
-            dir.path(),
-            &format!(
-                "#!/bin/sh\nsleep 30 &\necho $! > '{}'\nprintf '2.1.300'\nexit 0\n",
-                pid_file.display()
-            ),
-        );
-        // Leave room for the stand-in to be scheduled when the fast tier is
-        // running in parallel; otherwise the probe can time out before the
-        // script even writes helper.pid, leaving this test without its premise.
-        let bound = std::time::Duration::from_secs(3);
-        let started = std::time::Instant::now();
-        let outcome = probe_claude_version(claude.as_os_str(), bound);
-        let elapsed = started.elapsed();
-        assert_eq!(outcome, (false, None), "an unfinished line is unknown");
-        assert!(
-            elapsed < bound + std::time::Duration::from_millis(1500),
-            "the probe waited {elapsed:?} against a {bound:?} bound"
-        );
-
-        let helper: i32 = std::fs::read_to_string(&pid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        let gone = |pid: i32| {
-            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
-                stat.rsplit_once(") ")
-                    .is_some_and(|(_, rest)| rest.starts_with('Z'))
-            })
+        // What a probe waiting for EOF would wait: every bound below stays
+        // well under it.
+        const HELD_FOR: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut bound = std::time::Duration::from_secs(3);
+        let helper: i32 = loop {
+            let pid_file = dir.path().join(format!("helper-{}.pid", bound.as_secs()));
+            // Written by rename, so a stand-in killed mid-write leaves no
+            // half-written pid behind.
+            let claude = stand_in_claude(
+                dir.path(),
+                &format!(
+                    "#!/bin/sh\nsleep {held} &\necho $! > '{pid}.tmp' && mv '{pid}.tmp' '{pid}'\nprintf '2.1.300'\nexit 0\n",
+                    held = HELD_FOR.as_secs(),
+                    pid = pid_file.display()
+                ),
+            );
+            let started = std::time::Instant::now();
+            let outcome = probe_claude_version(claude.as_os_str(), bound);
+            let elapsed = started.elapsed();
+            assert_eq!(outcome, (false, None), "an unfinished line is unknown");
+            // Past the deadline the probe still spawns and reaps: a ceiling on
+            // something that must happen, so it widens with the load.
+            let slack = crate::test_budget::load_scaled(std::time::Duration::from_millis(1500));
+            assert!(
+                elapsed < bound + slack,
+                "the probe waited {elapsed:?} against a {bound:?} bound and {slack:?} of slack"
+            );
+            assert!(
+                bound + slack < HELD_FOR / 2,
+                "{bound:?} plus {slack:?} no longer tells a bounded probe from one waiting for EOF"
+            );
+            if let Ok(pid) = std::fs::read_to_string(&pid_file) {
+                break pid.trim().parse().unwrap();
+            }
+            assert!(
+                bound < std::time::Duration::from_secs(12),
+                "the stand-in never got as far as starting its helper within {bound:?}"
+            );
+            bound *= 2;
         };
+
         if Path::new("/proc/self/stat").exists() {
-            let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            while !gone(helper) && std::time::Instant::now() < until {
+            // Killed: gone, a zombie, exiting (`PF_EXITING` in the stat flags),
+            // or with `SIGKILL` pending, which it is from the moment the
+            // group is signalled until the helper next runs.
+            const PF_EXITING: u64 = 0x4;
+            const SIGKILL_BIT: u64 = 1 << (libc::SIGKILL - 1);
+            let killed = |pid: i32| {
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    return true;
+                };
+                let fields: Vec<&str> = stat
+                    .rsplit_once(") ")
+                    .map_or(Vec::new(), |(_, rest)| rest.split_whitespace().collect());
+                let zombie = fields.first().is_some_and(|s| *s == "Z" || *s == "X");
+                let exiting = fields
+                    .get(6)
+                    .and_then(|f| f.parse::<u64>().ok())
+                    .is_some_and(|flags| flags & PF_EXITING != 0);
+                let pending =
+                    std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+                        status.lines().any(|line| {
+                            ["SigPnd:", "ShdPnd:"].iter().any(|key| {
+                                line.strip_prefix(key)
+                                    .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+                                    .is_some_and(|mask| mask & SIGKILL_BIT != 0)
+                            })
+                        })
+                    });
+                zombie || exiting || pending
+            };
+            let until = std::time::Instant::now()
+                + crate::test_budget::load_scaled(std::time::Duration::from_secs(5));
+            while !killed(helper) && std::time::Instant::now() < until {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
-            assert!(gone(helper), "the helper holding stdout outlived the probe");
+            assert!(
+                killed(helper),
+                "the helper holding stdout outlived the probe: {:?}",
+                std::fs::read_to_string(format!("/proc/{helper}/stat"))
+            );
         }
     }
 

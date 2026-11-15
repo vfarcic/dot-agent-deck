@@ -11172,6 +11172,7 @@ command = "configured-planner"
                 path: "/w/unit".into(),
                 confirmed_dirty: true,
                 on_request: false,
+                nested_worktrees: Vec::new(),
             }),
             keep_worktree: Some("/w/unit".into()),
         };
