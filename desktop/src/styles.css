@@ -1683,9 +1683,10 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 .overview-note-hint { color: var(--faint); }
 /* A healthy daemon with no agents: one row the width of its group, icon, words
    and the one button, instead of a 260px centred card. */
-.overview-note.overview-note-row { min-height: 0; padding: 12px 16px; flex-direction: row; align-items: center; justify-content: flex-start; gap: 14px; text-align: left; }
+.overview-note.overview-note-row { min-height: 0; padding: 12px 16px; flex-direction: row; flex-wrap: wrap; align-items: center; justify-content: flex-start; gap: 14px; text-align: left; }
 .overview-note-row > svg { flex: none; }
-.overview-note-row > .overview-note-row-text { flex: 1; min-width: 0; margin-top: 0; display: block; }
+/* The 220px basis: when the buttons no longer fit beside the words, they wrap under them rather than squeezing the words into a narrow column. */
+.overview-note-row > .overview-note-row-text { flex: 1 1 220px; min-width: 0; margin-top: 0; display: block; }
 .overview-note-row-text h3 { margin: 0 0 2px; font-size: var(--text-lg); }
 .overview-note-row-text p { max-width: none; margin: 0; }
 .overview-note-row > .button { flex: none; }

@@ -409,6 +409,30 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     });
   });
 
+  /// Scenario: a fresh install with this machine as the only daemon and no agents. The empty note offers New agent and Add a daemon; from a wide window down to the 400px phone layout its heading stays on one line, its words keep a readable column instead of being squeezed beside the two buttons, and the page does not scroll sideways.
+  test("keeps the empty note's words readable beside its buttons at every width", async ({ page }) => {
+    await page.goto("/?fixture=1&state=empty");
+    await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+    await page.getByTestId("open-overview").click();
+    const note = page.getByTestId("overview-first-run");
+    await expect(note.getByTestId("overview-first-run-new-agent")).toBeVisible();
+    await expect(note.getByTestId("overview-first-run-add-daemon")).toBeVisible();
+
+    for (const width of [1280, 900, 681, 400]) {
+      await page.setViewportSize({ width, height: 800 });
+      const heading = await note.locator("h3").evaluate((element) => {
+        const lineHeight = parseFloat(getComputedStyle(element).lineHeight) || parseFloat(getComputedStyle(element).fontSize) * 1.2;
+        return { height: element.getBoundingClientRect().height, lineHeight };
+      });
+      expect(heading.height, `the note's heading wraps at ${width}px`).toBeLessThan(heading.lineHeight * 1.5);
+      const text = await note.locator(".overview-note-row-text").boundingBox();
+      expect(text?.width ?? 0, `the note's words are squeezed into a narrow column at ${width}px`).toBeGreaterThanOrEqual(220);
+      await expect(note.getByTestId("overview-first-run-add-daemon"), `Add a daemon is off screen at ${width}px`).toBeInViewport();
+      const scroll = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+      expect(scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(0);
+    }
+  });
+
   test.describe("at 400x780 phone", () => {
     test.use({ viewport: { width: 400, height: 780 } });
 
