@@ -1,5 +1,5 @@
 import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useMemo, useRef, useState, type CSSProperties, type MouseEvent, type ReactNode } from "react";
-import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
+import { Blocks, Boxes, CircleArrowUp, CircleStop, Columns3, Filter, LayoutList, Layers, Maximize2, Network, Play, Plus, RefreshCw, RotateCcw, Server, ShieldAlert, Sparkles, SquareTerminal, Wrench, X } from "lucide-react";
 import { desktopFeaturesOf } from "../types";
 import { KEEP_WORKTREE_SUFFIX, worktreePreview } from "../lib/worktreeClose";
 import { statusLabel, type AgentSession, type AgentStatus, type ConnectionView, type DeckRuntimeState, type DeckView } from "../types";
@@ -21,6 +21,7 @@ import { stopDaemonConfirmCopy, stopDaemonOffer } from "../lib/stopDaemon";
 import { NewAgentDialog, NO_DIALOG_FOR_DECK, NO_DIALOG_TO_DISCARD, NO_DIRECTORY_BROWSER, NO_NEW_AGENT_DIALOG, NO_NEW_AGENT_FORM, type NewAgentRuntime } from "./NewAgentDialog";
 import type { NewAgentDraft } from "../lib/newAgentDraft";
 import { DeckSelector } from "./DeckSelector";
+import { AddDaemonOpener } from "./AddDaemonDialog";
 import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { VoiceNumber } from "./VoiceNumber";
 import { PullRequestBadge } from "./PullRequestBadge";
@@ -1311,6 +1312,18 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
      door on this screen exists only while it is shown. `undefined` removes
      the top bar's button and each deck group's alike. */
   const openDeck = desktopFeaturesOf(runtime).showDeck ? () => VOICE_ACTIONS.openDeck.run(voiceContext) : undefined;
+  /*
+    PRD #2274 — the empty-agents note offers Add a daemon only while the local
+    daemon is the only one configured: one prompt where a new user already
+    looks, and nothing extra for someone who has added a daemon already. The
+    Daemon selector's Add a daemon… entry is there for everyone, always.
+  */
+  const openAddDaemon = useContext(AddDaemonOpener);
+  /* `chosen`, not `loaded`: a settings read that failed is loaded with the
+     defaults standing in, and those say nothing about which daemons the user
+     has (Qodo, PR #2319). */
+  const onlyLocalDaemon = settings?.chosen === true && !settings.settings.endpoints?.remote.length;
+  const addDaemon = openAddDaemon && onlyLocalDaemon ? () => VOICE_ACTIONS.addDaemon.run({ openAddDaemon }) : undefined;
   /**
    * `Ctrl+N` / `Cmd+N`, the TUI's `Ctrl+n` (PRD #1223 M4) — on this screen only,
    * because it is the screen the flow lives on.
@@ -1821,6 +1834,7 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
               filtering={filtering}
               fleetSize={decks.length}
               onOpenDeck={openDeck}
+              onAddDaemon={addDaemon}
               onReconnect={() => {
                 setOverrideError(undefined);
                 setStartError(deck.snapshot.connection.deckId, undefined);
@@ -1948,7 +1962,7 @@ function startErrorKey(deckId: string | undefined): string {
   return deckId ?? "";
 }
 
-function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
+function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, startError, onOpenDeck, onAddDaemon, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, upgradeLabel, upgradeTitle, onStopDaemon, stopDaemonReason, onReplaceDaemon, onNewAgent, hostOpen, onOpenHost, onCloseHost }: {
   deck: FleetDeck;
   now: number;
   columns: OverviewColumnId[];
@@ -1979,6 +1993,8 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
   onReplaceDaemon?: () => void;
   /** Open the New agent flow with THIS deck preselected (PRD #1223 M4). Absent where the deck cannot take a spawn. */
   onNewAgent?: () => void;
+  /** PRD #2274 — Add a daemon, in the empty-agents note. Absent unless the local daemon is the only one configured. */
+  onAddDaemon?: () => void;
   /** PR #1672 — whether THIS deck's Host popover is the open one, and the two ways to change that. */
   hostOpen: boolean;
   onOpenHost: () => void;
@@ -2119,6 +2135,7 @@ function DeckGroup({ deck, now, columns, filtering, fleetSize, overrideError, st
           onUpgrade={upgradeInNote ? onUpgrade : undefined}
           onReplaceDaemon={onReplaceDaemon}
           onNewAgent={onNewAgent}
+          onAddDaemon={onAddDaemon}
         />
       </div>
     </section>
@@ -2140,7 +2157,7 @@ function unknownPipsTitle(connection: ConnectionView): string {
   return "Not known — this daemon is not answering, so its agents cannot be counted.";
 }
 
-function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent }: {
+function DaemonBody({ agents, sections, filtering, now, columns, connection, message, compactNote, overrideError, startError, onOpenDeck, onReconnect, onStartDaemon, onConnectAnyway, onUpgrade, onReplaceDaemon, onNewAgent, onAddDaemon }: {
   agents: OverviewAgent[];
   sections: OverviewSection[];
   filtering: boolean;
@@ -2173,6 +2190,8 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
   onReplaceDaemon?: () => void;
   /** The New agent flow on this deck (PRD #1223 M4) — what the first-run note offers. */
   onNewAgent?: () => void;
+  /** PRD #2274 — Add a daemon, which the first-run note offers while this is the only daemon configured. */
+  onAddDaemon?: () => void;
 }) {
   const noteClass = compactNote ? "overview-note is-compact" : "overview-note";
   /*
@@ -2321,16 +2340,19 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
   if (!agents.length) {
     return (
       <OverviewNote className={noteClass} testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
-        <p>The daemon is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
+        {/* Plain words for what the user sees and can do (PRD #2274, CLAUDE.md rule 21). */}
+        <p>This daemon has no agents yet. That is how a fresh install starts, and nothing is wrong.</p>
         {/* The Orchestrations panel is named only where the screen it lives on is
             shown (issue #1198); a sentence pointing at a hidden screen is a
             door that is not there. */}
         {onNewAgent
-          ? <p className="overview-note-hint">{onOpenDeck ? "Create an agent on this daemon, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Create an agent on this daemon."} Whatever the daemon adopts shows up here on the next snapshot.</p>
-          : <p className="overview-note-hint">{onOpenDeck ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory."} Whatever the daemon adopts shows up here on the next snapshot.</p>}
+          ? <p className="overview-note-hint">{onOpenDeck ? "Create an agent on this daemon, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Create an agent on this daemon."} Agents appear here as soon as they start.</p>
+          : <p className="overview-note-hint">{onOpenDeck ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory."} Agents appear here as soon as they start.</p>}
+        {onAddDaemon && <p className="overview-note-hint" data-testid="overview-first-run-add-daemon-hint">Running agents on another machine? Add it as a daemon and its agents show here too.</p>}
         <div>
           {onNewAgent && <button className="button primary" data-testid="overview-first-run-new-agent" onClick={onNewAgent}><Plus size={14} /> New agent</button>}
           {onOpenDeck && <button className={onNewAgent ? "button secondary" : "button primary"} onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
+          {onAddDaemon && <button className="button secondary" data-testid="overview-first-run-add-daemon" onClick={onAddDaemon}><Server size={14} /> Add a daemon</button>}
         </div>
       </OverviewNote>
     );

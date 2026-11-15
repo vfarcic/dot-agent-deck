@@ -321,6 +321,16 @@ export type VoiceActionContext = {
    */
   switchDeck: (selection: string, identity?: VoiceDeckIdentityDto) => string | undefined;
   /**
+   * PRD #2274 — open the Add a daemon dialog over the screen that is up: the
+   * add form Settings → Daemons uses, in a dialog, so finishing or cancelling
+   * returns to that screen.
+   *
+   * **Served by the SHELL**, for {@link switchDeck}'s reason: the selector's
+   * Add a daemon… entry sits on the deck and on the overview, and the dialog
+   * writes the shell's settings.
+   */
+  openAddDaemon: () => void;
+  /**
    * PR #1451 round 3, change 4 — turn the page of the list on screen that is
    * split into pages while voice is on: the New agent dialog's while it has
    * one, else the Daemons screen's. On the agent dashboard, which scrolls
@@ -910,6 +920,17 @@ export const VOICE_ACTIONS = {
       const refused = context.switchDeck(target.deckSelection ?? "", target.deckIdentity);
       if (refused !== undefined) context.reportRefused?.(refused);
     },
+  },
+
+  /* PRD #2274 — the Daemon selector's Add a daemon… entry, the empty-agents
+     note's Add a daemon button and the spoken `add_daemon` are one control by
+     three routes. Opening the dialog stores nothing: the user fills the form
+     in and confirms it there. */
+  addDaemon: {
+    label: "Add a daemon",
+    voice: true,
+    needs: ["openAddDaemon"],
+    run: (context: Pick<VoiceActionContext, "openAddDaemon">) => context.openAddDaemon(),
   },
 
   /* PR #1451 round 3, change 4 — a page turn changes which items of a list
@@ -1643,12 +1664,13 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * {@link VoiceActionContext.closeSettings} — closing the topmost overlay with
  * no member of its own, read from the fence's stack, which spans both screens
  * ({@link VoiceActionContext.closeOverlay}), and switching deck (PRD #1195),
- * whose selector sits on both screens and writes the shell's settings. PRD
+ * whose selector sits on both screens and writes the shell's settings, as
+ * the Add a daemon dialog the selector opens does (PRD #2274). PRD
  * #1885's review dialog is the shell's too: it opens over the New agent dialog
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "openAddDaemon" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

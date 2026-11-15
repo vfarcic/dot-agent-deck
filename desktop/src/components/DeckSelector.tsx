@@ -60,8 +60,8 @@
  * M15; `docs/develop/glossary.md` has the canonical words). Identifiers keep
  * their `deck` spelling.
  */
-import { useEffect, useId, useMemo, useRef, useState } from "react";
-import { AlertTriangle, Check, ChevronsUpDown, Server } from "lucide-react";
+import { useContext, useEffect, useId, useMemo, useRef, useState } from "react";
+import { AlertTriangle, Check, ChevronsUpDown, Plus, Server } from "lucide-react";
 import { LOCAL_ENDPOINT_SELECTION, REMOTE_ADDRESS_FIELDS, type RemoteEndpointDto, type VoiceDeckIdentityDto } from "../lib/bridge";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
 import { DISPLAY_LIMITS, displayText } from "../lib/displayText";
@@ -78,6 +78,7 @@ import type { DesktopSettingsState } from "../hooks/useDesktopSettings";
 import { useNumberedList, useNumbersShown } from "../hooks/useVoiceNumbers";
 import { numberKey, type VoiceNumberedEntryDto, type VoiceNumberedSectionDto } from "../lib/voiceNumbers";
 import { VoiceNumber } from "./VoiceNumber";
+import { AddDaemonOpener } from "./AddDaemonDialog";
 import type { ConnectionView } from "../types";
 
 /**
@@ -179,6 +180,9 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
   const selection = parseSelection(section?.selection ?? LOCAL_ENDPOINT_SELECTION);
   const current = choices.find((choice) => sameSelection(choice.selection, selection));
   const note = deckStateNote(connection);
+  /* PRD #2274 — the shell's opener for the Add a daemon dialog; absent where
+     the selector is rendered with no shell around it. */
+  const openAddDaemon = useContext(AddDaemonOpener);
   /*
     PR #1451 round 3, change 4 — while the menu is open its entries are a
     numbered list, over whatever screen it opened on (the dialog layer), so
@@ -225,6 +229,13 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
     setOpen(false);
     VOICE_ACTIONS.switchDeck.run({ switchDeck: (token) => chooseDeckSelection(settings, token) }, { deckSelection: selectionToken(next) });
   };
+  /* PRD #2274 — the same registry entry the empty-agents note's button and
+     voice's `add_daemon` dispatch. The menu closes first, so cancelling the
+     dialog returns to the screen as it was, menu shut. */
+  const addDaemon = openAddDaemon && (() => {
+    setOpen(false);
+    VOICE_ACTIONS.addDaemon.run({ openAddDaemon });
+  });
 
   return (
     <div
@@ -296,7 +307,15 @@ export function DeckSelector({ settings, connection }: { settings: DesktopSettin
               );
             })}
           </div>
-          <p>Daemons are added and removed in Settings.</p>
+          {/* Always offered, however many daemons there are (PRD #2274): it
+              is where someone looks for "my other machine here too". Editing
+              and removing stay in Settings. */}
+          {addDaemon && (
+            <button className="deck-selector-option deck-selector-add" data-testid="deck-selector-add" onClick={addDaemon}>
+              <Plus size={12} aria-hidden="true" />
+              <span>Add a daemon…</span>
+            </button>
+          )}
         </div>
       )}
     </div>

@@ -127,6 +127,11 @@ pub const SCENARIOS: &[Scenario] = &[
         clients: &[Client::Desktop],
     },
     Scenario {
+        name: "add-daemon",
+        description: "The desktop Add a daemon dialog over the empty Dashboard, opened from its empty-agents note, with a host and user typed in.",
+        clients: &[Client::Desktop],
+    },
+    Scenario {
         name: "daemon-upgrade",
         description: "The desktop Upgrade dialog for a remote daemon on an older release, stopped at the restart question that names the agents a restart would stop, with Keep current daemon and Restart now.",
         clients: &[Client::Desktop],

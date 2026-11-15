@@ -192,6 +192,7 @@ describe("VOICE_ACTIONS", () => {
       "clearDashboardFilter",
       "openDeck",
       "switchDeck",
+      "addDaemon",
       // `closeAgentView` is deliberately NOT here any more: `close` names
       // `closeTopmost`, which decides between the overlay and the pane and then
       // calls the context member. The entry keeps a `no_voice` reason saying
