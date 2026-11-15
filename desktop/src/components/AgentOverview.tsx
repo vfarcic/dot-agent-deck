@@ -1308,9 +1308,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* And its close, published only while a popover is open, so
          `closeTopmost` reads its presence the way it reads `closeNewAgent`'s. */
       ...(hostOpen !== undefined ? { closeHostMetrics: () => setHostOpen(undefined) } : {}),
-      /* The counters popover, the same way: opened always, its close
+      /* The counters popover: its opening withheld while the New agent
+         dialog is open, so a voice result judged before the dialog opened
+         cannot open the list behind it (PR #2317 review); its close
          published only while it is open. */
-      showDashboardCounters,
+      ...(newAgent ? {} : { showDashboardCounters }),
       ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
     };
     voiceChannel.current = newAgent

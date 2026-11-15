@@ -120,6 +120,24 @@ describe("the dashboard's counters button (issue #2312 follow-up)", () => {
     expect(counters()).not.toHaveClass("is-open");
   });
 
+  /** Scenario: with the mouse over the button the counters show; a click opens them and a second click closes them with the mouse still there, so they are hidden and the button says so; leaving and coming back shows them again. */
+  it("a second click hides the counters even while the mouse stays over the button", () => {
+    render(<DeckShell runtime={runtime(microphone(), createFixtureFleet("fleet"))} initialView={{ kind: "overview" }} />);
+    fireEvent.pointerOver(button(), { pointerType: "mouse" });
+    expect(counters()).toHaveClass("is-shown");
+    expect(button()).toHaveAttribute("aria-expanded", "true");
+
+    fireEvent.click(button());
+    expect(counters()).toHaveClass("is-open");
+    fireEvent.click(button());
+    expect(counters()).not.toHaveClass("is-shown");
+    expect(button()).toHaveAttribute("aria-expanded", "false");
+
+    fireEvent.pointerOut(button(), { pointerType: "mouse" });
+    fireEvent.pointerOver(button(), { pointerType: "mouse" });
+    expect(counters()).toHaveClass("is-shown");
+  });
+
   /** Scenario: with an agent waiting for input in the fixture, the button itself carries the amber needs-input count, so it is visible without opening the popover. */
   it("shows a needs-input count on the button itself", () => {
     const fleet = createFixtureFleet("fleet");
@@ -145,6 +163,18 @@ describe("the dashboard's counters button (issue #2312 follow-up)", () => {
       expect(screen.getByTestId("voice-report")).toHaveTextContent("Showing the counters.");
 
       await speak(voice, "close");
+      expect(counters()).not.toHaveClass("is-open");
+    });
+
+    /** Scenario: with the New agent dialog open, a “show the counters” that arrives opens nothing behind the dialog. */
+    it("does not open the counters behind the New agent dialog", async () => {
+      const voice = microphone();
+      render(<DeckShell runtime={runtime(voice, [createFixtureSnapshot("docs")])} initialView={{ kind: "overview" }} />);
+      await act(async () => { fireEvent.click(screen.getByTestId("voice-trigger")); });
+      await act(async () => { fireEvent.click(screen.getByTestId("overview-new-agent")); });
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+      await speak(voice, "show the counters");
       expect(counters()).not.toHaveClass("is-open");
     });
   });

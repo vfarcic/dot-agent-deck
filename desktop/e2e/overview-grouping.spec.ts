@@ -343,7 +343,7 @@ test.describe("the fleet view (PRD #742 M4)", () => {
     to drop counters as the window narrowed.
   */
   test.describe("the counters button", () => {
-    /// Scenario: open the fleet dashboard. The button reads the agent total with the needs-input and daemons-answering warnings, and the counters are hidden. Hovering it shows every counter; moving away hides them; a click keeps them open until Escape. From 1440px down to 400px wide, either side of each width where the top bar changes, the button is on screen and the page does not scroll sideways.
+    /// Scenario: open the fleet dashboard. The button reads the agent total with the needs-input and daemons-answering warnings, and the counters are hidden. Hovering it shows every counter; moving away hides them; a click keeps them open until Escape, and a second click closes them with the mouse still on the button. From 1440px down to 400px wide, either side of each width where the top bar changes, the button and its list stay inside the window and the page does not scroll sideways.
     test("shows every counter on hover or click and fits every width", async ({ page }) => {
       await page.setViewportSize({ width: 1280, height: 800 });
       await openOverview(page, "fleet");
@@ -371,12 +371,41 @@ test.describe("the fleet view (PRD #742 M4)", () => {
       await page.keyboard.press("Escape");
       await expect(popover).toBeHidden();
 
-      for (const width of [1440, 1240, 1239, 961, 900, 681, 400]) {
+      // A second click closes it with the mouse still on the button.
+      await button.click();
+      await expect(popover).toBeVisible();
+      await button.click();
+      await expect(popover).toBeHidden();
+      await expect(button).toHaveAttribute("aria-expanded", "false");
+      await page.mouse.move(5, 790);
+
+      for (const width of [1440, 1240, 1239, 1101, 1100, 961, 681, 400]) {
         await page.setViewportSize({ width, height: 800 });
         await expect(button, `the counters button is off screen at ${width}px`).toBeInViewport();
+        await button.hover();
+        const box = await popover.boundingBox();
+        expect((box?.x ?? 0) + (box?.width ?? 0), `the counters run off the right edge at ${width}px`).toBeLessThanOrEqual(width);
+        expect(box?.x ?? -1, `the counters run off the left edge at ${width}px`).toBeGreaterThanOrEqual(0);
+        await page.mouse.move(5, 790);
         const scroll = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
         expect(scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(0);
       }
+    });
+
+    /// Scenario: in a window 330px tall the counters list opened from the button stops above the voice row and scrolls, so its last count, DAEMONS, can be scrolled to and read.
+    test("stops above the voice row in a short window and scrolls", async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 330 });
+      await openOverview(page, "fleet");
+      await page.getByTestId("dashboard-counters-button").click();
+      const popover = page.getByTestId("dashboard-counters-popover");
+      await expect(popover).toBeVisible();
+      const bottom = await popover.evaluate((element) => element.getBoundingClientRect().bottom);
+      const voiceTop = await page.locator(".voice-row").evaluate((element) => element.getBoundingClientRect().top);
+      expect(bottom, "the counters run under the voice row").toBeLessThanOrEqual(voiceTop);
+      await page.getByTestId("overview-count-decks").scrollIntoViewIfNeeded();
+      await expect(page.getByTestId("overview-count-decks")).toBeInViewport();
+      const decksBottom = await page.getByTestId("overview-count-decks").evaluate((element) => element.getBoundingClientRect().bottom);
+      expect(decksBottom, "DAEMONS stays under the voice row").toBeLessThanOrEqual(voiceTop + 0.5);
     });
   });
 
