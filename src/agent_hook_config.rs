@@ -4332,6 +4332,12 @@ mod tests {
     /// 500 ms failed both tests on a 16-CPU dev box at load average ~30
     /// (2026-10-13); at that load the factor alone brings this window to about
     /// the 2 s a flat window was raised to.
+    ///
+    /// Every window these tests wait out is paid in full, so each test lasts a
+    /// fixed number of them, and a loaded box stretches every one: up to six
+    /// times its base, which is why the three took 13–17 s each in the e2e
+    /// shards against about 3 s in the fast tier (#2111). Keep the count of
+    /// windows each test needs as small as what it proves allows.
     fn busy_holder_stall() -> std::time::Duration {
         crate::test_budget::load_scaled(std::time::Duration::from_secs(1))
     }
@@ -4380,7 +4386,10 @@ mod tests {
         let started = std::time::Instant::now();
         let release = {
             let stop = stop.clone();
-            let release_at = started + stall * 3;
+            // Two windows: the first has to be renewed by a publish for the
+            // wait to reach the release at all (#2111: every window here is
+            // paid in full, and load-scaled).
+            let release_at = started + stall * 2;
             std::thread::spawn(move || {
                 std::thread::sleep(release_at.saturating_duration_since(std::time::Instant::now()));
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -4445,9 +4454,12 @@ mod tests {
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
 
         // The stall window is sized as in the test above: a publish has to land
-        // inside each one for the wait to reach the ceiling at all.
+        // inside it for the wait to reach the ceiling at all. One full window
+        // and one the ceiling cuts short are enough to show the ceiling, not
+        // the stall, ends the wait; each extra window costs a whole loaded
+        // `stall` (#2111).
         let stall = busy_holder_stall();
-        let ceiling = stall.mul_f64(2.4);
+        let ceiling = stall.mul_f64(1.4);
         let started = std::time::Instant::now();
         let waited = lock_config_waiting(&dest, stall, ceiling);
         let elapsed = started.elapsed();
