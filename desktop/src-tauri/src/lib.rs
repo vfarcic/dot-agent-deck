@@ -45,6 +45,7 @@ mod selection_saves;
 // (the app and the CLI beside it) on the root crate's shared core.
 mod self_upgrade;
 mod settings;
+mod star_prompt;
 mod terminal;
 mod trust_review;
 // PRD #1487 M5: the Upgrade action and the local Replace daemon, on the root
@@ -2287,6 +2288,31 @@ async fn desktop_bootstrap(
     emit_snapshot(&app, &snapshot);
     ensure_snapshot_watchers(&app, &state);
     ensure_explicit_start_connected(options.start_if_missing, &snapshot)?;
+    Ok(snapshot)
+}
+
+/// Reconnect the one deck named by `deck_id`, and leave every other deck alone
+/// (issue #1994).
+///
+/// The webview's per-deck Reconnect, the button on a deck's own banner or
+/// dashboard section. [`desktop_bootstrap`] stays the whole-fleet statement the
+/// app starts from, and Refresh and an `[endpoints]` save still use it.
+///
+/// The deck is resolved against the observed set, as `desktop_start_daemon`
+/// resolves its own: an id this app is not observing is refused before any
+/// deck is contacted.
+#[tauri::command]
+async fn desktop_reconnect_deck(
+    app: AppHandle,
+    webview: Webview,
+    state: State<'_, DesktopState>,
+    deck_id: String,
+) -> Result<DesktopSnapshot, String> {
+    ensure_main_webview(&webview)?;
+    let scope = crate::dto::DeckScope::resolve(Some(&deck_id))?;
+    let snapshot = crate::daemon_bridge::reconnect_and_snapshot(&scope, &state).await?;
+    emit_snapshot(&app, &snapshot);
+    ensure_snapshot_watchers(&app, &state);
     Ok(snapshot)
 }
 
@@ -7055,10 +7081,13 @@ pub fn run() {
             desktop_new_agent_orchestrations,
             trust_review::desktop_project_trust_state,
             trust_review::desktop_approve_project_trust,
+            star_prompt::desktop_star_prompt_launch,
+            star_prompt::desktop_star_prompt_choose,
             desktop_list_directories,
             desktop_inbox_action,
             desktop_new_agent_options,
             desktop_bootstrap,
+            desktop_reconnect_deck,
             desktop_start_daemon,
             desktop_terminal_attach,
             desktop_terminal_write,
@@ -11143,6 +11172,7 @@ command = "configured-planner"
                 path: "/w/unit".into(),
                 confirmed_dirty: true,
                 on_request: false,
+                nested_worktrees: Vec::new(),
             }),
             keep_worktree: Some("/w/unit".into()),
         };

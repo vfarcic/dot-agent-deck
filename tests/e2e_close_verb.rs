@@ -782,6 +782,173 @@ fn assert_kept_with_sentinel(worktree: &Path, sentinel: &Path, context: &str) {
     );
 }
 
+/// Issue #2285: create another worktree of the fixture repository inside
+/// `worktree`, under a git-ignored `.worktrees/` as a project's workflow
+/// would, with an untracked file in it, and prove the dispatched worktree
+/// still reads CLEAN to `git status` — the case the dirty check cannot see.
+/// Answers the nested worktree and its untracked file.
+fn plant_ignored_nested_worktree(worktree: &Path, name: &str) -> (PathBuf, PathBuf) {
+    let out = common::fixture_git(worktree, worktree)
+        .args(["rev-parse", "--git-path", "info/exclude"])
+        .output()
+        .expect("git available");
+    let exclude = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+    let exclude = if exclude.is_absolute() {
+        exclude
+    } else {
+        worktree.join(exclude)
+    };
+    let mut rules = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !rules.lines().any(|l| l.trim() == "/.worktrees/") {
+        rules.push_str("\n/.worktrees/\n");
+        std::fs::create_dir_all(exclude.parent().expect("exclude has a parent"))
+            .expect("create the info dir");
+        std::fs::write(&exclude, rules).expect("ignore .worktrees/");
+    }
+    let nested = worktree.join(".worktrees").join(name);
+    let out = common::fixture_git(worktree, worktree)
+        .args(["worktree", "add", "-q", "-b", &format!("feat/{name}")])
+        .arg(&nested)
+        .output()
+        .expect("git available");
+    assert!(out.status.success(), "nested `git worktree add`: {out:?}");
+    let wip = nested.join("wip-2285.txt");
+    std::fs::write(&wip, "uncommitted work in a nested worktree").expect("write nested wip");
+    assert_eq!(
+        porcelain(worktree),
+        "",
+        "premise: the dispatched worktree reads clean, its nested worktree ignored"
+    );
+    (nested, wip)
+}
+
+fn assert_nested_work_kept(worktree: &Path, wip: &Path, context: &str) {
+    assert!(
+        worktree.is_dir(),
+        "a worktree holding another worktree was removed: {}\n{context}",
+        worktree.display()
+    );
+    assert_eq!(
+        std::fs::read_to_string(wip).unwrap_or_default(),
+        "uncommitted work in a nested worktree",
+        "the nested worktree's uncommitted work was lost\n{context}"
+    );
+}
+
+/// Scenario: A completed single unit's worktree holds another worktree of the
+/// repository under a git-ignored directory, with an untracked file in it,
+/// so `git status` in the unit reads clean. `close <name>` stops the agent but
+/// keeps the worktree, says `kept: holds other worktrees` and names the nested
+/// one; a second such unit closed with `--json` reports
+/// `kept-holds-worktrees` with the nested path. Both nested files survive.
+#[spec("dispatch/close-verb/014")]
+#[test]
+fn close_verb_014_a_worktree_holding_other_worktrees_is_kept_and_named() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let human = test.dispatch(&caller, "nested-human", false);
+    let json_unit = test.dispatch(&caller, "nested-json", false);
+    test.report_done(&human[0]);
+    test.report_done(&json_unit[0]);
+    let human_tree = test.worktrees[0].clone();
+    let json_tree = test.worktrees[1].clone();
+    let (human_nested, human_wip) = plant_ignored_nested_worktree(&human_tree, "feat-human");
+    let (json_nested, json_wip) = plant_ignored_nested_worktree(&json_tree, "feat-json");
+
+    let output = test.close(Some(&caller), &["nested-human"]);
+    assert_exit("close a unit holding a nested worktree", &output, 0);
+    let text = output_text(&output);
+    assert!(
+        text.contains(&format!(
+            "{}: kept: holds other worktrees",
+            human_tree.display()
+        )),
+        "the report must say why the worktree was kept, with its path\n{text}"
+    );
+    assert!(
+        text.contains(&format!("holds worktree {}", human_nested.display())),
+        "the report must name the nested worktree, which is what to remove first\n{text}"
+    );
+    test.assert_gone(&human);
+    assert_nested_work_kept(&human_tree, &human_wip, &text);
+
+    let output = test.close(Some(&caller), &["nested-json", "--json"]);
+    assert_exit("close --json a unit holding a nested worktree", &output, 0);
+    let json: serde_json::Value = serde_json::from_slice(&output.stdout).expect("close JSON");
+    let verdicts = json["worktrees"].as_array().expect("worktree verdicts");
+    assert_eq!(verdicts.len(), 1, "one worktree verdict: {json}");
+    assert_eq!(verdicts[0]["verdict"], "kept-holds-worktrees", "{json}");
+    assert_eq!(
+        verdicts[0]["nested_worktrees"][0],
+        json_nested.to_string_lossy().as_ref(),
+        "{json}"
+    );
+    test.assert_gone(&json_unit);
+    assert_nested_work_kept(&json_tree, &json_wip, &json.to_string());
+    test.assert_present(&[caller]);
+}
+
+/// Scenario: A single unit's worktree holds another worktree under a
+/// git-ignored directory, with an untracked file in it, and its card is
+/// selected in the attached TUI. Ctrl+W's confirmation says the worktree holds
+/// other worktrees and is kept, naming the nested one, before the user
+/// answers; choosing Close stops the agent, the status line repeats it, and
+/// the nested worktree's file is still on disk.
+#[spec("prompt/close-confirm/014")]
+#[test]
+fn close_confirm_014_ctrl_w_warns_that_a_worktree_holding_others_is_kept() {
+    let mut test = CloseDeck::new();
+    let caller = test.open_caller("caller");
+    let members = test.dispatch(&caller, "nested-tui", false);
+    let worktree = test.worktrees[0].clone();
+    let (_nested, wip) = plant_ignored_nested_worktree(&worktree, "feat-tui");
+    let card = members[0]
+        .display_name
+        .clone()
+        .expect("the dispatched unit's card name");
+
+    // Close the caller card first so the dispatched card is the selected one.
+    test.deck.send_keys(b"\x04");
+    test.deck.wait_for_string("COMMAND");
+    test.deck.send_keys(b"\x17");
+    test.deck.wait_for_string("Close selected agent?");
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\r");
+    test.assert_gone(std::slice::from_ref(&caller));
+    test.deck
+        .wait_until_grid("the dispatched card is the selected one", |grid| {
+            grid.lines()
+                .any(|l| l.contains('\u{25b8}') && l.contains(card.as_str()))
+        });
+
+    test.deck.send_keys(b"\x17");
+    test.deck.wait_for_string("Close selected agent?");
+    let path = worktree.to_string_lossy().into_owned();
+    test.deck.wait_until_grid(
+        "the dialog says the worktree holds other worktrees and is kept, with its \
+         path and the nested one's, before the user answers",
+        |grid| {
+            grid.contains("Holds other worktrees, so it is KEPT:")
+                && grid.contains(path.as_str())
+                && grid.contains("holds: .worktrees/feat-tui")
+        },
+    );
+    // Down once from Cancel is Close.
+    test.deck.send_keys(b"\x1b[B");
+    test.deck.send_keys(b"\r");
+
+    test.deck.wait_until_grid(
+        "the status line repeats why the worktree was kept, with its path",
+        |grid| {
+            !grid.contains("Close selected agent?")
+                && grid.contains("Holds other worktrees, so it is KEPT:")
+                && grid.contains(path.as_str())
+        },
+    );
+    test.assert_gone(&members);
+    assert_nested_work_kept(&worktree, &wip, &test.deck.snapshot_grid());
+}
+
 /// Scenario: A clean single unit is dispatched and its card selected in the
 /// attached TUI. Ctrl+W offers Cancel, Close and `Close, keep worktree`;
 /// Down, Down, Enter closes the agent but leaves the worktree and its ignored

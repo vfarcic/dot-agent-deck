@@ -310,6 +310,10 @@ describe("ControlDeck", () => {
         expect(banner).toHaveTextContent(snapshot.connection.disconnectedReason!.message);
         if (kind !== "not-running") {
           expect(within(banner).queryByTestId("start-daemon")).not.toBeInTheDocument();
+          // Issue #1994: the banner's Reconnect names its own deck, so the
+          // other decks in the fleet are not reconnected with it.
+          fireEvent.click(actions[0]);
+          expect(live.reconnect).toHaveBeenCalledExactlyOnceWith(snapshot.connection.deckId);
           return;
         }
         fireEvent.click(within(banner).getByTestId("start-daemon"));

@@ -216,7 +216,8 @@ describe("failed starts and connection errors per deck (PR #1623 review)", () =>
     rerender(<AgentOverview runtime={live([first, secondReason])} onNavigate={vi.fn()} />);
     expect(within(card(second.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
     fireEvent.click(within(card(second.connection.deckId!)).getByRole("button", { name: "Reconnect" }));
-    expect(reconnect).toHaveBeenCalledOnce();
+    // Issue #1994: and it reconnects the second deck alone, by name.
+    expect(reconnect).toHaveBeenCalledExactlyOnceWith(second.connection.deckId);
     expect(within(card(second.connection.deckId!)).queryByTestId("overview-start-error")).not.toBeInTheDocument();
     expect(within(card(first.connection.deckId!)).getByTestId("overview-start-error")).toBeInTheDocument();
 

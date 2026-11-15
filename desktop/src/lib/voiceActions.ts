@@ -497,6 +497,20 @@ export type VoiceActionContext = {
    */
   cancelProjectCommands: () => void;
   /**
+   * PRD #2174 — the star reminder's three buttons: Star (open the repository
+   * page and stop asking), Later (ask again after another ten launches) and
+   * Don't ask again. Each answers `undefined` when it chose, or the sentence
+   * saying why not: the reminder is not showing, or something is drawn over
+   * it.
+   *
+   * **Served by the SHELL**, which shows the reminder at startup over
+   * whichever screen comes up (`chooseShownStarPrompt` in
+   * `lib/starPrompt.ts`).
+   */
+  starRepo: () => string | undefined;
+  remindStarLater: () => string | undefined;
+  dismissStarPrompt: () => string | undefined;
+  /**
    * PRD #802 D5 — the two voice members that lead to a STOP, and the one rule
    * they share: **each can only OPEN a confirmation.** Neither runs a deck
    * action; the confirmation's own button does, pressed by the user. So a
@@ -1276,6 +1290,41 @@ export const VOICE_ACTIONS = {
     run: (context: Pick<VoiceActionContext, "cancelProjectCommands">) => context.cancelProjectCommands(),
   },
 
+  /* PRD #2174 — the star reminder's three buttons, which voice may press for
+     the reason it may press any button on a dialog the user is looking at:
+     each acts only while the reminder is showing, and none starts or stops
+     anything. `reportRefused` is read through `?.`, as `approveProjectCommands`
+     does: a click on the button serves no voice surface. */
+  starRepo: {
+    label: "Star the repository from the star reminder",
+    voice: true,
+    needs: ["starRepo"],
+    run: (context: Pick<VoiceActionContext, "starRepo"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.starRepo();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  remindStarLater: {
+    label: "Ask about starring the repository again later",
+    voice: true,
+    needs: ["remindStarLater"],
+    run: (context: Pick<VoiceActionContext, "remindStarLater"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.remindStarLater();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
+  dismissStarPrompt: {
+    label: "Stop the star reminder from asking again",
+    voice: true,
+    needs: ["dismissStarPrompt"],
+    run: (context: Pick<VoiceActionContext, "dismissStarPrompt"> & Partial<Pick<VoiceActionContext, "reportRefused">>) => {
+      const refused = context.dismissStarPrompt();
+      if (refused !== undefined) context.reportRefused?.(refused);
+    },
+  },
+
   /* PRD #802 D5 — the two rows that STOP something. Each entry calls a member
      that can only OPEN a confirmation (see the members' own comment on
      `VoiceActionContext`), so voice never reaches `runAction` for a stop: the
@@ -1630,7 +1679,7 @@ export type VoiceScreenContext = Omit<VoiceActionContext, keyof VoicePanelContex
  * on the overview and over the Runs screen on the deck. Its Cancel is reached
  * through `close`, so the shell publishes only its approve.
  */
-export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | keyof PullRequestContext>;
+export type VoiceShellContext = Pick<VoiceActionContext, "closeSettings" | "closeOverlay" | "switchDeck" | "turnPage" | "approveProjectCommands" | "cancelProjectCommands" | "starRepo" | "remindStarLater" | "dismissStarPrompt" | keyof PullRequestContext>;
 
 /**
  * PRD #1401 — the pull request browser's members, which the SHELL serves: the

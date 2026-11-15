@@ -7512,9 +7512,21 @@ fn drain_worktree_kept(state: &SharedState, ui: &mut UiState) {
     let Some(kept) = state.blocking_write().take_worktree_kept() else {
         return; // a concurrent path took it between the peek and here
     };
+    let shown = kept_worktree_nested_shown(&kept);
+    let nested = if shown.is_empty() {
+        String::new()
+    } else {
+        // At the daemon's cap there may be more than it named.
+        let more = if shown.len() >= crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED {
+            ", and maybe more"
+        } else {
+            ""
+        };
+        format!(" (holds: {}{more})", shown.join(", "))
+    };
     ui.status_message = Some((
         format!(
-            "{} {}",
+            "{} {}{nested}",
             kept_worktree_headline(&kept).trim_start_matches("! "),
             kept.path
         ),
@@ -7546,11 +7558,60 @@ fn kept_worktree_headline(kept: &KeptWorktree) -> &'static str {
         // Issue #1958: the user chose `Close, keep worktree` — the same words
         // as the desktop's notice.
         "Worktree kept on request:"
+    } else if !kept.nested_worktrees.is_empty() {
+        // Issue #2285: removing it would delete the worktrees inside it.
+        "! Holds other worktrees, so it is KEPT:"
     } else if kept.confirmed_dirty {
         "! Uncommitted work here is KEPT, not deleted:"
     } else {
         "! Uncommitted work here, if any, is KEPT:"
     }
+}
+
+/// Issue #2285: the worktrees that keep `kept`, each relative to it where it
+/// can be, so the user knows what to remove first. Empty when none did.
+fn kept_worktree_nested_shown(kept: &KeptWorktree) -> Vec<String> {
+    let parent = std::path::Path::new(&kept.path);
+    kept.nested_worktrees
+        .iter()
+        .map(
+            |nested| match std::path::Path::new(nested).strip_prefix(parent) {
+                Ok(relative) if !relative.as_os_str().is_empty() => {
+                    relative.to_string_lossy().into_owned()
+                }
+                _ => nested.clone(),
+            },
+        )
+        .collect()
+}
+
+/// Issue #2285: the most nested worktrees the close dialog lists one per line;
+/// past it, one more line says how many it left out.
+const KEPT_NESTED_DIALOG_LINES: usize = 3;
+
+/// Issue #2285: the close dialog's lines naming the worktrees that keep
+/// `kept`, one each, so a long name is clipped on its own line rather than
+/// hiding the others.
+fn kept_worktree_nested_lines(kept: &KeptWorktree) -> Vec<String> {
+    let shown = kept_worktree_nested_shown(kept);
+    let mut lines: Vec<String> = shown
+        .iter()
+        .take(KEPT_NESTED_DIALOG_LINES)
+        .map(|nested| format!("holds: {nested}"))
+        .collect();
+    if shown.len() > KEPT_NESTED_DIALOG_LINES {
+        // At the daemon's cap there may be more than it named.
+        let at_least = if shown.len() >= crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED {
+            "at least "
+        } else {
+            ""
+        };
+        lines.push(format!(
+            "holds: … and {at_least}{} more",
+            shown.len() - KEPT_NESTED_DIALOG_LINES
+        ));
+    }
+    lines
 }
 
 /// PRD #241: the resolved shape of a confirmed close — see
@@ -7926,13 +7987,10 @@ fn star_repo_and_report() -> String {
 }
 
 /// The status message for a star attempt, split out from the browser call so
-/// the exact bytes are testable without launching anything.
+/// the exact bytes are testable without launching anything. The desktop app
+/// says the same (PRD #2174), so the words live in [`crate::star_prompt`].
 fn star_message(opened: bool) -> String {
-    if opened {
-        "Thanks for starring! ⭐".to_string()
-    } else {
-        format!("Visit {} to star ⭐", repo_identity::DISPLAY)
-    }
+    crate::star_prompt::star_message(opened)
 }
 
 /// PRD #1885: open the trust prompt for `view`. Nothing it was opened for is
@@ -8030,23 +8088,35 @@ fn handle_trust_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     Action::Continue
 }
 
+/// PRD #2174: a star-prompt choice that could not be saved says why on the
+/// status line, as the desktop app's toast does, since the reminder would
+/// otherwise come back at a later launch with no word of it.
+fn report_star_save(ui: &mut UiState, saved: Result<(), String>) {
+    if let Err(why) = saved {
+        ui.status_message = Some((why, std::time::Instant::now()));
+    }
+}
+
 fn handle_star_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
     match key.code {
         KeyCode::Char('s') => {
             let msg = star_repo_and_report();
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
+            report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('l') | KeyCode::Esc => {
-            ui.star_prompt_state.snooze();
+            let saved = ui.star_prompt_state.snooze();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
             Action::Continue
         }
         KeyCode::Char('d') => {
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
             Action::Continue
         }
         _ => Action::Continue,
@@ -12543,19 +12613,22 @@ fn dispatch_action(
         // star-prompt [Star]: open the repo and stop asking (== `s`).
         Action::StarConfirm => {
             let msg = star_repo_and_report();
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
             ui.status_message = Some((msg, std::time::Instant::now()));
+            report_star_save(ui, saved);
         }
         // star-prompt [Snooze]: snooze (== `l` / Esc).
         Action::StarSnooze => {
-            ui.star_prompt_state.snooze();
+            let saved = ui.star_prompt_state.snooze();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
         }
         // star-prompt [Dismiss]: stop asking permanently (== `d`).
         Action::StarDismiss => {
-            ui.star_prompt_state.dismiss_permanently();
+            let saved = ui.star_prompt_state.dismiss_permanently();
             ui.mode = UiMode::Normal;
+            report_star_save(ui, saved);
         }
         // ===== PRD #80 M6: inline-edit button actions =====
         // filter [Apply]: commit and keep the typed filter (== Enter).
@@ -21288,7 +21361,10 @@ fn render_close_confirm(
     // The path is the actionable half — the user has to `cd` to it — so the
     // popup WIDENS to fit it rather than truncating by default, and only falls
     // back to a head-truncation when the terminal itself is too narrow.
-    let kept_lines = if state.kept_worktree.is_some() { 3 } else { 0 };
+    // Issue #2285: plus one line per worktree inside it that keeps it.
+    let kept_lines: u16 = state.kept_worktree.as_ref().map_or(0, |kept| {
+        3 + u16::try_from(kept_worktree_nested_lines(kept).len()).unwrap_or(0)
+    });
     // Saturating rather than `as u16`: the path arrives over the wire, and a
     // wrapping cast would turn an absurd length into a tiny popup instead of a
     // wide one clamped to the terminal.
@@ -21337,6 +21413,12 @@ fn render_close_confirm(
             format!("    {}", truncate_path_head(&kept.path, inner_width)),
             text_primary(),
         ));
+        for nested in kept_worktree_nested_lines(kept) {
+            text.push(Line::styled(
+                format!("    {}", truncate_path_head(&nested, inner_width)),
+                text_primary(),
+            ));
+        }
         text.push(Line::from(""));
     }
 
@@ -21523,8 +21605,8 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
 
     let text = vec![
         Line::from(""),
-        Line::styled("  If you find dot-agent-deck useful,", text_primary()),
-        Line::styled("  please consider starring the repo!", text_primary()),
+        Line::styled(format!("  {}", crate::star_prompt::BODY[0]), text_primary()),
+        Line::styled(format!("  {}", crate::star_prompt::BODY[1]), text_primary()),
         Line::from(""),
         Line::styled(
             format!("  {}", repo_identity::DISPLAY),
@@ -21540,7 +21622,7 @@ fn render_star_prompt(frame: &mut Frame, area: Rect) -> ConfirmDrawing {
     let key_line = u16::try_from(text.len() - 1).ok();
 
     let block = Block::default()
-        .title(" ⭐ Enjoying dot-agent-deck? ")
+        .title(format!(" ⭐ {} ", crate::star_prompt::TITLE))
         .title_style(
             Style::default()
                 .fg(Color::Yellow)
@@ -29701,6 +29783,25 @@ mod tests {
 
         // A terminal too narrow for any popup degrades rather than underflows.
         assert_eq!(star_popup_width(3, &over_the_old_limit), 0);
+    }
+
+    /// PRD #2174: the prompt's key line names the choices in the words the
+    /// desktop app's dialog uses too, which live in `crate::star_prompt`.
+    #[test]
+    fn star_prompt_key_line_uses_the_shared_words() {
+        use crate::star_prompt::{DONT_ASK_AGAIN, LATER, STAR};
+        assert_eq!(
+            STAR_PROMPT_KEYS.0,
+            format!("s {STAR}  l {LATER}  d {DONT_ASK_AGAIN}")
+        );
+        assert_eq!(
+            STAR_PROMPT_KEYS.1,
+            [
+                format!("s {STAR}").as_str(),
+                format!("l {LATER}").as_str(),
+                format!("d {DONT_ASK_AGAIN}").as_str()
+            ]
+        );
     }
 
     /// Issue #945 turned the star prompt's fallback message from a literal
@@ -49686,6 +49787,39 @@ mod tests {
                 "{height}: `y` answered a question asked again before its frame"
             );
         }
+    }
+
+    /// PRD #2174 (Qodo, PR #2321): a Later or Don't ask again that cannot be
+    /// saved — the state's directory is a file here — closes the prompt and
+    /// says why on the status line instead of being lost silently; one that
+    /// saves says nothing. `s` takes the same path after opening a browser,
+    /// which a unit test does not do, and the `[Snooze]`/`[Dismiss]` buttons
+    /// call the same `report_star_save`.
+    #[test]
+    fn star_choice_that_cannot_be_saved_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        for code in [KeyCode::Char('l'), KeyCode::Esc, KeyCode::Char('d')] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StarPrompt;
+            ui.star_prompt_state = config::StarPromptState::load_from(blocker.join("star.json"));
+            handle_star_prompt_key(KeyEvent::from(code), &mut ui);
+            assert_eq!(ui.mode, UiMode::Normal, "{code:?} left the prompt open");
+            let (said, _) = ui
+                .status_message
+                .clone()
+                .unwrap_or_else(|| panic!("{code:?}: a failed save said nothing"));
+            assert!(said.contains("star prompt"), "{code:?}: {said}");
+        }
+        let mut ui = default_ui();
+        ui.mode = UiMode::StarPrompt;
+        ui.star_prompt_state = config::StarPromptState::load_from(dir.path().join("star.json"));
+        handle_star_prompt_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        assert!(
+            ui.status_message.is_none(),
+            "a saved Later reported something"
+        );
     }
 
     /// Scenario: the star prompt opens. At a height of 8 rows, where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` choose nothing and Escape still closes it; at 80×24, where the line is on screen, each key reaches the prompt. Before its first frame none of the three reaches it at either size.

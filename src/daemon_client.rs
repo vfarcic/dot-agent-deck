@@ -5917,6 +5917,7 @@ mod tests {
                                 path: "/w/unit".to_string(),
                                 confirmed_dirty: true,
                                 on_request: false,
+                                nested_worktrees: Vec::new(),
                             }),
                             ..AttachResponse::ok()
                         }

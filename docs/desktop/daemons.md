@@ -84,7 +84,7 @@ When a daemon is not running, the app starts it for you, on this machine or on a
 1. On the Dashboard, find the daemon's section. It says **Daemon disconnected**, with a sentence saying why.
 2. Press the one button the section offers:
    - **Start daemon**, when no daemon is running there. The sentence reads `No daemon is running on this machine.`, or names the remote host, such as `No daemon is running on deploy@build-box:2222.`
-   - **Reconnect**, when a daemon is running there but the app is not connected to it, or when the app cannot tell, for example because the host cannot be reached. The sentence says which.
+   - **Reconnect**, when a daemon is running there but the app is not connected to it, or when the app cannot tell, for example because the host cannot be reached. The sentence says which. It reconnects this daemon only and leaves the other daemons' sections as they are; **Refresh** at the top of the Dashboard reconnects every daemon.
 3. For **Start daemon**, the app asks first and names the machine the daemon will start on. Press **Start daemon** in that dialog; the button reads **Starting…** until the daemon answers, and **Cancel** starts nothing.
 
 **Check it worked:** the section lists the daemon's agents, or **No agents are running yet**, and the **DAEMONS** count under the counters button at the top counts it among the daemons that answered.

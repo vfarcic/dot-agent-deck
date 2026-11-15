@@ -2603,6 +2603,20 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Does not assert:** a keep on one role of a team followed by an ordinary close of the other (the daemon-level `close_agents::tests::keeping_on_one_role_survives_an_ordinary_close_of_the_last`), a daemon without the keep capability, or a real agent.
 - **Platform coverage:** mac+linux.
 
+##### prompt/close-confirm/015 — A close that would leave a dispatched worktree on disk because other worktrees lie inside it says so, naming them, before the user answers (issue #2285).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`).
+- **Agent:** none.
+- **Asserts:** a `KeptWorktree` with `nested_worktrees` renders `Holds other worktrees, so it is KEPT:`, the path, and `holds: .worktrees/feat-1-demo` (the nested path relative to the kept one) above Cancel, never the `Uncommitted work` wording, and the Close choice is still drawn; with five nested worktrees, the first three each get their own `holds:` line and a fourth line reads `holds: … and 2 more`.
+- **Does not assert:** where the report comes from (`issue_dispatch_run::kept_worktree_preview_reports_a_tree_that_holds_other_worktrees`) or the close itself (`prompt/close-confirm/014`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/014 — Ctrl+W on a dispatched unit whose worktree holds another worktree under a git-ignored directory warns that it is kept, names the nested one, and keeps its uncommitted work (issue #2285).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
+- **Agent:** none — identity-recording `cat` probe.
+- **Asserts:** with another worktree of the fixture repository under the unit worktree's ignored `.worktrees/`, holding an untracked file, and `git status` in the unit empty (the premise: the dirty check cannot see it), Ctrl+W draws `Holds other worktrees, so it is KEPT:` with the worktree's path and `holds: .worktrees/feat-tui` before the user answers; choosing Close removes the agent, the status line repeats the headline and the path, and the unit worktree and the nested worktree's file are still on disk.
+- **Does not assert:** the tab/orchestration scope, `Force`-policy (issue-dispatch) worktrees, which are removed regardless, or the desktop dialog (`KeptWorktreeText.test.tsx`).
+- **Platform coverage:** mac+linux.
+
 #### prompt/pane-input
 
 ##### prompt/pane-input/001 — `Enter` on a focused orchestration role pane enters PaneInput mode.
@@ -2852,6 +2866,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** none.
 - **Asserts:** before the prompt's first frame, and at a height of 8 rows where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` do not reach the prompt and Escape does; at 80×24 each key reaches it and the drawn `[Star]` button is clickable.
 - **Does not assert:** what `s` does once it reaches the prompt (opening the browser, the persisted dismissal), or when the prompt opens (`StarPromptState::increment_and_check`).
+- **Platform coverage:** mac+linux.
+
+##### prompt/star/002 — The TUI and the desktop app share one star-reminder state: either client's launches count, and a choice in either holds in the other (PRD #2174).
+- **Layer:** L2 PTY (`tests/e2e_star_prompt.rs`): the real binary, with `DOT_AGENT_DECK_STAR_PROMPT` naming a per-test state file that the test writes and reads through `config::StarPromptState`, the API the desktop crate's `star_prompt.rs` calls on the same file.
+- **Agent:** none.
+- **Asserts:** after nine desktop launches the TUI's launch is the tenth and shows the prompt; `d` there leaves the file dismissed and the desktop's next thirty launches unasked; `l` there leaves the desktop's next nine launches unasked and its tenth asked; a "Don't ask again" made by the desktop keeps the TUI's next launch on the dashboard with no prompt, and that launch still counts.
+- **Does not assert:** the desktop app's dialog itself (its words, keys and voice rows are covered by `desktop/src/StarPrompt.test.tsx` and the desktop crate's `star_prompt::tests`), or `s`, which opens a browser.
 - **Platform coverage:** mac+linux.
 
 #### prompt/new-pane
@@ -6481,6 +6502,13 @@ without depending on the config struct API.
 - **Agent:** none — identity-recording `cat` probes in a two-role orchestration.
 - **Asserts:** closing a completed clean two-role unit through a worker's pane with `--keep-worktree --json` exits 0, removes both roles, keeps the shared worktree and its `.dot-agent-deck/` file, and reports one `kept-on-request` verdict for that path.
 - **Does not assert:** the TUI's tab-scope keep or a keep on a non-last role's StopAgent.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/014 — `close` keeps a unit's worktree that holds another worktree under a git-ignored directory, and names the nested one (issue #2285).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** for two completed single units, each with another worktree of the fixture repository under its ignored `.worktrees/` holding an untracked file and `git status` empty, `close <name>` exits 0, removes the agent, reports `<path>: kept: holds other worktrees` and `holds worktree <nested path>`, and `close <name> --json` reports one `kept-holds-worktrees` verdict whose `nested_worktrees` names the nested path; both unit worktrees and both nested files are still on disk. Without the fix both closes report `removed` and the nested files are gone.
+- **Does not assert:** the orchestration scope, the `Force` policy, or `worktree reclaim` (its own unit test, `worktree_reclaim::tests::a_candidate_holding_other_worktrees_is_kept_and_names_them`).
 - **Platform coverage:** mac+linux.
 
 #### dispatch/single
@@ -11371,14 +11399,29 @@ S-21 re-oracles the attached draft/no-cap and empty-navigation functions in `tes
 - **Layer:** Fast (`src/doorbell_switch.rs`, `src/config.rs`), temp files and symlinks.
 - **Agent:** none.
 - **Asserts:** the daemon's bounded config read reports a path with nothing at it (no link either), and a path inside a config folder that does not exist (a fresh install), as absent, with no warning, and both agents on; a link to a readable file as read, saying what the file says; and a link whose target is missing (absolute, relative, or reached through a second link), a link to a folder and a link loop each as failed with one warning, holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CLAUDE=on` still turns Claude Code back on over it and leaves Codex off.
-- **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests; `inbox/doorbell/062` covers it through the daemon), the warning's text, a dangling link at the config folder rather than at the file (it still reads as absent), or `config get` / `config set` through such a link.
+- **Does not assert:** that the daemon calls this read at each spawn (`at_spawn` is replaced in unit tests; `inbox/doorbell/062` covers it through the daemon), the warning's text, a dangling link at the config folder rather than at the file (`inbox/doorbell/063`), or `config get` / `config set` through such a link.
 - **Platform coverage:** unix (the test creates symlinks).
 
 ##### inbox/doorbell/062 — A Claude Code started while the deck's `config.toml` is a link to a missing file is held off, and with nothing at the path it is rung.
 - **Layer:** L2 lane 1 (`tests/e2e_claude_doorbell_turned_off.rs`), PTY-attached real TUI, its lazy-spawned daemon, the deck's `config.toml` in its sandbox `HOME` as a symlink to a path that does not exist, `daemon status --json`, and the deck's log.
 - **Agent:** none (`tests/support/claude_composer.py`, the scripted Claude Code screen `inbox/doorbell/056` uses, drawing the header of Claude Code 2.1.399, a release nobody measured; no model or credential).
 - **Asserts:** with the config path a dangling link, a scripted Claude Code started under the daemon and Idle at its empty composer with a message queued is held: the agent record names `cannot_type`, the card on the screen shows the cannot_type words, `daemon status` shows WAKE `none`, over 1.5 s nothing reaches the pane, no `doorbell rang` is logged, the log carries the config read's `it is a link whose target is missing` warning and a `doorbell off` line naming `turned_off`, and the message stays queued. With the link removed so nothing is at the path, a second worker started afterwards with the same header shows WAKE `doorbell`, is rung once, and its message is fetched and acknowledged, while the held pane still received nothing. Red under either mutation: the daemon's `doorbell_switch::at_spawn` returning the default switch, or the config read treating a dangling link as absent.
-- **Does not assert:** Codex (the same switch read, `inbox/doorbell/061`), a real Claude Code, a prompt recovering the held worker (`inbox/doorbell/056`), or a dangling link at the config folder rather than at the file.
+- **Does not assert:** Codex (the same switch read, `inbox/doorbell/061`), a real Claude Code, a prompt recovering the held worker (`inbox/doorbell/056`), or a dangling link at the config folder rather than at the file (the same read, `inbox/doorbell/063`).
+- **Platform coverage:** mac+linux.
+- **Cost:** none.
+
+##### inbox/doorbell/063 — A config folder that is a link to a missing folder holds the doorbell off, while a config folder that does not exist yet reads as no config.
+- **Layer:** Fast (`src/doorbell_switch.rs`, `src/config.rs`), temp files and symlinks.
+- **Agent:** none.
+- **Asserts:** the daemon's bounded config read reports a `config.toml` under folders that do not exist, under a link to a real folder, and in a missing folder below such a link, as absent, with no warning, and both agents on; and a `config.toml` whose config folder is a link whose target is missing (absolute, relative, or reached through a second link), whose folder two levels up is such a link, or whose folder is a link to a regular file, each as failed with one warning (naming the dangling folder, for the dangling ones), holding both agents off, while `DOT_AGENT_DECK_DOORBELL_CODEX=1` still turns Codex back on over it and leaves Claude Code off.
+- **Does not assert:** that the daemon calls this read at each spawn (`inbox/doorbell/064`), a race between the read and the folder changing (`a_missing_config_folder_is_absent_only_below_a_real_folder` covers each verdict), `config get` through such a folder, or an unmounted mount point that is still a real, empty folder (it reads as no config).
+- **Platform coverage:** unix (the test creates symlinks).
+
+##### inbox/doorbell/064 — A Claude Code started while the deck's config folder is a link to a missing folder is held off, and with no config folder at all it is rung.
+- **Layer:** L2 lane 1 (`tests/e2e_claude_doorbell_turned_off.rs`), PTY-attached real TUI, its lazy-spawned daemon, the deck's config folder (`.config/dot-agent-deck`) in its sandbox `HOME` replaced by a symlink to a path that does not exist, `daemon status --json`, and the deck's log.
+- **Agent:** none (`tests/support/claude_composer.py`, the scripted Claude Code screen `inbox/doorbell/062` uses, drawing the header of Claude Code 2.1.399, a release nobody measured; no model or credential).
+- **Asserts:** with the config folder a dangling link, a scripted Claude Code started under the daemon and Idle at its empty composer with a message queued is held: the agent record names `cannot_type`, the card on the screen shows the cannot_type words, `daemon status` shows WAKE `none`, over 1.5 s nothing reaches the pane, no `doorbell rang` is logged, the log carries the config read's warning naming the folder as a link whose target is missing and a `doorbell off` line naming `turned_off`, and the message stays queued. With the link removed so there is no config folder at all (a first run), a second worker started afterwards with the same header shows WAKE `doorbell`, is rung once, and its message is fetched and acknowledged, while the held pane still received nothing. Red when the config read stops checking the folders above a missing `config.toml`.
+- **Does not assert:** Codex (the same switch read, `inbox/doorbell/063`), a real Claude Code, a dangling link two folders up (`inbox/doorbell/063`), or `config get` / `config set` through such a folder.
 - **Platform coverage:** mac+linux.
 - **Cost:** none.
 
