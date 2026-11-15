@@ -279,6 +279,15 @@ export function overlayAbove(element: Element | null): boolean {
   return index >= 0 && index < open.length - 1;
 }
 
+/**
+ * PRD #2174 — whether no overlay is open at all, kept current as overlays come
+ * and go: for a dialog that opens on its own (the star reminder) and must not
+ * come up over one the user is in, whatever it is.
+ */
+export function useOverlayStackEmpty(): boolean {
+  return useSyncExternalStore(subscribeToStack, () => ordered().length === 0);
+}
+
 /** How to close the topmost open overlay, when it registered one (see `Fenced`). */
 export function topmostOverlayClose(): OverlayClose | undefined {
   return ordered().at(-1)?.close;

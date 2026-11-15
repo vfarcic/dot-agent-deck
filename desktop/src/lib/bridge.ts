@@ -20,6 +20,7 @@ import { DEFAULT_SPEECH_LANGUAGE, SPEECH_LANGUAGE_TOKENS } from "./speechLanguag
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
+import { STAR_THANKS, type StarChoice } from "./starPrompt";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -2325,6 +2326,19 @@ export interface DeckBridge {
    */
   approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
   /**
+   * PRD #2174 — whether this launch of the app shows the star reminder. The
+   * crate counts one launch per app process however often it is asked, in the
+   * reminder state the TUI shares. Optional so a test double need not serve
+   * it; a runtime without it never shows the reminder.
+   */
+  starPromptLaunch?(): Promise<boolean>;
+  /**
+   * PRD #2174 — the user's choice in the star reminder. Resolves Star's
+   * sentence (thanks, or where to go when the browser did not open), and
+   * nothing for Later and Don't ask again.
+   */
+  starPromptChoose?(choice: StarChoice): Promise<string | undefined>;
+  /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
    * wrappers. The runtime asks ONCE at startup (`useDeckRuntime`), and the
@@ -3140,6 +3154,8 @@ class FixtureDeckBridge implements DeckBridge {
    * Review project commands dialog. Off by default.
    */
   private docsTrustReview = false;
+  /** PRD #2174 — whether the star reminder was answered in this preview. */
+  private starAnswered = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
@@ -4004,6 +4020,22 @@ class FixtureDeckBridge implements DeckBridge {
 
   async approveProjectTrust(target: ProjectTrustTarget): Promise<ProjectTrust> {
     return this.projectTrustState(target);
+  }
+
+  /**
+   * PRD #2174 — `?star=1` plays a launch the star reminder shows at; any
+   * other preview shows none. A choice is made once: the preview, like the
+   * app, shows no second reminder until it is reloaded.
+   */
+  async starPromptLaunch(): Promise<boolean> {
+    await Promise.resolve();
+    return !this.starAnswered && new URLSearchParams(window.location.search).get("star") === "1";
+  }
+
+  async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
+    await Promise.resolve();
+    this.starAnswered = true;
+    return choice === "star" ? STAR_THANKS : undefined;
   }
 
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
@@ -5953,6 +5985,20 @@ export class TauriDeckBridge implements DeckBridge {
   async approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust> {
     const invoke = await this.getInvoke();
     return invoke<ProjectTrust>("desktop_approve_project_trust", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration, digest });
+  }
+
+  async starPromptLaunch(): Promise<boolean> {
+    const invoke = await this.getInvoke();
+    /* Only a literal `true` shows the reminder: an answer of any other shape
+       (an older crate, a mocked IPC that answers every command alike) must
+       not put a dialog over the app. */
+    return (await invoke<unknown>("desktop_star_prompt_launch")) === true;
+  }
+
+  async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
+    const invoke = await this.getInvoke();
+    const message = await invoke<unknown>("desktop_star_prompt_choose", { choice });
+    return typeof message === "string" ? message : undefined;
   }
 
   async dispose(): Promise<void> {

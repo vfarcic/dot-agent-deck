@@ -328,6 +328,18 @@ const ALLOWED_ROOT_MODULES: &[&str] = &[
     // reads no project state file, names no FORBIDDEN_SYMBOL or project-state
     // literal, and contains no `std::env::current_dir` — all zero for it.
     "self_upgrade",
+    // PRD #2174, argued rather than added quietly. The desktop's star
+    // reminder names the words the TUI's prompt shows (`TITLE`, `BODY`, the
+    // three choices, `star_message`) and the repository page Star opens, so
+    // both clients say the same thing in the same words (CLAUDE.md rule 22);
+    // a desktop-side copy would be a second list of them. The reminder's
+    // state is `config::StarPromptState`, already allowlisted: a per-user
+    // file in the user's config directory, never a project's. Checked against
+    // this rule's lines: the module holds constants and one `format!`; it
+    // reads no file, resolves no project, names no FORBIDDEN_SYMBOL or
+    // project-state literal, and contains no `std::env::current_dir` — all
+    // zero for it.
+    "star_prompt",
     "state",
     // PRD #1666, argued rather than added quietly. The desktop names ONE item
     // here, `truncate_on_char_boundary`, the byte bound it puts on a host

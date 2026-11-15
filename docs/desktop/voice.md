@@ -41,6 +41,7 @@ What you can do by voice, by screen:
 | An agent's pane | Type into the agent's prompt; submit it; turn [typing mode](#typing-mode) on and off; with typing off, say "stop" or "close this agent" on its own to ask to close the open agent (confirm by hand); in typing mode, [interrupt the agent, clear its prompt, or scratch what you last dictated](#interrupt-clear-and-scratch-that); [answer the question the agent is waiting on](#answering-an-agents-question); [open its pull request, or another agent's](#pull-requests) |
 | A pull request page | [Scroll it, open it in your system browser, or close it](#pull-requests) |
 | Review project commands | [Approve the commands shown and start the orchestration, or cancel](#approving-project-commands) |
+| The star reminder | [Star the repository, be reminded later, or stop being asked](#the-star-reminder) |
 
 "Close" on its own closes what is in front. With a confirmation or an upgrade dialog open, it closes that dialog the way **Cancel** or `Esc` does and leaves everything behind it as it was. With an agent's output **Reader** open, it closes the Reader, unless a confirmation or Settings is open over it, which closes first. While an upgrade is running, the dialog stays open and the app says why; when the dialog is asking whether to restart and stop running agents, "close" answers **Keep current daemon**, so nothing is stopped. In an agent's pane with typing off, **"close this agent"**, **"close the agent"** or **"close agent"** instead asks to end that agent, opening its **Close agent** confirmation. **"Back to dashboard"** closes the pane without ending the agent.
 
@@ -232,6 +233,10 @@ Typing into the agent does not work while the page is open over its pane: close 
 ## Approving project commands
 
 While **Review project commands** is open ([Approving Project Commands](../project-trust.md)), say **"approve and start"**, or any request that says *approve*, such as "approve the commands" or "I approve", to press **Approve and start**: it approves exactly the text on screen and starts the orchestration. A start that does not say *approve*, such as "start it" or "go ahead", does not approve anything. Say **"cancel"**, **"never mind"** or **"close"** to cancel the review, which starts nothing. With no review open, the app says there is nothing to approve. An approval applies only to the review that was on screen when you spoke: if it was cancelled, replaced by another, or re-shown with changed text before your words were understood, nothing is approved and the app asks you to look again.
+
+## The star reminder
+
+While the [star reminder](index.md#the-star-reminder) is open, say **"star the repo"** or **"star on GitHub"** to press **Star**, **"remind me later"** or **"not now"** to press **Later**, and **"don't ask again"** or **"stop asking"** to press **Don't ask again**. "Cancel", "never mind" or "close" closes it the way **Later** and `Esc` do. With no reminder showing, these commands do nothing and the app says the reminder is not showing; none of them opens the repository on its own.
 
 ## Checking a daemon's machine
 

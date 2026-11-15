@@ -2868,6 +2868,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Does not assert:** what `s` does once it reaches the prompt (opening the browser, the persisted dismissal), or when the prompt opens (`StarPromptState::increment_and_check`).
 - **Platform coverage:** mac+linux.
 
+##### prompt/star/002 — The TUI and the desktop app share one star-reminder state: either client's launches count, and a choice in either holds in the other (PRD #2174).
+- **Layer:** L2 PTY (`tests/e2e_star_prompt.rs`): the real binary, with `DOT_AGENT_DECK_STAR_PROMPT` naming a per-test state file that the test writes and reads through `config::StarPromptState`, the API the desktop crate's `star_prompt.rs` calls on the same file.
+- **Agent:** none.
+- **Asserts:** after nine desktop launches the TUI's launch is the tenth and shows the prompt; `d` there leaves the file dismissed and the desktop's next thirty launches unasked; `l` there leaves the desktop's next nine launches unasked and its tenth asked; a "Don't ask again" made by the desktop keeps the TUI's next launch on the dashboard with no prompt, and that launch still counts.
+- **Does not assert:** the desktop app's dialog itself (its words, keys and voice rows are covered by `desktop/src/StarPrompt.test.tsx` and the desktop crate's `star_prompt::tests`), or `s`, which opens a browser.
+- **Platform coverage:** mac+linux.
+
 #### prompt/new-pane
 
 ##### prompt/new-pane/001 — The new-pane form opens after the directory picker with three fields visible (Name, Command, Mode) and the initial focus on Name.

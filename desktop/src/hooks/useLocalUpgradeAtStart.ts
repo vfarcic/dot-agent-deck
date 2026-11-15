@@ -26,7 +26,7 @@ export const MODAL_RETRY_MS = 500;
  *
  * Live mode only — the fixture preview plays decks, it does not run daemons.
  */
-export function useLocalUpgradeAtStart(runtime: Pick<DeckRuntimeState, "mode" | "fleet" | "upgradeDaemon">): { target?: UpgradeTarget; close: () => void } {
+export function useLocalUpgradeAtStart(runtime: Pick<DeckRuntimeState, "mode" | "fleet" | "upgradeDaemon">): { target?: UpgradeTarget; close: () => void; pending: boolean } {
   const [target, setTarget] = useState<UpgradeTarget>();
   /* Bumped while another modal is open, to look again once it may have closed. */
   const [retry, setRetry] = useState(0);
@@ -50,5 +50,9 @@ export function useLocalUpgradeAtStart(runtime: Pick<DeckRuntimeState, "mode" | 
     // `key` stands for `found`: a new snapshot of the same daemon is not a new one.
   }, [key, open, retry]);
   const close = useCallback(() => setTarget(undefined), []);
-  return { target, close };
+  /* PRD #2174: an offer found and not yet shown — waiting for another modal
+     to close — so the star reminder can wait behind it rather than take its
+     turn (Qodo, PR #2321). */
+  const pending = found !== undefined && !open && !handled.current.has(found.key);
+  return { target, close, pending };
 }
