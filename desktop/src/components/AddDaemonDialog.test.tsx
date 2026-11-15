@@ -215,15 +215,38 @@ describe("AddDaemonDialog", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 
-  /// Scenario: press Add this daemon and have the write fail with the change still applied, as a Settings save that fails is. The dialog closes: the daemon is added for this session and the next save writes it, exactly as when it is added from Settings.
-  it("closes when the save is applied but not yet written, as Settings does", async () => {
+  /// Scenario: press Add this daemon and have the write fail with the change still applied, as a Settings save that fails is. The form goes, and the dialog stays to say the daemon is added but may not survive a restart, with the settings error once there is one; Close then closes it.
+  it("says so when the save is applied but not written, and closes on Close", async () => {
     const onClose = vi.fn();
     const save = vi.fn(async () => ({ saved: false as const }));
+    const { rerender } = render(<AddDaemonDialog settings={{ settings: settingsWith(), save }} onClose={onClose} />);
+    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
+    fireEvent.click(screen.getByTestId("add-daemon-save"));
+
+    await waitFor(() => expect(screen.getByTestId("add-daemon-error")).toHaveTextContent("may not survive a restart"));
+    expect(screen.queryByTestId("add-daemon-form")).toBeNull();
+    expect(screen.queryByTestId("add-daemon-save")).toBeNull();
+    rerender(<AddDaemonDialog settings={{ settings: settingsWith(), save, saveError: "This change is applied, but saving it failed, so it will not survive a restart. disk full" }} onClose={onClose} />);
+    expect(screen.getByTestId("add-daemon-error")).toHaveTextContent("disk full");
+    expect(onClose).not.toHaveBeenCalled();
+
+    expect(screen.getByTestId("add-daemon-cancel")).toHaveTextContent("Close");
+    fireEvent.click(screen.getByTestId("add-daemon-cancel"));
+    expect(onClose).toHaveBeenCalled();
+    expect(save).toHaveBeenCalledTimes(1);
+  });
+
+  /// Scenario: press Add this daemon and have the save come back with the file on disk not holding the daemon and no settings error, as when a newer save overtook it. The draft comes back with a sentence saying the daemon was not added.
+  it("says the daemon was not added when the file did not take it and nothing else says why", async () => {
+    const onClose = vi.fn();
+    const save = vi.fn(async () => ({ saved: false as const, disk: settingsWith() }));
     render(<AddDaemonDialog settings={{ settings: settingsWith(), save }} onClose={onClose} />);
     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "build-box" } });
     fireEvent.click(screen.getByTestId("add-daemon-save"));
-    await waitFor(() => expect(onClose).toHaveBeenCalled());
-    expect(save).toHaveBeenCalledTimes(1);
+
+    await waitFor(() => expect(screen.getByTestId("add-daemon-error")).toHaveTextContent("was not added"));
+    expect(screen.getByLabelText("Host")).toHaveValue("build-box");
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   /// Scenario: type a host and a name, press Add this daemon, and have the dialog close while the name is still being checked. When the check then comes back clean, nothing is stored.

@@ -30,6 +30,11 @@ export const AddDaemonOpener = createContext<(() => void) | undefined>(undefined
 /** What voice's "close" answers while the add is being saved. */
 export const ADD_DAEMON_SAVING = "The daemon is being added; the dialog closes once it is saved.";
 
+/** Said when a save left the daemon on screen but not on disk, and the hook has no sentence of its own for it. */
+const UNSAVED_FALLBACK = "The daemon is added, but saving it failed, so it may not survive a restart.";
+/** Said when the file on disk did not take the daemon, and the hook has no sentence of its own for it. */
+const RESTORED_FALLBACK = "The daemon was not added, because the daemon list on disk changed meanwhile. Add it again.";
+
 export function AddDaemonDialog({ settings, onClose }: { settings: Pick<DesktopSettingsState, "settings" | "save" | "saveError">; onClose: () => void }) {
   const form = useNewDaemon(settings.settings, settings.save, { startOpen: true });
   const shown = form.draft ?? form.pending;
@@ -46,8 +51,11 @@ export function AddDaemonDialog({ settings, onClose }: { settings: Pick<DesktopS
   /* On the overlay stack, so the rest of the window is fenced and voice's
      "close" is Cancel (issue #1709). */
   const ref = useInertBackground<HTMLElement>(true, OVERLAY_LAYER.dialog, dismiss);
-  /* The draft is gone with nothing pending: it was stored, so the dialog's work is done. */
-  const done = shown === undefined;
+  /* Added to the screen but not written: the dialog stays to say so, since the
+     Dashboard shows no settings error (Qodo, PR #2319). */
+  const unsaved = shown === undefined && form.unsaved !== undefined;
+  /* The draft is gone with nothing pending and nothing to report: it was stored, so the dialog's work is done. */
+  const done = shown === undefined && !unsaved;
   useEffect(() => {
     if (done) onClose();
   }, [done, onClose]);
@@ -90,14 +98,16 @@ export function AddDaemonDialog({ settings, onClose }: { settings: Pick<DesktopS
             <DaemonAddressFields row={shown} onChange={form.edit} disabled={busy} autoFocus />
           </div>
         )}
-        {saveFailed && settings.saveError && (
-          <p className="settings-error" role="alert" data-testid="add-daemon-error">{settings.saveError}</p>
+        {(unsaved || (saveFailed && shown)) && (
+          <p className="settings-error" role="alert" data-testid="add-daemon-error">{settings.saveError ?? (unsaved ? UNSAVED_FALLBACK : RESTORED_FALLBACK)}</p>
         )}
         <div className="add-daemon-actions">
-          <button className="button secondary" data-testid="add-daemon-cancel" disabled={form.pending !== undefined} onClick={() => void dismiss()}>Cancel</button>
-          <button className="button primary" data-testid="add-daemon-save" disabled={!form.canConfirm} onClick={() => void add()}>
-            <Check size={14} /> {busy ? "Adding…" : "Add this daemon"}
-          </button>
+          <button className="button secondary" data-testid="add-daemon-cancel" disabled={form.pending !== undefined} onClick={() => void dismiss()}>{unsaved ? "Close" : "Cancel"}</button>
+          {!unsaved && (
+            <button className="button primary" data-testid="add-daemon-save" disabled={!form.canConfirm} onClick={() => void add()}>
+              <Check size={14} /> {busy ? "Adding…" : "Add this daemon"}
+            </button>
+          )}
         </div>
       </section>
     </div>

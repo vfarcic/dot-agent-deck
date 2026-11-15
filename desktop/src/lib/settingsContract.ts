@@ -43,9 +43,10 @@ import type { DesktopSettingsDto } from "./bridge";
  * form). A save's own UI — the document applied at once, the failure sentence
  * in `saveError` — happens whether or not anyone reads this.
  *
- * `disk` is set when the failure replaced the document on screen with the one
- * on disk (the deck list changed outside the app, so what the window held was
- * stale): a deck the save added is then not on screen unless it is on disk.
+ * `disk` is set when the failure left the window's copy stale (the deck list
+ * changed outside the app), and is the document on disk: a deck the save added
+ * is not stored unless it is in it. The newest save also replaces the screen
+ * with it; a superseded one leaves the screen to the save after it.
  */
 export type SaveOutcome = { saved: true } | { saved: false; disk?: DesktopSettingsDto };
 

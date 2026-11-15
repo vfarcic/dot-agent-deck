@@ -69,13 +69,16 @@ export function saveEndpointSection(onSave: SettingsPanelProps["onSave"], docume
 
 /** How {@link NewDaemon.confirm} ended. */
 export type ConfirmResult =
-  /**
-   * Stored and selected. That includes a save the settings hook kept on screen
-   * after its write failed: `useDesktopSettings` applies the change, says the
-   * write failed, and carries the edit into the next save, so the daemon is
-   * added in this session exactly as it is from Settings.
-   */
+  /** Stored and selected. */
   | "added"
+  /**
+   * Selected and on screen, but the write failed: `useDesktopSettings` keeps
+   * the change applied, says the write failed in `saveError`, and carries the
+   * edit into the next save, so the daemon is added for this session and may
+   * not survive a restart. {@link NewDaemon.unsaved} holds the row, for a
+   * surface outside Settings to say so (Qodo, PR #2319).
+   */
+  | "unsaved"
   /** Nothing stored: the name was refused, and the reason is beside the field. */
   | "kept"
   /** Nothing stored: the save ran and the file on disk shows the daemon is not in it; the draft is back, and the save error says why. */
@@ -88,6 +91,8 @@ export interface NewDaemon {
   draft: RemoteEndpointDto | undefined;
   /** The row being stored right now, while its save is in flight. */
   pending: RemoteEndpointDto | undefined;
+  /** The row the last confirmation added to the screen without writing it to disk (`"unsaved"`), until the next start or cancel. */
+  unsaved: RemoteEndpointDto | undefined;
   /** The name it will be stored under; empty means the one the library derives. */
   name: string;
   /** Why the name on screen cannot be used, when the library said so. */
@@ -127,6 +132,7 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
   const checkDeckName = bridge?.checkDeckName;
   const [draft, setDraft] = useState<RemoteEndpointDto | undefined>(() => (startOpen ? blankEndpoint() : undefined));
   const [pending, setPending] = useState<RemoteEndpointDto>();
+  const [unsaved, setUnsaved] = useState<RemoteEndpointDto>();
   /**
    * The name the draft will be stored under (issue #1426), held beside it
    * rather than in it so a pre-fill can arrive without the draft's fields
@@ -207,6 +213,7 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
 
   const start = () => {
     setDraft(blankEndpoint());
+    setUnsaved(undefined);
     setNameState("");
     touched.current = false;
   };
@@ -216,6 +223,7 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
     // next, possibly before (or without) another render.
     latestDraft.current = undefined;
     setDraft(undefined);
+    setUnsaved(undefined);
     setNameState("");
   };
 
@@ -272,18 +280,27 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
     const current = sectionOf(document);
     const row: RemoteEndpointDto = chosen ? { ...now, name: chosen } : now;
     setDraft(undefined);
+    setUnsaved(undefined);
     setPending(row);
     let outcome: Awaited<ReturnType<SettingsPanelProps["onSave"]>> | undefined;
     try {
-      outcome = await saveEndpointSection(onSave, document, { remote: [...current.remote, row], selection: row.id });
+      // Without a row of the same id first: a retry after a save the file did
+      // not take can run while the screen still shows the first attempt.
+      const others = current.remote.filter((stored) => stored.id !== row.id);
+      outcome = await saveEndpointSection(onSave, document, { remote: [...others, row], selection: row.id });
     } finally {
       setPending(undefined);
     }
+    if (!outcome || outcome.saved) return "added";
     // A failure with no document from disk leaves the change applied and
-    // carried into the next save (`useDesktopSettings`), so the daemon IS
-    // added for this session; bringing the draft back would offer to add it a
-    // second time over a list that already holds it (Qodo, PR #2319).
-    if (!outcome || outcome.saved || !outcome.disk) return "added";
+    // carried into the next save (`useDesktopSettings`), so the daemon IS on
+    // screen for this session; bringing the draft back would offer to add it
+    // a second time over a list that already holds it. It is not on disk,
+    // though, and outside Settings nothing else says so (Qodo, PR #2319).
+    if (!outcome.disk) {
+      setUnsaved(row);
+      return "unsaved";
+    }
     if (sectionOf(outcome.disk).remote.some((stored) => stored.id === row.id)) return "added";
     // Another draft started meanwhile is the user's newer intent; leave it.
     if (latestDraft.current) return "restored";
@@ -297,6 +314,7 @@ export function useNewDaemon(settings: DesktopSettingsDto, onSave: SettingsPanel
   return {
     draft,
     pending,
+    unsaved,
     name,
     refusal,
     confirming,
