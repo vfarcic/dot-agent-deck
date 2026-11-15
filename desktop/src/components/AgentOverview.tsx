@@ -14,6 +14,7 @@ import { upgradeKindOf, upgradeOffered } from "../lib/upgrade";
 import { cliBehind, type SelfUpgradeApi, type SelfUpgradeCheck } from "../lib/selfUpgrade";
 import { ConnectionDetail } from "./ConnectionDetail";
 import { HostMetricsButton } from "./HostMetricsPanel";
+import { DashboardCounters } from "./DashboardCounters";
 import { chooseHostDeck } from "../lib/hostMetrics";
 import { CONNECT_ANYWAY_BODY, disconnectedDetails, incompatibleRemedy, startDaemonConfirmCopy } from "../lib/connectionRemedy";
 import { StartDaemonError } from "../lib/actionError";
@@ -1200,6 +1201,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     through one registry action (`showHostMetrics`).
   */
   const [hostOpen, setHostOpen] = useState<string | undefined>();
+  /* Issue #2312 follow-up — whether the counters popover is open: held here
+     so the button and the spoken "show the counters" open it through one
+     registry action (`showDashboardCounters`), as the Host popover is. */
+  const [countersOpen, setCountersOpen] = useState(false);
+  const showDashboardCounters = useCallback(() => setCountersOpen(true), []);
   const showHostMetrics = useCallback((deckId?: string): string | undefined => {
     const choice = chooseHostDeck(decks.map((deck) => ({
       deckId: deck.snapshot.connection.deckId,
@@ -1302,13 +1308,17 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
       /* And its close, published only while a popover is open, so
          `closeTopmost` reads its presence the way it reads `closeNewAgent`'s. */
       ...(hostOpen !== undefined ? { closeHostMetrics: () => setHostOpen(undefined) } : {}),
+      /* The counters popover, the same way: opened always, its close
+         published only while it is open. */
+      showDashboardCounters,
+      ...(countersOpen ? { closeDashboardCounters: () => setCountersOpen(false) } : {}),
     };
     voiceChannel.current = newAgent
       ? { closeNewAgent: () => newAgentClose.current?.(), ...directoryMoves }
       : newAgentAvailable ? { openNewAgent, ...directoryMoves } : directoryMoves;
     return () => { voiceChannel.current = undefined; };
   });
-  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics }), [onNavigate, openNewAgent, revealAgent, showHostMetrics]);
+  const voiceContext = useMemo(() => ({ navigate: onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters }), [onNavigate, openNewAgent, revealAgent, showHostMetrics, showDashboardCounters]);
   /* Issue #1198 — the deck is an experimental surface, so every "Open deck"
      door on this screen exists only while it is shown. `undefined` removes
      the top bar's button and each deck group's alike. */
@@ -1706,43 +1716,43 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     <div className="control-deck overview-screen">
       {/* The rail is the shell's — one rail, rendered once, beside every screen (#1197). */}
       <main className="deck-main">
-        <header className={`topbar${deckAttention ? " with-attention" : ""}`}>
+        <header className={`topbar overview-topbar${deckAttention ? " with-attention" : ""}`}>
           <div className="repo-context">
             <div className="repo-line"><LayoutList size={15} /><strong>Agent dashboard</strong></div>
             {/* PRD #741 M9: the same control, in the same block, as the deck's. */}
             {settings && <DeckSelector settings={settings} connection={connection} />}
           </div>
-          {/*
-            Issue #1676: which counters give way at a medium-width window is
-            named here, not left to their position. WAITING, IDLE and GROUPS
-            are the ones nobody has to act on; NEEDS INPUT and FAILED stay.
-          */}
-          <div className="run-instruments overview-instruments">
-            <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
-            <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
-            <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
-            <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
-            {/*
-              Issue #1757: the TUI's stats bar counts `waiting` beside `idle`, so
-              the header does too (CLAUDE.md rule 22). Optional like IDLE:
-              nothing here needs the user.
-            */}
-            <OverviewInstrument label="WAITING" testId="overview-count-waiting" optional><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
-            <OverviewInstrument label="IDLE" testId="overview-count-idle" optional><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
-            <OverviewInstrument label="GROUPS" testId="overview-count-groups" optional><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
-            {/*
-              PRD #742 M4. The one instrument that is ALWAYS known, and it is
-              what makes the counters beside it readable: they are computed over the
-              decks that answered, so "how many answered" is the caveat that
-              belongs next to them. It renders at one deck too — `1/1` is the
-              honest reading of a single-deck fleet, and hiding it would mean
-              the caveat appears only once there is already something wrong.
-            */}
-            <OverviewInstrument label="DAEMONS" testId="overview-count-decks">
-              <strong className={aggregate.decksUp === decks.length ? undefined : "count-failed"} title={decksUpTitle(aggregate.decksUp, decks.length)}>{aggregate.decksUp}/{decks.length}</strong>
-            </OverviewInstrument>
-          </div>
           <div className="top-actions">
+            {/*
+              Issue #2312 follow-up: the counters are one button that names
+              only what needs someone (needs input, failed, daemons not
+              answering) and opens the full set on hover, click or voice.
+              Issue #1757: WAITING is counted beside IDLE because the TUI's
+              stats bar counts it (CLAUDE.md rule 22).
+            */}
+            <DashboardCounters
+              summary={{ known, agents: aggregate.agents.length, needsInput: countOf("needs_input"), failed: countOf("failed"), decksUp: aggregate.decksUp, decksTotal: decks.length }}
+              open={countersOpen}
+              onOpen={() => VOICE_ACTIONS.showDashboardCounters.run(voiceContext)}
+              onClose={() => setCountersOpen(false)}
+            >
+              <OverviewInstrument label="AGENTS" testId="overview-count-agents"><OverviewCount known={known} value={aggregate.agents.length} /></OverviewInstrument>
+              <OverviewInstrument label="RUNNING" testId="overview-count-running"><OverviewCount known={known} value={countOf("running")} className="count-running" /></OverviewInstrument>
+              <OverviewInstrument label="NEEDS INPUT" testId="overview-count-needs-input"><OverviewCount known={known} value={countOf("needs_input")} className="count-needs-input" /></OverviewInstrument>
+              <OverviewInstrument label="FAILED" testId="overview-count-failed"><OverviewCount known={known} value={countOf("failed")} className="count-failed" /></OverviewInstrument>
+              <OverviewInstrument label="WAITING" testId="overview-count-waiting"><OverviewCount known={known} value={countOf("waiting")} className="count-waiting" /></OverviewInstrument>
+              <OverviewInstrument label="IDLE" testId="overview-count-idle"><OverviewCount known={known} value={countOf("idle")} /></OverviewInstrument>
+              <OverviewInstrument label="GROUPS" testId="overview-count-groups"><OverviewCount known={known} value={aggregate.groups} /></OverviewInstrument>
+              {/*
+                PRD #742 M4. The one counter that is ALWAYS known, and it is
+                what makes the others readable: they are computed over the
+                daemons that answered, so "how many answered" is the caveat
+                that belongs next to them.
+              */}
+              <OverviewInstrument label="DAEMONS" testId="overview-count-decks">
+                <strong className={aggregate.decksUp === decks.length ? undefined : "count-failed"} title={decksUpTitle(aggregate.decksUp, decks.length)}>{aggregate.decksUp}/{decks.length}</strong>
+              </OverviewInstrument>
+            </DashboardCounters>
             {newAgentAvailable && <button className="button primary compact" data-testid="overview-new-agent" aria-label="New agent" title="New agent (Ctrl+N / ⌘N)" onClick={() => VOICE_ACTIONS.openNewAgent.run(voiceContext)}><Plus size={14} /><span>New agent</span></button>}
             {openDeck && <button className="button secondary compact" data-testid="overview-open-deck" onClick={openDeck}><SquareTerminal size={14} /><span>Open daemons</span></button>}
             <DashboardFilterControls filter={filter} daemons={filterDaemons} />
@@ -2315,20 +2325,29 @@ function DaemonBody({ agents, sections, filtering, now, columns, connection, mes
   }
 
   if (!agents.length) {
+    /*
+      One full-width row rather than a centred card (issue #2312 follow-up):
+      a healthy daemon with nothing to show is not worth a third of the
+      window, and the green lamp in the group's header already says it is
+      healthy. No "Open daemons" here: it opened the Daemons screen for the
+      SELECTED daemon, not this group's, so under All daemons it landed on a
+      "choose a daemon" note; the top bar and the rail keep that door.
+      The Orchestrations panel is named only where the screen it lives on is
+      shown (issue #1198); a sentence pointing at a hidden screen is a door
+      that is not there.
+    */
+    const hint = onNewAgent
+      ? onOpenDeck ? "Press New agent, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Press New agent to start one."
+      : onOpenDeck ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory.";
     return (
-      <OverviewNote className={noteClass} testId="overview-first-run" icon={<Blocks size={26} />} title="No agents are running yet">
-        <p>The daemon is healthy and owns nothing. This is what a fresh install looks like — not a failure.</p>
-        {/* The Orchestrations panel is named only where the screen it lives on is
-            shown (issue #1198); a sentence pointing at a hidden screen is a
-            door that is not there. */}
-        {onNewAgent
-          ? <p className="overview-note-hint">{onOpenDeck ? "Create an agent on this daemon, or activate an orchestration from the Daemons screen's Orchestrations panel." : "Create an agent on this daemon."} Whatever the daemon adopts shows up here on the next snapshot.</p>
-          : <p className="overview-note-hint">{onOpenDeck ? "Activate an orchestration from the Daemons screen's Orchestrations panel, or start an agent from the CLI in a project directory." : "Start an agent from the CLI in a project directory."} Whatever the daemon adopts shows up here on the next snapshot.</p>}
-        <div>
-          {onNewAgent && <button className="button primary" data-testid="overview-first-run-new-agent" onClick={onNewAgent}><Plus size={14} /> New agent</button>}
-          {onOpenDeck && <button className={onNewAgent ? "button secondary" : "button primary"} onClick={onOpenDeck}><SquareTerminal size={14} /> Open daemons</button>}
+      <div className="overview-note overview-note-row" data-testid="overview-first-run">
+        <Blocks size={22} aria-hidden="true" />
+        <div className="overview-note-row-text">
+          <h3>No agents are running yet</h3>
+          <p className="overview-note-hint">{hint}</p>
         </div>
-      </OverviewNote>
+        {onNewAgent && <button className="button primary compact" data-testid="overview-first-run-new-agent" onClick={onNewAgent}><Plus size={14} /> New agent</button>}
+      </div>
     );
   }
 
@@ -3040,9 +3059,9 @@ function OverviewNote({ className, testId, icon, title, children }: { className?
   return <div className={className ?? "overview-note"} data-testid={testId}>{icon}<h3>{title}</h3>{children}</div>;
 }
 
-/** `optional`: one of the counters a medium-width window hides to make room. */
-function OverviewInstrument({ label, children, testId, optional }: { label: string; children: ReactNode; testId?: string; optional?: boolean }) {
-  return <div className={optional ? "instrument instrument-optional" : "instrument"} data-testid={testId}><span>{label}</span>{children}</div>;
+/** One counter in the dashboard's counters popover: its label and its value. */
+function OverviewInstrument({ label, children, testId }: { label: string; children: ReactNode; testId?: string }) {
+  return <div className="instrument" data-testid={testId}><span>{label}</span>{children}</div>;
 }
 
 /**

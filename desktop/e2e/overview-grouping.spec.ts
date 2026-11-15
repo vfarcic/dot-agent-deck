@@ -337,33 +337,45 @@ test.describe("the fleet view (PRD #742 M4)", () => {
   });
 
   /*
-    Issue #1676. Between 1241px and 1480px the header has room for five
-    counters, and which five is named, not positional: NEEDS INPUT and FAILED
-    stay, because a person has to act on them, and IDLE and GROUPS give way.
-    The range was 961px to 1260px until the type scale (issue #2312) made the
-    counters and the header's buttons larger.
+    Issue #2312 follow-up. The counters are one button in the header that
+    reads the total and what needs someone, and every counter opens under it
+    on hover or click. It replaced issue #1676's row of instruments, which had
+    to drop counters as the window narrowed.
   */
-  test.describe("between 1241px and 1480px", () => {
-    /// Scenario: open the fleet dashboard in a 1480px window, then narrow it to 1241px, the narrowest width before the counters go. At both widths NEEDS INPUT and FAILED are among the counters shown, IDLE and GROUPS are not, the counters stop short of the header's buttons, and nothing runs off the right edge.
-    test("keeps the counters a person acts on and drops idle and groups", async ({ page }) => {
-      await page.setViewportSize({ width: 1480, height: 800 });
+  test.describe("the counters button", () => {
+    /// Scenario: open the fleet dashboard. The button reads the agent total with the needs-input and daemons-answering warnings, and the counters are hidden. Hovering it shows every counter; moving away hides them; a click keeps them open until Escape. From 1440px down to 400px wide, either side of each width where the top bar changes, the button is on screen and the page does not scroll sideways.
+    test("shows every counter on hover or click and fits every width", async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 800 });
       await openOverview(page, "fleet");
-      for (const width of [1480, 1241]) {
+      const button = page.getByTestId("dashboard-counters-button");
+      await expect(button).toContainText("7 agents");
+      await expect(button).toContainText("needs input");
+      await expect(button).toContainText("2/4 daemons");
+      const popover = page.getByTestId("dashboard-counters-popover");
+      await expect(popover).toBeHidden();
+
+      await button.hover();
+      await expect(popover).toBeVisible();
+      for (const name of ["agents", "running", "needs-input", "failed", "waiting", "idle", "groups", "decks"]) {
+        await expect(page.getByTestId(`overview-count-${name}`), `${name} is not in the popover`).toBeVisible();
+      }
+      // Down onto the list itself: it stays open on the way.
+      await popover.hover();
+      await expect(popover).toBeVisible();
+      await page.mouse.move(5, 790);
+      await expect(popover).toBeHidden();
+
+      await button.click();
+      await page.mouse.move(5, 790);
+      await expect(popover).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(popover).toBeHidden();
+
+      for (const width of [1440, 1240, 1239, 961, 900, 681, 400]) {
         await page.setViewportSize({ width, height: 800 });
-        for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
-          await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at ${width}px`).toBeVisible();
-        }
-        for (const name of ["idle", "groups"]) {
-          await expect(page.getByTestId(`overview-count-${name}`), `${name} is shown at ${width}px`).toBeHidden();
-        }
-        const layout = await page.evaluate(() => {
-          const counters = document.querySelector(".overview-instruments")?.getBoundingClientRect();
-          const actions = Array.from(document.querySelectorAll(".topbar .top-actions")).at(-1)?.getBoundingClientRect();
-          return { countersRight: counters?.right, actionsLeft: actions?.left, actionsRight: actions?.right, scroll: document.documentElement.scrollWidth, viewport: window.innerWidth };
-        });
-        expect(layout.countersRight, `the counters run under the header's buttons at ${width}px`).toBeLessThanOrEqual((layout.actionsLeft ?? 0) + 0.5);
-        expect(layout.actionsRight, `the header's buttons run off the window at ${width}px`).toBeLessThanOrEqual(layout.viewport + 0.5);
-        expect(layout.scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(layout.viewport);
+        await expect(button, `the counters button is off screen at ${width}px`).toBeInViewport();
+        const scroll = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+        expect(scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(0);
       }
     });
   });

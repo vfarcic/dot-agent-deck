@@ -282,12 +282,6 @@ reason = "First-run note's New agent: forwards `onNewAgent`, which the overview 
 
 [[site]]
 file = "desktop/src/components/AgentOverview.tsx"
-handler = "onClick"
-code = "onOpenDeck"
-reason = "First-run note's Open daemons: forwards `onOpenDeck`, which is VOICE_ACTIONS.openDeck (`open_deck`)."
-
-[[site]]
-file = "desktop/src/components/AgentOverview.tsx"
 handler = "onChange"
 code = "(event) => setDashboardFilter({ ...filter, text: event.target.value })"
 reason = "Typing the dashboard filter's text; voice filters with `filter_dashboard`."
@@ -719,6 +713,14 @@ file = "desktop/src/components/ConfirmDialog.tsx"
 handler = "onClick"
 code = "() => run(\"keep\", keep.action)"
 reason = "Confirmation dialog's second confirm, the close that keeps the dispatched worktree (`Close agent, keep worktree` / `Close all N roles, keep worktree`, issue #1958): runs the destructive close the opener staged, like the Confirm button. Kept manual by design for the same reason: voice raises the same confirmation (`stop_agent`, `close_orchestration`) and the user picks which close by hand."
+
+# --- desktop/src/components/DashboardCounters.tsx ---
+
+[[site]]
+file = "desktop/src/components/DashboardCounters.tsx"
+handler = "onClick"
+code = "() => (open ? onClose() : onOpen())"
+reason = "The dashboard's counters button. Voice-reachable: `show_dashboard_counters` opens the same popover (issue #2312 follow-up) and `close` closes it; the click calls the overview's open/close callbacks rather than the entry, as the Host button does."
 
 # --- desktop/src/components/DeckSelector.tsx ---
 

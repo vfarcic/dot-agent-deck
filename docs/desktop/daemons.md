@@ -8,7 +8,7 @@ The app shares its list of remote daemons with the CLI: both read and write `rem
 
 The **Daemon** selector under the Dashboard's title chooses what the Dashboard shows, and the choice is saved:
 
-- **All daemons**: every daemon at once, one section each. The **DAEMONS** counter then says how many of them answered.
+- **All daemons**: every daemon at once, one section each. The **DAEMONS** count under the counters button at the top then says how many of them answered, and the button itself shows a red count, such as `2/3 daemons`, when some did not.
 - **This machine**: the daemon on this computer, at the same default address the TUI uses. This is the default. If you point the TUI at another socket with `DOT_AGENT_DECK_ATTACH_SOCKET`, launch the app with the same variable.
 - One entry per remote daemon, called by its name: the same name `dot-agent-deck connect <name>` takes. A daemon with no usable name is called by its user, host and port (the port only when it is not 22).
 
@@ -87,7 +87,7 @@ When a daemon is not running, the app starts it for you, on this machine or on a
    - **Reconnect**, when a daemon is running there but the app is not connected to it, or when the app cannot tell, for example because the host cannot be reached. The sentence says which.
 3. For **Start daemon**, the app asks first and names the machine the daemon will start on. Press **Start daemon** in that dialog; the button reads **Starting…** until the daemon answers, and **Cancel** starts nothing.
 
-**Check it worked:** the section lists the daemon's agents, or **No agents are running yet**, and the **DAEMONS** counter at the top counts it among the daemons that answered.
+**Check it worked:** the section lists the daemon's agents, or **No agents are running yet**, and the **DAEMONS** count under the counters button at the top counts it among the daemons that answered.
 
 A remote daemon's section reads `Checking whether a daemon is running on <host>.` with **Reconnect** for a few seconds after it first appears, while the app asks the host over ssh; it then shows **Start daemon** if nothing is running there. The app starts a remote daemon over ssh with the daemon's settings in **Settings → Daemons**, so it listens at that daemon's **Daemon socket** and the app finds it.
 

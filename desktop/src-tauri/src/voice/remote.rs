@@ -818,6 +818,7 @@ mod tests {
                 "close",
                 "open_settings",
                 "show_host_metrics",
+                "show_dashboard_counters",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

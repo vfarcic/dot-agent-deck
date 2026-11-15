@@ -635,6 +635,39 @@ action_words = ["host", "resource", "usage", "disk", "machine", "memory", "cpu",
   kind     = "deck_ref"
   optional = true
 
+# Issue #2312 follow-up — the agent dashboard's counters button, by voice. The
+# button dispatches through the same registry entry (`showDashboardCounters`),
+# so this row exposes the click rather than a second route to the popover.
+#
+# **The button's label is in the description** (the label rule,
+# `docs/develop/voice-first-design.md`): its accessible name starts
+# "Counters", it reads "<n> agents" and, when something needs someone,
+# "<n> needs input", "<n> failed" or "<up>/<total> daemons". The popover's own
+# words — agents, running, needs input, failed, waiting, idle, groups,
+# daemons — are the rest.
+#
+# `screens = ["overview"]` and `requires = ["new_agent_dialog_closed"]` for
+# `show_host_metrics`' reason: the button is on the agent dashboard only, and
+# the New agent dialog is modal over it. It shows figures and nothing else, so
+# it is outside D5.
+[[commands]]
+id          = "show_dashboard_counters"
+description = """Open the agent dashboard's counters: the popover that the Counters button at the top of
+the dashboard opens, listing how many agents there are in total, running, needing input, failed,
+waiting and idle, how many groups, and how many daemons are answering. Use for counters, show the
+counters, show counts, stats, statistics, totals, summary, how many agents are there, how many are
+running, how many need input, how many failed, how many daemons are answering. This only OPENS the
+counters: it starts, stops and changes nothing. A request to close or hide them is `close`, not this
+one. It is not `show_host_metrics`, which shows one machine's disk, memory and load, and not
+`filter_dashboard`, which changes which agents are listed."""
+invoke      = "showDashboardCounters"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "the counters open from the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Showing the counters."
+asks_to     = "show the dashboard's counters"
+try_saying  = "show the counters"
+
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry
 # (`switchDeck`), so this row exposes the click rather than a second route to

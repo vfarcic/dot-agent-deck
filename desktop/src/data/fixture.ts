@@ -1498,6 +1498,17 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     report: "Showing the Host figures.",
   },
   {
+    // Issue #2312 follow-up — the dashboard's counters, on the dashboard with
+    // the New agent dialog closed, as `commands.toml` says.
+    phrases: ["show the counters", "counters", "show the stats", "how many agents are running"],
+    action: "show_dashboard_counters",
+    invoke: "showDashboardCounters",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "the counters open from the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Showing the counters.",
+  },
+  {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at
     // this row, because the two are one word apart in speech. Callable on every
     // screen (the pull request browser's too, PRD #1401) for `voice_off`'s reason: the real row has no `screens`

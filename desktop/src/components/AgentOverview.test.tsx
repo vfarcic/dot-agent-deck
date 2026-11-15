@@ -2006,6 +2006,10 @@ describe("AgentOverview", () => {
 
     expect(screen.getByTestId("overview-first-run")).toBeVisible();
     expect(screen.getByRole("heading", { name: "No agents are running yet" })).toBeVisible();
+    // Issue #2312 follow-up: one row with one hint, and no Open daemons — it
+    // opened the selected daemon's screen, not this group's.
+    expect(screen.getByTestId("overview-first-run")).toHaveClass("overview-note-row");
+    expect(within(screen.getByTestId("overview-first-run")).queryByRole("button", { name: /open daemons/i })).toBeNull();
     expect(screen.queryByTestId("overview-disconnected")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
   });

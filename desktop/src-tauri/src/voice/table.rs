@@ -1298,6 +1298,11 @@ mod tests {
                 ("close", "closeTopmost", vec![]),
                 ("open_settings", "openSettings", vec!["deck", "overview"]),
                 ("show_host_metrics", "showHostMetrics", vec!["overview"]),
+                (
+                    "show_dashboard_counters",
+                    "showDashboardCounters",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -2298,6 +2303,7 @@ mod tests {
                 "close",
                 "open_settings",
                 "show_host_metrics",
+                "show_dashboard_counters",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

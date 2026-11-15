@@ -7,7 +7,7 @@ The **Agent dashboard** is the desktop app's main screen and the one it opens on
 ## Check what is running
 
 1. Choose what to watch with the **Daemon** selector under the title: **All daemons**, **This machine** (the default on a fresh install), or one remote daemon. Remote daemons are added in [Settings → Daemons](daemons.md).
-2. Read the counters at the top. **AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered. **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When a shown daemon has not answered, **DAEMONS** turns red and the other counters describe only the daemons that did. When no daemon answered, the other counters read `—`. In a narrower window the header shows fewer counters: **WAITING**, **IDLE** and **GROUPS** go first, then the rest. Widen the window, or zoom out with `Ctrl` or `⌘` and `-` ([Settings → Zoom](settings.md#zoom)), to bring them back.
+2. Read the counters button at the top, beside **New agent**. It shows how many agents the daemons that answered are running, for example `7 agents`, and adds a count only when something needs you: amber `1 needs input`, red `1 failed`, and red `2/4 daemons` when some of the daemons shown have not answered. Hover over it, or click it, to see every count: **AGENTS**, **RUNNING**, **NEEDS INPUT**, **FAILED**, **WAITING**, **IDLE** and **GROUPS** count the agents on the daemons that answered, and **DAEMONS** reads `<answered>/<shown>`, for example `1/1` for one healthy daemon. When no daemon answered, the counts read `—`. After a click the list stays open until you click the button again, press `Esc` or click elsewhere; with voice on, "show the counters" opens it ([Voice Control → Checking the counters](voice.md#checking-the-counters)). In a window narrower than 1240 pixels the button shows its numbers without the words. The TUI's dashboard shows the same counts on one line.
 3. Read the rows. Each daemon has its own section (below); press **Refresh** to reconnect to the daemons and read their agent lists again. When there are more daemons and agents than fit the window, a scrollbar stays on the right edge: its length shows how much of the dashboard is on screen and its position shows where you are. Scroll with the mouse, the trackpad or the keyboard, or, with voice on, [by voice](voice.md#scrolling-the-dashboard).
 
 ## One section per daemon
@@ -22,7 +22,7 @@ Beside the daemon's name, a small **Host** button shows how the machine that dae
 
 Each group header shows how many agents it holds, how many are in each status, and the working directory most of its agents share. A row shows its own directory only when it differs from that.
 
-![The Dashboard with two daemons, each in its own section with its own New agent button: Local daemon with four agents and a remote daemon, dev@build-box, with two; the DAEMONS counter reads 2/2 and the other counters add up the agents of both](/img/dashboard-fleet-desktop.png)
+![The Dashboard with two daemons, each in its own section with its own New agent button: Local daemon with four agents and a remote daemon, dev@build-box, with two; the counters button at the top reads 6 agents and 1 needs input, adding up the agents of both](/img/dashboard-fleet-desktop.png)
 
 ## Rows and columns
 
@@ -59,7 +59,7 @@ A daemon none of whose agents match shows one line in its place, for example `bu
 
 The filter stays while you move between screens and lasts until you clear it or quit the app; the next time the app starts, the Dashboard shows every agent. You can also set and clear it [by voice](voice.md#filtering-the-dashboard). The TUI's dashboard has no filter.
 
-![The Dashboard filtered to working agents: two daemons filtered to working agents: the line under the header reads Showing 3 of 6 agents · Working, with a remove control beside Working and a Show all button, while the counters above still count all six agents](/img/dashboard-filter-desktop.png)
+![The Dashboard filtered to working agents: two daemons filtered to working agents: the line under the header reads Showing 3 of 6 agents · Working, with a remove control beside Working and a Show all button, while the counters button above still counts all six agents](/img/dashboard-filter-desktop.png)
 
 ## Statuses
 
@@ -177,7 +177,7 @@ A daemon section shows one of these instead of its agents:
 | **Daemon not configured** | A remote daemon has no socket path yet. | Open [Settings → Daemons](daemons.md), choose it and press **Test connection**, which finds the path. |
 | **Incompatible daemon** | A daemon answered, but it and the app are different versions, so the app will not use it. The message says which of the two is older, and either that the app has not connected because it could misread what the daemon reports, or that the two cannot work together at all. | Update the older of the two (see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release)). The note says what each of its buttons does: **Upgrade**, offered when a remote daemon is older than the app, installs the app's version there and restarts the daemon, asking before it stops any running agent ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)); **Replace daemon**, offered on the daemon on this machine, stops it and starts the daemon that came with the app, asking before it stops any running agent; **Open daemons** goes to the Daemons screen; **Connect anyway**, offered only when the message says the app could misread the daemon (never when the two cannot work together), uses the daemon as it is until you quit the app, though some of what it shows may be wrong. The choice covers the whole app session, not only this daemon: until you quit, the app also uses any other daemon it would refuse for the same reason, on any deck, including one that replaces this daemon later; **Reconnect** tries again. **Technical details** under the message shows the exact versions, for a bug report. |
 | **Desktop bridge error** | The app could not read the daemon's agents, and no daemon answered for it to judge. This is a problem on the app's side, not a version difference. | Press **Reconnect**. If it keeps happening, restart the app. |
-| **No agents are running yet** | The daemon is healthy and runs no agents. This is what a fresh install looks like. | Press **New agent**. |
+| **No agents are running yet** | The daemon is healthy and runs no agents. This is what a fresh install looks like. It is one line across the daemon's section, with a **New agent** button. | Press **New agent**. |
 
 ![The desktop app's dashboard with a healthy daemon and no agents: “No agents are running yet”](/img/dashboard-empty-desktop.png)
 

@@ -141,6 +141,13 @@ test("each connected deck shows its own host utilisation", async ({ page }) => {
     await expect(metrics).toContainText(new RegExp(`Memory available[^\\n]*${memory}(?:\\.0+)? GiB`));
     // The daemon's sample age is on the wire but not shown (PR #1672).
     await expect(metrics).not.toContainText("Sample age");
+    // Closed before the next deck's: an open popover hangs over the groups
+    // below it, and with an empty daemon's note one row tall (issue #2312
+    // follow-up) the next Host button can sit underneath it.
+    if (card === localCard) {
+      await page.keyboard.press("Escape");
+      await expect(metrics).toHaveCount(0);
+    }
   }
   await expect(localCard.getByTestId("daemon-identity")).toContainText("Local daemon");
   await expect(remoteCard.getByTestId("daemon-identity")).toContainText("build@remote-host");
