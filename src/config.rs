@@ -648,6 +648,14 @@ pub const MAX_DASHBOARD_CONFIG_BYTES: u64 = crate::project_resolve::MAX_PROJECT_
 /// means the open failed with `NotFound` and a following `lstat` of `path`
 /// failed with `NotFound` too; when the `lstat` finds anything (a link, or an
 /// entry that appeared after the open) or fails another way, the read fails.
+///
+/// Issue #2156: the same holds for a folder above `config.toml` — typically
+/// `~/.config/dot-agent-deck` itself — that is a link whose target is missing.
+/// The open and the `lstat` of `path` both say `NotFound` then, because the
+/// missing folder is on the path, so [`missing_config_folder_verdict`] looks at
+/// the nearest folder above it that is there: a real folder (or a link to one)
+/// is a first run whose config folder does not exist yet, and anything else
+/// fails the read.
 fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -659,7 +667,8 @@ fn read_dashboard_config_bounded(path: &Path) -> Result<Option<String>, String> 
     let file = match options.open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return after_open_not_found(std::fs::symlink_metadata(path).map(|m| m.file_type()));
+            return after_open_not_found(std::fs::symlink_metadata(path).map(|m| m.file_type()))
+                .and_then(|_| missing_config_folder_verdict(path));
         }
         Err(e) => return Err(format!("open failed: {e}")),
     };
@@ -687,6 +696,66 @@ fn after_open_not_found(
         Ok(kind) if kind.is_symlink() => Err("it is a link whose target is missing".into()),
         Ok(_) => Err("it changed while it was being read".into()),
         Err(e) => Err(format!("stat after a failed open failed: {e}")),
+    }
+}
+
+/// Issue #2156: [`read_dashboard_config_bounded`]'s verdict once neither the
+/// open nor the `lstat` of `path` found anything, from the nearest folder
+/// above `path` that `lstat` finds. Every entry between it and `path` is
+/// missing, so it decides whether the config's folder simply does not exist
+/// yet (`Ok(None)`, a first run) or sits behind a link whose target is
+/// missing — moved, or on a volume that is not mounted — and may hold the
+/// config that turned a doorbell off (`Err`). A relative `path` whose every
+/// folder is missing is absent: the walk stops at the working directory.
+fn missing_config_folder_verdict(path: &Path) -> Result<Option<String>, String> {
+    for folder in path.ancestors().skip(1) {
+        if folder.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(folder) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            lstat => {
+                return nearest_config_folder_verdict(folder, lstat.map(|m| m.file_type()), || {
+                    std::fs::metadata(folder).map(|m| m.file_type())
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// [`missing_config_folder_verdict`]'s verdict on `folder`, the nearest entry
+/// above the config path that is there, from its `lstat` and, for a link, the
+/// `stat` that follows it. `Ok(None)` only for a folder, or a link that leads
+/// to one; a link whose target is missing, anything that is not a folder, or a
+/// call that fails another way fails the read.
+fn nearest_config_folder_verdict(
+    folder: &Path,
+    lstat: std::io::Result<std::fs::FileType>,
+    stat: impl FnOnce() -> std::io::Result<std::fs::FileType>,
+) -> Result<Option<String>, String> {
+    match lstat {
+        Ok(kind) if kind.is_dir() => Ok(None),
+        Ok(kind) if kind.is_symlink() => match stat() {
+            Ok(target) if target.is_dir() => Ok(None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+                "the folder {} is a link whose target is missing",
+                folder.display()
+            )),
+            Ok(_) => Err(format!(
+                "the folder {} is a link to something that is not a folder",
+                folder.display()
+            )),
+            Err(e) => Err(format!(
+                "stat of the folder {} failed: {e}",
+                folder.display()
+            )),
+        },
+        Ok(_) => Err(format!("{} is not a folder", folder.display())),
+        Err(e) => Err(format!(
+            "stat of the folder {} failed: {e}",
+            folder.display()
+        )),
     }
 }
 
@@ -3143,6 +3212,102 @@ mod tests {
             let verdict = after_open_not_found(lstat);
             assert!(verdict.is_err(), "{name}: {verdict:?}");
         }
+    }
+
+    /// Issue #2156: the nearest folder above a config path that is not there
+    /// decides whether the config is absent. Only a folder, or a link that
+    /// leads to one, is a first run; a link whose target is missing, a link to
+    /// a file, a file, and a call that fails another way each fail the read,
+    /// so a race or an unreadable folder holds the doorbell off rather than
+    /// reading as no config.
+    #[cfg(unix)]
+    #[test]
+    fn a_missing_config_folder_is_absent_only_below_a_real_folder() {
+        use std::io::{Error, ErrorKind};
+        let dir = crate::test_temp::tempdir().unwrap();
+        let file = dir.path().join("file");
+        std::fs::write(&file, "").unwrap();
+        let folder = dir.path().join("folder");
+        std::fs::create_dir(&folder).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        let lstat = |p: &Path| Ok(std::fs::symlink_metadata(p).unwrap().file_type());
+        let stat = |p: &Path| {
+            let p = p.to_path_buf();
+            move || std::fs::metadata(&p).map(|m| m.file_type())
+        };
+        let never = || -> std::io::Result<std::fs::FileType> { panic!("stat of a non-link") };
+        let at = Path::new("/somewhere");
+
+        assert_eq!(
+            nearest_config_folder_verdict(at, lstat(&folder), never),
+            Ok(None)
+        );
+        assert_eq!(
+            nearest_config_folder_verdict(at, lstat(&link), stat(&folder)),
+            Ok(None),
+            "a link to a folder"
+        );
+        assert_eq!(
+            nearest_config_folder_verdict(at, lstat(&link), || Err(Error::from(
+                ErrorKind::NotFound
+            ))),
+            Err("the folder /somewhere is a link whose target is missing".to_string())
+        );
+        for (name, verdict) in [
+            (
+                "link to a file",
+                nearest_config_folder_verdict(at, lstat(&link), stat(&file)),
+            ),
+            (
+                "link, stat denied",
+                nearest_config_folder_verdict(at, lstat(&link), || {
+                    Err(Error::from(ErrorKind::PermissionDenied))
+                }),
+            ),
+            (
+                "a file",
+                nearest_config_folder_verdict(at, lstat(&file), never),
+            ),
+            (
+                "lstat denied",
+                nearest_config_folder_verdict(
+                    at,
+                    Err(Error::from(ErrorKind::PermissionDenied)),
+                    never,
+                ),
+            ),
+        ] {
+            assert!(verdict.is_err(), "{name}: {verdict:?}");
+        }
+
+        // The walk itself: nothing above a relative path's missing folders
+        // but the working directory, which is a first run.
+        assert_eq!(
+            missing_config_folder_verdict(Path::new("no-such-folder/config.toml")),
+            Ok(None)
+        );
+    }
+
+    /// Issue #2156 (what `docs/configuration.md` says of it): `config set`
+    /// through a config folder that is a link whose target is missing fails,
+    /// and creates nothing at the link or where it points.
+    #[cfg(unix)]
+    #[test]
+    fn a_config_save_through_a_dangling_config_folder_fails() {
+        let dir = crate::test_temp::tempdir().unwrap();
+        let target = dir.path().join("unmounted/dot-agent-deck");
+        let folder = dir.path().join("dot-agent-deck");
+        std::os::unix::fs::symlink(&target, &folder).unwrap();
+        let result = DashboardConfig::default().save_to(&folder.join("config.toml"));
+        assert!(result.is_err(), "{result:?}");
+        assert!(
+            std::fs::symlink_metadata(&folder)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!dir.path().join("unmounted").exists());
     }
 
     /// The pure trust rule the ancestor walk stops on (issue #577). Split out

@@ -28,6 +28,27 @@ use crate::doorbell_txn as txn;
 /// long is reported stalled (plan §2.3's write caps).
 pub(crate) const PHASE_WRITE_CAP: Duration = Duration::from_millis(200);
 
+/// The command word a ring's doorbell line names: the deck this daemon runs
+/// from ([`crate::platform::paths::binary_name`], issue #1730).
+#[cfg(not(test))]
+fn doorbell_command() -> String {
+    crate::platform::paths::binary_name()
+}
+
+/// Issue #2289: in this crate's unit-test build the running executable is the
+/// libtest binary under the checkout's `target/`, so naming it would make the
+/// typed line's length, and whether it wraps in a test pane, follow where the
+/// repository is checked out. The unit tests' rings name this fixed path
+/// instead; the e2e tests, built without `cfg(test)`, keep the real one.
+#[cfg(test)]
+pub(crate) const TEST_DOORBELL_COMMAND: &str = "/opt/deck/dot-agent-deck";
+
+/// See [`TEST_DOORBELL_COMMAND`].
+#[cfg(test)]
+fn doorbell_command() -> String {
+    TEST_DOORBELL_COMMAND.to_string()
+}
+
 /// How often a ring that holds the writer asks again whether the generation
 /// is still fit for it.
 const STILL_ADMITTED_EVERY: Duration = Duration::from_millis(50);
@@ -800,7 +821,7 @@ impl AgentPtyRegistry {
             settling,
             submit_route: caps.hook_route || caps.transcript_route,
             still_admitted: still,
-            command: crate::platform::paths::binary_name(),
+            command: doorbell_command(),
         };
         let draw = || {
             let mut byte = [0u8; 1];
