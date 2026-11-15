@@ -49719,6 +49719,39 @@ mod tests {
         }
     }
 
+    /// PRD #2174 (Qodo, PR #2321): a Later or Don't ask again that cannot be
+    /// saved — the state's directory is a file here — closes the prompt and
+    /// says why on the status line instead of being lost silently; one that
+    /// saves says nothing. `s` takes the same path after opening a browser,
+    /// which a unit test does not do, and the `[Snooze]`/`[Dismiss]` buttons
+    /// call the same `report_star_save`.
+    #[test]
+    fn star_choice_that_cannot_be_saved_says_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-directory");
+        std::fs::write(&blocker, "").unwrap();
+        for code in [KeyCode::Char('l'), KeyCode::Esc, KeyCode::Char('d')] {
+            let mut ui = default_ui();
+            ui.mode = UiMode::StarPrompt;
+            ui.star_prompt_state = config::StarPromptState::load_from(blocker.join("star.json"));
+            handle_star_prompt_key(KeyEvent::from(code), &mut ui);
+            assert_eq!(ui.mode, UiMode::Normal, "{code:?} left the prompt open");
+            let (said, _) = ui
+                .status_message
+                .clone()
+                .unwrap_or_else(|| panic!("{code:?}: a failed save said nothing"));
+            assert!(said.contains("star prompt"), "{code:?}: {said}");
+        }
+        let mut ui = default_ui();
+        ui.mode = UiMode::StarPrompt;
+        ui.star_prompt_state = config::StarPromptState::load_from(dir.path().join("star.json"));
+        handle_star_prompt_key(KeyEvent::from(KeyCode::Char('l')), &mut ui);
+        assert!(
+            ui.status_message.is_none(),
+            "a saved Later reported something"
+        );
+    }
+
     /// Scenario: the star prompt opens. At a height of 8 rows, where its `s Star  l Later  d Don't ask again` line is cut off, `s`, `l` and `d` choose nothing and Escape still closes it; at 80×24, where the line is on screen, each key reaches the prompt. Before its first frame none of the three reaches it at either size.
     #[spec("prompt/star/001")]
     #[test]
