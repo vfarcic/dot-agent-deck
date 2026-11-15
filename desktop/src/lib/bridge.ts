@@ -20,6 +20,7 @@ import { DEFAULT_SPEECH_LANGUAGE, SPEECH_LANGUAGE_TOKENS } from "./speechLanguag
 import type { AnswerOutcomeDto, PendingQuestionDto, QuestionResultDto, QuestionSelectionDto, QuestionTextSlotDto, VoiceQuestionTarget } from "./voiceQuestion";
 import { pullRequestFromDto } from "./pullRequest";
 import type { ProjectTrust, ProjectTrustTarget } from "./projectTrust";
+import { STAR_THANKS, type StarChoice } from "./starPrompt";
 import { DEFAULT_DESKTOP_FEATURES, UNREPORTED } from "../types";
 import type { HandoffEdge,
   AgentBackground,
@@ -1907,10 +1908,25 @@ export interface DeckBridge {
    * before calling it. The desktop crate pushes a per-deck snapshot but no
    * "this deck left the fleet" event, so the set of decks the bridge knows
    * about is the set seen since the last connect. Everything that can change
-   * which decks are observed therefore goes through here: app start, Reconnect,
-   * and a settings save that touched `[endpoints]` (see `saveSettings`).
+   * which decks are observed therefore goes through here: app start, the
+   * dashboard's Refresh, and a settings save that touched `[endpoints]` (see
+   * `saveSettings`). One deck's own Reconnect does NOT: that is
+   * {@link reconnectDeck}.
    */
   connect(): Promise<DeckFleet>;
+  /**
+   * Reconnect ONE deck, named by its id, and answer the fleet with that deck's
+   * fresh snapshot folded in (issue #1994).
+   *
+   * What a deck's own Reconnect button calls — its banner's, its empty
+   * screen's, its dashboard section's. It used to call {@link connect}, so one
+   * deck's button reset the whole fleet around the SELECTED deck: every other
+   * deck dropped off the screen until its watcher reported again, and the deck
+   * whose button it was was never reconnected at all unless it was the
+   * selected one. This touches the named deck alone and leaves every other
+   * deck as it is, as the TUI's reconnect leaves every daemon but its own.
+   */
+  reconnectDeck(deckId: string): Promise<DeckFleet>;
   subscribe(onFleet: FleetListener, onTerminal: TerminalListener, onWorktreeKept?: WorktreeKeptListener): Promise<Unsubscribe>;
   previewWorktreeClose: import("./worktreeClose").WorktreeClosePreview;
   runAction(action: DeckAction): Promise<DeckActionResult>;
@@ -2309,6 +2325,19 @@ export interface DeckBridge {
    * refusal when the config changed since, and approves nothing then.
    */
   approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust>;
+  /**
+   * PRD #2174 — whether this launch of the app shows the star reminder. The
+   * crate counts one launch per app process however often it is asked, in the
+   * reminder state the TUI shares. Optional so a test double need not serve
+   * it; a runtime without it never shows the reminder.
+   */
+  starPromptLaunch?(): Promise<boolean>;
+  /**
+   * PRD #2174 — the user's choice in the star reminder. Resolves Star's
+   * sentence (thanks, or where to go when the browser did not open), and
+   * nothing for Later and Don't ask again.
+   */
+  starPromptChoose?(choice: StarChoice): Promise<string | undefined>;
   /**
    * Issue #1198 — which of the app's experimental surfaces to show: the
    * desktop process's own flag, read through its `features::show_desktop_*`
@@ -3125,6 +3154,8 @@ class FixtureDeckBridge implements DeckBridge {
    * Review project commands dialog. Off by default.
    */
   private docsTrustReview = false;
+  /** PRD #2174 — whether the star reminder was answered in this preview. */
+  private starAnswered = false;
   /** PRD #1223 M4 — the command each fixture deck last started a plain agent with, as the live crate keeps it: per deck, in memory. */
   private lastCommands = new Map<string, string>();
   /** PRD #1487 M5 — decks with a fixture upgrade running, and the restart questions waiting on an answer. */
@@ -3203,6 +3234,12 @@ class FixtureDeckBridge implements DeckBridge {
   }
 
   async connect(): Promise<DeckFleet> {
+    await Promise.resolve();
+    return structuredClone(this.fleet);
+  }
+
+  async reconnectDeck(_deckId: string): Promise<DeckFleet> {
+    // The fixture fleet has no links to drop; its decks are as they were.
     await Promise.resolve();
     return structuredClone(this.fleet);
   }
@@ -3985,6 +4022,22 @@ class FixtureDeckBridge implements DeckBridge {
     return this.projectTrustState(target);
   }
 
+  /**
+   * PRD #2174 — `?star=1` plays a launch the star reminder shows at; any
+   * other preview shows none. A choice is made once: the preview, like the
+   * app, shows no second reminder until it is reloaded.
+   */
+  async starPromptLaunch(): Promise<boolean> {
+    await Promise.resolve();
+    return !this.starAnswered && new URLSearchParams(window.location.search).get("star") === "1";
+  }
+
+  async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
+    await Promise.resolve();
+    this.starAnswered = true;
+    return choice === "star" ? STAR_THANKS : undefined;
+  }
+
   async newAgentOrchestrations(deckId: string, path: string): Promise<NewAgentOrchestrations> {
     await Promise.resolve();
     this.connectedDeck(deckId);
@@ -4147,6 +4200,13 @@ export class TauriDeckBridge implements DeckBridge {
    * without this would trade an unbounded queue for a dead terminal.
    */
   private attachRequested = new Map<string, AgentTarget>();
+  /**
+   * How many snapshots of each deck {@link foldSnapshot} has folded, so
+   * `reconnectDeck` can tell whether its answer is still the newest word on
+   * its deck (PR #2322 review). A count, never cleared: it is only ever
+   * compared with itself across one call.
+   */
+  private foldsOf = new Map<string, number>();
   private terminalListener?: TerminalListener;
   /**
    * The fold every `desktop://snapshot` lands in (PRD #742 M4): one entry per
@@ -4517,16 +4577,26 @@ export class TauriDeckBridge implements DeckBridge {
    * waiting on the invocation that never settles.
    *
    * So it is cleared exactly where a whole-bridge restart happens — `connect()`
-   * and `dispose()` — and nowhere else. Both mean the frontend is starting its
-   * relationship with the daemon over, which is the only moment at which
+   * and `dispose()` — and, for one deck's agents alone, where that deck is
+   * reconnected (`reconnectDeck`, issue #1994). Each means the frontend is
+   * starting its relationship with a daemon over, which is the only moment at which
    * forgetting an outstanding command is a fresh start rather than an
    * unbounded queue: it costs at most one extra queued command per Reconnect,
    * bounded by a deliberate user action, against a pane that is otherwise dead
    * until the app restarts.
    */
-  private clearAttachSuppression(): void {
-    this.attachInvocations.clear();
-    this.attachRequested.clear();
+  private clearAttachSuppression(deckId?: string): void {
+    if (deckId === undefined) {
+      this.attachInvocations.clear();
+      this.attachRequested.clear();
+      return;
+    }
+    // Issue #1994: one deck's Reconnect starts that deck's relationship over
+    // and no other's, so it forgets that deck's outstanding attaches alone.
+    // Every key here is `boundAgentKey`, which leads with the deck.
+    const prefix = agentKey(deckId, "");
+    for (const key of this.attachInvocations) if (key.startsWith(prefix)) this.attachInvocations.delete(key);
+    for (const key of this.attachRequested.keys()) if (key.startsWith(prefix)) this.attachRequested.delete(key);
   }
 
   private async attachAgents(targets: AgentTarget[], expectedLifecycle = this.lifecycle): Promise<void> {
@@ -5019,6 +5089,39 @@ export class TauriDeckBridge implements DeckBridge {
     return this.fleetView();
   }
 
+  async reconnectDeck(deckId: string): Promise<DeckFleet> {
+    this.clearAttachSuppression(deckId);
+    const invoke = await this.getInvoke();
+    const foldsBefore = this.foldsOf.get(deckId) ?? 0;
+    const reported = () => (this.foldsOf.get(deckId) ?? 0) !== foldsBefore;
+    let dto: DesktopSnapshotDto;
+    try {
+      dto = await invoke<DesktopSnapshotDto>("desktop_reconnect_deck", { deckId });
+    } catch (cause) {
+      // The crate emits nothing before it refuses, so a snapshot of this deck
+      // folded during a refused call is its watcher's report, and newer than
+      // the refusal: the deck answers with it rather than with a failure the
+      // screen has moved past (PR #2322 review). Only this bridge can tell,
+      // because it alone sees each deck's folds; the runtime sees whole fleets.
+      if (reported()) return this.fleetView();
+      throw cause;
+    }
+    /*
+      The crate EMITS this snapshot before it answers, and the event and the
+      answer reach the webview separately. When any snapshot of this deck was
+      folded while the call was out, it is either this one already or a newer
+      one from the deck's watcher, and folding the answer over it would roll
+      the deck back (PR #2322 review). The answer is folded only when nothing
+      arrived for the deck, which keeps a bridge whose events are not flowing
+      answered too.
+
+      A FOLD, not `connect()`'s reset, either way: the answer is one deck's,
+      and every other deck's entry is as true as it was before the click.
+    */
+    if (reported()) return this.fleetView();
+    return this.foldSnapshot(dto);
+  }
+
   /**
    * Fold one deck's snapshot into the fleet and answer the new whole.
    *
@@ -5030,6 +5133,7 @@ export class TauriDeckBridge implements DeckBridge {
    */
   private foldSnapshot(dto: DesktopSnapshotDto): DeckFleet {
     const deckId = dto.connection.deckId;
+    this.foldsOf.set(deckId, (this.foldsOf.get(deckId) ?? 0) + 1);
     /*
       PRD #742 M5: the selection comes off the wire now, and it is read BEFORE
       the fold because `selected` below decides which deck gets the evidence
@@ -5881,6 +5985,20 @@ export class TauriDeckBridge implements DeckBridge {
   async approveProjectTrust(target: ProjectTrustTarget, digest: string): Promise<ProjectTrust> {
     const invoke = await this.getInvoke();
     return invoke<ProjectTrust>("desktop_approve_project_trust", { deckId: target.deckId ?? null, path: target.path, orchestration: target.orchestration, digest });
+  }
+
+  async starPromptLaunch(): Promise<boolean> {
+    const invoke = await this.getInvoke();
+    /* Only a literal `true` shows the reminder: an answer of any other shape
+       (an older crate, a mocked IPC that answers every command alike) must
+       not put a dialog over the app. */
+    return (await invoke<unknown>("desktop_star_prompt_launch")) === true;
+  }
+
+  async starPromptChoose(choice: StarChoice): Promise<string | undefined> {
+    const invoke = await this.getInvoke();
+    const message = await invoke<unknown>("desktop_star_prompt_choose", { choice });
+    return typeof message === "string" ? message : undefined;
   }
 
   async dispose(): Promise<void> {

@@ -1118,6 +1118,31 @@ fn docs_screenshot_help() {
     });
 }
 
+/// Scenario: Start the deck on a launch the star reminder shows at — its
+/// state file says nine launches have been counted, so this one is the tenth
+/// — and capture the star prompt over the empty dashboard as
+/// `star-prompt-tui.html`.
+#[test]
+#[ignore = "docs-screenshot generator: run it with `cargo docs-screenshots`"]
+fn docs_screenshot_star_prompt() {
+    html_dir();
+    let state = common::harness_tempdir().expect("star state dir");
+    let path = state.path().join("star-prompt-state.json");
+    std::fs::write(
+        &path,
+        r#"{"launch_count": 9, "permanently_dismissed": false, "last_prompt_at_launch": 0}"#,
+    )
+    .expect("write star state");
+    let deck = launch_with(|builder| {
+        builder.with_env("DOT_AGENT_DECK_STAR_PROMPT", path.to_string_lossy())
+    });
+    capture(&deck, "star-prompt", |grid| {
+        grid.contains("Enjoying dot-agent-deck?")
+            && grid.contains("s Star  l Later  d Don't ask again")
+            && grid.contains("[Dismiss]")
+    });
+}
+
 /// The release the `self-upgrade` scene offers and the one its copy runs: the
 /// desktop half of the scenario shows the same pair.
 const SELF_UPGRADE_LATEST: &str = "0.47.0";

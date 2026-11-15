@@ -472,6 +472,29 @@ screen = "deck"
 action = "approve_project_commands"
 outcome = "dispatch"
 
+# PRD #2174 — the star reminder's three buttons, by the words the docs give and
+# by the buttons' own labels, on the screens the app opens on.
+[[fixtures]]
+name = "star-repo-by-the-docs-words"
+utterance = "star the repo"
+screen = "overview"
+action = "star_repo"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "remind-star-later-by-the-docs-words"
+utterance = "remind me later"
+screen = "deck"
+action = "remind_star_later"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "dismiss-star-prompt-by-its-label"
+utterance = "don't ask again"
+screen = "overview"
+action = "dismiss_star_prompt"
+outcome = "dispatch"
+
 # Issue #1263 — the deck field once the dialog is open. Over a dialog with no
 # form yet, and over a live form (where a different deck clears the directory);
 # the field's label said with a deck's name; and the deck screen, where there is

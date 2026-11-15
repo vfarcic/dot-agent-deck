@@ -4332,6 +4332,12 @@ mod tests {
     /// 500 ms failed both tests on a 16-CPU dev box at load average ~30
     /// (2026-10-13); at that load the factor alone brings this window to about
     /// the 2 s a flat window was raised to.
+    ///
+    /// Every window these tests wait out is paid in full, so each test lasts a
+    /// fixed number of them, and a loaded box stretches every one: up to six
+    /// times its base, which is why the three took 13–17 s each in the e2e
+    /// shards against about 3 s in the fast tier (#2111). Keep the count of
+    /// windows each test needs as small as what it proves allows.
     fn busy_holder_stall() -> std::time::Duration {
         crate::test_budget::load_scaled(std::time::Duration::from_secs(1))
     }
@@ -4374,19 +4380,26 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
-        // The release is anchored to the instant the measurement starts, not to
-        // when this thread is next scheduled, so a delay before the wait cannot
-        // let the holder let go before the waiter has been blocked past `stall`.
-        let started = std::time::Instant::now();
+        // The release is anchored to an instant taken just before the wait
+        // begins, after the release thread is already running, so neither a
+        // delay before the wait nor spawning that thread can let the holder go
+        // before the waiter has been blocked past `stall`, short of this thread
+        // being descheduled for two whole windows between the send and the
+        // call (Qodo on PR #2325: anchored before the spawn, and with one window
+        // of margin, it could).
+        let (go, wait_starts) = std::sync::mpsc::channel::<std::time::Instant>();
         let release = {
             let stop = stop.clone();
-            let release_at = started + stall * 3;
             std::thread::spawn(move || {
+                let started = wait_starts.recv().expect("the wait's start");
+                let release_at = started + stall * 3;
                 std::thread::sleep(release_at.saturating_duration_since(std::time::Instant::now()));
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
 
+        let started = std::time::Instant::now();
+        go.send(started).expect("start the release clock");
         let waited = lock_config_waiting(&dest, stall, std::time::Duration::from_secs(60));
         let elapsed = started.elapsed();
         release.join().expect("release thread");
@@ -4445,9 +4458,12 @@ mod tests {
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
 
         // The stall window is sized as in the test above: a publish has to land
-        // inside each one for the wait to reach the ceiling at all.
+        // inside it for the wait to reach the ceiling at all. One full window
+        // and one the ceiling cuts short are enough to show the ceiling, not
+        // the stall, ends the wait; each extra window costs a whole loaded
+        // `stall` (#2111).
         let stall = busy_holder_stall();
-        let ceiling = stall.mul_f64(2.4);
+        let ceiling = stall.mul_f64(1.4);
         let started = std::time::Instant::now();
         let waited = lock_config_waiting(&dest, stall, ceiling);
         let elapsed = started.elapsed();

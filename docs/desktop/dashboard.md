@@ -163,7 +163,7 @@ The TUI shows the same pull request on the agent's card, as `#1234` with a glyph
 
 In the TUI the same things are `Ctrl+w` on a card, and closing an orchestration's tab; its confirmation offers **Close, keep worktree** for a dispatched unit. The TUI has no single-role close: closing a role's card closes its whole tab.
 
-If a dispatched unit has uncommitted changes, both clients' close confirmations warn that the worktree will be **KEPT**, naming its directory. After the close, the desktop shows a notice naming the daemon and the directory actually kept; it stays until you dismiss it with its **×**. The TUI reports the kept directory on its status line. A clean worktree is removed without a kept-worktree notice, unless you chose to keep it. See [Dispatcher Mode → Finish up](../dispatcher-mode.md#finish-up) to recover work or clean up leftover worktrees.
+If a dispatched unit has uncommitted changes, or other worktrees inside its worktree, both clients' close confirmations warn that the worktree will be **KEPT**, naming its directory and any worktrees inside it. After the close, the desktop shows a notice naming the daemon and the directory actually kept; it stays until you dismiss it with its **×**. The TUI reports the kept directory on its status line. A clean worktree is removed without a kept-worktree notice, unless you chose to keep it. See [Dispatcher Mode → Finish up](../dispatcher-mode.md#finish-up) to recover work or clean up leftover worktrees.
 
 ## When a daemon is not there
 

@@ -248,9 +248,26 @@ fn parse_worktree_porcelain(bytes: &[u8]) -> Vec<RawWorktree> {
     result
 }
 
-/// Enumerate linked worktrees (excludes the main working tree) for the repo
-/// rooted at or above `repo_dir`.
-fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
+/// Issue #2285: every worktree path in a `git worktree list --porcelain -z`
+/// listing, the main working tree included, through the one parser.
+pub(crate) fn worktree_paths_from_porcelain_z(bytes: &[u8]) -> Vec<PathBuf> {
+    parse_worktree_porcelain(bytes)
+        .into_iter()
+        .map(|wt| wt.path)
+        .collect()
+}
+
+/// Issue #2285: the paths in `all` that lie strictly inside `dir`, compared
+/// as git lists them (real paths), so a worktree is never its own nested one.
+pub(crate) fn paths_inside<'a>(dir: &Path, all: &'a [PathBuf]) -> Vec<&'a PathBuf> {
+    all.iter()
+        .filter(|p| p.as_path() != dir && p.starts_with(dir))
+        .collect()
+}
+
+/// Enumerate every worktree of the repo rooted at or above `repo_dir`, the
+/// main working tree first (git's documented order).
+fn list_all_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
     let out = git_at(repo_dir)
         .args(["worktree", "list", "--porcelain", "-z"])
         .output()
@@ -261,11 +278,7 @@ fn list_linked_worktrees(repo_dir: &Path) -> Result<Vec<RawWorktree>, String> {
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    let mut all = parse_worktree_porcelain(&out.stdout);
-    if !all.is_empty() {
-        all.remove(0); // the main working tree
-    }
-    Ok(all)
+    Ok(parse_worktree_porcelain(&out.stdout))
 }
 
 /// Outcome of probing a worktree's cleanliness. `Unresolvable` is distinct
@@ -547,7 +560,13 @@ fn parse_pr_state(json: &str, branch: &str, push_repos: &[String]) -> PrState {
 /// scenario via worktree-scoped remotes — the common config's value always
 /// wins.)
 pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String> {
-    let raw = list_linked_worktrees(repo_dir)?;
+    let mut raw = list_all_worktrees(repo_dir)?;
+    // Issue #2285: the main working tree is never a candidate, but it counts
+    // as one a candidate could hold, so containment reads the whole listing.
+    let all_paths = existing_paths(raw.iter().map(|wt| wt.path.clone()));
+    if !raw.is_empty() {
+        raw.remove(0); // the main working tree
+    }
     let mut reports = Vec::with_capacity(raw.len());
     for wt in raw {
         let cleanliness = check_cleanliness(&wt.path);
@@ -562,7 +581,10 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
             Some(branch) => resolve_pr_state(&wt.path, branch),
             None => PrState::Unresolvable("worktree has no branch (detached HEAD)".to_string()),
         };
-        let verdict = decide(&pr_state, &cleanliness, ownership);
+        let verdict = keep_if_it_holds_worktrees(
+            decide(&pr_state, &cleanliness, ownership),
+            &paths_inside(&wt.path, &all_paths),
+        );
         reports.push(WorktreeReport {
             path: wt.path,
             branch: wt.branch,
@@ -574,6 +596,35 @@ pub fn examine_worktrees(repo_dir: &Path) -> Result<Vec<WorktreeReport>, String>
         });
     }
     Ok(reports)
+}
+
+/// Issue #2285: the listed worktree paths, less those whose directories are
+/// confirmed gone. One that is gone (git's `prunable`) has nothing left to
+/// lose, so it keeps no parent, as for close; one that cannot be looked at
+/// for any other reason is kept, since it may hold work.
+fn existing_paths(paths: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
+    paths
+        .into_iter()
+        .filter(
+            |p| !matches!(p.symlink_metadata(), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+        )
+        .collect()
+}
+
+/// Issue #2285: a worktree that other worktrees lie inside is kept whatever
+/// [`decide`] said, because `git worktree remove` deletes the whole directory,
+/// theirs included, with their uncommitted work, and `check_cleanliness`
+/// cannot see one under a git-ignored directory. A `Keep` stays the `Keep` it
+/// was: its reason already blocks the removal.
+fn keep_if_it_holds_worktrees(verdict: Verdict, nested: &[&PathBuf]) -> Verdict {
+    if nested.is_empty() || matches!(verdict, Verdict::Keep(_)) {
+        return verdict;
+    }
+    let names: Vec<String> = nested.iter().map(|p| display_path(p)).collect();
+    Verdict::Keep(format!(
+        "holds other worktrees, which removing it would delete: {}; remove them first",
+        names.join(", ")
+    ))
 }
 
 /// Render a worktree path for human output as an **injective** escape: two
@@ -770,6 +821,108 @@ mod tests {
     fn decide_merged_clean_foreign_asks() {
         let v = decide(&PrState::Merged, &Cleanliness::Clean, Ownership::Foreign);
         assert!(matches!(v, Verdict::Ask(_)));
+    }
+
+    /// Issue #2285: a candidate that other worktrees lie inside is kept, and
+    /// the reason names them; one already kept keeps its own reason, and one
+    /// with nothing inside it keeps its verdict. Only paths strictly inside
+    /// count — not the worktree itself, and not a sibling sharing its prefix.
+    #[test]
+    fn a_candidate_holding_other_worktrees_is_kept_and_names_them() {
+        let all = vec![
+            PathBuf::from("/w/unit"),
+            PathBuf::from("/w/unit/.worktrees/feat-1"),
+            PathBuf::from("/w/unit-2"),
+        ];
+        let nested = paths_inside(Path::new("/w/unit"), &all);
+        assert_eq!(nested, vec![&all[1]]);
+        assert!(paths_inside(Path::new("/w/unit-2"), &all).is_empty());
+
+        for verdict in [Verdict::Remove, Verdict::Ask("foreign".into())] {
+            let kept = keep_if_it_holds_worktrees(verdict, &nested);
+            assert!(
+                matches!(&kept, Verdict::Keep(r) if r.contains("holds other worktrees") && r.contains("feat-1")),
+                "{kept:?}"
+            );
+        }
+        assert_eq!(
+            keep_if_it_holds_worktrees(Verdict::Keep("dirty".into()), &nested),
+            Verdict::Keep("dirty".into())
+        );
+        assert_eq!(
+            keep_if_it_holds_worktrees(Verdict::Remove, &[]),
+            Verdict::Remove
+        );
+    }
+
+    /// Issue #2285 (review): a listed worktree whose directory is already
+    /// gone keeps no parent, so a nested directory deleted by hand does not
+    /// leave reclaim refusing the parent until `git worktree prune`.
+    #[test]
+    fn a_deleted_nested_worktree_keeps_no_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let unit = tmp.path().join("unit");
+        let live = unit.join(".worktrees").join("live");
+        let gone = unit.join(".worktrees").join("gone");
+        std::fs::create_dir_all(&live).unwrap();
+        let all = existing_paths([unit.clone(), live.clone(), gone]);
+        assert_eq!(all, vec![unit.clone(), live.clone()]);
+        assert_eq!(paths_inside(&unit, &all), vec![&live]);
+        std::fs::remove_dir_all(&live).unwrap();
+        let all = existing_paths([unit.clone(), live]);
+        assert!(paths_inside(&unit, &all).is_empty());
+    }
+
+    /// Issue #2285 (review): the main working tree is never a reclaim
+    /// candidate, but a linked worktree holding it is kept, since removing
+    /// that worktree would delete the main checkout with it.
+    #[test]
+    fn a_linked_worktree_holding_the_main_checkout_is_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = tmp.path();
+        let main = sandbox.join("outer").join("main");
+        std::fs::create_dir_all(&main).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = crate::git_env::fixture_git(dir, sandbox)
+                .args(args)
+                .output()
+                .expect("git available");
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&main, &["init", "-q", "."]);
+        git(&main, &["commit", "-q", "--allow-empty", "-m", "init"]);
+        // The containment set comes from the whole listing, so the main
+        // checkout counts as held by any candidate directory around it — here
+        // `outer`, its parent, stands in for such a candidate.
+        let linked = sandbox.join("linked");
+        git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "l",
+                &linked.to_string_lossy(),
+            ],
+        );
+        let all = existing_paths(
+            list_all_worktrees(&main)
+                .unwrap()
+                .into_iter()
+                .map(|wt| wt.path),
+        );
+        let main_real = std::fs::canonicalize(&main).unwrap();
+        assert!(
+            all.contains(&main_real),
+            "the listing keeps the main tree: {all:?}"
+        );
+        let parent = main_real.parent().unwrap();
+        assert_eq!(paths_inside(parent, &all), vec![&main_real]);
+        assert!(matches!(
+            keep_if_it_holds_worktrees(Verdict::Remove, &paths_inside(parent, &all)),
+            Verdict::Keep(_)
+        ));
     }
 
     #[test]
@@ -1152,7 +1305,7 @@ mod tests {
 
         use crate::git_env::fixture_git;
         use crate::worktree_reclaim::{
-            Cleanliness, check_cleanliness, list_linked_worktrees, remove_worktree_dir,
+            Cleanliness, check_cleanliness, list_all_worktrees, remove_worktree_dir,
         };
 
         /// Marker in the child's environment: this process is the re-exec'd half
@@ -1477,7 +1630,9 @@ mod tests {
             // 2. READ — the enumeration `examine_worktrees` makes its removal
             //    decision from. The decoy has a linked worktree of its own, so a
             //    steered answer is available and wrong.
-            let listed = list_linked_worktrees(&clone).expect("list the clone's linked worktrees");
+            let listed = list_all_worktrees(&clone)
+                .expect("list the clone's worktrees")
+                .split_off(1);
             let paths: Vec<PathBuf> = listed
                 .iter()
                 .map(|w| std::fs::canonicalize(&w.path).unwrap_or_else(|_| w.path.clone()))

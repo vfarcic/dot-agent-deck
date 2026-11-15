@@ -421,6 +421,9 @@ mod tests {
                 "start_new_agent".to_string(),
                 "discard_new_agent".to_string(),
                 "approve_project_commands".to_string(),
+                "star_repo".to_string(),
+                "remind_star_later".to_string(),
+                "dismiss_star_prompt".to_string(),
                 "stop_agent".to_string(),
                 "close_orchestration".to_string(),
                 "none".to_string(),
@@ -517,6 +520,9 @@ mod tests {
                 "start_new_agent",
                 "discard_new_agent",
                 "approve_project_commands",
+                "star_repo",
+                "remind_star_later",
+                "dismiss_star_prompt",
                 "stop_agent",
                 "close_orchestration",
                 "none"
@@ -732,6 +738,11 @@ mod tests {
                 // PRD #1885: callable where its dialog opens; the app answers
                 // that nothing is waiting when no review is open.
                 ("approve_project_commands".to_string(), true),
+                // PRD #2174: the star reminder's buttons, on every screen the
+                // app opens on; the app answers that it is not showing.
+                ("star_repo".to_string(), true),
+                ("remind_star_later".to_string(), true),
+                ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), false),
                 ("close_orchestration".to_string(), false),
             ]
@@ -792,6 +803,11 @@ mod tests {
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
                 ("approve_project_commands".to_string(), true),
+                // PRD #2174: the star reminder's buttons, on every screen the
+                // app opens on; the app answers that it is not showing.
+                ("star_repo".to_string(), true),
+                ("remind_star_later".to_string(), true),
+                ("dismiss_star_prompt".to_string(), true),
                 // The D5 stops: on the overview with the New agent dialog
                 // closed (#1260), and each only opens a confirmation.
                 ("stop_agent".to_string(), true),
@@ -851,6 +867,9 @@ mod tests {
                 ("start_new_agent".to_string(), false),
                 ("discard_new_agent".to_string(), false),
                 ("approve_project_commands".to_string(), false),
+                ("star_repo".to_string(), true),
+                ("remind_star_later".to_string(), true),
+                ("dismiss_star_prompt".to_string(), true),
                 ("stop_agent".to_string(), true),
                 ("close_orchestration".to_string(), false),
             ]

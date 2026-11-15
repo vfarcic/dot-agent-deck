@@ -78,9 +78,9 @@
     },
     {
       "customType": "regex",
-      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the nextest download URL (`get.nexte.st/<X.Y.Z>/linux`). Same datasource as the workflow nextest manager (crate), so both arrive as one cargo-nextest update.",
+      "description": "The RWX configs (`.rwx/ci.yml`, `.rwx/sandbox.yml`, docs/develop/rwx.md) are a third place the toolchain is pinned, in their own syntax, so the workflow managers above do not match them. This one reads the nextest version the `nextest` task installs (`CARGO_NEXTEST_VERSION: <X.Y.Z>`), which its download URL uses twice (the release tag and the asset name). Same datasource as the workflow nextest manager (crate), so both arrive as one cargo-nextest update. The task checks the release tarball against a pinned SHA-256 (issue #2300), so a bump PR also needs that checksum updated by hand in every `.rwx/` file that installs nextest (the `.sha256` beside the `x86_64-unknown-linux-gnu` tarball on the `cargo-nextest-<X.Y.Z>` GitHub release); the task fails until then, which is the point.",
       "managerFilePatterns": ["/^\\.rwx/[^/]+\\.ya?ml$/"],
-      "matchStrings": ["get\\.nexte\\.st/(?<currentValue>\\d+\\.\\d+\\.\\d+)/"],
+      "matchStrings": ["CARGO_NEXTEST_VERSION:\\s*(?<currentValue>\\d+\\.\\d+\\.\\d+)"],
       "datasourceTemplate": "crate",
       "depNameTemplate": "cargo-nextest"
     },

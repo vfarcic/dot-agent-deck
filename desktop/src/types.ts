@@ -1695,7 +1695,11 @@ export interface DeckRuntimeState {
    * another, and both declarations travel in the same array.
    */
   setShownTerminals: (targets: AgentTarget[]) => Promise<void>;
-  reconnect: () => Promise<void>;
+  /**
+   * Reconnect the deck named by `deckId` and no other (issue #1994), or, with
+   * no id, re-establish the whole fleet (the dashboard's Refresh).
+   */
+  reconnect: (deckId?: string) => Promise<void>;
   /**
    * PRD #819 M6: the projects the connected daemon knows about. There is no
    * client-side list to fall back to — an unreachable daemon means no projects
@@ -1737,6 +1741,13 @@ export interface DeckRuntimeState {
    */
   projectTrustState?: (target: import("./lib/projectTrust").ProjectTrustTarget) => Promise<import("./lib/projectTrust").ProjectTrust>;
   approveProjectTrust?: (target: import("./lib/projectTrust").ProjectTrustTarget, digest: string) => Promise<import("./lib/projectTrust").ProjectTrust>;
+  /**
+   * PRD #2174 — whether this launch shows the star reminder, and the user's
+   * choice in it. Optional for the reason the two above are; a runtime
+   * without them never shows the reminder.
+   */
+  starPromptLaunch?: () => Promise<boolean>;
+  starPromptChoose?: (choice: import("./lib/starPrompt").StarChoice) => Promise<string | undefined>;
   /** The desktop app's own settings, and where they live (PRD #803). */
   getSettings: () => Promise<import("./lib/bridge").DesktopSettingsSnapshotDto>;
   /**

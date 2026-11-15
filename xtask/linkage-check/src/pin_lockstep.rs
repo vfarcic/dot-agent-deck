@@ -1978,7 +1978,9 @@ fn rwx_config(rust: &str, nextest: &str, pnpm: &str, gotask: &str) -> String {
          - key: rustup\n    \
          run: curl -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain {rust}\n  \
          - key: nextest\n    \
-         run: curl -LsSf https://get.nexte.st/{nextest}/linux | tar zxf -\n  \
+         env:\n      \
+         CARGO_NEXTEST_VERSION: {nextest}\n    \
+         run: curl -fsSL -o /tmp/n.tar.gz https://github.com/nextest-rs/nextest/releases/download/cargo-nextest-${{CARGO_NEXTEST_VERSION}}/cargo-nextest-${{CARGO_NEXTEST_VERSION}}-x86_64-unknown-linux-gnu.tar.gz\n  \
          - key: pnpm\n    \
          run: npm install -g pnpm@{pnpm}\n  \
          - key: go-task\n    \
@@ -2110,7 +2112,7 @@ fn an_rwx_config_missing_a_pin_fails() {
     let full = rwx_config("1.97.1", "0.9.143", PNPM, "3.53.1");
     for (class, marker) in [
         ("gotask", "go-task/task/releases"),
-        ("nextest", "get.nexte.st"),
+        ("nextest", "CARGO_NEXTEST_VERSION:"),
         ("pnpm", "pnpm@"),
     ] {
         let rwx: String = full

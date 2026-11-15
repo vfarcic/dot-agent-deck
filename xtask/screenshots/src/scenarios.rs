@@ -206,6 +206,11 @@ pub const SCENARIOS: &[Scenario] = &[
         description: "Review project commands for the orchestration `team`, changed since it was approved: `coder` changed, `tester` new, `reviewer` removed — opened from New Agent in both clients (PRD #1885).",
         clients: &[Client::Tui, Client::Desktop],
     },
+    Scenario {
+        name: "star-prompt",
+        description: "The star reminder at startup, on a launch it shows at, in both clients: the TUI's star prompt and the desktop app's Enjoying dot-agent-deck? dialog over an empty dashboard (PRD #2174).",
+        clients: &[Client::Tui, Client::Desktop],
+    },
 ];
 
 /// Look a scenario up by name.

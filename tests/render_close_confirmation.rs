@@ -100,6 +100,7 @@ fn close_confirm_007_kept_worktree_warns_before_the_keystroke() {
             path: PATH.to_string(),
             confirmed_dirty: true,
             on_request: false,
+            nested_worktrees: Vec::new(),
         }),
         ..CloseConfirmState::default()
     };
@@ -130,6 +131,7 @@ fn close_confirm_007_kept_worktree_warns_before_the_keystroke() {
             path: PATH.to_string(),
             confirmed_dirty: false,
             on_request: false,
+            nested_worktrees: Vec::new(),
         }),
         ..CloseConfirmState::default()
     };
@@ -170,6 +172,7 @@ fn close_confirm_008_a_long_kept_path_keeps_its_tail() {
             path: path.clone(),
             confirmed_dirty: true,
             on_request: false,
+            nested_worktrees: Vec::new(),
         }),
         ..CloseConfirmState::default()
     };
@@ -269,6 +272,7 @@ fn close_confirm_011_a_dispatched_worktree_offers_close_keep_worktree() {
             path: PATH.to_string(),
             confirmed_dirty: true,
             on_request: false,
+            nested_worktrees: Vec::new(),
         }),
         ..armed.clone()
     };
@@ -314,4 +318,68 @@ fn close_confirm_011_a_dispatched_worktree_offers_close_keep_worktree() {
         handle_close_confirm_key(&mut cancel, enter),
         Action::DismissModal
     ));
+}
+
+/// Scenario: Arm the close confirmation for a close that would leave a dispatched worktree on disk because other worktrees lie inside it. The dialog must say so with the path and a line naming the nested worktree relative to it, above the Cancel/Close options, and must not claim uncommitted work.
+#[spec("prompt/close-confirm/015")]
+#[test]
+fn close_confirm_015_a_worktree_holding_others_warns_and_names_them() {
+    const PATH: &str = "/home/dev/code/deck-dispatch-fix-login";
+    let state = CloseConfirmState {
+        kept_worktree: Some(KeptWorktree {
+            path: PATH.to_string(),
+            confirmed_dirty: false,
+            on_request: false,
+            nested_worktrees: vec![format!("{PATH}/.worktrees/feat-1-demo")],
+        }),
+        ..CloseConfirmState::default()
+    };
+    let text = buffer_to_text(&render_close_confirm_to_buffer(&state, 80, 24));
+    assert!(
+        text.contains("Holds other worktrees, so it is KEPT:"),
+        "the dialog must say why the worktree is kept\n{text}"
+    );
+    assert!(text.contains(PATH), "{text}");
+    assert!(
+        text.contains("holds: .worktrees/feat-1-demo"),
+        "the dialog must name the nested worktree, relative to the kept one\n{text}"
+    );
+    assert!(
+        !text.contains("Uncommitted work"),
+        "nothing measured uncommitted work, so the dialog must not claim it\n{text}"
+    );
+    let named_at = text
+        .find("holds: .worktrees")
+        .expect("nested line rendered");
+    let cancel_at = text.find("> Cancel").expect("Cancel rendered");
+    assert!(named_at < cancel_at, "{text}");
+    assert!(text.contains("  Close"), "{text}");
+
+    // Several are listed one per line, so a long one cannot hide the others,
+    // and past three the dialog says how many more there are.
+    let many = CloseConfirmState {
+        kept_worktree: Some(KeptWorktree {
+            path: PATH.to_string(),
+            confirmed_dirty: false,
+            on_request: false,
+            nested_worktrees: (1..=5)
+                .map(|n| format!("{PATH}/.worktrees/feat-{n}"))
+                .collect(),
+        }),
+        ..CloseConfirmState::default()
+    };
+    let text = buffer_to_text(&render_close_confirm_to_buffer(&many, 80, 30));
+    for n in 1..=3 {
+        assert!(
+            text.contains(&format!("holds: .worktrees/feat-{n}")),
+            "nested worktree {n} must have its own line\n{text}"
+        );
+    }
+    assert!(!text.contains("feat-4"), "{text}");
+    assert!(text.contains("holds: … and 2 more"), "{text}");
+    assert!(!text.contains("at least"), "{text}");
+    assert!(
+        text.contains("  Close"),
+        "the choices are still drawn\n{text}"
+    );
 }

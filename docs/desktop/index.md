@@ -95,6 +95,30 @@ If **Relaunch** fails, the dialog shows why under its buttons; quit the app and 
 
 Upgrading does not stop the daemon or its agents. When the restarted app finds the daemon on this machine running the older release, it restarts the daemon onto its own version, asking first when agents are running ([Daemons → Upgrade the CLI and the daemon on this machine](daemons.md#upgrade-the-cli-and-the-daemon-on-this-machine)). If the Dashboard says **Incompatible daemon** after the app restarts, see [Installation → Keep the app and the daemon on the same release](../installation.md#keep-the-app-and-the-daemon-on-the-same-release). A remote daemon is not upgraded from this dialog; use its **Upgrade** button ([Daemons → Upgrade a remote daemon](daemons.md#upgrade-a-remote-daemon)).
 
+## The star reminder
+
+About once every 10 launches, the app asks when it starts whether you would like to star the dot-agent-deck repository on GitHub. The dialog, **Enjoying dot-agent-deck?**, offers three choices, with the same keys as the TUI's star prompt:
+
+**TUI:**
+
+![The TUI's star prompt over an empty dashboard: the title Enjoying dot-agent-deck?, the lines If you find dot-agent-deck useful, please consider starring the repo!, the address github.com/vfarcic/dot-agent-deck, the key line s Star, l Later, d Don't ask again, and the buttons Star, Snooze and Dismiss](/img/star-prompt-tui.png)
+
+**Desktop:**
+
+![The desktop app's Enjoying dot-agent-deck? dialog over an empty Dashboard, with the same two lines and address and the buttons d Don't ask again, l Later and s Star](/img/star-prompt-desktop.png)
+
+| Button | Key | What it does |
+|---|---|---|
+| **Star** | `s` | Opens the repository page in your default browser and stops the reminder. The app then says `Thanks for starring! ⭐`, or, when no browser could be opened, the address to visit. |
+| **Later** | `l` or `Esc` | Closes the dialog and asks again after another 10 launches. |
+| **Don't ask again** | `d` | Closes the dialog and stops the reminder. |
+
+You can also say "star the repo", "remind me later" or "don't ask again" while the dialog is open, or "cancel" to close it the way **Later** does ([Voice Control → The star reminder](voice.md#the-star-reminder)).
+
+The reminder is shared with the TUI on the same machine. Launches of either one count towards the next reminder, and **Star** or **Don't ask again** in either one stops it in both, so you are not asked twice. If you already chose **Don't ask again** in the TUI, the app never shows the reminder. Connecting the app to several daemons, or to daemons on other machines, does not change how often it asks.
+
+When the app starts with something else to ask you first, such as an upgrade it offers at startup, the reminder waits until that dialog closes.
+
 ## Features behind the `experimental` flag
 
 Some desktop surfaces are hidden unless the `experimental` flag is on, and these pages do not describe them. If you see one of these on someone else's screen and not on yours, that is why:

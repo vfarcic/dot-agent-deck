@@ -1389,6 +1389,19 @@ mod tests {
                     "approveProjectCommands",
                     vec!["deck", "overview"],
                 ),
+                // PRD #2174: the star reminder's three buttons, on every
+                // screen the app opens on.
+                ("star_repo", "starRepo", vec!["deck", "overview", "agent"]),
+                (
+                    "remind_star_later",
+                    "remindStarLater",
+                    vec!["deck", "overview", "agent"]
+                ),
+                (
+                    "dismiss_star_prompt",
+                    "dismissStarPrompt",
+                    vec!["deck", "overview", "agent"]
+                ),
                 // PRD #802 D5's set: each only opens a confirmation.
                 ("stop_agent", "confirmStopAgent", vec!["overview", "agent"]),
                 (
@@ -2286,7 +2299,12 @@ mod tests {
                 "previous_page",
                 // PRD #1885: the review dialog's approve, where it opens (the
                 // Runs screen); with none open the app says so.
-                "approve_project_commands"
+                "approve_project_commands",
+                // PRD #2174: the star reminder's buttons; with none showing
+                // the app says so.
+                "star_repo",
+                "remind_star_later",
+                "dismiss_star_prompt"
             ]
         );
         assert_eq!(
@@ -2319,6 +2337,10 @@ mod tests {
                 "open_pr",
                 // PRD #1885: over the New agent dialog.
                 "approve_project_commands",
+                // PRD #2174: the star reminder's buttons.
+                "star_repo",
+                "remind_star_later",
+                "dismiss_star_prompt",
                 // PRD #802 D5's two stops: on the overview, where their
                 // controls are. Each only opens a confirmation.
                 "stop_agent",
@@ -2344,6 +2366,11 @@ mod tests {
                 "hush_reading",
                 // PRD #1401: the open pane's agent's pull request, or the named agent's.
                 "open_pr",
+                // PRD #2174: the star reminder's buttons, which the reminder
+                // follows to the agent screen when the app opens on one.
+                "star_repo",
+                "remind_star_later",
+                "dismiss_star_prompt",
                 // Issue #1402: ask to close the agent shown in the pane.
                 "stop_agent"
             ]

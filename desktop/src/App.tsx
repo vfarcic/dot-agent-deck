@@ -29,6 +29,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   SquareTerminal,
+  Star as StarIcon,
   X,
   Zap,
 } from "lucide-react";
@@ -94,6 +95,8 @@ import { deckScreenSnapshot } from "./lib/deckScreen";
 import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
+import { StarPromptGate } from "./components/StarPromptDialog";
+import { chooseShownStarPrompt, useStarPrompt } from "./lib/starPrompt";
 import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
 import { desktopFeaturesOf } from "./types";
@@ -612,6 +615,16 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
    * set, which detaches that terminal's own connection only.
    */
   const restart = useRestartNotice(runtime.fleet);
+  /**
+   * PRD #2174 — the star reminder, shown at startup about once every ten
+   * launches of either client. The shell's, not a screen's, because it comes
+   * up over whichever screen the app opens on. Star's sentence (thanks, or
+   * where to go to star) is shown in the toast of the screen that is up.
+   */
+  const [starNotice, setStarNotice] = useState<string>(); // voice-registry-exempt: Star's sentence in the toast, reporting what the reminder's choice did
+  const star = useStarPrompt(runtime, setStarNotice);
+  const dismissStarNotice = useCallback(() => setStarNotice(undefined), []);
+  const [newAgentOpen, setNewAgentOpen] = useState(false); // voice-registry-exempt: whether the overview's New agent dialog is open, reported by the overview so the star reminder waits behind it; it opens nothing
   /** The record the pane RENDERS: the deck's current answer, else its last one. */
   const paneAgentShown = paneAgent ?? heldPaneAgent?.agent;
   /**
@@ -1211,6 +1224,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
          and replaced, or re-shown with new text, while the words were being
          worked out is not approved (PRD #1885 review, auditor 3). */
       approveProjectCommands: () => approveShownReview(declaredTrustReview),
+      /* PRD #2174 — the star reminder's three buttons, while it is showing;
+         with none showing each answers that it is not. */
+      starRepo: () => chooseShownStarPrompt("star"),
+      remindStarLater: () => chooseShownStarPrompt("later"),
+      dismissStarPrompt: () => chooseShownStarPrompt("dismiss"),
       /* Only while Settings is open and nothing is drawn over it, so `close`
          reads its presence as "Settings is on top" (#1197, PR #1680 review). */
       ...(overlaysOpen.settings && !overlayAbove(document.querySelector(SETTINGS_PANEL)) ? { closeSettings: () => setOverlay(screen, "settings", false) } : {}),
@@ -1353,7 +1371,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     ? (
       <>
         {/* voice-registry-exempt: the overview's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS` */}
-        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
+        <AgentOverview runtime={runtime} settings={settings} onNavigate={setView} agentPaneOpen={agentView !== undefined} voiceChannel={overviewVoiceContext} newAgentVoice={newAgentVoice} onConfirmationChange={setConfirmationOpen} onNewAgentChange={setNewAgentOpen} notice={noticeOf(selfUpgrade) !== dismissedSelfUpgrade ? <SelfUpgradeBanner check={selfUpgrade} onOpen={openSelfUpgrade} onDismiss={() => setDismissedSelfUpgrade(noticeOf(selfUpgrade))} /> : undefined} selfUpgrade={{ check: selfUpgrade, api: selfUpgradeApi, onClosed: recheckSelfUpgrade }} />
         {/*
           The overview mounts no terminal of its own (PRD #745's commitment), so
           there is no tile here to promote and the pane is a sibling of the
@@ -1378,11 +1396,11 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
           mounted together, so there is at most one toast. The cleanup
           warnings ride with it but outlive it (issue #1234).
         */}
-        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} />
+        <Toast message={runtime.error} onDismiss={runtime.clearError} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restart.notice} onDismissRestart={restart.dismiss} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={dismissStarNotice} />
       </>
     )
     // voice-registry-exempt: the deck's navigator, which it names as `navigate` in its own registry context and dispatches through `VOICE_ACTIONS`
-    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} />;
+    : <DeckSurface runtime={runtime} settings={settings} orchestrationPlatformIssue={orchestrationPlatformIssue} onNavigate={setView} openAgent={openAgent} onCloseAgent={closeAgent} stopContext={agentStopContext} voiceChannel={deckVoiceContext} overlays={deckOverlays} onConfirmationChange={setConfirmationOpen} onPaneTabChange={setPaneTab} restartNotice={restart.notice} onDismissRestartNotice={restart.dismiss} starNotice={starNotice} onDismissStarNotice={dismissStarNotice} />;
   /*
     PRD #802 M6 — the voice surface is a SIBLING of the screen switch, and this
     shape is the whole of that decision.
@@ -1406,6 +1424,20 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
     same reason: they are the app's, not one screen's, so neither is torn down
     or re-created by a navigation.
   */
+  /* PRD #2174 — the star reminder waits while something more important is
+     open over the app at startup (a confirmation such as the upgrade the app
+     offers when it starts, or is waiting to offer, the newer-release dialog, the New agent dialog,
+     Settings, voice's numbered choice dialog, the pull request browser), and
+     comes up once it closes — behind the choice dialog, `Escape` would
+     answer the reminder rather than cancel the choice (Qodo, PR #2321). Under
+     the New agent dialog it would leave voice's `close` closing the form
+     behind it (Greptile, PR #2321). */
+  /* Qodo, PR #2321: and while ANY overlay is open — an agent's pane, the
+     command palette, the shortcut guide, a project-commands review — read from
+     the overlay stack rather than listed one by one (`StarPromptGate`); and
+     while the connection banner is up, which its backdrop would cover. */
+  const connectionBanner = runtime.snapshot.connection.status !== "connected" || Boolean(runtime.snapshot.connection.buildStampMismatchOnly) || Boolean(runtime.snapshot.connection.selectionFallback);
+  const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>
@@ -1425,6 +1457,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} addDaemonOpen={overlaysOpen.addDaemon ?? false} onCloseAddDaemon={closeAddDaemon} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
+        <StarPromptGate due={star.due} ready={starReady} onChoose={star.choose} />
         {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
         {prBrowser && (
           <PullRequestBrowser
@@ -1709,7 +1742,7 @@ function tileKey(agent: { daemonId: string; id: string; incarnation?: string }):
   return `${agent.daemonId}\u0000${agent.id}\u0000${agent.incarnation ?? ""}`;
 }
 
-export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void }) {
+export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = desktopOrchestrationPlatformIssue(), onNavigate, openAgent, onCloseAgent, stopContext, voiceChannel, overlays: shellOverlays, onConfirmationChange, onPaneTabChange, restartNotice, onDismissRestartNotice, starNotice, onDismissStarNotice }: { runtime: DeckRuntimeState; settings: DesktopSettingsState; orchestrationPlatformIssue?: string; onNavigate?: (view: DeckView) => void; openAgent?: { deckId: string; agentId: string; incarnation?: string }; onCloseAgent?: () => void; stopContext?: AgentTileProps["stopContext"]; voiceChannel?: VoiceContextChannel; overlays?: ScreenOverlays; onConfirmationChange?: (open: boolean) => void; onPaneTabChange?: (tab: PanelTab) => void; restartNotice?: string; onDismissRestartNotice?: () => void; starNotice?: string; onDismissStarNotice?: () => void }) {
   const { mode, setShownTerminals } = runtime;
   const keyboardInput = useKeyboardInput(runtime.sendTerminalInput);
   // #1083: this screen cannot merge across decks, so under All Decks it shows
@@ -2705,7 +2738,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
             */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Replace is absent on a remote deck, said once. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect(snapshot.connection.deckId)}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
 
@@ -2797,7 +2830,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 />
               ))}
             </div>
-          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
+          ) : <EmptyDeck onReconnect={() => void runtime.reconnect(snapshot.connection.deckId)} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
         </section>}
       </main>
 
@@ -2833,7 +2866,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           mounts its own copy of this over `runtime.error` alone (audit W2) —
           it has no notice of its own, and it is not mounted at the same time
           as this one. */}
-      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} />
+      <Toast message={notice || runtime.error} detail={notice ? noticeState?.detail : undefined} onDismiss={dismissToast} warnings={runtime.cleanupWarnings} onDismissWarning={runtime.dismissCleanupWarning} restart={restartNotice} onDismissRestart={onDismissRestartNotice} worktrees={runtime.worktreeKept} onDismissWorktree={runtime.dismissWorktreeKept} star={starNotice} onDismissStar={onDismissStarNotice} />
     </div>
   );
 }
@@ -2859,7 +2892,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
  * while a warning that roles may still be running ends only when the user
  * dismisses THAT warning.
  */
-function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void }) {
+function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart, onDismissRestart, worktrees, onDismissWorktree, star, onDismissStar }: { message?: string; detail?: string; onDismiss: () => void; warnings?: readonly CleanupWarningEntry[]; onDismissWarning?: (id: number) => void; restart?: string; onDismissRestart?: () => void; worktrees?: readonly WorktreeKeptEntry[]; onDismissWorktree?: (id: number) => void; star?: string; onDismissStar?: () => void }) {
   /* The newest entries are at the bottom, so an overflowing stack is kept
      scrolled there whenever something is added or the message changes. */
   const stack = useRef<HTMLDivElement>(null);
@@ -2867,8 +2900,8 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
   const newestWorktree = worktrees?.at(-1)?.id;
   useEffect(() => {
     if (stack.current) stack.current.scrollTop = stack.current.scrollHeight;
-  }, [newestWarning, newestWorktree, message, restart]);
-  if (!message && !warnings?.length && !restart && !worktrees?.length) return null;
+  }, [newestWarning, newestWorktree, message, restart, star]);
+  if (!message && !warnings?.length && !restart && !worktrees?.length && !star) return null;
   return (
     <div className="toast-stack" ref={stack}>
       {worktrees?.map((kept) => (
@@ -2898,6 +2931,14 @@ function Toast({ message, detail, onDismiss, warnings, onDismissWarning, restart
             <span>{sanitizeText(restart)}</span>
           </div>
           <button aria-label="Dismiss restart notice" onClick={onDismissRestart}><X size={14} /></button>
+        </div>
+      )}
+      {/* PRD #2174: Star's sentence, in a slot of its own so it never replaces an action's. */}
+      {star && (
+        <div className="toast" data-testid="star-toast" role="status">
+          <StarIcon size={15} />
+          <div className="toast-body"><span>{star}</span></div>
+          <button aria-label="Dismiss star message" onClick={onDismissStar}><X size={14} /></button>
         </div>
       )}
       {message && (
