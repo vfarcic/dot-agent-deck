@@ -746,6 +746,13 @@ action = "close"
 outcome = "dispatch"
 
 [[fixtures]]
+name = "close-counters-hide-stats"
+utterance = "hide the stats"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
 name = "close-it-host-open"
 utterance = "close it"
 screen = "overview"
