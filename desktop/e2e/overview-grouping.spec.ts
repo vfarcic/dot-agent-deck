@@ -337,33 +337,100 @@ test.describe("the fleet view (PRD #742 M4)", () => {
   });
 
   /*
-    Issue #1676. Between 961px and 1260px the header has room for five
-    counters, and which five is named, not positional: NEEDS INPUT and FAILED
-    stay, because a person has to act on them, and IDLE and GROUPS give way.
+    Issue #2312 follow-up. The counters are one button in the header that
+    reads the total and what needs someone, and every counter opens under it
+    on hover or click. It replaced issue #1676's row of instruments, which had
+    to drop counters as the window narrowed.
   */
-  test.describe("between 961px and 1260px", () => {
-    /// Scenario: open the fleet dashboard in a 1200px window, then narrow it to 961px, the narrowest width before the counters go. At both widths NEEDS INPUT and FAILED are among the counters shown, IDLE and GROUPS are not, the counters stop short of the header's buttons, and nothing runs off the right edge.
-    test("keeps the counters a person acts on and drops idle and groups", async ({ page }) => {
-      await page.setViewportSize({ width: 1200, height: 800 });
+  test.describe("the counters button", () => {
+    /// Scenario: open the fleet dashboard. The button reads the agent total with the needs-input and daemons-answering warnings, and the counters are hidden. Hovering it shows every counter; moving away hides them; a click keeps them open until Escape, and a second click closes them with the mouse still on the button. From 1440px down to 400px wide, either side of each width where the top bar changes, the button and its list stay inside the window and the page does not scroll sideways.
+    test("shows every counter on hover or click and fits every width", async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 800 });
       await openOverview(page, "fleet");
-      for (const width of [1200, 961]) {
+      const button = page.getByTestId("dashboard-counters-button");
+      await expect(button).toContainText("7 agents");
+      await expect(button).toContainText("needs input");
+      await expect(button).toContainText("2/4 daemons");
+      const popover = page.getByTestId("dashboard-counters-popover");
+      await expect(popover).toBeHidden();
+
+      await button.hover();
+      await expect(popover).toBeVisible();
+      for (const name of ["agents", "running", "needs-input", "failed", "waiting", "idle", "groups", "decks"]) {
+        await expect(page.getByTestId(`overview-count-${name}`), `${name} is not in the popover`).toBeVisible();
+      }
+      // Down onto the list itself: it stays open on the way.
+      await popover.hover();
+      await expect(popover).toBeVisible();
+      await page.mouse.move(5, 790);
+      await expect(popover).toBeHidden();
+
+      await button.click();
+      await page.mouse.move(5, 790);
+      await expect(popover).toBeVisible();
+      await page.keyboard.press("Escape");
+      await expect(popover).toBeHidden();
+
+      // A second click closes it with the mouse still on the button.
+      await button.click();
+      await expect(popover).toBeVisible();
+      await button.click();
+      await expect(popover).toBeHidden();
+      await expect(button).toHaveAttribute("aria-expanded", "false");
+      await page.mouse.move(5, 790);
+
+      for (const width of [1440, 1240, 1239, 1101, 1100, 961, 681, 400]) {
         await page.setViewportSize({ width, height: 800 });
-        for (const name of ["agents", "running", "needs-input", "failed", "decks"]) {
-          await expect(page.getByTestId(`overview-count-${name}`), `${name} is hidden at ${width}px`).toBeVisible();
-        }
-        for (const name of ["idle", "groups"]) {
-          await expect(page.getByTestId(`overview-count-${name}`), `${name} is shown at ${width}px`).toBeHidden();
-        }
-        const layout = await page.evaluate(() => {
-          const counters = document.querySelector(".overview-instruments")?.getBoundingClientRect();
-          const actions = Array.from(document.querySelectorAll(".topbar .top-actions")).at(-1)?.getBoundingClientRect();
-          return { countersRight: counters?.right, actionsLeft: actions?.left, actionsRight: actions?.right, scroll: document.documentElement.scrollWidth, viewport: window.innerWidth };
-        });
-        expect(layout.countersRight, `the counters run under the header's buttons at ${width}px`).toBeLessThanOrEqual((layout.actionsLeft ?? 0) + 0.5);
-        expect(layout.actionsRight, `the header's buttons run off the window at ${width}px`).toBeLessThanOrEqual(layout.viewport + 0.5);
-        expect(layout.scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(layout.viewport);
+        await expect(button, `the counters button is off screen at ${width}px`).toBeInViewport();
+        await button.hover();
+        const box = await popover.boundingBox();
+        expect((box?.x ?? 0) + (box?.width ?? 0), `the counters run off the right edge at ${width}px`).toBeLessThanOrEqual(width);
+        expect(box?.x ?? -1, `the counters run off the left edge at ${width}px`).toBeGreaterThanOrEqual(0);
+        await page.mouse.move(5, 790);
+        const scroll = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+        expect(scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(0);
       }
     });
+
+    /// Scenario: in a window 330px tall the counters list opened from the button stops above the voice row and scrolls, so its last count, DAEMONS, can be scrolled to and read.
+    test("stops above the voice row in a short window and scrolls", async ({ page }) => {
+      await page.setViewportSize({ width: 1280, height: 330 });
+      await openOverview(page, "fleet");
+      await page.getByTestId("dashboard-counters-button").click();
+      const popover = page.getByTestId("dashboard-counters-popover");
+      await expect(popover).toBeVisible();
+      const bottom = await popover.evaluate((element) => element.getBoundingClientRect().bottom);
+      const voiceTop = await page.locator(".voice-row").evaluate((element) => element.getBoundingClientRect().top);
+      expect(bottom, "the counters run under the voice row").toBeLessThanOrEqual(voiceTop);
+      await page.getByTestId("overview-count-decks").scrollIntoViewIfNeeded();
+      await expect(page.getByTestId("overview-count-decks")).toBeInViewport();
+      const decksBottom = await page.getByTestId("overview-count-decks").evaluate((element) => element.getBoundingClientRect().bottom);
+      expect(decksBottom, "DAEMONS stays under the voice row").toBeLessThanOrEqual(voiceTop + 0.5);
+    });
+  });
+
+  /// Scenario: a fresh install with this machine as the only daemon and no agents. The empty note offers New agent and Add a daemon; from a wide window down to the 400px phone layout its heading stays on one line, its words keep a readable column instead of being squeezed beside the two buttons, and the page does not scroll sideways.
+  test("keeps the empty note's words readable beside its buttons at every width", async ({ page }) => {
+    await page.goto("/?fixture=1&state=empty");
+    await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
+    await page.getByTestId("open-overview").click();
+    const note = page.getByTestId("overview-first-run");
+    await expect(note.getByTestId("overview-first-run-new-agent")).toBeVisible();
+    await expect(note.getByTestId("overview-first-run-add-daemon")).toBeVisible();
+
+    for (const width of [1280, 900, 681, 400]) {
+      await page.setViewportSize({ width, height: 800 });
+      const heading = await note.locator("h3").evaluate((element) => {
+        const lineHeight = parseFloat(getComputedStyle(element).lineHeight) || parseFloat(getComputedStyle(element).fontSize) * 1.2;
+        return { height: element.getBoundingClientRect().height, lineHeight };
+      });
+      expect(heading.height, `the note's heading wraps at ${width}px`).toBeLessThan(heading.lineHeight * 1.5);
+      const text = await note.locator(".overview-note-row-text").boundingBox();
+      expect(text?.width ?? 0, `the note's words are squeezed into a narrow column at ${width}px`).toBeGreaterThanOrEqual(220);
+      await expect(note.getByTestId("overview-first-run-add-daemon"), `Add a daemon is off screen at ${width}px`).toBeInViewport();
+      const scroll = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);
+      expect(scroll, `the page scrolls sideways at ${width}px`).toBeLessThanOrEqual(0);
+    }
   });
 
   test.describe("at 400x780 phone", () => {

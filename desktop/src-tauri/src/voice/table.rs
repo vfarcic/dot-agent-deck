@@ -1299,6 +1299,11 @@ mod tests {
                 ("open_settings", "openSettings", vec!["deck", "overview"]),
                 ("add_daemon", "addDaemon", vec!["deck", "overview"]),
                 ("show_host_metrics", "showHostMetrics", vec!["overview"]),
+                (
+                    "show_dashboard_counters",
+                    "showDashboardCounters",
+                    vec!["overview"]
+                ),
                 ("switch_deck", "switchDeck", vec!["deck", "overview"]),
                 // No screens: see the row's own comment — stopping must never
                 // be unavailable.
@@ -2319,6 +2324,7 @@ mod tests {
                 "open_settings",
                 "add_daemon",
                 "show_host_metrics",
+                "show_dashboard_counters",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

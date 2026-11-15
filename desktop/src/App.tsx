@@ -1239,7 +1239,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
       /* PR #1672 — the overview publishes the Host popover's close while one
          is open; a stop or upgrade confirmation is modal over the dashboard,
          so while one is open `close` does not reach behind it to the popover. */
-      ...(confirmationOpen ? { closeHostMetrics: undefined } : {}),
+      ...(confirmationOpen ? { closeHostMetrics: undefined, closeDashboardCounters: undefined } : {}),
       /* Issue #1492 — the dashboard's scroll, refused while anything is in
          front of it: a dialog layer (the open Daemon selector's menu), the
          Settings sheet, a stop confirmation, or any other modal. Voice acts on what is in front,
@@ -2684,8 +2684,6 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
           {!allDecks && <div className="run-instruments deck-instruments">
             <Instrument label="HEALTH" testId="run-health"><span className={`health-value health-${snapshot.health}`}><i />{snapshot.health}</span></Instrument>
             <Instrument label="NODE"><strong>{String(snapshot.currentNode).padStart(2, "0")}<em>/{String(snapshot.totalNodes).padStart(2, "0")}</em></strong></Instrument>
-            {/* Em dash, this deck's established "not known": no daemon tracks an attempt count (PRD #745 M8). */}
-            <Instrument label="ATTEMPT"><strong>{snapshot.currentAttempt === undefined ? "—" : String(snapshot.currentAttempt).padStart(2, "0")}</strong></Instrument>
             <Instrument label="ELAPSED"><strong>{snapshot.elapsed}</strong></Instrument>
             <Instrument label="SPEND"><strong>{mode === "fixture" ? `$${snapshot.spend.toFixed(2)}` : "—"}</strong></Instrument>
           </div>}

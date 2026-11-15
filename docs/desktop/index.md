@@ -11,7 +11,7 @@ The desktop app is a client of a daemon. When no daemon is running on this machi
 - Run the TUI, `dot-agent-deck`. It starts a daemon if none is running.
 - Run `dot-agent-deck daemon serve` in a terminal. It runs in the foreground, and exits on its own about 30 seconds after it last had a client, an agent or an enabled schedule, so open the app within that window. `DOT_AGENT_DECK_IDLE_SHUTDOWN_SECS=0 dot-agent-deck daemon serve` keeps it up until you stop it.
 
-**Check it worked:** the Dashboard shows a section named **Local daemon** listing its agents (or **No agents are running yet**), and the **DAEMONS** counter at the top reads `1/1`. A section that says **Daemon disconnected** offers one button: **Start daemon** when no daemon is running there, or **Reconnect** when a daemon is running but the app is not connected to it. See [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there) for the other states.
+**Check it worked:** the Dashboard shows a section named **Local daemon** listing its agents (or **No agents are running yet**), and hovering over the counters button at the top shows **DAEMONS** `1/1`. A section that says **Daemon disconnected** offers one button: **Start daemon** when no daemon is running there, or **Reconnect** when a daemon is running but the app is not connected to it. See [Dashboard → When a daemon is not there](dashboard.md#when-a-daemon-is-not-there) for the other states.
 
 While the desktop app is connected it counts as a client, so the daemon stays up under it. [Installation → How the desktop app gets a daemon](../installation.md#how-the-desktop-app-gets-a-daemon) has the details.
 

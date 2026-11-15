@@ -709,6 +709,7 @@ pub(crate) mod tests {
                 "open_settings".to_string(),
                 "add_daemon".to_string(),
                 "show_host_metrics".to_string(),
+                "show_dashboard_counters".to_string(),
                 "switch_deck".to_string(),
                 "voice_off".to_string(),
                 "list_commands".to_string(),

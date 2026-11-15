@@ -401,6 +401,20 @@ export type VoiceActionContext = {
    */
   closeHostMetrics: () => void;
   /**
+   * The agent dashboard's counters (issue #2312 follow-up): the one button in
+   * the top bar that replaced the row of AGENTS, RUNNING, NEEDS INPUT … DAEMONS
+   * instruments, and the popover it opens with every one of them. Opening it
+   * is what the button's click does, and what the `show_dashboard_counters`
+   * row dispatches. **Served by the OVERVIEW**, which holds whether it is open.
+   */
+  showDashboardCounters: () => void;
+  /**
+   * Close the counters popover: what a second click on the button, Escape and
+   * a press outside it do. Published only while it is open, for
+   * {@link closeHostMetrics}'s reason: `closeTopmost` reads its presence.
+   */
+  closeDashboardCounters: () => void;
+  /**
    * PRD #1223 — the New agent dialog's directory browser, by voice: go into
    * the child a `dir_ref` resolved to (`target.directoryPath`), go up to `..`,
    * or choose the directory on screen. Each calls the function the browser's
@@ -791,9 +805,14 @@ export const VOICE_ACTIONS = {
      * open, as it does `closeNewAgent`, and the shell withholds it while a stop
      * or upgrade confirmation is open, which is modal over the dashboard too
      * and not in this chain.
+     *
+     * **The dashboard's counters popover sits just above it** (issue #2312
+     * follow-up): it hangs from the top bar, so it is under the same layers
+     * and over a Host popover. `closeDashboardCounters` is published and
+     * withheld the same way as `closeHostMetrics`.
      */
     run: (
-      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closeOverlay" | "closePullRequest" | "reportPending" | "closeHostMetrics">>,
+      context: Pick<VoiceActionContext, "closeAgentView" | "reportNothingToClose" | "reportRefused"> & Partial<Pick<VoiceActionContext, "dismissVoiceOverlay" | "closeNewAgent" | "closeSettings" | "closeOverlay" | "closePullRequest" | "reportPending" | "closeHostMetrics" | "closeDashboardCounters">>,
       target: VoiceDispatchTarget,
     ) => {
       /* Reported once the page has closed, for `openPullRequestInBrowser`'s
@@ -816,6 +835,9 @@ export const VOICE_ACTIONS = {
         return;
       }
       if (target.agentViewOpen) return context.closeAgentView();
+      /* The counters popover hangs from the top bar, over the dashboard and
+         so over a Host popover in it: it goes first of the two. */
+      if (context.closeDashboardCounters) return context.closeDashboardCounters();
       if (context.closeHostMetrics) return context.closeHostMetrics();
       context.reportNothingToClose();
     },
@@ -1113,6 +1135,15 @@ export const VOICE_ACTIONS = {
       const refused = context.showHostMetrics(target?.preselectDeckId || undefined);
       if (refused !== undefined) context.reportRefused?.(refused);
     },
+  },
+
+  /* Issue #2312 follow-up — the dashboard's counters button, by voice. The
+     button's click opens through this entry too; `close` closes it. */
+  showDashboardCounters: {
+    label: "Show the agent dashboard's counters",
+    voice: true,
+    needs: ["showDashboardCounters"],
+    run: (context: Pick<VoiceActionContext, "showDashboardCounters">) => context.showDashboardCounters(),
   },
 
   /* PRD #1223 — the three `requires`-gated rows: the New agent dialog's
@@ -1686,7 +1717,7 @@ export type PullRequestContext = Pick<VoiceActionContext, "openPullRequest" | "o
  * dialog for; a dispatch of `openNewAgent` there is refused against its
  * `needs`, the way the overview refuses a deck overlay.
  */
-export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics">;
+export type VoiceOverviewContext = Pick<VoiceActionContext, "openNewAgent" | "closeNewAgent" | "openDirectory" | "goToParentDirectory" | "useThisDirectory" | "filterDirectories" | "clearDirectoryFilter" | NewAgentFormMember | "confirmStopAgent" | "confirmCloseOrchestration" | "scrollDashboard" | "revealAgent" | "showHostMetrics" | "closeHostMetrics" | "showDashboardCounters" | "closeDashboardCounters">;
 
 /** The New agent form's members, served — like the browser's — from the dialog's slot. */
 export type NewAgentFormMember = "chooseNewAgentDeck" | "chooseNewAgentMode" | "chooseNewAgentType" | "nameNewAgent" | "setNewAgentCommand" | "startNewAgent" | "discardNewAgent";

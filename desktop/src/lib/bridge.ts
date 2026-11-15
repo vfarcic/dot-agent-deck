@@ -3033,8 +3033,8 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     // not waiting its turn, and a person has to act on it.
     // Issue #1757: a Waiting agent's work is still under way, so its node is active.
     status: isWorkUnderWay(agent.status) ? "active" : agent.status === "passed" ? "passed" : agent.status === "failed" ? "failed" : agent.status === "blocked" ? "blocked" : "queued",
-    // No attempt: it was read straight off the hardcoded per-agent one, so
-    // every live node claimed a retry count no daemon tracks (PRD #745 M8).
+    // No attempt: no daemon tracks a retry count, and a hardcoded one made
+    // every live node claim one (PRD #745 M8).
     enabled: true,
   }));
 
@@ -3089,7 +3089,6 @@ export function mapDesktopSnapshot(dto: DesktopSnapshotDto, previous?: DeckSnaps
     spend: previous?.spend ?? 0,
     currentNode: Math.max(1, agents.findIndex((agent) => isWorkUnderWay(agent.status)) + 1),
     totalNodes: agents.length,
-    // No currentAttempt, for the same reason as the per-agent one.
     paused: false,
     stages,
     agents: agents.map((agent) => {

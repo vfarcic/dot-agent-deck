@@ -9,6 +9,7 @@ import { isSelectionCtrlC, isTerminalCopyChord } from "../lib/terminalCopy";
 import { agentKeySequence, keyPlatform, leavesPasteToWebview } from "../lib/terminalKeys";
 import { registerRefit, registerTerminal, unregisterRefit, unregisterTerminal } from "../lib/terminalRegistry";
 import { keepSelectionAcrossResize } from "../lib/terminalSelection";
+import { TERMINAL_FONT_SIZE } from "../lib/typeScale";
 
 /**
  * Issue #1705 — clipboard writes from agents' terminals, one at a time and
@@ -247,7 +248,7 @@ export function TerminalViewport({
       disableStdin: Boolean(readOnlyRef.current),
       drawBoldTextInBrightColors: false,
       fontFamily: '"JetBrains Mono", "SFMono-Regular", Consolas, monospace',
-      fontSize: 13.5,
+      fontSize: TERMINAL_FONT_SIZE,
       fontWeight: "400",
       fontWeightBold: "600",
       lineHeight: 1.3,

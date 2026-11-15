@@ -46,7 +46,6 @@ function seedSnapshot(mode: RuntimeMode): DeckSnapshot {
       spend: 0,
       currentNode: 0,
       totalNodes: 0,
-      currentAttempt: undefined,
       stages: [],
       agents: [],
       evidence: [],

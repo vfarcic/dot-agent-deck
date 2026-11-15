@@ -722,6 +722,59 @@ screen = "overview"
 action = "close"
 outcome = "dispatch"
 
+# Issue #2312 follow-up — the dashboard's counters (`show_dashboard_counters`):
+# the button's own label, two natural phrasings, the guard that the machine's
+# figures stay `show_host_metrics`, and the close. Not yet measured against a
+# live backend.
+[[fixtures]]
+name = "show-counters-label"
+utterance = "show the counters"
+screen = "overview"
+action = "show_dashboard_counters"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-counters-how-many"
+utterance = "how many agents are running"
+screen = "overview"
+action = "show_dashboard_counters"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-counters-stats"
+utterance = "show the stats"
+screen = "overview"
+action = "show_dashboard_counters"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-counters-not-host"
+utterance = "how much memory is left"
+screen = "overview"
+action = "show_host_metrics"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "show-counters-unavailable"
+utterance = "show the counters"
+screen = "agent"
+action = "show_dashboard_counters"
+outcome = "unavailable"
+
+[[fixtures]]
+name = "close-counters"
+utterance = "close the counters"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
+[[fixtures]]
+name = "close-counters-hide-stats"
+utterance = "hide the stats"
+screen = "overview"
+action = "close"
+outcome = "dispatch"
+
 [[fixtures]]
 name = "close-it-host-open"
 utterance = "close it"

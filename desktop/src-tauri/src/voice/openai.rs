@@ -329,6 +329,7 @@ mod tests {
                 "open_settings",
                 "add_daemon",
                 "show_host_metrics",
+                "show_dashboard_counters",
                 "switch_deck",
                 "voice_off",
                 "list_commands",

@@ -1678,23 +1678,20 @@ describe("TauriDeckBridge", () => {
 
   /**
    * PRD #745 M8. No daemon tracks a retry count or a per-agent git branch, so
-   * live mode now reports neither instead of the `1` every tile printed as
-   * `ATT 01` and the literal "Unavailable" the topbar printed as a branch.
+   * live mode reports neither: no attempt on a run-graph node, and no branch
+   * instead of the literal "Unavailable" the topbar once printed as one.
    */
   it("fabricates no attempt count and no branch in live mode", async () => {
     const { mapDesktopSnapshot } = await import("./bridge");
 
     const mapped = mapDesktopSnapshot(structuredClone(snapshot));
 
-    expect(mapped.agents[0]?.attempt).toBeUndefined();
     expect(mapped.stages[0]?.attempt).toBeUndefined();
-    expect(mapped.currentAttempt).toBeUndefined();
     expect(mapped.branch).toBeUndefined();
     // And a previous snapshot cannot smuggle one back in: the field is not
     // carried forward, so a fixture-shaped value can never become live data.
-    const carried = mapDesktopSnapshot(structuredClone(snapshot), { ...mapped, branch: "main", currentAttempt: 3 });
+    const carried = mapDesktopSnapshot(structuredClone(snapshot), { ...mapped, branch: "main" });
     expect(carried.branch).toBeUndefined();
-    expect(carried.currentAttempt).toBeUndefined();
   });
 });
 

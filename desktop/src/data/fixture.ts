@@ -255,7 +255,6 @@ const agents: AgentSession[] = ([
     status: "passed",
     task: "Define the smallest observable coding loop and its acceptance contract.",
     cwd: "/dev/active/dot-agent-deck-gui",
-    attempt: 1,
     duration: "04:18",
     tokens: 18240,
     cost: 0.82,
@@ -282,7 +281,6 @@ const agents: AgentSession[] = ([
     status: "passed",
     task: "Build the visual control room and bridge it to the existing daemon.",
     cwd: "/dev/active/dot-agent-deck-gui",
-    attempt: 2,
     duration: "09:44",
     tokens: 28612,
     cost: 1.34,
@@ -314,7 +312,6 @@ const agents: AgentSession[] = ([
     status: "running",
     task: "Audit terminal lifecycle, unsafe actions, and event integrity.",
     cwd: "/dev/active/dot-agent-deck-gui",
-    attempt: 1,
     duration: "02:26",
     tokens: 9568,
     cost: 0.41,
@@ -342,7 +339,6 @@ const agents: AgentSession[] = ([
     status: "queued",
     task: "Exercise fixture, live disconnect, terminal input, and approval paths.",
     cwd: "/dev/active/dot-agent-deck-gui",
-    attempt: 1,
     duration: "00:00",
     tokens: 0,
     cost: 0,
@@ -1345,7 +1341,6 @@ export function createFixtureSnapshot(state: FixtureState = "connected"): DeckSn
     spend: 2.57,
     currentNode: 4,
     totalNodes: 6,
-    currentAttempt: 1,
     paused: false,
     stages: state === "empty" || docs ? [] : stages.map((stage) => ({ ...stage })),
     // Issue #2001: the docs scenarios picture a LIVE deck, whose tile prints no
@@ -1496,6 +1491,17 @@ export const FIXTURE_VOICE_COMMANDS: ReadonlyArray<{
     requires: "new_agent_dialog_closed",
     unavailableHint: "the Host figures open from the agent dashboard, once the agent's pane and the New agent dialog are closed",
     report: "Showing the Host figures.",
+  },
+  {
+    // Issue #2312 follow-up — the dashboard's counters, on the dashboard with
+    // the New agent dialog closed, as `commands.toml` says.
+    phrases: ["show the counters", "counters", "show the stats", "how many agents are running"],
+    action: "show_dashboard_counters",
+    invoke: "showDashboardCounters",
+    screens: ["overview"],
+    requires: "new_agent_dialog_closed",
+    unavailableHint: "the counters open from the agent dashboard, once the agent's pane and the New agent dialog are closed",
+    report: "Showing the counters.",
   },
   {
     // The VIEW, never the terminal pane — the same line `commands.toml` draws at

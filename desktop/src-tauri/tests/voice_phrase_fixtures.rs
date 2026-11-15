@@ -756,6 +756,7 @@ fn parameterless_judge_fixtures() -> Vec<JudgeFixture> {
         "start_new_agent",
         "open_new_agent",
         "show_host_metrics",
+        "show_dashboard_counters",
     ]
     .into_iter()
     .map(|action| JudgeFixture::new("F1", action, "open docs", false, true))

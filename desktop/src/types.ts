@@ -659,8 +659,7 @@ export interface DesktopFeatures {
   showAgentProfiles: boolean;
   /**
    * Issue #1400 — the agent screen's Diff, Checks, Delegations and Artifacts
-   * tabs and its ATT, MODEL and USAGE fields, which a live daemon supplies
-   * nothing for today. Off leaves Terminal as the only tab.
+   * tabs, which a live daemon supplies nothing for today. Off leaves Terminal as the only tab.
    */
   showAgentDetails: boolean;
 }
@@ -704,8 +703,8 @@ export interface WorkflowStage {
   agentId?: string;
   status: StageStatus;
   /**
-   * FIXTURE-ONLY, and optional for the same reason as `AgentSession.attempt`:
-   * live mode derived it from that hardcoded `1`, so every node claimed an
+   * FIXTURE-ONLY: no retry counter exists anywhere in the daemon, and live
+   * mode once derived this from a hardcoded `1`, so every node claimed an
    * attempt count no daemon tracks (PRD #745 M8).
    */
   attempt?: number;
@@ -942,13 +941,6 @@ export interface AgentSession {
    * {@link UNREPORTED} at its own render seam.
    */
   cwd?: string;
-  /**
-   * FIXTURE-ONLY — no retry counter exists anywhere in the daemon, so live mode
-   * reports NOTHING here rather than the `1` it used to hardcode: every tile
-   * read `ATT 01` as if it were a fact (PRD #745 M8). Optional, so a surface
-   * that renders it has to decide what absence looks like.
-   */
-  attempt?: number;
   /** FIXTURE-ONLY — `started_at` is invented on hydration, so a duration lies across a daemon restart. */
   duration: string;
   /** FIXTURE-ONLY — no token accounting in daemon state. */
@@ -1226,8 +1218,6 @@ export interface DeckSnapshot {
   spend: number;
   currentNode: number;
   totalNodes: number;
-  /** FIXTURE-ONLY — see `AgentSession.attempt`. Absent in live mode. */
-  currentAttempt?: number;
   paused: boolean;
   /**
    * The daemon's registered-schedule revision (issue #887) — carried solely so

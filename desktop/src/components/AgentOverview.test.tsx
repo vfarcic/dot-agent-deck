@@ -1217,8 +1217,8 @@ describe("AgentOverview", () => {
 
     const region = screen.getByTestId("overview-table-region");
     const track = region.querySelector(".overview-table-track") as HTMLElement;
-    expect(track.style.getPropertyValue("--overview-grid")).toBe("minmax(150px, 1.3fr) 78px 40px");
-    expect(gridTemplateFor(["displayName", "cli", "toolCount"])).toBe("minmax(150px, 1.3fr) 78px 40px");
+    expect(track.style.getPropertyValue("--overview-grid")).toBe("minmax(150px, 1.3fr) 110px 56px");
+    expect(gridTemplateFor(["displayName", "cli", "toolCount"])).toBe("minmax(150px, 1.3fr) 110px 56px");
 
     // The scroll is on the region, not on a card: per-card scrolling would let
     // two cards sit at different offsets and the columns would desynchronise.
@@ -2007,6 +2007,10 @@ describe("AgentOverview", () => {
 
     expect(screen.getByTestId("overview-first-run")).toBeVisible();
     expect(screen.getByRole("heading", { name: "No agents are running yet" })).toBeVisible();
+    // Issue #2312 follow-up: one row with one hint, and no Open daemons — it
+    // opened the selected daemon's screen, not this group's.
+    expect(screen.getByTestId("overview-first-run")).toHaveClass("overview-note-row");
+    expect(within(screen.getByTestId("overview-first-run")).queryByRole("button", { name: /open daemons/i })).toBeNull();
     expect(screen.queryByTestId("overview-disconnected")).not.toBeInTheDocument();
     expect(screen.queryByTestId("overview-incompatible")).not.toBeInTheDocument();
   });

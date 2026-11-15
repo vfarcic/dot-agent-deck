@@ -238,7 +238,6 @@ describe("agent pane overlay", () => {
     expect(within(overlay).getByRole("heading", { name: "Plan / architecture" })).toBeVisible();
     // Nothing is removed from the header, and identity matters MORE here: in
     // the grid, position tells a reader which tile they are looking at.
-    expect(within(overlay).getByText("ATT")).toBeVisible();
     expect(within(overlay).getByText("passed")).toBeVisible();
   });
 
@@ -507,7 +506,7 @@ describe("agent pane overlay", () => {
  * Issue #1400. With the `experimental` flag off — the shipped default — the
  * agent screen offers only what a live daemon supplies: the Terminal tab, and
  * TIME and TOOLS among the readings. The Diff, Checks, Delegations and
- * Artifacts tabs and the ATT, MODEL and USAGE fields come back with the flag.
+ * Artifacts tabs come back with the flag; the readings stay TIME and TOOLS.
  */
 describe("agent details behind the experimental flag", () => {
   const DETAILS_OFF = { ...fixtureDesktopFeatures("?experimental=1"), showAgentDetails: false };
@@ -529,9 +528,8 @@ describe("agent details behind the experimental flag", () => {
 
   /**
    * Scenario: with the flag off, open a live agent's pane from the dashboard.
-   * The tab strip holds Terminal alone, the header has no ATT, the readings
-   * are TIME and TOOLS with no MODEL or USAGE, and TIME counts the agent's
-   * uptime from the spawn instant the daemon reported.
+   * The tab strip holds Terminal alone, the readings are TIME and TOOLS, and
+   * TIME counts the agent's uptime from the spawn instant the daemon reported.
    */
   it("shows only the terminal tab and the readings the daemon supplies while the flag is off", () => {
     const view = { kind: "agent" as const, deckId: "deck-000000000000dec1", agentId: "7", from: "overview" as const };
@@ -539,7 +537,6 @@ describe("agent details behind the experimental flag", () => {
     const pane = screen.getByTestId("agent-pane-overlay");
 
     expect(within(pane).getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual(["Terminal"]);
-    expect(within(pane).queryByText("ATT")).not.toBeInTheDocument();
     const metrics = within(pane).getByLabelText(/run metrics$/);
     expect(Array.from(metrics.children, (cell) => cell.querySelector("span")?.textContent)).toEqual(["TIME", "TOOLS"]);
     const time = within(metrics).getByText("TIME").parentElement!;
@@ -548,18 +545,19 @@ describe("agent details behind the experimental flag", () => {
   });
 
   /**
-   * Scenario: the same live agent with the flag on. All five tabs and the
-   * ATT, MODEL and USAGE fields are back, and TIME still reads the uptime.
+   * Scenario: the same live agent with the flag on. All five tabs are back,
+   * the readings are still only TIME and TOOLS (no ATT, MODEL or USAGE, which
+   * a daemon reports nothing for), and TIME still reads the uptime.
    */
-  it("brings back the four tabs and the ATT, MODEL and USAGE fields with the flag on", () => {
+  it("brings back the four tabs with the flag on, and no reading the daemon cannot fill", () => {
     const view = { kind: "agent" as const, deckId: "deck-000000000000dec1", agentId: "7", from: "overview" as const };
     render(<DeckShell runtime={{ ...liveRuntime(Date.now() - 2 * 3_600_000), desktopFeatures: fixtureDesktopFeatures("?experimental=1") }} initialView={view} />);
     const pane = screen.getByTestId("agent-pane-overlay");
 
     expect(within(pane).getAllByRole("tab").map((tab) => tab.getAttribute("aria-label"))).toEqual(["Terminal", "Diff", "Checks", "Delegations", "Artifacts"]);
-    expect(within(pane).getByText("ATT")).toBeVisible();
+    expect(within(pane).queryByText("ATT")).not.toBeInTheDocument();
     const metrics = within(pane).getByLabelText(/run metrics$/);
-    expect(Array.from(metrics.children, (cell) => cell.querySelector("span")?.textContent)).toEqual(["TIME", "TOOLS", "MODEL", "USAGE"]);
+    expect(Array.from(metrics.children, (cell) => cell.querySelector("span")?.textContent)).toEqual(["TIME", "TOOLS"]);
     expect(within(metrics).getByText("TIME").parentElement).toHaveTextContent("2h");
   });
 

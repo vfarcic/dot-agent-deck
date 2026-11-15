@@ -515,13 +515,22 @@ whole_while = "new_agent_dialog"
 # descriptions settle it: this one names them, and `show_host_metrics` says it
 # only opens and that a close is this row. None of them names an orchestration,
 # so none can pass `close_orchestration`'s `must_name` guard.
+#
+# **The dashboard counters' words are this row's too** (issue #2312
+# follow-up, PR #2317 review). "close the counters", "hide the counters",
+# "close the stats" and "hide the stats" each carry a
+# `show_dashboard_counters` word, so as with the Host popover both
+# descriptions name the split: this one claims them, and that row says it only
+# opens and that a close is this one. The counters popover sits above a Host
+# popover in `closeTopmost`'s chain, so it is named before it here.
 [[commands]]
 id          = "close"
 description = """Close whatever is open OVER the current screen and go back to what was
 underneath. That is the pull request page open in the app if one is ("close the PR" and "close the
 pull request" mean closing that page, never the pull request itself), then the list of spoken
 commands if it is showing, then the New agent dialog if it is open, then one agent's open pane,
-then the Settings sheet if it is open, and otherwise a daemon's Host popover if it is open. Use for
+then the Settings sheet if it is open, then the dashboard's counters list if it is open, and
+otherwise a daemon's Host popover if it is open. Use for
 close, close this, close it, close the
 dialog, close this dialog, close the new agent dialog, close new agent (the accessible name of the
 dialog's X button), cancel, cancel this, cancel it, never mind,
@@ -529,7 +538,9 @@ dismiss this, hide this, get rid of this, I'm done with this, stop looking at th
 agent, back to dashboard (the label of an open agent pane's button), or back to the dashboard or
 overview. Closing the Host popover is THIS one too: close host (the accessible name of the popover's
 X button), close host info, close resource usage, hide resource usage, close the host figures — a
-request to CLOSE or HIDE the Host figures is never `show_host_metrics`. In the agent pane with typing off,
+request to CLOSE or HIDE the Host figures is never `show_host_metrics`. Closing the dashboard's counters
+is THIS one too: close the counters, hide the counters, close the stats, hide the stats, close the counts —
+a request to CLOSE or HIDE the counters is never `show_dashboard_counters`. In the agent pane with typing off,
 the whole phrases "close agent", "close this agent" and "close the agent" ask for its stop
 confirmation (`stop_agent`), not this view-only command. Elsewhere "close the agent", and on
 the agent screen "close the agent screen", "close the agent
@@ -659,6 +670,39 @@ action_words = ["host", "resource", "usage", "disk", "machine", "memory", "cpu",
   name     = "deck"
   kind     = "deck_ref"
   optional = true
+
+# Issue #2312 follow-up — the agent dashboard's counters button, by voice. The
+# button dispatches through the same registry entry (`showDashboardCounters`),
+# so this row exposes the click rather than a second route to the popover.
+#
+# **The button's label is in the description** (the label rule,
+# `docs/develop/voice-first-design.md`): its accessible name starts
+# "Counters", it reads "<n> agents" and, when something needs someone,
+# "<n> needs input", "<n> failed" or "<up>/<total> daemons". The popover's own
+# words — agents, running, needs input, failed, waiting, idle, groups,
+# daemons — are the rest.
+#
+# `screens = ["overview"]` and `requires = ["new_agent_dialog_closed"]` for
+# `show_host_metrics`' reason: the button is on the agent dashboard only, and
+# the New agent dialog is modal over it. It shows figures and nothing else, so
+# it is outside D5.
+[[commands]]
+id          = "show_dashboard_counters"
+description = """Open the agent dashboard's counters: the popover that the Counters button at the top of
+the dashboard opens, listing how many agents there are in total, running, needing input, failed,
+waiting and idle, how many groups, and how many daemons are answering. Use for counters, show the
+counters, show counts, stats, statistics, totals, summary, how many agents are there, how many are
+running, how many need input, how many failed, how many daemons are answering. This only OPENS the
+counters: it starts, stops and changes nothing. A request to close or hide them is `close`, not this
+one. It is not `show_host_metrics`, which shows one machine's disk, memory and load, and not
+`filter_dashboard`, which changes which agents are listed."""
+invoke      = "showDashboardCounters"
+screens     = ["overview"]
+requires    = ["new_agent_dialog_closed"]
+unavailable_hint = "the counters open from the agent dashboard, once the agent's pane and the New agent dialog are closed"
+report      = "Showing the counters."
+asks_to     = "show the dashboard's counters"
+try_saying  = "show the counters"
 
 # PRD #1195 M3 — the Deck selector at the top of the deck and the overview, by
 # voice. The drop-down dispatches through the same registry entry

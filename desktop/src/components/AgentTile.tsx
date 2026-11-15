@@ -182,8 +182,8 @@ export interface AgentTileProps {
   presentation: AgentPanePresentation;
   /**
    * Issue #1400 — `DesktopFeatures.showAgentDetails`: whether to offer the
-   * Diff, Checks, Delegations and Artifacts tabs and the ATT, MODEL and USAGE
-   * fields, which a live daemon supplies nothing for. Required, so each render
+   * Diff, Checks, Delegations and Artifacts tabs, which a live daemon supplies
+   * nothing for. Required, so each render
    * site says which rather than inheriting a default. PRD #1399 decides what
    * becomes of each.
    */
@@ -614,18 +614,7 @@ export function AgentTile({
             )}
           </div>
         </div>
-        {/*
-          PRD #745 M8: an em dash — this deck's established "not known" — when
-          no attempt was reported. Live mode used to hardcode `1`, so every tile
-          printed `ATT 01` as if the daemon tracked retries; it tracks none.
-        */}
         <div className="agent-header-actions">
-          {showDetails && (
-            <div className="agent-attempt" title={agent.attempt === undefined ? "No attempt count is reported by the daemon" : "Current attempt"}>
-              <span>ATT</span>
-              <strong>{agent.attempt === undefined ? "—" : agent.attempt.toString().padStart(2, "0")}</strong>
-            </div>
-          )}
           {/*
             PRD #1105 M5's deck entry point, and M2's way back out. Both are
             native `<button>`s in the header rather than a click handler on the
@@ -679,12 +668,6 @@ export function AgentTile({
         ) : (
           <>
             <div><span>TOOLS</span><strong>{agent.toolCount}</strong></div>
-            {showDetails && (
-              <>
-                <div><span>MODEL</span><strong>—</strong></div>
-                <div><span>USAGE</span><strong>—</strong></div>
-              </>
-            )}
           </>
         )}
       </div>
