@@ -3838,6 +3838,21 @@ pub struct AmbiguousCandidate {
 pub struct WorktreeVerdict {
     pub path: String,
     pub verdict: WorktreeVerdictKind,
+    /// Issue #2285: with [`WorktreeVerdictKind::KeptHoldsWorktrees`], the
+    /// worktrees inside it that kept it. Additive, omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nested_worktrees: Vec<String>,
+}
+
+impl WorktreeVerdict {
+    /// A verdict that names no nested worktrees.
+    pub fn new(path: String, verdict: WorktreeVerdictKind) -> Self {
+        Self {
+            path,
+            verdict,
+            nested_worktrees: Vec::new(),
+        }
+    }
 }
 
 /// PRD #1589 D6: the typed cleanup verdict a close waits for.
@@ -3865,6 +3880,10 @@ pub enum WorktreeVerdictKind {
     /// state. The daemon no longer records it, so it is `worktree reclaim`'s
     /// to find. An older CLI decodes it as [`Self::Unknown`].
     KeptOnRequest,
+    /// Issue #2285: kept because other worktrees of the repository lie inside
+    /// it, which removing it would delete; [`WorktreeVerdict::nested_worktrees`]
+    /// names them. An older CLI decodes it as [`Self::Unknown`].
+    KeptHoldsWorktrees,
     #[serde(other)]
     Unknown,
 }
@@ -13683,6 +13702,7 @@ mod tests {
             path: "/w".into(),
             confirmed_dirty: true,
             on_request: false,
+            nested_worktrees: Vec::new(),
         };
         assert_eq!(
             serde_json::to_value(&measured).unwrap(),

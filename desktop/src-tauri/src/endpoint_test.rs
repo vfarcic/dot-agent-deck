@@ -685,7 +685,10 @@ async fn test_remote(
 /// closes one, so every such click leaked an authenticated `ssh` child — the
 /// exact leak this function exists to prevent, reached by mistaking two decks
 /// for one.
-async fn release_if_not_observed(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
+///
+/// Also reached from `daemon_bridge::reconnect_and_snapshot`, for a deck that
+/// left the fleet while its Reconnect's handshake was out (issue #1994).
+pub(crate) async fn release_if_not_observed(tunnels: &EndpointTunnels, endpoint: &Endpoint) {
     if !crate::dto::deck_is_observed(endpoint) {
         tunnels.release(endpoint).await;
     }

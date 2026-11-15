@@ -2688,7 +2688,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
               the substitution would be silent, and acting on the wrong machine's
               agents is the outcome that makes it worth a row.
             */}{snapshot.connection.selectionFallback && <span data-testid="selection-fallback">{displayText(snapshot.connection.selectionFallback, DISPLAY_LIMITS.message)}</span>}{/* PRD #741 M7: why Replace is absent on a remote deck, said once. */}{remoteDeck && snapshot.connection.localOnlyReason && <span data-testid="remote-deck-notice">{displayText(snapshot.connection.localOnlyReason, DISPLAY_LIMITS.message)}</span>}</div>
-            {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect()}><RefreshCw size={13} /> Reconnect</button>}</div>}
+            {snapshot.connection.status !== "loading" && <div className="connection-actions">{offersStart && <button className="button primary compact" data-testid="start-daemon" onClick={requestStartDaemon}><Play size={13} /> Start daemon</button>}{upgradeInBanner && <button className="button primary compact" data-testid="upgrade-daemon-banner" onClick={requestUpgrade}><ArrowUpCircleIcon size={13} /> Upgrade</button>}{offersReplace && <button className="button primary compact" data-testid="replace-daemon" onClick={requestRestartDaemon}><RefreshCw size={13} /> Replace daemon</button>}{offersConnectAnyway && <button className="button primary compact" data-testid="connect-anyway" onClick={requestConnectAnyway}><ShieldAlert size={13} /> Connect anyway</button>}{offersReconnect && <button className="button secondary compact" onClick={() => void runtime.reconnect(snapshot.connection.deckId)}><RefreshCw size={13} /> Reconnect</button>}</div>}
           </div>
         )}
 
@@ -2780,7 +2780,7 @@ export function DeckSurface({ runtime, settings, orchestrationPlatformIssue = de
                 />
               ))}
             </div>
-          ) : <EmptyDeck onReconnect={() => void runtime.reconnect()} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
+          ) : <EmptyDeck onReconnect={() => void runtime.reconnect(snapshot.connection.deckId)} onProfiles={() => VOICE_ACTIONS.openAgentProfiles.run(voiceContext)} />}
         </section>}
       </main>
 

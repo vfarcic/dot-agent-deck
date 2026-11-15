@@ -2603,6 +2603,20 @@ Issue #1794: a daemon must not be left half-alive — hook endpoint up, no attac
 - **Does not assert:** a keep on one role of a team followed by an ordinary close of the other (the daemon-level `close_agents::tests::keeping_on_one_role_survives_an_ordinary_close_of_the_last`), a daemon without the keep capability, or a real agent.
 - **Platform coverage:** mac+linux.
 
+##### prompt/close-confirm/015 — A close that would leave a dispatched worktree on disk because other worktrees lie inside it says so, naming them, before the user answers (issue #2285).
+- **Layer:** L1 (in-process `TestBackend` through `render_close_confirm_to_buffer`).
+- **Agent:** none.
+- **Asserts:** a `KeptWorktree` with `nested_worktrees` renders `Holds other worktrees, so it is KEPT:`, the path, and `holds: .worktrees/feat-1-demo` (the nested path relative to the kept one) above Cancel, never the `Uncommitted work` wording, and the Close choice is still drawn; with five nested worktrees, the first three each get their own `holds:` line and a fourth line reads `holds: … and 2 more`.
+- **Does not assert:** where the report comes from (`issue_dispatch_run::kept_worktree_preview_reports_a_tree_that_holds_other_worktrees`) or the close itself (`prompt/close-confirm/014`).
+- **Platform coverage:** mac+linux+windows.
+
+##### prompt/close-confirm/014 — Ctrl+W on a dispatched unit whose worktree holds another worktree under a git-ignored directory warns that it is kept, names the nested one, and keeps its uncommitted work (issue #2285).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`; real-binary PTY, real daemon, real `dispatch --single`).
+- **Agent:** none — identity-recording `cat` probe.
+- **Asserts:** with another worktree of the fixture repository under the unit worktree's ignored `.worktrees/`, holding an untracked file, and `git status` in the unit empty (the premise: the dirty check cannot see it), Ctrl+W draws `Holds other worktrees, so it is KEPT:` with the worktree's path and `holds: .worktrees/feat-tui` before the user answers; choosing Close removes the agent, the status line repeats the headline and the path, and the unit worktree and the nested worktree's file are still on disk.
+- **Does not assert:** the tab/orchestration scope, `Force`-policy (issue-dispatch) worktrees, which are removed regardless, or the desktop dialog (`KeptWorktreeText.test.tsx`).
+- **Platform coverage:** mac+linux.
+
 #### prompt/pane-input
 
 ##### prompt/pane-input/001 — `Enter` on a focused orchestration role pane enters PaneInput mode.
@@ -6481,6 +6495,13 @@ without depending on the config struct API.
 - **Agent:** none — identity-recording `cat` probes in a two-role orchestration.
 - **Asserts:** closing a completed clean two-role unit through a worker's pane with `--keep-worktree --json` exits 0, removes both roles, keeps the shared worktree and its `.dot-agent-deck/` file, and reports one `kept-on-request` verdict for that path.
 - **Does not assert:** the TUI's tab-scope keep or a keep on a non-last role's StopAgent.
+- **Platform coverage:** mac+linux.
+
+##### dispatch/close-verb/014 — `close` keeps a unit's worktree that holds another worktree under a git-ignored directory, and names the nested one (issue #2285).
+- **Layer:** L2 synthetic, lane 1 (`tests/e2e_close_verb.rs`).
+- **Agent:** none — identity-recording `cat` probes.
+- **Asserts:** for two completed single units, each with another worktree of the fixture repository under its ignored `.worktrees/` holding an untracked file and `git status` empty, `close <name>` exits 0, removes the agent, reports `<path>: kept: holds other worktrees` and `holds worktree <nested path>`, and `close <name> --json` reports one `kept-holds-worktrees` verdict whose `nested_worktrees` names the nested path; both unit worktrees and both nested files are still on disk. Without the fix both closes report `removed` and the nested files are gone.
+- **Does not assert:** the orchestration scope, the `Force` policy, or `worktree reclaim` (its own unit test, `worktree_reclaim::tests::a_candidate_holding_other_worktrees_is_kept_and_names_them`).
 - **Platform coverage:** mac+linux.
 
 #### dispatch/single

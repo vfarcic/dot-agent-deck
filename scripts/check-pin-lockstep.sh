@@ -637,7 +637,7 @@ scan_rwx_toolchain() {
   scan_rwx 'rust-version:[[:space:]]*' 'Rust toolchain'
   scan_rwx '--default-toolchain[[:space:]]+' 'Rust toolchain'
 }
-scan_rwx_nextest() { scan_rwx 'get\.nexte\.st/' 'cargo-nextest'; }
+scan_rwx_nextest() { scan_rwx 'CARGO_NEXTEST_VERSION:[[:space:]]*' 'cargo-nextest'; }
 scan_rwx_pnpm() { scan_rwx 'pnpm@' 'pnpm'; }
 scan_rwx_gotask() { scan_rwx 'go-task/task/releases/download/v' 'go-task'; }
 
