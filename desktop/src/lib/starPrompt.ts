@@ -99,7 +99,8 @@ export function useStarPrompt(runtime: StarPromptRuntime, report: (message: stri
   useEffect(() => {
     if (asked.current || !launch) return;
     asked.current = true;
-    void launch().then((show) => { if (show) setDue(true); }, () => undefined);
+    /* A launch the crate could not answer shows no reminder, and says why in the console rather than nowhere. */
+    void launch().then((show) => { if (show) setDue(true); }, (cause: unknown) => console.warn("The star reminder's launch check failed:", cause));
   }, [launch]);
   const choosePrompt = runtime.starPromptChoose;
   const choose = useCallback((choice: StarChoice) => {
