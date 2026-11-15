@@ -460,7 +460,10 @@ GATES — CLAUDE.md is the authority, this is the summary:
   `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
   filtered to a single test, since a filter narrows what runs, not what compiles) goes
   through `rwx sandbox exec -- <command>`, `cargo mutants` included (do not
-  raise its `--jobs`), so the compile leaves this shared machine. Do not run
+  raise its `--jobs`), so the compile leaves this shared machine. Split a
+  command that could run past 30 minutes into several execs
+  (`cargo mutants --shard k/n`, test filters): RWX kills one exec at 30
+  minutes and stops the sandbox with it. Do not run
   `rwx sandbox stop`: the agents in this worktree share the sandbox, a stop
   kills a command one of them is running in it, and it stops itself after
   five idle minutes. If `rwx whoami` fails, run it locally and say so in your

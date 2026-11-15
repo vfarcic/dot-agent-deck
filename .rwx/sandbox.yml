@@ -125,5 +125,9 @@ tasks:
     # DAD_REMOTE_EXEC_KEEP=0): one unit's agents share it, and a stop killed a
     # teammate's running command (2026-10-31). This timeout is what stops it. A running command counts
     # as activity (measured 2026-10-22: a 3-minute command survived a 1-minute
-    # timeout), so a short timeout cannot cut a long test run off.
+    # timeout), so this timeout does not cut a running command off. RWX does:
+    # one exec is killed at 30 minutes, with the sandbox. Nothing documented
+    # says what sets that; rwx-sandbox's --first-exec-timeout and
+    # --inactivity-timeout both default to 30m, and setting either above 30m
+    # was not measured (issue #2077, docs/develop/rwx.md "Stopping").
     run: rwx-sandbox --inactivity-timeout 5m
