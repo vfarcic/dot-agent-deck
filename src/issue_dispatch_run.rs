@@ -313,11 +313,15 @@ pub enum TreeKeepCheck {
 }
 
 /// The ONE question a `KeepIfDirty` removal and the close preview ask before
-/// deleting a tree, so they cannot disagree: does it hold uncommitted work
-/// ([`worktree_is_dirty`]), and failing that, other worktrees
-/// ([`nested_worktrees`])? `Err` when either could not be asked. The two read
-/// git concurrently, so the close preview's deadline covers one round trip
-/// rather than two.
+/// deleting a tree, so they cannot disagree: does it hold other worktrees
+/// ([`nested_worktrees`]), and failing that, uncommitted work
+/// ([`worktree_is_dirty`])? `Err` when the answer depends on one that could
+/// not be asked. The two read git concurrently, so the close preview's
+/// deadline covers one round trip rather than two.
+///
+/// The worktrees inside it win over a dirty tree (review on #2316): the usual
+/// way to discard a kept tree's changes is `git worktree remove --force`,
+/// which deletes them too, so the report has to name them even then.
 pub async fn worktree_keep_check(
     worktree_dir: &Path,
     clone_dir: &Path,
@@ -326,15 +330,16 @@ pub async fn worktree_keep_check(
         worktree_is_dirty(worktree_dir),
         nested_worktrees(worktree_dir, clone_dir)
     );
+    if let Ok(nested) = &nested
+        && !nested.is_empty()
+    {
+        return Ok(TreeKeepCheck::HoldsWorktrees(nested.clone()));
+    }
     if dirty? {
         return Ok(TreeKeepCheck::Dirty);
     }
-    let nested = nested?;
-    Ok(if nested.is_empty() {
-        TreeKeepCheck::Clean
-    } else {
-        TreeKeepCheck::HoldsWorktrees(nested)
-    })
+    nested?;
+    Ok(TreeKeepCheck::Clean)
 }
 
 /// Issue #717: the close-confirmation dialog's advance warning that a
@@ -5580,6 +5585,27 @@ mod tests {
             "with nothing inside it, the unit is removed as before"
         );
         assert!(!unit.exists());
+    }
+
+    /// Issue #2285 (review on #2316): a unit that has uncommitted changes AND
+    /// holds another worktree is reported as holding it, with its path, since
+    /// `git worktree remove --force`, the usual way to discard the changes,
+    /// would delete the nested worktree too.
+    #[tokio::test]
+    async fn a_dirty_worktree_holding_another_names_the_nested_one() {
+        let tmp = crate::test_temp::tempdir().unwrap();
+        let (repo, unit, nested) = init_unit_with_nested_worktree(tmp.path());
+        std::fs::write(unit.join("dirty-2285.txt"), "uncommitted").unwrap();
+        assert_eq!(worktree_is_dirty(&unit).await, Ok(true), "the premise");
+        let shown = vec![nested.to_string_lossy().into_owned()];
+        assert_eq!(
+            worktree_keep_check(&unit, &repo).await,
+            Ok(TreeKeepCheck::HoldsWorktrees(shown.clone()))
+        );
+        let outcome = remove_worktree_outcome(&unit, &repo, RemovalPolicy::KeepIfDirty).await;
+        assert_eq!(outcome, WorktreeRemoval::KeptHoldsWorktrees(shown));
+        assert!(nested.join("wip.txt").is_file());
+        assert!(unit.join("dirty-2285.txt").is_file());
     }
 
     /// Issue #2285 (review): a listed nested worktree that exists but cannot
