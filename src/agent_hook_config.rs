@@ -4380,22 +4380,26 @@ mod tests {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let holder =
             hold_and_keep_publishing(&dest, std::time::Duration::from_millis(25), stop.clone());
-        // The release is anchored to the instant the measurement starts, not to
-        // when this thread is next scheduled, so a delay before the wait cannot
-        // let the holder let go before the waiter has been blocked past `stall`.
-        let started = std::time::Instant::now();
+        // The release is anchored to an instant taken just before the wait
+        // begins, after the release thread is already running, so neither a
+        // delay before the wait nor spawning that thread can let the holder go
+        // before the waiter has been blocked past `stall`, short of this thread
+        // being descheduled for two whole windows between the send and the
+        // call (Qodo on PR #2325: anchored before the spawn, and with one window
+        // of margin, it could).
+        let (go, wait_starts) = std::sync::mpsc::channel::<std::time::Instant>();
         let release = {
             let stop = stop.clone();
-            // Two windows: the first has to be renewed by a publish for the
-            // wait to reach the release at all (#2111: every window here is
-            // paid in full, and load-scaled).
-            let release_at = started + stall * 2;
             std::thread::spawn(move || {
+                let started = wait_starts.recv().expect("the wait's start");
+                let release_at = started + stall * 3;
                 std::thread::sleep(release_at.saturating_duration_since(std::time::Instant::now()));
                 stop.store(true, std::sync::atomic::Ordering::SeqCst);
             })
         };
 
+        let started = std::time::Instant::now();
+        go.send(started).expect("start the release clock");
         let waited = lock_config_waiting(&dest, stall, std::time::Duration::from_secs(60));
         let elapsed = started.elapsed();
         release.join().expect("release thread");
