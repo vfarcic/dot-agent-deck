@@ -394,7 +394,9 @@ fn verdict_text(kind: WorktreeVerdictKind) -> &'static str {
     match kind {
         WorktreeVerdictKind::Removed => "removed",
         WorktreeVerdictKind::KeptDirty => "kept: uncommitted changes",
-        WorktreeVerdictKind::KeptCouldNotCheck => "kept: could not check for uncommitted changes",
+        WorktreeVerdictKind::KeptCouldNotCheck => {
+            "kept: could not check for uncommitted changes or worktrees inside it"
+        }
         WorktreeVerdictKind::RemoveFailed => "kept: removing it failed",
         WorktreeVerdictKind::StillInUse => "kept: still in use",
         WorktreeVerdictKind::NotRecorded => {
@@ -404,6 +406,7 @@ fn verdict_text(kind: WorktreeVerdictKind) -> &'static str {
             "cleanup still running: the agents are stopped, the outcome is not known yet"
         }
         WorktreeVerdictKind::KeptOnRequest => "kept on request",
+        WorktreeVerdictKind::KeptHoldsWorktrees => "kept: holds other worktrees",
         WorktreeVerdictKind::Unknown => "unknown",
     }
 }
@@ -412,6 +415,19 @@ fn verdict_text(kind: WorktreeVerdictKind) -> &'static str {
 /// it again.
 const KEPT_ON_REQUEST_HINT: &str = "    find or remove it later with `dot-agent-deck worktree reclaim`, \
      run from the repository it belongs to\n";
+
+/// Issue #2285: the lines under a worktree kept because other worktrees lie
+/// inside it, after the lines naming each of them. The deck names at most
+/// [`crate::issue_dispatch_run::MAX_NESTED_WORKTREES_REPORTED`], and a report
+/// too long for its bound names none, so the hint says where to see them all.
+const KEPT_HOLDS_WORKTREES_HINT: &str = "    remove those worktrees first (`git worktree remove <path>`), \
+     then this one the same way or with `dot-agent-deck worktree reclaim`; \
+     `git worktree list`, run in the repository, lists them all\n";
+
+/// Issue #2285: said instead of the names when the report was too long to
+/// carry them.
+const KEPT_HOLDS_WORKTREES_UNNAMED: &str =
+    "    the report was too long to name the worktrees inside it\n";
 
 fn pane_lines(out: &mut String, t: &CloseTarget) {
     for pane in &t.panes {
@@ -635,6 +651,15 @@ pub fn render_human(report: &CloseReport, preview: Option<&CloseReport>) -> Stri
             if verdict.verdict == WorktreeVerdictKind::KeptOnRequest {
                 out.push_str(KEPT_ON_REQUEST_HINT);
             }
+            if verdict.verdict == WorktreeVerdictKind::KeptHoldsWorktrees {
+                if verdict.nested_worktrees.is_empty() {
+                    out.push_str(KEPT_HOLDS_WORKTREES_UNNAMED);
+                }
+                for nested in &verdict.nested_worktrees {
+                    out.push_str(&format!("    holds worktree {}\n", shown(nested)));
+                }
+                out.push_str(KEPT_HOLDS_WORKTREES_HINT);
+            }
         }
     }
     out
@@ -703,13 +728,18 @@ pub fn render_json(report: &CloseReport, preview: Option<&CloseReport>) -> serde
         .iter()
         .filter_map(|t| {
             t.worktree_verdict.as_ref().map(|v| {
-                serde_json::json!({
+                let mut entry = serde_json::json!({
                     "name": name_of(t),
                     "unit_id": t.unit_id,
                     "path": v.path,
                     "verdict": v.verdict,
                     "branch": t.branch,
-                })
+                });
+                // Issue #2285: the worktrees that kept it, when any did.
+                if !v.nested_worktrees.is_empty() {
+                    entry["nested_worktrees"] = serde_json::json!(v.nested_worktrees);
+                }
+                entry
             })
         })
         .collect();
@@ -839,10 +869,10 @@ mod tests {
         let mut closed = target(CloseOutcome::Closed);
         closed.forced_over = vec![CloseRefusalReason::Busy];
         closed.branch = Some("agent/dispatch-issue-1".into());
-        closed.worktree_verdict = Some(WorktreeVerdict {
-            path: "/wt".into(),
-            verdict: WorktreeVerdictKind::KeptDirty,
-        });
+        closed.worktree_verdict = Some(WorktreeVerdict::new(
+            "/wt".into(),
+            WorktreeVerdictKind::KeptDirty,
+        ));
         let mut refused = target(CloseOutcome::Refused);
         refused.reason = Some(CloseRefusalReason::NotReported);
         refused.message = Some("had not reported".into());
@@ -859,6 +889,60 @@ mod tests {
         assert_eq!(json["exit_code"], 1);
     }
 
+    /// Issue #2285: a worktree kept because other worktrees lie inside it
+    /// reads `kept: holds other worktrees`, names each of them and says to
+    /// remove them first; the JSON carries the verdict and their paths.
+    #[test]
+    fn a_worktree_that_holds_other_worktrees_is_reported_with_their_paths() {
+        let mut closed = target(CloseOutcome::Closed);
+        closed.worktree_verdict = Some(WorktreeVerdict {
+            path: "/wt/unit".into(),
+            verdict: WorktreeVerdictKind::KeptHoldsWorktrees,
+            nested_worktrees: vec!["/wt/unit/.worktrees/feat-1".into()],
+        });
+        let report = CloseReport {
+            targets: vec![closed],
+            ..CloseReport::default()
+        };
+        let human = render_human(&report, None);
+        assert!(
+            human.contains("  /wt/unit: kept: holds other worktrees\n"),
+            "{human}"
+        );
+        assert!(
+            human.contains("    holds worktree /wt/unit/.worktrees/feat-1\n"),
+            "{human}"
+        );
+        assert!(human.contains("remove those worktrees first"), "{human}");
+        assert!(human.contains("`git worktree list`"), "{human}");
+        assert!(!human.contains("too long to name"), "{human}");
+        let json = render_json(&report, None);
+        assert_eq!(json["worktrees"][0]["verdict"], "kept-holds-worktrees");
+        assert_eq!(
+            json["worktrees"][0]["nested_worktrees"][0],
+            "/wt/unit/.worktrees/feat-1"
+        );
+        assert_eq!(json["exit_code"], 0);
+
+        // A report too long for its bound sheds the names; the verdict and
+        // the reason survive, and the report says the names were cut.
+        let mut cut = target(CloseOutcome::Closed);
+        cut.worktree_verdict = Some(WorktreeVerdict::new(
+            "/wt/unit".into(),
+            WorktreeVerdictKind::KeptHoldsWorktrees,
+        ));
+        let human = render_human(
+            &CloseReport {
+                targets: vec![cut],
+                ..CloseReport::default()
+            },
+            None,
+        );
+        assert!(human.contains("kept: holds other worktrees"), "{human}");
+        assert!(human.contains("too long to name the worktrees"), "{human}");
+        assert!(human.contains("`git worktree list`"), "{human}");
+    }
+
     /// Issue #1958: a worktree kept on request reads `kept on request` with
     /// its path and a pointer at `worktree reclaim` (`would be kept on request`
     /// in a dry run), and the JSON carries `kept-on-request`. A daemon that
@@ -867,10 +951,10 @@ mod tests {
     fn a_worktree_kept_on_request_is_reported_with_its_path_and_reclaim() {
         let mut closed = target(CloseOutcome::Closed);
         closed.branch = Some("agent/dispatch-issue-1".into());
-        closed.worktree_verdict = Some(WorktreeVerdict {
-            path: "/wt/issue-1".into(),
-            verdict: WorktreeVerdictKind::KeptOnRequest,
-        });
+        closed.worktree_verdict = Some(WorktreeVerdict::new(
+            "/wt/issue-1".into(),
+            WorktreeVerdictKind::KeptOnRequest,
+        ));
         let report = CloseReport {
             targets: vec![closed.clone()],
             ..CloseReport::default()
