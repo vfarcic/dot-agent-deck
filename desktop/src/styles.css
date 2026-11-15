@@ -171,10 +171,13 @@
      steps, so a later adjustment is an edit here rather than another sweep.
      The agent's output is the reference: `--text-base` is the terminal's own
      size (`TERMINAL_FONT_SIZE` in `lib/typeScale.ts`, which a unit test pins
-     to this value), ordinary text — labels, rows, buttons, dialog bodies — is
-     at least that, headings are larger, and only secondary text (badges, hints,
-     timestamps, key caps) goes smaller, never below the 11px floor. Zoom cannot
-     do this: it scales the terminal too, so it keeps the ratio. */
+     to this value), ordinary text — rows, buttons, inputs, dialog bodies — is
+     at least that, and headings are larger. Text that ranks below it is one or
+     two steps smaller, never below the 11px floor: field, section, tab and
+     instrument labels, badges, hints and notes, agent metadata, list captions,
+     timestamps, footers, key caps and a few compact controls such as filter
+     buttons. Zoom cannot do this: it scales the terminal too, so it keeps the
+     ratio. */
   --text-xs: 11px;
   --text-sm: 12px;
   --text-base: 13.5px;
