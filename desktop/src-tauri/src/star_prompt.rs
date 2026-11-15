@@ -40,15 +40,15 @@ pub enum StarChoice {
 /// This process's launch: counted on the first ask, remembered after it.
 pub struct StarLaunch {
     due: Mutex<Option<bool>>,
-    /// Whether a choice has been saved in this process.
-    chosen: std::sync::atomic::AtomicBool,
+    /// Whether a Star has been saved in this process.
+    starred: std::sync::atomic::AtomicBool,
 }
 
 impl StarLaunch {
     pub const fn new() -> Self {
         Self {
             due: Mutex::new(None),
-            chosen: std::sync::atomic::AtomicBool::new(false),
+            starred: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -60,12 +60,16 @@ impl StarLaunch {
         *due.get_or_insert_with(|| StarPromptState::load_from(path).increment_and_check())
     }
 
-    /// A choice was saved: this process shows no reminder again. Answers
-    /// whether it is the process's first, so that only one Star opens the
-    /// browser however many requests overlap (Qodo, PR #2321).
-    pub fn answered(&self) -> bool {
+    /// A choice was saved: this process shows no reminder again.
+    pub fn answered(&self) {
         *self.due.lock().unwrap_or_else(|e| e.into_inner()) = Some(false);
-        !self.chosen.swap(true, std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A Star was saved. Answers whether it is the process's first Star, so
+    /// that only one opens the browser however many requests overlap — and a
+    /// Later racing it cannot take that turn (Qodo, PR #2321).
+    pub fn first_star(&self) -> bool {
+        !self.starred.swap(true, std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -106,8 +110,8 @@ pub async fn desktop_star_prompt_choose(
     let path = star_prompt_path();
     tokio::task::spawn_blocking(move || {
         record_choice(path, choice)?;
-        let first = STAR_LAUNCH.answered();
-        Ok((first && choice == StarChoice::Star)
+        STAR_LAUNCH.answered();
+        Ok((choice == StarChoice::Star && STAR_LAUNCH.first_star())
             .then(|| star_message(open_with_platform_opener(REPO_URL, LAUNCH_GRACE).is_ok())))
     })
     .await
@@ -158,9 +162,10 @@ mod tests {
         let process = StarLaunch::new();
         assert!(process.check(path.clone()), "the tenth launch did not ask");
         assert!(process.check(path.clone()), "a reload forgot the reminder");
-        assert!(process.answered(), "the first choice is the first");
-        assert!(!process.answered(), "a second choice is not");
+        process.answered();
         assert!(!process.check(path.clone()), "a choice did not close it");
+        assert!(process.first_star(), "the first Star opens the browser");
+        assert!(!process.first_star(), "a second Star does not");
     }
 
     #[test]

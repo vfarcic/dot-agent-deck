@@ -239,6 +239,19 @@ describe("the star reminder in the app", () => {
     expect(await screen.findByTestId("star-prompt-dialog")).toBeVisible();
   });
 
+  /** Scenario: the app starts on a due launch while its daemon is disconnected, so the connection banner is up. The reminder waits rather than cover it, and comes up once the daemon connects. */
+  it("waits while the connection banner is up", async () => {
+    const starPromptLaunch = vi.fn(async () => true);
+    const connected = runtimeOf({ starPromptLaunch });
+    const down = { ...connected, snapshot: { ...connected.snapshot, connection: { ...connected.snapshot.connection, status: "disconnected" as const } } };
+    const { rerender } = render(<DeckShell runtime={down} initialView={{ kind: "deck" }} />);
+    await waitFor(() => expect(starPromptLaunch).toHaveBeenCalled());
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.queryByTestId("star-prompt-dialog")).toBeNull();
+    rerender(<DeckShell runtime={connected} initialView={{ kind: "deck" }} />);
+    expect(await screen.findByTestId("star-prompt-dialog")).toBeVisible();
+  });
+
   /** Scenario: the app starts on a launch the reminder state says is not due. No reminder shows. */
   it("shows nothing when not due", async () => {
     const starPromptLaunch = vi.fn(async () => false);

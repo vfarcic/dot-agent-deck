@@ -29715,10 +29715,6 @@ mod tests {
         assert_eq!(star_popup_width(3, &over_the_old_limit), 0);
     }
 
-    /// Issue #945 turned the star prompt's fallback message from a literal
-    /// into a `format!` over `repo_identity::DISPLAY`, so the bytes it renders
-    /// are asserted against the literal it replaced. The success message never
-    /// named the repo and is here only to pin the other branch.
     /// PRD #2174: the prompt's key line names the choices in the words the
     /// desktop app's dialog uses too, which live in `crate::star_prompt`.
     #[test]
@@ -29738,6 +29734,10 @@ mod tests {
         );
     }
 
+    /// Issue #945 turned the star prompt's fallback message from a literal
+    /// into a `format!` over `repo_identity::DISPLAY`, so the bytes it renders
+    /// are asserted against the literal it replaced. The success message never
+    /// named the repo and is here only to pin the other branch.
     #[test]
     fn star_message_is_byte_identical_to_the_literals_it_replaced() {
         assert_eq!(star_message(true), "Thanks for starring! ⭐");

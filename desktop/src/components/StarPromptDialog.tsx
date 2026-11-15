@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useLayoutEffect, useState, type KeyboardEvent } from "react";
 import { Star } from "lucide-react";
 
-import { insideVoicePeer, overlayAbove, OVERLAY_LAYER, useInertBackground } from "../hooks/useInertBackground";
+import { insideVoicePeer, overlayAbove, OVERLAY_LAYER, useInertBackground, useOverlayStackEmpty } from "../hooks/useInertBackground";
 import {
   DONT_ASK_AGAIN,
   LATER,
@@ -16,6 +16,23 @@ import {
   type StarChoice,
 } from "../lib/starPrompt";
 import { VOICE_ACTIONS } from "../lib/voiceActions";
+
+/**
+ * PRD #2174 — whether the reminder is up: once it is `due` and `ready` (the
+ * shell's list of what it waits behind) and no overlay is open at all, read
+ * from the overlay stack so whatever the user is in — an agent's pane, the
+ * palette, a review — is never covered (Qodo, PR #2321). Once up it stays up
+ * until answered, since it is then on the stack itself. A component of its
+ * own so that only it, not the whole shell, re-renders as overlays come and go.
+ */
+export function StarPromptGate({ due, ready, onChoose }: { due: boolean; ready: boolean; onChoose: (choice: StarChoice) => void }) {
+  const nothingOpen = useOverlayStackEmpty();
+  const [up, setUp] = useState(false);
+  const mayOpen = due && ready && nothingOpen;
+  if (mayOpen && !up) setUp(true);
+  if (!due && up) setUp(false);
+  return due && (up || mayOpen) ? <StarPromptDialog onChoose={onChoose} /> : null;
+}
 
 /** The key that makes each choice, the TUI prompt's. */
 const KEYS: Record<string, StarChoice> = { s: "star", l: "later", Escape: "later", d: "dismiss" };

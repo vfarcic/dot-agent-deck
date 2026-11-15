@@ -94,7 +94,7 @@ import { deckScreenSnapshot } from "./lib/deckScreen";
 import { LaunchCleanupError, StartDaemonError } from "./lib/actionError";
 import { CleanupWarning } from "./components/CleanupWarning";
 import { ProjectTrustDialog } from "./components/ProjectTrustDialog";
-import { StarPromptDialog } from "./components/StarPromptDialog";
+import { StarPromptGate } from "./components/StarPromptDialog";
 import { chooseShownStarPrompt, useStarPrompt } from "./lib/starPrompt";
 import { approveShownReview, isNotApproved, reviewDeckChangedNotice, useProjectTrustReview, type ProjectTrustView } from "./lib/projectTrust";
 import type { VoiceDirectoriesDto, VoiceNewAgentDto, VoiceOutcomeDto } from "./lib/bridge";
@@ -1420,7 +1420,12 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
      answer the reminder rather than cancel the choice (Qodo, PR #2321). Under
      the New agent dialog it would leave voice's `close` closing the form
      behind it (Greptile, PR #2321). */
-  const starShown = star.due && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
+  /* Qodo, PR #2321: and while ANY overlay is open — an agent's pane, the
+     command palette, the shortcut guide, a project-commands review — read from
+     the overlay stack rather than listed one by one (`StarPromptGate`); and
+     while the connection banner is up, which its backdrop would cover. */
+  const connectionBanner = runtime.snapshot.connection.status !== "connected" || Boolean(runtime.snapshot.connection.buildStampMismatchOnly) || Boolean(runtime.snapshot.connection.selectionFallback);
+  const starReady = !connectionBanner && !confirmationOpen && !localUpgrade.pending && !selfUpgradeOpen && !newAgentOpen && !choiceOpen && !overlaysOpen.settings && !prBrowser;
   return (
     <OpenPullRequest.Provider value={openPullRequest}>
     <VoiceOn.Provider value={voiceOn}>
@@ -1439,7 +1444,7 @@ export function DeckShell({ runtime, orchestrationPlatformIssue, initialView = {
         <VoiceControlPanel runtime={runtime} screen={prBrowser ? "pull_request" : view.kind} onDispatch={dispatchVoice} channel={panelVoiceContext} directories={readDirectories} newAgent={readNewAgent} newAgentInstance={readNewAgentInstance} endpoints={readEndpoints} pane={voicePane} fleet={runtime.fleet} selectedDeckId={selectedDeckId} confirmationOpen={confirmationOpen || selfUpgradeOpen} reading={settings.loaded ? readingSwitch : undefined} readingAgents={readingAgents} readingDecks={readingDecks} onReadingSwitch={switchReading} onReadingNoticeShown={readingNoticeShown} onVoiceChange={setVoiceOn} agentIncarnations={readAgentIncarnations} numbered={readNumbered} pages={readPager} onChoiceChange={setChoiceOpen} keyboard={panelKeyboard} />
         <ShellSettings runtime={runtime} settings={settings} open={overlaysOpen.settings ?? false} onClose={() => setOverlay(screen, "settings", false)} />
         {localUpgrade.target && <UpgradeDialog target={localUpgrade.target} runtime={runtime} onClose={localUpgrade.close} autoStart />}
-        {starShown && <StarPromptDialog onChoose={star.choose} />}
+        <StarPromptGate due={star.due} ready={starReady} onChoose={star.choose} />
         {/* PRD #1401 — LAST, so opening it moves no sibling's position (see above). */}
         {prBrowser && (
           <PullRequestBrowser

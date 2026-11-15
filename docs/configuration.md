@@ -13,7 +13,8 @@ This page is the reference for the files and environment variables that configur
 | `remotes.toml` | registered remote hosts, see [Remote Environments](remote-environments.md) | `dot-agent-deck remote`/`connect` and the desktop app | `~/.config/dot-agent-deck/remotes.toml` | `DOT_AGENT_DECK_REMOTES` |
 | `desktop.toml` | the desktop app's own settings ([reference](#desktoptoml-reference)) | the desktop app | `~/.config/dot-agent-deck/desktop.toml` | `DOT_AGENT_DECK_DESKTOP_CONFIG` |
 | `session.toml` | the TUI's saved session (panes to restore, and its copy of the last command used) | the TUI | `~/.config/dot-agent-deck/session.toml` | `DOT_AGENT_DECK_SESSION` |
-| `config-gen-state.json`, `star-prompt-state.json` | small TUI state files | the TUI | beside `config.toml` | `DOT_AGENT_DECK_CONFIG_GEN_STATE`, `DOT_AGENT_DECK_STAR_PROMPT` |
+| `config-gen-state.json` | small TUI state file | the TUI | beside `config.toml` | `DOT_AGENT_DECK_CONFIG_GEN_STATE` |
+| `star-prompt-state.json` | the [star reminder](desktop/index.md#the-star-reminder)'s state, shared by both clients | the TUI and the desktop app | beside `config.toml` | `DOT_AGENT_DECK_STAR_PROMPT` |
 
 `~/.config/dot-agent-deck/` is used on macOS and Linux whatever `XDG_CONFIG_HOME` says; of the files above, only `schedules.toml` consults `XDG_CONFIG_HOME`, and only when it is an absolute path: an empty or relative value is ignored. On Windows the directory is `%APPDATA%\dot-agent-deck`. Every override variable takes the full path of the file, not a directory.
 
