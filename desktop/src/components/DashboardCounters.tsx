@@ -30,7 +30,8 @@ const POPOVER_MARGIN = 12;
  * Escape outside it closes it, and an Escape inside it closes it and hands
  * focus back to the button. Kept inside the window the same way too: shifted
  * left by any overflow past the right edge, and limited in height to the room
- * above the voice row, scrolling past that.
+ * above the voice row, scrolling past that. Measured again whenever the
+ * window, the button or the list changes size.
  */
 export function DashboardCounters({ summary, open, onOpen, onClose, children }: {
   summary: DashboardCountersSummary;
@@ -96,7 +97,16 @@ export function DashboardCounters({ summary, open, onOpen, onClose, children }: 
     };
     measure();
     window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
+    /* And whenever the button or the list changes size while shown: a count
+       change adds or drops an alert on the button, which moves it in the
+       phone layout, and a longer number widens the list (PR #2317 review). */
+    const observer = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(measure);
+    if (root.current) observer?.observe(root.current);
+    if (popover.current) observer?.observe(popover.current);
+    return () => {
+      window.removeEventListener("resize", measure);
+      observer?.disconnect();
+    };
   }, [shown]);
 
   const words = countersWords(summary);
