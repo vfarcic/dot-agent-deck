@@ -55,8 +55,12 @@ fn orphan_exit_001_orphaned_daemon_self_exits() {
     // Intermediate parent: a shell that backgrounds the daemon (so the daemon's
     // parent is THIS shell, not the test), records the daemon pid, then sleeps.
     // Killing the shell orphans the daemon without touching the test process.
+    // `exec` makes the sleep REPLACE the shell (same pid, still the daemon's
+    // parent) rather than run as its child: a child `sleep` survives the
+    // SIGKILL below as an orphan holding this test's stdout/stderr for 60 s,
+    // which nextest reports as LEAK.
     let script = format!(
-        "'{bin}' daemon serve >/dev/null 2>&1 &\necho $! > '{pid}'\nsleep 60\n",
+        "'{bin}' daemon serve >/dev/null 2>&1 &\necho $! > '{pid}'\nexec sleep 60\n",
         bin = bin,
         pid = pidfile.display(),
     );

@@ -463,15 +463,24 @@ impl WorkTracker {
         }
     }
 
-    /// An orderly shutdown's journal barrier, within `bound` in all: first
-    /// hand every live attempt's held-back session id
-    /// ([`Self::flush_held_sessions`]'s, which no later round will write)
-    /// to the writer, outside the session quota and waiting for queue room
-    /// rather than dropping it, then wait for the writer to write what it
-    /// was handed. So a graceful stop leaves each live attempt's latest
-    /// reported id on disk without relying on the next periodic round or on
-    /// the attempt's end, which a PTY reader detached at shutdown may never
-    /// reach. A session reported after this call is not covered.
+    /// An orderly shutdown's journal barrier, best effort: first hand every
+    /// live attempt's held-back session id ([`Self::flush_held_sessions`]'s,
+    /// which no later round will write) to the writer, outside the session
+    /// quota and waiting for queue room rather than dropping it, then wait
+    /// for the writer to write what it was handed. On a shutdown whose
+    /// writer keeps up, that leaves each live attempt's latest reported id
+    /// on disk without relying on the next periodic round or on the
+    /// attempt's end, which a PTY reader detached at shutdown may never
+    /// reach.
+    ///
+    /// `bound` caps the waiting for queue room and for the writer's drain,
+    /// not the whole call: taking the book's lock and walking its sessions
+    /// are outside it, and each wait polls every 5 ms, so the call can
+    /// overrun `bound` by about that much. An id still unqueued when the
+    /// deadline passes stays held and is logged, not written; one the writer
+    /// was handed but did not write in time (or that a failed writer drops)
+    /// is missing from disk. A session reported after this call is not
+    /// covered.
     pub fn drain(&self, bound: std::time::Duration) {
         let Some(journal) = self.journal() else {
             return;

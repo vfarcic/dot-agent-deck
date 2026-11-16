@@ -2325,6 +2325,149 @@ async fn a_graceful_shutdown_writes_the_held_session_before_its_drain() {
     drop(release);
 }
 
+/// A journal whose writer waits at its gate, with a queue of 8: the tests
+/// below fill it until it drops an event.
+fn stalled_journal(state: &Path) -> (WorkJournal, Arc<crate::work_journal::WriterGate>) {
+    let gate = crate::work_journal::WriterGate::closed();
+    let journal = WorkJournal::try_open_with(
+        state,
+        "run1",
+        &DeckId::generate(),
+        JournalOptions {
+            home: PathBuf::from("/home/someone"),
+            queue_capacity: 8,
+            hooks: crate::work_journal::TestHooks {
+                gate: Some(Arc::clone(&gate)),
+                ..Default::default()
+            },
+            ..JournalOptions::default()
+        },
+    )
+    .unwrap();
+    (journal, gate)
+}
+
+/// PRD #1790 (review round 4): the shutdown barrier ([`WorkTracker::drain`])
+/// against a stalled writer and a full queue returns at its deadline instead
+/// of waiting for queue room, and keeps the held session id it could not
+/// queue: nothing of it is on disk once the writer is let go, and the next
+/// [`WorkTracker::flush_held_sessions`] round still has it to write.
+#[test]
+fn a_drain_against_a_full_stalled_queue_returns_and_keeps_the_held_session() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let (journal, gate) = stalled_journal(state.path());
+    let tracker = WorkTracker::default();
+    tracker.install(journal);
+    let claude = AgentType::ClaudeCode;
+    let start = |agent: &str| {
+        let pane = format!("p{agent}");
+        let work = tracker
+            .resolve_spawn(None, Some(&pane), None, None)
+            .kept()
+            .unwrap();
+        tracker.attempt_started(&work, agent, Some(&pane), None);
+    };
+    start("1");
+    start("2");
+    // Attempt 2's ids take the whole session quota, so attempt 1's one
+    // report is refused and held.
+    for n in 0..8 / crate::work_journal::SESSION_QUEUE_SHARE {
+        tracker.session_seen("2", Some("p2"), &format!("b-{n}"), &claude, false);
+    }
+    tracker.session_seen("1", Some("p1"), "s-only", &claude, false);
+    // Saturate the queue with lifecycle events. The quota's refusal above
+    // already counts as a drop, so wait for one more.
+    let journal = tracker.journal().unwrap();
+    let refused = journal.dropped_events();
+    assert!(
+        refused > 0,
+        "precondition: the quota refused attempt 1's id"
+    );
+    let mut n = 100;
+    while journal.dropped_events() == refused {
+        start(&n.to_string());
+        n += 1;
+        assert!(n < 200, "the queue never filled");
+    }
+    let bound = Duration::from_millis(200);
+    let began = std::time::Instant::now();
+    tracker.drain(bound);
+    let took = began.elapsed();
+    gate.open();
+    assert!(
+        took < bound + Duration::from_secs(2),
+        "the drain waited {took:?} against a stalled writer (bound {bound:?})"
+    );
+    journal.flush();
+    let attempt = AttemptId::new("run1", 1).unwrap();
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        None,
+        "the drain could not have queued the held id, yet it is on disk"
+    );
+    assert_eq!(
+        tracker.flush_held_sessions(),
+        1,
+        "the drain lost the held id it could not queue"
+    );
+    journal.flush();
+    assert_eq!(
+        latest_on_disk(state.path(), &attempt),
+        Some("s-only".to_string())
+    );
+}
+
+/// PRD #1790 (review round 4): a graceful shutdown of the registry whose
+/// journal writer is stalled behind a full queue, with a held session id
+/// still to hand over, returns within its agents' grace and the journal
+/// drain bound ([`crate::work_journal::SHUTDOWN_DRAIN`]) rather than
+/// hanging on the journal.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_graceful_shutdown_with_a_stalled_full_journal_returns_in_bound() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let (journal, gate) = stalled_journal(state.path());
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal);
+    let spawn = |n: usize| {
+        registry
+            .spawn_agent(SpawnOptions {
+                command: Some("cat"),
+                env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), format!("wj-stall-{n}"))],
+                ..SpawnOptions::default()
+            })
+            .expect("spawn")
+    };
+    let agent = spawn(0);
+    let claude = AgentType::ClaudeCode;
+    for n in 0..=8 / crate::work_journal::SESSION_QUEUE_SHARE {
+        registry.session_seen(&agent, Some("wj-stall-0"), &format!("s-{n}"), &claude);
+    }
+    // The quota's refusal above already counts as a drop, so saturate the
+    // queue until one more is dropped.
+    let journal = registry.work().journal().unwrap();
+    let refused = journal.dropped_events();
+    let mut n = 1;
+    while journal.dropped_events() == refused {
+        spawn(n);
+        n += 1;
+        assert!(n < 20, "the queue never filled");
+    }
+    let grace = Duration::from_secs(2);
+    let began = std::time::Instant::now();
+    let stopping = Arc::clone(&registry);
+    tokio::task::spawn_blocking(move || stopping.shutdown_all_graceful(grace))
+        .await
+        .unwrap();
+    let took = began.elapsed();
+    gate.open();
+    let bound = grace + crate::work_journal::SHUTDOWN_DRAIN + Duration::from_secs(3);
+    assert!(
+        took < bound,
+        "the graceful shutdown took {took:?} against a stalled journal (bound {bound:?})"
+    );
+}
+
 /// PRD #1790: the launch-record prune's liveness test is the journal's own
 /// [`WorkJournal::run_is_live`], read from real run locks: this journal's
 /// run and a run whose lock another open journal holds are live, so their

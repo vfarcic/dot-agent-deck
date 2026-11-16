@@ -6653,4 +6653,85 @@ mod hygiene_tests {
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
         assert!(!err.to_string().starts_with("longer than"), "{err}");
     }
+
+    /// PRD #1790: [`resolve_trusted_dir_path`] as this account, with no
+    /// private group.
+    #[cfg(unix)]
+    fn walk(path: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        resolve_trusted_dir_path(path, euid, &|| None)
+    }
+
+    /// A directory this account alone writes, and its resolved path. Asserts
+    /// that it resolves, so each refusal below is about the symlinks made in
+    /// it, not about its ancestors.
+    #[cfg(unix)]
+    fn walk_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let real = std::fs::canonicalize(root.path()).unwrap();
+        assert_eq!(walk(root.path()), Ok(real.clone()), "precondition");
+        (root, real)
+    }
+
+    /// A symlink naming itself, by a relative or an absolute target, is
+    /// refused as too many symlinks rather than walked forever, both as the
+    /// last component and as an ancestor.
+    #[cfg(unix)]
+    #[test]
+    fn the_ancestor_walk_refuses_a_symlink_that_names_itself() {
+        let (_root, real) = walk_fixture();
+        let link = real.join("self");
+        std::os::unix::fs::symlink("self", &link).unwrap();
+        let reason = walk(&link).expect_err("a self-loop");
+        assert!(reason.contains("too many symlinks"), "{reason}");
+        let absolute = real.join("absolute-self");
+        std::os::unix::fs::symlink(&absolute, &absolute).unwrap();
+        let reason = walk(&absolute).expect_err("an absolute self-loop");
+        assert!(reason.contains("too many symlinks"), "{reason}");
+        // Reached as an ancestor rather than as the last component.
+        let reason = walk(&link.join("below")).expect_err("a self-loop above");
+        assert!(reason.contains("too many symlinks"), "{reason}");
+    }
+
+    /// A cycle of three symlinks, each naming the next, is refused as too
+    /// many symlinks whichever link the path starts at.
+    #[cfg(unix)]
+    #[test]
+    fn the_ancestor_walk_refuses_a_cycle_of_symlinks() {
+        let (_root, real) = walk_fixture();
+        std::os::unix::fs::symlink("b", real.join("a")).unwrap();
+        std::os::unix::fs::symlink(real.join("c"), real.join("b")).unwrap();
+        std::os::unix::fs::symlink("./a", real.join("c")).unwrap();
+        for start in ["a", "b", "c"] {
+            let reason = walk(&real.join(start)).expect_err("a cycle");
+            assert!(reason.contains("too many symlinks"), "{start}: {reason}");
+        }
+    }
+
+    /// A chain of 40 symlinks to a real directory is followed to it, and one
+    /// of 41 is refused: the bound counts hops, so a long chain with no
+    /// cycle in it is refused as well, at the kernel's own limit.
+    #[cfg(unix)]
+    #[test]
+    fn the_ancestor_walk_follows_forty_symlinks_and_refuses_forty_one() {
+        let (_root, real) = walk_fixture();
+        let target = real.join("target");
+        std::fs::create_dir(&target).unwrap();
+        // `l0` -> `l1` -> ... -> `l40` -> `target`: 41 links from `l0`.
+        let links = 41;
+        for n in 0..links {
+            let next = if n + 1 == links {
+                "target".to_string()
+            } else {
+                format!("l{}", n + 1)
+            };
+            std::os::unix::fs::symlink(next, real.join(format!("l{n}"))).unwrap();
+        }
+        assert_eq!(walk(&real.join("l1")), Ok(target.clone()), "40 hops");
+        let reason = walk(&real.join("l0")).expect_err("41 hops");
+        assert!(reason.contains("too many symlinks"), "{reason}");
+    }
 }
