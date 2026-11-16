@@ -43,7 +43,20 @@ Flipping the switch is a one-line pull request, and it takes effect on that pull
 - **A pull request from a fork needs someone to start its RWX run by hand** in the RWX UI.
 - **Tool caches live in the vault `dot_agent_deck_rwx_eval`, which must be LOCKED with `main` as its only permitted branch** (RWX UI: Vaults, then the vault, then Access Control), and whose "Allow public repositories" setting must stay on for GitHub-triggered runs on this public repository. RWX lets a run write a tool cache only when the vault is unlocked for it, so with that setting a pull request's run reads the caches and cannot write them, and a PR's build code cannot plant files that a later PR restores (the counterpart of `ci.yml` saving Rust caches only from `main`, #1743). The caches are written by `.rwx/ci.yml`'s daily cron (`main-tool-caches`, 04:00 UTC), which RWX runs on `main` and which keeps them inside their 48-hour lifetime. Until that first cron run after a lock, PRs build without caches (slower, not broken).
 - **Versions stay in step with local.** `.rwx/ci.yml` and `.rwx/sandbox.yml` pin the toolchain a third time, after `devbox.json` and the workflows. renovate.json's RWX customManagers bump them in the same grouped PRs as the other copies (every RWX bump is held for a human), and `scripts/check-pin-lockstep.sh` fails `cargo test-fast` when the Rust toolchain, nextest, pnpm or go-task in `.rwx/` disagree with `devbox.json`. RWX's own package versions (`git/clone`, `nodejs/install`, `rust-lang/install`) have no Renovate datasource and are bumped by hand.
-- **Reading a red:** RWX's failures are not in `gh run view`. `gh pr checks <n>` lists `RWX: linux` with a link to the run, and `rwx results <run-id>` (or `rwx logs <task-id>`) shows what failed.
+- **Reading a red:** RWX's failures are not in `gh run view`. `gh pr checks <n>` lists `RWX: linux` with a link to the run, and `rwx results <run-id>` (or `rwx logs <task-id>`) shows what failed. For every test's outcome and time, not only the failures, see [Per-test results](#per-test-results).
+
+### Per-test results
+
+`rwx results <run-id> --json` gives each task's `TestCount` and `FailedTestCount`, and its text output names the failed tests, but it does not return the tests themselves. Measured on 2026-11-16 with CLI v3.36.1 (issue #2101): `rwx results` in either format, `rwx artifacts list` on a task that declares a `test-results` output (it answers `Artifacts for task … not found`) and `rwx mcp serve`, whose one tool is `get_run_test_failures`, returned no passing test and no per-test time; the Captain API pages in RWX's docs describe endpoints for test suites and flaky tests, not for one run's results. Before this, per-test results came from parsing nextest's lines in `rwx logs`, and the TypeScript suites' could not be read at all.
+
+Each task that runs tests (`test`, the five `e2e` shards, `desktop-web`, `desktop-browser` and `desktop-driver`) also copies its JUnit file into `$RWX_ARTIFACTS` as `junit.xml` from an `EXIT` trap, so a failing task keeps it too. Read a run's files with:
+
+```bash
+scripts/rwx-junit.sh <run-id> [<out-dir>]     # <out-dir>/<task-key>/junit.xml, one per task
+rwx artifacts download <task-id> junit.xml --output junit.xml   # one task
+```
+
+The script prints `<task-key> downloaded`, `missing` or `failed` for each task that reported tests, and exits non-zero unless every one downloaded; a run from before #2101 merged reads `missing` throughout. It reads each task's latest attempt; a nextest retry inside that attempt is in the file as `<flakyFailure>`. The nextest files are the format `.config/nextest.toml` describes, the same ones `ci.yml` uploads as GitHub artifacts.
 
 ## Sandboxed runs for agents
 

@@ -239,6 +239,12 @@ tasks:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_INCREMENTAL: "0"
     run: |
+      # Issue #2101: the JUnit file as an artifact as well, whatever the exit
+      # status. RWX parses a `test-results` output into its UI and a task's
+      # `TestCount`, but the CLI (v3.36.1) returns only those counts and the
+      # failed tests, so `scripts/rwx-junit.sh` reads per-test results from
+      # this artifact (docs/develop/rwx.md, "Per-test results").
+      trap '[ -e target/nextest/default/junit.xml ] && cp target/nextest/default/junit.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       # pi-extension/'s typecheck (issue #1708), as in ci.yml's `test` job.
       (cd pi-extension && npm ci --ignore-scripts && npm run typecheck)
       cargo test-fast
@@ -324,6 +330,8 @@ tasks:
       # rule accepts (docs/develop/rwx.md, "The export chain"). GitHub's
       # runners need no such step (their root is ext4), so ci.yml runs the
       # tier without it.
+      # Issue #2101: the JUnit file as an artifact, as in the `test` task.
+      trap '[ -e target/nextest/default/junit.xml ] && cp target/nextest/default/junit.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       scripts/rwx-export-root.sh scripts/e2e-shard.sh "$SHARD" \
         cargo nextest run --archive-file e2e.tar.zst --workspace-remap . \
         --extract-to . --extract-overwrite --retries 1
@@ -372,6 +380,8 @@ tasks:
     use: [code, pnpm]
     run: |
       cd desktop
+      # Issue #2101: the JUnit file as an artifact, as in the `test` task.
+      trap '[ -e junit/vitest.xml ] && cp junit/vitest.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       pnpm install --frozen-lockfile
       pnpm test
       pnpm build
@@ -419,8 +429,9 @@ tasks:
     run: |
       cd desktop
       # The reports GHA's job uploads on failure; RWX keeps what lands in
-      # $RWX_ARTIFACTS, whatever the exit status.
-      trap 'for d in playwright-report test-results; do [ -e "$d" ] && cp -r "$d" "$RWX_ARTIFACTS/"; done; true' EXIT
+      # $RWX_ARTIFACTS, whatever the exit status. Issue #2101: the JUnit file
+      # too, as `junit.xml`, as in the `test` task.
+      trap 'for d in playwright-report test-results; do [ -e "$d" ] && cp -r "$d" "$RWX_ARTIFACTS/"; done; [ -e junit/playwright.xml ] && cp junit/playwright.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       pnpm install --frozen-lockfile
       # The browsers and their packages come from `playwright-browsers`, so this
       # downloads nothing; with no `--with-deps` it cannot fall back to the
@@ -459,7 +470,8 @@ tasks:
       export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
       cargo build --locked --bin dot-agent-deck
       cd desktop
-      trap '[ -e driver-results ] && cp -r driver-results "$RWX_ARTIFACTS/"; true' EXIT
+      # Issue #2101: the JUnit file as `junit.xml`, as in the `test` task.
+      trap '[ -e driver-results ] && cp -r driver-results "$RWX_ARTIFACTS/"; [ -e junit/driver.xml ] && cp junit/driver.xml "$RWX_ARTIFACTS/junit.xml"; true' EXIT
       pnpm install --frozen-lockfile
       pnpm test:driver:types
       VITE_DAD_DRIVER_SEAM=1 pnpm tauri build --debug --no-bundle
