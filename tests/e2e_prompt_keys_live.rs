@@ -430,7 +430,7 @@ fn exercise_reading_reply(
     assert_running(deck, agent_id, "the completed reading turn");
 }
 
-/// Scenario: Open a real interactive OpenCode pane on the cheap test model with a uniquely named sentinel file and subscribe before asking it to discover the filename. Its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
+/// Scenario: Open a real interactive OpenCode pane on the cheap test model with a uniquely named sentinel file, wait for its submit-ready mode line, and subscribe before asking it to discover the filename. Its successful final reply must contain the sentinel, appear in the attached pane, and arrive exactly once during a five-second duplicate-delivery check.
 #[spec("voice/reading-reply/004")]
 #[test]
 fn reading_reply_004_real_opencode_delivers_sentinel_once_to_subscribed_client() {
@@ -439,7 +439,7 @@ fn reading_reply_004_real_opencode_delivers_sentinel_once_to_subscribed_client()
     const SENTINEL: &str = "reading_reply_sentinel_opencode_b6d9.txt";
     let launch = AgentLaunch {
         name: "reading-reply-opencode",
-        ready: "Ask anything",
+        ready: common::OPENCODE_SUBMIT_READY,
         resubmit_until_empty: false,
     };
     let command = common::opencode_interactive_command(false, false, "");
@@ -1003,12 +1003,7 @@ fn prompt_voice_keys_004_codex_honours_the_served_keys() {
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);
 }
 
-/// Scenario: Start a genuine interactive OpenCode pane on the cheap test model,
-/// read the keys the daemon serves for it, and write them on an attach stream
-/// as the desktop does — the interrupt's two Esc writes with the served pause
-/// between them: delete removes exactly a dictated tail, clear empties the
-/// prompt, interrupt stops a long numbered list mid-way, and a follow-up prompt
-/// naming a fixture file is answered with the agent still running.
+/// Scenario: Start a genuine interactive OpenCode pane on the cheap test model and wait for its submit-ready mode line. Write the daemon's served keys on an attach stream as the desktop does: delete removes exactly a dictated tail, clear empties the prompt, interrupt stops a long numbered list mid-way, and a follow-up prompt naming a fixture file is answered with the agent still running.
 #[spec("prompt/voice-keys/005")]
 #[test]
 fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
@@ -1017,7 +1012,7 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
     const SENTINEL: &str = "voicekeys_parity_sentinel_opencode_7f15.txt";
     let launch = AgentLaunch {
         name: "voicekeys-opencode",
-        ready: "Ask anything",
+        ready: common::OPENCODE_SUBMIT_READY,
         resubmit_until_empty: false,
     };
     let command = common::opencode_interactive_command(false, false, "");
