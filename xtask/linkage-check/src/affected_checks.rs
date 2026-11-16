@@ -571,24 +571,47 @@ pub(crate) fn is_fmt_write(planned: &[String]) -> bool {
 
 /// The files rustfmt's `-l` listed, repo-relative where they are under `root`
 /// (cargo hands rustfmt absolute paths), in the order given, blank lines dropped.
+///
+/// rustfmt separates the names with newlines and escapes nothing, so a file
+/// whose name contains a newline arrives as several lines. Lines are therefore
+/// joined back while together they name an existing file and apart they do not;
+/// a fragment that never names a file is reported as it was printed, rather
+/// than swallowing the lines after it.
 pub(crate) fn reformatted_files(root: &Path, listing: &str) -> Vec<String> {
+    let exists = |name: &str| !name.is_empty() && root.join(name).is_file();
+    let mut names: Vec<String> = Vec::new();
+    let mut pending: Vec<&str> = Vec::new();
+    for line in listing.split('\n') {
+        if line.is_empty() && pending.is_empty() {
+            continue;
+        }
+        pending.push(line);
+        let joined = pending.join("\n");
+        if exists(&joined) {
+            names.push(joined);
+            pending.clear();
+        } else if pending.len() > 1 && exists(line) {
+            // The earlier fragments named no file together: report each.
+            names.extend(pending[..pending.len() - 1].iter().map(|f| f.to_string()));
+            names.push(line.to_string());
+            pending.clear();
+        }
+    }
+    names.extend(pending.iter().map(|f| f.to_string()));
+    names.retain(|name| !name.trim().is_empty());
+
     let roots: Vec<std::path::PathBuf> = [Some(root.to_path_buf()), root.canonicalize().ok()]
         .into_iter()
         .flatten()
         .collect();
-    listing
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(|line| {
-            let path = Path::new(line);
+    names
+        .into_iter()
+        .map(|name| {
+            let path = Path::new(&name);
             roots
                 .iter()
                 .find_map(|r| path.strip_prefix(r).ok())
-                .map_or_else(
-                    || line.to_string(),
-                    |rel| rel.to_string_lossy().into_owned(),
-                )
+                .map_or_else(|| name.clone(), |rel| rel.to_string_lossy().into_owned())
         })
         .collect()
 }
@@ -2117,6 +2140,31 @@ mod tests {
             let listing = format!("{}\n", canonical.join("src/x.rs").display());
             assert_eq!(reformatted_files(&link, &listing), paths(&["src/x.rs"]));
         }
+    }
+
+    /// A rewritten file whose name contains a newline is one file in the
+    /// report, not two, and a listed name that is not a file does not swallow
+    /// the names after it.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_name_with_a_newline_is_reported_as_one_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonicalize");
+        std::fs::write(root.join("a\nb.rs"), "").expect("write");
+        std::fs::write(root.join("a.rs"), "").expect("write");
+        let listing = format!(
+            "{root}/a\nb.rs\n/gone/x.rs\n{root}/a.rs\n",
+            root = root.display()
+        );
+        let files = reformatted_files(&root, &listing);
+        assert_eq!(files, paths(&["a\nb.rs", "/gone/x.rs", "a.rs"]));
+        assert_eq!(
+            fmt_report(&files),
+            "affected-checks: `cargo fmt` reformatted 3 file(s); stage them before you commit:\n\
+             affected-checks:   a\\nb.rs\n\
+             affected-checks:   /gone/x.rs\n\
+             affected-checks:   a.rs\n"
+        );
     }
 
     #[test]
