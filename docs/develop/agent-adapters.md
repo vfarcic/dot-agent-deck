@@ -13,7 +13,7 @@ The agent set is a **curated, compiled-in registry** ([`src/agent_registry.rs`](
 
 So the two shapes of "add an agent" are:
 
-- **Reuse a shipped strategy** → a registry entry (+ any strategy-specific *data*, e.g. a wrapper rule set) + a release. This is the cheap, common path. Codex, Gemini, and any other stdout-emitting CLI are this.
+- **Reuse a shipped strategy** → a registry entry (+ any strategy-specific *data*, e.g. a wrapper rule set) + a release. This is the cheap, common path. Devin and Antigravity are this on `NativeHooks`, and any stdout-emitting CLI could be this on `Wrapper`.
 - **Introduce a genuinely new mechanism** → implement a new [`IntegrationStrategy`] **once**, then it is a registry entry thereafter. Aider's log-watcher is this: the *first* log-watcher agent pays for the strategy; the second is config.
 
 ## The four shipped integration strategies
@@ -22,7 +22,7 @@ Events reach the deck by different mechanisms per agent — that is why this lay
 
 | Strategy | Reference agent | Mechanism | Install / activation | Module |
 |---|---|---|---|---|
-| `NativeHooks` | Claude Code, Devin | Hook scripts installed into the agent's own config that shell back to the deck | Machine-global, at TUI startup (`auto_install`) | [`src/hooks_manage.rs`](../../src/hooks_manage.rs), [`src/devin_hooks_manage.rs`](../../src/devin_hooks_manage.rs) |
+| `NativeHooks` | Claude Code, Devin, Antigravity | Hook scripts installed into the agent's own config that shell back to the deck | Machine-global, at TUI startup (`auto_install`) | [`src/hooks_manage.rs`](../../src/hooks_manage.rs), [`src/devin_hooks_manage.rs`](../../src/devin_hooks_manage.rs), [`src/antigravity_hooks_manage.rs`](../../src/antigravity_hooks_manage.rs) |
 | `Plugin` | OpenCode | A JS plugin materialized into the agent's plugin directory | Machine-global, at TUI startup (`auto_install`) | [`src/opencode_manage.rs`](../../src/opencode_manage.rs) |
 | `Extension` | Pi | A bundled TypeScript extension materialized into the agent's HOME (`include_str!`) | Auto-materialized at spawn time (guarded on the spawn command being `pi`) | [`src/orchestrator_ext.rs`](../../src/orchestrator_ext.rs) — see [pi-extension.md](pi-extension.md) |
 | `Wrapper` | Codex | `dot-agent-deck wrap -- <cmd>` spawns the agent, passes stdio through transparently, and tees stdout/stderr through pattern detection into events | No install step — the launch command is rewritten to wrap the agent | [`src/wrap.rs`](../../src/wrap.rs) |
@@ -33,7 +33,7 @@ The startup installer dispatches on the strategy from the registry rather than f
 
 ### Why Codex is the worked example
 
-Codex is the first **wrapper** agent, and a wrapped session is the first place the `live_target` / `send_result` distinction actually bites (below). It exercises every seam a "reuse a shipped strategy" agent touches — a new `AgentType`, a registry entry, a wrapper rule set, a live-target declaration, a badge colour, and the full test ladder — without needing a brand-new mechanism. If you can follow the Codex change, you can add Gemini by analogy in an afternoon.
+Codex is the first, and so far the only, **wrapper** agent, and a wrapped session is the first place the `live_target` / `send_result` distinction actually bites (below). It exercises every seam a "reuse a shipped strategy" agent touches — a new `AgentType`, a registry entry, a wrapper rule set, a live-target declaration, a badge colour, and the full test ladder — without needing a brand-new mechanism. If you can follow the Codex change, you can add another wrapper agent by analogy.
 
 ## The `AgentEvent` contract (what every strategy produces)
 
@@ -87,7 +87,7 @@ pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX];
 
 ### 3. Wire the integration strategy
 
-**If you are reusing the `Wrapper` strategy (the cheap path — Codex, Gemini):** you write *no new mechanism*, only *data*. Add a [`RuleSet`] in [`src/wrap.rs`](../../src/wrap.rs) and select it by agent type in `ruleset_for`. **Write its markers against a capture of the process the wrapper actually spawns**, not against a documented output mode it does not launch — Codex's set is the cautionary case (issue #540):
+**If you are reusing the `Wrapper` strategy (Codex is the one agent on it):** you write *no new mechanism*, only *data*. Add a [`RuleSet`] in [`src/wrap.rs`](../../src/wrap.rs) and select it by agent type in `ruleset_for`. **Write its markers against a capture of the process the wrapper actually spawns**, not against a documented output mode it does not launch — Codex's set is the cautionary case (issue #540):
 
 ```rust
 pub static CODEX: RuleSet = RuleSet {
@@ -211,9 +211,9 @@ Adding an agent is only "done" when it is covered at every layer the shipped age
 
 ## Follow-up agents built on this seam
 
-Two follow-up PRDs build directly on the PRD #20 machinery documented here:
+Follow-up agents build directly on the PRD #20 machinery documented here:
 
-- **Gemini** — a **wrapper**-strategy agent, so a thin registry entry + a Gemini-specific `classify_line` rule set + detection + e2e. It reuses `dot-agent-deck wrap` wholesale; the PRD is small *because the wrapper strategy already exists*.
+- **Antigravity** ([PRD #211](https://github.com/vfarcic/dot-agent-deck/issues/211), Google's `agy`, its successor to Gemini CLI; the Gemini wrapper agent an earlier version of this page planned was never built, and Gemini CLI is out of that PRD's scope) ships on the **`NativeHooks`** strategy, not the wrapper: [`src/antigravity_hooks_manage.rs`](../../src/antigravity_hooks_manage.rs) owns one named hook in `agy`'s global `~/.gemini/config/hooks.json`. Its hooks do not report a permission prompt or an interrupted turn, so its status also comes from the OSC 7501 sequences `agy` writes to its terminal when `AGY_CLI_OSC7501=on` is in its environment ([`src/status_osc.rs`](../../src/status_osc.rs), switched on per agent by `AgentSpec::status_osc7501`; Antigravity is the one agent that switches it on). How the inbox reaches it is in [Agent messaging](agent-messaging.md#antigravity-prd-211). Codex remains the only `Wrapper` agent.
 - **Aider** — introduces the **new log-watcher** strategy (`dot-agent-deck watch --agent aider --log <path>` tailing Aider's structured logs into `AgentEvent`s). That PRD carries the one-time log-watcher `IntegrationStrategy` implementation; every log-watching agent after it is back on the cheap path.
 
 ### Devin — the second `NativeHooks` agent

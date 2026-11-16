@@ -12471,8 +12471,8 @@ fn dispatch_action(
                     } else {
                         AgentType::from_command(Some(req.command.as_str()))
                     };
-                    // PRD #20 M8: Wrapper-strategy agents (Codex now; Gemini
-                    // later) launch WRAPPED so their stdout is monitored
+                    // PRD #20 M8: Wrapper-strategy agents (Codex is the only
+                    // one) launch WRAPPED so their stdout is monitored
                     // transparently, but the wrap is applied by the DAEMON, not
                     // here: this command goes out BARE with `spawn_agent_type` as
                     // `StartAgent.agent_type`, and `agent_pty`'s common spawn

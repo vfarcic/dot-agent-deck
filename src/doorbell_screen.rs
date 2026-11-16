@@ -1027,10 +1027,7 @@ fn antigravity_placeholder(text: &str) -> bool {
 /// `dim`, the placeholder style the profile reads ([`antigravity_placeholder`]).
 ///
 /// The cursor sits right after the text, or at column 2 of an empty
-/// composer, in every measured frame. The e2e build's stand-in
-/// (`tests/fixtures/antigravity/agy`) parks it under its footer instead;
-/// [`antigravity_cursor_parked`] lets that build read a cursor there as one
-/// that edits nothing.
+/// composer, in every measured frame.
 fn antigravity_composer(grid: &Grid) -> Option<Composer> {
     let prompt_row = (1..grid.rows).rev().find(|&r| {
         grid.cell(r, 0).is_some_and(|c| c.text == ">")
@@ -1065,12 +1062,11 @@ fn antigravity_composer(grid: &Grid) -> Option<Composer> {
     } else {
         grid.text_from(last_row, 0).chars().count() as u16
     };
-    let cursor_at_end = antigravity_cursor_parked(grid, close)
-        || if text.is_empty() || placeholder {
-            grid.cursor == (prompt_row, ANTIGRAVITY_INDENT)
-        } else {
-            grid.cursor == (last_row, end_col)
-        };
+    let cursor_at_end = if text.is_empty() || placeholder {
+        grid.cursor == (prompt_row, ANTIGRAVITY_INDENT)
+    } else {
+        grid.cursor == (last_row, end_col)
+    };
     Some(Composer {
         prompt_row,
         last_row,
@@ -1079,13 +1075,6 @@ fn antigravity_composer(grid: &Grid) -> Option<Composer> {
         cursor_at_end,
         hidden,
     })
-}
-
-/// Whether the e2e build's Antigravity stand-in has parked its cursor under
-/// the composer's closing rule (row `close`), where it edits nothing. Always
-/// `false` outside the e2e build: a real `agy` keeps its cursor in the box.
-fn antigravity_cursor_parked(grid: &Grid, close: u16) -> bool {
-    cfg!(feature = "e2e") && grid.cursor.0 > close
 }
 
 /// The ready screen: the composer framed by two full-width rules, and

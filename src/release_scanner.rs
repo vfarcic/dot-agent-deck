@@ -122,31 +122,9 @@ pub const ANTIGRAVITY_HEADER: HeaderRecogniser = HeaderRecogniser {
     end: VersionEnd::BlankPassed,
 };
 
-/// The header the e2e build's Antigravity stand-in
-/// (`tests/fixtures/antigravity/agy`) draws: the same words with no logo, at
-/// row 0, column 0. Recognised only by the e2e build ([`HEADER_RECOGNISERS`]).
-pub const ANTIGRAVITY_STANDIN_HEADER: HeaderRecogniser = HeaderRecogniser {
-    agent: AgentType::Antigravity,
-    row: 0,
-    col: 0,
-    text: "Antigravity CLI ",
-    end: VersionEnd::BlankPassed,
-};
-
 /// Every header the deck recognises.
-#[cfg(not(feature = "e2e"))]
 pub const HEADER_RECOGNISERS: &[HeaderRecogniser] =
     &[CODEX_HEADER, CLAUDE_HEADER, ANTIGRAVITY_HEADER];
-
-/// Every header the deck recognises, and the e2e build's Antigravity
-/// stand-in's.
-#[cfg(feature = "e2e")]
-pub const HEADER_RECOGNISERS: &[HeaderRecogniser] = &[
-    CODEX_HEADER,
-    CLAUDE_HEADER,
-    ANTIGRAVITY_HEADER,
-    ANTIGRAVITY_STANDIN_HEADER,
-];
 
 /// A cell's text, with an untouched cell read as a blank.
 fn cell_char(screen: &vt100::Screen, row: u16, col: u16) -> Option<char> {

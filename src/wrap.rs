@@ -510,8 +510,8 @@ fn tee<R: Read, W: Write>(mut reader: R, mut writer: W, mut on_line: impl FnMut(
 /// [`IntegrationStrategy::Wrapper`](crate::agent_registry::IntegrationStrategy::Wrapper)
 /// mechanism, so the agent's stdout is monitored transparently.
 ///
-/// Called at the TUI new-agent spawn site: a Wrapper-strategy agent (Codex now;
-/// Gemini later) launches as
+/// Called at the TUI new-agent spawn site: a Wrapper-strategy agent (Codex is
+/// the only one) launches as
 /// `dot-agent-deck wrap --agent <registry-basename> -- <command>` while its
 /// Command field, `last_command`, and persisted metadata keep the bare base
 /// command. `--agent <basename>` pins the identity through the registry
