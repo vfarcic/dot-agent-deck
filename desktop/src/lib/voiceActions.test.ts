@@ -396,15 +396,41 @@ describe("VOICE_ACTIONS", () => {
     expect(screen.queryByText("That agent is not on the dashboard any more, so nothing was sent.")).not.toBeInTheDocument();
   });
 
-  /// Scenario: With on-screen names withheld, a bare generate config dispatch has no agent parameter. It opens the viewed agent's neutral confirmation, and Yes sends only to that pane's captured process.
-  it("desktop/config-gen/003: a nameless pane dispatch confirms the viewed agent", async () => {
+  /// Scenario: With on-screen names withheld, a nameless config request resolves after the user either stays in the same pane or switches to another agent. A switched pane shows the stop-style refusal without confirming or sending; the unchanged pane opens its neutral confirmation and Yes sends only to the original process.
+  it.each([
+    ["generate config", "unchanged"],
+    ["generate config", "other-agent"],
+    ["please create an orchestration configuration", "unchanged"],
+    ["please create an orchestration configuration", "other-agent"],
+  ] as const)("desktop/config-gen/003: a delayed nameless pane dispatch holds its original agent (%s, %s)", async (said, change) => {
     const privateSettings: DesktopSettingsDto = { ...DEFAULT_DESKTOP_SETTINGS, voice: { ...DEFAULT_VOICE_SETTINGS, labels: "withheld" } };
-    const { deck, resolveVoice } = renderDashboardVoice("generate config", "overview", {
-      kind: "dispatch", transcript: "generate config", action: "generate_config", invoke: "confirmGenerateConfig", params: [],
+    const outcome: VoiceResultDto["outcome"] = {
+      kind: "dispatch", transcript: said, action: "generate_config", invoke: "confirmGenerateConfig", params: [],
       sentence: "Confirm generating config — nothing has been sent yet.",
-    }, { getSettings: vi.fn(async () => ({ settings: privateSettings })) });
+    };
+    let release!: (result: VoiceResultDto) => void;
+    const pending = new Promise<VoiceResultDto>((resolve) => { release = resolve; });
+    const { deck } = renderDashboardVoice(said, "overview", outcome, {
+      getSettings: vi.fn(async () => ({ settings: privateSettings })),
+      resolveVoice: vi.fn(() => pending),
+    });
     fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[0]);
-    await speakDashboardCommand(resolveVoice);
+    await speakDashboardCommand(deck.resolveVoice as ReturnType<typeof vi.fn>);
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    if (change === "other-agent") {
+      fireEvent.keyDown(document.body, { key: "Escape" });
+      await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).toBeNull());
+      fireEvent.click(screen.getAllByRole("button", { name: /^Open .* agent$/ })[1]);
+      expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading")).toHaveTextContent("filter-voice-agent-2");
+    }
+    await act(async () => release({ outcome, resolveMs: 21, backend: "stub" }));
+    if (change === "other-agent") {
+      expect.soft(screen.queryByRole("alertdialog"), "a delayed request for the first agent must not confirm the second agent").toBeNull();
+      expect.soft(screen.getByTestId("voice-report")).toHaveTextContent("Nothing ran — the pane on screen changed. Say it again.");
+      expect(deck.generateConfig).not.toHaveBeenCalled();
+      expect(deck.runAction).not.toHaveBeenCalled();
+      return;
+    }
     const dialog = screen.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
     expect(deck.generateConfig).not.toHaveBeenCalled();
     await act(async () => fireEvent.click(within(dialog).getByRole("button", { name: "Yes" })));
