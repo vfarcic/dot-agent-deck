@@ -460,7 +460,11 @@ GATES — CLAUDE.md is the authority, this is the summary:
   `cargo test-e2e` run, and a `cargo test-fast` or `cargo nextest` run
   filtered to a single test, since a filter narrows what runs, not what compiles) goes
   through `rwx sandbox exec -- <command>`, `cargo mutants` included (do not
-  raise its `--jobs`), so the compile leaves this shared machine. Split a
+  raise its `--jobs`), so the compile leaves this shared machine. An e2e
+  test run there goes through `scripts/rwx-export-root.sh`
+  (`rwx sandbox exec -- scripts/rwx-export-root.sh cargo test-e2e <filter>`):
+  without it the sandbox fails e2e tests that pass in CI
+  (docs/develop/rwx.md, "The export chain"). Split a
   command that could run past 30 minutes into several execs
   (`cargo mutants --shard k/n`, test filters): RWX kills one exec at 30
   minutes and stops the sandbox with it. Do not run
