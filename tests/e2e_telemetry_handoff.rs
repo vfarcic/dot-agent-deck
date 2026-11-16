@@ -21,21 +21,17 @@ use telemetry_operation_receiver::{EXPORT_WAIT, Receiver, attribute, nanos};
 const TASK: &str = "PRIVATE_HANDOFF_TASK_1981_7e093c";
 const REPORT: &str = "PRIVATE_HANDOFF_REPORT_1981_58b21a";
 
+/// A deck with the worker-response timeout off, so no idle-worker report can
+/// land in an orchestrator's inbox; the blocked-worker report does not depend
+/// on it (issue #2230).
 fn launch(receiver: &Receiver) -> TuiDeck {
-    launch_with_response_timeout(receiver, "0")
-}
-
-/// [`launch`] with the worker-response timeout at `ms`. The blocked-worker
-/// notice rides the idle-worker watch's delegation record, which is armed only
-/// while that timeout is on.
-fn launch_with_response_timeout(receiver: &Receiver, ms: &str) -> TuiDeck {
     let deck = TuiDeck::builder()
         .without_agent_credentials()
         .impersonating_pane_signals()
         // These synthetic tests run CLI components from the test process with
         // fixture-owned capability tokens, rather than inside a real agent.
         .with_env("DOT_AGENT_DECK_INBOX_TEST_UNBOUND_COMPONENTS", "1")
-        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", ms)
+        .with_env("DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS", "0")
         .with_env("DOT_AGENT_DECK_INBOX_UNDELIVERED_NOTICE_AFTER_MS", "300000")
         .with_env("DOT_AGENT_DECK_WAITING_NOTICE_DEBOUNCE_MS", "300")
         .with_env("OTEL_EXPORTER_OTLP_ENDPOINT", &receiver.endpoint)
@@ -336,8 +332,9 @@ fn telemetry_otlp_039_handoff_marks_exited_worker_undeliverable() {
 #[test]
 fn telemetry_otlp_047_failed_worker_ends_its_handoff_promptly() {
     let receiver = Receiver::start();
-    // An hour: on, so the blocked-worker notice is owed, and never due here.
-    let deck = launch_with_response_timeout(&receiver, "3600000");
+    // The worker-response timeout is off: the blocked-worker notice below is
+    // owed whatever it is (issue #2230).
+    let deck = launch(&receiver);
     let (orch, worker) = route::team(&deck, false);
     let id = delegate(&deck, &orch, &worker);
     cli(&deck, &worker, &["inbox", "fetch", "--json"]);

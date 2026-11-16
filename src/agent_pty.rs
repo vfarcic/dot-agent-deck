@@ -8916,13 +8916,13 @@ struct DelegationTracker {
     ///
     /// A third map rather than a field on `records` because it must answer a
     /// question neither watch can: *did the orchestrator ask for this at all?*
-    /// Both of those maps are populated only when their detector is switched on
-    /// and their panes are healthy, so an ABSENT record there means "no
-    /// delegation, or a delegation whose detector is off, or one armed while a
-    /// pane was closing" — three states that must be told apart, because in the
-    /// disabled-detector one the completion is entirely genuine. This ledger is
-    /// armed for every delegate the daemon dispatches regardless of either
-    /// timeout, so `Unsolicited` here means what it says.
+    /// Neither of those maps is armed for every delegation (`records` skips an
+    /// orchestrator with no live agent and a pane mid-close, and skipped a
+    /// disabled idle detector until issue #2230; the waiting notices need their
+    /// own detector on), so an ABSENT record there does not mean "no
+    /// delegation", and a completion without one can be entirely genuine. This
+    /// ledger is armed for every delegate the daemon dispatches regardless of
+    /// either timeout, so `Unsolicited` here means what it says.
     commissions: HashMap<String, DelegationCommission>,
     /// Issue #590: per worker pane, how many armed commissions belong to a
     /// dispatch task that has not yet taken that pane's
@@ -9405,11 +9405,12 @@ impl Drop for CommissionDispatchInFlight {
 ///
 /// This is deliberately NOT derived from [`DelegationRetirement`]. Its `Nothing`
 /// arm is not a reliable proxy for "never delegated": the idle detector arms no
-/// record when `worker_response_timeout_minutes = 0`, when the orchestrator pane
-/// has no live registry agent, or when either pane is mid-close — and in the
-/// first of those the completion is genuine and must still be reported as such.
-/// Reading `Nothing` as "unsolicited" would silently mislabel every completion
-/// in every project that has turned the detector off.
+/// record when the orchestrator pane has no live registry agent or when either
+/// pane is mid-close, and until issue #2230 it armed none when
+/// `worker_response_timeout_minutes = 0` either — a completion in any of those
+/// is genuine and must still be reported as such. Reading `Nothing` as
+/// "unsolicited" silently mislabelled every completion in every project that
+/// had turned the detector off.
 // `Clone, Copy` for parity with its sibling `state::WorkDoneReportChannel`
 // (issue #448 review, finding 7 minor): both are small plain enums describing one
 // completion, and a caller that has to `match`-and-rebuild one but not the other
