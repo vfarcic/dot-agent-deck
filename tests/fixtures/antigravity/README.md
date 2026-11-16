@@ -25,6 +25,7 @@ Hook payloads, hook outputs and OSC 7501 status sequences captured from a real A
 | `output-pre-invocation-inject-steps.json` | a `PreInvocation` output `agy` honoured: the nested `systemMessage` object reached the model | written by the probe, behaviour captured |
 | `output-pre-invocation-inject-steps-rejected.json` | the string form of `systemMessage`, which `agy` rejected (`failed to unmarshal result … via protojson`) and ignored | written by the probe, behaviour captured |
 | `osc7501-sequences.json` | every distinct OSC 7501 sequence `agy` wrote (`sequences`, with the exact bytes and the decoded `msg`), and the order they came in for each scenario (`scenarios`) | captured; `scenarios` transcribed from the driver's event log |
+| `permission-menu.json` | Command permission labels drawn by real interactive `agy` 1.5.9, plus the two-choice file creation menu (also drawn when `write_file` overwrites an existing file); digits 1–3 run a scratch command without Enter, while digit 4 and Esc leave its target untouched; file creation accepts 1 and denies 2 | measured through the daemon attach stream; scratch command filename normalized to the OSC fixture's `probe.txt` |
 
 ## Synthetic terminal geometry
 

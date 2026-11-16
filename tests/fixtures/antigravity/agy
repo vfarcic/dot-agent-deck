@@ -13,6 +13,7 @@ import termios
 import re
 import signal
 import textwrap
+import base64
 
 
 if "--version" in sys.argv:
@@ -27,10 +28,22 @@ capture = (root / "input.bytes").open("ab", buffering=0)
 line = bytearray()
 state = "booting"
 placeholder = True
+permission_menu = None
+permission_prompt = ""
 
 
 def redraw():
     width = os.get_terminal_size(0).columns
+    if permission_menu is not None:
+        menu = json.loads((root / "permission-menu.json").read_text())
+        if permission_menu is not True:
+            menu = menu[permission_menu]
+        options = "\r\n".join(
+            f"  {option['key']}. {option['label']}" for option in menu["options"]
+        )
+        sys.stdout.write("\033[2J\033[H" + permission_prompt + "\r\n" + options + "\r\nEsc to cancel\r\n")
+        sys.stdout.flush()
+        return
     content = line.decode(errors="replace")
     hint = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)"
     rows = textwrap.wrap(content or (hint if placeholder else ""), width=max(1, width - 2)) or [""]
@@ -53,7 +66,7 @@ def redraw():
 
 
 def replay(action):
-    global state
+    global state, permission_menu, permission_prompt
     if "hook" in action:
         payload = json.loads((root / action["hook"]).read_text())
         # The capture's workspace is sanitized; retain its measured event shape
@@ -98,6 +111,20 @@ def replay(action):
             history.write(json.dumps(action) + "\n")
     elif "pause_ms" in action:
         time.sleep(action["pause_ms"] / 1000)
+    elif "permission_menu" in action:
+        permission_menu = action["permission_menu"]
+        menu = json.loads((root / "permission-menu.json").read_text())
+        if permission_menu is not True:
+            menu = menu[permission_menu]
+        permission_prompt = action.get("prompt", menu["prompt"])
+        redraw()
+        if permission_menu is not True:
+            # The label source is a measured menu, with this fixture's own
+            # isolated path in place of the real measurement's scratch path.
+            encoded = base64.b64encode(permission_prompt.encode()).decode()
+            sys.stdout.write(f"\033]7501;state=blocked:kind=permission:app=antigravity:msg={encoded}\007")
+            sys.stdout.flush()
+            state = "blocked"
     else:
         raise ValueError(action)
 
@@ -140,7 +167,14 @@ while True:
         with (root / "input-history.jsonl").open("a") as history:
             history.write(json.dumps({"state": state, "bytes": list(chunk)}) + "\n")
         for c in chunk:
-            if c == 13:
+            if permission_menu is not None:
+                if c in (49, 50, 51, 52):
+                    (root / "permission-answer.txt").write_text(chr(c))
+                    permission_menu = None
+                    (root / "delivered.txt").write_text(f"AGY-PERMISSION-ANSWER-{chr(c)}")
+                    replay({"osc": "working"})
+                    replay({"osc": "idle"})
+            elif c == 13:
                 value = line.decode(errors="replace")
                 line.clear()
                 placeholder = True

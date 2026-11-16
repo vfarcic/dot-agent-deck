@@ -4,6 +4,8 @@
 //! The stand-in prints no status text: assertions read the dashboard card.
 
 dot_agent_deck_test_harness::link!();
+#[path = "common/questions.rs"]
+mod questions;
 
 use common::TuiDeck;
 use serde_json::{Value, json};
@@ -148,10 +150,13 @@ fn antigravity_status_002_error_stop_shows_its_error_text() {
     replay.card("Error", "generating and executing", "Stop ERROR");
 }
 
-/// Scenario: An Antigravity stand-in writes the captured OSC permission signal, then working, then another permission followed by idle. The card shows Needs Input with the decoded question and clears the question when it recovers to Thinking or Idle respectively.
+/// Scenario: An Antigravity stand-in writes captured permission OSC signals followed by working or idle; the dashboard shows Needs Input with the decoded question and then clears it. For each measured permission option, the attached pane draws the real menu, the deck offers the same options and an answer sends the matching digit without Enter, with always-allow requiring confirmation, before the pane visibly resumes and the question clears.
 #[spec("antigravity/status/003")]
 #[test]
 fn antigravity_status_003_permission_question_decodes_and_clears() {
+    use dot_agent_deck::daemon_client::{AnswerReport, DaemonClient};
+    use dot_agent_deck::question::{AnswerChannel, AnswerRefusal, OptionRole};
+
     let replay = Replay::launch("./agy");
     for recovery in ["working", "idle"] {
         replay.replay(json!([{"osc": "blocked", "kind": "permission", "msg": QUESTION}]));
@@ -166,6 +171,177 @@ fn antigravity_status_003_permission_question_decodes_and_clears() {
             recovery,
         );
     }
+
+    // Measured against real agy 1.5.9 in a seeded scratch HOME on
+    // 2026-11-16. permission-menu.json records its screen-only labels;
+    // the OSC payload carries the question, never the option list.
+    let menu: Value =
+        serde_json::from_str(include_str!("fixtures/antigravity/permission-menu.json")).unwrap();
+    for selected in 1..=4 {
+        let replay = Replay::launch("./agy");
+        replay.replay(json!([
+            {"permission_menu": true},
+            {"osc": "blocked", "kind": "permission", "msg": QUESTION}
+        ]));
+        replay.card("Needs Input", QUESTION, "measured permission menu");
+        let id = questions::agent_id(&replay.deck);
+        assert!(
+            common::wait_until(Duration::from_secs(15), || {
+                questions::snapshot(&replay.deck, &id)
+                    .is_some_and(|live| live.pending_question.is_some())
+            }),
+            "Antigravity permission OSC must offer a PendingQuestion with its measured menu; live={:?}\n{}",
+            questions::snapshot(&replay.deck, &id),
+            replay.diagnostic()
+        );
+        let q = questions::snapshot(&replay.deck, &id)
+            .unwrap()
+            .pending_question
+            .unwrap();
+        assert_eq!(q.kind, dot_agent_deck::question::QuestionKind::Permission);
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        assert_eq!(q.questions.len(), 1);
+        assert_eq!(q.questions[0].prompt, QUESTION);
+        assert!(!q.questions[0].multi_select);
+        let options = &q.questions[0].options;
+        assert_eq!(options.len(), 4, "the measured menu: {q:?}");
+        for (option, expected) in options.iter().zip(menu["options"].as_array().unwrap()) {
+            assert_eq!(
+                option.index,
+                expected["key"].as_str().unwrap().parse::<u32>().unwrap()
+            );
+            assert_eq!(option.label, expected["label"].as_str().unwrap());
+            assert!(
+                !option.keyboard_only,
+                "measured option must be answerable: {option:?}"
+            );
+            assert!(!option.maybe_hidden);
+        }
+        assert_eq!(options[0].role, OptionRole::AllowOnce);
+        assert_eq!(options[1].role, OptionRole::AllowAlways);
+        assert_eq!(options[2].role, OptionRole::AllowAlways);
+        assert_eq!(options[3].role, OptionRole::Deny);
+        for option in &options[1..3] {
+            assert!(
+                option.scope.as_ref().is_some_and(|scope| !scope.is_empty()),
+                "always allow must name what is approved: {option:?}"
+            );
+            assert!(
+                option.scope.as_ref().unwrap().contains("rm -f probe.txt"),
+                "scope must include the measured command prefix: {option:?}"
+            );
+        }
+        assert!(options[1].scope.as_ref().unwrap().contains("conversation"));
+        assert!(options[2].scope.as_ref().unwrap().contains("settings.json"));
+        replay.deck.send_bytes(b"1");
+        for expected in menu["options"].as_array().unwrap() {
+            replay
+                .deck
+                .wait_for_string(expected["label"].as_str().unwrap());
+        }
+        let before = std::fs::read(replay.deck.workdir().join("input.bytes"))
+            .unwrap_or_default()
+            .len();
+        let answers = vec![questions::selection(0, &[selected])];
+        if (2..=3).contains(&selected) {
+            assert_eq!(
+                questions::answer(&replay.deck, &id, &q, answers.clone()),
+                AnswerReport::Refused(AnswerRefusal::AlwaysNotConfirmed)
+            );
+            assert!(!replay.deck.workdir().join("permission-answer.txt").exists());
+        }
+        let client = DaemonClient::new(replay.deck.attach_socket_path().to_path_buf());
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(client.answer_question_while(|| true, &id, &q.id, q.revision, answers, true))
+            .expect("answer the measured Antigravity permission");
+        assert_eq!(result, AnswerReport::Answered);
+        replay
+            .deck
+            .wait_for_string(&format!("AGY-PERMISSION-ANSWER-{selected}"));
+        assert_eq!(
+            std::fs::read_to_string(replay.deck.workdir().join("permission-answer.txt")).unwrap(),
+            selected.to_string()
+        );
+        let captured = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap();
+        assert_eq!(
+            &captured[before..],
+            selected.to_string().as_bytes(),
+            "one measured digit, no Enter"
+        );
+        replay.deck.send_bytes(b"\x04");
+        replay.cleared_question("Idle", "the selected permission answer");
+        assert!(
+            questions::snapshot(&replay.deck, &id)
+                .unwrap()
+                .pending_question
+                .is_none()
+        );
+    }
+
+    // File creation is a two-option menu, not Bash's four-option menu.
+    // Its OSC wording was measured alongside the menu on agy 1.5.9.
+    for selected in [1, 2] {
+        let replay = Replay::launch("./agy");
+        let prompt = format!(
+            "Approve Edit: Write: {}",
+            replay.deck.workdir().join("question-create.txt").display()
+        );
+        replay.replay(json!([{"permission_menu": "create", "prompt": prompt}]));
+        let id = questions::agent_id(&replay.deck);
+        let q = questions::pending(
+            &replay.deck,
+            &id,
+            dot_agent_deck::question::QuestionKind::Permission,
+        );
+        assert_eq!(q.channel, AnswerChannel::Keys);
+        let options = &q.questions[0].options;
+        assert_eq!(
+            options.len(),
+            2,
+            "file creation has no always-allow options: {q:?}"
+        );
+        assert_eq!(options[0].label, "Yes, allow creation");
+        assert_eq!(options[0].role, OptionRole::AllowOnce);
+        assert_eq!(options[1].label, "No, deny creation");
+        assert_eq!(options[1].role, OptionRole::Deny);
+        assert!(options.iter().all(|option| !option.keyboard_only));
+        replay.deck.send_bytes(b"1");
+        replay.deck.wait_for_string("1. Yes, allow creation");
+        replay.deck.wait_for_string("2. No, deny creation");
+        let before = std::fs::read(replay.deck.workdir().join("input.bytes"))
+            .unwrap_or_default()
+            .len();
+        assert_eq!(
+            questions::answer(
+                &replay.deck,
+                &id,
+                &q,
+                vec![questions::selection(0, &[selected])]
+            ),
+            AnswerReport::Answered
+        );
+        replay
+            .deck
+            .wait_for_string(&format!("AGY-PERMISSION-ANSWER-{selected}"));
+        let captured = std::fs::read(replay.deck.workdir().join("input.bytes")).unwrap();
+        assert_eq!(&captured[before..], selected.to_string().as_bytes());
+    }
+
+    // The captured folder-trust dialog has different labels and navigation.
+    // Do not misrepresent it as an answerable Bash permission menu.
+    let replay = Replay::launch("./agy");
+    replay.replay(json!([{"osc": "blocked", "kind": "permission", "msg": "Trust this folder?"}]));
+    replay.card("Needs Input", "Trust this folder?", "folder trust");
+    let id = questions::agent_id(&replay.deck);
+    assert!(
+        questions::snapshot(&replay.deck, &id)
+            .unwrap()
+            .pending_question
+            .is_none_or(|question| !question.has_answerable_option())
+    );
 }
 
 /// Scenario: An Antigravity stand-in starts a tool through its hook and emits OSC working; the card stays Working with the command. After idle, OSC working shows Thinking before idle, done or error ends the turn without a Stop hook; the card shows Idle for idle and done, or Error with its decoded text.

@@ -4730,8 +4730,8 @@ mod tests {
             .expect("a measured agent carries prompt keys")
     }
 
-    /// PRD #1541: the daemon's prompt keys reach the webview in its camelCase
-    /// vocabulary, with the bytes unchanged and an absent limit absent.
+    /// Scenario: Project the daemon's Claude Code, OpenCode and Antigravity prompt keys into the webview's camelCase vocabulary.
+    /// The key bytes stay unchanged and absent limits stay absent (PRD #1541).
     #[test]
     fn prompt_keys_are_copied_from_the_daemon_in_the_webview_shape() {
         let mut record = fixture_record();
@@ -4772,6 +4772,25 @@ mod tests {
                 .get("maxLiteralWriteChars")
                 .is_none()
         );
+
+        let mut record = fixture_record();
+        record.agent_type = Some(AgentType::Antigravity);
+        record.prompt_keys = Some(registry_keys(AgentType::Antigravity));
+        let value = serde_json::to_value(map_agent(record)).unwrap();
+        assert_eq!(value["agentType"], "antigravity");
+        assert_eq!(
+            value["promptKeys"]["interrupt"],
+            serde_json::json!([
+                {"bytes": "\u{1b}", "pauseAfterMs": 0}
+            ])
+        );
+        assert_eq!(
+            value["promptKeys"]["clear"],
+            serde_json::json!({
+                "bytes": "\u{15}", "presses": "per_line"
+            })
+        );
+        assert_eq!(value["promptKeys"]["deleteChar"]["bytes"], "\u{7f}");
     }
 
     /// PRD #1541: a record the daemon served no keys for has none in the

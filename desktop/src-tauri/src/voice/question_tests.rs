@@ -1318,6 +1318,43 @@ fn codex_permission() -> DesktopPendingQuestion {
     ))
 }
 
+/// The command menu measured on interactive agy 1.5.9 on 2026-11-16.
+/// The L2 Antigravity test checks the daemon's producer; this fixture checks
+/// the desktop's projection and spoken selection of its measured labels.
+fn antigravity_permission() -> DesktopPendingQuestion {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../tests/fixtures/antigravity/permission-menu.json"
+    ))
+    .unwrap();
+    let mut question = permission(AnswerChannel::Keys);
+    question.id = "q-antigravity".into();
+    question.tool.as_mut().unwrap().detail = Some("rm -f probe.txt".into());
+    question.questions[0].prompt = fixture["prompt"].as_str().unwrap().into();
+    question.questions[0].options = fixture["options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            let index = entry["key"].as_str().unwrap().parse::<u32>().unwrap();
+            let role = match index {
+                1 => OptionRole::AllowOnce,
+                2 | 3 => OptionRole::AllowAlways,
+                _ => OptionRole::Deny,
+            };
+            let mut option = option(index, entry["label"].as_str().unwrap(), role);
+            option.scope = match index {
+                2 => Some("commands starting with `rm -f probe.txt` in this conversation".into()),
+                3 => Some(
+                    "commands starting with `rm -f probe.txt`, persisted to settings.json".into(),
+                ),
+                _ => None,
+            };
+            option
+        })
+        .collect();
+    map_pending_question(&question)
+}
+
 /// OpenCode 1.18.34's permission row, which draws no numbers: 1 Allow once,
 /// 2 Allow always, 3 Reject — the left-to-right places.
 fn opencode_permission() -> DesktopPendingQuestion {
@@ -1418,19 +1455,15 @@ fn refusal(verdict: Result<Vec<(u32, Vec<u32>)>, QuestionVerdict>) -> String {
     }
 }
 
-/// Scenario (question/desktop/020): with each agent's real permission prompt
-/// waiting, the user picks an option by its number — "2", "two", "second",
-/// "option two", "number two", "the second one" — or "the last one". The
-/// number is the one the agent draws beside the option (or its place in
-/// OpenCode's unnumbered row), so on Claude Code's prompt "1" is Yes, as on
-/// screen; a number the agent draws beside nothing is refused, naming the
-/// options with their numbers. Claude's No, after an option Claude may leave
-/// out, is chosen by name, not number (question/desktop/031).
+/// Scenario (question/desktop/020): With each agent's measured permission prompt waiting, choose by number, ordinal or "the last one"; Antigravity's fourth option is its measured No, cancel.
+/// The desktop uses the screen's number (or OpenCode's unnumbered place) and refuses missing numbers while listing the available choices.
+/// Claude's No, after a potentially omitted option, is chosen by name instead (question/desktop/031).
 #[tokio::test]
 async fn question_desktop_020_an_option_is_chosen_by_its_number() {
-    let cases: [(&str, DesktopPendingQuestion, u32); 5] = [
+    let cases: [(&str, DesktopPendingQuestion, u32); 6] = [
         ("claude", claude_auto_mode(), 1),
         ("codex", codex_permission(), 2),
+        ("antigravity", antigravity_permission(), 4),
         ("opencode", opencode_permission(), 2),
         ("pi", pi_select(), 2),
         ("devin", devin_permission(), 8),
@@ -1479,15 +1512,22 @@ async fn question_desktop_020_an_option_is_chosen_by_its_number() {
     );
 }
 
-/// Scenario (question/desktop/021): the user says a distinctive part of one
-/// option's label — "proceed" and "don't ask again" on Codex, "always" on
-/// OpenCode, "production" on Pi, "auto mode" on Claude Code — and that option
-/// is chosen, with the "always allow" confirmation where it grants for good.
-/// Claude's auto-mode option is keyboard-only, so naming it is refused with
-/// that reason rather than read as another option; misspelt ("swich to auto
-/// mode"), it is no part of a permission prompt's label and goes to the model.
+/// Scenario (question/desktop/021): Say a distinctive part of a measured option label, including Antigravity's conversation-only and persisted choices, and the desktop selects that option with confirmation for always allow.
+/// Naming Claude's keyboard-only auto-mode option is refused; a misspelling that matches no label goes to the model.
 #[tokio::test]
 async fn question_desktop_021_part_of_one_label_chooses_it() {
+    let antigravity = antigravity_permission();
+    for (said, selected) in [
+        ("run command", 1),
+        ("in this conversation", 2),
+        ("persist to settings", 3),
+        ("no, cancel", 4),
+    ] {
+        assert_eq!(
+            chose(&antigravity, &[], said).await.unwrap(),
+            [(0, vec![selected])]
+        );
+    }
     assert_eq!(
         chose(&codex_permission(), &[], "proceed").await.unwrap(),
         [(0, vec![1])]

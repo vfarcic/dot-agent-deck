@@ -7,153 +7,23 @@ mod inbox;
 #[path = "support/inbox_route.rs"]
 mod route;
 
+#[path = "support/antigravity_live.rs"]
+mod antigravity;
+#[path = "common/questions.rs"]
+mod questions;
+
+use antigravity::{antigravity_test_model, check_antigravity_available, seed_home};
 use common::TuiDeck;
 use inbox::Pane;
-use serde_json::{Value, json};
+use serde_json::json;
 use spec::spec;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::path::PathBuf;
+use std::process::Command;
 use std::time::Duration;
 
 const BUDGET: Duration = Duration::from_secs(120);
-const TOKEN: &str = ".gemini/antigravity-cli/antigravity-oauth-token";
 const CONTENT: &str = "antigravity-real-work-91cf4a";
 const REPORT: &str = "AGY-REAL-REPORT-2c6f19";
-
-fn antigravity_test_model() -> String {
-    std::env::var("DOT_AGENT_DECK_ANTIGRAVITY_TEST_MODEL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "gemini-3.8-flash-low".into())
-}
-
-fn host_token() -> PathBuf {
-    PathBuf::from(std::env::var_os("HOME").expect("host HOME")).join(TOKEN)
-}
-
-fn gemini_key() -> Option<String> {
-    std::env::var("GEMINI_API_KEY")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-}
-
-fn token_redactions(value: &Value, out: &mut Vec<String>) {
-    match value {
-        Value::String(s) if s.len() >= 8 => out.push(s.clone()),
-        Value::Object(map) => map.values().for_each(|v| token_redactions(v, out)),
-        Value::Array(items) => items.iter().for_each(|v| token_redactions(v, out)),
-        _ => {}
-    }
-}
-
-fn seed_home(home: &Path, fixture: &Path) -> std::io::Result<()> {
-    let source = host_token();
-    let target = home.join(TOKEN);
-    std::fs::create_dir_all(target.parent().unwrap())?;
-    std::fs::set_permissions(
-        target.parent().unwrap(),
-        std::fs::Permissions::from_mode(0o700),
-    )?;
-    if std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file() && m.len() > 0) {
-        let bytes = std::fs::read(source)?;
-        // Register before a copy or a diagnostic can expose a token value.
-        let mut redactions = vec![String::from_utf8_lossy(&bytes).into_owned()];
-        if let Ok(value) = serde_json::from_slice::<Value>(&bytes) {
-            token_redactions(&value, &mut redactions);
-        }
-        common::register_diagnostic_redactions(redactions);
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&target)?
-            .write_all(&bytes)?;
-        assert_eq!(
-            std::fs::metadata(&target)?.permissions().mode() & 0o777,
-            0o600
-        );
-    } else if gemini_key().is_none() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            "Antigravity token unavailable; sign in or set GEMINI_API_KEY",
-        ));
-    }
-    let cli = home.join(".gemini/antigravity-cli");
-    std::fs::create_dir_all(cli.join("cache"))?;
-    std::fs::write(
-        cli.join("cache/onboarding.json"),
-        br#"{"onboardingComplete":true,"consumerOnboardingComplete":true}"#,
-    )?;
-    std::fs::write(
-        cli.join("settings.json"),
-        json!({"trustedWorkspaces":[fixture, fixture.canonicalize()?]}).to_string(),
-    )?;
-    Ok(())
-}
-
-/// Probe the same model the interactive pane uses, without an inference turn.
-fn check_antigravity_available() -> Result<(), String> {
-    common::install_credential_redaction();
-    if !Command::new("agy")
-        .arg("--version")
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-    {
-        return Err("Antigravity CLI not available on PATH (agy --version)".into());
-    }
-    let root = common::race_safe_tempdir();
-    let home = root.path().join("home");
-    seed_home(&home, root.path()).map_err(|_| {
-        "Antigravity needs a non-empty OAuth token file or GEMINI_API_KEY".to_string()
-    })?;
-    let mut command = Command::new("agy");
-    command
-        .arg("models")
-        .env_clear()
-        .env("HOME", &home)
-        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-        .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
-        .current_dir(root.path())
-        .stdin(Stdio::null());
-    if let Some(key) = gemini_key() {
-        command.env("GEMINI_API_KEY", key);
-    }
-    let child = std::cell::RefCell::new(
-        command
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| "Antigravity model availability probe failed".to_string())?,
-    );
-    if !common::wait_until(Duration::from_secs(30), || {
-        child.borrow_mut().try_wait().is_ok_and(|s| s.is_some())
-    }) {
-        let _ = child.borrow_mut().kill();
-        let _ = child.borrow_mut().wait();
-        return Err("Antigravity model availability probe timed out".into());
-    }
-    let output = child
-        .into_inner()
-        .wait_with_output()
-        .map_err(|_| "Antigravity model availability probe failed".to_string())?;
-    let model = antigravity_test_model();
-    if !output.status.success()
-        || !String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .any(|line| line.split_whitespace().next() == Some(model.as_str()))
-    {
-        return Err(format!(
-            "Antigravity model {model} unavailable; set DOT_AGENT_DECK_ANTIGRAVITY_TEST_MODEL to an accessible model"
-        ));
-    }
-    eprintln!("Antigravity model under test: {model}");
-    Ok(())
-}
 
 fn quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -167,6 +37,10 @@ struct Agy {
 
 impl Agy {
     fn start(team: bool) -> Self {
+        Self::start_with_permissions(team, true)
+    }
+
+    fn start_with_permissions(team: bool, bypass: bool) -> Self {
         let deck = TuiDeck::builder()
             .with_pty_size(220, 60)
             .with_env("PATH", common::path_with_binary_dir())
@@ -181,22 +55,29 @@ impl Agy {
         if !installed.exists() && std::fs::hard_link(binary, &installed).is_err() {
             std::fs::copy(binary, &installed).unwrap();
         }
-        // The live test drives the hook CLI and delivery independently of the
-        // installer's RED tests (hooks/install/028–031). Use the measured file
-        // shape here so a missing installer cannot prevent a real agent turn.
-        let hook = json!({"type":"command", "command":format!("{} hook --agent antigravity", quote(installed.to_str().unwrap()))});
-        let hooks = json!({"dot-agent-deck":{
-            "SessionStart":[hook],"PreInvocation":[hook],"Stop":[hook],
-            "PreToolUse":[{"matcher":"*","hooks":[hook]}],
-            "PostToolUse":[{"matcher":"*","hooks":[hook]}]
-        }});
-        let config = deck.home_dir().join(".gemini/config");
-        std::fs::create_dir_all(&config).unwrap();
-        std::fs::write(config.join("hooks.json"), hooks.to_string()).unwrap();
+        let install = Command::new(&installed)
+            .args(["hooks", "install", "--agent", "antigravity"])
+            .env_clear()
+            .env("HOME", deck.home_dir())
+            .env("PATH", common::path_with_binary_dir())
+            .env("AGY_CLI_DISABLE_AUTO_UPDATE", "true")
+            .current_dir(deck.workdir())
+            .output()
+            .expect("run the shipped Antigravity hook installer");
+        assert!(
+            install.status.success(),
+            "Antigravity hook installer failed: {}",
+            String::from_utf8_lossy(&install.stderr)
+        );
         // Explicitly approve tools for this bounded scratch-file scenario:
         // real 1.5.9 still asked to create a file with --mode auto alone.
         let command = common::capability_export_command(&format!(
-            "exec agy --mode auto --dangerously-skip-permissions --model {}",
+            "exec agy --mode auto {} --model {}",
+            if bypass {
+                "--dangerously-skip-permissions"
+            } else {
+                ""
+            },
             quote(&antigravity_test_model())
         ));
         let membership = |role: &str, index, start| {
@@ -399,5 +280,50 @@ fn antigravity_live_002_real_worker_receives_delegate_and_reports_work_done() {
         "orchestrator must receive task-scoped work-done report for {id}: {}",
         agy.evidence()
     );
+    agy.card("Idle");
+}
+
+/// Scenario: Ask genuine interactive Antigravity to remove a uniquely named scratch sentinel without pre-approving its tools. Its permission menu and Needs Input card appear before the file is removed; answering Allow Once through the deck's question API runs the command, removes the sentinel and lets the turn finish Idle.
+#[spec("question/live/009")]
+#[test]
+fn question_live_009_antigravity_permission_allow_once_continues() {
+    use dot_agent_deck::daemon_client::AnswerReport;
+    use dot_agent_deck::question::{AnswerChannel, OptionRole, QuestionKind};
+
+    skip_unless!(check_antigravity_available());
+    let agy = Agy::start_with_permissions(false, false);
+    let sentinel = agy.deck.workdir().join("question_agy_permission_836ab.txt");
+    std::fs::write(&sentinel, "permission sentinel\n").unwrap();
+    let mut input = common::AttachInput::attach(agy.deck.attach_socket_path(), &agy.pane.agent);
+    input.write("question_agy_permission_836ab: Use run_command exactly once to run `rm -f question_agy_permission_836ab.txt`. Do not use another tool or change the command. After success reply DONE and stop. If denied, stop without retrying.");
+    assert!(common::wait_until(Duration::from_secs(10), || agy
+        .screen()
+        .contains("If denied")));
+    input.write("\r");
+    assert!(
+        common::wait_until(BUDGET, || agy.screen().contains("4.")),
+        "the real Antigravity permission menu must appear: {}",
+        agy.evidence()
+    );
+    let q = questions::pending(&agy.deck, &agy.pane.agent, QuestionKind::Permission);
+    assert_eq!(q.channel, AnswerChannel::Keys);
+    assert_eq!(q.questions[0].options[0].role, OptionRole::AllowOnce);
+    assert!(!q.questions[0].options[0].keyboard_only);
+    assert!(sentinel.exists(), "the command ran before approval");
+    assert_eq!(
+        questions::answer(
+            &agy.deck,
+            &agy.pane.agent,
+            &q,
+            vec![questions::selection(0, &[1])]
+        ),
+        AnswerReport::Answered
+    );
+    assert!(
+        common::wait_until(BUDGET, || !sentinel.exists()),
+        "the approved real command did not remove its sentinel: {}",
+        agy.evidence()
+    );
+    questions::finished(&agy.deck, &agy.pane.agent);
     agy.card("Idle");
 }

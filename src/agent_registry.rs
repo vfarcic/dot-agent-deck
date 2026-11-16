@@ -1831,9 +1831,8 @@ mod tests {
         }
     }
 
-    /// PRD #1541: each measured agent's keys, pinned by value against the
-    /// verified table in the PRD. A change here is a re-measurement — update
-    /// the versions in [`PromptKeys`]'s doc comment with it.
+    /// Scenario: Read each measured agent's prompt keys, including Antigravity, and compare the interrupt, clear and delete values with the verified interactive measurements.
+    /// A change here is a re-measurement; update the versions in [`PromptKeys`]'s doc comment with it (PRD #1541).
     #[test]
     fn prompt_keys_match_the_verified_table() {
         let claude = keys(AgentType::ClaudeCode);
@@ -1875,6 +1874,20 @@ mod tests {
         assert_eq!(pi.clear.pause_between_writes_ms, None);
         assert_eq!(pi.delete_char.bytes, "\x7f");
         assert_eq!(pi.delete_char.max_literal_write_chars, None);
+
+        // agy 1.5.9, isolated interactive HOME, 2026-11-16: one ESC
+        // interrupts; one Ctrl+U removes a logically single-line draft even
+        // when wrapped; 300 Ctrl+U in one write still clears; one DEL removes
+        // one character; 101 separate DEL writes 20 ms apart remove exactly
+        // 101 characters. Bulk delete measurements left residual input even
+        // at 50 characters, so this table does not invent a literal-write cap.
+        let antigravity = keys(AgentType::Antigravity);
+        assert_eq!(antigravity.interrupt.as_ref(), &[step("\x1b", 0)]);
+        assert_eq!(antigravity.clear.bytes, "\x15");
+        assert_eq!(antigravity.clear.presses, ClearPresses::PerLine);
+        assert_eq!(antigravity.clear.max_presses_per_write, None);
+        assert_eq!(antigravity.clear.pause_between_writes_ms, None);
+        assert_eq!(antigravity.delete_char.bytes, "\x7f");
     }
 
     /// PRD #1541: Devin is unsupported until measured logged in, and the

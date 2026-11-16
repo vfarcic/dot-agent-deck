@@ -37,11 +37,20 @@ describe("PRD #1541 — the voice surface's view of the open agent", () => {
     expect(voicePaneAgent({})).toEqual({});
   });
 
+  /** Scenario: Resolve fixture agent identities and check that Antigravity carries its measured prompt keys alongside the other supported agents. */
   it("gives fixture agents the keys a real deck serves, and none to Devin or an unknown binary", () => {
     expect(fixtureAgentIdentity("claude", "running")).toEqual({ agentType: "claude_code", turn: "working", promptKeys: FIXTURE_PROMPT_KEYS.claude_code });
     expect(fixtureAgentIdentity("opencode", "needs_input")).toEqual({ agentType: "open_code", turn: "idle", promptKeys: FIXTURE_PROMPT_KEYS.open_code });
     expect(fixtureAgentIdentity("devin", "running")).toEqual({ agentType: "devin", turn: "working" });
-    expect(fixtureAgentIdentity("agy", "running")).toEqual({ agentType: "antigravity", turn: "working" });
+    // Measured in interactive agy 1.5.9 (2026-11-16); keep the demo's voice
+    // surface consistent with the keys served by the real daemon.
+    expect(fixtureAgentIdentity("agy", "running")).toEqual({
+      agentType: "antigravity", turn: "working", promptKeys: expect.objectContaining({
+        interrupt: [{ bytes: "\u001b", pauseAfterMs: 0 }],
+        clear: { bytes: "\u0015", presses: "per_line" },
+        deleteChar: expect.objectContaining({ bytes: "\u007f" }),
+      }),
+    });
     expect(fixtureAgentIdentity("bash", "failed")).toEqual({ agentType: "none" });
     expect(fixtureAgentIdentity(undefined, "idle")).toEqual({ agentType: "none", turn: "idle" });
   });

@@ -13,7 +13,7 @@
 //! keystrokes through the TUI, which has key handling of its own.
 //!
 //! Claude Code on Haiku has a test per key, asserted against its framed input
-//! row. Codex and OpenCode (each on its cheap test model) have one test each
+//! row. Codex, OpenCode and Antigravity (each on its cheap test model) have one test each
 //! that runs all three keys in one session, asserted on the whole pane, since
 //! their input boxes are drawn differently. Pi is not covered — see the
 //! catalog's `prompt/voice-keys` section for why.
@@ -23,6 +23,8 @@
 //! OpenCode, Codex and Pi delivering each turn only once.
 
 dot_agent_deck_test_harness::link!();
+#[path = "support/antigravity_live.rs"]
+mod antigravity;
 
 use std::time::{Duration, Instant};
 
@@ -769,8 +771,20 @@ fn launch_agent(
     command: &str,
     sentinel: &str,
 ) -> (TuiDeck, String, PromptKeys) {
+    launch_agent_with_home(builder, fixture, launch, command, sentinel, |_| {})
+}
+
+fn launch_agent_with_home(
+    builder: common::TuiDeckBuilder,
+    fixture: &str,
+    launch: &AgentLaunch,
+    command: &str,
+    sentinel: &str,
+    seed_home: impl FnOnce(&TuiDeck),
+) -> (TuiDeck, String, PromptKeys) {
     let deck = builder.with_pty_size(180, 45).launch_with_fixture(fixture);
     deck.wait_for_string("No active agents");
+    seed_home(&deck);
     std::fs::write(deck.workdir().join(sentinel), "prompt keys sentinel\n")
         .expect("write the sentinel file");
     deck.send_keys(b"\x0e");
@@ -983,4 +997,43 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
         "OpenCode's interrupt is Esc, a pause, Esc: {keys:?}"
     );
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);
+}
+
+/// Scenario: Open genuine interactive Antigravity on the cheap Flash model with credentials and onboarding seeded into an isolated HOME. Write the keys served by the daemon through the desktop's attach stream: delete removes exactly the draft tail, clear empties the draft, interrupt stops a visibly streaming turn, and the next turn reports the fixture sentinel with the agent still running.
+#[spec("prompt/voice-keys/006")]
+#[test]
+fn prompt_voice_keys_006_antigravity_honours_the_served_keys() {
+    skip_unless!(antigravity::check_antigravity_available());
+    const SENTINEL: &str = "voicekeys_parity_sentinel_antigravity_936a.txt";
+    let launch = AgentLaunch {
+        name: "voicekeys-antigravity",
+        ready: "? for shortcuts",
+        resubmit_until_empty: false,
+    };
+    let command = format!(
+        "agy --mode auto --dangerously-skip-permissions --model {}",
+        antigravity::antigravity_test_model()
+    );
+    let builder = TuiDeck::builder()
+        .with_env("PATH", common::path_with_binary_dir())
+        .with_env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    let (deck, id, keys) =
+        launch_agent_with_home(builder, "minimal", &launch, &command, SENTINEL, |deck| {
+            antigravity::seed_home(deck.home_dir(), deck.workdir()).unwrap()
+        });
+    if deck
+        .snapshot_grid()
+        .contains("Auto is now the default agent mode")
+    {
+        let mut writer = PaneWriter::attach(deck.attach_socket_path(), &id);
+        writer.write("\x1b");
+        deck.wait_until_grid("the first-run announcement dismissed", |grid| {
+            !grid.contains("Auto is now the default agent mode")
+        });
+    }
+    // agy 1.5.9 (2026-11-16): one DEL works; 101 individual writes
+    // 20 ms apart removed exactly 101 characters, while raw bursts of 50
+    // and 2290 left residual input. Keep exercising the client write path
+    // here so serving the bytes alone cannot hide a broken scratch-that.
+    exercise_prompt_keys(&launch, &deck, &id, &keys, SENTINEL);
 }
