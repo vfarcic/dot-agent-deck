@@ -4798,6 +4798,7 @@ mod tests {
 
         let mut record = fixture_record();
         record.agent_type = Some(AgentType::Antigravity);
+        record.live.as_mut().unwrap().agent_type = Some(AgentType::Antigravity);
         record.prompt_keys = Some(registry_keys(AgentType::Antigravity));
         let value = serde_json::to_value(map_agent(record)).unwrap();
         assert_eq!(value["agentType"], "antigravity");

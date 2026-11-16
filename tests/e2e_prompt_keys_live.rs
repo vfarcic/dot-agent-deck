@@ -127,6 +127,38 @@ impl PaneWriter {
             .write_steps(chunks.iter().map(|chunk| (chunk.as_str(), between)));
         writes
     }
+
+    /// Scratch the dictated characters with the same cap and pause the
+    /// desktop reads from the daemon. Agents without pacing keep one write.
+    fn delete_chars(&mut self, keys: &PromptKeys, presses: usize) {
+        if presses == 0 {
+            return;
+        }
+        let per_write = keys
+            .delete_char
+            .max_presses_per_write
+            .map_or(presses, |cap| cap as usize)
+            .max(1);
+        let mut chunks = Vec::new();
+        let mut left = presses;
+        while left > 0 {
+            let now = left.min(per_write);
+            chunks.push(keys.delete_char.bytes.repeat(now));
+            left -= now;
+        }
+        let between = Duration::from_millis(u64::from(
+            keys.delete_char.pause_between_writes_ms.unwrap_or(0),
+        ));
+        self.input
+            .write_steps(chunks.iter().enumerate().map(|(index, chunk)| {
+                let pause = if index + 1 < chunks.len() {
+                    between
+                } else {
+                    Duration::ZERO
+                };
+                (chunk.as_str(), pause)
+            }));
+    }
 }
 
 /// A launched interactive Claude Haiku pane, its daemon record and the keys
@@ -869,7 +901,7 @@ fn exercise_prompt_keys(
     deck.wait_until_grid_then_hold("the kept word and the tail", BEFORE_SUBMIT, |grid| {
         grid.contains("tail 8b31")
     });
-    writer.write(&keys.delete_char.bytes.repeat(TAIL.chars().count()));
+    writer.delete_chars(keys, TAIL.chars().count());
     writer.write(NEXT);
     let joined = format!("{KEPT}{NEXT}");
     deck.wait_until_grid_then_hold("exactly the tail removed", BEFORE_SUBMIT, |grid| {
@@ -999,7 +1031,7 @@ fn prompt_voice_keys_005_opencode_honours_the_served_keys() {
     exercise_prompt_keys(&launch, &deck, &agent_id, &keys, SENTINEL);
 }
 
-/// Scenario: Open genuine interactive Antigravity on the cheap Flash model with credentials and onboarding seeded into an isolated HOME. Write the keys served by the daemon through the desktop's attach stream: delete removes exactly the draft tail, clear empties the draft, interrupt stops a visibly streaming turn, and the next turn reports the fixture sentinel with the agent still running.
+/// Scenario: Open genuine interactive Antigravity on the cheap Flash model with credentials and onboarding seeded into an isolated HOME, dismissing its first-run announcement even when it arrives after the composer. Write the keys served by the daemon through the desktop's attach stream, respecting its delete cap and pause: delete removes exactly the draft tail, clear empties the draft, interrupt stops a visibly streaming turn, and the next turn reports the fixture sentinel with the agent still running.
 #[spec("prompt/voice-keys/006")]
 #[test]
 fn prompt_voice_keys_006_antigravity_honours_the_served_keys() {
@@ -1021,10 +1053,13 @@ fn prompt_voice_keys_006_antigravity_honours_the_served_keys() {
         launch_agent_with_home(builder, "minimal", &launch, &command, SENTINEL, |deck| {
             antigravity::seed_home(deck.home_dir(), deck.workdir()).unwrap()
         });
-    if deck
-        .snapshot_grid()
-        .contains("Auto is now the default agent mode")
-    {
+    // The composer can paint before this asynchronous first-run announcement.
+    // Wait for it rather than relying on a single launch-time snapshot; older
+    // versions that do not show it can still proceed after the bounded wait.
+    if deck.wait_for_grid_string_within(
+        "Auto is now the default agent mode",
+        Duration::from_secs(10),
+    ) {
         let mut writer = PaneWriter::attach(deck.attach_socket_path(), &id);
         writer.write("\x1b");
         deck.wait_until_grid("the first-run announcement dismissed", |grid| {

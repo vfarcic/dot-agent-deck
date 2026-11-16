@@ -2799,7 +2799,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 ##### prompt/voice-keys/006 — A real Antigravity pane honours the daemon's delete, clear and interrupt keys.
 - **Layer:** L2 PTY-attached, lane 2 (`tests/e2e_prompt_keys_live.rs`).
 - **Agent:** Real interactive `agy` on the cheap Flash model, isolated credentials and seeded onboarding, with tools pre-approved for the bounded fixture task.
-- **Asserts:** The keys arrive through `ListAgents`; raw attach input deletes exactly a dictated tail, clears a draft, interrupts a visibly streaming numbered list before completion and leaves the agent running to answer a follow-up with the fixture sentinel name.
+- **Asserts:** The keys arrive through `ListAgents`; raw attach input follows the served delete cap and pause to remove exactly a dictated tail, clears a draft, interrupts a visibly streaming numbered list before completion and leaves the agent running to answer a follow-up with the fixture sentinel name. The first-run announcement is dismissed even if it arrives after the composer.
 - **Does not assert:** The permission menu, covered separately by `question/live/009`.
 - **Platform coverage:** mac+linux.
 
