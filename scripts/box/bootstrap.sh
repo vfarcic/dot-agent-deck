@@ -930,11 +930,14 @@ check codex    '[ -s ~/.codex/auth.json ]'                    'codex login'
 check opencode '[ -s ~/.local/share/opencode/auth.json ]'     'opencode auth login'
 check pi       '[ -s ~/.pi/agent/auth.json ]'                 'pi   (then /login)'
 check devin    '[ -s ~/.local/share/devin/credentials.toml ]' 'devin   (follow its login prompt)'
-# agy keeps no login file this script can test for, so only its API-key setup,
-# the one to use inside the deck, counts as logged in here; a box signed in
-# with a Google account still lists it.
+# agy counts as logged in when its Google-account sign-in file is present and
+# non-empty, or when its API-key setup (the one to use inside the deck) is in
+# place. agy keeps the sign-in in the OS keyring when there is one and falls
+# back to that file only on a box without a keyring, so a sign-in kept in a
+# keyring is invisible to this check: on such a box a signed-in agy may still be
+# listed here as needing a login.
 # shellcheck disable=SC2016  # eval'd inside check()
-have agy && check agy '[ -n "${GEMINI_API_KEY:-}" ] && grep -Eq "\"modelProvider\"[[:space:]]*:[[:space:]]*\"gemini\"" ~/.gemini/antigravity-cli/settings.json' \
+have agy && check agy '[ -s ~/.gemini/antigravity-cli/antigravity-oauth-token ] || { [ -n "${GEMINI_API_KEY:-}" ] && grep -Eq "\"modelProvider\"[[:space:]]*:[[:space:]]*\"gemini\"" ~/.gemini/antigravity-cli/settings.json; }' \
   'agy   (then sign in with a Google account) or, for use inside the deck, an API key: set {"modelProvider": "gemini"} in ~/.gemini/antigravity-cli/settings.json and export GEMINI_API_KEY'
 check gh       'gh auth status'                               'gh auth login && gh auth setup-git'
 have rwx && check rwx 'rwx whoami'                            'rwx login'
