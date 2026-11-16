@@ -722,9 +722,10 @@ pub fn request_answer_notice(
             "approval request closed",
             format!(
                 "The deck's request to approve orchestration '{orchestration}' of project \
-                 {project} closed without an answer: its .dot-agent-deck.toml changed or no \
-                 longer names it. Retry your {verbs} if you still need it; if that is refused \
-                 too, the deck asks the user again."
+                 {project} closed without an answer: its .dot-agent-deck.toml now reads \
+                 differently, here or in another worktree of the project, or no longer names \
+                 it. Retry your {verbs} if you still need it; if that is refused too, the deck \
+                 asks the user again."
             ),
         ),
     };

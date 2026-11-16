@@ -2727,9 +2727,9 @@ const APPROVED_NOTICE: &str = "was approved. Retry your";
 /// Issue #2348: what the deck notice of a denial says.
 const DECLINED_NOTICE: &str = "stays refused, so do not retry it";
 
-/// Wait for one message containing `needle` in `pane`'s inbox, then hold a
-/// moment and assert no second one followed: each refused caller is told once
-/// per answer.
+/// Wait for one message containing `needle` in `pane`'s inbox, then watch
+/// the inbox for a window and assert no second one arrives in it: each refused
+/// caller is told once per answer.
 fn assert_told_once(attach: &Path, pane: &str, needle: &str) {
     assert!(
         inbox_view::wait_for(
@@ -2741,10 +2741,13 @@ fn assert_told_once(attach: &Path, pane: &str, needle: &str) {
         "the refused caller must be told the answer ({needle:?}).\nInbox:\n{}",
         inbox_view::text(attach, pane)
     );
-    std::thread::sleep(Duration::from_millis(500));
-    assert_eq!(
-        inbox_view::count_containing(attach, pane, needle),
-        1,
+    // A negative over a window, polled, as `no_roles_for` is: a duplicate
+    // would be posted by the same answer, right behind the first.
+    let duplicated = common::wait_until(Duration::from_millis(500), || {
+        inbox_view::count_containing(attach, pane, needle) > 1
+    });
+    assert!(
+        !duplicated,
         "the refused caller is told once per answer.\nInbox:\n{}",
         inbox_view::text(attach, pane)
     );

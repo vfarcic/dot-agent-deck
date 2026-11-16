@@ -11707,7 +11707,12 @@ impl AppState {
         // refusal delivers nothing and the orchestrator's `delegate` fails with
         // the reason and the command that approves it.
         if let Some(identity) = orchestration.as_ref() {
-            let caller_agent = registry.pane_current_agent_id(&signal.pane_id);
+            // Issue #2348 (PR #2351 review): the agent the sender's capability
+            // attested, not whoever holds the pane after the config read; the
+            // pane's current agent only for an unattested call.
+            let caller_agent = sender_agent_id
+                .map(str::to_owned)
+                .or_else(|| registry.pane_current_agent_id(&signal.pane_id));
             let mut checked: Vec<&str> = Vec::new();
             for (_, pane_id) in &targets {
                 let Some(cwd) = self.pane_cwd_map.get(pane_id).map(String::as_str) else {

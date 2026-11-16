@@ -186,8 +186,27 @@ pub struct CallerNotice {
 }
 
 /// Where the serving daemon posts [`CallerNotice`]s ([`inbox_sink`] in
-/// `daemon serve`). Called off the hub's lock.
-pub type NoticeSink = Arc<dyn Fn(CallerNotice) + Send + Sync>;
+/// `daemon serve`), answering what became of the notice. Called off the hub's
+/// lock.
+pub type NoticeSink = Arc<dyn Fn(&CallerNotice) -> Posted + Send + Sync>;
+
+/// What a [`NoticeSink`] did with a notice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Posted {
+    /// It is in the caller's inbox.
+    Delivered,
+    /// The agent no longer holds its pane: nobody is left to tell.
+    Gone,
+    /// The caller is still there, but its inbox (or the deck) refused the
+    /// notice, full for now: it is tried again every [`SWEEP_INTERVAL`] until
+    /// it goes in or the caller is gone, since the refusal told the caller to
+    /// wait for it (PR #2351 review).
+    Refused,
+}
+
+/// The most notices kept for another try ([`Posted::Refused`]). Past it the
+/// oldest is given up, with a warning.
+pub const MAX_RETRYING_NOTICES: usize = 256;
 
 /// The pending requests and the remembered denials of one daemon.
 #[derive(Debug, Default)]
@@ -241,13 +260,16 @@ impl TrustRequestHub {
         callers.push(caller.clone());
     }
 
-    /// `request` closed with `answer`: owe each of its callers but `except`
-    /// one notice, naming every verb that agent was refused.
+    /// `request` closed with `answer`: owe each of its callers one notice,
+    /// naming every verb that agent was refused but `except`, the attempt
+    /// already starting it.
     fn told(&mut self, request: &TrustRequest, answer: Answer, except: Option<&RefusedCaller>) {
         let callers = self.waiting.remove(&request.id).unwrap_or_default();
         let mut agents: Vec<(RefusedCaller, Vec<String>)> = Vec::new();
         for caller in callers {
-            if except.is_some_and(|e| e.same_agent(&caller)) {
+            // Only the attempt that found it approved: the same agent's other
+            // refused verbs are still waiting (PR #2351 review).
+            if except == Some(&caller) {
                 continue;
             }
             match agents.iter_mut().find(|(a, _)| a.same_agent(&caller)) {
@@ -325,9 +347,19 @@ impl TrustRequestHub {
             }
             return (Raised::Full, replaced);
         }
+        // Carried over only from a request raised for the same config file: a
+        // linked worktree shares the project's key but reads its own file, so
+        // another worktree's callers would retry their own text, which this
+        // request's answer says nothing about. They are told the request
+        // closed unanswered instead (PR #2351 review).
+        let config_dir = check.config_dir.display().to_string();
         let mut carried: Vec<RefusedCaller> = Vec::new();
         for old in &replaced_requests {
-            carried.extend(self.waiting.remove(&old.id).unwrap_or_default());
+            if old.config_dir == config_dir {
+                carried.extend(self.waiting.remove(&old.id).unwrap_or_default());
+            } else {
+                self.told(old, Answer::Withdrawn, None);
+            }
         }
         self.next_id = self.next_id.wrapping_add(1);
         let asked_by: String = crate::untrusted_text::escape_control_and_bidi(asked_by)
@@ -443,6 +475,8 @@ struct Served {
     tx: Option<broadcast::Sender<BroadcastMsg>>,
     /// Issue #2348: where the refused callers' notices go.
     sink: Option<NoticeSink>,
+    /// Issue #2348: notices a full inbox refused, tried again by the sweep.
+    retrying: Vec<CallerNotice>,
 }
 
 static SERVED: Mutex<Served> = Mutex::new(Served {
@@ -456,6 +490,7 @@ static SERVED: Mutex<Served> = Mutex::new(Served {
     },
     tx: None,
     sink: None,
+    retrying: Vec::new(),
 });
 
 fn served() -> std::sync::MutexGuard<'static, Served> {
@@ -499,8 +534,24 @@ fn deliver(owed: Option<(NoticeSink, Vec<CallerNotice>)>) {
         return;
     };
     let post = move || {
-        for notice in notices {
-            sink(notice);
+        let refused: Vec<CallerNotice> = notices
+            .into_iter()
+            .filter(|notice| sink(notice) == Posted::Refused)
+            .collect();
+        if refused.is_empty() {
+            return;
+        }
+        let mut served = served();
+        for notice in refused {
+            if served.retrying.len() >= MAX_RETRYING_NOTICES {
+                let dropped = served.retrying.remove(0);
+                tracing::warn!(
+                    pane_id = %crate::config_validation::escape_id_for_log(&dropped.pane_id),
+                    "trust request: too many answers are waiting for room in their callers' \
+                     inboxes; the oldest is given up"
+                );
+            }
+            served.retrying.push(notice);
         }
     };
     match tokio::runtime::Handle::try_current() {
@@ -511,29 +562,65 @@ fn deliver(owed: Option<(NoticeSink, Vec<CallerNotice>)>) {
     }
 }
 
+/// The notices a full inbox refused, with the sink to try them again through
+/// ([`deliver`]); `None` when there are none.
+fn take_retrying() -> Option<(NoticeSink, Vec<CallerNotice>)> {
+    let mut served = served();
+    let notices = std::mem::take(&mut served.retrying);
+    served
+        .sink
+        .clone()
+        .filter(|_| !notices.is_empty())
+        .map(|sink| (sink, notices))
+}
+
 /// Issue #2348: the serving daemon's sink — post each notice to its caller's
 /// inbox as a deck notice, only while the agent it names still holds its
 /// pane. A caller that is gone is skipped.
 pub fn inbox_sink(registry: std::sync::Weak<crate::agent_pty::AgentPtyRegistry>) -> NoticeSink {
-    Arc::new(move |notice: CallerNotice| {
+    Arc::new(move |notice: &CallerNotice| {
         let Some(registry) = registry.upgrade() else {
-            return;
+            return Posted::Gone;
         };
+        let holds = || {
+            registry.pane_current_agent_id(&notice.pane_id).as_deref()
+                == Some(notice.agent_id.as_str())
+        };
+        if !holds() {
+            tracing::info!(
+                pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
+                answer = ?notice.answer,
+                "trust request: a refused caller is gone, so it is not told the answer"
+            );
+            return Posted::Gone;
+        }
         let to = crate::inbox::Recipient::bound(&notice.pane_id, &notice.agent_id);
-        match crate::inbox_hub::post_notice_to_live(&registry, to, notice.subject, notice.body) {
-            Ok(id) => tracing::info!(
-                pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
-                message_id = %id,
-                answer = ?notice.answer,
-                "trust request: told a refused caller the answer"
-            ),
-            Err(error) => tracing::info!(
-                pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
-                %error,
-                answer = ?notice.answer,
-                "trust request: a refused caller was not told the answer (it is gone, or its \
-                 inbox refused the notice)"
-            ),
+        match crate::inbox_hub::post_notice_to_live(
+            &registry,
+            to,
+            notice.subject,
+            notice.body.clone(),
+        ) {
+            Ok(id) => {
+                tracing::info!(
+                    pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
+                    message_id = %id,
+                    answer = ?notice.answer,
+                    "trust request: told a refused caller the answer"
+                );
+                Posted::Delivered
+            }
+            Err(_) if !holds() => Posted::Gone,
+            Err(error) => {
+                tracing::info!(
+                    pane_id = %crate::config_validation::escape_id_for_log(&notice.pane_id),
+                    %error,
+                    answer = ?notice.answer,
+                    "trust request: a refused caller's inbox refused the answer; it is tried \
+                     again"
+                );
+                Posted::Refused
+            }
         }
     })
 }
@@ -683,6 +770,8 @@ pub async fn run_sweep() {
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        // Issue #2348: another try for the answers a full inbox refused.
+        deliver(take_retrying());
         let pending = served().hub.pending.clone();
         if pending.is_empty() {
             continue;
@@ -1158,6 +1247,48 @@ mod tests {
         assert_eq!(told, ["2"]);
     }
 
+    /// PR #2351 review: the attempt that found the text approved is left
+    /// out, but the same agent's other refused verbs are still told.
+    #[test]
+    fn only_the_attempt_that_found_it_approved_is_left_out() {
+        let mut hub = TrustRequestHub::default();
+        let c = check("/p", "team", "claude");
+        let restart = caller("1", "agent-a", "pane restart");
+        hub.raise_for(&c, "pane restart", Some(&restart));
+        hub.raise_for(&c, "delegate", Some(&caller("1", "agent-a", "delegate")));
+        hub.settle_approved_except("/p", "team", &c.digest(), Some(&restart));
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(
+            notices[0].body.contains("Retry your delegate now"),
+            "{}",
+            notices[0].body
+        );
+        assert!(!notices[0].body.contains("pane restart"));
+    }
+
+    /// PR #2351 review: a linked worktree shares the project's key but reads
+    /// its own file, so its callers are not handed another worktree's answer:
+    /// they are told the request closed unanswered.
+    #[test]
+    fn another_worktrees_text_closes_the_old_callers_unanswered() {
+        let mut hub = TrustRequestHub::default();
+        let a = check("/p", "team", "claude");
+        let mut b = check("/p", "team", "claude --model haiku");
+        b.config_dir = PathBuf::from("/p-worktree");
+        hub.raise_for(&a, "dispatch", Some(&caller("1", "agent-a", "dispatch")));
+        hub.raise_for(&b, "dispatch", Some(&caller("2", "agent-b", "dispatch")));
+        let notices = hub.take_notices();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert_eq!(notices[0].pane_id, "1");
+        assert_eq!(notices[0].answer, Answer::Withdrawn);
+        assert!(notices[0].body.contains("another worktree"));
+        let id = hub.list().requests[0].id;
+        hub.deny(id, &b.digest());
+        let told: Vec<String> = hub.take_notices().into_iter().map(|n| n.pane_id).collect();
+        assert_eq!(told, ["2"], "only B's caller hears B's answer");
+    }
+
     #[test]
     fn the_callers_of_one_request_are_bounded() {
         let mut hub = TrustRequestHub::default();
@@ -1184,8 +1315,9 @@ mod tests {
         let sink_got = Arc::clone(&got);
         install(
             tx,
-            Some(Arc::new(move |n: CallerNotice| {
-                sink_got.lock().unwrap().push(n)
+            Some(Arc::new(move |n: &CallerNotice| {
+                sink_got.lock().unwrap().push(n.clone());
+                Posted::Delivered
             })),
         );
         let c = check("/served-notice-test", "team", "claude");
@@ -1223,6 +1355,44 @@ mod tests {
         let notices = std::mem::take(&mut *got.lock().unwrap());
         assert_eq!(notices.len(), 1, "{notices:?}");
         assert_eq!(notices[0].answer, Answer::Declined);
+        served().tx = None;
+        served().sink = None;
+    }
+
+    /// PR #2351 review: an answer a full inbox refused is kept and tried
+    /// again (the sweep's [`take_retrying`]) until it goes in; one whose
+    /// caller is gone is dropped.
+    #[test]
+    fn an_answer_a_full_inbox_refused_is_tried_again() {
+        let (tx, _rx) = broadcast::channel(8);
+        let attempts: Arc<Mutex<Vec<String>>> = Arc::default();
+        let seen = Arc::clone(&attempts);
+        install(
+            tx,
+            Some(Arc::new(move |n: &CallerNotice| {
+                let mut seen = seen.lock().unwrap();
+                seen.push(n.pane_id.clone());
+                let tries = seen.iter().filter(|p| **p == n.pane_id).count();
+                match n.pane_id.as_str() {
+                    "gone" => Posted::Gone,
+                    _ if tries < 3 => Posted::Refused,
+                    _ => Posted::Delivered,
+                }
+            })),
+        );
+        let c = check("/retry-test", "team", "claude");
+        refusal_for(&c, "dispatch", Some(&caller("full", "agent-f", "dispatch")));
+        refusal_for(&c, "dispatch", Some(&caller("gone", "agent-g", "dispatch")));
+        note_approved(&c.project, &c.orchestration, &c.digest());
+        assert_eq!(served().retrying.len(), 1, "the refused one is kept");
+        deliver(take_retrying());
+        assert_eq!(served().retrying.len(), 1, "still refused: kept");
+        deliver(take_retrying());
+        assert!(served().retrying.is_empty(), "delivered on the third try");
+        assert!(take_retrying().is_none());
+        let tries = attempts.lock().unwrap().clone();
+        assert_eq!(tries.iter().filter(|p| *p == "full").count(), 3);
+        assert_eq!(tries.iter().filter(|p| *p == "gone").count(), 1);
         served().tx = None;
         served().sink = None;
     }
