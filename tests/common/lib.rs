@@ -8232,6 +8232,10 @@ pub fn require_real_e2e() -> bool {
 /// checked out, including ones predating this marker.
 #[doc(hidden)]
 pub fn _skip_if_err(result: Result<(), String>) -> bool {
+    // Issue #2132: a `DAD_AGENT_BIN` the constructor refused must not turn into
+    // a skip, or into a pass on whatever agent `PATH` held, in a test whose
+    // preflight runs an agent by name before any other harness call.
+    assert_agent_bin_pin_usable();
     // Issue #502/#785 audit S1. The narrowest choke point that covers every
     // runtime credential preflight: `skip_unless!` is what wraps each
     // `check_*_available` call, so a test that gates on a credential passes
@@ -10183,6 +10187,17 @@ pub(crate) fn agent_bin_dir(raw: &Path) -> Result<PathBuf, String> {
         return Err(format!(
             "{AGENT_BIN_ENV}={} is not a directory; it names the directory that holds the \
              agent executables to run (`claude`, `codex`, …), not one executable",
+            raw.display()
+        ));
+    }
+    // `contain_path` drops these from every `PATH` the harness gives a deck, so
+    // a pin there would reach the preflight but not the pane: the preflight
+    // would check one agent while the pane ran another.
+    if is_inside_checkout(&resolved_entry(raw)) || is_deck_telemetry_shim_dir(raw) {
+        return Err(format!(
+            "{AGENT_BIN_ENV}={} is inside the checkout or a deck's telemetry shim directory, \
+             which the harness keeps out of every deck's PATH, so the agent a pane runs would \
+             not be the pinned one; put the pin directory outside the checkout",
             raw.display()
         ));
     }

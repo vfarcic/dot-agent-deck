@@ -1093,6 +1093,9 @@ fn a_reaper_ends_once_its_last_escapee_has() {
          </dev/null >/dev/null 2>&1 &";
     let script = format!("{escapee} : '{marker}'; exit 0");
 
+    // The reaper's deadline counts from after this spawn, so a reaper that
+    // waits it out is still alive at `spawned + LINGER_CAP_SECS`.
+    let spawned = Instant::now();
     let mut wrapper = Command::new(env!("CARGO_BIN_EXE_dot-agent-deck"))
         .args(["wrap", "--agent", "codex", "--", "/bin/sh", "-c", &script])
         .env("ESCAPEE_PID_FILE", &escapee_pid_path)
@@ -1171,9 +1174,20 @@ fn a_reaper_ends_once_its_last_escapee_has() {
         )),
         "the escapee must exit once released"
     );
-    let left = common::wait_until(common::load_scaled(Duration::from_secs(10)), || {
-        !common::process_running(reaper)
-    });
+    // Bounded by the reaper's own deadline, less a margin: a wait that could
+    // run past it would let a reaper that waits the cap out pass.
+    let before_deadline = (spawned + Duration::from_secs(LINGER_CAP_SECS))
+        .saturating_duration_since(Instant::now())
+        .saturating_sub(Duration::from_secs(5));
+    if before_deadline.is_zero() {
+        release_and_reap(&[reaper]);
+        panic!(
+            "the probe's set-up took too long to leave room before the reaper's \
+             {LINGER_CAP_SECS} s deadline, so this run cannot tell the two behaviours apart"
+        );
+    }
+    let budget = common::load_scaled(Duration::from_secs(10)).min(before_deadline);
+    let left = common::wait_until(budget, || !common::process_running(reaper));
     if !left {
         release_and_reap(&[reaper]);
     }

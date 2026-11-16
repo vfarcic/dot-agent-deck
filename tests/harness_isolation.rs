@@ -166,15 +166,19 @@ fn harness_clears_inherited_deck_endpoints() {
 // ---------------------------------------------------------------------------
 
 /// Set only on the re-executed child of [`agent_bin_pins_every_lookup`].
+#[cfg(unix)]
 const AGENT_BIN_CHILD_ENV: &str = "DAD_TEST_HARNESS_AGENT_BIN_CHILD";
 
 /// What that child prints once its checks have passed.
+#[cfg(unix)]
 const AGENT_BIN_CHILD_DONE: &str = "harness-agent-bin-child-checked";
 
 /// What the pinned stand-in `claude` prints for `--version`.
+#[cfg(unix)]
 const PINNED_CLAUDE: &str = "9.9.9 (pinned stand-in)";
 
 /// Re-execute this test binary on `name` with `env`, PATH set to `path`.
+#[cfg(unix)]
 fn reexec(name: &str, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::process::Output {
     std::process::Command::new(std::env::current_exe().expect("test binary path"))
         .args(["--exact", name, "--nocapture", "--test-threads=1"])
@@ -189,6 +193,7 @@ fn reexec(name: &str, path: &std::ffi::OsStr, env: &[(&str, &str)]) -> std::proc
 /// `~/.local/bin` first, then start a fresh copy of this test binary. In that
 /// child, `claude --version` run by name, the harness's own `PATH` for a deck
 /// and the agent preflight's lookup must all reach the pinned stand-in.
+#[cfg(unix)]
 #[test]
 fn agent_bin_pins_every_lookup() {
     if let Some(pinned) = std::env::var_os(AGENT_BIN_CHILD_ENV) {
@@ -265,6 +270,7 @@ fn agent_bin_pins_every_lookup() {
 /// Scenario: Start a fresh copy of this test binary with `DAD_AGENT_BIN` set to
 /// a relative path, and in that child ask the harness for a temp directory. The
 /// child must fail naming the variable rather than run whatever `PATH` holds.
+#[cfg(unix)]
 #[test]
 fn an_unusable_agent_bin_fails_the_first_harness_call() {
     if std::env::var_os(AGENT_BIN_CHILD_ENV).is_some() {
