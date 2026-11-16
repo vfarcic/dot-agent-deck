@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.50.2] - 2026-11-16
+
+### Added
+
+- **Approve an orchestration inside the deck when work the deck started needs it**
+  When an agent's `dispatch --orchestration`, an orchestrator's `delegate`, `pane restart` or `pane spawn`, a schedule firing, **Run now** or a scheduled issue dispatch is refused because the orchestration is not approved as its `.dot-agent-deck.toml` now reads, the TUI and the desktop app attached to that deck now open **Review project commands** for it. You no longer have to leave the deck to run `dot-agent-deck trust approve`.
+  The review shows what asked (for example `Asked by: dispatch`) and, in the desktop app, which deck. Approve it (`a` in the TUI, **Approve** in the desktop app, or "approve" by voice) and the refused work starts when it is tried again; the refusal tells the agent or schedule to retry. Deny it (`Esc`, **Deny**, or "cancel" by voice) and that work is refused, saying you declined it, without asking again about the same text until the daemon restarts. Answering in one client closes the review in the others. A request raised while no client is attached appears when one attaches, and a retry while the review is waiting opens no second one.
+  Waiting requests and denials are kept in the daemon's memory only, so restarting the daemon forgets them and the next attempt asks again. Approvals are stored as before. See [Approving Project Commands](https://agent-deck.devopstoolkit.ai/docs/project-trust.md#answering-the-decks-request).
+
+
+
 ## [0.50.1] - 2026-11-16
 
 ### Added
