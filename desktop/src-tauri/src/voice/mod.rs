@@ -675,6 +675,7 @@ pub mod test_support {
             authoring_kind: None,
             inbox: None,
             delivery_notice: None,
+            status_reason: None,
             pending_question: None,
             input_held: None,
             input_discarded: false,

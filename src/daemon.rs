@@ -871,6 +871,9 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     // delivery as state on the pane's card instead of typing a diagnostic line
     // into the agent's input buffer. See `install_delivery_notice_sink`.
     install_delivery_notice_sink(&pty_registry, state.clone(), event_tx.clone());
+    // PRD #211: the status an agent writes to its terminal (OSC 7501), read
+    // by each pane's reader thread and applied by the monitor below.
+    let status_signals = install_status_signal_sink(&pty_registry);
     let client_count = daemon.client_count;
     let idle_shutdown = daemon.idle_shutdown;
     let scheduler = daemon.scheduler;
@@ -1094,6 +1097,17 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
         })
     };
 
+    // PRD #211: unconditional; it waits on the reader threads' channel and
+    // runs no timer unless a sign-in signal is being held back.
+    let status_osc_handle = {
+        let registry = pty_registry.clone();
+        let monitor_state = state.clone();
+        let monitor_event_tx = event_tx.clone();
+        tokio::spawn(async move {
+            run_status_osc_monitor(registry, monitor_state, monitor_event_tx, status_signals).await;
+        })
+    };
+
     // PRD #1666 part 3 (Q35-20e): unconditional — every attached client's
     // card follows the typing the deck holds for its pane. Waits on the
     // registry's display notice, so it runs no timer while nothing is held.
@@ -1162,6 +1176,7 @@ pub async fn run_daemon_with(socket_path: &Path, daemon: Daemon) -> Result<(), D
     }
     shell_activity_handle.abort();
     codex_rollout_handle.abort();
+    status_osc_handle.abort();
     input_held_handle.abort();
     opencode_mode_handle.abort();
     pull_request_handle.abort();
@@ -3483,6 +3498,174 @@ async fn run_codex_rollout_monitor(
         for failure in failures {
             report_codex_rollout_failure(&state, &event_tx, &registry, failure).await;
         }
+    }
+}
+
+/// PRD #211: route every pane's OSC 7501 status ([`crate::status_osc`]) from
+/// its reader thread to [`run_status_osc_monitor`]. The send never blocks the
+/// reader, and the channel keeps each pane's signals in the order they were
+/// read.
+fn install_status_signal_sink(
+    registry: &Arc<AgentPtyRegistry>,
+) -> tokio::sync::mpsc::UnboundedReceiver<crate::agent_pty::StatusSignals> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    registry.set_status_signal_sink(Arc::new(move |signals| {
+        let _ = tx.send(signals);
+    }));
+    rx
+}
+
+/// PRD #211: apply the status agents write to their terminals as OSC 7501
+/// sequences, each as ONE event through [`ingest_event_unless`] — the path,
+/// lock order and broadcast a hook's report takes, so a hook event and a
+/// signal land in the order the daemon received them, and the later one wins.
+///
+/// A `blocked:kind=auth` is held back by [`crate::status_osc::AuthSettle`]
+/// until it has stood for [`crate::status_osc::AUTH_SETTLE`] from the moment
+/// its pane's reader read it; any other signal from the pane discards it. Before
+/// a held signal is shown, every signal already queued is taken in first, so a
+/// busy monitor never shows one whose `idle` was already waiting.
+///
+/// No internal shutdown signal: aborted in `run_daemon_with`'s cleanup.
+async fn run_status_osc_monitor(
+    registry: Arc<AgentPtyRegistry>,
+    state: SharedState,
+    event_tx: broadcast::Sender<BroadcastMsg>,
+    mut signals: tokio::sync::mpsc::UnboundedReceiver<crate::agent_pty::StatusSignals>,
+) {
+    use crate::status_osc::AuthSettle;
+    // Only the panes holding a sign-in signal back have an entry.
+    let mut held: std::collections::HashMap<
+        (String, String),
+        (crate::event::AgentType, AuthSettle),
+    > = std::collections::HashMap::new();
+    loop {
+        let due = held
+            .values()
+            .filter_map(|(_, settle)| settle.due_at())
+            .min();
+        let mut batches = Vec::new();
+        match due {
+            Some(at) => {
+                tokio::select! {
+                    batch = signals.recv() => match batch {
+                        Some(batch) => batches.push(batch),
+                        None => return,
+                    },
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
+                }
+            }
+            None => match signals.recv().await {
+                Some(batch) => batches.push(batch),
+                None => return,
+            },
+        }
+        while let Ok(batch) = signals.try_recv() {
+            batches.push(batch);
+        }
+        for batch in batches {
+            let key = (batch.pane_id.clone(), batch.agent_id.clone());
+            let mut settle = held
+                .remove(&key)
+                .map(|(_, settle)| settle)
+                .unwrap_or_default();
+            for signal in &batch.signals {
+                if let Some(update) = settle.signal(signal, batch.seen_at) {
+                    report_status_update(
+                        &state,
+                        &event_tx,
+                        &registry,
+                        &key,
+                        &batch.agent_type,
+                        update,
+                    )
+                    .await;
+                }
+            }
+            if settle.due_at().is_some() {
+                held.insert(key, (batch.agent_type, settle));
+            }
+        }
+        let now = std::time::Instant::now();
+        let ready: Vec<(String, String)> = held
+            .iter()
+            .filter(|(_, (_, settle))| settle.due_at().is_some_and(|at| at <= now))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in ready {
+            if let Some((agent_type, mut settle)) = held.remove(&key)
+                && let Some(update) = settle.poll(now)
+            {
+                report_status_update(&state, &event_tx, &registry, &key, &agent_type, update).await;
+            }
+        }
+    }
+}
+
+/// PRD #211: one OSC 7501 status update as the event the card applies, filed
+/// under the pane's current hook generation (or, before the agent's first hook,
+/// the pane's card), and applied only while the generation that wrote it still
+/// holds the pane.
+///
+/// `agy` reports one busy state, so `working` is a `Thinking` that
+/// [`crate::state::AppState::apply_event`] shows as Working for it. A Needs
+/// Input is a `PermissionRequest` with no question: the agent's message rides
+/// as [`crate::event::STATUS_REASON_METADATA_KEY`], which the card shows.
+async fn report_status_update(
+    state: &SharedState,
+    event_tx: &broadcast::Sender<BroadcastMsg>,
+    registry: &Arc<AgentPtyRegistry>,
+    (pane_id, agent_id): &(String, String),
+    agent_type: &crate::event::AgentType,
+    update: crate::status_osc::StatusUpdate,
+) {
+    use crate::event::EventType;
+    use crate::status_osc::StatusUpdate;
+    let (event_type, reason) = match update {
+        StatusUpdate::Working => (EventType::Thinking, None),
+        StatusUpdate::Idle => (EventType::Idle, None),
+        StatusUpdate::Error(message) => (EventType::Error, message),
+        StatusUpdate::NeedsInput(message) => (EventType::PermissionRequest, message),
+    };
+    let session_id = {
+        let state = state.read().await;
+        state
+            .pane_hook_session_id(pane_id)
+            .or_else(|| state.pane_session_id(pane_id))
+            .unwrap_or_else(|| pane_id.clone())
+    };
+    let mut metadata = std::collections::HashMap::new();
+    if let Some(reason) = reason {
+        metadata.insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
+    }
+    let event = AgentEvent {
+        session_id,
+        agent_type: agent_type.clone(),
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: chrono::Utc::now(),
+        user_prompt: None,
+        metadata,
+        pane_id: Some(pane_id.clone()),
+        agent_id: Some(agent_id.clone()),
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: None,
+        background_revision: None,
+    };
+    let ingested = ingest_event_unless(state, event_tx, registry, event, false, None, |_| {
+        registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str())
+    })
+    .await;
+    if !ingested {
+        tracing::debug!(
+            pane_id = %escape_id_for_log(pane_id),
+            agent_id = %escape_id_for_log(agent_id),
+            "status osc: dropped a signal from a generation that no longer holds its pane"
+        );
     }
 }
 

@@ -2256,6 +2256,7 @@ fn live_016_reconnected_card_reads_how_long_the_agent_has_been_quiet() {
             blocked: None,
             hook_generation: None,
             delivery_notice: None,
+            status_reason: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,

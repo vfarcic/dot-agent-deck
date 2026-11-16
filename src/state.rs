@@ -977,6 +977,14 @@ pub struct SessionSnapshot {
     /// absence as no notice, so no `PROTOCOL_VERSION` bump.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delivery_notice: Option<String>,
+    /// PRD #211: the agent's own words for its Error or Needs Input
+    /// ([`SessionState::status_reason`]), so a client that attaches, or
+    /// re-reads the agent list, after the event still shows them. `Some` only
+    /// beside the status it explains. Additive optional, the `blocked`
+    /// precedent: an older reader ignores the key, a newer one reads its
+    /// absence as no reason, so no `PROTOCOL_VERSION` bump.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     /// PRD #1631: the question this session's agent is waiting on —
     /// [`SessionState::pending_question`]. The one model the desktop's voice
     /// answers and #1497's spoken prompts both read. Additive optional, the
@@ -1346,6 +1354,7 @@ impl SessionState {
             // A pane property: `AppState::live_session_for` fills it.
             hook_generation: None,
             delivery_notice: self.delivery_notice().map(str::to_string),
+            status_reason: self.status_reason(),
             pending_question: self.pending_question.clone(),
             pull_request: self.pull_request.clone(),
             pull_request_revision: Some(self.pull_request_revision),
@@ -1413,6 +1422,30 @@ impl SessionState {
             .and_then(|e| e.metadata.get(crate::event::DELIVERY_NOTICE_METADATA_KEY))
             .map(String::as_str)
             .filter(|notice| !notice.trim().is_empty())
+    }
+
+    /// PRD #211: the agent's own words for why this card is in Error or Needs
+    /// Input — the [`crate::event::STATUS_REASON_METADATA_KEY`] of the newest
+    /// event of the kind that sets that status, cleaned for display. `None` in
+    /// any other status, and when that event gave no reason: an Error or a
+    /// prompt reported without one explains nothing, so it ends an earlier
+    /// reason, as it ends a delivery notice.
+    pub fn status_reason(&self) -> Option<String> {
+        let explains = |event: &AgentEvent| match self.status {
+            SessionStatus::Error => event.event_type == EventType::Error,
+            SessionStatus::WaitingForInput => matches!(
+                event.event_type,
+                EventType::PermissionRequest | EventType::WaitingForInput
+            ),
+            _ => false,
+        };
+        self.recent_events
+            .iter()
+            .rev()
+            .find(|event| explains(event))
+            .and_then(|event| event.metadata.get(crate::event::STATUS_REASON_METADATA_KEY))
+            .map(|reason| crate::status_osc::clean_message(reason))
+            .filter(|reason| !reason.is_empty())
     }
 
     /// Issue #1678: the background work this card shows — the daemon's
@@ -7089,7 +7122,56 @@ fn overlay_snapshot_fields(session: &mut SessionState, snap: &SessionSnapshot) {
     {
         push_delivery_notice_carrier(session, notice);
     }
+    // PRD #211: likewise the agent's reason for its Error or Needs Input, as an
+    // event of the kind that sets the status, carrying it.
+    if let Some(reason) = snap
+        .status_reason
+        .as_deref()
+        .map(crate::status_osc::clean_message)
+        .filter(|reason| !reason.is_empty())
+        && session.status_reason().as_deref() != Some(reason.as_str())
+    {
+        let event_type = match snap.status {
+            SessionStatus::Error => Some(EventType::Error),
+            SessionStatus::WaitingForInput => Some(EventType::PermissionRequest),
+            _ => None,
+        };
+        if let Some(event_type) = event_type {
+            push_status_reason_carrier(session, event_type, reason);
+        }
+    }
     merge_snapshot_background(session, snap);
+}
+
+/// PRD #211: push an event of `event_type` carrying the agent's `reason` onto
+/// `session`'s journal, stamped at its `last_activity`, where
+/// [`SessionState::status_reason`] reads it. Shaped as the delivery-notice
+/// carrier is.
+fn push_status_reason_carrier(session: &mut SessionState, event_type: EventType, reason: String) {
+    let mut metadata = HashMap::new();
+    metadata.insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
+    let held = held_background(session);
+    session.recent_events.push_back(AgentEvent {
+        session_id: session.session_id.clone(),
+        agent_type: AgentType::None,
+        event_type,
+        tool_name: None,
+        tool_detail: None,
+        cwd: None,
+        timestamp: session.last_activity,
+        user_prompt: None,
+        metadata,
+        pane_id: session.pane_id.clone(),
+        agent_id: None,
+        agent_version: None,
+        schema_version: None,
+        live_target: None,
+        background: held.and_then(|(background, _)| background),
+        background_revision: held.map(|(_, revision)| revision),
+    });
+    while session.recent_events.len() > MAX_RECENT_EVENTS {
+        pop_oldest_event(&mut session.recent_events);
+    }
 }
 
 /// Bound on a delivery notice read off the wire, in characters. The daemon's
@@ -15278,6 +15360,15 @@ impl AppState {
                 .metadata
                 .get(crate::event::SUBAGENT_ID_METADATA_KEY)
                 .is_some_and(|answered| release_subagent_wait(session, answered)),
+            // PRD #211: Antigravity reports one busy state — its terminal
+            // status says `working` from the prompt to the turn's end, between
+            // tool calls too — so its model calls read as Working, as that
+            // signal does, rather than flickering to Thinking between tools.
+            EventType::Thinking if event.agent_type == AgentType::Antigravity => {
+                session.status = SessionStatus::Working;
+                session.active_tool = None;
+                true
+            }
             EventType::Thinking => {
                 session.status = SessionStatus::Thinking;
                 session.active_tool = None;
@@ -23383,6 +23474,89 @@ mod tests {
         assert_eq!(card.live_snapshot().delivery_notice, None);
     }
 
+    /// PRD #211: the agent's reason rides the event that sets the status it
+    /// explains, survives a snapshot, and ends with that status or with a
+    /// later event of the same kind that gives none.
+    #[test]
+    fn a_status_reason_explains_its_status_and_survives_the_snapshot() {
+        let reasoned = |event_type: EventType, secs: i64, reason: &str| {
+            let mut event = quota_event(event_type, secs);
+            event.agent_type = AgentType::Antigravity;
+            event.tool_name = None;
+            event.metadata.insert(
+                crate::event::STATUS_REASON_METADATA_KEY.to_string(),
+                reason.to_string(),
+            );
+            event
+        };
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        state.apply_event(reasoned(
+            EventType::PermissionRequest,
+            2,
+            "Approve Bash:\n rm -f probe.txt\u{1b}",
+        ));
+        let card = &state.sessions["gen-q"];
+        assert_eq!(card.status, SessionStatus::WaitingForInput);
+        assert_eq!(
+            card.status_reason().as_deref(),
+            Some("Approve Bash: rm -f probe.txt")
+        );
+        let snap = card.live_snapshot();
+        assert_eq!(
+            snap.status_reason.as_deref(),
+            Some("Approve Bash: rm -f probe.txt")
+        );
+        let mut other = AppState::default();
+        other.register_pane("pane-q".to_string());
+        other.seed_hydrated_session(
+            "pane-q".to_string(),
+            None,
+            Some(AgentType::Antigravity),
+            Some("agent-q".to_string()),
+            Some(&snap),
+        );
+        let seeded = other
+            .sessions
+            .values()
+            .find(|s| s.pane_id.as_deref() == Some("pane-q"))
+            .unwrap();
+        assert_eq!(
+            seeded.status_reason().as_deref(),
+            Some("Approve Bash: rm -f probe.txt")
+        );
+
+        state.apply_event(quota_event(EventType::Idle, 3));
+        let card = &state.sessions["gen-q"];
+        assert_eq!(card.status_reason(), None);
+        assert_eq!(card.live_snapshot().status_reason, None);
+
+        state.apply_event(reasoned(EventType::Error, 4, "network issue"));
+        assert_eq!(
+            state.sessions["gen-q"].status_reason().as_deref(),
+            Some("network issue")
+        );
+        // An Error reported without a reason explains nothing.
+        state.apply_event(quota_event(EventType::Error, 5));
+        assert_eq!(state.sessions["gen-q"].status_reason(), None);
+    }
+
+    /// PRD #211: Antigravity's model calls read as Working, the one busy state
+    /// its terminal status reports; every other agent's still read Thinking.
+    #[test]
+    fn an_antigravity_turn_reads_working_and_others_thinking() {
+        let mut state = AppState::default();
+        state.register_pane("pane-q".to_string());
+        state.apply_event(quota_event(EventType::SessionStart, 1));
+        let mut thinking = quota_event(EventType::Thinking, 2);
+        thinking.agent_type = AgentType::Antigravity;
+        state.apply_event(thinking);
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Working);
+        state.apply_event(quota_event(EventType::Thinking, 3));
+        assert_eq!(state.sessions["gen-q"].status, SessionStatus::Thinking);
+    }
+
     /// PRD #1666 long-turn delivery: the daemon's "delivered after all" event
     /// lifts the card's not-delivered Error to Thinking, and only that Error:
     /// an Error the agent reported, or a card in any other status, keeps its
@@ -24604,6 +24778,7 @@ mod tests {
             }),
             hook_generation: None,
             delivery_notice: None,
+            status_reason: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,
@@ -24677,6 +24852,7 @@ mod tests {
             }),
             hook_generation: None,
             delivery_notice: None,
+            status_reason: None,
             pending_question: None,
             pull_request: None,
             pull_request_revision: None,

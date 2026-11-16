@@ -194,6 +194,8 @@ pub mod scheduler;
 pub mod self_upgrade;
 pub mod spawn;
 pub mod state;
+// PRD #211: agent status read from OSC 7501 sequences in a pane's output.
+pub mod status_osc;
 pub mod submitted_prompt;
 // PRD #1401: the TUI's `o` key, which hands a wire URL to the system browser.
 pub mod system_browser;

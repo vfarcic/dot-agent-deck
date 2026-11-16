@@ -492,6 +492,18 @@ pub const SURFACED_INBOX_METADATA_KEY: &str = "surfaced_inbox";
 /// notice this replaced, kept because the text still reaches a human.
 pub const DELIVERY_NOTICE_METADATA_KEY: &str = "delivery_notice";
 
+/// Metadata key: the agent's own words for why its card is in Error or Needs
+/// Input (PRD #211) — the error a failed turn reported, or what the agent is
+/// waiting on when it raised no question the deck can read. Shown on the card
+/// beside the status it explains ([`crate::state::SessionState::status_reason`]).
+///
+/// Set by the hook CLI from an Antigravity `Stop` that ended in an error, and
+/// by the daemon from the agent's OSC 7501 status ([`crate::status_osc`]).
+/// Agent-derived text: bounded and stripped of control characters where it is
+/// produced and again where a card reads it. It rides the free-form `metadata`
+/// map, so a consumer that does not know the key ignores it.
+pub const STATUS_REASON_METADATA_KEY: &str = "status_reason";
+
 /// `AgentEvent.metadata` key marking the `Thinking` event the DAEMON authors
 /// when a message it reported not delivered ([`DELIVERY_NOTICE_METADATA_KEY`])
 /// was acknowledged after all (PRD #1666 long-turn delivery). It lifts the

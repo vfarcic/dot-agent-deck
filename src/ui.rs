@@ -25042,6 +25042,17 @@ fn render_session_card(
         ));
     }
 
+    // PRD #211: the agent's own words for its Error or Needs Input — the error
+    // a failed turn reported, or what it waits on when it raised no question
+    // the deck reads — under `Dir:` like the deck's reasons above, in the
+    // status's colour. The desktop tile shows the same row.
+    if !is_placeholder && let Some(reason) = session.status_reason() {
+        attention.push((
+            reason,
+            Style::default().fg(palette::status_color(&session.status)),
+        ));
+    }
+
     // PRD #1666 part 3 (Q35, core §7): the deck holds what the user typed
     // into this pane, and says why, whether or not messages wait — the
     // desktop tile's held-input row. On a card whose agent has reported

@@ -852,6 +852,13 @@ pub struct DesktopAgent {
     /// `status: "error"`, and scrubbed here like every other daemon text.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_notice: Option<String>,
+    /// PRD #211: the agent's own words for its `error` or
+    /// `waiting_for_input` status (`SessionSnapshot::status_reason`) — the
+    /// error a failed turn reported, or what it waits on. Present only beside
+    /// one of those statuses, and scrubbed here like every other agent text.
+    /// The TUI card's reason row.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_reason: Option<String>,
     /// PRD #1631: the question this agent is waiting on
     /// (`SessionSnapshot.pending_question`), every text field made safe to
     /// show, with whether each option can be answered by voice. Absent when
@@ -2581,6 +2588,16 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         .and_then(|snapshot| snapshot.delivery_notice.as_deref())
         .map(safe_display_text)
         .filter(|notice| !notice.is_empty());
+    let status_reason = live
+        .filter(|snapshot| {
+            matches!(
+                snapshot.status,
+                SessionStatus::Error | SessionStatus::WaitingForInput
+            )
+        })
+        .and_then(|snapshot| snapshot.status_reason.as_deref())
+        .map(safe_display_text)
+        .filter(|reason| !reason.is_empty());
     let pending_question = live
         .and_then(|snapshot| snapshot.pending_question.as_ref())
         .map(map_pending_question);
@@ -2645,6 +2662,7 @@ pub(crate) fn map_agent(record: AgentRecord) -> DesktopAgent {
         authoring_kind: record.authoring_kind,
         inbox,
         delivery_notice,
+        status_reason,
         pending_question,
         input_held,
         input_discarded,
@@ -4401,6 +4419,7 @@ mod tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                status_reason: None,
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: None,

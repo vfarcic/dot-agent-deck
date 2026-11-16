@@ -410,6 +410,13 @@ export interface DesktopAgentDto {
    */
   deliveryNotice?: string;
   /**
+   * PRD #211 — the agent's own words for its `error` or `waiting_for_input`
+   * status: the error a failed turn reported, or what it waits on. Agent text;
+   * `agentFromDto` keeps it only beside one of those statuses and as a display
+   * copy.
+   */
+  statusReason?: string;
+  /**
    * PRD #1631: the question this agent is waiting on
    * (`SessionSnapshot.pending_question`), every text field scrubbed by the
    * crate and still the agent's own words. Absent when it waits on nothing,
@@ -2824,6 +2831,9 @@ function agentFromDto(agent: DesktopAgentDto, index: number, daemonId: string): 
     ...(agent.inbox ? { inbox: inboxFromDto(agent.inbox) } : {}),
     ...(agent.status === "error" && agent.deliveryNotice
       ? { deliveryNotice: displayText(agent.deliveryNotice, DISPLAY_LIMITS.prompt) }
+      : {}),
+    ...((agent.status === "error" || agent.status === "waiting_for_input") && agent.statusReason
+      ? { statusReason: displayText(agent.statusReason, DISPLAY_LIMITS.prompt) }
       : {}),
     ...(agent.pendingQuestion ? { pendingQuestion: agent.pendingQuestion } : {}),
     ...(inputHeld ? { inputHeld } : {}),

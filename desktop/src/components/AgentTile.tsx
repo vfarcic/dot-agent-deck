@@ -589,6 +589,11 @@ export function AgentTile({
             {agent.deliveryNotice && !held && (
               <p className="agent-delivery-notice" data-testid={`delivery-notice-${agent.id}`}>{agent.deliveryNotice}</p>
             )}
+            {/* PRD #211: the agent's own words for its error or Needs Input —
+                the TUI card's reason row. */}
+            {agent.statusReason && !held && (
+              <p className={agent.status === "failed" ? "agent-delivery-notice" : "agent-status-reason"} data-testid={`status-reason-${agent.id}`}>{agent.statusReason}</p>
+            )}
             {/* PRD #1666 §6.5: what the deck says about this agent's deck
                 messages beyond the badge — the TUI card's notice row — and the
                 messages waiting on the user's Retry or Cancel. */}

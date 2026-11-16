@@ -339,6 +339,22 @@ pub struct AgentSpec {
     /// ([`crate::question::answer_keys`]). `None` for an agent with no such
     /// menus (Pi, whose dialogs report their own options) and the placeholder.
     pub questions: Option<&'static QuestionTables>,
+    /// PRD #211: the agent writes its own status to its terminal as an OSC
+    /// 7501 sequence ([`crate::status_osc`]), and the daemon reads it from the
+    /// pane's output. `None` leaves the reader off, which costs a pane nothing.
+    pub status_osc7501: Option<StatusOsc7501>,
+}
+
+/// PRD #211 ([`AgentSpec::status_osc7501`]): how one agent reports its status
+/// through OSC 7501.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StatusOsc7501 {
+    /// The `app=` value the agent's sequences carry. A sequence naming any
+    /// other app is not this agent's and is ignored.
+    pub app: &'static str,
+    /// The environment variable, and its value, that asks the agent to emit
+    /// the sequences. The deck sets it on every pane it starts for the agent.
+    pub enable_env: (&'static str, &'static str),
 }
 
 /// PRD #1666 part 3, Q28 ([`AgentSpec::first_hook`]): when an agent's own
@@ -865,6 +881,7 @@ pub static CLAUDE_CODE: AgentSpec = AgentSpec {
     doorbell_ready_screen: Some(claude_prompt_on_screen),
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&CLAUDE_CODE_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// PRD #1666 part 2 (`inbox/doorbell/008`): do `rows`, one trimmed screen row
@@ -942,6 +959,7 @@ pub static OPEN_CODE: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&OPEN_CODE_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// Pi — bundled-extension strategy (shipped, PRD #201).
@@ -982,6 +1000,7 @@ pub static PI: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: None,
+    status_osc7501: None,
 };
 
 /// Codex — stdout-wrapper strategy (PRD #20 M7). The first agent to use the
@@ -1039,6 +1058,7 @@ pub static CODEX: AgentSpec = AgentSpec {
     // PRD #1666 part 3, Q28: its SessionStart comes with its first prompt.
     first_hook: FirstHook::WithFirstPrompt,
     questions: Some(&CODEX_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// PRD #1666 S7 (decision A): whether `rows` — a pane's screen, one trimmed
@@ -1253,15 +1273,17 @@ pub static DEVIN: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: Some(&DEVIN_QUESTIONS),
+    status_osc7501: None,
 };
 
 /// Google's Antigravity CLI (`agy`, PRD #211) — native-hooks strategy, like
 /// [`DEVIN`]. Its process comm is `agy`, the binary is `agy`.
 ///
-/// This entry carries its identity and presentation only. Its hook installer,
-/// refresh, prompt keys, question tables, doorbell recognisers and OSC 7501
-/// status reader are wired by later PRD #211 tasks, so each is left at its
-/// inert default until then.
+/// Its status comes from its hooks and from the OSC 7501 sequences it writes
+/// to its terminal ([`AgentSpec::status_osc7501`]): no hook reports a
+/// permission prompt or an interrupted turn. Its hook installer, refresh,
+/// prompt keys, question tables and doorbell recognisers are wired by later
+/// PRD #211 tasks, so each is left at its inert default until then.
 pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     agent_type: AgentType::Antigravity,
     label: "Antigravity",
@@ -1293,6 +1315,12 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     first_hook: FirstHook::BeforePrompt,
     // PRD #211: wired in a later task.
     questions: None,
+    // Measured on `agy` 1.5.9: `AGY_CLI_OSC7501=on` makes it emit at once,
+    // terminated by BEL, every sequence carrying `app=antigravity`.
+    status_osc7501: Some(StatusOsc7501 {
+        app: "antigravity",
+        enable_env: ("AGY_CLI_OSC7501", "on"),
+    }),
 };
 
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
@@ -1322,6 +1350,7 @@ pub static NONE: AgentSpec = AgentSpec {
     doorbell_ready_screen: None,
     first_hook: FirstHook::BeforePrompt,
     questions: None,
+    status_osc7501: None,
 };
 
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral

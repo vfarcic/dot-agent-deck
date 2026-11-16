@@ -115,6 +115,153 @@ pub(crate) struct OpenCodeHookInput {
     _extra: HashMap<String, Value>,
 }
 
+/// PRD #211: the stdin JSON of an Antigravity CLI (`agy`) hook. Its fields are
+/// camelCase, and every one is lenient for the reason
+/// [`ClaudeCodeHookInput::source`] gives: a strange shape costs that field,
+/// never the event. Measured on `agy` 1.5.9 (`tests/fixtures/antigravity/`).
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AntigravityHookInput {
+    #[serde(default, deserialize_with = "lenient_string")]
+    hook_event_name: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    conversation_id: Option<String>,
+    #[serde(default, deserialize_with = "lenient_string")]
+    cwd: Option<String>,
+    /// The user's prompt of the turn, on every event of it.
+    #[serde(default, deserialize_with = "lenient_string")]
+    last_user_input: Option<String>,
+    /// `PreInvocation`'s 0-based model call within the turn's loop.
+    #[serde(default)]
+    invocation_num: Option<Value>,
+    /// `PreToolUse` / `PostToolUse`: `{id, name, args}`.
+    #[serde(default, deserialize_with = "lenient_object")]
+    tool_call: Option<Value>,
+    /// `Stop`: `NO_TOOL_CALL` for an ordinary turn end, `ERROR` for a failed
+    /// model request.
+    #[serde(default, deserialize_with = "lenient_string")]
+    termination_reason: Option<String>,
+    /// `Stop` with `ERROR`: what failed. Empty on a `PostToolUse` that
+    /// succeeded.
+    #[serde(default, deserialize_with = "lenient_string")]
+    error: Option<String>,
+}
+
+/// PRD #211: an Antigravity hook payload as the [`AgentEvent`] the deck
+/// ingests, through the shared Claude-shaped builder. `None` for an event
+/// that moves no card:
+///
+/// - `SessionStart` (fired with the first prompt of a conversation) →
+///   `SessionStart`;
+/// - `PreInvocation` → the turn's `Thinking`, which Antigravity's card shows as
+///   Working, carrying `lastUserInput` as the prompt on its first model call
+///   (`invocationNum` 0) only, so a later call in the same turn records no
+///   second prompt;
+/// - `PreToolUse` / `PostToolUse` → `ToolStart` / `ToolEnd`;
+/// - `Stop` → `Idle`, or `Error` carrying its `error` text as the card's
+///   [`crate::event::STATUS_REASON_METADATA_KEY`] when `terminationReason` is
+///   `ERROR`;
+/// - `PostInvocation` and anything else → nothing.
+fn antigravity_hook_event(input: &str) -> Option<AgentEvent> {
+    let payload: AntigravityHookInput = serde_json::from_str(input).ok()?;
+    let session_id = payload.conversation_id.filter(|id| !id.is_empty())?;
+    let tool_call = payload.tool_call.as_ref();
+    let tool = |key: &str| {
+        tool_call
+            .and_then(|call| call.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
+    let (hook_event_name, prompt) = match payload.hook_event_name.as_deref()? {
+        "SessionStart" => ("SessionStart", None),
+        "PreInvocation" => {
+            let first = payload
+                .invocation_num
+                .as_ref()
+                .and_then(Value::as_u64)
+                .is_none_or(|n| n == 0);
+            (
+                "UserPromptSubmit",
+                payload.last_user_input.filter(|_| first),
+            )
+        }
+        "PreToolUse" => ("PreToolUse", None),
+        "PostToolUse" => ("PostToolUse", None),
+        "Stop" if payload.termination_reason.as_deref() == Some("ERROR") => ("StopFailure", None),
+        "Stop" => ("Stop", None),
+        _ => return None,
+    };
+    let tool_events = matches!(hook_event_name, "PreToolUse" | "PostToolUse");
+    let reason = (hook_event_name == "StopFailure")
+        .then(|| {
+            payload
+                .error
+                .as_deref()
+                .map(crate::status_osc::clean_message)
+        })
+        .flatten()
+        .filter(|reason| !reason.is_empty());
+    let mut event = build_event_typed_with_version(
+        ClaudeCodeHookInput {
+            session_id,
+            hook_event_name: hook_event_name.to_string(),
+            cwd: payload.cwd,
+            tool_name: tool_events.then(|| tool("name")).flatten(),
+            tool_input: tool_events
+                .then(|| tool_call.and_then(|call| call.get("args")).cloned())
+                .flatten(),
+            tool_use_id: tool_events.then(|| tool("id")).flatten(),
+            prompt,
+            ..Default::default()
+        },
+        AgentType::Antigravity,
+        &|| None,
+    )?;
+    if let Some(reason) = reason {
+        event
+            .metadata
+            .insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
+    }
+    Some(event)
+}
+
+/// PRD #211: what an Antigravity hook prints. `agy` wants a JSON object from
+/// every hook that exits 0; `{"decision":"allow"}` on `PreToolUse` defers to
+/// the next hook or `agy`'s own policy (measured: it does not suppress a
+/// permission prompt), and `{}` everywhere else changes nothing.
+fn antigravity_hook_output(input: &str) -> &'static str {
+    let event = serde_json::from_str::<Value>(input).ok();
+    match event
+        .as_ref()
+        .and_then(|payload| payload.get("hookEventName"))
+        .and_then(Value::as_str)
+    {
+        Some("PreToolUse") => r#"{"decision":"allow"}"#,
+        _ => "{}",
+    }
+}
+
+/// PRD #211: an Antigravity hook. Its hooks file is shared by the Antigravity
+/// App and IDE, so outside a deck pane this does nothing but answer; in one it
+/// reports the event, then answers. It always exits 0: `agy` only logs a
+/// failing hook.
+fn handle_antigravity_hook() -> ExitCode {
+    let input = read_stdin().unwrap_or_default();
+    if crate::inbox_prompt::in_deck_pane()
+        && let Some(event) = antigravity_hook_event(&input)
+    {
+        // Issue #318: present this pane's hook capability token.
+        let token = crate::hook_provenance::token_from_env();
+        if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref()) {
+            let _ = send_to_socket(&json);
+        }
+    }
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{}", antigravity_hook_output(&input));
+    let _ = out.flush();
+    ExitCode::SUCCESS
+}
+
 /// [`lenient_string`] for a JSON object: anything else is `None`.
 fn lenient_object<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
     Ok(Option::<Value>::deserialize(d)?.filter(Value::is_object))
@@ -171,6 +318,9 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
                 question_agent_version(&AgentType::Devin)
             })
         }
+        // PRD #211: Antigravity's payloads are camelCase and name their own
+        // events; see [`antigravity_hook_event`].
+        "antigravity" => antigravity_hook_event(input),
         _ => {
             let hook_input: ClaudeCodeHookInput = serde_json::from_str(input).ok()?;
             build_event_typed_with_version(hook_input, AgentType::ClaudeCode, &|| {
@@ -291,6 +441,9 @@ fn question_version_line(program: &str) -> Option<String> {
 }
 
 pub fn handle_hook(agent: &str) -> ExitCode {
+    if agent == "antigravity" {
+        return handle_antigravity_hook();
+    }
     let input = match read_stdin() {
         Some(s) if !s.is_empty() => s,
         _ => return ExitCode::SUCCESS,
@@ -1503,6 +1656,30 @@ fn extract_tool_detail(tool_name: Option<&str>, tool_input: Option<&Value>) -> O
         // the tool NAME is documented, so a shape we guessed wrong must still
         // yield a useful detail rather than none. Devin's other tools (`read`,
         // `edit`, `grep`, …) are left to the generic branch for the same reason.
+        // PRD #211: Antigravity's tools, as measured on `agy` 1.5.9
+        // (`run_command {CommandLine}`, `write_file` / `read_file {Path}`) and
+        // as its docs name the others. An unexpected shape falls through to
+        // the first string, as `exec` does.
+        "run_command"
+        | "write_file"
+        | "read_file"
+        | "view_file"
+        | "write_to_file"
+        | "replace_file_content"
+        | "multi_replace_file_content"
+        | "grep_search" => {
+            let key = match tool_name? {
+                "run_command" => "CommandLine",
+                "write_file" | "read_file" => "Path",
+                "view_file" => "AbsolutePath",
+                "grep_search" => "Query",
+                _ => "TargetFile",
+            };
+            match input.get(key).and_then(|v| v.as_str()) {
+                Some(value) => truncate(value.lines().next().unwrap_or(value), 120),
+                None => truncate(input.values().find_map(|v| v.as_str())?, 80),
+            }
+        }
         "exec" => match input.get("command").and_then(|v| v.as_str()) {
             Some(cmd) => truncate(cmd.lines().next().unwrap_or(cmd), 120),
             None => truncate(input.values().find_map(|v| v.as_str())?, 80),
@@ -3693,6 +3870,86 @@ fn is_transient_read_error(err: &std::io::Error, deadline: Option<std::time::Ins
 mod tests {
     use super::*;
     use spec::spec;
+
+    /// PRD #211: a captured Antigravity hook payload.
+    fn agy(name: &str) -> String {
+        std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/antigravity")
+                .join(name),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn antigravity_hooks_map_to_the_events_a_card_reads() {
+        let event = |name: &str| hook_payload_event("antigravity", &agy(name));
+
+        let start = event("session-start.json").expect("SessionStart");
+        assert_eq!(start.event_type, EventType::SessionStart);
+        assert_eq!(start.agent_type, AgentType::Antigravity);
+        assert_eq!(start.session_id, "00000000-0000-4000-8000-000000000001");
+
+        let prompt = event("pre-invocation.json").expect("first model call");
+        assert_eq!(prompt.event_type, EventType::Thinking);
+        assert!(
+            prompt
+                .user_prompt
+                .as_deref()
+                .is_some_and(|p| p.starts_with("Run the shell command:")),
+            "{prompt:?}"
+        );
+        // A later model call of the same loop records no second prompt.
+        let again = event("pre-invocation-after-continue.json").expect("re-entered loop");
+        assert_eq!(again.event_type, EventType::Thinking);
+        assert_eq!(again.user_prompt, None);
+
+        let tool = event("pre-tool-use-run-command.json").expect("PreToolUse");
+        assert_eq!(tool.event_type, EventType::ToolStart);
+        assert_eq!(tool.tool_name.as_deref(), Some("run_command"));
+        assert_eq!(tool.tool_detail.as_deref(), Some("echo agy-probe-1"));
+        assert!(tool.metadata.contains_key("tool_use_id"));
+        let write = event("pre-tool-use-write-file.json").expect("PreToolUse");
+        assert_eq!(write.tool_name.as_deref(), Some("write_file"));
+        assert_eq!(
+            write.tool_detail.as_deref(),
+            Some("/home/user/project/probe.txt")
+        );
+        let ended = event("post-tool-use-run-command.json").expect("PostToolUse");
+        assert_eq!(ended.event_type, EventType::ToolEnd);
+        assert_eq!(ended.tool_name.as_deref(), Some("run_command"));
+
+        let stop = event("stop.json").expect("Stop");
+        assert_eq!(stop.event_type, EventType::Idle);
+        assert!(
+            !stop
+                .metadata
+                .contains_key(crate::event::STATUS_REASON_METADATA_KEY)
+        );
+        let failed = event("stop-error.json").expect("Stop ERROR");
+        assert_eq!(failed.event_type, EventType::Error);
+        assert!(
+            failed.metadata[crate::event::STATUS_REASON_METADATA_KEY]
+                .starts_with("generating and executing:"),
+            "{failed:?}"
+        );
+
+        assert!(event("post-invocation.json").is_none());
+        assert!(hook_payload_event("antigravity", "{\"hookEventName\":\"Stop\"}").is_none());
+        assert!(hook_payload_event("antigravity", "not json").is_none());
+    }
+
+    #[test]
+    fn antigravity_hooks_answer_with_a_json_object() {
+        assert_eq!(
+            antigravity_hook_output(&agy("pre-tool-use-run-command.json")),
+            r#"{"decision":"allow"}"#
+        );
+        for name in ["session-start.json", "pre-invocation.json", "stop.json"] {
+            assert_eq!(antigravity_hook_output(&agy(name)), "{}");
+        }
+        assert_eq!(antigravity_hook_output(""), "{}");
+    }
 
     /// Issue #1182: what the pane's card, the desktop overview and the prompt
     /// history show for a seeded Claude agent. Before this they showed

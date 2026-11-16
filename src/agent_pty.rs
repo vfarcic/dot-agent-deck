@@ -2104,6 +2104,9 @@ struct PushCost {
     /// The generation's release latch changed, or its window closed: its
     /// re-projection is due (plan §3.4′).
     latch_changed: bool,
+    /// PRD #211: the push completed OSC 7501 status sequences, which
+    /// [`AgentBus::take_status_signals`] hands over.
+    status_signals: bool,
 }
 
 struct AgentBusState {
@@ -2132,6 +2135,15 @@ struct AgentBusState {
     /// lock before it is published. Nothing reads it yet, nor the input
     /// epoch it notes into (Q35-06).
     output_hook: crate::composer_probe::paste_mode::OutputHook,
+    /// PRD #211: the OSC 7501 status reader, for a generation spawned as an
+    /// agent whose registry entry switches it on
+    /// ([`crate::agent_registry::AgentSpec::status_osc7501`]); `None` for
+    /// every other, which then scans nothing.
+    status_osc: Option<crate::status_osc::Osc7501Scanner>,
+    /// PRD #211: the status sequences read and not yet handed over, in byte
+    /// order. Only the reader thread pushes, and it takes them after each
+    /// push, so they leave in the order the agent wrote them.
+    status_signals: Vec<crate::status_osc::OscSignal>,
 }
 
 impl AgentBusState {
@@ -2203,6 +2215,8 @@ impl AgentBus {
                 evidence: crate::evidence_state::EvidenceState::new(profile, rows, cols),
                 release: crate::release_scanner::ReleaseCapture::start(rows, cols),
                 output_hook,
+                status_osc: None,
+                status_signals: Vec::new(),
             }),
             label: String::new(),
             #[cfg(test)]
@@ -2215,12 +2229,26 @@ impl AgentBus {
         }
     }
 
-    /// The bus for a generation spawned as `agent` (Q83).
+    /// The bus for a generation spawned as `agent` (Q83). PRD #211: an agent
+    /// that reports its status through OSC 7501 gets the reader for it.
     pub fn spawned_as(self, agent: Option<AgentType>) -> Self {
-        Self {
+        let mut bus = Self {
             spawned_as: agent,
             ..self
-        }
+        };
+        let reader = bus
+            .spawned_as
+            .as_ref()
+            .and_then(|agent| crate::agent_registry::spec(agent).status_osc7501)
+            .map(|osc| crate::status_osc::Osc7501Scanner::new(osc.app));
+        bus.state.get_mut().unwrap().status_osc = reader;
+        bus
+    }
+
+    /// PRD #211: the OSC 7501 status sequences read since the last call, in
+    /// the order the agent wrote them.
+    fn take_status_signals(&self) -> Vec<crate::status_osc::OscSignal> {
+        std::mem::take(&mut self.state.lock().unwrap().status_signals)
     }
 
     /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
@@ -2313,6 +2341,18 @@ impl AgentBus {
         let scanner = state.release.last_push();
         state.live_modes.feed(&arc);
         state.output_hook.on_output(&arc);
+        // PRD #211: off for every agent that does not report through OSC
+        // 7501, so this is one branch for them.
+        let status_signals = match state.status_osc.as_mut() {
+            Some(reader) => {
+                let mut found = Vec::new();
+                reader.scan(&arc, &mut found);
+                let any = !found.is_empty();
+                state.status_signals.extend(found);
+                any
+            }
+            None => false,
+        };
         for &b in arc.iter() {
             state.scrollback.push_back(b);
         }
@@ -2352,6 +2392,7 @@ impl AgentBus {
             evidence_ns,
             scanner,
             latch_changed,
+            status_signals,
         }
     }
 
@@ -3171,6 +3212,24 @@ fn pump_reader(
             && let (Some(registry), Some(pane)) = (registry.upgrade(), pane_id_env.as_deref())
         {
             registry.request_reprojection(pane, &agent_id);
+        }
+        // PRD #211: the agent's own status reports, handed to the daemon in
+        // the order they were written.
+        if cost.status_signals {
+            let signals = bus.take_status_signals();
+            if let (Some(registry), Some(pane), Some(agent)) = (
+                registry.upgrade(),
+                pane_id_env.as_deref(),
+                bus.spawned_as.as_ref(),
+            ) {
+                registry.publish_status_signals(StatusSignals {
+                    pane_id: pane.to_string(),
+                    agent_id: agent_id.clone(),
+                    agent_type: agent.clone(),
+                    signals,
+                    seen_at: Instant::now(),
+                });
+            }
         }
     };
     // PRD #1666 part 3 (Q35-20a): on Linux the reader also takes drain
@@ -8431,6 +8490,9 @@ pub struct AgentPtyRegistry {
     /// `None` for a registry with no owning daemon (in-process unit tests),
     /// where publishing is a silent no-op. See [`DeliveryNotice`].
     delivery_notice_sink: Mutex<Option<DeliveryNoticeSink>>,
+    /// PRD #211: where the OSC 7501 status a pane's agent writes is reported.
+    /// `None` for a registry with no owning daemon, which drops it.
+    status_signal_sink: Mutex<Option<StatusSignalSink>>,
     /// PRD #126: delegations that are still awaiting a `work-done` plus the set
     /// of panes currently mid-close. Both live under ONE mutex so "mark this
     /// pane closing AND drop its outstanding records" is a single atomic
@@ -10615,6 +10677,27 @@ pub struct DeliveryNotice {
 /// broadcast, neither of which the registry owns.
 pub type DeliveryNoticeSink = Arc<dyn Fn(DeliveryNotice) + Send + Sync>;
 
+/// PRD #211: OSC 7501 status sequences one generation wrote, read off its PTY
+/// output by the reader thread ([`crate::status_osc`]).
+#[derive(Debug, Clone)]
+pub struct StatusSignals {
+    pub pane_id: String,
+    /// The generation that wrote them.
+    pub agent_id: String,
+    /// What it was spawned as: the agent whose registry entry switched the
+    /// reader on.
+    pub agent_type: AgentType,
+    /// In the order they were written.
+    pub signals: Vec<crate::status_osc::OscSignal>,
+    /// When the reader read them.
+    pub seen_at: Instant,
+}
+
+/// PRD #211: the daemon's sink for [`StatusSignals`], installed via
+/// [`AgentPtyRegistry::set_status_signal_sink`]. Called on the reader thread,
+/// so it must not block.
+pub type StatusSignalSink = Arc<dyn Fn(StatusSignals) + Send + Sync>;
+
 impl Default for AgentPtyRegistry {
     fn default() -> Self {
         Self::new()
@@ -10717,6 +10800,7 @@ impl AgentPtyRegistry {
                 crate::dispatched_units::DispatchedUnits::default(),
             ),
             delivery_notice_sink: Mutex::new(None),
+            status_signal_sink: Mutex::new(None),
             delegations: crate::lock_rank::RankedMutex::new(DelegationTracker::default()),
             delegation_seq: AtomicU64::new(1),
             dispatch_returns: crate::lock_rank::RankedMutex::new(
@@ -11080,6 +11164,22 @@ impl AgentPtyRegistry {
     /// (every in-process unit test) simply drops notices.
     pub fn set_delivery_notice_sink(&self, sink: DeliveryNoticeSink) {
         *self.delivery_notice_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// PRD #211: install the daemon's sink for [`StatusSignals`]. A registry
+    /// without one drops them.
+    pub fn set_status_signal_sink(&self, sink: StatusSignalSink) {
+        *self.status_signal_sink.lock().unwrap() = Some(sink);
+    }
+
+    /// PRD #211: hand a generation's OSC 7501 status to the daemon. Whether
+    /// the generation still holds its pane is checked where the status is
+    /// applied, under the lock that applies it.
+    pub fn publish_status_signals(&self, signals: StatusSignals) {
+        let sink = self.status_signal_sink.lock().unwrap().clone();
+        if let Some(sink) = sink {
+            sink(signals);
+        }
     }
 
     /// Issue #424 (reviewer blocker 3): report a delivery failure against the
@@ -14524,6 +14624,17 @@ impl AgentPtyRegistry {
                 crate::inbox_receipt::ENV_INBOX_SPOOL.to_string(),
                 spool.to_string_lossy().into_owned(),
             ));
+        }
+        // PRD #211: an agent that reports its status through OSC 7501 is asked
+        // to, on every pane the deck starts for it; the daemon reads what it
+        // writes ([`AgentBus::spawned_as`]).
+        if let Some(osc) = spawn_agent_type
+            .as_ref()
+            .and_then(|agent| crate::agent_registry::spec(agent).status_osc7501)
+        {
+            let (name, value) = osc.enable_env;
+            opts.env.retain(|(k, _)| k != name);
+            opts.env.push((name.to_string(), value.to_string()));
         }
 
         // Capture the full env vec and the requested PTY size BEFORE
@@ -25929,6 +26040,7 @@ mod spawn_tests {
                 blocked: None,
                 hook_generation: None,
                 delivery_notice: None,
+                status_reason: None,
                 pending_question: None,
                 pull_request: None,
                 pull_request_revision: None,

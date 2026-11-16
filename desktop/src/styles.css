@@ -706,6 +706,8 @@ code, kbd, .instrument strong, .agent-instruments strong, time { font-family: "J
 /* Issue #1933: the notice says how the agent's pane ended, its exit code last,
    so it wraps rather than being cut, as the TUI card wraps it. */
 .agent-identity p.agent-delivery-notice, .agent-delivery-notice { color: var(--red); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
+/* PRD #211: what an agent waiting on the user says it waits on. Its error reason takes the delivery notice's style. */
+.agent-identity p.agent-status-reason, .agent-status-reason { color: var(--amber); font-family: "JetBrains Mono", monospace; font-size: var(--text-sm); white-space: normal; overflow-wrap: anywhere; }
 /* Issue #1678: background work still running after the turn ended. Ink rather
    than --muted, as the TUI draws it in its primary text colour: it is a reading
    about now, not a label. */

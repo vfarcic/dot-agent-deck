@@ -1066,6 +1066,12 @@ export interface AgentSession {
    */
   deliveryNotice?: string;
   /**
+   * HONEST. PRD #211: the agent's own words for its error or Needs Input — the
+   * error a failed turn reported, or what it waits on. A display copy, present
+   * only while the daemon reports one of those statuses.
+   */
+  statusReason?: string;
+  /**
    * HONEST. PRD #1631: the question the agent is waiting on, from the daemon's
    * snapshot. Every text field is the agent's own words, scrubbed by the
    * crate; render it through `displayText` like any other free-form string.
