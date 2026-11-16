@@ -34,6 +34,8 @@ struct ClaudeDeck {
     daemon: common::DaemonProc,
     spawns: PathBuf,
     settings: PathBuf,
+    /// The daemon's tracing log (`DOT_AGENT_DECK_LOG`).
+    log: PathBuf,
     // Last, so the daemon (and the stand-ins it reaps) go before their files.
     _scratch: tempfile::TempDir,
 }
@@ -70,7 +72,13 @@ impl ClaudeDeck {
             bin.display(),
             std::env::var("PATH").unwrap_or_default()
         );
-        let daemon = common::spawn_daemon_serve_with_env(Some(&toml), "0", &[("PATH", &path)]);
+        let log = scratch.join("deck.log");
+        let log_str = log.display().to_string();
+        let daemon = common::spawn_daemon_serve_with_env(
+            Some(&toml),
+            "0",
+            &[("PATH", &path), ("DOT_AGENT_DECK_LOG", &log_str)],
+        );
         let settings = daemon.home.join(".claude").join("settings.json");
         assert!(
             !settings.exists(),
@@ -102,6 +110,7 @@ impl ClaudeDeck {
             daemon,
             spawns,
             settings,
+            log,
             _scratch: tempdir,
         }
     }
@@ -300,5 +309,50 @@ fn install_029_a_claude_code_agent_starts_with_hooks_repaired_from_a_deleted_cop
     assert!(
         seen.contains("issue-1973-theme"),
         "the user's other settings must survive the repair:\n{seen}"
+    );
+}
+
+/// Scenario: Start a headless daemon with no `~/.claude`, then give Claude Code
+/// a `settings.json` that is not valid JSON and fire a scheduled Claude Code
+/// stand-in. The agent must still start, the file must be left byte for byte
+/// as the user wrote it, and the deck's log must say the hooks could not be
+/// repaired, naming the file it refused, rather than skipping it in silence.
+#[spec("hooks/install/030")]
+#[test]
+fn install_030_a_malformed_claude_settings_file_is_left_alone_and_the_refusal_logged() {
+    let deck = ClaudeDeck::new(1);
+    let malformed = "{ \"theme\": \"issue-1973\", \"hooks\": ";
+    std::fs::create_dir_all(deck.settings.parent().unwrap()).expect("set up ~/.claude");
+    std::fs::write(&deck.settings, malformed).expect("seed a malformed settings.json");
+
+    let seen = deck.spawn(1);
+    assert_eq!(
+        seen, malformed,
+        "the agent must start with the user's malformed settings.json exactly as they wrote it"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&deck.settings).expect("read settings.json"),
+        malformed,
+        "the deck must never write over a settings file it cannot parse"
+    );
+    let logged = || {
+        std::fs::read_to_string(&deck.log)
+            .unwrap_or_default()
+            .lines()
+            .any(|line| {
+                line.contains("could not repair the agent's hooks before it started")
+                    && line.contains("Claude Code")
+            })
+    };
+    assert!(
+        common::wait_until(WAIT, logged),
+        "the deck's log must say Claude Code's hooks could not be repaired before it \
+         started; log:\n{}",
+        std::fs::read_to_string(&deck.log).unwrap_or_default()
+    );
+    let log = std::fs::read_to_string(&deck.log).unwrap_or_default();
+    assert!(
+        log.contains(&*deck.settings.to_string_lossy()),
+        "the refusal must name the settings file it left alone; log:\n{log}"
     );
 }

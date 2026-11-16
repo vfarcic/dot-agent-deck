@@ -357,9 +357,10 @@ pub fn repairs_before_spawn(agent: &AgentType) -> bool {
 /// Issue #1973: run `agent`'s startup install just before the daemon starts
 /// one of its agents, but only when its hooks need it
 /// ([`pins_need_repair`]): they name no deck at all, which is what an agent
-/// set up after the deck started has, or a deck copy that is gone. Hooks that
-/// already name a usable deck are not touched, so the deck does not write the
-/// agent's config, which is the user's file, every time an agent starts.
+/// set up after the deck started has, or a deck copy that is gone, or the
+/// config could not be read back. Hooks that already name a usable deck are
+/// not touched, so the deck does not write the agent's config, which is the
+/// user's file, every time an agent starts.
 ///
 /// What the install could not write is logged, as the startup install logs
 /// it: the agent still starts, and `dot-agent-deck hooks refresh` names the
@@ -391,11 +392,15 @@ fn repair_with(
         return None;
     }
     let name = crate::hook_binary::agent_display_name(agent);
-    tracing::info!(
-        agent = name,
-        ?pins,
-        "hooks: repairing the agent's hooks before it starts (issue #1973)"
-    );
+    // A config that could not be read is handed to the install, which says
+    // why or finds the agent absent; only a read config is worth a line here.
+    if pins.is_some() {
+        tracing::info!(
+            agent = name,
+            ?pins,
+            "hooks: repairing the agent's hooks before it starts (issue #1973)"
+        );
+    }
     let attempt = install();
     if let InstallAttempt::Ran { failed } = &attempt
         && !failed.is_empty()
@@ -414,14 +419,17 @@ fn repair_with(
 /// again before an agent starts. `Some` with no pins means the config names no
 /// deck, so the agent would report nothing; a pin `repairable` accepts is one
 /// the install replaces (a copy that is gone, or a bare or relative name).
-/// `None`, a config that could not be read or an agent not installed here,
-/// is left alone: the install would refuse the first and skip the second.
+/// `None` (the config could not be read, or the agent is not installed here)
+/// is handed to the install too: it reads the config itself, refuses a file
+/// it cannot read or parse rather than writing over it, and reports why, so a
+/// malformed settings file is named in the log instead of skipped in silence;
+/// for an agent that is not installed it does nothing.
 pub(crate) fn pins_need_repair(
     pins: Option<&[HookPin]>,
     repairable: impl Fn(&str) -> bool,
 ) -> bool {
     match pins {
-        None => false,
+        None => true,
         Some([]) => true,
         Some(pins) => pins.iter().any(|pin| repairable(&pin.binary)),
     }
@@ -778,8 +786,9 @@ mod tests {
         const GONE: &str = "/home/u/removed/dot-agent-deck";
         let repairable = |binary: &str| binary == GONE;
         assert!(
-            !pins_need_repair(None, repairable),
-            "an unreadable config, or an agent not installed here, is left to the startup install"
+            pins_need_repair(None, repairable),
+            "an unreadable config goes to the install, which refuses it and says why \
+             (and does nothing for an agent not installed here)"
         );
         assert!(
             pins_need_repair(Some(&[]), repairable),
@@ -822,16 +831,6 @@ mod tests {
         assert_eq!(ran.get(), 0, "usable hooks must not run the install");
 
         assert_eq!(
-            repair_with(&AgentType::ClaudeCode, || None, install, never),
-            None
-        );
-        assert_eq!(
-            ran.get(),
-            0,
-            "an unreadable config must not run the install"
-        );
-
-        assert_eq!(
             repair_with(&AgentType::ClaudeCode, || Some(Vec::new()), install, never),
             Some(InstallAttempt::Ran {
                 failed: vec!["settings.json is not valid JSON".into()]
@@ -842,6 +841,15 @@ mod tests {
             1,
             "hooks naming no deck must run the install once"
         );
+
+        assert_eq!(
+            repair_with(&AgentType::ClaudeCode, || None, install, never),
+            Some(InstallAttempt::Ran {
+                failed: vec!["settings.json is not valid JSON".into()]
+            }),
+            "a config that could not be read goes to the install, whose refusal says why"
+        );
+        assert_eq!(ran.get(), 2);
     }
 
     /// Issue #1973 and CLAUDE.md rule 20: every agent with a startup install

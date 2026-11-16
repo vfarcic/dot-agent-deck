@@ -3678,7 +3678,7 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Layer:** L2 headless e2e (`tests/e2e_daemon_plugin_refresh.rs`), the real `daemon serve` from `common::spawn_daemon_serve` with a durable `~/.local/bin/dot-agent-deck` in an isolated HOME; no TUI is started.
 - **Agent:** none; a stand-in `opencode` script, run as a scheduled task's command through `RunNow`, records each plugin's `BINARY_PATH` the moment it starts, or that the plugin is absent. It answers `--version` with `1.18.35` and exits without recording, because the deck probes `<opencode> --version` before each OpenCode spawn and ahead of the per-spawn install (PRD #2050); a stand-in that recorded on that probe would record the stale pins.
 - **Asserts:** with no OpenCode folder at daemon start, no plugin is written; after both layouts (`~/.config/opencode`, `~/.opencode`) are created holding a plugin pinned to a deleted copy of the deck, the scheduled OpenCode agent finds the global root's plugin pinned to the daemon's `~/.local/bin/dot-agent-deck` as it starts, and no deck plugin left in `~/.opencode/plugin/`: since PRD #2050 the deck removes its legacy copy once the global root holds the module.
-- **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon repairs before an agent starts only when they need it (`hooks/install/028`, `029`); a real OpenCode.
+- **Does not assert:** a plugin folder the deck cannot write, and the card notice that follows (`inbox/boundary/025`); a plugin pinned to another live install, which is kept (`inbox/boundary/025`); the plugin template's integration level (`inbox/boundary/025`); the daemon's startup install (`hooks/install/009`); Claude Code's hooks, which the daemon repairs before an agent starts only when they need it (`hooks/install/028`–`030`); a real OpenCode.
 - **Platform coverage:** mac+linux.
 
 ##### hooks/install/025 — An OpenCode 2.x agent starts with the deck's 2.x layout and `--standalone` (PRD #2050).
@@ -3714,6 +3714,13 @@ Measured while writing these, against Claude Code 2.1.289 through this path, and
 - **Agent:** as `hooks/install/028`.
 - **Asserts:** after the daemon started, `~/.claude/settings.json` is seeded with a deck `Stop` hook pinned to a deleted copy, a hook of the user's own and an unrelated `theme` setting; as the scheduled Claude Code agent starts, every deck hook runs the daemon's `~/.local/bin/dot-agent-deck`, the deleted copy is named nowhere, and the user's hook and setting are still there.
 - **Does not assert:** a pin to another live install, which the per-start check leaves alone (unit-tested in `hooks_refresh::tests::hooks_are_repaired_before_a_start_only_when_they_need_it`); the installer's own rules for which entries it owns (`hooks/install/001`–`003`).
+- **Platform coverage:** mac+linux.
+
+##### hooks/install/030 — A Claude Code agent whose `settings.json` is not valid JSON still starts, the file is left as it was, and the deck logs the refused repair (issue #1973).
+- **Layer:** as `hooks/install/028`, with the daemon's `DOT_AGENT_DECK_LOG` pointed at a file in the scratch directory.
+- **Agent:** as `hooks/install/028`.
+- **Asserts:** after the daemon started, `~/.claude/settings.json` is seeded with text that is not valid JSON; the scheduled Claude Code stand-in starts and sees that text unchanged, the file still holds it afterwards, and the deck's log has a line saying Claude Code's hooks could not be repaired before it started, and names the settings file.
+- **Does not assert:** the wording `hooks refresh` prints for the same file (`hooks/install/019`); a file the deck cannot read for permissions, which takes the same path.
 - **Platform coverage:** mac+linux.
 
 #### hooks/opencode-real
