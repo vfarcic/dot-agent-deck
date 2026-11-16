@@ -698,8 +698,8 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 ##### dashboard/pane/008 — Agent cards retain their registry-colored type badges even when they have friendly display names (PRD #20 M7, review finding 9).
 - **Layer:** L1 (ratatui `TestBackend` + color-aware `insta` snapshot).
-- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex `SessionState` fixtures, including friendly display names).
-- **Asserts:** the unnamed Codex card and named cards for all four shipped agents contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted.
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, Codex, Devin, Antigravity and unidentified `SessionState` fixtures, including friendly display names).
+- **Asserts:** the unnamed Codex card and named Claude Code, OpenCode, Pi and Codex cards contain their registry identity; every badge cell uses that registry entry's `badge_color`; complete color-aware buffers are snapshotted. A friendly-named Antigravity card shows the exact `Antigravity` badge with a uniform foreground distinct from the rendered badges of all five existing agents and the unidentified placeholder.
 - **Does not assert:** wrapper event delivery or real Codex execution (covered by `codex/wrap/001` and `codex/live/001`).
 - **Platform coverage:** mac+linux+windows.
 
@@ -1107,15 +1107,15 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 
 ##### dashboard/filter/003 — `type:<agent>` filters mixed sessions by registry identity and composes with ordinary text (PRD #20 M9).
 - **Layer:** L1 (in-process `filter_sessions` pure-data matrix).
-- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, Codex, Devin and Antigravity session states).
 - **Asserts:** `type:claude`, `type:claudecode`, `type:opencode`, `type:pi`, and `type:codex` each select only that agent; type matching is case-insensitive; a remaining text term is ANDed with the type; conflicting `type:codex type:claude` constraints use true AND semantics and yield no matches; an unknown type yields no matches; plain id/cwd/status/display-name matching is unchanged.
 - **Does not assert:** the rendered dashboard result (covered by `dashboard/filter/004`).
 - **Platform coverage:** mac+linux+windows.
 
-##### dashboard/filter/004 — Typing `type:codex` in the `/` search visibly narrows the dashboard to Codex cards (PRD #20 M9).
+##### dashboard/filter/004 — Typing `type:<agent>` in the `/` search visibly narrows the dashboard to that agent's cards (PRD #20 M9, PRD #211).
 - **Layer:** L1 (in-process keyboard handlers + ratatui `TestBackend` dashboard render).
-- **Agent:** none (synthetic Claude Code, OpenCode, Pi, and Codex session states).
-- **Asserts:** `/` enters filter mode; typing `type:codex` through the filter input leaves the Codex card visible and hides every non-Codex card in the rendered buffer.
+- **Agent:** none (synthetic Claude Code, OpenCode, Pi, Codex, Devin and Antigravity session states).
+- **Asserts:** the unfiltered dashboard shows all six cards with Antigravity's badge present; `/` enters filter mode; typing each agent's `type:` query through the filter input leaves only that agent's card visible in the rendered buffer. Antigravity's query is case-insensitive, composes with an ordinary matching text term, and keeps its badge visible after filtering.
 - **Does not assert:** accepting or clearing the filter (covered by `dashboard/filter/002` and `dashboard/selection/004`).
 - **Platform coverage:** mac+linux+windows.
 

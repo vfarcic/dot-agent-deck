@@ -36064,6 +36064,18 @@ mod tests {
                 "/work/codex-project",
                 "4",
             ),
+            (
+                "devin-session",
+                AgentType::Devin,
+                "/work/devin-project",
+                "5",
+            ),
+            (
+                "antigravity-session",
+                AgentType::Antigravity,
+                "/work/antigravity-project",
+                "6",
+            ),
         ] {
             state.apply_event(AgentEvent {
                 session_id: session_id.to_string(),
@@ -36096,6 +36108,8 @@ mod tests {
             ("opencode-session", "frontend"),
             ("pi-session", "test-runner"),
             ("codex-session", "wrapped-worker"),
+            ("devin-session", "devin-worker"),
+            ("antigravity-session", "agy-worker"),
         ] {
             ui.display_names
                 .insert(session_id.to_string(), display_name.to_string());
@@ -36352,58 +36366,92 @@ mod tests {
         );
     }
 
-    /// Scenario: From the dashboard, press `/` and type `type:codex` through the
-    /// normal filter-input handlers, then render the resulting card list. The
-    /// visible dashboard must contain the Codex card and hide the Claude Code,
-    /// OpenCode, and Pi cards.
+    /// Scenario: Render a mixed deck containing every supported agent, then press `/` and type each agent's `type:` filter through the normal input handlers. Each filter must keep only its agent's card visible, including Antigravity, whose filter also accepts uppercase spelling and an additional matching text term.
     #[spec("dashboard/filter/004")]
     #[test]
     fn filter_004_slash_type_filter_narrows_rendered_cards() {
         let (state, mut ui) = typed_filter_fixture();
-        let action = handle_normal_key(
-            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
-            &mut ui,
-            state.sessions.len(),
-            None,
-            &KeybindingConfig::default(),
-        );
-        assert!(matches!(action, Action::EnterFilter));
-        ui.mode = UiMode::Filter;
-        for c in "type:codex".chars() {
-            handle_filter_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
-        }
-
-        let filtered = filter_sessions(&state, &ui);
-        let cards: Vec<(&SessionState, Option<&str>)> = filtered
-            .iter()
-            .map(|(id, session)| (*session, ui.display_names.get(*id).map(String::as_str)))
-            .collect();
-        let buffer = render_dashboard_cards_to_buffer(
-            &cards,
-            ui.selected_index,
-            CardDensityKind::Normal,
-            0,
-            Utc::now(),
-            100,
-        );
-        let visible: String = (0..buffer.area().height)
-            .map(|y| {
-                (0..buffer.area().width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-
-        assert!(
-            visible.contains("wrapped-worker"),
-            "typing type:codex must leave the Codex card visible:\n{visible}"
-        );
-        for hidden in ["planner", "frontend", "test-runner"] {
-            assert!(
-                !visible.contains(hidden),
-                "typing type:codex must hide the {hidden} card:\n{visible}"
+        let render = |ui: &UiState| {
+            let filtered = filter_sessions(&state, ui);
+            let cards: Vec<(&SessionState, Option<&str>)> = filtered
+                .iter()
+                .map(|(id, session)| (*session, ui.display_names.get(*id).map(String::as_str)))
+                .collect();
+            let buffer = render_dashboard_cards_to_buffer(
+                &cards,
+                ui.selected_index,
+                CardDensityKind::Normal,
+                0,
+                Utc::now(),
+                100,
             );
+            (0..buffer.area().height)
+                .map(|y| {
+                    (0..buffer.area().width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let names = [
+            "planner",
+            "frontend",
+            "test-runner",
+            "wrapped-worker",
+            "devin-worker",
+            "agy-worker",
+        ];
+        let unfiltered = render(&ui);
+        for name in names {
+            assert!(
+                unfiltered.contains(name),
+                "the unfiltered dashboard must show {name}:\n{unfiltered}"
+            );
+        }
+        assert!(
+            unfiltered.contains("Antigravity"),
+            "Antigravity must have a visible badge before filtering:\n{unfiltered}"
+        );
+
+        for (query, expected) in [
+            ("type:claude", "planner"),
+            ("type:opencode", "frontend"),
+            ("type:pi", "test-runner"),
+            ("type:codex", "wrapped-worker"),
+            ("type:devin", "devin-worker"),
+            ("type:antigravity", "agy-worker"),
+            ("TYPE:ANTIGRAVITY", "agy-worker"),
+            ("type:antigravity agy-worker", "agy-worker"),
+        ] {
+            ui.filter_text.clear();
+            ui.mode = UiMode::Normal;
+            let action = handle_normal_key(
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                &mut ui,
+                state.sessions.len(),
+                None,
+                &KeybindingConfig::default(),
+            );
+            assert!(matches!(action, Action::EnterFilter));
+            ui.mode = UiMode::Filter;
+            for c in query.chars() {
+                handle_filter_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &mut ui);
+            }
+            let visible = render(&ui);
+            for name in names {
+                assert_eq!(
+                    visible.contains(name),
+                    name == expected,
+                    "typing {query:?} must show only {expected}, checking {name}:\n{visible}"
+                );
+            }
+            if expected == "agy-worker" {
+                assert!(
+                    visible.contains("Antigravity"),
+                    "the filtered Antigravity card must retain its badge:\n{visible}"
+                );
+            }
         }
     }
 

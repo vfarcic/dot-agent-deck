@@ -2838,9 +2838,7 @@ fn pane_007_pi_card_shows_pi_identity() {
     }
 }
 
-/// Scenario: Render a live Codex session with no friendly display name into a
-/// color-aware card buffer. The title must expose the first-class `Codex`
-/// identity and every cell in that label must use Codex's registry badge color.
+/// Scenario: Render a live Codex session and friendly-named agent cards into color-aware buffers, retaining their agent badges. An Antigravity card must show the exact `Antigravity` badge in a uniform colour distinct from every existing agent and the unidentified placeholder.
 #[spec("dashboard/pane/008")]
 #[test]
 fn pane_008_codex_card_shows_colored_identity_badge() {
@@ -2968,6 +2966,89 @@ fn pane_008_codex_card_shows_colored_identity_badge() {
         ));
     }
     insta::assert_snapshot!("pane_008_named_agent_badges", named_badges);
+
+    let mut antigravity = session.clone();
+    antigravity.agent_type = AgentType::Antigravity;
+    antigravity.display_name = Some("friendly-agy".to_string());
+    let antigravity_buffer = render_card_to_buffer(
+        &antigravity,
+        Some("friendly-agy"),
+        Some(1),
+        density,
+        0,
+        now,
+        false,
+        width,
+        height,
+    );
+    let text = buffer_to_text(&antigravity_buffer);
+    assert!(
+        text.contains("friendly-agy") && text.contains("Antigravity"),
+        "a named Antigravity card must show its friendly name and Antigravity badge:\n{text}"
+    );
+    let label_width = "Antigravity".len() as u16;
+    let badge_start = (0..antigravity_buffer.area().height)
+        .find_map(|y| {
+            (0..=width.saturating_sub(label_width))
+                .find(|&x| {
+                    (x..x + label_width)
+                        .map(|cx| antigravity_buffer[(cx, y)].symbol())
+                        .collect::<String>()
+                        == "Antigravity"
+                })
+                .map(|x| (x, y))
+        })
+        .expect("the Antigravity badge is rendered whole");
+    let (badge_x, badge_y) = badge_start;
+    let badge_colour = antigravity_buffer[badge_start].fg;
+    assert!(
+        (badge_x..badge_x + label_width)
+            .all(|x| antigravity_buffer[(x, badge_y)].fg == badge_colour),
+        "every Antigravity badge cell must use the same colour:\n{}",
+        buffer_to_color_text(&antigravity_buffer)
+    );
+    for existing in [
+        AgentType::ClaudeCode,
+        AgentType::OpenCode,
+        AgentType::Pi,
+        AgentType::Codex,
+        AgentType::Devin,
+        AgentType::None,
+    ] {
+        let mut control = session.clone();
+        control.agent_type = existing.clone();
+        let control_buffer = render_card_to_buffer(
+            &control,
+            None,
+            Some(1),
+            density,
+            0,
+            now,
+            false,
+            width,
+            height,
+        );
+        let label = dot_agent_deck::agent_registry::spec(&existing).label;
+        let label_width = label.len() as u16;
+        let control_colour = (0..height).find_map(|y| {
+            (0..=width.saturating_sub(label_width)).find_map(|x| {
+                let text: String = (x..x + label_width)
+                    .map(|cx| control_buffer[(cx, y)].symbol())
+                    .collect();
+                (text == label).then_some(control_buffer[(x, y)].fg)
+            })
+        });
+        assert_ne!(
+            Some(badge_colour),
+            control_colour,
+            "the rendered Antigravity badge must have its own colour, distinct from {existing:?}:\n{}",
+            buffer_to_color_text(&antigravity_buffer)
+        );
+        assert!(
+            control_colour.is_some(),
+            "the {existing:?} control badge must be rendered"
+        );
+    }
 }
 
 /// Scenario: Aggregate a busy mixed deck (14 Claude Code + 8 Codex sessions) and
