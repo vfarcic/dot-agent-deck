@@ -20,6 +20,11 @@ pub enum PaneError {
     /// aimed at stays as it is. The message is the sentence to show.
     #[error("{0}")]
     Refused(String),
+    /// PRD #2119: the shared daemon client's own error, shown in its own
+    /// words with no controller wrapper, so a client that reports it says
+    /// exactly what the desktop app says for the same cause.
+    #[error("{0}")]
+    Client(crate::daemon_client::ClientError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -594,7 +599,9 @@ pub trait PaneController: Send + Sync {
     }
     /// PRD #2119: ask the daemon to post the configuration-generation request
     /// to `pane`'s inbox — the daemon composes it for the pane's own working
-    /// directory — bound to the agent the pane holds now, and only on the
+    /// directory — bound to `expected_agent_id` when the caller knows which
+    /// agent it asked about (the card's, captured when the confirmation
+    /// opened), else to the agent the pane holds now, and only on the
     /// daemon process `pane` was learned from ([`BoundPane`]), as
     /// [`Self::post_message`] is. Answers the message id, or
     /// [`GatedQuery::Unsupported`] when the daemon does not generate configs
@@ -606,6 +613,7 @@ pub trait PaneController: Send + Sync {
     fn generate_config(
         &self,
         _pane: &BoundPane,
+        _expected_agent_id: Option<&str>,
     ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
         Err(PaneError::NotAvailable)
     }

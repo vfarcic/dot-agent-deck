@@ -8778,6 +8778,14 @@ async fn generate_config(
             "generate-config: pane {pane_id} has no live agent; nothing was posted"
         ));
     };
+    if let Some(expected) = expected_agent_id
+        && expected != live
+    {
+        return AttachResponse::err(format!(
+            "generate-config: pane {pane_id} is now occupied by another agent than {expected}; \
+             nothing was posted"
+        ));
+    }
     let role_cwd = state.read().await.pane_cwd_map.get(pane_id).cloned();
     let cwd = role_cwd.or_else(|| registry.agent_record_any(&live).and_then(|r| r.cwd));
     let Some(cwd) = cwd else {
@@ -8787,11 +8795,14 @@ async fn generate_config(
         ));
     };
     let body = crate::config_gen::config_gen_prompt(&cwd);
+    // Bind the post to the agent sampled above, whether or not the caller named
+    // one: the prompt was composed for that agent's directory, so an agent
+    // that replaced it while the directory was being read must receive nothing.
     post_message_as(
         "generate-config",
         registry,
         pane_id,
-        expected_agent_id,
+        Some(live.as_str()),
         crate::config_gen::CONFIG_GEN_SUBJECT.to_string(),
         body,
         None,
@@ -10697,6 +10708,92 @@ mod fence_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Scenario: Start a config request for agent A, pause its directory lookup, and replace A with B in the same pane. Both an omitted and a supplied expected agent must refuse the request and leave B's inbox empty; an unchanged agent receives one request as a control.
+    #[cfg(unix)]
+    #[spec("daemon/config-gen/003")]
+    #[tokio::test]
+    async fn config_gen_003_replacement_during_directory_lookup_receives_nothing() {
+        use std::future::Future;
+        use std::task::{Context, Poll, Waker};
+        let mut observations = Vec::new();
+        for supplied in [true, false] {
+            for replace in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let registry = Arc::new(AgentPtyRegistry::new());
+                registry.set_hook_socket(dir.path().join("unreachable.sock"));
+                let spawn = || {
+                    registry
+                        .spawn_agent(SpawnOptions {
+                            command: Some("cat"),
+                            cwd: Some(dir.path().to_str().unwrap()),
+                            env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                                crate::agent_pty::DOT_AGENT_DECK_PANE_ID.to_string(),
+                                "config-race-pane".into(),
+                            )]),
+                            ..SpawnOptions::default()
+                        })
+                        .unwrap()
+                };
+                let original = spawn();
+                let state: SharedState =
+                    Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+                let mut locked = state.write().await;
+                locked.pane_cwd_map.insert(
+                    "config-race-pane".into(),
+                    dir.path().to_str().unwrap().into(),
+                );
+                let request = generate_config(
+                    &registry,
+                    &state,
+                    "config-race-pane",
+                    supplied.then_some(original.as_str()),
+                );
+                tokio::pin!(request);
+                // The initial live-agent sample is synchronous. Holding this
+                // lock makes the following directory read the first Pending,
+                // so no sleep or scheduler timing selects the interleaving.
+                assert!(matches!(
+                    request
+                        .as_mut()
+                        .poll(&mut Context::from_waker(Waker::noop())),
+                    Poll::Pending
+                ));
+                if replace {
+                    registry.close_agent(&original).unwrap();
+                    let replacement = spawn();
+                    assert_ne!(replacement, original);
+                }
+                drop(locked);
+                let response = request.await;
+                let messages = registry.inbox().list("config-race-pane");
+                let bindings: Vec<_> = messages
+                    .iter()
+                    .map(|message| message.bind_agent.clone())
+                    .collect();
+                observations.push((
+                    supplied,
+                    replace,
+                    response.ok,
+                    response.id.is_some(),
+                    bindings,
+                ));
+                registry.shutdown_all();
+            }
+        }
+        for (supplied, replace, ok, claimed_message, bindings) in observations {
+            assert_eq!(
+                ok, !replace,
+                "supplied_expected_id={supplied}, replaced={replace}: a config composed for A must never be accepted for B; bindings={bindings:?}"
+            );
+            assert_eq!(claimed_message, !replace);
+            assert_eq!(
+                bindings.len(),
+                usize::from(!replace),
+                "the replacement's inbox must stay empty"
+            );
+        }
+    }
 
     /// PRD #1885 review (reviewer 4). Scenario: a client asks for the trust
     /// view of an orchestration, then the project's config changes and it asks

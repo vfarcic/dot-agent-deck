@@ -99,6 +99,27 @@ describe("desktop/config-gen/002: generating configuration from an agent", () =>
     expect(confirmation()).toBeNull();
   });
 
+  /** Scenario: Confirm generation for planner, dismiss the busy question, and open builder while the request is still pending. A late successful send must leave builder open instead of taking the user back to planner. */
+  it("keeps the user's navigation after dismissing a pending generation with No", async () => {
+    let settle!: (result: GenerationResult) => void;
+    const generateConfig = vi.fn(() => new Promise<GenerationResult>((resolve) => { settle = resolve; }));
+    const navigate = vi.fn();
+    render(<AgentOverview runtime={{ ...runtime(vi.fn()), generateConfig }} onNavigate={navigate} />);
+    open();
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "Yes" }));
+    expect(generateConfig).toHaveBeenCalledTimes(1);
+    fireEvent.click(within(confirmation()!).getByRole("button", { name: "No" }));
+    expect(confirmation()).toBeNull();
+    fireEvent.click(within(row(FIXTURE_REMOTE_DAEMON_ID, "42")).getByRole("button", { name: "Open builder agent" }));
+    expect(navigate).toHaveBeenLastCalledWith(expect.objectContaining({ kind: "agent", agentId: "42" }));
+    navigate.mockClear();
+
+    await act(async () => settle({ outcome: "sent", message: sent, messageId: "m-late" }));
+
+    expect(navigate).not.toHaveBeenCalled();
+    expect(confirmation()).toBeNull();
+  });
+
   /** Scenario: The daemon answers unsupported or refuses the captured target after Yes. The shared upgrade/failure sentence is visible and the app does not present a successful send or enter the agent pane. */
   it.each([["unsupported", upgrade], ["failed", failed]] as const)("shows the shared %s outcome", async (outcome, message) => {
     const { rt, generateConfig } = generation(outcome, message);

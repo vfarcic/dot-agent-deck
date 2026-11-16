@@ -44,6 +44,7 @@ struct Script {
     silent_hello: bool,
     generate_capability: Option<bool>,
     generate_reply: Option<AttachResponse>,
+    silent_generate: bool,
     generate_requests: Vec<serde_json::Value>,
 }
 
@@ -183,6 +184,9 @@ impl RestartingDeck {
                                     .unwrap()
                                     .generate_requests
                                     .push(request.clone());
+                                if script.lock().unwrap().silent_generate {
+                                    std::future::pending::<()>().await;
+                                }
                             }
                             if op == "stop-agent" {
                                 script.lock().unwrap().stop_requests.push(request.clone());
@@ -332,6 +336,10 @@ impl RestartingDeck {
 
     pub(crate) fn config_requests(&self) -> Vec<serde_json::Value> {
         self.script.lock().unwrap().generate_requests.clone()
+    }
+
+    pub(crate) fn silence_config_generation(&self) {
+        self.script.lock().unwrap().silent_generate = true;
     }
 
     /// The daemon restarts now, as the process `next`.

@@ -2084,10 +2084,13 @@ async fn generate_config_on(
             message: CONFIG_GEN_UPGRADE_MESSAGE.to_string(),
         },
         Ok(Err(error)) => DesktopGenerateConfigResult::failed(&error),
-        Err(_) => DesktopGenerateConfigResult::failed(&format!(
-            "the daemon did not answer within {}s",
-            crate::daemon_bridge::DECK_REPLY_TIMEOUT.as_secs()
-        )),
+        // The shared client's timeout sentence, so the TUI (which waits the
+        // same budget) says the same words.
+        Err(_) => DesktopGenerateConfigResult::failed(
+            &dot_agent_deck::daemon_client::ClientError::TimedOut(
+                crate::daemon_bridge::DECK_REPLY_TIMEOUT,
+            ),
+        ),
     }
 }
 

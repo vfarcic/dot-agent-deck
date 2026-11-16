@@ -10055,6 +10055,8 @@ pub(crate) mod restart_fixture {
         hellos: HashMap<&'static str, usize>,
         /// Capabilities every process leaves out of its `Hello`.
         withheld: Vec<&'static str>,
+        generate_reply: Option<AttachResponse>,
+        silent_generate: bool,
     }
 
     pub(crate) struct RestartingDaemon {
@@ -10190,7 +10192,21 @@ pub(crate) mod restart_fixture {
                                 recorded.lock().unwrap().push(format!("{process}:{op}"));
                                 requests.lock().unwrap().push((process, request.clone()));
                                 restart_after_serving(&script, process, &op);
-                                let _ = write_resp(&mut stream, &serve(&op)).await;
+                                if op == "generate-config" && script.lock().unwrap().silent_generate
+                                {
+                                    std::future::pending::<()>().await;
+                                }
+                                let reply = if op == "generate-config" {
+                                    script
+                                        .lock()
+                                        .unwrap()
+                                        .generate_reply
+                                        .clone()
+                                        .unwrap_or_else(|| serve(&op))
+                                } else {
+                                    serve(&op)
+                                };
+                                let _ = write_resp(&mut stream, &reply).await;
                                 // Hold an attach or subscription open, as a
                                 // daemon would, until the client leaves.
                                 while let Ok(Some(_)) = read_frame(&mut stream).await {}
@@ -10239,6 +10255,12 @@ pub(crate) mod restart_fixture {
         /// as a daemon from before it would.
         pub(crate) fn withhold(&self, capability: &'static str) {
             self.script.lock().unwrap().withheld.push(capability);
+        }
+
+        pub(crate) fn config_generation(&self, reply: Option<AttachResponse>, silent: bool) {
+            let mut script = self.script.lock().unwrap();
+            script.generate_reply = reply;
+            script.silent_generate = silent;
         }
 
         /// The ops `process` received, in order.

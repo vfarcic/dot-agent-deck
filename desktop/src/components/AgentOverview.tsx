@@ -1250,15 +1250,20 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     if ("incarnation" in target && !sameIncarnation(target.incarnation, agent.incarnation)) return GENERATE_TARGET_RESTARTED;
     if (!agent.paneId) return GENERATE_CONFIG_NO_PANE;
     setGenerationNotice(undefined);
-    setConfirm(generateConfigConfirmation(agent, agent.paneId, generateConfig, (result) => {
+    const question = generateConfigConfirmation(agent, agent.paneId, generateConfig, (result) => {
       if (result.outcome !== "sent") {
         setGenerationNotice(result.message);
         return;
       }
-      onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) });
+      /* Dismissed while it was sending: the outcome is still recorded, but
+         the user has moved on, so the screen stays where they took it. */
+      if (shownConfirm.current === question) {
+        onNavigate({ kind: "agent", deckId: agent.daemonId, agentId: agent.id, from: "overview", ...(agent.incarnation ? { incarnation: agent.incarnation } : {}) });
+      }
       if (onConfigRequestSent) onConfigRequestSent({ deckId: agent.daemonId, agentId: agent.id }, result.message);
       else setGenerationNotice(result.message);
-    }));
+    });
+    setConfirm(question);
     return undefined;
   };
   /* The rows' control, offered only where the runtime can send the request. A refusal is this screen's banner. */
@@ -1475,6 +1480,11 @@ export function AgentOverview({ runtime, settings, onNavigate, agentPaneOpen = f
     VOICE_ACTIONS.openAgent.run(voiceContext, { deckId: agent.daemonId, agentId: agent.id, from: "overview", incarnation: agent.incarnation });
   }, [voiceContext]);
   const [confirm, setConfirm] = useState<ConfirmState>();
+  /* The confirmation on screen as of the last render, read by an answer that
+     arrives after it: a Generate config the user dismissed with No must not
+     take them to its agent when its request settles late. */
+  const shownConfirm = useRef<ConfirmState | undefined>(confirm);
+  shownConfirm.current = confirm;
   /** PRD #1487 M5 — the Upgrade dialog, for the deck whose card it was pressed on. */
   const [upgrade, setUpgrade] = useState<UpgradeTarget>();
   /** Issue #1753 — Upgrade on the Local daemon section: the CLI, the daemon, or both. */

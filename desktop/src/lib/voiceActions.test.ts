@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createElement } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { approvedProjectTrust } from "../test/projectTrust";
@@ -320,6 +320,54 @@ describe("VOICE_ACTIONS", () => {
       expect(screen.queryByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" })).not.toBeInTheDocument();
       expect(notice.closest("[inert], [aria-hidden='true']")).toBeNull();
     });
+  });
+
+  /// Scenario: Confirm a config request from the dashboard, dismiss its busy question with No, and open another agent. A late successful send must keep that second pane visible.
+  it("desktop/config-gen/002: later navigation survives a dismissed overview send", async () => {
+    let settle!: (result: { outcome: "sent"; messageId: string; message: string }) => void;
+    const generateConfig = vi.fn(() => new Promise<{ outcome: "sent"; messageId: string; message: string }>((resolve) => { settle = resolve; }));
+    const deck = runtime({ snapshot: generationSnapshot(), generateConfig });
+    render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    const agents = screen.getAllByRole("button", { name: /^Open .* agent$/ });
+    const secondLabel = agents[1].getAttribute("aria-label")!;
+    fireEvent.click(screen.getAllByRole("button", { name: /Generate config/i })[0]);
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
+    expect(screen.queryByRole("alertdialog")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: secondLabel }));
+    const second = await screen.findByTestId("agent-pane-overlay");
+    const heading = within(second).getByRole("heading").textContent;
+
+    await act(async () => settle({ outcome: "sent", messageId: "m-late", message: "Config request sent to the agent's inbox." }));
+
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading")).toHaveTextContent(heading!);
+    expect(generateConfig).toHaveBeenCalledTimes(1);
+  });
+
+  /// Scenario: Start generation from an open agent pane, dismiss the busy question, close the pane, and open another agent. A late successful result leaves that second pane visible and does not show the first agent's result there.
+  it("desktop/config-gen/002: a dismissed pane request cannot reopen its agent on late success", async () => {
+    let settle!: (result: { outcome: "sent"; messageId: string; message: string }) => void;
+    const generateConfig = vi.fn(() => new Promise<{ outcome: "sent"; messageId: string; message: string }>((resolve) => { settle = resolve; }));
+    const deck = runtime({ snapshot: generationSnapshot(), generateConfig });
+    render(createElement(DeckShell, { runtime: deck, initialView: { kind: "overview" } }));
+    const agents = screen.getAllByRole("button", { name: /^Open .* agent$/ });
+    const secondLabel = agents[1].getAttribute("aria-label")!;
+    fireEvent.click(agents[0]);
+    const first = await screen.findByTestId("agent-pane-overlay");
+    fireEvent.click(within(first).getByRole("button", { name: /Generate config/i }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "Yes" }));
+    fireEvent.click(within(screen.getByRole("alertdialog")).getByRole("button", { name: "No" }));
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    await waitFor(() => expect(screen.queryByTestId("agent-pane-overlay")).toBeNull());
+    fireEvent.click(screen.getByRole("button", { name: secondLabel }));
+    const second = await screen.findByTestId("agent-pane-overlay");
+    const heading = within(second).getByRole("heading").textContent;
+
+    await act(async () => settle({ outcome: "sent", messageId: "m-late", message: "Config request sent to the agent's inbox." }));
+
+    expect(within(screen.getByTestId("agent-pane-overlay")).getByRole("heading")).toHaveTextContent(heading!);
+    expect(screen.queryByText("Config request sent to the agent's inbox.")).toBeNull();
+    expect(generateConfig).toHaveBeenCalledTimes(1);
   });
 
   /// Scenario: each clear phrase is heard while a text filter hides every agent except one. The actual voice dispatch restores the full dashboard and removes its active-filter controls.

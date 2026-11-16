@@ -3831,6 +3831,41 @@ mod tests {
         }
     }
 
+    /// Scenario: Confirm Generate config through Tauri on a daemon that receives the request but never answers it. The result carries exactly the shared client timeout sentence used by the TUI, with no claim of successful delivery.
+    #[cfg(unix)]
+    #[test]
+    fn config_gen_001_desktop_timeout_uses_the_shared_client_failure_sentence() {
+        use crate::restart_binding_tests::RestartingDeck;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let _selection = runtime.block_on(SELECTION_LOCK.lock());
+        let owner = {
+            let _entered = runtime.enter();
+            RestartingDeck::start("config-timeout", "owner-a")
+        };
+        let _fleet = config_gen_fleet(owner.endpoint(), owner.endpoint());
+        owner.silence_config_generation();
+        let answer = config_gen_ipc(
+            crate::terminal::DesktopState::default(),
+            &deck_wire_id(&owner.endpoint()),
+            "owner-a",
+        );
+        assert_eq!(answer["outcome"], "failed");
+        assert!(answer.get("messageId").is_none());
+        assert_eq!(owner.config_requests().len(), 1);
+        assert_eq!(
+            answer["message"],
+            dot_agent_deck::config_gen::config_gen_failed_message(
+                &dot_agent_deck::daemon_client::ClientError::TimedOut(
+                    std::time::Duration::from_secs(15)
+                )
+            )
+        );
+    }
+
     /// Scenario: A confirmation was opened on daemon process A, then the daemon restarts and reuses the agent id on process B. Confirming through Tauri shows the shared failure sentence and sends B nothing; a confirmation captured from B succeeds as a control.
     #[cfg(unix)]
     #[test]

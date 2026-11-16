@@ -1316,11 +1316,11 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 
 #### dashboard/config-gen
 
-##### dashboard/config-gen/001 — A TUI attached to a daemon without config generation explains that the daemon must be upgraded.
+##### dashboard/config-gen/001 — TUI generation preserves the confirmed agent and shows shared outcome words.
 - **Layer:** L1, in-process action dispatch and rendered status row.
 - **Agent:** none.
-- **Asserts:** confirming generation shows the shared upgrade message and posts no locally composed fallback prompt.
-- **Test:** `config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback` in `src/ui.rs`; drives both mouse Yes and keyboard Enter through production dispatch with an Unsupported controller and checks the rendered upgrade notice, no generic inbox post, no focus and no typing mode.
+- **Asserts:** confirming generation shows the shared upgrade message and posts no locally composed fallback prompt; an unopened pane sends the agent identity captured when the dialog opened even if the card changes before Yes; a daemon refusal and a silent-daemon timeout show exactly the desktop's shared client error sentence in the status.
+- **Tests:** `config_gen_001_older_daemon_shows_upgrade_without_posting_a_fallback`, `config_gen_001_confirmation_keeps_the_agent_it_opened_for`, `config_gen_001_refusal_uses_the_desktop_failure_sentence`, and `config_gen_001_timeout_uses_the_desktop_failure_sentence` in `src/ui.rs`; mouse/keyboard dispatch and a scripted daemon exercise the real controller.
 - **Does not assert:** successful delivery (covered by `inbox/route/007`) or the shared-client capability gate (`daemon/config-gen/004`).
 - **Platform coverage:** mac+linux.
 
@@ -2323,8 +2323,8 @@ The attached deck's host measurements, supplied by the daemon. Desktop browser c
 ##### daemon/config-gen/003 — A missing or replaced config-generation target is refused.
 - **Layer:** protocol, fast tier.
 - **Agent:** none (in-process daemon with cat panes).
-- **Asserts:** an unknown pane and a request retaining a replaced agent's identity are refused without posting a message to the replacement.
-- **Test:** `config_gen_003_missing_or_replaced_target_receives_nothing` in `tests/daemon_protocol.rs`.
+- **Asserts:** an unknown pane and a request retaining a replaced agent's identity are refused without posting a message to the replacement; replacing an agent after the live sample while the cwd lookup is blocked is refused with both omitted and supplied expected identity, and the replacement inbox stays empty; an unchanged occupant receives one message as a control.
+- **Tests:** `config_gen_003_missing_or_replaced_target_receives_nothing` in `tests/daemon_protocol.rs`; `config_gen_003_replacement_during_directory_lookup_receives_nothing` in `src/daemon_protocol.rs`.
 - **Does not assert:** user-facing refusal wording.
 - **Platform coverage:** mac+linux.
 
@@ -15655,8 +15655,8 @@ These desktop Rust and Vitest tests live outside the root Rust spec scanner, as 
 ##### desktop/config-gen/001 — Generation reaches the selected agent's owning daemon and preserves each outcome.
 - **Layer:** fast-tier Rust socket tests and Vitest bridge tests.
 - **Agent:** none (scripted daemon).
-- **Tests:** `config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome` and `config_gen_001_desktop_refuses_a_restarted_target` in `desktop/src-tauri/src/dto.rs`; `desktop/config-gen/001: …` in `desktop/src/lib/bridgeIncarnation.test.ts`.
-- **Asserts:** a named agent's request carries its pane and expected agent identity to its owning daemon even when another daemon is selected; sent, unsupported and failed outcomes use the shared crate strings; an old daemon receives no fallback and a successor process receives no acting request; IPC carries deck, agent, pane and incarnation.
+- **Tests:** `config_gen_001_desktop_routes_to_the_owner_and_maps_every_outcome`, `config_gen_001_desktop_refuses_a_restarted_target`, and `config_gen_001_desktop_timeout_uses_the_shared_client_failure_sentence` in `desktop/src-tauri/src/dto.rs`; `desktop/config-gen/001: …` in `desktop/src/lib/bridgeIncarnation.test.ts`.
+- **Asserts:** a named agent's request carries its pane and expected agent identity to its owning daemon even when another daemon is selected; sent, unsupported and failed outcomes use the shared crate strings; a silent daemon returns the same client timeout sentence as the TUI without a success claim; an old daemon receives no fallback and a successor process receives no acting request; IPC carries deck, agent, pane and incarnation.
 - **Does not assert:** real agents or native webview rendering.
 - **Platform coverage:** Rust socket test on Unix; Vitest on mac+linux+windows.
 
@@ -15664,7 +15664,7 @@ These desktop Rust and Vitest tests live outside the root Rust spec scanner, as 
 - **Layer:** Vitest, rendered React components with an injected runtime.
 - **Agent:** none.
 - **Tests:** `desktop/config-gen/002: …` in `desktop/src/components/AgentOverviewStop.test.tsx` and `desktop/src/lib/voiceActions.test.ts`.
-- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success.
+- **Asserts:** action on the overview row and open agent pane; TUI title and explanation; Yes/No only without destructive styling; No sends nothing; Yes preserves the captured binding, focuses the sent target and shows success; unsupported/failure show their shared text without claiming success; dismissing a pending generation and opening another agent preserves the user's navigation when success arrives late, both from the overview and from an already-open pane.
 - **Does not assert:** Tauri transport (covered by desktop/config-gen/001), real agents or a TUI-style desktop command-key layer (none exists).
 - **Platform coverage:** mac+linux+windows.
 

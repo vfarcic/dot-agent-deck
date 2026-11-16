@@ -2277,6 +2277,10 @@ struct UiState {
     /// from, so the request is posted there or nowhere. PRD #2119: no
     /// directory — the daemon composes the request for the pane's own.
     config_gen_target: Option<crate::pane::BoundPane>,
+    /// The registry id of the agent the card showed when the config-gen
+    /// prompt opened. The request names it, so an agent that replaced it
+    /// before the user confirmed receives nothing (PRD #2119 review).
+    config_gen_agent: Option<String>,
     /// Selected option index in the config-gen modal (0=Yes, 1=No).
     config_gen_selected: usize,
     /// Selected option in quit confirm modal (0=Detach, 1=Stop, 2=Cancel).
@@ -2733,6 +2737,7 @@ impl UiState {
             last_click: None,
             star_prompt_state: config::StarPromptState::default(),
             config_gen_target: None,
+            config_gen_agent: None,
             config_gen_selected: 0,
             quit_confirm_selected: 0,
             close_confirm: CloseConfirmState::default(),
@@ -8229,12 +8234,14 @@ fn handle_config_gen_prompt_key(key: KeyEvent, ui: &mut UiState) -> Action {
             _ => {
                 // No — dismiss; the user can ask again at any time.
                 ui.config_gen_target = None;
+                ui.config_gen_agent = None;
                 ui.mode = UiMode::Normal;
                 Action::Continue
             }
         },
         KeyCode::Esc => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
             Action::Continue
         }
@@ -11355,8 +11362,13 @@ fn perform_stop_and_quit(ui: &mut UiState, pane: &dyn PaneController) -> Flow {
 /// daemon too old to generate one is told apart and named
 /// ([`crate::config_gen::CONFIG_GEN_UPGRADE_MESSAGE`]), and nothing else is
 /// sent in its place — no request composed here, no generic inbox post.
+///
+/// `agent` is the card's agent when the prompt opened: the request names it,
+/// so a different agent in the pane by the time the user confirmed is sent
+/// nothing.
 fn send_config_gen_prompt(
     card: &crate::pane::BoundPane,
+    agent: Option<&str>,
     ui: &mut UiState,
     pane: &dyn PaneController,
     tab_manager: &mut TabManager,
@@ -11367,7 +11379,7 @@ fn send_config_gen_prompt(
     // PRD #1666 part 2 (G-fix6): asked of the daemon process the selected card
     // was learned from, so a detached or never-attached card sends nothing to
     // a restarted daemon's agent under the same pane id.
-    let message = match pane.generate_config(card) {
+    let message = match pane.generate_config(card, agent) {
         Ok(crate::daemon_client::GatedQuery::Answered(_)) => {
             // Open and focus the pane so the user can watch the agent take it.
             if let Some(tab_idx) = tab_manager.tab_index_for_pane(pane_id) {
@@ -12075,6 +12087,7 @@ fn dispatch_action(
                 && let Some(card) = session.bound_pane()
             {
                 ui.config_gen_target = Some(card);
+                ui.config_gen_agent = session.agent_id.clone();
                 ui.config_gen_selected = 0;
                 ui.mode = UiMode::ConfigGenPrompt;
             } else {
@@ -12647,7 +12660,8 @@ fn dispatch_action(
             }
         }
         Action::SendConfigGenPrompt { pane: card } => {
-            send_config_gen_prompt(&card, ui, pane, tab_manager);
+            let agent = ui.config_gen_agent.take();
+            send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
         }
         // ===== PRD #80 M5: modal button actions =====
         // quit-confirm [Stop]: resolve like Enter-on-Stop — straight to
@@ -12677,13 +12691,15 @@ fn dispatch_action(
         // config-gen [Yes]: send the prompt to the pending target pane.
         Action::ConfigGenConfirm => {
             ui.mode = UiMode::Normal;
+            let agent = ui.config_gen_agent.take();
             if let Some(card) = ui.config_gen_target.take() {
-                send_config_gen_prompt(&card, ui, pane, tab_manager);
+                send_config_gen_prompt(&card, agent.as_deref(), ui, pane, tab_manager);
             }
         }
         // config-gen [No]: dismiss; the user can ask again at any time.
         Action::ConfigGenDismiss => {
             ui.config_gen_target = None;
+            ui.config_gen_agent = None;
             ui.mode = UiMode::Normal;
         }
         // star-prompt [Star]: open the repo and stop asking (== `s`).
@@ -37214,6 +37230,7 @@ mod tests {
         fn generate_config(
             &self,
             card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
         ) -> Result<crate::daemon_client::GatedQuery<String>, PaneError> {
             self.config_requests.lock().unwrap().push(card.clone());
             Ok(crate::daemon_client::GatedQuery::Unsupported)
@@ -37323,6 +37340,7 @@ mod tests {
         fn generate_config(
             &self,
             _card: &crate::pane::BoundPane,
+            _expected_agent_id: Option<&str>,
         ) -> Result<crate::daemon_client::GatedQuery<String>, crate::pane::PaneError> {
             Ok(crate::daemon_client::GatedQuery::Answered(
                 "m-config".into(),
@@ -50161,6 +50179,132 @@ mod tests {
             );
             assert!(pc.focused.lock().unwrap().is_empty());
         }
+    }
+
+    #[cfg(unix)]
+    fn config_gen_scripted_confirmation(
+        replace_card: bool,
+        silent: bool,
+    ) -> (String, Vec<serde_json::Value>) {
+        use crate::daemon_client::restart_fixture::RestartingDaemon;
+        use crate::embedded_pane::EmbeddedPaneController;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let daemon = runtime.block_on(async { RestartingDaemon::spawn("config-process") });
+        daemon.config_generation(
+            Some(crate::daemon_protocol::AttachResponse::err(
+                "target refused",
+            )),
+            silent,
+        );
+        let pc = Arc::new(
+            EmbeddedPaneController::new(daemon.path.clone(), runtime.handle().clone())
+                .with_protocol_gate(),
+        );
+        let mut snapshot = AppState::default();
+        let incarnation = crate::daemon_client::Incarnation::from(Some("config-process".into()));
+        snapshot.learn_stream_incarnation(incarnation.clone());
+        let sid = snapshot.insert_placeholder_session_learned(
+            "pane-1".into(),
+            None,
+            None,
+            Some("1".into()),
+            incarnation,
+        );
+        let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+        let mut tabs = TabManager::new(pc.clone());
+        let mut ui = default_ui();
+        dispatch_action(
+            Action::RequestConfigGen,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+        if replace_card {
+            snapshot.sessions.get_mut(&sid).unwrap().agent_id = Some("2".into());
+            *state.blocking_write() = snapshot.clone();
+        }
+        dispatch_action(
+            Action::ConfigGenConfirm,
+            &mut ui,
+            &*pc,
+            &state,
+            &mut tabs,
+            &snapshot,
+            &[],
+            Some(&sid),
+            Rect::new(0, 0, 240, 24),
+        );
+        assert_ne!(ui.mode, UiMode::PaneInput);
+        let status = glossary_status_text(&ui)
+            .expect("a visible generation outcome")
+            .to_owned();
+        assert!(glossary_status_row(&state, &mut ui).contains("Failed to send config prompt:"));
+        (
+            status,
+            daemon.requests_to("config-process", "generate-config"),
+        )
+    }
+
+    /// Scenario: Open Generate config on an unopened card for agent A, replace its displayed occupant with B, then confirm Yes. The request still names A, so the replacement can never receive A's config instructions; an unchanged card is the control.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_confirmation_keeps_the_agent_it_opened_for() {
+        let observations: Vec<_> = [false, true]
+            .into_iter()
+            .map(|replace| {
+                let (_, requests) = config_gen_scripted_confirmation(replace, false);
+                assert_eq!(requests.len(), 1, "one confirmation request");
+                (replace, requests[0]["expected_agent_id"].clone())
+            })
+            .collect();
+        assert_eq!(
+            observations,
+            vec![
+                (false, serde_json::json!("1")),
+                (true, serde_json::json!("1"))
+            ],
+            "Yes must preserve the agent captured when the dialog opened, including on an unopened pane"
+        );
+    }
+
+    /// Scenario: Confirm Generate config and have the daemon refuse the target. The TUI's visible status is exactly the desktop's shared failure sentence for the same client error.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_refusal_uses_the_desktop_failure_sentence() {
+        let (status, _) = config_gen_scripted_confirmation(false, false);
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::Server("target refused".into())
+            )
+        );
+    }
+
+    /// Scenario: Confirm Generate config on a daemon that receives the request but never answers. The TUI shows the same timeout sentence as the desktop and stays out of typing mode.
+    #[cfg(unix)]
+    #[spec("dashboard/config-gen/001")]
+    #[test]
+    fn config_gen_001_timeout_uses_the_desktop_failure_sentence() {
+        let (status, requests) = config_gen_scripted_confirmation(false, true);
+        assert_eq!(requests.len(), 1, "the timeout follows a sent request");
+        assert_eq!(
+            status,
+            crate::config_gen::config_gen_failed_message(
+                &crate::daemon_client::ClientError::TimedOut(std::time::Duration::from_secs(15))
+            )
+        );
     }
 
     /// Scenario: Confirm Generate config on an agent whose pane is not open here. A pane that can be opened enters typing mode; a refused focus or unavailable pane leaves command mode and the card intact, with the sent notice visible.

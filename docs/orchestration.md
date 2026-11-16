@@ -116,7 +116,7 @@ Instead of writing the file yourself, you can ask an agent that is already runni
 
    A dialog titled **Generate .dot-agent-deck.toml** asks whether to instruct your agent to analyse the project and create one.
 3. Choose **Yes**. **No** (or `Esc`) closes the dialog and sends nothing.
-4. The deck sends the agent a [deck message](#delivery-in-the-tui-and-desktop-app) asking it to analyse the project, pick roles from the [role library](#role-library), find the commands that launch agents in this project (devbox scripts, Makefile targets, bare `claude`, `opencode`, `pi`, `codex` or `devin`), and propose a config. Both clients say `Config request sent to the agent's inbox.` and bring the agent in front of you: the TUI focuses its pane, so what you type next goes to the agent, and the desktop app opens its pane.
+4. The deck sends the agent a [deck message](#delivery-in-the-tui-and-desktop-app) asking it to analyse the project, pick roles from the [role library](#role-library), find the commands that launch agents in this project (devbox scripts, Makefile targets, bare `claude`, `opencode`, `pi`, `codex` or `devin`), and propose a config. Both clients say `Config request sent to the agent's inbox.` and bring the agent in front of you: the TUI focuses its pane, so what you type next goes to the agent, and the desktop app opens its pane. In the desktop app, pressing **No** while the dialog says `Sending…` closes it but does not take the request back; the app then leaves you where you are instead of opening the agent's pane.
 5. Read the proposal in the agent's pane and tell the agent what to change. It writes `.dot-agent-deck.toml` to the project directory only after you approve the proposal.
 6. Run `dot-agent-deck validate`.
 
@@ -130,12 +130,12 @@ Instead of writing the file yourself, you can ask an agent that is already runni
 
 The request reaches the agent the way any deck message does, so every supported agent can take it; [Which agents wake for messages](#which-agents-wake-for-messages) says when one needs a prompt from you first. Devin, for example, takes it only when you ask it in its pane to run `dot-agent-deck inbox fetch`. If the agent's card or tile says its message is waiting, do what it says.
 
-If it does not work, the TUI's status line or the desktop app's notice says why; the first two messages read the same in both clients:
+If it does not work, the TUI's status line or the desktop app's notice says why; the first two messages, reasons included, read the same in both clients:
 
 | Message | What it means | What to do |
 |---|---|---|
 | `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.` | The daemon running your agents comes from a release without this feature. Nothing was sent. | Upgrade the deck on the daemon's machine and restart the daemon on the new release ([After upgrading](installation.md#after-upgrading); for a daemon the desktop app watches, [Desktop app → Daemons](desktop/daemons.md)). Restarting the daemon stops its agents, so do it when you are ready to. |
-| `Failed to send config prompt: <reason>` | The daemon could not send the request to that agent, for example because the agent exited or the daemon does not know the agent's directory. | Fix what the reason names, or start a new agent on the project directory and try again. |
+| `Failed to send config prompt: <reason>` | The daemon could not send the request to that agent, for example because the agent exited, another agent replaced it in that pane after you chose it, or the daemon does not know the agent's directory. Nothing was sent to another agent. `Failed to send config prompt: no answer from the daemon within 15s` means the daemon did not answer in time, so the request may or may not have arrived. | Fix what the reason names, or start a new agent on the project directory and try again. After `no answer from the daemon within 15s`, look in the agent's pane before asking again. |
 | `No active agent to send prompt to.` (TUI) · `That agent has no pane the daemon can send the request to, so nothing was sent.` (desktop) | The agent you chose has no running pane. | Select an agent that is running in the project, or start one. |
 
 ## Configuration reference
