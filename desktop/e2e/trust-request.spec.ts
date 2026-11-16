@@ -49,7 +49,7 @@ function snapshot(deckId: string, requests: Request[]) {
 }
 
 type Call = { command: string; args: Record<string, unknown> };
-type MockWindow = Window & { __dadCalls: Call[]; __dadEmit: (payload: unknown) => void };
+type MockWindow = Window & { __dadCalls: Call[]; __dadEmit: (payload: unknown) => void; __dadListening: () => boolean };
 
 /** The app on its live bridge, the local deck connected with nothing pending, and the remote deck listing `remote`. */
 async function open(page: Page, remote: Request[]): Promise<void> {
@@ -72,6 +72,7 @@ async function open(page: Page, remote: Request[]): Promise<void> {
     });
     Object.defineProperty(window, "__dadCalls", { value: calls });
     Object.defineProperty(window, "__dadEmit", { value: emit });
+    Object.defineProperty(window, "__dadListening", { value: () => (listeners.get("desktop://snapshot") ?? []).length > 0 });
     Object.defineProperty(window, "__TAURI_INTERNALS__", { value: {
       transformCallback: (callback: (event: unknown) => void) => {
         const id = ++next;
@@ -115,7 +116,10 @@ async function open(page: Page, remote: Request[]): Promise<void> {
   }, { local: snapshot(LOCAL, []) });
   await page.goto("/?live=1");
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
-  // The remote deck's watcher reports after the bootstrap, as the crate's do.
+  // The remote deck's watcher reports after the bootstrap, as the crate's do —
+  // once the bridge listens, or the snapshot is emitted to nobody (seen on
+  // WebKit, whose start is slower).
+  await page.waitForFunction(() => (window as unknown as MockWindow).__dadListening());
   await page.evaluate((payload) => (window as unknown as MockWindow).__dadEmit(payload), snapshot(REMOTE, remote));
 }
 
