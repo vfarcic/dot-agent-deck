@@ -294,10 +294,17 @@ fn handle_antigravity_hook() -> ExitCode {
                 }
             }
         }
+        // PRD #211 (review): a turn that ended, and was not handed mail to go
+        // on with, carries its final reply for the deck's reading subscribers.
+        let reply = (!turn_goes_on)
+            .then(|| antigravity_turn_reply(&input))
+            .flatten();
         let report = |announce: Option<String>| {
             // Issue #318: present this pane's hook capability token.
             let token = crate::hook_provenance::token_from_env();
-            if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref()) {
+            if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref())
+                .and_then(|line| with_turn_reply(line, reply.as_ref()))
+            {
                 let _ = match announce {
                     Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
                     None => send_to_socket(&json),
@@ -321,6 +328,96 @@ fn handle_antigravity_hook() -> ExitCode {
     }
     print_antigravity_answer(&input);
     ExitCode::SUCCESS
+}
+
+/// PRD #211 (review): how much of the end of `agy`'s transcript the hook reads
+/// for a turn's reply. The reply is the last line, and one longer than this is
+/// not read: the deck keeps at most
+/// [`crate::daemon_protocol::MAX_TURN_REPLY_BYTES`] of it, and the file grows
+/// with the whole conversation.
+const ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES: u64 = 256 * 1024;
+
+/// PRD #211 (review): the final reply of the Antigravity turn `input` ends,
+/// for the deck's reading subscribers. Only a `Stop` that ended the turn
+/// normally (`NO_TOOL_CALL`) ends one; the caller asks only for a `Stop` that
+/// was not handed mail to go on with. `agy`'s payload carries no reply, but its
+/// transcript (`transcriptPath`, `transcript_full.jsonl`) already holds the
+/// turn's last step when `Stop` runs, measured on `agy` 1.5.9: one JSON object
+/// per line, the reply being a `"source":"MODEL"`, `"type":"PLANNER_RESPONSE"`
+/// step whose `content` is its text. `None` when the transcript cannot say:
+/// unreadable, its last line not such a step (a tool call, a system message),
+/// or longer than [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`].
+fn antigravity_turn_reply(input: &str) -> Option<crate::daemon_protocol::FinalReply> {
+    let payload: Value = serde_json::from_str(input).ok()?;
+    if payload.get("hookEventName").and_then(Value::as_str) != Some("Stop")
+        || payload.get("terminationReason").and_then(Value::as_str) != Some("NO_TOOL_CALL")
+    {
+        return None;
+    }
+    let path = std::path::Path::new(payload.get("transcriptPath")?.as_str()?);
+    if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+        return None;
+    }
+    let text = antigravity_transcript_reply(&last_line_of(path)?)?;
+    Some(crate::turn_reply::normalize(
+        crate::daemon_protocol::FinalReply {
+            turn_id: None,
+            text,
+            failed: false,
+        },
+    ))
+}
+
+/// The last non-empty line of the regular file at `path`, read from at most
+/// its last [`ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES`]; `None` when that tail holds
+/// no whole line.
+fn last_line_of(path: &std::path::Path) -> Option<String> {
+    use std::io::{Read as _, Seek as _};
+    let mut file = std::fs::File::open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let start = metadata
+        .len()
+        .saturating_sub(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES);
+    file.seek(std::io::SeekFrom::Start(start)).ok()?;
+    let mut tail = Vec::new();
+    file.take(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES)
+        .read_to_end(&mut tail)
+        .ok()?;
+    let tail = String::from_utf8_lossy(&tail);
+    let trimmed = tail.trim_end_matches(['\n', '\r']);
+    let line = match trimmed.rfind('\n') {
+        Some(at) => &trimmed[at + 1..],
+        // The whole tail is one line: whole only if it is the whole file.
+        None if start == 0 => trimmed,
+        None => return None,
+    };
+    (!line.trim().is_empty()).then(|| line.to_owned())
+}
+
+/// The reply one `agy` transcript line records, when it is the model's final
+/// response: `"source":"MODEL"`, `"type":"PLANNER_RESPONSE"`, no tool calls,
+/// and its `content` text (empty when it has none, a turn that ended with
+/// nothing to read).
+fn antigravity_transcript_reply(line: &str) -> Option<String> {
+    let step: Value = serde_json::from_str(line).ok()?;
+    if step.get("source").and_then(Value::as_str) != Some("MODEL")
+        || step.get("type").and_then(Value::as_str) != Some("PLANNER_RESPONSE")
+        || step
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+    {
+        return None;
+    }
+    Some(
+        step.get("content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned(),
+    )
 }
 
 /// [`antigravity_hook_output`] on stdout.
@@ -358,8 +455,9 @@ enum AntigravityInbox {
 /// - `Stop` that ended the turn normally (`NO_TOOL_CALL`) hands over what is
 ///   waiting as `{"decision":"continue","reason":…}`, so `agy` goes on with
 ///   it. One that ended in an `ERROR` hands over nothing: the mail stays
-///   queued for the next turn's end or the doorbell. `agy` stops honouring
-///   `continue` after ten in a row by itself.
+///   queued for the next turn's end or the doorbell. Neither does one at
+///   `agy`'s continue cap ([`antigravity_stop_may_continue`]): `agy` would
+///   ignore that continue, so the turn ends Idle and the doorbell delivers.
 ///
 /// Both hand-overs are one-shot receipt receivers under
 /// [`crate::event::InboxComponent::AntigravityHooks`], headed by
@@ -406,9 +504,7 @@ fn antigravity_inbox_hooks(
                 .map_or(AntigravityInbox::Nothing, AntigravityInbox::Print)
         }
         #[cfg(unix)]
-        Some("Stop")
-            if payload.get("terminationReason").and_then(Value::as_str) == Some("NO_TOOL_CALL") =>
-        {
+        Some("Stop") if antigravity_stop_may_continue(&payload) => {
             crate::inbox_prompt::one_shot_injection(
                 crate::inbox_prompt::HookHandOver {
                     component: crate::event::InboxComponent::AntigravityHooks,
@@ -424,6 +520,26 @@ fn antigravity_inbox_hooks(
         }
         _ => AntigravityInbox::Nothing,
     }
+}
+
+/// PRD #211: how many `Stop` continues in a row `agy` honours. Measured on
+/// `agy` 1.5.9: it fires `Stop` with `executionNum` 0 through 10 and acts on a
+/// continue from the first ten, but ignores the one the eleventh returns and
+/// ends the turn.
+pub(crate) const ANTIGRAVITY_STOP_CONTINUE_CAP: u64 = 10;
+
+/// PRD #211: whether a `Stop` may hand over the mail waiting for its pane as
+/// a continue. Only an ordinary turn end (`NO_TOOL_CALL`) whose continue
+/// `agy` will still act on may: past [`ANTIGRAVITY_STOP_CONTINUE_CAP`] the
+/// mail would be acknowledged and then discarded, so it stays queued and the
+/// turn ends Idle, where the doorbell delivers it in a fresh turn. A `Stop`
+/// with no `executionNum` is the first of its turn.
+fn antigravity_stop_may_continue(payload: &Value) -> bool {
+    payload.get("terminationReason").and_then(Value::as_str) == Some("NO_TOOL_CALL")
+        && payload
+            .get("executionNum")
+            .and_then(Value::as_u64)
+            .is_none_or(|n| n < ANTIGRAVITY_STOP_CONTINUE_CAP)
 }
 
 /// [`lenient_string`] for a JSON object: anything else is `None`.
@@ -4166,6 +4282,138 @@ mod tests {
             assert_eq!(antigravity_hook_output(&agy(name)), "{}");
         }
         assert_eq!(antigravity_hook_output(""), "{}");
+    }
+
+    /// PRD #211 (review): a finished Antigravity turn's reply is the last
+    /// step of its transcript, as measured on `agy` 1.5.9: after a tool call,
+    /// and after a `Stop` continue the turn went on with. A turn whose
+    /// transcript does not end in the model's reply, an `ERROR` turn, and a
+    /// transcript that is not one, claim no reply.
+    #[test]
+    fn antigravity_turn_reply_is_the_transcripts_last_model_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = |transcript: &std::path::Path, base: &str| {
+            let mut payload: Value = serde_json::from_str(&agy(base)).unwrap();
+            payload["transcriptPath"] = Value::from(transcript.to_str().unwrap());
+            payload.to_string()
+        };
+        let copy = |fixture: &str| {
+            let path = dir.path().join(fixture);
+            std::fs::write(&path, agy(fixture)).unwrap();
+            path
+        };
+        let tools = copy("transcript-full-tool-turn.jsonl");
+        let reply = antigravity_turn_reply(&stop(&tools, "stop.json")).expect("a reply");
+        assert_eq!(
+            reply.text,
+            "The command successfully printed `agy-probe-77`, DONE-77."
+        );
+        assert!(!reply.failed);
+        let continued = copy("transcript-full-after-continue.jsonl");
+        assert_eq!(
+            antigravity_turn_reply(&stop(&continued, "stop.json"))
+                .unwrap()
+                .text,
+            "CONTINUED-REPLY-8812",
+            "the reply is what the turn ended on, after its continue"
+        );
+        assert_eq!(
+            antigravity_turn_reply(&stop(&tools, "stop-error.json")),
+            None,
+            "an ERROR Stop is not a finished turn"
+        );
+        assert_eq!(antigravity_turn_reply(&agy("pre-invocation.json")), None);
+
+        // The transcript ends on a tool call or a system message: no reply.
+        let lines: Vec<&str> = agy("transcript-full-tool-turn.jsonl")
+            .leak()
+            .lines()
+            .collect();
+        let cut = dir.path().join("cut.jsonl");
+        std::fs::write(&cut, lines[..2].join("\n")).unwrap();
+        assert_eq!(antigravity_turn_reply(&stop(&cut, "stop.json")), None);
+        let continued_lines: Vec<String> = agy("transcript-full-after-continue.jsonl")
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        std::fs::write(&cut, continued_lines[..5].join("\n")).unwrap();
+        assert_eq!(antigravity_turn_reply(&stop(&cut, "stop.json")), None);
+        // Not a transcript, or not there.
+        let other = dir.path().join("transcript.txt");
+        std::fs::copy(&tools, &other).unwrap();
+        assert_eq!(antigravity_turn_reply(&stop(&other, "stop.json")), None);
+        assert_eq!(
+            antigravity_turn_reply(&stop(&dir.path().join("gone.jsonl"), "stop.json")),
+            None
+        );
+        // A long conversation is read from its end only, and a last line
+        // longer than that tail claims nothing.
+        let long = dir.path().join("long.jsonl");
+        let filler = format!("{}\n", "x".repeat(1024));
+        let mut body = filler.repeat(1024);
+        body.push_str(lines[5]);
+        body.push('\n');
+        std::fs::write(&long, &body).unwrap();
+        assert_eq!(
+            antigravity_turn_reply(&stop(&long, "stop.json"))
+                .unwrap()
+                .text,
+            "The command successfully printed `agy-probe-77`, DONE-77."
+        );
+        let huge = serde_json::json!({"source":"MODEL","type":"PLANNER_RESPONSE",
+            "content":"y".repeat(ANTIGRAVITY_TRANSCRIPT_TAIL_BYTES as usize)});
+        std::fs::write(&long, format!("{filler}{huge}\n")).unwrap();
+        assert_eq!(antigravity_turn_reply(&stop(&long, "stop.json")), None);
+    }
+
+    /// PRD #211: `agy` honours a `Stop` continue at `executionNum` 0–9 and
+    /// ignores the one returned at 10, so a `Stop` there takes no mail: the
+    /// hook prints its plain answer, the turn ends Idle, and the mail stays
+    /// queued for the doorbell's fresh turn.
+    #[test]
+    fn antigravity_stop_takes_no_mail_at_the_continue_cap() {
+        let stop = |patch: Value| {
+            let mut payload: Value = serde_json::from_str(&agy("stop.json")).unwrap();
+            payload.as_object_mut().unwrap().extend(
+                patch
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone())),
+            );
+            payload
+        };
+        for n in 0..ANTIGRAVITY_STOP_CONTINUE_CAP {
+            assert!(
+                antigravity_stop_may_continue(&stop(serde_json::json!({"executionNum": n}))),
+                "executionNum {n} still continues"
+            );
+        }
+        for n in [10, 11, 50] {
+            let payload = stop(serde_json::json!({"executionNum": n}));
+            assert!(
+                !antigravity_stop_may_continue(&payload),
+                "executionNum {n} is past agy's cap and must hand over nothing"
+            );
+            let mut event = hook_payload_event("antigravity", &payload.to_string()).unwrap();
+            assert_eq!(event.event_type, EventType::Idle, "the turn ends Idle");
+            let mut announce = None;
+            assert!(matches!(
+                antigravity_inbox_hooks(&payload.to_string(), &mut event, &mut announce),
+                AntigravityInbox::Nothing
+            ));
+            assert_eq!(
+                antigravity_hook_output(&payload.to_string()),
+                "{}",
+                "the plain answer, no continue"
+            );
+        }
+        assert!(antigravity_stop_may_continue(&stop(
+            serde_json::json!({"executionNum": null})
+        )));
+        assert!(!antigravity_stop_may_continue(
+            &serde_json::from_str(&agy("stop-error.json")).unwrap()
+        ));
     }
 
     /// Issue #1182: what the pane's card, the desktop overview and the prompt

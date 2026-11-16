@@ -190,6 +190,15 @@ pub struct DeleteCharKey {
     /// M1), so a sender applies `min(800, this)` — the per-agent value exists so
     /// that policy is a client decision that can be revisited against the
     /// deck's own measurement rather than baked into the wire.
+    ///
+    /// PRD #211: on an agent whose deletes are paced
+    /// ([`Self::max_presses_per_write`]) it is that per-write cap instead,
+    /// and the agent claims no collapse limit. A client that predates pacing
+    /// sends a write's deletes in one burst, and it applies this bound: so it
+    /// removes only a write that one paced write's presses delete, and
+    /// refuses a longer one rather than burst deletes the agent drops. A
+    /// client that paces takes no bound from it.
+    /// `paced_deletes_bound_a_burst_client_to_one_write` keeps the two equal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_literal_write_chars: Option<u32>,
     /// The most presses of [`Self::bytes`] to put in one write; `None` where
@@ -197,7 +206,8 @@ pub struct DeleteCharKey {
     /// some deletes from a single write of 50 and of 2290, while 101 deletes
     /// each written on its own 20 ms apart removed exactly 101 characters, so
     /// its deletes go one per write (PRD #211). An additive field: a client
-    /// that does not know it writes one burst, as before.
+    /// that does not know it bursts its deletes, which
+    /// [`Self::max_literal_write_chars`] keeps to one write's worth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_presses_per_write: Option<u32>,
     /// How long to wait between two writes of one deletion, in milliseconds;
@@ -1387,9 +1397,11 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     // write still cleared; one DEL removes one character, but a single write
     // of 50 or 2290 DELs left part of the text behind, while 101 DELs written
     // one at a time 20 ms apart removed exactly 101. No paste collapse was
-    // observed, so no literal-write limit is claimed. Ctrl+C quits on a
-    // second press, so it is never sent. The doorbell does not read these:
-    // it submits with CR and withdraws with the delete key its facts verify.
+    // observed, so the literal-write field carries the per-write cap a
+    // client that bursts its deletes must stay within
+    // ([`DeleteCharKey::max_literal_write_chars`]). Ctrl+C quits on a second
+    // press, so it is never sent. The doorbell does not read these: it
+    // submits with CR and withdraws with the delete key its facts verify.
     prompt_keys: Some(PromptKeys {
         interrupt: Cow::Borrowed(&SINGLE_ESC),
         clear: ClearKey {
@@ -1400,7 +1412,7 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
         },
         delete_char: DeleteCharKey {
             bytes: Cow::Borrowed(DEL),
-            max_literal_write_chars: None,
+            max_literal_write_chars: Some(1),
             max_presses_per_write: Some(1),
             pause_between_writes_ms: Some(20),
         },
@@ -2106,11 +2118,11 @@ mod tests {
         let antigravity = keys(AgentType::Antigravity);
         assert_eq!(antigravity.delete_char.max_presses_per_write, Some(1));
         assert_eq!(antigravity.delete_char.pause_between_writes_ms, Some(20));
-        assert_eq!(antigravity.delete_char.max_literal_write_chars, None);
+        assert_eq!(antigravity.delete_char.max_literal_write_chars, Some(1));
         let value = serde_json::to_value(antigravity).unwrap();
         assert_eq!(
             value["delete_char"],
-            serde_json::json!({"bytes": "\u{7f}", "max_presses_per_write": 1, "pause_between_writes_ms": 20})
+            serde_json::json!({"bytes": "\u{7f}", "max_literal_write_chars": 1, "max_presses_per_write": 1, "pause_between_writes_ms": 20})
         );
         for agent in [
             AgentType::ClaudeCode,
@@ -2130,6 +2142,124 @@ mod tests {
             serde_json::from_value(serde_json::json!({"bytes": "\u{7f}"})).unwrap();
         assert_eq!(older.max_presses_per_write, None);
         assert_eq!(older.pause_between_writes_ms, None);
+    }
+
+    /// PRD #211: an agent whose deletes are paced serves its per-write cap as
+    /// its literal-write bound, so a client that predates pacing, and sends a
+    /// write's deletes in one burst, never sends more of them in one write
+    /// than the agent keeps.
+    #[test]
+    fn paced_deletes_bound_a_burst_client_to_one_write() {
+        for spec in ALL {
+            let Some(keys) = spec.prompt_keys.as_ref() else {
+                continue;
+            };
+            if let Some(cap) = keys.delete_char.max_presses_per_write {
+                assert_eq!(
+                    keys.delete_char.max_literal_write_chars,
+                    Some(cap),
+                    "{}: a paced agent's literal-write bound is its per-write cap",
+                    spec.label
+                );
+            }
+        }
+    }
+
+    /// PRD #211, the reviewer's contract finding: a desktop built before
+    /// pacing existed, attached to this daemon, reads Antigravity's served
+    /// keys by its own rules — the pre-branch `map_prompt_keys` allowlist in
+    /// `desktop/src-tauri/src/dto.rs` and the pre-branch "scratch that" in
+    /// `VoiceControlPanel.tsx`, which refuses a write longer than
+    /// `min(800, maxLiteralWriteChars)` and otherwise writes
+    /// `deleteChar.bytes.repeat(length)` at once. Those rules, frozen here,
+    /// applied to the JSON this daemon serves, never send a burst longer than
+    /// the agent's per-write cap, while its interrupt and clear still map.
+    #[test]
+    fn a_pre_pacing_client_never_bursts_antigravity_deletes() {
+        // The pre-branch wire types: unknown fields are ignored, as there.
+        #[derive(Deserialize)]
+        struct OldStep {
+            bytes: String,
+            pause_after_ms: u32,
+        }
+        #[derive(Deserialize)]
+        struct OldClear {
+            bytes: String,
+            presses: ClearPresses,
+            #[serde(default)]
+            max_presses_per_write: Option<u32>,
+            #[serde(default)]
+            pause_between_writes_ms: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        struct OldDelete {
+            bytes: String,
+            #[serde(default)]
+            max_literal_write_chars: Option<u32>,
+        }
+        #[derive(Deserialize)]
+        struct OldKeys {
+            interrupt: Vec<OldStep>,
+            clear: OldClear,
+            delete_char: OldDelete,
+        }
+        // The pre-branch `map_prompt_keys`: `Some(literal limit)` when the
+        // set reaches the panel.
+        fn old_map(keys: &OldKeys) -> Option<Option<u32>> {
+            if keys.interrupt.is_empty() || keys.interrupt.len() > 2 {
+                return None;
+            }
+            if keys.interrupt.iter().any(|step| step.bytes != "\x1b")
+                || keys
+                    .interrupt
+                    .iter()
+                    .map(|step| u64::from(step.pause_after_ms))
+                    .sum::<u64>()
+                    > 2_000
+            {
+                return None;
+            }
+            if keys.clear.bytes != "\x15" || !["\x7f", "\x08"].contains(&&*keys.delete_char.bytes) {
+                return None;
+            }
+            let total: u64 = match keys.clear.presses {
+                ClearPresses::PerWrappedRow => 64,
+                ClearPresses::PerLine => 32,
+                ClearPresses::Unknown => return None,
+            };
+            let per_write = match keys.clear.max_presses_per_write {
+                Some(0) => return None,
+                Some(cap) => u64::from(cap),
+                None => total,
+            };
+            if (total.div_ceil(per_write) - 1)
+                * u64::from(keys.clear.pause_between_writes_ms.unwrap_or(0))
+                > 3_000
+            {
+                return None;
+            }
+            Some(keys.delete_char.max_literal_write_chars)
+        }
+        // The pre-branch scratch: the one write of deletes it sends for a
+        // dictated write of `chars` characters, or `None` when it refuses.
+        fn old_scratch(limit: Option<u32>, chars: u32) -> Option<u32> {
+            (chars <= 800u32.min(limit.unwrap_or(800))).then_some(chars)
+        }
+
+        let served = keys(AgentType::Antigravity);
+        let cap = served.delete_char.max_presses_per_write.expect("paced");
+        let old: OldKeys = serde_json::from_value(serde_json::to_value(served).unwrap()).unwrap();
+        let limit = old_map(&old).expect("an old client still gets interrupt and clear");
+        for chars in 1..=900 {
+            if let Some(burst) = old_scratch(limit, chars) {
+                assert!(
+                    burst <= cap,
+                    "an old client would burst {burst} deletes into agy in one write"
+                );
+            }
+        }
+        assert_eq!(old_scratch(limit, 1), Some(1), "one character is one write");
+        assert_eq!(old_scratch(limit, 2), None, "longer is refused, not burst");
     }
 
     /// PRD #1541: a clear rule a NEWER daemon names decodes as `Unknown`

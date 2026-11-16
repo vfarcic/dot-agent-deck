@@ -3522,6 +3522,11 @@ async fn run_codex_rollout_monitor(
 /// signal, which the card has to see, is among them.
 pub(crate) const MAX_PENDING_STATUS_SIGNALS: usize = 16;
 
+/// PRD #211 (review): the longest an OSC 7501 signal waits for a hook event of
+/// its generation that was received before the signal was read, and is still
+/// being ingested ([`report_status_update`]).
+const STATUS_SIGNAL_HOOK_WAIT: Duration = Duration::from_millis(500);
+
 /// PRD #211 (audit, CWE-400/770): the most generations with signals waiting.
 /// Reached only by a burst across that many live panes; past it the
 /// generation that has waited longest loses what it had waiting.
@@ -3542,11 +3547,21 @@ pub(crate) struct StatusSignalQueue {
 #[derive(Default)]
 struct PendingStatus {
     /// Each generation's waiting signals, with when it first had any waiting.
-    by_generation:
-        std::collections::HashMap<(String, String), (u64, crate::agent_pty::StatusSignals)>,
+    by_generation: std::collections::HashMap<(String, String), (u64, PendingSignals)>,
     next: u64,
     /// Signals dropped to the bounds since the last report of it.
     dropped: u64,
+}
+
+/// One generation's OSC 7501 signals waiting in a [`StatusSignalQueue`], each
+/// with when its pane's reader read it: the receipt-order witness a signal is
+/// applied under ([`report_status_update`]).
+pub(crate) struct PendingSignals {
+    pub(crate) pane_id: String,
+    pub(crate) agent_id: String,
+    pub(crate) agent_type: crate::event::AgentType,
+    /// In the order they were written.
+    pub(crate) signals: Vec<(crate::status_osc::OscSignal, std::time::Instant)>,
 }
 
 impl StatusSignalQueue {
@@ -3574,17 +3589,18 @@ impl StatusSignalQueue {
             let (_, waiting) = pending.by_generation.entry(key).or_insert_with(|| {
                 (
                     at,
-                    crate::agent_pty::StatusSignals {
+                    PendingSignals {
                         pane_id: signals.pane_id.clone(),
                         agent_id: signals.agent_id.clone(),
                         agent_type: signals.agent_type.clone(),
                         signals: Vec::new(),
-                        seen_at: signals.seen_at,
                     },
                 )
             });
-            waiting.signals.extend(signals.signals);
-            waiting.seen_at = signals.seen_at;
+            let seen_at = signals.seen_at;
+            waiting
+                .signals
+                .extend(signals.signals.into_iter().map(|signal| (signal, seen_at)));
             waiting.agent_type = signals.agent_type;
             let excess = waiting
                 .signals
@@ -3603,9 +3619,9 @@ impl StatusSignalQueue {
     /// Everything waiting, each generation's signals in the order they were
     /// written and the generations in the order they first had any waiting,
     /// with how many signals the bounds dropped since the last take.
-    pub(crate) fn take(&self) -> (Vec<crate::agent_pty::StatusSignals>, u64) {
+    pub(crate) fn take(&self) -> (Vec<PendingSignals>, u64) {
         let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
-        let mut batches: Vec<(u64, crate::agent_pty::StatusSignals)> = pending
+        let mut batches: Vec<(u64, PendingSignals)> = pending
             .by_generation
             .drain()
             .map(|(_, batch)| batch)
@@ -3708,8 +3724,8 @@ async fn run_status_osc_monitor(
                 .remove(&key)
                 .map(|(_, settle)| settle)
                 .unwrap_or_default();
-            for signal in &batch.signals {
-                if let Some(update) = settle.signal(signal, batch.seen_at) {
+            for (signal, seen_at) in &batch.signals {
+                if let Some(update) = settle.signal(signal, *seen_at) {
                     report_status_update(
                         &state,
                         &event_tx,
@@ -3717,6 +3733,7 @@ async fn run_status_osc_monitor(
                         &key,
                         &batch.agent_type,
                         update,
+                        *seen_at,
                     )
                     .await;
                 }
@@ -3733,9 +3750,18 @@ async fn run_status_osc_monitor(
             .collect();
         for key in ready {
             if let Some((agent_type, mut settle)) = held.remove(&key)
-                && let Some(update) = settle.poll(now)
+                && let Some((update, seen_at)) = settle.poll(now)
             {
-                report_status_update(&state, &event_tx, &registry, &key, &agent_type, update).await;
+                report_status_update(
+                    &state,
+                    &event_tx,
+                    &registry,
+                    &key,
+                    &agent_type,
+                    update,
+                    seen_at,
+                )
+                .await;
             }
         }
     }
@@ -3771,6 +3797,17 @@ fn pane_agent_release(
 /// permission prompt whose menu the agent's tables know also carries that
 /// menu as the pending question ([`crate::question::antigravity_permission`]).
 /// A repeat of the prompt already pending keeps its question id.
+///
+/// `seen_at` is when the pane's reader read the signal. A hook event attested
+/// to the same generation and received after it is newer evidence, so the
+/// signal is dropped rather than applied over that event's status and
+/// question (review: a queued `working` must not turn a newer tool's Working
+/// into Thinking). Asked under the `AppState` write lock, with the rest of
+/// the drop rule. Before that, a hook of the same generation received before
+/// the signal was read and still being ingested is waited for, up to
+/// [`STATUS_SIGNAL_HOOK_WAIT`], so the signal lands after it; nothing else on
+/// this path awaits anything but the locks every event takes.
+#[allow(clippy::too_many_arguments)]
 async fn report_status_update(
     state: &SharedState,
     event_tx: &broadcast::Sender<BroadcastMsg>,
@@ -3778,9 +3815,20 @@ async fn report_status_update(
     (pane_id, agent_id): &(String, String),
     agent_type: &crate::event::AgentType,
     update: crate::status_osc::StatusUpdate,
+    seen_at: std::time::Instant,
 ) {
     use crate::event::EventType;
     use crate::status_osc::StatusUpdate;
+    // A hook of this generation accepted before the signal was read is older
+    // evidence the signal must land after: a `PreToolUse` is what a permission
+    // prompt is bound to. Waited for within a bound, since its ingest takes
+    // only the locks every event takes.
+    let deadline = tokio::time::Instant::now() + STATUS_SIGNAL_HOOK_WAIT;
+    while registry.hook_in_flight_before(agent_id, seen_at)
+        && tokio::time::Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
     let (event_type, reason, permission) = match update {
         StatusUpdate::Working => (EventType::Thinking, None, false),
         StatusUpdate::Idle => (EventType::Idle, None, false),
@@ -3866,15 +3914,22 @@ async fn report_status_update(
     if let Some(question) = &question {
         event.set_question(question);
     }
+    let superseded = std::sync::atomic::AtomicBool::new(false);
     let ingested = ingest_event_unless(state, event_tx, registry, event, false, None, |_| {
-        registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str())
+        if registry.pane_current_agent_id(pane_id).as_deref() != Some(agent_id.as_str()) {
+            return true;
+        }
+        let newer = registry.hook_received_after(agent_id, seen_at);
+        superseded.store(newer, std::sync::atomic::Ordering::Relaxed);
+        newer
     })
     .await;
     if !ingested {
         tracing::debug!(
             pane_id = %escape_id_for_log(pane_id),
             agent_id = %escape_id_for_log(agent_id),
-            "status osc: dropped a signal from a generation that no longer holds its pane"
+            superseded = superseded.load(std::sync::atomic::Ordering::Relaxed),
+            "status osc: dropped a signal older than a hook event, or from a generation that no longer holds its pane"
         );
     }
 }
@@ -6478,6 +6533,10 @@ async fn run_hook_loop_with_limits(
                 // Issue #1664: taken here, in accept order, before the task
                 // that may run ahead of an earlier connection's is spawned.
                 let mut event_order_ticket = Some(event_order.admit());
+                // PRD #211 (review): when this connection was accepted, the
+                // receipt-order witness of the event it carries
+                // (`AgentPtyRegistry::note_hook_receipt`).
+                let accepted_at = std::time::Instant::now();
                 let hold_limit = Arc::clone(&hold_limit);
                 let state = state.clone();
                 let event_tx = event_tx.clone();
@@ -8552,6 +8611,9 @@ async fn run_hook_loop_with_limits(
                             // daemon ever learns the true type. Upgrade-only
                             // inside the registry; a no-op when the type is
                             // `None` or the pane id is unknown/absent.
+                            // PRD #211 (review): the generation this connection's event is
+                            // attested to, whose receipt is noted below and its ingest after.
+                            let mut receipt_owner: Option<String> = None;
                             if let Some(ref pane_id) = event.pane_id {
                                 // A SessionStart naming a pane this daemon never
                                 // spawned is always wrong, and silently so: it
@@ -8605,6 +8667,31 @@ async fn run_hook_loop_with_limits(
                                             .or(event.agent_id.as_deref()),
                                         &event.agent_type,
                                     );
+                                }
+                                // PRD #211 (review): an event attested to its
+                                // generation is newer than any OSC 7501 signal
+                                // that generation's reader read before this
+                                // connection was accepted, so that signal is
+                                // not applied over it. And an agent that
+                                // reports its status that way, started from a
+                                // shell in the pane, is read from here on: its
+                                // own hook, attested by the pane's token, says
+                                // what runs there.
+                                if let Some(owner) = attested_agent.as_deref() {
+                                    receipt_owner = Some(owner.to_string());
+                                    pty_registry.note_hook_receipt(owner, accepted_at);
+                                    if pty_registry.read_status_osc_from_own_hooks(
+                                        pane_id,
+                                        owner,
+                                        &event.agent_type,
+                                    ) {
+                                        info!(
+                                            pane_id = %escape_id_for_log(pane_id),
+                                            agent_id = %escape_id_for_log(owner),
+                                            agent_type = ?event.agent_type,
+                                            "status osc: reading the status of an agent its own hooks named in the pane"
+                                        );
+                                    }
                                 }
                             }
                             // Fan out to subscribed attach connections and
@@ -8672,6 +8759,9 @@ async fn run_hook_loop_with_limits(
                                 attested_agent,
                             )
                             .await;
+                            if let Some(owner) = receipt_owner {
+                                pty_registry.note_hook_applied(&owner, accepted_at);
+                            }
                         } else {
                             // PRD #1666 part 3 (Q87): on a registered composer
                             // connection a line it can't parse, half an
@@ -22284,10 +22374,17 @@ mod status_signal_queue_tests {
             batches[0].pane_id, "quiet",
             "the first to wait is served first"
         );
-        assert_eq!(batches[0].signals, vec![signal(OscState::Idle, None)]);
-        assert_eq!(batches[1].signals.len(), MAX_PENDING_STATUS_SIGNALS);
+        let signals = |at: usize| -> Vec<OscSignal> {
+            batches[at]
+                .signals
+                .iter()
+                .map(|(signal, _)| signal.clone())
+                .collect()
+        };
+        assert_eq!(signals(0), vec![signal(OscState::Idle, None)]);
+        assert_eq!(signals(1).len(), MAX_PENDING_STATUS_SIGNALS);
         assert_eq!(
-            batches[1].signals.last(),
+            signals(1).last(),
             Some(&signal(OscState::Blocked, Some("permission")))
         );
         assert_eq!(queue.len(), 0);
@@ -22308,5 +22405,196 @@ mod status_signal_queue_tests {
         assert_eq!(batches.len(), MAX_PENDING_STATUS_GENERATIONS);
         assert_eq!(dropped, 10);
         assert_eq!(batches[0].pane_id, "p10");
+    }
+}
+
+/// PRD #211 (review): an OSC 7501 signal is ordered against hook events by
+/// when the pane's reader read it, not by when the monitor gets to apply it.
+#[cfg(all(test, unix))]
+mod status_signal_order_tests {
+    use super::*;
+    use crate::agent_pty::{DOT_AGENT_DECK_PANE_ID, SpawnOptions};
+    use crate::event::AgentType;
+    use crate::status_osc::StatusUpdate;
+    use std::time::{Duration, Instant};
+
+    const PANE: &str = "agy-order";
+
+    struct Fixture {
+        registry: Arc<AgentPtyRegistry>,
+        state: SharedState,
+        event_tx: broadcast::Sender<BroadcastMsg>,
+        owner: String,
+    }
+
+    impl Fixture {
+        async fn start() -> Self {
+            let registry = Arc::new(AgentPtyRegistry::new());
+            let owner = registry
+                .spawn_agent(SpawnOptions {
+                    command: Some("/bin/cat"),
+                    env: crate::test_isolation::pin_unreachable_endpoints(vec![(
+                        DOT_AGENT_DECK_PANE_ID.to_string(),
+                        PANE.to_string(),
+                    )]),
+                    agent_type: Some(AgentType::Antigravity),
+                    ..SpawnOptions::default()
+                })
+                .expect("spawn stand-in");
+            let state: SharedState =
+                Arc::new(tokio::sync::RwLock::new(crate::state::AppState::default()));
+            state.write().await.register_pane(PANE.to_string());
+            let (event_tx, _rx) = broadcast::channel(EVENT_BROADCAST_CAPACITY);
+            Self {
+                registry,
+                state,
+                event_tx,
+                owner,
+            }
+        }
+
+        /// The hook loop's part for one Antigravity hook: the connection it
+        /// came on was accepted at `accepted_at`, then the event is applied.
+        async fn hook(&self, fixture: &str, accepted_at: Instant) {
+            let input = std::fs::read_to_string(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/antigravity")
+                    .join(fixture),
+            )
+            .unwrap();
+            let mut event = crate::hook::hook_payload_event("antigravity", &input).unwrap();
+            event.pane_id = Some(PANE.to_string());
+            event.agent_id = Some(self.owner.clone());
+            self.registry.note_hook_receipt(&self.owner, accepted_at);
+            ingest_event(&self.state, &self.event_tx, &self.registry, event).await;
+            self.registry.note_hook_applied(&self.owner, accepted_at);
+        }
+
+        /// The monitor applying a signal the reader read at `seen_at`.
+        async fn signal(&self, update: StatusUpdate, seen_at: Instant) {
+            report_status_update(
+                &self.state,
+                &self.event_tx,
+                &self.registry,
+                &(PANE.to_string(), self.owner.clone()),
+                &AgentType::Antigravity,
+                update,
+                seen_at,
+            )
+            .await;
+        }
+
+        async fn status(&self) -> crate::state::SessionStatus {
+            let state = self.state.read().await;
+            let session = state
+                .pane_hook_session_id(PANE)
+                .expect("a hook named the card");
+            state.sessions[&session].status.clone()
+        }
+
+        async fn question(&self) -> bool {
+            self.state
+                .read()
+                .await
+                .pending_question_for(&self.owner, Some(PANE))
+                .is_some()
+        }
+    }
+
+    /// Scenario: the reader reads `idle`, and before the monitor applies it a
+    /// newer `PreToolUse` arrives and is applied. The late `idle` leaves the
+    /// tool's Working card alone; a signal read after that hook still applies.
+    #[tokio::test]
+    async fn a_signal_read_before_a_newer_hook_does_not_overwrite_it() {
+        let deck = Fixture::start().await;
+        let start = Instant::now();
+        deck.hook("pre-invocation.json", start).await;
+        let read = start + Duration::from_millis(5);
+        // The slow path: the signal waits while a newer hook lands first.
+        let accepted = read + Duration::from_millis(5);
+        deck.hook("pre-tool-use-run-command.json", accepted).await;
+        assert_eq!(deck.status().await, crate::state::SessionStatus::Working);
+        deck.signal(StatusUpdate::Idle, read).await;
+        assert_eq!(
+            deck.status().await,
+            crate::state::SessionStatus::Working,
+            "an idle read before the tool's PreToolUse repainted its card"
+        );
+        deck.signal(StatusUpdate::Idle, accepted + Duration::from_millis(1))
+            .await;
+        assert_eq!(
+            deck.status().await,
+            crate::state::SessionStatus::Idle,
+            "a signal read after the hook is the newer report"
+        );
+    }
+
+    /// Scenario: a permission prompt is read, its call ends with a
+    /// `PostToolUse` that is applied first, and only then does the monitor
+    /// reach the prompt. It raises no Needs Input and no question.
+    #[tokio::test]
+    async fn a_permission_read_before_its_calls_end_raises_nothing() {
+        let deck = Fixture::start().await;
+        let start = Instant::now();
+        deck.hook("pre-invocation.json", start).await;
+        deck.hook(
+            "pre-tool-use-run-command.json",
+            start + Duration::from_millis(1),
+        )
+        .await;
+        let read = start + Duration::from_millis(5);
+        deck.hook(
+            "post-tool-use-run-command.json",
+            read + Duration::from_millis(5),
+        )
+        .await;
+        let after_post = deck.status().await;
+        deck.signal(
+            StatusUpdate::Permission(Some("Approve Bash: echo agy-probe-1".into())),
+            read,
+        )
+        .await;
+        assert_eq!(deck.status().await, after_post);
+        assert_ne!(after_post, crate::state::SessionStatus::WaitingForInput);
+        assert!(!deck.question().await);
+    }
+
+    /// Scenario: a `PreToolUse` connection is accepted, and the permission
+    /// prompt it leads to is read before that event has been ingested. The
+    /// signal waits for it, lands after it, and is bound to its call.
+    #[tokio::test]
+    async fn a_permission_read_after_its_calls_receipt_waits_for_its_ingest() {
+        let deck = Arc::new(Fixture::start().await);
+        let start = Instant::now();
+        deck.hook("pre-invocation.json", start).await;
+        let accepted = start + Duration::from_millis(1);
+        // Received, not yet ingested.
+        deck.registry.note_hook_receipt(&deck.owner, accepted);
+        let read = accepted + Duration::from_millis(1);
+        let signal = {
+            let deck = Arc::clone(&deck);
+            tokio::spawn(async move {
+                deck.signal(
+                    StatusUpdate::Permission(Some("Approve Bash: echo agy-probe-1".into())),
+                    read,
+                )
+                .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !signal.is_finished(),
+            "the signal waits for the call it is bound to"
+        );
+        deck.hook("pre-tool-use-run-command.json", accepted).await;
+        signal.await.unwrap();
+        assert_eq!(
+            deck.status().await,
+            crate::state::SessionStatus::WaitingForInput
+        );
+        assert!(
+            deck.question().await,
+            "the prompt is bound to the PreToolUse ingested ahead of it"
+        );
     }
 }

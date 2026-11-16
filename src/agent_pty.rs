@@ -2081,6 +2081,14 @@ pub struct AgentBus {
     /// The agent the generation was spawned as, whose release alone sets its
     /// input grammar (Q83); `None` keeps it strict.
     spawned_as: Option<AgentType>,
+    /// PRD #211 (review): when the hook loop accepted the latest connection
+    /// carrying an event attested to this generation. An OSC 7501 signal its
+    /// reader read before then is older than that event, and is not applied
+    /// over it ([`AgentPtyRegistry::hook_received_after`]).
+    hook_receipt: Mutex<Option<Instant>>,
+    /// PRD #211 (review): the accept instant of the latest such event the
+    /// hook loop has finished ingesting ([`AgentPtyRegistry::note_hook_applied`]).
+    hook_applied: Mutex<Option<Instant>>,
 }
 
 /// Test seam: [`AgentBus`]'s hook for the next push that moves the release
@@ -2135,11 +2143,14 @@ struct AgentBusState {
     /// lock before it is published. Nothing reads it yet, nor the input
     /// epoch it notes into (Q35-06).
     output_hook: crate::composer_probe::paste_mode::OutputHook,
-    /// PRD #211: the OSC 7501 status reader, for a generation spawned as an
-    /// agent whose registry entry switches it on
-    /// ([`crate::agent_registry::AgentSpec::status_osc7501`]); `None` for
-    /// every other, which then scans nothing.
-    status_osc: Option<crate::status_osc::Osc7501Scanner>,
+    /// PRD #211: the OSC 7501 status reader, and the agent it reads for: on
+    /// from the spawn for a generation spawned as an agent whose registry
+    /// entry switches it on
+    /// ([`crate::agent_registry::AgentSpec::status_osc7501`]), or from the
+    /// first of that agent's own hooks attested to the generation, for one
+    /// started from a shell in the pane ([`AgentBus::read_status_osc_for`]).
+    /// `None` for every other, which then scans nothing.
+    status_osc: Option<(AgentType, crate::status_osc::Osc7501Scanner)>,
     /// PRD #211: the status sequences read and not yet handed over, in byte
     /// order. Only the reader thread pushes, and it takes them after each
     /// push, so they leave in the order the agent wrote them.
@@ -2226,6 +2237,8 @@ impl AgentBus {
             input,
             composer_bell,
             spawned_as: None,
+            hook_receipt: Mutex::new(None),
+            hook_applied: Mutex::new(None),
         }
     }
 
@@ -2236,19 +2249,47 @@ impl AgentBus {
             spawned_as: agent,
             ..self
         };
-        let reader = bus
-            .spawned_as
-            .as_ref()
-            .and_then(|agent| crate::agent_registry::spec(agent).status_osc7501)
-            .map(|osc| crate::status_osc::Osc7501Scanner::new(osc.app));
+        let reader = bus.spawned_as.as_ref().and_then(|agent| {
+            crate::agent_registry::spec(agent)
+                .status_osc7501
+                .map(|osc| {
+                    (
+                        agent.clone(),
+                        crate::status_osc::Osc7501Scanner::new(osc.app),
+                    )
+                })
+        });
         bus.state.get_mut().unwrap().status_osc = reader;
         bus
     }
 
+    /// PRD #211 (review): read `agent`'s OSC 7501 status from here on, for a
+    /// generation that agent's own hooks named. Nothing for an agent that
+    /// reports none, or while the reader is already on. Whether it turned on.
+    fn read_status_osc_for(&self, agent: &AgentType) -> bool {
+        let Some(osc) = crate::agent_registry::spec(agent).status_osc7501 else {
+            return false;
+        };
+        let mut state = self.state.lock().unwrap();
+        if state.status_osc.is_some() {
+            return false;
+        }
+        state.status_osc = Some((
+            agent.clone(),
+            crate::status_osc::Osc7501Scanner::new(osc.app),
+        ));
+        true
+    }
+
     /// PRD #211: the OSC 7501 status sequences read since the last call, in
-    /// the order the agent wrote them.
-    fn take_status_signals(&self) -> Vec<crate::status_osc::OscSignal> {
-        std::mem::take(&mut self.state.lock().unwrap().status_signals)
+    /// the order the agent wrote them, with the agent the reader reads for.
+    fn take_status_signals(&self) -> Option<(AgentType, Vec<crate::status_osc::OscSignal>)> {
+        let mut state = self.state.lock().unwrap();
+        let signals = std::mem::take(&mut state.status_signals);
+        state
+            .status_osc
+            .as_ref()
+            .map(|(agent, _)| (agent.clone(), signals))
     }
 
     /// PRD #1666 part 3 (Q35-14b): the generation's release for `agent`, as
@@ -2344,7 +2385,7 @@ impl AgentBus {
         // PRD #211: off for every agent that does not report through OSC
         // 7501, so this is one branch for them.
         let status_signals = match state.status_osc.as_mut() {
-            Some(reader) => {
+            Some((_, reader)) => {
                 let mut found = Vec::new();
                 reader.scan(&arc, &mut found);
                 let any = !found.is_empty();
@@ -3216,18 +3257,18 @@ fn pump_reader(
         // PRD #211: the agent's own status reports, handed to the daemon in
         // the order they were written.
         if cost.status_signals {
-            let signals = bus.take_status_signals();
-            if let (Some(registry), Some(pane), Some(agent)) = (
+            let seen_at = Instant::now();
+            if let (Some(registry), Some(pane), Some((agent, signals))) = (
                 registry.upgrade(),
                 pane_id_env.as_deref(),
-                bus.spawned_as.as_ref(),
+                bus.take_status_signals(),
             ) {
                 registry.publish_status_signals(StatusSignals {
                     pane_id: pane.to_string(),
                     agent_id: agent_id.clone(),
-                    agent_type: agent.clone(),
+                    agent_type: agent,
                     signals,
-                    seen_at: Instant::now(),
+                    seen_at,
                 });
             }
         }
@@ -13289,6 +13330,111 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// PRD #211 (review): the hook loop accepted, at `at`, a connection
+    /// carrying an event attested to generation `agent_id`. Kept as the
+    /// latest such instant.
+    pub fn note_hook_receipt(&self, agent_id: &str, at: Instant) {
+        let bus = {
+            let inner = self.inner.lock();
+            match inner.agents.get(agent_id) {
+                Some(agent) => Arc::clone(&agent.bus),
+                None => return,
+            }
+        };
+        let mut receipt = bus.hook_receipt.lock().unwrap();
+        if receipt.is_none_or(|latest| latest < at) {
+            *receipt = Some(at);
+        }
+    }
+
+    /// PRD #211 (review): the hook loop finished ingesting the event attested
+    /// to generation `agent_id` whose connection it accepted at `at`, whether
+    /// it applied it or refused it.
+    pub fn note_hook_applied(&self, agent_id: &str, at: Instant) {
+        let Some(bus) = self.generation_bus(agent_id) else {
+            return;
+        };
+        let mut applied = bus.hook_applied.lock().unwrap();
+        if applied.is_none_or(|latest| latest < at) {
+            *applied = Some(at);
+        }
+    }
+
+    /// PRD #211 (review): whether a hook event attested to generation
+    /// `agent_id`, accepted at or before `at`, has not been ingested yet. An
+    /// OSC 7501 signal read at `at` is newer than that event, and is applied
+    /// after it.
+    pub fn hook_in_flight_before(&self, agent_id: &str, at: Instant) -> bool {
+        let Some(bus) = self.generation_bus(agent_id) else {
+            return false;
+        };
+        let Some(received) = *bus.hook_receipt.lock().unwrap() else {
+            return false;
+        };
+        let applied = *bus.hook_applied.lock().unwrap();
+        received <= at && applied.is_none_or(|applied| applied < received)
+    }
+
+    fn generation_bus(&self, agent_id: &str) -> Option<Arc<AgentBus>> {
+        let inner = self.inner.lock();
+        inner
+            .agents
+            .get(agent_id)
+            .map(|agent| Arc::clone(&agent.bus))
+    }
+
+    /// PRD #211 (review): whether a hook event attested to generation
+    /// `agent_id` was received after `at`, the instant its OSC 7501 reader
+    /// read a signal: that signal is then older than the event, and the
+    /// event's status and question stand.
+    pub fn hook_received_after(&self, agent_id: &str, at: Instant) -> bool {
+        let bus = {
+            let inner = self.inner.lock();
+            match inner.agents.get(agent_id) {
+                Some(agent) => Arc::clone(&agent.bus),
+                None => return false,
+            }
+        };
+        bus.hook_receipt
+            .lock()
+            .unwrap()
+            .is_some_and(|latest| latest > at)
+    }
+
+    /// PRD #211 (review): an event of `agent`'s own hooks, attested to
+    /// generation `agent_id`, named pane `pane_id`: read `agent`'s OSC 7501
+    /// status from that generation's output from here on, as for one spawned
+    /// as it. That covers an agent started from a shell in the pane. Only
+    /// while the generation still speaks for the pane, and only for one
+    /// spawned as no agent or as this one; the reader never turns on from
+    /// the pane's output itself. Whether it turned on.
+    pub fn read_status_osc_from_own_hooks(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+        agent: &AgentType,
+    ) -> bool {
+        crate::agent_registry::spec(agent).status_osc7501.is_some() && {
+            let bus = {
+                let inner = self.inner.lock();
+                let Some(record) = inner.agents.get(agent_id) else {
+                    return false;
+                };
+                if record.pane_id_env.as_deref() != Some(pane_id)
+                    || !Self::generation_speaks_for_pane(&inner, agent_id, record, pane_id)
+                    || record
+                        .spawn_agent_type
+                        .as_ref()
+                        .is_some_and(|spawned| spawned != agent)
+                {
+                    return false;
+                }
+                Arc::clone(&record.bus)
+            };
+            bus.read_status_osc_for(agent)
+        }
+    }
+
     /// PRD #211 (audit suggestion): the release of `agent` that generation
     /// `agent_id` drew in its own output, as its release scanner latched it.
     /// `None` when the registry holds no such generation.
@@ -14655,11 +14801,16 @@ impl AgentPtyRegistry {
             ));
         }
         // PRD #211: an agent that reports its status through OSC 7501 is asked
-        // to, on every pane the deck starts for it; the daemon reads what it
-        // writes ([`AgentBus::spawned_as`]).
-        if let Some(osc) = spawn_agent_type
-            .as_ref()
-            .and_then(|agent| crate::agent_registry::spec(agent).status_osc7501)
+        // to on every pane the deck starts, whatever the pane's command, so
+        // one started from a shell there reports it too. The daemon reads it
+        // from a generation spawned as that agent ([`AgentBus::spawned_as`]),
+        // or once that agent's own hooks name the generation
+        // ([`Self::read_status_osc_from_own_hooks`]). The variable is the
+        // agent's own opt-in: no other program reads it, and the sequences an
+        // unread pane carries are an OSC every terminal ignores.
+        for osc in crate::agent_registry::ALL
+            .iter()
+            .filter_map(|spec| spec.status_osc7501)
         {
             let (name, value) = osc.enable_env;
             opts.env.retain(|(k, _)| k != name);

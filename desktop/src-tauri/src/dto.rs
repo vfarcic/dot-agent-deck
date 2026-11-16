@@ -2403,7 +2403,14 @@ pub(crate) fn map_prompt_keys(
         },
         delete_char: DesktopDeleteCharKey {
             bytes: keys.delete_char.bytes.to_string(),
-            max_literal_write_chars: keys.delete_char.max_literal_write_chars,
+            // PRD #211: on a paced key this is the per-write cap, the bound a
+            // client that bursts its deletes needs; this client paces, and the
+            // agent claims no collapse limit
+            // (`agent_registry::DeleteCharKey::max_literal_write_chars`).
+            max_literal_write_chars: keys
+                .delete_char
+                .max_literal_write_chars
+                .filter(|_| keys.delete_char.max_presses_per_write.is_none()),
             max_presses_per_write: keys.delete_char.max_presses_per_write,
             pause_between_writes_ms: keys.delete_char.pause_between_writes_ms,
         },
@@ -4823,6 +4830,9 @@ mod tests {
     #[test]
     fn delete_pacing_is_copied_within_its_bounds() {
         let keys = registry_keys(AgentType::Antigravity);
+        // The served literal-write bound is for a client that bursts its
+        // deletes; this one paces them, so it is not carried.
+        assert_eq!(keys.delete_char.max_literal_write_chars, Some(1));
         let mapped = serde_json::to_value(map_prompt_keys(&keys).unwrap()).unwrap();
         assert_eq!(
             mapped["deleteChar"],

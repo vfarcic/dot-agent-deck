@@ -351,7 +351,8 @@ pub fn decode_base64(input: &[u8]) -> Option<Vec<u8>> {
 /// through and discards a held one.
 #[derive(Debug, Default, Clone)]
 pub struct AuthSettle {
-    held: Option<(Instant, Option<String>)>,
+    /// The held signal: when it is due, when it was seen, and its message.
+    held: Option<(Instant, Instant, Option<String>)>,
 }
 
 impl AuthSettle {
@@ -360,7 +361,7 @@ impl AuthSettle {
         if signal.is_auth() {
             // A repeat keeps the first one's clock: it has stood since then.
             if self.held.is_none() {
-                self.held = Some((now + AUTH_SETTLE, signal.msg.clone()));
+                self.held = Some((now + AUTH_SETTLE, now, signal.msg.clone()));
             }
             return None;
         }
@@ -370,15 +371,16 @@ impl AuthSettle {
 
     /// When the held signal is due, if one is held.
     pub fn due_at(&self) -> Option<Instant> {
-        self.held.as_ref().map(|(at, _)| *at)
+        self.held.as_ref().map(|(at, _, _)| *at)
     }
 
-    /// The held signal's update, once it is due at `now`.
-    pub fn poll(&mut self, now: Instant) -> Option<StatusUpdate> {
+    /// The held signal's update, once it is due at `now`, with when it was
+    /// seen: the instant it is ordered against hook events by.
+    pub fn poll(&mut self, now: Instant) -> Option<(StatusUpdate, Instant)> {
         match &self.held {
-            Some((at, _)) if *at <= now => {
-                let (_, msg) = self.held.take()?;
-                Some(StatusUpdate::NeedsInput(msg))
+            Some((at, _, _)) if *at <= now => {
+                let (_, seen, msg) = self.held.take()?;
+                Some((StatusUpdate::NeedsInput(msg), seen))
             }
             _ => None,
         }
@@ -579,7 +581,11 @@ mod tests {
         );
         assert_eq!(
             settle.poll(start + AUTH_SETTLE),
-            Some(StatusUpdate::NeedsInput(Some("Sign in required".into())))
+            Some((
+                StatusUpdate::NeedsInput(Some("Sign in required".into())),
+                start
+            )),
+            "the held signal is ordered by when it was first seen"
         );
         assert_eq!(settle.due_at(), None);
     }

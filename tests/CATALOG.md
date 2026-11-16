@@ -8002,6 +8002,15 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Does not assert:** a real Claude session or every other supported agent.
 - **Platform coverage:** mac+linux (unix-only file).
 
+#### antigravity/shell
+
+##### antigravity/shell/001 — Antigravity started from a shell in a pane shows Needs Input and an interrupted turn once its hooks name it.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_shell.rs`).
+- **Agent:** `agy` stand-in typed at a plain `sh` pane's prompt, replaying captured hooks and measured OSC 7501 permission and idle signals.
+- **Asserts:** the pane's environment carries `AGY_CLI_OSC7501=on`; a permission signal before any hook shows no Needs Input; after `SessionStart` and `PreInvocation` the Antigravity card shows Thinking, then Needs Input with the decoded question for a hook-bound permission signal, then Idle with the question cleared on an idle signal.
+- **Does not assert:** a real `agy`, voice answers in a shell-started pane, or start-up dialogs shown before the first prompt.
+- **Platform coverage:** mac+linux (unix-only file).
+
 #### codex/status
 
 ##### codex/status/001 — A deck-launched Codex whose hooks are trusted shows the status its hooks report, not its output: Idle until the first prompt and Idle again after its turn (issue #1493).
