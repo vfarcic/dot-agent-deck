@@ -237,7 +237,7 @@ impl Scanner {
     /// whole lines show to `found`. A transcript that shrank below the mark,
     /// or went, shows nothing more; reading stops at [`MAX_READ`].
     pub fn poll(&mut self, found: &mut Vec<InboxAttemptRef>) {
-        let Ok(mut file) = std::fs::File::open(&self.mark.path) else {
+        let Some(mut file) = open_regular(&self.mark.path) else {
             return;
         };
         self.present = true;
@@ -286,6 +286,22 @@ pub enum Watched {
     /// The transcript never existed while the witness watched: Claude
     /// Code keeps none for this session, so nothing can witness.
     NoTranscript,
+}
+
+/// `path` opened for reading only if it is a regular file. The open does
+/// not block: the path was accepted while it may not have existed, and a
+/// FIFO created there in the meantime must not hold the witness past its
+/// deadline.
+fn open_regular(path: &std::path::Path) -> Option<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path).ok()?;
+    file.metadata().ok()?.is_file().then_some(file)
 }
 
 /// Watch the transcript until every attempt in `expected` is found or
@@ -394,16 +410,33 @@ fn run_unix(plan: Plan) {
             .cloned()
             .collect(),
     };
-    crate::inbox_prompt::commit_exact(
-        found,
-        crate::event::InboxOneShotSender::ClaudeHooks,
-        Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
-    );
+    // Nothing waits on the witness, so a commit the deck did not answer in
+    // time, or whose connection was lost, is tried once more. What still
+    // fails goes to the deck as the batch's `degraded` notice, which the
+    // agent's card shows: its stderr reaches nobody (issue #2341 review).
+    let commit = || {
+        crate::inbox_prompt::commit_exact_quietly(
+            found.clone(),
+            crate::event::InboxOneShotSender::ClaudeHooks,
+            Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
+        )
+    };
+    let mut committed = commit();
+    if matches!(
+        committed,
+        crate::inbox_prompt::Committed::Lost | crate::inbox_prompt::Committed::TimedOut
+    ) {
+        committed = commit();
+    }
+    let degraded = plan
+        .degraded
+        .clone()
+        .or_else(|| crate::inbox_prompt::committed_notice(committed).map(str::to_string));
     if let (Some(batch), Some(mut stream)) = (plan.batch.as_ref(), connection) {
         let line = format!(
             "{}{}\n",
             if plan.cut { "\n" } else { "" },
-            batch.control_line(plan.degraded.clone())
+            batch.control_line(degraded)
         );
         let _ = stream.set_write_timeout(Some(crate::inbox_oneshot::RECEIPTS_ANSWER_WAIT));
         let _ = stream.write_all(line.as_bytes());
@@ -481,6 +514,24 @@ mod tests {
             assert_eq!(found, want, "{entry}");
         }
         assert!(witnessed_in_line(b"{not json [dot-agent-deck message ").is_empty());
+    }
+
+    /// Scenario: A FIFO stands where the transcript was to be created. The scanner opens it without blocking, reads nothing from it, and a watch for an attempt still ends at its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn a_fifo_in_the_transcripts_place_does_not_hold_the_witness() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.jsonl");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let start = Instant::now();
+        let watched = watch(
+            TranscriptMark { path, offset: 0 },
+            &[at(ID, 1, 1)],
+            start + Duration::from_millis(300),
+        );
+        assert_eq!(watched, Watched::NoTranscript);
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     /// Scenario: A transcript holds an earlier prompt carrying a block before the hook's mark, then gains a hook context for a second attempt in two writes, the first ending mid-line. The scanner reports only the attempt appended after the mark, and only once its line is complete.

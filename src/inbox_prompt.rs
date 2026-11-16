@@ -860,41 +860,51 @@ pub fn commit_exact(
     sender: crate::event::InboxOneShotSender,
     receipts_by: std::time::Instant,
 ) {
+    #[cfg(unix)]
+    report_committed(commit_exact_quietly(attempts, sender, receipts_by), sender);
+    // The one-shot receipt protocol is Unix only: no one-shot there wrote
+    // a block for a prompt to carry.
+    #[cfg(not(unix))]
+    let _ = (attempts, sender, receipts_by);
+}
+
+/// [`commit_exact`], answering what came of it instead of saying it on
+/// stderr: for the transcript witness, whose stderr reaches nobody
+/// (issue #2341). [`Committed::Nothing`] outside a deck pane or without a
+/// token.
+#[cfg(unix)]
+pub fn commit_exact_quietly(
+    attempts: Vec<InboxAttemptRef>,
+    sender: crate::event::InboxOneShotSender,
+    receipts_by: std::time::Instant,
+) -> Committed {
     if attempts.is_empty() {
-        return;
+        return Committed::Nothing;
     }
     let Some(pane_id) = std::env::var(DOT_AGENT_DECK_PANE_ID)
         .ok()
         .filter(|pane| !pane.is_empty())
     else {
-        return;
+        return Committed::Nothing;
     };
     let Some(token) = crate::hook_provenance::token_from_env() else {
-        return;
+        return Committed::Nothing;
     };
     let agent_id = std::env::var(DOT_AGENT_DECK_AGENT_ID)
         .ok()
         .filter(|agent| !agent.is_empty());
-    #[cfg(unix)]
-    report_committed(
-        commit_attempts_by(
-            &crate::endpoint_resolve::client_socket_path(),
-            CommitFor {
-                pane_id: &pane_id,
-                agent_id: agent_id.as_deref(),
-                token: &token,
-                sender,
-            },
-            attempts,
-            &pinned_spool(),
-            receipts_by,
-        ),
-        sender,
-    );
-    // The one-shot receipt protocol is Unix only: no one-shot there wrote
-    // a block for a prompt to carry.
-    #[cfg(not(unix))]
-    let _ = (pane_id, agent_id, token, sender, receipts_by);
+    commit_attempts_by(
+        &crate::endpoint_resolve::client_socket_path(),
+        CommitFor {
+            pane_id: &pane_id,
+            agent_id: agent_id.as_deref(),
+            token: &token,
+            sender,
+        },
+        attempts,
+        &pinned_spool(),
+        receipts_by,
+    )
 }
 
 /// Say on stderr what `committed` leaves the user to act on, if anything:
@@ -917,8 +927,8 @@ fn report_committed(committed: Committed, sender: crate::event::InboxOneShotSend
 }
 
 /// The notice [`report_committed`] says for `committed`, if any.
-#[cfg(all(test, unix))]
-fn committed_notice(committed: Committed) -> Option<&'static str> {
+#[cfg(unix)]
+pub fn committed_notice(committed: Committed) -> Option<&'static str> {
     match committed {
         Committed::Withheld => Some(crate::inbox_oneshot::RECEIPTS_COMMIT_UNSUPPORTED),
         Committed::Lost => Some(crate::inbox_oneshot::RECEIPTS_COMMIT_CONNECTION_LOST),
