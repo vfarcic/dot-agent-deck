@@ -9667,6 +9667,13 @@ Since PRD #1666 S5 the deck types nothing into the orchestrator: its idle, waiti
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 
+##### scheduler/idle-worker/033 — Turning the idle-worker report off leaves the blocked-worker report on (issue #2230).
+- **Layer:** fast integration (real `handle_delegate` and the daemon's real hook-ingestion step `daemon::ingest_event` against daemon-owned PTYs), `tests/idle_worker_detector.rs`.
+- **Agent:** none (`cat` stand-ins; the worker's `quota_blocked` report is fed through ingestion tagged with its registry agent id).
+- **Asserts:** with `worker_response_timeout_minutes = 0` in the orchestration's config and the millisecond seam unset, then with `DOT_AGENT_DECK_WORKER_RESPONSE_TIMEOUT_MS=0`, a worker that acknowledges its task and reports a provider usage limit produces exactly one `⚠ delegated worker blocked by a provider usage limit` notice naming its pane in the orchestrator's inbox, and no idle-worker prompt arrives for either delegation. Verified red before the fix (the inbox stayed empty: the delegation record the notice is claimed from was armed only while the timeout was on).
+- **Does not assert:** that the idle report stays off over a full timeout window (`scheduler/idle-worker/003`); the notice's delivery as a submitted turn (`scheduler/idle-worker/024`); a real agent's usage limit.
+- **Platform coverage:** mac+linux.
+
 #### scheduler/live
 
 ##### scheduler/live/001 — A scheduled fire surfaces its card LIVE to an already-attached TUI, without a disconnect/reconnect (PRD #127 finding #2).
@@ -15778,7 +15785,7 @@ These Node `node:test` scenarios live in `desktop/driver/`, outside the Rust `#[
 
 ##### telemetry/otlp/047 — A worker whose turn ends on an error is reported to its orchestrator, and its handoff ends then (issue #2099).
 
-- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate, fetch and ack CLI calls, the daemon's own hook ingestion and a local OTLP/JSON receiver; the waiting-notice debounce shortened to 300 ms and the worker-response timeout set to an hour, on but never due (the blocked-worker notice is owed only while that timeout is on).
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_telemetry_handoff.rs`); real delegate, fetch and ack CLI calls, the daemon's own hook ingestion and a local OTLP/JSON receiver; the waiting-notice debounce shortened to 300 ms and the worker-response timeout off (`0`), so the blocked-worker notice it asserts is also the one issue #2230 found missing with the timeout off.
 - **Agent:** two Python PTY stand-ins; the worker's failure is a tagged Claude Code `error` hook event, as `StopFailure` sends after a rate-limit burst.
 - **Asserts:** after the worker acknowledges its task and reports the error, one `A delegated worker stopped on an error` daemon notice reaches the orchestrator's inbox and the task's agent.handoff exports with outcome `worker_failed`, role `coder` and no reported event, while neither agent's run has ended. Then the orchestrator re-delegates with `--supersede`, the worker acknowledges the new task and reports a provider usage limit (`quota_blocked`): the existing blocked-worker notice arrives and that handoff exports `worker_blocked`. Each handoff is exported once, closing the runs adds none, and no private task text reaches the OTLP bodies. Before the fix the notice never arrived (the error case) and both handoffs stayed open.
 - **Does not assert:** a real agent's failed turn (the hook mapping is `status/blocked/011`, `/022`, `/023`, `/026`); the default 30-second debounce; a worker that starts working again inside the debounce (the episode's cancellation is the waiting notice's, `scheduler/idle-worker/021`); a report sent after the handoff ended.
