@@ -54,7 +54,10 @@
 //!   (issue #329's mechanism) and, when `.dot-agent-deck/` holds no
 //!   `.gitignore`, creates one containing `*`, which a negation in a tracked
 //!   `.gitignore` above it cannot override; an existing `.gitignore` there is
-//!   never changed, and one that is not a regular file is refused. Then it
+//!   never changed, and one that is not a regular file is refused, as is
+//!   (Unix) one owned by another account or writable by other or by a group
+//!   that is not this account's private group, since such an account could
+//!   re-include the task between git's verdict and the file's creation. Then it
 //!   asks git (`git check-ignore -q`, whose exit status is the verdict:
 //!   0 ignored, 1 not; and `git ls-files --error-unmatch`: 0 tracked, 1 not)
 //!   whether the task's path is ignored and untracked, and writes nothing
@@ -66,15 +69,23 @@
 //!   be the one at that path before the file is created. That holds for
 //!   git's rules as they are at the save, not against a `.gitignore` edited
 //!   afterwards.
-//! - **Never overwritten.** The file is created `O_EXCL`, owner-only. Each
-//!   dispatch mints a new work id, so a later dispatch into the same worktree
-//!   writes a new file; a file already there for the same work id is kept
-//!   and the save fails with a warning, never replaced.
+//! - **Whole or absent.** The task is written to the temp name
+//!   `.dispatch-task-<work id>.md.tmp` (created `O_EXCL`, owner-only),
+//!   `fsync`ed, and only then given its final name, after which the
+//!   directory is `fsync`ed. So the final name never holds a cut-off task,
+//!   even after a crash mid-write; such a crash leaves only the temp file.
+//! - **Never overwritten.** The final name is given by a rename that refuses
+//!   an existing entry (`renameat2(RENAME_NOREPLACE)` on Linux, else `linkat`
+//!   then `unlinkat` of the temp). Each dispatch mints a new work id, so a
+//!   later dispatch into the same worktree writes a new file; a file already
+//!   there for the same work id is kept and the save fails with a warning,
+//!   never replaced.
 //! - **Not swept.** The coordination sweep's age bound
 //!   ([`crate::orchestrator_context::is_sweepable_coordination_name`]) and
 //!   the inbox spill retention ([`crate::inbox_spills`], which removes only
-//!   the `inbox-message-*` files it minted) both leave it alone. It goes with
-//!   the worktree.
+//!   the `inbox-message-*` files it minted) both leave the published task
+//!   alone. It goes with the worktree. A temp file left by a crashed save is
+//!   the age sweep's ([`is_temp_file_name`]): it is never read as a task.
 //!
 //! Off Unix the worktree root's owner and mode are not judged and the
 //! directory operations are path operations
@@ -112,6 +123,23 @@ pub fn file_name(work: &WorkId) -> String {
     format!("{PREFIX}{work}.md")
 }
 
+/// The name [`save`] writes `work`'s task under before publishing it as
+/// [`file_name`]: `.dispatch-task-<work id>.md.tmp`.
+fn temp_file_name(work: &WorkId) -> String {
+    format!(".{}.tmp", file_name(work))
+}
+
+/// `name` is exactly a [`save`] temp file's name
+/// (`.dispatch-task-<work id>.md.tmp`). The age sweep removes one left by a
+/// save that died before publishing it
+/// ([`crate::orchestrator_context::is_sweepable_coordination_name`]); the
+/// published task is exempt.
+pub fn is_temp_file_name(name: &str) -> bool {
+    name.strip_prefix('.')
+        .and_then(|rest| rest.strip_suffix(".tmp"))
+        .is_some_and(is_task_file_name)
+}
+
 /// `name` is named as a saved dispatch task ([`file_name`]).
 pub fn is_task_file_name(name: &str) -> bool {
     name.strip_prefix(PREFIX)
@@ -134,6 +162,24 @@ fn save_with(
     git: &dyn Fn(&Path) -> Command,
     deadline: Duration,
 ) -> io::Result<PathBuf> {
+    save_writing(worktree, work, task, git, deadline, &write_synced)
+}
+
+/// What [`save`] writes into its temp file: every byte, then `fsync`.
+fn write_synced(file: &mut std::fs::File, bytes: &[u8]) -> io::Result<()> {
+    file.write_all(bytes).and_then(|()| file.sync_all())
+}
+
+/// [`save_with`] with the write into the temp file passed in too, so a test
+/// can stand in a write that fails or dies half way.
+fn save_writing(
+    worktree: &Path,
+    work: &WorkId,
+    task: &str,
+    git: &dyn Fn(&Path) -> Command,
+    deadline: Duration,
+    write: &dyn Fn(&mut std::fs::File, &[u8]) -> io::Result<()>,
+) -> io::Result<PathBuf> {
     let name = file_name(work);
     let held = crate::orchestrator_context::open_held_context_dir(worktree)?;
     ensure_ignore_file(&held)?;
@@ -150,47 +196,68 @@ fn save_with(
         ));
     }
     if held.has_entry(&name) {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            format!("{name} already exists; the saved task is kept, not replaced"),
-        ));
+        return Err(already_saved(&name));
     }
-    let mut file = held.create_new(&name)?;
-    let written = file
-        .write_all(task.as_bytes())
-        .and_then(|()| file.sync_all());
-    if let Err(error) = written {
+    // The task is written whole under a temp name and only then given its
+    // final one, so the final name never holds a cut-off task, not even
+    // after a crash mid-write (which leaves only the temp, for the sweep).
+    let temp = temp_file_name(work);
+    let mut file = held.create_new(&temp)?;
+    if let Err(error) = write(&mut file, task.as_bytes()) {
         drop(file);
-        let _ = held.remove(&name);
+        let _ = held.remove(&temp);
         return Err(error);
+    }
+    drop(file);
+    if let Err(error) = held.rename_noreplace(&temp, &name) {
+        let _ = held.remove(&temp);
+        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+            already_saved(&name)
+        } else {
+            error
+        });
+    }
+    if let Err(error) = held.sync() {
+        // The file under its final name is complete (it was synced before
+        // the rename); only its directory entry may not survive a crash.
+        tracing::warn!(
+            %error,
+            "dispatch: the saved task's directory could not be synced; the task may not survive a crash"
+        );
     }
     Ok(held.path().join(name))
 }
 
+/// The error for a task already saved under `name`.
+fn already_saved(name: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::AlreadyExists,
+        format!("{name} already exists; the saved task is kept, not replaced"),
+    )
+}
+
 /// Create `.dot-agent-deck/.gitignore` holding `*` when the directory has no
-/// entry of that name; an existing regular file, whatever it holds, is left
-/// as it is, and an existing entry of any other kind (a FIFO, a symlink, a
-/// directory) is refused, since git would block on or follow it.
+/// entry of that name. An existing regular file, whatever it holds, is left
+/// as it is, but only when no other account could rewrite it: on Unix it
+/// must be owned by this account and writable by neither other nor a group
+/// that is not this account's private group ([`ignore_file_refusal`]),
+/// since git's verdict below reads it and an account that could edit it
+/// could re-include the task between that verdict and the file's creation.
+/// An existing entry of any other kind (a FIFO, a symlink, a directory) is
+/// refused, since git would block on or follow it. A refusal writes nothing.
 fn ensure_ignore_file(held: &HeldContextDir) -> io::Result<()> {
-    match held.is_regular_file(IGNORE_FILE)? {
-        Some(true) => return Ok(()),
-        Some(false) => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("{CONTEXT_DIR_NAME}/{IGNORE_FILE} is not a regular file"),
-            ));
-        }
-        None => {}
+    if existing_ignore_file_trusted(held)? {
+        return Ok(());
     }
     let mut file = match held.create_new(IGNORE_FILE) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-            return match held.is_regular_file(IGNORE_FILE)? {
-                Some(true) => Ok(()),
-                _ => Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("{CONTEXT_DIR_NAME}/{IGNORE_FILE} is not a regular file"),
-                )),
+            return if existing_ignore_file_trusted(held)? {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "{CONTEXT_DIR_NAME}/{IGNORE_FILE} appeared and vanished while it was being created"
+                )))
             };
         }
         Err(e) => return Err(e),
@@ -204,6 +271,74 @@ fn ensure_ignore_file(held: &HeldContextDir) -> io::Result<()> {
         return Err(error);
     }
     Ok(())
+}
+
+/// `Ok(true)` when `.dot-agent-deck/.gitignore` exists and may be relied on,
+/// `Ok(false)` when there is none, and `PermissionDenied` when one exists
+/// that may not (not a regular file, or, on Unix, one another account could
+/// write).
+fn existing_ignore_file_trusted(held: &HeldContextDir) -> io::Result<bool> {
+    let refused = |why: String| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{CONTEXT_DIR_NAME}/{IGNORE_FILE} {why}"),
+        )
+    };
+    #[cfg(unix)]
+    {
+        let Some(entry) = held.entry_stat(IGNORE_FILE)? else {
+            return Ok(false);
+        };
+        if !entry.regular {
+            return Err(refused("is not a regular file".into()));
+        }
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let euid = unsafe { libc::geteuid() };
+        let private = if entry.mode & 0o020 != 0 {
+            crate::platform::paths::effective_private_group()
+        } else {
+            None
+        };
+        match ignore_file_refusal(entry.uid, entry.gid, entry.mode, euid, private) {
+            Some(why) => Err(refused(why)),
+            None => Ok(true),
+        }
+    }
+    #[cfg(not(unix))]
+    match held.is_regular_file(IGNORE_FILE)? {
+        Some(true) => Ok(true),
+        Some(false) => Err(refused("is not a regular file".into())),
+        None => Ok(false),
+    }
+}
+
+/// Why an existing `.dot-agent-deck/.gitignore` owned by `uid` with group
+/// `gid` and permission bits `mode` is one another account than `euid`
+/// could rewrite, or `None` when, by owner and mode bits, only `euid` (and
+/// root) can: the policy the worktree root is held to
+/// ([`crate::orchestrator_context::project_root_refusal`]), its private
+/// group exception included. Pure, so every branch is testable. Mode bits
+/// only: an ACL is not seen.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn ignore_file_refusal(
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    euid: u32,
+    private_group: Option<u32>,
+) -> Option<String> {
+    if uid != euid {
+        return Some(format!("is owned by uid {uid}, not by this account"));
+    }
+    if mode & 0o002 != 0 {
+        return Some(format!("is writable by every account (mode {mode:o})"));
+    }
+    if mode & 0o020 != 0 && private_group != Some(gid) {
+        return Some(format!(
+            "is writable by group {gid}, which is not this account's private group (mode {mode:o})"
+        ));
+    }
+    None
 }
 
 /// `Ok` only when git, run in `worktree`, says `relative` is ignored
@@ -707,6 +842,146 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!task_path(&repo, &w).exists());
+    }
+
+    /// PR #2363 review (Greptile): a write into the task file that fails
+    /// part way leaves nothing under the final name, and no temp either.
+    #[test]
+    fn a_failed_write_leaves_no_task_under_its_final_name() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let w = work();
+        let short = |file: &mut std::fs::File, bytes: &[u8]| -> io::Result<()> {
+            file.write_all(&bytes[..bytes.len() / 2])?;
+            Err(io::Error::new(io::ErrorKind::StorageFull, "disk full"))
+        };
+        let error = save_writing(
+            &repo,
+            &w,
+            "THE WHOLE TASK",
+            &crate::git_env::git_at,
+            GIT_DEADLINE,
+            &short,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::StorageFull, "{error}");
+        assert!(
+            !task_path(&repo, &w).exists(),
+            "a cut-off task was published"
+        );
+        assert!(
+            !repo
+                .join(CONTEXT_DIR_NAME)
+                .join(temp_file_name(&w))
+                .exists(),
+            "the failed save's temp was left behind"
+        );
+    }
+
+    /// PR #2363 review (Greptile): a save that dies in the middle of its
+    /// write (the process killed, so no cleanup runs; here a panic) leaves
+    /// no file under the task's final name, only its temp, which the age
+    /// sweep takes and which is not read as a task. A later save is not
+    /// stopped by it.
+    #[test]
+    fn a_save_that_dies_mid_write_publishes_no_task() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let w = work();
+        let dies = |file: &mut std::fs::File, bytes: &[u8]| -> io::Result<()> {
+            file.write_all(&bytes[..bytes.len() / 2]).unwrap();
+            panic!("the daemon died mid-write");
+        };
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            save_writing(
+                &repo,
+                &w,
+                "THE WHOLE TASK",
+                &crate::git_env::git_at,
+                GIT_DEADLINE,
+                &dies,
+            )
+        }));
+        assert!(died.is_err(), "the stand-in write did not die");
+        assert!(
+            !task_path(&repo, &w).exists(),
+            "a cut-off task sits under its final name"
+        );
+        let temp = temp_file_name(&w);
+        assert!(repo.join(CONTEXT_DIR_NAME).join(&temp).exists());
+        assert!(is_temp_file_name(&temp));
+        assert!(!is_task_file_name(&temp), "a temp is never read as a task");
+        assert!(crate::orchestrator_context::is_sweepable_coordination_name(
+            &temp
+        ));
+        let later = work();
+        save(&repo, &later, "LATER").unwrap();
+        assert_eq!(
+            std::fs::read_to_string(task_path(&repo, &later)).unwrap(),
+            "LATER"
+        );
+    }
+
+    /// PR #2363 review (Qodo): the decision on an existing
+    /// `.dot-agent-deck/.gitignore`'s owner and mode.
+    #[test]
+    fn only_an_ignore_file_this_account_alone_can_write_is_trusted() {
+        let (me, other, private, shared) = (1000, 1001, 1000, 100);
+        assert_eq!(ignore_file_refusal(me, shared, 0o644, me, None), None);
+        assert_eq!(ignore_file_refusal(me, shared, 0o600, me, None), None);
+        assert_eq!(
+            ignore_file_refusal(me, private, 0o664, me, Some(private)),
+            None
+        );
+        assert!(ignore_file_refusal(me, shared, 0o664, me, Some(private)).is_some());
+        assert!(ignore_file_refusal(me, private, 0o664, me, None).is_some());
+        assert!(ignore_file_refusal(me, private, 0o646, me, Some(private)).is_some());
+        assert!(ignore_file_refusal(other, shared, 0o644, me, None).is_some());
+    }
+
+    /// PR #2363 review (Qodo): an existing `.dot-agent-deck/.gitignore`
+    /// that every account can write (or a group other than this account's
+    /// private group) is refused before git is asked: no task is written and
+    /// the file is left as it was. The same file at 0644 is relied on.
+    #[cfg(unix)]
+    #[test]
+    fn an_ignore_file_others_can_write_is_refused() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+        let root = tempfile::tempdir().unwrap();
+        let repo = repo(root.path(), None);
+        let dir = repo.join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let ignore = dir.join(".gitignore");
+        std::fs::write(&ignore, "*\n").unwrap();
+        let set = |bits| std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(bits));
+
+        set(0o646).unwrap();
+        let w = work();
+        let error = save(&repo, &w, "TASK").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert!(error.to_string().contains(".gitignore"), "{error}");
+        assert!(!task_path(&repo, &w).exists());
+        assert_eq!(std::fs::read_to_string(&ignore).unwrap(), "*\n");
+        let mode = std::fs::metadata(&ignore).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o646, "the refused file was changed");
+
+        set(0o664).unwrap();
+        let gid = std::fs::metadata(&ignore).unwrap().gid();
+        let private = crate::platform::paths::effective_private_group() == Some(gid);
+        let saved = save(&repo, &w, "TASK");
+        if private {
+            saved.unwrap();
+        } else {
+            assert_eq!(saved.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+            assert!(!task_path(&repo, &w).exists());
+            // Control: owner-only write is relied on.
+            set(0o644).unwrap();
+            save(&repo, &w, "TASK").unwrap();
+        }
+        assert_eq!(
+            std::fs::read_to_string(task_path(&repo, &w)).unwrap(),
+            "TASK"
+        );
     }
 
     /// F3: the decision on the worktree root's owner and mode.

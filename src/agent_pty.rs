@@ -1044,15 +1044,20 @@ pub struct AgentPty {
     /// as the PTY library resolves it ([`effective_launch_dir`]): the spawn's
     /// cwd, or with none (or one that is not a directory) the child's `HOME`.
     /// Not the registry's `cwd` metadata, which keeps only what the caller
-    /// gave. `None` when it could not be resolved, and for a prepared start
-    /// whose directory was moved away from the path it asked for to where
-    /// no path can be found for it ([`Self::launch_dir_moved_from`]).
+    /// gave. For a pathname start, re-checked once the child exists
+    /// ([`confirm_launch_dir`]): a folder replaced or removed before the
+    /// PTY library's own check is not recorded as where the child started.
+    /// `None` when it could not be resolved, and for a start whose directory
+    /// was moved away from its path to where no path can be found for it
+    /// ([`Self::launch_dir_moved_from`]).
     pub launch_dir: Option<String>,
     /// PRD #1790: for a prepared start whose verified directory no longer
     /// sat at the path it asked for when the child entered it, and whose
     /// current path could not be resolved ([`prepared_launch_folder`]), that
-    /// requested path, which names some other directory or nothing. `None`
-    /// otherwise.
+    /// requested path, which names some other directory or nothing; and for
+    /// a pathname start whose resolved folder no longer named the same
+    /// directory after the spawn, when the child's own cwd could not be read
+    /// ([`confirm_launch_dir`]). `None` otherwise.
     pub launch_dir_moved_from: Option<String>,
 }
 
@@ -1142,6 +1147,96 @@ pub(crate) fn effective_launch_dir(cmd: &CommandBuilder) -> Option<String> {
     std::path::absolute(dir?)
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
+}
+
+/// The `(device, inode)` of the directory `path` names (symlinks followed,
+/// as a `chdir` follows them), or `None` when it names no directory. Off
+/// Unix there is no identity to read, so always `None`.
+fn dir_identity(path: &str) -> Option<(u64, u64)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::metadata(path).ok()?;
+        meta.is_dir().then(|| (meta.dev(), meta.ino()))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        None
+    }
+}
+
+/// PRD #1790 (PR #2363 review): the launch record's folder for a pathname
+/// start, settled once its child exists. `resolved` is the folder
+/// [`effective_launch_dir`] resolved before the spawn and `before` that
+/// directory's identity then. `portable-pty` repeats the `is_dir` test
+/// itself inside `spawn_command` and falls back to `HOME` when it fails, so
+/// a folder removed or replaced between the two is not where the child
+/// started.
+///
+/// - The path still names the directory it named before the spawn: that
+///   directory was there throughout, so the child started in it. Recorded.
+/// - Otherwise, on Linux, the child's cwd as `/proc/<pid>/cwd` reports it,
+///   when that link reads as an absolute path naming the same directory the
+///   link itself resolves to (the identity check); this is normally where
+///   the fallback put it. Recorded.
+/// - Otherwise (no child cwd to read, a deleted cwd, off Linux): no folder,
+///   and `resolved` as the folder it was moved or removed from, the same
+///   outcome a prepared start whose directory vanished gets.
+///
+/// Off Unix there is no identity to compare, so the pre-spawn folder is
+/// kept as it is.
+fn confirm_launch_dir(
+    resolved: Option<String>,
+    before: Option<(u64, u64)>,
+    child_pid: Option<u32>,
+) -> (Option<String>, Option<String>) {
+    #[cfg(not(unix))]
+    {
+        let _ = (before, child_pid);
+        (resolved, None)
+    }
+    #[cfg(unix)]
+    {
+        let Some(path) = resolved else {
+            return (None, None);
+        };
+        if before.is_some() && dir_identity(&path) == before {
+            return (Some(path), None);
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(actual) = child_pid.and_then(child_cwd) {
+            return (Some(actual), None);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = child_pid;
+        (None, Some(path))
+    }
+}
+
+/// The current directory of process `pid` as an absolute path, read from
+/// `/proc/<pid>/cwd` and kept only when that path names the very directory
+/// the link resolves to (a deleted directory reads as `"<path> (deleted)"`,
+/// which names nothing or something else).
+#[cfg(target_os = "linux")]
+fn child_cwd(pid: u32) -> Option<String> {
+    use std::os::unix::fs::MetadataExt as _;
+    let link = format!("/proc/{pid}/cwd");
+    let actual = std::fs::metadata(&link).ok()?;
+    let path = std::fs::read_link(&link).ok()?;
+    if !path.is_absolute() {
+        return None;
+    }
+    let path = path.to_str()?.to_string();
+    (dir_identity(&path) == Some((actual.dev(), actual.ino()))).then_some(path)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: run once by the next pathname spawn on this thread, after
+    /// its launch folder was resolved and before `spawn_command`.
+    static BEFORE_SPAWN_COMMAND: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// PRD #92 F8: hardcoded grace window between SIGTERM and the SIGKILL
@@ -1803,7 +1898,9 @@ fn spawn_with_dir(
     // **This narrows the fallback without closing it**: a directory removed
     // between this check and portable-pty's own still lands the child in
     // `$HOME`, because portable-pty 0.8.1 decides the fallback inside
-    // `spawn_command` with no way for a caller to refuse it.
+    // `spawn_command` with no way for a caller to refuse it. The launch
+    // record re-checks the folder once the child exists, so it does not name
+    // a folder the child never started in (`confirm_launch_dir`).
     if verified_dir.is_none()
         && let Some(dir) = opts.cwd
         && !std::path::Path::new(dir).is_dir()
@@ -2076,16 +2173,34 @@ fn spawn_with_dir(
     }
 
     let argv = cmd.get_argv().clone();
+    let pathname_start = prepared_launch.is_none();
     let (launch_dir, launch_dir_moved_from) = match prepared_launch {
         Some(Some(PreparedLaunchFolder::At(path))) => (Some(path), None),
         Some(Some(PreparedLaunchFolder::MovedFrom(path))) => (None, Some(path)),
         Some(None) => (None, None),
         None => (effective_launch_dir(&cmd), None),
     };
+    // PRD #1790 (PR #2363 review): the identity of the folder a pathname
+    // start resolved, re-checked once the child exists
+    // ([`confirm_launch_dir`]).
+    let launch_identity = if pathname_start {
+        launch_dir.as_deref().and_then(dir_identity)
+    } else {
+        None
+    };
+    #[cfg(test)]
+    if let Some(hook) = BEFORE_SPAWN_COMMAND.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
     let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| AgentPtyError::Spawn(e.to_string()))?;
+    let (launch_dir, launch_dir_moved_from) = if pathname_start {
+        confirm_launch_dir(launch_dir, launch_identity, child.process_id())
+    } else {
+        (launch_dir, launch_dir_moved_from)
+    };
 
     // PRD #163 M3: adopt the child into the OS grouping its teardown will use, as
     // early as possible. This is a no-op on Unix (`portable-pty` already `setsid`'d
@@ -24671,6 +24786,108 @@ mod spawn_tests {
         std::fs::rename(dir, &old).expect("move the verified directory away");
         std::fs::create_dir(dir).expect("put a replacement at the verified path");
         (verified, old)
+    }
+
+    /// A pathname spawn of a child that stays up, in `cwd`, with `HOME` set
+    /// to `home`; answers its launch folder and moved-from path once it has
+    /// been killed and reaped.
+    #[cfg(target_os = "linux")]
+    fn launch_folder_of_pathname_spawn(cwd: &str, home: &std::path::Path) -> LaunchFolder {
+        let pty = spawn(SpawnOptions {
+            command: Some("exec sleep 30"),
+            cwd: Some(cwd),
+            env: vec![
+                ("SHELL".into(), "/bin/sh".into()),
+                ("HOME".into(), home.to_string_lossy().into_owned()),
+            ],
+            ..SpawnOptions::default()
+        })
+        .expect("spawn should succeed");
+        let folder = (pty.launch_dir.clone(), pty.launch_dir_moved_from.clone());
+        let mut child = pty.child;
+        let _ = child.kill();
+        let _ = child.wait();
+        folder
+    }
+
+    #[cfg(target_os = "linux")]
+    type LaunchFolder = (Option<String>, Option<String>);
+
+    /// PRD #1790 (PR #2363 review, Qodo): a pathname start's folder removed
+    /// after the deck resolved it and before the PTY library spawned the
+    /// child (which then starts in `HOME`) is not recorded as the launch
+    /// folder: the record names where the child really started, read from
+    /// its `/proc/<pid>/cwd`. Control: an untouched folder is recorded as
+    /// given.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_folder_removed_before_the_spawn_is_not_recorded() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().expect("utf-8 tempdir").to_string();
+
+        let (kept, moved) = launch_folder_of_pathname_spawn(&path, &home);
+        assert_eq!(kept.as_deref(), Some(path.as_str()), "control");
+        assert_eq!(moved, None);
+
+        let removed = dir.clone();
+        BEFORE_SPAWN_COMMAND.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                std::fs::remove_dir(&removed).expect("remove the launch folder");
+            }));
+        });
+        let (recorded, moved) = launch_folder_of_pathname_spawn(&path, &home);
+        assert_ne!(
+            recorded.as_deref(),
+            Some(path.as_str()),
+            "a folder the child never started in was recorded"
+        );
+        let recorded = recorded.expect("the child's own cwd is readable while it runs");
+        assert_eq!(
+            std::fs::canonicalize(&recorded).unwrap(),
+            std::fs::canonicalize(&home).unwrap(),
+            "the child started in HOME, and the record must say so"
+        );
+        assert_eq!(moved, None);
+    }
+
+    /// PRD #1790 (PR #2363 review, Qodo): the post-spawn decision. A path
+    /// still naming the directory it named before the spawn is kept; one
+    /// that does not, with no child cwd to read, is no folder and the path
+    /// it was moved from; with a readable child cwd, that cwd.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_launch_folder_is_confirmed_by_identity_after_the_spawn() {
+        let root = tempfile::tempdir().expect("create tempdir");
+        let dir = root.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.to_str().unwrap().to_string();
+        let before = dir_identity(&path);
+        assert!(before.is_some());
+        assert_eq!(
+            confirm_launch_dir(Some(path.clone()), before, None),
+            (Some(path.clone()), None)
+        );
+        // Replaced by another directory at the same path.
+        std::fs::rename(&dir, root.path().join("old")).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        assert_eq!(
+            confirm_launch_dir(Some(path.clone()), before, None),
+            (None, Some(path.clone()))
+        );
+        // With a process whose cwd can be read (this one), that cwd.
+        let own = std::env::current_dir().unwrap();
+        let (recorded, moved) =
+            confirm_launch_dir(Some(path.clone()), before, Some(std::process::id()));
+        assert_eq!(
+            std::fs::canonicalize(recorded.unwrap()).unwrap(),
+            std::fs::canonicalize(own).unwrap()
+        );
+        assert_eq!(moved, None);
+        assert_eq!(confirm_launch_dir(None, None, None), (None, None));
     }
 
     /// A child that writes `marker` into its working directory and exits.

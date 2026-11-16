@@ -1727,6 +1727,74 @@ impl ContextDir {
         std::fs::rename(self.path.join(from), self.path.join(to))
     }
 
+    /// Give the entry `from` of the held directory the name `to` there,
+    /// refusing (`AlreadyExists`) when `to` exists, so an existing entry is
+    /// never replaced; `from` is gone afterwards on success. On Linux one
+    /// `renameat2(RENAME_NOREPLACE)`; where the filesystem or kernel has no
+    /// such rename (`EINVAL`, `ENOSYS`, `EOPNOTSUPP`), and on other Unix
+    /// systems, `linkat` (which refuses an existing `to` itself) then
+    /// `unlinkat` of `from`. A failure to remove `from` after the link
+    /// succeeded is not an error: the entry is published, and `from` is left
+    /// for the caller's sweep.
+    #[cfg(unix)]
+    fn rename_noreplace(&self, from: &str, to: &str) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let (from_c, to_c) = (single_component(from)?, single_component(to)?);
+        let fd = self.guard.as_raw_fd();
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            // Through `syscall`, not glibc's wrapper, for the reason
+            // `platform::trusted_dir` gives (older glibc on aarch64).
+            // SAFETY: one open directory descriptor, two NUL-terminated
+            // components, and the flag; no link is followed.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    fd,
+                    from_c.as_ptr(),
+                    fd,
+                    to_c.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.raw_os_error(),
+                Some(libc::EINVAL | libc::ENOSYS | libc::EOPNOTSUPP)
+            ) {
+                return Err(error);
+            }
+        }
+        // SAFETY: one open directory descriptor, two NUL-terminated
+        // components; flags 0 follow no symlink.
+        if unsafe { libc::linkat(fd, from_c.as_ptr(), fd, to_c.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let _ = self.unlink(from);
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn rename_noreplace(&self, from: &str, to: &str) -> std::io::Result<()> {
+        std::fs::hard_link(self.path.join(from), self.path.join(to))?;
+        let _ = std::fs::remove_file(self.path.join(from));
+        Ok(())
+    }
+
+    /// Make the held directory's entries durable: `fsync` on its descriptor.
+    #[cfg(unix)]
+    fn sync(&self) -> std::io::Result<()> {
+        self.guard.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
     /// Remove the entry `name` of the held directory. Not a directory: without
     /// `AT_REMOVEDIR`, `unlinkat` refuses one. A symlink is removed, never
     /// followed.
@@ -3012,13 +3080,19 @@ pub struct SweepReport {
 /// So are saved dispatch tasks, `dispatch-task-<work id>.md` (PRD #1790): a
 /// unit may run for longer than the sweep's window, and its task is what a
 /// restore hands back to it ([`crate::dispatch_task`]). They go with the
-/// worktree.
+/// worktree. The temp file a save writes before publishing one,
+/// `.dispatch-task-<work id>.md.tmp`, is not exempt: it is never what a
+/// restore reads, and one is left behind only by a save that died between
+/// its create and its publish, so the age bound is what removes it.
 pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
     if name == CONTEXT_FILE_NAME
         || crate::inbox_spills::is_spill_file_name(name)
         || crate::dispatch_task::is_task_file_name(name)
     {
         return false;
+    }
+    if crate::dispatch_task::is_temp_file_name(name) {
+        return true;
     }
     if let Some(rest) = name.strip_prefix('.') {
         return rest.starts_with(&format!("{CONTEXT_FILE_NAME}.")) && rest.ends_with(".tmp");
@@ -3964,14 +4038,10 @@ impl HeldContextDir {
 
     /// Whether the entry `name` of the held directory is a regular file
     /// (a symlink reported as itself, not followed); `None` when there is
-    /// no such entry.
+    /// no such entry. Off Unix only: on Unix [`Self::entry_stat`] answers
+    /// this along with the owner and mode.
+    #[cfg(not(unix))]
     pub(crate) fn is_regular_file(&self, name: &str) -> std::io::Result<Option<bool>> {
-        #[cfg(unix)]
-        let found = self
-            .dir
-            .stat_of(name)
-            .map(|st| file_type_bits(&st) == libc::S_IFREG);
-        #[cfg(not(unix))]
         let found = std::fs::symlink_metadata(self.dir.path().join(name))
             .map(|meta| meta.file_type().is_file());
         match found {
@@ -3991,6 +4061,51 @@ impl HeldContextDir {
     pub(crate) fn remove(&self, name: &str) -> std::io::Result<()> {
         self.dir.unlink(name)
     }
+
+    /// The owner, group, permission bits and kind of the entry `name` of the
+    /// held directory, a symlink reported as itself (`fstatat` with
+    /// `AT_SYMLINK_NOFOLLOW` relative to the held descriptor); `None` when
+    /// there is no such entry.
+    #[cfg(unix)]
+    pub(crate) fn entry_stat(&self, name: &str) -> std::io::Result<Option<EntryStat>> {
+        match self.dir.stat_of(name) {
+            Ok(st) => Ok(Some(EntryStat {
+                uid: st.st_uid,
+                gid: st.st_gid,
+                #[allow(clippy::unnecessary_cast)]
+                mode: (st.st_mode as u32) & 0o7777,
+                regular: file_type_bits(&st) == libc::S_IFREG,
+            })),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Publish the entry `from` under the name `to`, never replacing an
+    /// existing `to` (`AlreadyExists`), both entries of the held directory
+    /// ([`ContextDir::rename_noreplace`]).
+    pub(crate) fn rename_noreplace(&self, from: &str, to: &str) -> std::io::Result<()> {
+        self.dir.rename_noreplace(from, to)
+    }
+
+    /// `fsync` the held directory, so the entries just created or renamed in
+    /// it survive a crash (a no-op off Unix).
+    pub(crate) fn sync(&self) -> std::io::Result<()> {
+        self.dir.sync()
+    }
+}
+
+/// One entry of a [`HeldContextDir`] as [`HeldContextDir::entry_stat`]
+/// reads it.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EntryStat {
+    pub uid: u32,
+    pub gid: u32,
+    /// Permission bits (`0o7777`).
+    pub mode: u32,
+    /// A regular file (not a symlink, FIFO, directory, ...).
+    pub regular: bool,
 }
 
 /// Whether `existing` already carries a rule for the context directory, in any
