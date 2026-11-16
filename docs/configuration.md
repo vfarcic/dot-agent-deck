@@ -96,7 +96,7 @@ A change applies to agents started after it, in the TUI and the desktop app alik
 | --- | --- | --- | --- |
 | `default_command` | string | `""` | [Command new agents start with](#set-the-command-new-agents-start-with) |
 | `default_dir` | absolute path, or `""` | `""` (unset) | [Directory agent creation starts browsing in](#set-the-directory-new-agents-start-browsing-in) |
-| `auto_config_prompt` | boolean | `true` | Accepted and stored, but it currently changes nothing; see [Generate a config with your agent](#generate-a-config-with-your-agent-tui) |
+| `auto_config_prompt` | boolean | `true` | No effect. It is still accepted, so an existing `config.toml` that sets it keeps working |
 | `bell.enabled` | boolean | `true` | [TUI bell](#turn-the-tuis-terminal-bell-on-or-off) master switch |
 | `bell.on_waiting_for_input` | boolean | `true` | Bell on waiting for input |
 | `bell.on_idle` | boolean | `false` | Bell on idle |
@@ -110,7 +110,6 @@ The file is TOML, and you can edit it by hand:
 ```toml
 default_command = "claude"
 default_dir = "/home/me/projects"
-auto_config_prompt = true
 
 [bell]
 enabled = true
@@ -159,16 +158,17 @@ Errors include: an orchestration with fewer than two roles, not exactly one role
 
 `validate` does not report a key it does not recognise, or a top-level key placed below a table header (see [Top-level keys](#top-level-keys)).
 
-### Generate a config with your agent (TUI)
+### Generate a config with your agent
 
-This is a TUI feature; the desktop app has no equivalent. It asks an agent that is already running in the project to write the file for you.
+Instead of starting from the template, you can ask an agent that is already running in the project to write the file for you, from the TUI or the desktop app.
 
-1. Start an agent in the project and select its card on the dashboard.
-2. Press `g` (or click **Generate**). A dialog titled **Generate .dot-agent-deck.toml** opens.
-3. Choose with the arrow keys and `Enter`: **Yes** sends your agent a prompt asking it to analyse the project, propose an orchestration and write it after your approval ([Quick setup](orchestration.md#quick-setup) describes what the agent does); **No** or `Esc` closes the dialog; **Never** closes it and records the directory in `config-gen-state.json`.
-4. When the agent has written the file, run `dot-agent-deck validate` in the project, then press `Ctrl+n`, pick the directory, and choose the orchestration on the **Mode** row.
+1. Start an agent in the project.
+2. Ask it to generate the config: in the TUI, select its card in command mode and press `g` (or click **Generate** in the footer); in the desktop app, press **Generate config** on the agent's row on the Dashboard or in its pane, or say "generate config with" and its name.
+3. A dialog titled **Generate .dot-agent-deck.toml** opens in both clients. Choose **Yes** to send the agent the request, or **No** (or `Esc`) to close it and send nothing.
+4. The agent's pane comes to the front and the agent proposes a config. Tell it what to change; it writes the file after you approve.
+5. Run `dot-agent-deck validate` in the project, then start an agent there and choose the orchestration under **Mode** in the New agent form of either client.
 
-The dialog opens only when you press `g` or click **Generate**. The dialog's hint `Disable: dot-agent-deck config set auto_config_prompt false` and the **Never** choice currently have no further effect, because nothing opens the dialog on its own. If `g` shows `No active agent to send prompt to.`, the selected card has no running agent pane.
+[Quick setup](orchestration.md#quick-setup) has the screenshots, what the agent is asked to do, and what each message means when it does not work, including `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.`
 
 ## `.dot-agent-deck.toml` reference
 

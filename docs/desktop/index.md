@@ -27,6 +27,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 | Open an agent's live terminal and type into it | Click its row on the Dashboard | [Dashboard → The agent pane](dashboard.md#the-agent-pane) |
 | Start an agent, an orchestration, a dispatcher or a schedule-authoring agent | **New agent** on the Dashboard, or `Ctrl+N` / `⌘N` | [New Agent](new-agent.md) |
 | Read an agent's pull request on GitHub, inside the app | The pull request badge on its row or in its pane | [Dashboard → Pull requests](dashboard.md#pull-requests) |
+| Have an agent write the project's `.dot-agent-deck.toml` | **Generate config** on its row or in its pane | [Dashboard → Generate a config with an agent](dashboard.md#generate-a-config-with-an-agent) |
 | Stop an agent, or every role of an orchestration | The stop control on a row, **Close** on an orchestration | [Dashboard → Closing agents and orchestrations](dashboard.md#closing-agents-and-orchestrations) |
 | Watch a daemon on another machine over ssh | **Settings → Daemons** | [Daemons](daemons.md) |
 | Start a daemon that is not running, on this machine or a remote one | **Start daemon** on its section of the Dashboard | [Daemons → Start a daemon from the app](daemons.md#start-a-daemon-from-the-app) |
@@ -42,7 +43,7 @@ The rail on the left has two entries, **Dashboard** and **Settings**, and the **
 These are TUI-only:
 
 - The [Schedules manager](../scheduled-tasks.md). The desktop app can start a schedule-authoring agent from **New agent**, but cannot list, edit or run schedules. Use the TUI or the `dot-agent-deck schedule` CLI.
-- Generating `.dot-agent-deck.toml` with `g`, filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
+- Filtering agents with `/`, renaming an agent, and [customising keybindings](../keyboard-shortcuts.md).
 - Saving and restoring the workspace, and the quit dialog's **Detach** / **Stop**.
 - Installing the deck on a remote machine (`dot-agent-deck remote add`). Once it is installed, the desktop app can [start a daemon there](daemons.md#start-a-daemon-from-the-app) and [upgrade it](daemons.md#upgrade-a-remote-daemon) to the app's version.
 

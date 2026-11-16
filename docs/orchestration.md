@@ -107,15 +107,36 @@ If a step does not happen, see [When something goes wrong](#when-something-goes-
 
 ## Quick setup
 
-Instead of writing the file yourself, you can have an agent in the TUI propose one. Generating is a TUI feature; the file it writes is used by both clients.
+Instead of writing the file yourself, you can ask an agent that is already running in the project to propose one. The TUI and the desktop app do this the same way, and the file the agent writes is used by both.
 
-![The Generate .dot-agent-deck.toml dialog with Yes / No / Never options](./img/orchestration-generate-dialog.png)
+1. Start an agent on the project directory with **Mode** left on **No mode**: `Ctrl+n` in the TUI, **New agent** in the desktop app ([Desktop app → New agent](desktop/new-agent.md)).
+2. Ask that agent to generate the config:
+   - **TUI:** press `Ctrl+d` to enter command mode, select the agent's card and press `g`, or click **Generate** in the footer.
+   - **Desktop:** press the **Generate config** button on the agent's row on the Dashboard (`Generate config with <name>`), or **Generate config** in the header of the agent's pane. With voice on, say **"generate config with"** and the agent's name on the Dashboard, or **"generate config"** in its pane ([Voice Control → Generating a config](desktop/voice.md#generating-a-config)).
 
-1. Run `dot-agent-deck` and open an agent pane on the project directory (`Ctrl+n`, Mode `No mode`).
-2. Press `Ctrl+d` to enter command mode, select that agent's card, and press `g`.
-3. Choose **Yes**. The deck sends the agent a prompt asking it to analyse the project, pick roles from the [role library](#role-library), find the commands that launch agents in this project (devbox scripts, Makefile targets, bare `claude`, `opencode`, `pi`, `codex` or `devin`), and propose a config. **No** closes the dialog; **Never** stops the deck offering it for that directory.
-4. Review the proposal and tell the agent what to change. It writes `.dot-agent-deck.toml` to the project directory.
-5. Run `dot-agent-deck validate`.
+   A dialog titled **Generate .dot-agent-deck.toml** asks whether to instruct your agent to analyse the project and create one.
+3. Choose **Yes**. **No** (or `Esc`) closes the dialog and sends nothing.
+4. The deck sends the agent a [deck message](#delivery-in-the-tui-and-desktop-app) asking it to analyse the project, pick roles from the [role library](#role-library), find the commands that launch agents in this project (devbox scripts, Makefile targets, bare `claude`, `opencode`, `pi`, `codex` or `devin`), and propose a config. Both clients say `Config request sent to the agent's inbox.` and bring the agent in front of you: the TUI focuses its pane, so what you type next goes to the agent, and the desktop app opens its pane.
+5. Read the proposal in the agent's pane and tell the agent what to change. It writes `.dot-agent-deck.toml` to the project directory only after you approve the proposal.
+6. Run `dot-agent-deck validate`.
+
+**TUI:**
+
+![The TUI's Generate .dot-agent-deck.toml dialog over the dashboard, asking whether to instruct the agent to analyse the project and create a config, with Yes selected and No below it](./img/generate-config-tui.png)
+
+**Desktop:**
+
+![The desktop app's Generate .dot-agent-deck.toml dialog over the agent dashboard, with the same question and No and Yes buttons](./img/generate-config-desktop.png)
+
+The request reaches the agent the way any deck message does, so every supported agent can take it; [Which agents wake for messages](#which-agents-wake-for-messages) says when one needs a prompt from you first. Devin, for example, takes it only when you ask it in its pane to run `dot-agent-deck inbox fetch`. If the agent's card or tile says its message is waiting, do what it says.
+
+If it does not work, the TUI's status line or the desktop app's notice says why; the first two messages read the same in both clients:
+
+| Message | What it means | What to do |
+|---|---|---|
+| `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.` | The daemon running your agents comes from a release without this feature. Nothing was sent. | Upgrade the deck on the daemon's machine and restart the daemon on the new release ([After upgrading](installation.md#after-upgrading); for a daemon the desktop app watches, [Desktop app → Daemons](desktop/daemons.md)). Restarting the daemon stops its agents, so do it when you are ready to. |
+| `Failed to send config prompt: <reason>` | The daemon could not send the request to that agent, for example because the agent exited or the daemon does not know the agent's directory. | Fix what the reason names, or start a new agent on the project directory and try again. |
+| `No active agent to send prompt to.` (TUI) · `That agent has no pane the daemon can send the request to, so nothing was sent.` (desktop) | The agent you chose has no running pane. | Select an agent that is running in the project, or start one. |
 
 ## Configuration reference
 

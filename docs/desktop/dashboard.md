@@ -96,6 +96,8 @@ To watch or talk to one agent:
 4. To copy the agent's output, drag across it with the mouse. Some agents, such as Codex, OpenCode and Claude Code in its fullscreen mode, handle the mouse themselves: they highlight what you drag across and copy it when you release the button, so the text is on your clipboard with nothing more to press. Otherwise the terminal highlights the text, and you copy it with your system's copy key: `⌘C` on macOS, `Ctrl+Shift+C` on Linux, and `Ctrl+C` or `Ctrl+Shift+C` on Windows. On Windows, `Ctrl+C` copies only while text is highlighted and then clears the highlight, so pressing it again interrupts the agent. On macOS and Linux, plain `Ctrl+C` always goes to the agent as an interrupt, even while text is highlighted.
 5. Press **Back to dashboard**, or `Escape` when you are not typing in the terminal, to close the pane. The agent keeps running.
 
+To ask the agent to write the project's `.dot-agent-deck.toml`, press **Generate config** in the pane's header ([Generate a config with an agent](#generate-a-config-with-an-agent)).
+
 To end the agent instead, press the red **Close agent** button with the stop icon in the pane's header. The same `Close <name>?` confirmation as on the Dashboard asks before stopping it. **Cancel** (or `Escape`) leaves the agent and its pane open; confirming stops that agent and returns you to the Dashboard. For an orchestration role, the confirmation warns that this closes just that role: the other roles keep running, leaving the orchestration one role short. To close the whole orchestration, return to the Dashboard and use **Close** on its group header.
 
 With voice on and typing mode off, say **"stop"**, **"stop it"**, **"stop that"** or **"close this agent"** on its own to open that confirmation; you still confirm by hand. In typing mode, "stop" interrupts the agent's turn instead of ending its session. Say "typing off" before asking to close the agent. See [Voice Control](voice.md#interrupt-clear-and-scratch-that). In the TUI, enter command mode (`Ctrl+D`), select the agent's card on the dashboard and press `Ctrl+W`, then choose **Close**. On an orchestration tab, that key asks to close the whole orchestration instead.
@@ -152,6 +154,10 @@ To sign out, use [Settings → GitHub → Sign out of GitHub](settings.md#github
 ### In the TUI
 
 The TUI shows the same pull request on the agent's card, as `#1234` with a glyph for its state and its review on the card's bottom border (see [Session Management → What a TUI card shows](../session-management.md#what-a-tui-card-shows)), and `o` opens the selected card's pull request in your system browser rather than inside the TUI. The desktop app has no `o` key, because it has no keyboard selection of a row: click the badge or say "open the PR for" and the agent's name instead.
+
+## Generate a config with an agent
+
+To have an agent write the project's `.dot-agent-deck.toml` for you, press **Generate config** on its row (the file icon, `Generate config with <name> agent`) or in the header of its pane, or, with voice on, say "generate config with" and the agent's name ("generate config" alone in its pane). The **Generate .dot-agent-deck.toml** dialog asks whether to instruct the agent to analyse the project and create one: **Yes** sends the request, **No** sends nothing. After **Yes** the agent's pane opens and shows `Config request sent to the agent's inbox.`, and the agent proposes a config in its pane and writes it once you approve. When the request cannot be sent, the Dashboard or the pane says why, for example `This daemon is too old to generate a config. Upgrade the daemon to use Generate config.` In the TUI, select the agent's card in command mode and press `g`. [Orchestration → Quick setup](../orchestration.md#quick-setup) has the steps, the screenshots and what each message means.
 
 ## Closing agents and orchestrations
 
