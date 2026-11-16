@@ -324,6 +324,9 @@ describe("a pane with no terminal", () => {
     expect(unreachable.setShownTerminals).toHaveBeenLastCalledWith([]);
     expect(screen.queryByTestId("terminal-planner")).not.toBeInTheDocument();
 
+    // Cleared so the `viewportProps.at(-1)` below can only be a mount made on
+    // the return, not the healthy one from the start of this test.
+    viewportProps.length = 0;
     const answering = harness("connected");
     await act(async () => { rerender(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />); });
 
