@@ -35,6 +35,7 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use crate::agent_pty::{TabMembership, Termination};
+use crate::event::AgentType;
 use crate::work_journal::{
     CloseHow, Destination, EndCause, EndHow, Event, Launch, Refs, WorkId, WorkJournal,
 };
@@ -58,6 +59,31 @@ const MAX_RETIRED_TASKS: usize = 64;
 /// abandoned task that arrives after many newer ones still finds its work.
 /// Bounded: the oldest goes first.
 const MAX_SETTLED_TASKS: usize = 4096;
+
+/// PRD #1790: whether `session`, reported by an agent of type `agent` on
+/// `pane`, names a session the agent could be resumed into. Pi's hooks report
+/// a synthetic `<pane>-session` id that is not Pi's own, so it is not one; an
+/// empty id is not one either. OpenCode's id is taken as reported, though its
+/// plugin reports every later session in a folder under the folder's first id
+/// (the docs say so; a later stage settles which id a resume needs).
+pub fn is_resumable_session(agent: &AgentType, pane: Option<&str>, session: &str) -> bool {
+    if session.is_empty() || *agent == AgentType::Pi {
+        return false;
+    }
+    !pane.is_some_and(|pane| session == format!("{pane}-session"))
+}
+
+/// What [`WorkTracker::launch_recorded`] writes about one launch: the spawn's
+/// own view of it, before any wrapping.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LaunchDetails<'a> {
+    pub command: Option<&'a str>,
+    pub shell: Option<&'a str>,
+    pub agent_type: Option<&'a AgentType>,
+    pub cwd: Option<&'a str>,
+    pub name: Option<&'a str>,
+    pub membership: Option<&'a TabMembership>,
+}
 
 /// How a generation's end reads in the journal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +209,10 @@ struct Book {
     spawning: HashMap<WorkId, usize>,
     /// Dispatched unit id -> its work.
     units: HashMap<String, UnitWork>,
+    /// Live attempt (registry agent id) -> the session id last written for
+    /// it as `attempt_session` (PRD #1790), so an unchanged id is not written
+    /// again. Retired with the attempt.
+    sessions: HashMap<String, String>,
 }
 
 impl Book {
@@ -279,6 +309,7 @@ pub(crate) struct BookSizes {
     pub settled: usize,
     pub units: usize,
     pub spawning: usize,
+    pub sessions: usize,
 }
 
 /// What a spawn minted, so a spawn that publishes nothing can forget it.
@@ -552,6 +583,7 @@ impl WorkTracker {
             settled: book.settled.len(),
             units: book.units.len(),
             spawning: book.spawning.len(),
+            sessions: book.sessions.len(),
         }
     }
 
@@ -646,6 +678,116 @@ impl WorkTracker {
         }
     }
 
+    /// PRD #1790: generation `agent_id`'s hooks report it is in agent session
+    /// `session`. Writes `attempt_session` the first time the attempt's id is
+    /// seen and each time it changes, never for an unchanged one, and nothing
+    /// for an attempt this run is not serving (one not started yet, or
+    /// already ended), for an id the redaction rule refuses, or for an id
+    /// that names no resumable session ([`is_resumable_session`]). Takes only
+    /// the book's leaf mutex and queues the event, so it may be called under
+    /// the state's lock that applied the hook.
+    pub fn session_seen(
+        &self,
+        agent_id: &str,
+        pane: Option<&str>,
+        session: &str,
+        agent: &AgentType,
+    ) {
+        let Some(journal) = self.journal() else {
+            return;
+        };
+        if !is_resumable_session(agent, pane, session) {
+            return;
+        }
+        let Some(attempt) = agent_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|agent| journal.attempt_id(agent))
+        else {
+            return;
+        };
+        let Some(plain) = journal.plain(session) else {
+            return;
+        };
+        let mut book = self.book();
+        let Some(work) = book.attempts.get(agent_id).cloned() else {
+            return;
+        };
+        if book
+            .sessions
+            .get(agent_id)
+            .is_some_and(|last| *last == plain)
+        {
+            return;
+        }
+        book.sessions.insert(agent_id.to_string(), plain.clone());
+        journal.record(Event::AttemptSession {
+            work,
+            attempt,
+            session: plain,
+            agent: agent.clone(),
+        });
+    }
+
+    /// PRD #1790: write how generation `agent_id`, serving `work`, was
+    /// launched to the launch-record store under the journal's state
+    /// directory ([`crate::launch_records`]). File I/O: call it with no lock
+    /// held. Nothing is written with no journal installed, or a disabled one
+    /// (whose retention could never remove the record); a failure is logged.
+    pub fn launch_recorded(&self, work: &WorkId, agent_id: &str, launch: LaunchDetails<'_>) {
+        let Some(journal) = self.journal().filter(|j| j.is_enabled()) else {
+            return;
+        };
+        let (Some(state_dir), Some(attempt)) = (
+            journal.state_dir(),
+            agent_id
+                .parse::<u64>()
+                .ok()
+                .and_then(|agent| journal.attempt_id(agent)),
+        ) else {
+            return;
+        };
+        let (role, orchestration, orchestration_id) = match launch.membership {
+            Some(TabMembership::Orchestration {
+                name,
+                role_name,
+                orchestration_id,
+                ..
+            }) => (
+                (!role_name.is_empty()).then(|| role_name.clone()),
+                Some(name.clone()),
+                orchestration_id.clone(),
+            ),
+            _ => (None, None, None),
+        };
+        let cwd = launch.cwd.map(|cwd| {
+            std::path::absolute(cwd)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| cwd.to_string())
+        });
+        let record = crate::launch_records::LaunchRecord {
+            v: crate::launch_records::SCHEMA_VERSION,
+            work: work.clone(),
+            attempt,
+            command: launch.command.map(str::to_string),
+            shell: launch.shell.map(str::to_string),
+            agent_type: launch.agent_type.cloned(),
+            cwd,
+            name: launch.name.map(str::to_string),
+            role,
+            orchestration,
+            orchestration_id,
+            ts_ms: crate::launch_records::now_ms(),
+        };
+        if let Err(error) = crate::launch_records::write(state_dir, &record) {
+            tracing::warn!(
+                %error,
+                agent_id,
+                "launch records: could not record how an agent was launched"
+            );
+        }
+    }
+
     /// Generation `agent_id` ended.
     pub fn attempt_ended(&self, agent_id: &str, end: AttemptEnd) {
         let Some(journal) = self.journal() else {
@@ -659,6 +801,7 @@ impl WorkTracker {
             return;
         };
         let mut book = self.book();
+        book.sessions.remove(agent_id);
         // A task bound to this generation can no longer be worked by it.
         book.retire_tasks(|_, task| task.worker_agent == agent_id);
         let Some(work) = book.attempts.remove(agent_id) else {
@@ -1182,7 +1325,15 @@ pub fn spawn_compaction(journal: WorkJournal) -> tokio::task::JoinHandle<()> {
             every.tick().await;
             loop {
                 let round = journal.clone();
-                let Ok(report) = tokio::task::spawn_blocking(move || round.compact()).await else {
+                let Ok(report) = tokio::task::spawn_blocking(move || {
+                    let report = round.compact();
+                    if !report.skipped_recovery_pending {
+                        prune_launch_records(&round);
+                    }
+                    report
+                })
+                .await
+                else {
                     break;
                 };
                 if !report.skipped_recovery_pending {
@@ -1200,6 +1351,38 @@ pub fn spawn_compaction(journal: WorkJournal) -> tokio::task::JoinHandle<()> {
             }
         }
     })
+}
+
+/// PRD #1790: remove the launch records whose work `journal` no longer holds
+/// ([`crate::launch_records::prune`]), after a compaction round. Blocking;
+/// never fails: an error is logged.
+pub fn prune_launch_records(journal: &WorkJournal) {
+    let Some(state_dir) = journal.state_dir().filter(|_| journal.is_enabled()) else {
+        return;
+    };
+    let read = match journal.read() {
+        Ok(read) => read,
+        Err(error) => {
+            tracing::warn!(%error, "launch records: the journal could not be read to prune them");
+            return;
+        }
+    };
+    let works: std::collections::HashSet<WorkId> =
+        read.lines.iter().map(|l| l.event.work().clone()).collect();
+    match crate::launch_records::prune(
+        state_dir,
+        &works,
+        // A line of a newer schema may hold a work this build cannot see, so
+        // such a read cannot show a work is gone either.
+        read.stats.truncated || read.stats.newer_version > 0,
+        crate::launch_records::now_ms(),
+    ) {
+        Ok(report) if report.removed > 0 => {
+            tracing::info!(?report, "launch records: pruned");
+        }
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "launch records: could not prune"),
+    }
 }
 
 /// What a committed report was about.

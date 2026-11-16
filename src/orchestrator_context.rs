@@ -3008,8 +3008,16 @@ pub struct SweepReport {
 /// while its message is waiting or its task is running, whatever its age, and
 /// removes it on its own schedule ([`crate::inbox_spills`]). An age sweep here
 /// would delete the full body of a message still queued.
+///
+/// So are saved dispatch tasks, `dispatch-task-<work id>.md` (PRD #1790): a
+/// unit may run for longer than the sweep's window, and its task is what a
+/// restore hands back to it ([`crate::dispatch_task`]). They go with the
+/// worktree.
 pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
-    if name == CONTEXT_FILE_NAME || crate::inbox_spills::is_spill_file_name(name) {
+    if name == CONTEXT_FILE_NAME
+        || crate::inbox_spills::is_spill_file_name(name)
+        || crate::dispatch_task::is_task_file_name(name)
+    {
         return false;
     }
     if let Some(rest) = name.strip_prefix('.') {

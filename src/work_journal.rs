@@ -145,9 +145,10 @@ const MAX_LISTED: usize = 65_536;
 
 const MAINTENANCE_LOCK: &str = "maintenance.lock";
 
-const KNOWN_KINDS: [&str; 6] = [
+const KNOWN_KINDS: [&str; 7] = [
     "opened",
     "attempt_started",
+    "attempt_session",
     "attempt_ended",
     "linked",
     "reported",
@@ -514,6 +515,18 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         role: Option<String>,
     },
+    /// PRD #1790: the agent session an attempt is in, as its hooks reported
+    /// it. Written when the attempt's session id first becomes known and
+    /// again each time it changes (a `/clear`, a new conversation), never for
+    /// an unchanged one, so an attempt's lines read in order give its
+    /// sessions in order and the last is the one to resume. Additive under
+    /// `v:1`: a reader that predates it skips the kind.
+    AttemptSession {
+        work: WorkId,
+        attempt: AttemptId,
+        session: String,
+        agent: crate::event::AgentType,
+    },
     AttemptEnded {
         work: WorkId,
         attempt: AttemptId,
@@ -551,6 +564,7 @@ impl Event {
         match self {
             Event::Opened { work, .. }
             | Event::AttemptStarted { work, .. }
+            | Event::AttemptSession { work, .. }
             | Event::AttemptEnded { work, .. }
             | Event::Linked { work, .. }
             | Event::Reported { work, .. }
@@ -563,6 +577,7 @@ impl Event {
         match self {
             Event::Opened { .. } => "opened",
             Event::AttemptStarted { .. } => "attempt_started",
+            Event::AttemptSession { .. } => "attempt_session",
             Event::AttemptEnded { .. } => "attempt_ended",
             Event::Linked { .. } => "linked",
             Event::Reported { .. } => "reported",
@@ -713,6 +728,7 @@ fn validate(line: &Line, homes: &HomeSpellings) -> Result<(), Refusal> {
                 plain("role", role)?;
             }
         }
+        Event::AttemptSession { session, .. } => plain("session", session)?,
         Event::AttemptEnded {
             how, code, cause, ..
         } => {
@@ -2155,6 +2171,13 @@ impl WorkJournal {
     /// The journal's directory, for messages.
     pub fn dir(&self) -> &Path {
         &self.shared.path
+    }
+
+    /// The state directory the journal lives under (the parent of
+    /// [`Self::dir`]), where the stores that follow its retention keep their
+    /// files ([`crate::launch_records`]).
+    pub fn state_dir(&self) -> Option<&Path> {
+        self.shared.path.parent()
     }
 
     /// `text` as a plain (not a path) string field, or `None` when the

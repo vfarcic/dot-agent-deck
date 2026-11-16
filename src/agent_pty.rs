@@ -15116,6 +15116,19 @@ impl AgentPtyRegistry {
             Some(Arc::clone(&doorbell)),
             Arc::clone(bus.input()),
         );
+        // PRD #1790: what this generation's launch record keeps, captured
+        // before the record below takes the values; written once the
+        // generation is published, with the registry lock released.
+        let launch_record = work.as_ref().map(|_| {
+            (
+                spawn_command.clone(),
+                overlay_value(&captured_env, "SHELL").map(str::to_string),
+                spawn_agent_type.clone(),
+                cwd_stored.clone(),
+                display_name.clone(),
+                tab_membership.clone(),
+            )
+        });
         let agent = RunningAgent {
             child,
             process_group,
@@ -15231,6 +15244,24 @@ impl AgentPtyRegistry {
         // harmless — the monitor will re-check counters anyway.
         self.change_notify.notify_one();
         drop(inner);
+        // PRD #1790: how this attempt was launched, kept across a restart
+        // (file I/O, so after the registry lock is released).
+        if let (Some(work), Some((command, shell, agent_type, cwd, name, membership))) =
+            (&work, &launch_record)
+        {
+            self.work.launch_recorded(
+                work,
+                &id,
+                crate::work_tracking::LaunchDetails {
+                    command: command.as_deref(),
+                    shell: shell.as_deref(),
+                    agent_type: agent_type.as_ref(),
+                    cwd: cwd.as_deref(),
+                    name: name.as_deref(),
+                    membership: membership.as_ref(),
+                },
+            );
+        }
         // PRD #1666 part 3, round 5 test seam: a panic after the record is
         // published and before the spawn returns ((f2')'s seam).
         let _ = self.fault_point(FAULT_SPAWN_AFTER_INSERT);

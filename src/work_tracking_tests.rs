@@ -1492,3 +1492,155 @@ fn a_dispatch_with_no_caller_closes_with_what_it_spawned() {
         (0, 0, 0)
     );
 }
+
+/// The `attempt_session` lines of `work`, in order, as (attempt, session).
+fn sessions_of(read: &[Line], work: &WorkId) -> Vec<(String, String)> {
+    read.iter()
+        .filter_map(|l| match &l.event {
+            Event::AttemptSession {
+                work: w,
+                attempt,
+                session,
+                ..
+            } if w == work => Some((attempt.to_string(), session.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// PRD #1790: an attempt's session id is written when it first appears and
+/// each time it changes, never again while it is unchanged; an attempt that is
+/// not live writes nothing, and the dedupe is retired with the attempt.
+#[test]
+fn a_session_is_written_when_it_appears_and_when_it_changes_only() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let work = tracker
+        .resolve_spawn(None, Some("p"), None, None)
+        .kept()
+        .unwrap();
+    let claude = AgentType::ClaudeCode;
+    // Before its start, the attempt is not this run's to write for.
+    tracker.session_seen("7", Some("p"), "s-early", &claude);
+    tracker.attempt_started(&work, "7", Some("p"), None);
+    for session in ["s-1", "s-1", "s-2", "s-2", "s-1"] {
+        tracker.session_seen("7", Some("p"), session, &claude);
+    }
+    // A path-like id is refused by the redaction rule, not written.
+    tracker.session_seen("7", Some("p"), "/home/someone/x", &claude);
+    assert_eq!(tracker.book_sizes().sessions, 1);
+    tracker.attempt_ended("7", worker_end());
+    assert_eq!(tracker.book_sizes().sessions, 0, "retired with its attempt");
+    // After its end, nothing more is written for it.
+    tracker.session_seen("7", Some("p"), "s-3", &claude);
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        sessions_of(&read, &work),
+        [
+            ("run1/7".to_string(), "s-1".to_string()),
+            ("run1/7".to_string(), "s-2".to_string()),
+            ("run1/7".to_string(), "s-1".to_string()),
+        ]
+    );
+    assert!(read.iter().all(|l| match &l.event {
+        Event::AttemptSession { agent, .. } => *agent == AgentType::ClaudeCode,
+        _ => true,
+    }));
+}
+
+/// PRD #1790: Pi's synthetic `<pane>-session` id is not a session Pi could be
+/// resumed into, so it is never written; an OpenCode id is written as
+/// reported.
+#[test]
+fn a_synthetic_pi_session_is_not_written() {
+    assert!(!is_resumable_session(
+        &AgentType::Pi,
+        Some("p"),
+        "p-session"
+    ));
+    assert!(!is_resumable_session(&AgentType::Pi, Some("p"), "real-id"));
+    assert!(!is_resumable_session(
+        &AgentType::ClaudeCode,
+        Some("p"),
+        "p-session"
+    ));
+    assert!(!is_resumable_session(&AgentType::ClaudeCode, Some("p"), ""));
+    assert!(is_resumable_session(
+        &AgentType::OpenCode,
+        Some("p"),
+        "ses_abc"
+    ));
+    assert!(is_resumable_session(
+        &AgentType::ClaudeCode,
+        None,
+        "p-session"
+    ));
+
+    let state = crate::test_temp::tempdir().unwrap();
+    let tracker = tracker(state.path());
+    let work = tracker
+        .resolve_spawn(None, Some("p"), None, None)
+        .kept()
+        .unwrap();
+    tracker.attempt_started(&work, "3", Some("p"), None);
+    tracker.session_seen("3", Some("p"), "p-session", &AgentType::Pi);
+    tracker.session_seen("3", Some("p"), "ses_abc", &AgentType::OpenCode);
+    let read = lines(&tracker, state.path());
+    assert_eq!(
+        sessions_of(&read, &work),
+        [("run1/3".to_string(), "ses_abc".to_string())]
+    );
+}
+
+/// PRD #1790: a spawn through the registry records how it was launched — the
+/// command as given, the absolute folder, the display name and the
+/// orchestration seat — under the journal's state directory, keyed by the
+/// attempt's journal ids.
+#[tokio::test]
+async fn a_spawn_records_how_it_was_launched() {
+    let state = crate::test_temp::tempdir().unwrap();
+    let cwd = crate::test_temp::tempdir().unwrap();
+    let registry = Arc::new(AgentPtyRegistry::new());
+    registry.work().install(journal(state.path(), "run1"));
+    let membership = TabMembership::Orchestration {
+        name: "tdd".into(),
+        role_index: 1,
+        role_name: "coder".into(),
+        is_start_role: false,
+        orchestration_cwd: None,
+        display_title: None,
+        orchestration_id: Some("orch-7".into()),
+    };
+    let cwd_text = cwd.path().to_string_lossy().into_owned();
+    let agent = registry
+        .spawn_agent(SpawnOptions {
+            command: Some("cat"),
+            cwd: Some(&cwd_text),
+            display_name: Some("Named pane"),
+            env: vec![(DOT_AGENT_DECK_PANE_ID.to_string(), "lr-pane".to_string())],
+            tab_membership: Some(membership),
+            agent_type: Some(AgentType::ClaudeCode),
+            ..SpawnOptions::default()
+        })
+        .expect("spawn");
+    let work = registry
+        .attest_facts(&agent)
+        .and_then(|facts| facts.work)
+        .expect("the work is pinned on the generation");
+    let records = crate::launch_records::read_all(state.path()).unwrap();
+    assert_eq!(records.len(), 1, "{records:?}");
+    let record = &records[0];
+    assert_eq!(record.work, work);
+    assert_eq!(
+        record.attempt,
+        AttemptId::new("run1", agent.parse().unwrap()).unwrap()
+    );
+    assert_eq!(record.command.as_deref(), Some("cat"));
+    assert_eq!(record.cwd.as_deref(), Some(cwd_text.as_str()));
+    assert_eq!(record.name.as_deref(), Some("Named pane"));
+    assert_eq!(record.agent_type, Some(AgentType::ClaudeCode));
+    assert_eq!(record.role.as_deref(), Some("coder"));
+    assert_eq!(record.orchestration.as_deref(), Some("tdd"));
+    assert_eq!(record.orchestration_id.as_deref(), Some("orch-7"));
+    registry.shutdown_all();
+}

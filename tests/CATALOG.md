@@ -540,7 +540,7 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 ##### journal/launch/002 — A dispatch is a child work of its dispatcher's pane work, and its unit's report or silent end is recorded.
 - **Layer:** L2 headless `daemon serve`, lane 1 (`tests/e2e_work_journal.rs`); the real `dot-agent-deck dispatch --single` CLI from a stand-in pane in a one-commit repository.
 - **Agent:** synthetic routing stand-in, as dispatcher and as the unit.
-- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work, with `refs.branch` = `agent/dispatch-<slug>`, a `u-…` `refs.unit_id` and `workspace` = the unit's worktree; the unit agent's `attempt_started` is on the dispatch work and its `DOT_AGENT_DECK_WORK_ID` names it; the unit's `work-done --done` writes `reported` on the dispatch work with that `unit_id`, a `report_id`, `destination=inbox` and `to` = the dispatcher's work; a second unit from the same dispatcher, closed through the daemon before it reports, gets `closed how=unit_ended` and no `reported`; no task or report text reaches the journal.
+- **Asserts:** an `opened launch=dispatch` whose `parent` is the dispatcher pane's work, with `refs.branch` = `agent/dispatch-<slug>`, a `u-…` `refs.unit_id` and `workspace` = the unit's worktree; the unit agent's `attempt_started` is on the dispatch work and its `DOT_AGENT_DECK_WORK_ID` names it; the unit's `work-done --done` writes `reported` on the dispatch work with that `unit_id`, a `report_id`, `destination=inbox` and `to` = the dispatcher's work; a second unit from the same dispatcher, closed through the daemon before it reports, gets `closed how=unit_ended` and no `reported`; no task or report text reaches the journal; `<worktree>/.dot-agent-deck/dispatch-task-<work id>.md` contains the dispatched task and is ignored according to both `git check-ignore` and `git status --porcelain --ignored` in a repository without a tracked ignore rule.
 - **Does not assert:** an orchestration-shaped dispatch (journal/launch/006); a unit that ends by its agent exiting rather than by a close; whether a unit that did report also gets a `closed`.
 - **Platform coverage:** mac+linux.
 
@@ -586,6 +586,13 @@ The daemon's lifecycle record under `<state_dir>/work-journal/` (`docs/develop/w
 - **Agent:** synthetic routing stand-ins: a pane and a `--single` unit dispatched from it.
 - **Asserts:** with a half line (no newline) appended to the dead segment, the new daemon starts and serves; both open attempts get `attempt_ended how=interrupted cause=daemon_gone` in the new run's segment; the dead segment is byte for byte what was left, or folded away into a `compacted-*.jsonl` that carries every complete line of it byte for byte (the torn tail may be dropped).
 - **Does not assert:** compaction's retention rules.
+- **Platform coverage:** mac+linux.
+
+##### journal/restart/003 — Launch details and changed session ids survive a daemon restart.
+- **Layer:** L2 headless `daemon serve` ×2 on one state directory, lane 1 (`tests/e2e_work_journal.rs`).
+- **Agent:** synthetic routing stand-in registered as a Claude Code orchestration role; no real agent or credentials.
+- **Asserts:** after posting session-start hooks for an initial session, a new session after clear and an unchanged repeat, then stopping the first daemon and starting a fresh one, the shared journal reader returns the old attempt and exactly the two session ids in order, tied to its work and agent type; one JSON launch record for that attempt preserves its command, cwd, display name, role, orchestration name and instance, schema version, timestamp and shell field; launch-record directory and JSON files have modes 0700 and 0600 respectively.
+- **Does not assert:** resuming an agent, listing interrupted work, retention expiry, Pi synthetic session exclusion or OpenCode session aliases; SIGKILL recovery is `journal/restart/002`.
 - **Platform coverage:** mac+linux.
 
 #### journal/compat

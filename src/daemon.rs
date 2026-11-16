@@ -2393,7 +2393,37 @@ where
     // delegated worker's `WaitingForInput` — see the method's doc, including
     // why the pane's live agent is read there, under this lock, and not before
     // it like `daemon_owns_pane` above.
+    // PRD #1790: what the work journal's `attempt_session` needs, taken
+    // before the apply consumes the event. Only a report the hook gate
+    // proved, from the agent's own hooks (not one the daemon or the wrapper
+    // authored), and naming the generation that sent it.
+    let session_report =
+        (!unproven && !event.is_daemon_synthetic() && !event.is_wrapper_output_classified())
+            .then(|| {
+                Some((
+                    event.pane_id.clone()?,
+                    event
+                        .agent_id
+                        .clone()
+                        .or_else(|| attested_agent.map(str::to_string))?,
+                    event.session_id.clone(),
+                    event.agent_type.clone(),
+                ))
+            })
+            .flatten();
     state.apply_hook_event_watching_waiting(event, registry, attested_agent);
+    // The session is the attempt's once the apply made it the pane's current
+    // hook session: a report the state refused, or one about a conversation
+    // the pane has moved past, records nothing. The tracker writes it only
+    // when it changed. Under this lock, so sessions reach the journal in the
+    // order the state applied them; the tracker takes only its leaf mutex.
+    if let Some((pane, generation, session, agent_type)) = session_report
+        && state.pane_hook_session_id(&pane).as_deref() == Some(session.as_str())
+    {
+        registry
+            .work()
+            .session_seen(&generation, Some(&pane), &session, &agent_type);
+    }
     // Stamped on the frame that changed the aggregate, and on every shell frame
     // of a pane that reports its own turns — the client's cue that the frame
     // is background work and not a status (an older daemon never stamps one).
