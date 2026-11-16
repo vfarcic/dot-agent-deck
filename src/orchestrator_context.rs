@@ -2748,6 +2748,24 @@ pub(crate) fn is_sweepable_coordination_name(name: &str) -> bool {
     name.ends_with(".md")
 }
 
+/// Remove a left-over [`CONTEXT_FILE_NAME`] from the held directory when the
+/// retention sweep is turned off (Qodo on PR #2355): the sweep is what
+/// removes it otherwise ([`swept_whatever_its_age`]), and turning the age
+/// sweep off keeps the coordination files an operator may want, not a brief
+/// no current deck refreshes. The same envelope as the sweep: one name,
+/// stated without following it, removed only when it is a regular file.
+/// Answers whether it removed one.
+fn remove_retired_fixed_path(dir: &ContextDir) -> bool {
+    #[cfg(unix)]
+    let regular = dir
+        .stat_of(CONTEXT_FILE_NAME)
+        .is_ok_and(|st| file_type_bits(&st) == libc::S_IFREG);
+    #[cfg(not(unix))]
+    let regular = std::fs::symlink_metadata(dir.path().join(CONTEXT_FILE_NAME))
+        .is_ok_and(|m| m.file_type().is_file());
+    regular && dir.unlink(CONTEXT_FILE_NAME).is_ok()
+}
+
 /// Whether the sweep removes `name` without waiting for the retention window
 /// (issue #1395): only the retired [`CONTEXT_FILE_NAME`]. It must still be
 /// [`is_sweepable_coordination_name`] and a regular file, like every removal.
@@ -3496,6 +3514,11 @@ fn tidy_context_dir(project: &ProjectDirGuard, dir: &ContextDir) {
                 "swept coordination files past the retention window"
             );
         }
+    } else if remove_retired_fixed_path(dir) {
+        tracing::info!(
+            dir = %dir.path().display(),
+            "removed a left-over {CONTEXT_FILE_NAME}"
+        );
     }
     match ensure_git_excludes_in(project) {
         Ok(GitExcludeOutcome::Added) => tracing::info!(
@@ -5455,6 +5478,35 @@ mod hygiene_tests {
                 outside.exists(),
                 "…and is never followed to something outside"
             );
+        }
+    }
+
+    /// Qodo on PR #2355: with the retention sweep turned off, a left-over
+    /// fixed-path copy is still removed — and only a regular file at that
+    /// name, never a link or anything else.
+    #[test]
+    fn a_left_over_fixed_path_copy_goes_even_with_the_sweep_off() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CONTEXT_DIR_NAME);
+        std::fs::create_dir(&dir).unwrap();
+        let fixed = dir.join(CONTEXT_FILE_NAME);
+        let handoff = dir.join("prd-99-handoff.md");
+        std::fs::write(&fixed, "stale brief").unwrap();
+        std::fs::write(&handoff, "kept").unwrap();
+        let held = held_context_dir(tmp.path());
+
+        assert!(remove_retired_fixed_path(&held));
+        assert!(!fixed.exists(), "the stale copy is gone");
+        assert!(handoff.is_file(), "nothing else is touched");
+        assert!(!remove_retired_fixed_path(&held), "already gone");
+
+        #[cfg(unix)]
+        {
+            let outside = tmp.path().join("precious.md");
+            std::fs::write(&outside, "must survive").unwrap();
+            std::os::unix::fs::symlink(&outside, &fixed).unwrap();
+            assert!(!remove_retired_fixed_path(&held), "a link is not removed");
+            assert!(std::fs::symlink_metadata(&fixed).is_ok() && outside.is_file());
         }
     }
 

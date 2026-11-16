@@ -359,9 +359,8 @@ fn two_publishes_get_distinct_paths_and_neither_replaces_the_other() {
 /// An older deck left `orchestrator-context.md` holding some earlier launch's
 /// brief. A publish now writes only its own file, so whatever still reads the
 /// fixed name never gets the new brief mixed with — or in place of — that one:
-/// the name is either gone (the publish's retention sweep removes it whatever
-/// its age, unless the operator turned the sweep off) or still exactly the
-/// stale bytes. And the publish leaves no temp file behind.
+/// the name is either gone (the publish's housekeeping removes it whatever
+/// its age) or, should that removal fail, still exactly the stale bytes. And the publish leaves no temp file behind.
 #[test]
 fn a_stale_fixed_path_copy_is_never_refreshed() {
     let (_guard, project) = project();
