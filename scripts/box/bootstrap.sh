@@ -92,7 +92,11 @@
 # (docs/develop/rwx.md). The sandbox's compute is billed to the account the rwx
 # CLI is logged in as, which is why the flag is opt-in. Layer 5 installs the CLI
 # with or without it, and logging it in stays the operator's step; until it is
-# logged in, the helper runs locally and prints a note saying why. It sticks,
+# logged in, the helper runs locally and prints a note saying why. It also adds
+# dev.remote_exec=rwx to OTEL_RESOURCE_ATTRIBUTES, which the deck merges into
+# its agents' telemetry, so a query can tell where an agent's gates ran
+# (docs/develop/telemetry-analysis.md); a box without the flag has no such
+# attribute. It sticks,
 # reaches a running daemon and turns off exactly as --use-vals does, through its
 # own marked block, except that turning it off unsets the variable in the
 # running systemd --user manager only while its value there is still `rwx`.
@@ -152,6 +156,9 @@ RELAY_OPEN='# >>> dad-box RELAY (scripts/box/bootstrap.sh --relay) >>>'
 RELAY_CLOSE='# <<< dad-box RELAY <<<'
 REXEC_OPEN='# >>> dad-box REMOTE_EXEC (scripts/box/bootstrap.sh --remote-exec) >>>'
 REXEC_CLOSE='# <<< dad-box REMOTE_EXEC <<<'
+# shellcheck disable=SC2016  # written literally into ~/.bashrc
+REXEC_LABEL='case ",${OTEL_RESOURCE_ATTRIBUTES:-}," in *,dev.remote_exec=rwx,*) ;; *) export OTEL_RESOURCE_ATTRIBUTES="${OTEL_RESOURCE_ATTRIBUTES:+$OTEL_RESOURCE_ATTRIBUTES,}dev.remote_exec=rwx" ;; esac'
+REXEC_ATTR=dev.remote_exec=rwx
 # --use-vals, --relay and --remote-exec stick while their block is there, so the layers
 # before 4 already act on them (layer 4 checks the markers before it writes).
 RELAY_GIVEN="$RELAY_FLAG"
@@ -422,8 +429,11 @@ export OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT
 $RELAY_CLOSE")
 fi
 if [ "$REMOTE_EXEC_FLAG" = 1 ]; then
+  # The label tags the box's telemetry with where its agents' gates run
+  # (docs/develop/telemetry-analysis.md); added once, so re-sourcing does not repeat it.
   OPTION_BLOCKS+=("$REXEC_OPEN
 export DAD_REMOTE_EXEC=rwx
+$REXEC_LABEL
 $REXEC_CLOSE")
 fi
 if [ ${#OPTION_BLOCKS[@]} -gt 0 ]; then
@@ -463,7 +473,9 @@ PATH=${HOME}/.local/bin:${HOME}/.opencode/bin:${HOME}/.local/share/devbox/global
 EOF
 [ "$USE_VALS_FLAG" = 1 ] && echo 'USE_VALS=true' >> "$HOME/.config/environment.d/999-dad-box.conf"
 [ "$RELAY_FLAG" = 1 ] && echo "OTEL_EXPORTER_OTLP_ENDPOINT=$RELAY_ENDPOINT" >> "$HOME/.config/environment.d/999-dad-box.conf"
-[ "$REMOTE_EXEC_FLAG" = 1 ] && echo 'DAD_REMOTE_EXEC=rwx' >> "$HOME/.config/environment.d/999-dad-box.conf"
+# The label is appended to whatever an earlier environment.d file set, not put in its place.
+# shellcheck disable=SC2016  # written literally, expanded by systemd's environment.d parser
+[ "$REMOTE_EXEC_FLAG" = 1 ] && printf 'DAD_REMOTE_EXEC=rwx\nOTEL_RESOURCE_ATTRIBUTES=${OTEL_RESOURCE_ATTRIBUTES:+${OTEL_RESOURCE_ATTRIBUTES},}%s\n' "$REXEC_ATTR" >> "$HOME/.config/environment.d/999-dad-box.conf"
 # The user manager reads environment.d only when it starts, and linger started
 # it before this file existed: apply the same PATH to the running manager too.
 systemctl --user set-environment "PATH=$HOME/.local/bin:$HOME/.opencode/bin:$HOME/.local/share/devbox/global/default/.devbox/nix/profile/default/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" || echo "  warning: could not update the running systemd --user manager (applies at next login)"
@@ -479,11 +491,30 @@ elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OTEL_EXPORT
   # operator set in the manager some other way.
   systemctl --user unset-environment OTEL_EXPORTER_OTLP_ENDPOINT || true
 fi
+# An unreachable manager reads as no attributes, as the warnings around it do, rather than stopping the run.
+MANAGER_ATTRS="$({ systemctl --user show-environment 2>/dev/null || true; } | sed -n 's/^OTEL_RESOURCE_ATTRIBUTES=//p')"
 if [ "$REMOTE_EXEC_FLAG" = 1 ]; then
   systemctl --user set-environment DAD_REMOTE_EXEC=rwx || echo "  warning: could not set DAD_REMOTE_EXEC in the running systemd --user manager (applies at next login)"
-elif [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DAD_REMOTE_EXEC=//p')" = rwx ]; then
-  # Off: clear only the value this script writes, as for the relay endpoint.
-  systemctl --user unset-environment DAD_REMOTE_EXEC || true
+  case ",$MANAGER_ATTRS," in
+    *",$REXEC_ATTR,"*) ;;
+    *) systemctl --user set-environment "OTEL_RESOURCE_ATTRIBUTES=${MANAGER_ATTRS:+$MANAGER_ATTRS,}$REXEC_ATTR" || echo "  warning: could not set OTEL_RESOURCE_ATTRIBUTES in the running systemd --user manager (applies at next login)" ;;
+  esac
+else
+  if [ "$(systemctl --user show-environment 2>/dev/null | sed -n 's/^DAD_REMOTE_EXEC=//p')" = rwx ]; then
+    # Off: clear only the value this script writes, as for the relay endpoint.
+    systemctl --user unset-environment DAD_REMOTE_EXEC || true
+  fi
+  # Likewise the label: remove only that pair, keeping any others.
+  case ",$MANAGER_ATTRS," in
+    *",$REXEC_ATTR,"*)
+      REST="$(printf '%s' "$MANAGER_ATTRS" | tr ',' '\n' | grep -vxF "$REXEC_ATTR" | paste -sd, - || true)"
+      if [ -n "$REST" ]; then
+        systemctl --user set-environment "OTEL_RESOURCE_ATTRIBUTES=$REST" || true
+      else
+        systemctl --user unset-environment OTEL_RESOURCE_ATTRIBUTES || true
+      fi
+      ;;
+  esac
 fi
 # shellcheck source=/dev/null
 eval "$(awk -v po="$PATH_OPEN" -v pc="$PATH_CLOSE" '$0 == po { on = 1 } on { print } $0 == pc { on = 0 }' "$HOME/.bashrc")"
