@@ -322,6 +322,7 @@ describe("a pane with no terminal", () => {
     expect(within(before).getByTestId("terminal-absent-planner")).toBeVisible();
     expect(before.querySelector(".agent-tile")).toHaveAttribute("data-agent-record", "held");
     expect(unreachable.setShownTerminals).toHaveBeenLastCalledWith([]);
+    expect(screen.queryByTestId("terminal-planner")).not.toBeInTheDocument();
 
     const answering = harness("connected");
     await act(async () => { rerender(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />); });
@@ -554,6 +555,11 @@ describe("a pane whose agent has left the fleet", () => {
    * whole of the finding: before this, `OverviewAgentPane` returned `null` while
    * `DeckShell` stayed in `view.kind === "agent"` and went on declaring the
    * agent shown.
+   *
+   * Its control is the round trip in the describe above, `attaches the
+   * terminal and clears the notice when the pane's own deck answers again`: the
+   * cheap version of this fix — close whenever the agent fails to resolve — is
+   * green here and closes the pane there, where the deck only stopped answering.
    */
   it("closes the view and stops declaring the agent when a daemon that is answering retires it", async () => {
     const answering = harness("connected");
@@ -587,58 +593,6 @@ describe("a pane whose agent has left the fleet", () => {
   });
 
   /**
-   * Scenario: the same open pane, and build-box stops answering — reporting no
-   * agents at all, which is what a daemon with no live link reports. The view is
-   * NOT closed: when build-box answers again the pane is there with its
-   * terminal, having never been navigated away from.
-   *
-   * This is the control that stops the test above passing for the wrong reason.
-   * The cheap version of that fix — close whenever the agent fails to resolve —
-   * is green on it and throws a healthy pane away here, on nothing worse than a
-   * remote deck blinking.
-   *
-   * The reconnect is how the claim is made observable. A view that is merely
-   * rendering nothing and a view that has been closed look identical while the
-   * deck is away; only the return distinguishes them.
-   */
-  it("keeps the view when the pane's deck stops answering, so the pane returns when it answers again", async () => {
-    const answering = harness("connected");
-    const { rerender } = render(<DeckShell runtime={answering.runtime("local")} initialView={paneView} />);
-    await waitFor(() => expect(answering.setShownTerminals).toHaveBeenCalledTimes(1));
-    expect(within(screen.getByTestId("agent-pane-overlay")).getByTestId("terminal-planner")).toBeVisible();
-
-    // A deck with no live link, exactly as the crate reports one: the daemon is
-    // still in the fleet and it lists no agents. The second argument is gone
-    // because it would say nothing — issue #1143 made `disconnected` empty the
-    // list on its own, which is what the crate does and what this test always
-    // claimed to be modelling.
-    const away = harness("disconnected");
-    await act(async () => { rerender(<DeckShell runtime={away.runtime("local")} initialView={paneView} />); });
-
-    // Nothing is declared shown while the daemon cannot be attached over — which
-    // is `paneDeckAttachable` doing its existing job, and is also why a
-    // standing declaration cannot outlive a daemon going away.
-    expect(away.setShownTerminals).toHaveBeenLastCalledWith([]);
-    expect(screen.queryByTestId("terminal-planner")).not.toBeInTheDocument();
-    // The view is kept AND, since #1143, rendered — from the record held for
-    // this pane. The close below is what must not happen; a blank frame was
-    // what used to happen instead.
-    expect(screen.getByTestId("agent-pane-overlay").querySelector(".agent-tile")).toHaveAttribute("data-agent-record", "held");
-
-    viewportProps.length = 0;
-    const returned = harness("connected");
-    await act(async () => { rerender(<DeckShell runtime={returned.runtime("local")} initialView={paneView} />); });
-
-    // The view survived the outage, so the pane is simply back — same agent,
-    // same deck, live terminal, and the declaration naming it again.
-    const pane = screen.getByTestId("agent-pane-overlay");
-    expect(within(pane).getByRole("heading", { name: "Plan / architecture on build-box" })).toBeVisible();
-    expect(within(pane).getByTestId("terminal-planner")).toBeVisible();
-    expect(viewportProps.at(-1)).toMatchObject({ agentId: "planner", deckId: REMOTE_DECK_ID });
-    expect(returned.setShownTerminals).toHaveBeenLastCalledWith([{ deckId: REMOTE_DECK_ID, agentId: "planner" }]);
-  });
-
-  /**
    * Scenario: the same retirement under a DECK-origin pane — build-box is the
    * selected deck, its Planner is open as a promoted tile, and build-box stops
    * listing it. The view closes and the daemon grid is left with no pane over it.
@@ -654,7 +608,8 @@ describe("a pane whose agent has left the fleet", () => {
    */
   it("closes a daemon-origin pane when the daemon under it retires the agent", async () => {
     const deckView = { ...paneView, from: "deck" as const };
-    // build-box selected, for the reason the test above gives.
+    // build-box selected, for the reason `leaves a daemon-origin pane's screen
+    // to explain itself, with its remedy reachable` gives.
     const answering = harness("connected", undefined, BUILD_BOX_ROW);
     const { rerender } = render(<DeckShell runtime={answering.runtime("remote")} initialView={deckView} />);
 
@@ -681,7 +636,7 @@ describe("a pane whose agent has left the fleet", () => {
    * TO"*. Nothing is ever declared shown for that agent, not even on the first
    * commit, and the app lands on the overview.
    *
-   * This is the half of the fix the three tests above cannot see, and the reason
+   * This is the half of the fix the two tests above cannot see, and the reason
    * it is a separate case rather than a tidier condition. The close is an
    * EFFECT, so it runs after the commit is painted — but `useShownTerminals`
    * fires on that same first commit, when the shown key goes from nothing to
