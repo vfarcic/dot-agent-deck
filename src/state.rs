@@ -16062,7 +16062,7 @@ mod tests {
                 NotBesideTheRecordedContext,
             ),
             (
-                "the mirror",
+                "the retired fixed path",
                 "a0",
                 std::path::PathBuf::from("/p/.dot-agent-deck/orchestrator-context.md"),
                 NotBesideTheRecordedContext,

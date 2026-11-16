@@ -17,12 +17,13 @@
 //! 5. stale-path replacement
 //! 6. the resulting permission bits
 //!
-//! Issue #1233 split the publish in two, and the cases follow it. Each publish
-//! now writes its own never-rewritten `orchestrator-context-<32 hex>.md`
-//! (`publish_orchestrator_context`), and the fixed `orchestrator-context.md` is
-//! a best-effort compatibility mirror refreshed afterwards
-//! (`mirror_orchestrator_context`). Cases 2 and 5 are about replacing an
-//! existing entry, which only the mirror does, so they exercise the mirror.
+//! Issue #1233 gave each publish its own never-rewritten
+//! `orchestrator-context-<32 hex>.md` (`publish_orchestrator_context`), and
+//! issue #1395 retired the fixed `orchestrator-context.md` that was refreshed
+//! beside it as a compatibility mirror. Nothing replaces an existing entry any
+//! more, so cases 2 and 5 are now about the fixed-path entry an older deck left:
+//! a link planted there is not followed, and a stale copy is never refreshed
+//! with a new publish's bytes.
 //!
 //! **Fast tier, and deliberately not linked against `tests/common/`.** That
 //! module pulls the whole PTY harness into another binary and duplicates its
@@ -45,7 +46,7 @@ use std::path::{Path, PathBuf};
 
 use dot_agent_deck::orchestrator_context::{
     CONTEXT_DIR_NAME, CONTEXT_FILE_NAME, CONTEXT_FILE_PREFIX, ContextPublishError,
-    MAX_CONTEXT_BYTES, PublishedContext, mirror_orchestrator_context, publish_orchestrator_context,
+    MAX_CONTEXT_BYTES, PublishedContext, publish_orchestrator_context,
 };
 
 // Issue #322 / linkage-check rule 8: the self-contained scratch-dir resolver,
@@ -68,8 +69,9 @@ fn context_dir(project: &Path) -> PathBuf {
     project.join(CONTEXT_DIR_NAME)
 }
 
-/// The compatibility mirror (issue #1233), which is the fixed name.
-fn mirror_file(project: &Path) -> PathBuf {
+/// The fixed name an older deck refreshed as a compatibility mirror (issue
+/// #1233), retired by issue #1395.
+fn fixed_path_file(project: &Path) -> PathBuf {
     context_dir(project).join(CONTEXT_FILE_NAME)
 }
 
@@ -92,11 +94,9 @@ fn published_files(project: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// What every production caller does: publish, then refresh the mirror.
-fn publish_and_mirror(project: &Path, content: &str) -> PublishedContext {
-    let published = publish_orchestrator_context(project, content).expect("publish must succeed");
-    mirror_orchestrator_context(project, content);
-    published
+/// A publish that must succeed.
+fn publish(project: &Path, content: &str) -> PublishedContext {
+    publish_orchestrator_context(project, content).expect("publish must succeed")
 }
 
 fn mode_of(path: &Path) -> u32 {
@@ -107,8 +107,8 @@ fn mode_of(path: &Path) -> u32 {
         & 0o777
 }
 
-/// Everything in `.dot-agent-deck` other than the context files themselves —
-/// the per-publish files and the mirror — i.e. leftover temp files.
+/// Everything in `.dot-agent-deck` other than the per-publish context files (and
+/// the retired fixed name) — i.e. leftover temp files.
 fn residue(project: &Path) -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(context_dir(project)) else {
         return Vec::new();
@@ -151,13 +151,6 @@ fn a_symlinked_context_directory_is_refused_and_nothing_is_written_through_it() 
         "nothing may be written through the link, but {} holds {written:?}",
         elsewhere.display()
     );
-
-    // The mirror refuses the same directory, and says so only in the log.
-    mirror_orchestrator_context(&project, "leaked?");
-    assert!(
-        !elsewhere.join(CONTEXT_FILE_NAME).exists(),
-        "the mirror may not write through the link either"
-    );
 }
 
 /// Create `.dot-agent-deck` the way the publish itself does — **explicitly**
@@ -177,41 +170,43 @@ fn create_context_dir_owner_only(project: &Path) {
         .expect("create .dot-agent-deck owner-only");
 }
 
-/// Case 2. A mirror destination that is a symlink is **replaced**, not
-/// followed.
+/// Case 2. A symlink at the retired fixed path is neither followed nor written
+/// through (issue #1395).
 ///
-/// `rename(2)` acts on the directory entry, so the link is unlinked and a real
-/// file takes its place. `std::fs::write` does the opposite — it opens the link,
-/// follows it, and truncates the target — which is how a coordinator context can
-/// end up overwriting a file the operator never named. The per-publish file has
-/// no existing entry to replace: its open is `create_new` with `O_NOFOLLOW`.
+/// Before #1395 every publish renamed a mirror over that name, which replaced
+/// a link rather than following it. Nothing writes the name now, and the
+/// per-publish file has no existing entry to replace: its open is `create_new`
+/// with `O_NOFOLLOW`. What stays to prove is that a link left there — by an
+/// older deck's directory or by someone with write on it — leads nowhere: the
+/// publish writes nothing through it, and the retention sweep, which removes a
+/// regular file at that name whatever its age, removes no link and follows
+/// none.
 #[test]
-fn a_destination_symlink_is_replaced_rather_than_followed() {
+fn a_symlink_at_the_retired_fixed_path_is_not_followed() {
     let (_guard, project) = project();
     let (_target_guard, target_root) = self::project();
     let target = target_root.join("precious.txt");
     std::fs::write(&target, "do not clobber me").expect("seed the link target");
 
     create_context_dir_owner_only(&project);
-    std::os::unix::fs::symlink(&target, mirror_file(&project)).expect("symlink the destination");
+    std::os::unix::fs::symlink(&target, fixed_path_file(&project)).expect("symlink the fixed path");
 
-    publish_and_mirror(&project, "the new context");
+    let published = publish(&project, "the new context");
 
     assert_eq!(
         std::fs::read_to_string(&target).expect("read the link target"),
         "do not clobber me",
-        "the publish must not have written through the destination symlink"
+        "the publish must not have written through the link"
     );
-    let published = mirror_file(&project);
     assert!(
-        !std::fs::symlink_metadata(&published)
-            .expect("stat the destination")
+        std::fs::symlink_metadata(fixed_path_file(&project))
+            .expect("stat the fixed path")
             .file_type()
             .is_symlink(),
-        "the destination must be a real file after the publish, not still a link"
+        "the link is left as it was, neither replaced nor removed"
     );
     assert_eq!(
-        std::fs::read_to_string(&published).expect("read the published context"),
+        std::fs::read_to_string(&published.path).expect("read the published context"),
         "the new context"
     );
 }
@@ -239,7 +234,7 @@ fn creation_is_owner_only_under_a_permissive_umask_and_a_permissive_parent() {
     // does not inherit it.
     let previous = unsafe { libc::umask(0) };
 
-    let published = publish_and_mirror(&project, "owner only");
+    let published = publish(&project, "owner only");
 
     // SAFETY: same call, restoring what was read above.
     unsafe { libc::umask(previous) };
@@ -253,11 +248,6 @@ fn creation_is_owner_only_under_a_permissive_umask_and_a_permissive_parent() {
         mode_of(&published.path),
         0o600,
         "the context file must be owner-only even with a zero umask and a 0777 parent"
-    );
-    assert_eq!(
-        mode_of(&mirror_file(&project)),
-        0o600,
-        "and so must the mirror"
     );
 }
 
@@ -280,7 +270,7 @@ fn a_failed_publish_leaves_the_previous_context_intact_and_no_residue() {
         return;
     }
     let (_guard, project) = project();
-    let first = publish_and_mirror(&project, "the first context");
+    let first = publish(&project, "the first context");
     assert!(
         residue(&project).is_empty(),
         "a clean publish leaves nothing"
@@ -330,9 +320,9 @@ fn a_failed_publish_leaves_the_previous_context_intact_and_no_residue() {
 #[test]
 fn two_publishes_get_distinct_paths_and_neither_replaces_the_other() {
     let (_guard, project) = project();
-    let a = publish_and_mirror(&project, "context A");
+    let a = publish(&project, "context A");
     let a_inode = inode_of(&a.path);
-    let b = publish_and_mirror(&project, "context B");
+    let b = publish(&project, "context B");
 
     assert_ne!(a.path, b.path, "each publish needs a file of its own");
     for (published, content) in [(&a, "context A"), (&b, "context B")] {
@@ -363,82 +353,33 @@ fn two_publishes_get_distinct_paths_and_neither_replaces_the_other() {
     assert_eq!(on_disk, expected);
 }
 
-/// Issue #1233's compatibility mirror holds the latest publish in the project.
-#[test]
-fn the_fixed_path_mirrors_the_latest_publish() {
-    let (_guard, project) = project();
-    publish_and_mirror(&project, "context A");
-    let b = publish_and_mirror(&project, "context B");
-    assert_eq!(
-        std::fs::read_to_string(mirror_file(&project)).expect("read the mirror"),
-        std::fs::read_to_string(&b.path).expect("read B"),
-        "the mirror is the latest publish's bytes"
-    );
-    assert_eq!(mode_of(&mirror_file(&project)), 0o600);
-}
-
-/// The mirror is best effort: a mirror that cannot be written does not fail
-/// the publish, and leaves the per-publish file intact.
+/// Case 5. A stale fixed-path copy is never refreshed with a new publish's
+/// bytes (issue #1395).
 ///
-/// Forced by putting a directory at the mirror's name, which the rename cannot
-/// replace.
+/// An older deck left `orchestrator-context.md` holding some earlier launch's
+/// brief. A publish now writes only its own file, so whatever still reads the
+/// fixed name never gets the new brief mixed with — or in place of — that one:
+/// the name is either gone (the publish's retention sweep removes it whatever
+/// its age, unless the operator turned the sweep off) or still exactly the
+/// stale bytes. And the publish leaves no temp file behind.
 #[test]
-fn a_failed_mirror_write_does_not_fail_the_publish() {
+fn a_stale_fixed_path_copy_is_never_refreshed() {
     let (_guard, project) = project();
     create_context_dir_owner_only(&project);
-    std::fs::create_dir(mirror_file(&project)).expect("block the mirror with a directory");
+    let stale = "STALE".repeat(4096);
+    std::fs::write(fixed_path_file(&project), &stale).expect("leave a stale copy");
 
-    let published = publish_and_mirror(&project, "the real context");
+    let published = publish(&project, "short");
 
     assert_eq!(
         std::fs::read_to_string(&published.path).expect("read the published context"),
-        "the real context"
+        "short"
     );
-    assert!(
-        mirror_file(&project).is_dir(),
-        "the blocking directory is left alone"
-    );
-    assert!(
-        residue(&project)
-            .iter()
-            .all(|name| name == CONTEXT_FILE_NAME),
-        "a failed mirror write leaves no temp file behind, found {:?}",
-        residue(&project)
-    );
-}
-
-/// Case 5. Refreshing the mirror over an existing one replaces it wholly — no
-/// residue of a longer previous version, and no leftover temp file.
-///
-/// The length asymmetry is the point: a write that appended, or that wrote
-/// without truncating, would leave the tail of the first context readable at the
-/// end of the second. A reader of the mirror gets two briefs and no way to tell
-/// which is current.
-#[test]
-fn republishing_replaces_a_stale_context_wholly() {
-    let (_guard, project) = project();
-    let long = "STALE".repeat(4096);
-    publish_and_mirror(&project, &long);
-    let first_inode = inode_of(&mirror_file(&project));
-
-    publish_and_mirror(&project, "short");
-
-    let published = std::fs::read_to_string(mirror_file(&project)).expect("read the mirror");
-    assert_eq!(
-        published, "short",
-        "the second mirror write must replace the first wholly, not overlay it"
-    );
-    assert_ne!(
-        inode_of(&mirror_file(&project)),
-        first_inode,
-        "a rename publishes a NEW inode over the old entry, which is what makes a concurrent \
-         reader see one whole version or the other rather than a prefix"
-    );
-    assert_eq!(
-        mode_of(&mirror_file(&project)),
-        0o600,
-        "the replacement must be owner-only too — the mode is not inherited from what it replaced"
-    );
+    match std::fs::read_to_string(fixed_path_file(&project)) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(left) => assert_eq!(left, stale, "the stale copy must not be rewritten"),
+        Err(e) => panic!("read the fixed path: {e}"),
+    }
     assert!(
         residue(&project).is_empty(),
         "found {:?}",
@@ -465,7 +406,7 @@ fn inode_of(path: &Path) -> u64 {
 #[test]
 fn a_context_past_the_bound_is_refused_and_the_previous_one_is_untouched() {
     let (_guard, project) = project();
-    let good = publish_and_mirror(&project, "the good context");
+    let good = publish(&project, "the good context");
 
     let oversized = "x".repeat(MAX_CONTEXT_BYTES + 1);
     let err = publish_orchestrator_context(&project, &oversized)
