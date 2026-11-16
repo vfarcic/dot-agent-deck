@@ -37305,6 +37305,7 @@ mod tests {
         /// Whether the daemon actually has a pane to attach (`false` = the
         /// card really is dead).
         hydratable: bool,
+        refuse_focus: bool,
         wired: std::sync::Mutex<bool>,
         hydrate_calls: std::sync::Mutex<usize>,
     }
@@ -37312,12 +37313,30 @@ mod tests {
         fn new(hydratable: bool) -> Self {
             Self {
                 hydratable,
+                refuse_focus: false,
                 wired: std::sync::Mutex::new(false),
                 hydrate_calls: std::sync::Mutex::new(0),
             }
         }
     }
     impl crate::pane::PaneController for UnwiredPC {
+        fn generate_config(
+            &self,
+            _card: &crate::pane::BoundPane,
+        ) -> Result<crate::daemon_client::GatedQuery<String>, crate::pane::PaneError> {
+            Ok(crate::daemon_client::GatedQuery::Answered(
+                "m-config".into(),
+            ))
+        }
+        fn focus_card(&self, card: &crate::pane::BoundPane) -> Result<(), crate::pane::PaneError> {
+            if self.refuse_focus {
+                Err(crate::pane::PaneError::Refused(
+                    "the agent restarted".into(),
+                ))
+            } else {
+                self.focus_pane(&card.pane_id)
+            }
+        }
         fn focus_pane(&self, _id: &str) -> Result<(), crate::pane::PaneError> {
             if *self.wired.lock().unwrap() {
                 Ok(())
@@ -50141,6 +50160,87 @@ mod tests {
                 "an older daemon must receive no locally composed fallback"
             );
             assert!(pc.focused.lock().unwrap().is_empty());
+        }
+    }
+
+    /// Scenario: Confirm Generate config on an agent whose pane is not open here. A pane that can be opened enters typing mode; a refused focus or unavailable pane leaves command mode and the card intact, with the sent notice visible.
+    #[spec("inbox/route/007")]
+    #[test]
+    fn route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card() {
+        for (hydratable, refuse_focus) in [(true, false), (false, false), (true, true)] {
+            for keyboard in [false, true] {
+                let mut controller = UnwiredPC::new(hydratable);
+                controller.refuse_focus = refuse_focus;
+                let pc = Arc::new(controller);
+                let mut snapshot = AppState::default();
+                let incarnation =
+                    crate::daemon_client::Incarnation::from(Some("listed-process".into()));
+                snapshot.learn_stream_incarnation(incarnation.clone());
+                let sid = snapshot.insert_placeholder_session_learned(
+                    "selected-pane".into(),
+                    None,
+                    None,
+                    Some("selected-agent".into()),
+                    incarnation,
+                );
+                let state: SharedState = Arc::new(tokio::sync::RwLock::new(snapshot.clone()));
+                let mut tab_manager = TabManager::new(pc.clone());
+                let mut ui = default_ui();
+                ui.display_names
+                    .insert(sid.clone(), "config-target-agent".into());
+                dispatch_action(
+                    Action::RequestConfigGen,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(ui.mode, UiMode::ConfigGenPrompt);
+                let confirm = if keyboard {
+                    handle_config_gen_prompt_key(
+                        KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+                        &mut ui,
+                    )
+                } else {
+                    Action::ConfigGenConfirm
+                };
+                dispatch_action(
+                    confirm,
+                    &mut ui,
+                    &*pc,
+                    &state,
+                    &mut tab_manager,
+                    &snapshot,
+                    &[],
+                    Some(&sid),
+                    Rect::new(0, 0, 180, 24),
+                );
+                assert_eq!(
+                    ui.mode,
+                    if hydratable && !refuse_focus {
+                        UiMode::PaneInput
+                    } else {
+                        UiMode::Normal
+                    },
+                    "hydratable={hydratable}, refused={refuse_focus}, keyboard={keyboard}"
+                );
+                let rows = glossary_frame_rows(&state.blocking_read(), &mut ui);
+                let status = rows.last().expect("the frame has a status row");
+                assert!(status.contains(crate::config_gen::CONFIG_GEN_SENT_MESSAGE));
+                assert!(status.contains(if hydratable && !refuse_focus {
+                    "TYPING"
+                } else {
+                    "COMMAND"
+                }));
+                assert!(
+                    rows.iter().any(|row| row.contains("config-target-agent")),
+                    "a sent request must keep its card even when focus fails"
+                );
+            }
         }
     }
 

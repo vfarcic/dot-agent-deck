@@ -14406,10 +14406,10 @@ Per Decision 27, documented user-facing behaviors that are deliberately not cata
 - **Platform coverage:** mac+linux.
 
 ##### inbox/route/007 — Confirm config generation in the attached TUI and also request it through the daemon verb; both deliver the exact prompt for the target directory.
-- **Layer:** L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
+- **Layer:** L1 in-process action dispatch and rendered status row; L2 synthetic, lane 1 (real binary, isolated daemon, scripted agent; no credential).
 - **Agent:** none.
-- **Asserts:** confirming Yes in the real TUI and calling the daemon's `generate-config` verb each queue one bound message with a complete body equal to `config_gen_prompt` for the daemon-reported target cwd; after Idle its pane fetches the instructions without typed prompt content.
-- **Test:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane.
+- **Asserts:** confirming Yes in the real TUI opens a socket-started agent's previously unopened pane in typing mode, displays its output, and sends typed approval there; confirming Yes and calling the daemon's `generate-config` verb each queue one bound message with a complete body equal to `config_gen_prompt` for the daemon-reported target cwd; after Idle its pane fetches the instructions without typed prompt content. L1 covers mouse and keyboard confirmation with successful hydration, unavailable hydration and refused bound focus: typing starts after successful focus, and a failed focus keeps the card in command mode with the sent notice visible.
+- **Tests:** `route_007_tui_config_generation_posts_bound_message` in `tests/e2e_inbox_route.rs`; shared binary-only fixture `tests/support/inbox_route.rs` records PTY input and runs the real `inbox fetch` CLI in the recipient pane. `route_007_sent_config_opens_an_unwired_pane_or_keeps_the_card` in `src/ui.rs`.
 - **Does not assert:** real-model compliance or native agent component integration (S6–S9); desktop client seeds.
 - **Platform coverage:** mac+linux.
 

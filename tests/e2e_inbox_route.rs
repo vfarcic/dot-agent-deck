@@ -561,7 +561,7 @@ fn route_006_respawn_failure_posts_daemon_notice() {
     assert!(!String::from_utf8_lossy(&bytes(&worker)).contains(route::TASK));
 }
 
-/// Scenario: Request configuration generation from a live synthetic card through the real TUI and accept the dialog, then ask through the daemon's config-generation verb. Each request queues one bound message whose complete body matches the target cwd's prompt; after Idle the pane fetches the instructions without typed prompt content.
+/// Scenario: Start an agent over the attach socket with no pane open in this TUI, request configuration generation from its card and accept the dialog. Its pane becomes visible in typing mode and receives typed approval; this request and the daemon's config-generation verb each queue the target cwd's prompt, fetched after Idle without typed prompt content.
 #[spec("inbox/route/007")]
 #[test]
 fn route_007_tui_config_generation_posts_bound_message() {
@@ -575,9 +575,17 @@ fn route_007_tui_config_generation_posts_bound_message() {
     status(&deck, &pane, "session_start", "codex");
     deck.wait_for_absence("No active agents");
     status(&deck, &pane, "thinking", "codex");
+    assert!(
+        !deck.snapshot_grid().contains("ROUTE-AGENT-READY"),
+        "precondition: the socket-started agent's pane is not open here"
+    );
     deck.send_keys(b"g");
     deck.wait_for_string("[Yes]");
     deck.send_keys(b"\r");
+    deck.wait_until_grid(
+        "sent config opens the agent's pane in typing mode",
+        |grid| grid.contains("ROUTE-AGENT-READY") && grid.contains("[Command Mode"),
+    );
     let messages = route::count(&deck, &pane, 1);
     let cwd = common::agent_records_on(deck.attach_socket_path())
         .into_iter()
@@ -639,6 +647,10 @@ fn route_007_tui_config_generation_posts_bound_message() {
     assert!(!String::from_utf8_lossy(&bytes(&pane)).contains(".dot-agent-deck.toml"));
     let retained = route::count(&deck, &pane, 2);
     assert_eq!(retained.len(), 2, "one inbox message per confirmed request");
+    deck.send_keys(b"CONFIG-GEN-APPROVAL-7f3a2c\r");
+    deck.wait_until_grid("approval reaches the focused agent", |grid| {
+        grid.contains("SUBMITTED:CONFIG-GEN-APPROVAL-7f3a2c")
+    });
 }
 
 /// Scenario: In separate runs leave a delegate Queued or Fetched past the accelerated undelivered deadline. For the Queued one the orchestrator receives one daemon-labelled inbox notice naming the message, worker, state and doorbell path, without pane text being typed; the Fetched one, which may have reached the worker, raises none. Replace another task's orchestrator before that deadline and require its successor to receive no stale notice while the worker's original task stays fetchable.

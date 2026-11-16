@@ -268,14 +268,21 @@ describe("VOICE_ACTIONS", () => {
       params: [{ name: "agent", kind: "agent_ref", spoken: "first agent", value: "planner", label: "planner" }],
       sentence: "Confirm generating config — nothing has been sent yet.",
     });
-    registryDispatch.mockClear();
-    await speakDashboardCommand(resolveVoice);
-    const dialog = await screen.findByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
-    expect(within(dialog).getByRole("button", { name: "Yes" })).toBeVisible();
-    expect(within(dialog).getByRole("button", { name: "No" })).toBeVisible();
-    expectOneRegistryDispatch("confirmGenerateConfig");
-    expect(deck.runAction).not.toHaveBeenCalled();
-    expect(deck.generateConfig).not.toHaveBeenCalled();
+    const { VOICE_ACTIONS } = await vi.importActual<typeof import("./voiceActions")>("./voiceActions");
+    // Spoken dispatch reads this original registry, rather than the exported
+    // wrapper above that records control clicks.
+    const spokenDispatch = vi.spyOn(VOICE_ACTIONS.confirmGenerateConfig, "run");
+    try {
+      await speakDashboardCommand(resolveVoice);
+      const dialog = await screen.findByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+      expect(within(dialog).getByRole("button", { name: "Yes" })).toBeVisible();
+      expect(within(dialog).getByRole("button", { name: "No" })).toBeVisible();
+      expect(spokenDispatch).toHaveBeenCalledTimes(1);
+      expect(deck.runAction).not.toHaveBeenCalled();
+      expect(deck.generateConfig).not.toHaveBeenCalled();
+    } finally {
+      spokenDispatch.mockRestore();
+    }
   });
 
   /// Scenario: Click Generate config on an agent. It crosses the same voice registry entry once and opens a confirmation without sending work.
@@ -309,7 +316,10 @@ describe("VOICE_ACTIONS", () => {
     expect(deck.generateConfig).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("agent-pane-overlay")).toBeVisible();
     expect(notice).toBeVisible();
-    expect(notice.closest("[inert], [aria-hidden='true']")).toBeNull();
+    await waitFor(() => {
+      expect(screen.queryByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" })).not.toBeInTheDocument();
+      expect(notice.closest("[inert], [aria-hidden='true']")).toBeNull();
+    });
   });
 
   /// Scenario: each clear phrase is heard while a text filter hides every agent except one. The actual voice dispatch restores the full dashboard and removes its active-filter controls.
