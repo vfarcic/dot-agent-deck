@@ -836,6 +836,24 @@ pub struct DashboardStats {
     pub total_tools: u64,
 }
 
+/// PRD #211 (audit, CWE-345): an Antigravity tool call its `PreToolUse`
+/// reported and nothing has ended yet ([`AppState::antigravity_call`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AntigravityCallRecord {
+    /// The generation whose hook reported it.
+    agent_id: Option<String>,
+    /// `agy`'s tool name (`run_command`, `write_file`, …).
+    tool: String,
+    use_id: Option<String>,
+    /// What the call acts on, unaltered
+    /// ([`crate::event::TOOL_SUBJECT_METADATA_KEY`]); `None` for a tool whose
+    /// menu was not measured, or a subject too long to send.
+    subject: Option<String>,
+    /// A permission question bound to it was applied: the prompt is up, and the
+    /// agent's next `working`/`idle` ends it.
+    prompted: bool,
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ActiveTool {
     pub name: String,
@@ -2038,6 +2056,10 @@ pub struct AppState {
     /// a regression can exercise the budget without allocating it. `None`
     /// everywhere outside tests.
     unproven_journal_budget: Option<usize>,
+    /// PRD #211 (audit, CWE-345): per pane, the Antigravity tool call its
+    /// `PreToolUse` started and no `PostToolUse` has ended — what an OSC 7501
+    /// permission prompt on that pane is bound to ([`Self::antigravity_call`]).
+    antigravity_calls: HashMap<String, AntigravityCallRecord>,
     /// Whether the event [`Self::apply_event_unsettled`] last admitted was
     /// admitted as UNPROVEN — read by the daemon's waiting-for-input watch,
     /// which keeps history only for the deck's own agents (audit finding 4).
@@ -13446,6 +13468,7 @@ impl AppState {
         attested_agent: Option<&str>,
     ) -> AppliedEvent {
         self.applied_unproven = false;
+        self.track_antigravity_call(&mut event);
         let pane_id = event.pane_id.clone();
         let doorbell_view_before = pane_id.as_deref().map(|pane| self.doorbell_view(pane));
         self.applied_background = None;
@@ -13478,6 +13501,158 @@ impl AppState {
             self.enforce_unproven_journal_budget();
         }
         applied
+    }
+
+    /// PRD #211 (audit, CWE-345): the Antigravity tool call outstanding on
+    /// `pane_id` from `agent_id`'s own `PreToolUse` — started, not ended by a
+    /// `PostToolUse`, the turn not interrupted since — that a permission prompt
+    /// from that generation may be bound to. `None` when there is none, or it
+    /// came from another generation.
+    pub fn antigravity_call(
+        &self,
+        pane_id: &str,
+        agent_id: &str,
+    ) -> Option<crate::question::AntigravityCall<'_>> {
+        let record = self.antigravity_calls.get(pane_id)?;
+        if record.agent_id.as_deref() != Some(agent_id) {
+            return None;
+        }
+        Some(crate::question::AntigravityCall {
+            tool: &record.tool,
+            use_id: record.use_id.as_deref(),
+            subject: record.subject.as_deref()?,
+        })
+    }
+
+    /// PRD #211 (audit, CWE-345): whether `question`, which `event` — an
+    /// Antigravity OSC 7501 permission prompt — carries, is still bound to its
+    /// pane's outstanding call: the generation that raised the prompt reported
+    /// that call, the question names the call's id, and its prompt is the
+    /// call's own command or path as the signal shows it.
+    fn antigravity_question_bound(
+        &self,
+        event: &AgentEvent,
+        question: &crate::question::PendingQuestion,
+    ) -> bool {
+        let Some(record) = event
+            .pane_id
+            .as_deref()
+            .and_then(|pane| self.antigravity_calls.get(pane))
+        else {
+            return false;
+        };
+        event.agent_id.is_some()
+            && record.agent_id == event.agent_id
+            && question
+                .tool
+                .as_ref()
+                .is_some_and(|tool| tool.use_id == record.use_id)
+            && record
+                .subject
+                .as_deref()
+                .zip(crate::question::antigravity_prompt_lead(&record.tool))
+                .is_some_and(|(subject, lead)| {
+                    question.questions.first().is_some_and(|q| {
+                        q.prompt == crate::status_osc::clean_message(&format!("{lead}{subject}"))
+                    })
+                })
+    }
+
+    /// PRD #211 (audit, CWE-345): drop the question from an Antigravity OSC
+    /// 7501 permission prompt that is no longer bound to its pane's
+    /// outstanding call ([`Self::antigravity_question_bound`]) — a
+    /// `PostToolUse` landed between the daemon building it and this ingest, or
+    /// another call replaced it. Called by the daemon under the state lock
+    /// that applies the event, before the copy clients receive is taken, so no
+    /// client is offered it either. The prompt stays a Needs Input card,
+    /// answered at the keyboard. `true` when it dropped one.
+    pub(crate) fn strip_unbound_antigravity_question(&self, event: &mut AgentEvent) -> bool {
+        if event.agent_type != AgentType::Antigravity
+            || event.event_type != EventType::PermissionRequest
+            || !event.is_status_signal()
+        {
+            return false;
+        }
+        let Some(question) = event.question() else {
+            return false;
+        };
+        if self.antigravity_question_bound(event, &question) {
+            return false;
+        }
+        event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+        true
+    }
+
+    /// PRD #211 (audit, CWE-345): keep [`Self::antigravity_calls`] in step with
+    /// an Antigravity event, and — in the daemon — refuse a permission question
+    /// the daemon built from an OSC 7501 prompt unless, under this same lock,
+    /// it is still bound to the pane's outstanding call: the same generation,
+    /// call id and command or path. A `PostToolUse` that landed between the
+    /// daemon building the question and applying it leaves the prompt a plain
+    /// Needs Input, answered at the keyboard.
+    fn track_antigravity_call(&mut self, event: &mut AgentEvent) {
+        if event.agent_type != AgentType::Antigravity {
+            return;
+        }
+        let Some(pane_id) = event.pane_id.clone() else {
+            return;
+        };
+        let signal = event.is_status_signal();
+        let use_id = || event.metadata.get("tool_use_id").cloned();
+        match event.event_type {
+            EventType::ToolStart if !signal && !event.is_from_subagent() => {
+                let record = AntigravityCallRecord {
+                    agent_id: event.agent_id.clone(),
+                    tool: event.tool_name.clone().unwrap_or_default(),
+                    use_id: use_id(),
+                    subject: event
+                        .metadata
+                        .get(crate::event::TOOL_SUBJECT_METADATA_KEY)
+                        .cloned(),
+                    prompted: false,
+                };
+                self.antigravity_calls.insert(pane_id, record);
+            }
+            EventType::ToolEnd if !signal && !event.is_from_subagent() => {
+                let ended = use_id();
+                if self.antigravity_calls.get(&pane_id).is_some_and(|record| {
+                    record.use_id.is_none() || ended.is_none() || record.use_id == ended
+                }) {
+                    self.antigravity_calls.remove(&pane_id);
+                }
+            }
+            EventType::PermissionRequest if signal => {
+                let Some(question) = event.question() else {
+                    return;
+                };
+                if self.antigravity_question_bound(event, &question) {
+                    if let Some(record) = self.antigravity_calls.get_mut(&pane_id) {
+                        record.prompted = true;
+                    }
+                } else if self.agent_ownership.is_some() {
+                    event.metadata.remove(crate::event::QUESTION_METADATA_KEY);
+                }
+            }
+            // The agent at work again after its prompt: the prompt is over.
+            EventType::Thinking if signal => {
+                if self
+                    .antigravity_calls
+                    .get(&pane_id)
+                    .is_some_and(|record| record.prompted)
+                {
+                    self.antigravity_calls.remove(&pane_id);
+                }
+            }
+            // A turn that ended or was interrupted ends its calls with it:
+            // `agy` reports a denied or cancelled call by no hook at all.
+            EventType::Idle
+            | EventType::Error
+            | EventType::SessionStart
+            | EventType::SessionEnd => {
+                self.antigravity_calls.remove(&pane_id);
+            }
+            _ => {}
+        }
     }
 
     /// The body of [`Self::apply_event_reporting`], before the unproven-session
@@ -26303,5 +26478,144 @@ mod tests {
                 .map(|e| &e.tool_detail),
             "the most recently active card keeps its newest report whole"
         );
+    }
+
+    /// PRD #211 (audit, CWE-345): the hook and signal events an Antigravity
+    /// pane produces, for the call-binding tests below.
+    fn agy_event(event_type: EventType, agent_id: &str) -> AgentEvent {
+        AgentEvent {
+            session_id: "agy-session".to_string(),
+            agent_type: AgentType::Antigravity,
+            event_type,
+            tool_name: None,
+            tool_detail: None,
+            cwd: None,
+            timestamp: Utc::now(),
+            user_prompt: None,
+            metadata: HashMap::new(),
+            pane_id: Some("agy-pane".to_string()),
+            agent_id: Some(agent_id.to_string()),
+            agent_version: None,
+            schema_version: None,
+            live_target: None,
+            background: None,
+            background_revision: None,
+        }
+    }
+
+    fn agy_pre_tool_use(agent_id: &str, command: &str) -> AgentEvent {
+        let mut event = agy_event(EventType::ToolStart, agent_id);
+        event.tool_name = Some("run_command".to_string());
+        event
+            .metadata
+            .insert("tool_use_id".to_string(), "call-1".to_string());
+        event.metadata.insert(
+            crate::event::TOOL_SUBJECT_METADATA_KEY.to_string(),
+            command.to_string(),
+        );
+        event
+    }
+
+    fn agy_signal(event_type: EventType, agent_id: &str) -> AgentEvent {
+        let mut event = agy_event(event_type, agent_id);
+        event.metadata.insert(
+            crate::event::STATUS_SIGNAL_METADATA_KEY.to_string(),
+            crate::event::STATUS_SIGNAL_METADATA_VALUE.to_string(),
+        );
+        event
+    }
+
+    /// A permission signal carrying the question the daemon would build for
+    /// `prompt` from what `state` holds for the pane now, or a forged one bound
+    /// to nothing when it holds no call.
+    fn agy_permission(state: &AppState, agent_id: &str, prompt: &str) -> AgentEvent {
+        let mut event = agy_signal(EventType::PermissionRequest, agent_id);
+        let call = state.antigravity_call("agy-pane", agent_id);
+        let question = crate::question::antigravity_permission(
+            "q-agy-1".into(),
+            prompt,
+            call.as_ref(),
+            1,
+            Some((1, 5, 9)),
+        )
+        .unwrap_or_else(|_| {
+            crate::question::antigravity_permission(
+                "q-agy-1".into(),
+                prompt,
+                Some(&crate::question::AntigravityCall {
+                    tool: "run_command",
+                    use_id: Some("call-1"),
+                    subject: prompt.strip_prefix("Approve Bash: ").unwrap(),
+                }),
+                1,
+                Some((1, 5, 9)),
+            )
+            .unwrap()
+        });
+        event.set_question(&question);
+        event
+    }
+
+    /// PRD #211 (audit, CWE-345): a permission question from an Antigravity
+    /// OSC signal is offered only while the generation's own `PreToolUse` is
+    /// outstanding and names what the prompt names. Without one, after its
+    /// `PostToolUse`, from another generation, or after the agent went back
+    /// to work, the daemon drops the question and the card is a plain Needs
+    /// Input answered at the keyboard.
+    #[test]
+    fn antigravity_permission_is_offered_only_while_its_call_is_outstanding() {
+        let mut state = AppState::default();
+        let _ownership = install_ownership(&mut state, StubOwnership::owning("agy-pane", "agy-1"));
+        state.apply_event(agy_event(EventType::SessionStart, "agy-1"));
+        let pending = |state: &AppState| state.pending_question_for("agy-1", Some("agy-pane"));
+
+        // No PreToolUse: a forged prompt is not answerable.
+        let mut forged = agy_permission(&state, "agy-1", "Approve Bash: echo harmless");
+        assert!(state.strip_unbound_antigravity_question(&mut forged));
+        state.apply_event(forged);
+        assert!(pending(&state).is_none());
+
+        // Its own call outstanding: offered, and bound to that call.
+        state.apply_event(agy_pre_tool_use("agy-1", "rm -f probe.txt"));
+        assert!(state.antigravity_call("agy-pane", "agy-1").is_some());
+        assert!(state.antigravity_call("agy-pane", "agy-2").is_none());
+        let mut bound = agy_permission(&state, "agy-1", "Approve Bash: rm -f probe.txt");
+        assert!(!state.strip_unbound_antigravity_question(&mut bound));
+        state.apply_event(bound);
+        assert_eq!(pending(&state).unwrap().1.id, "q-agy-1");
+
+        // Another command than the call's is not bound.
+        let mut other = agy_permission(&state, "agy-1", "Approve Bash: echo harmless");
+        assert!(state.strip_unbound_antigravity_question(&mut other));
+
+        // Another generation's prompt is not bound to this call.
+        // (`agy-2` holds no call, so this is the same question, forged.)
+        let mut stranger = agy_permission(&state, "agy-2", "Approve Bash: rm -f probe.txt");
+        assert!(state.strip_unbound_antigravity_question(&mut stranger));
+
+        // Answered: `working`, then the call's PostToolUse — a later prompt
+        // naming the same call is not answerable.
+        let call_question = agy_permission(&state, "agy-1", "Approve Bash: rm -f probe.txt");
+        state.apply_event(agy_signal(EventType::Thinking, "agy-1"));
+        assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
+        let mut replayed = call_question.clone();
+        assert!(state.strip_unbound_antigravity_question(&mut replayed));
+
+        // A fresh call ended by its PostToolUse is no longer outstanding.
+        state.apply_event(agy_pre_tool_use("agy-1", "rm -f probe.txt"));
+        let mut post = agy_pre_tool_use("agy-1", "rm -f probe.txt");
+        post.event_type = EventType::ToolEnd;
+        state.apply_event(post);
+        assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
+        let mut after = call_question.clone();
+        assert!(state.strip_unbound_antigravity_question(&mut after));
+        state.apply_event(after);
+        assert!(pending(&state).is_none());
+
+        // An interrupted turn (OSC idle) ends the call too: a denied or
+        // cancelled call reports no PostToolUse.
+        state.apply_event(agy_pre_tool_use("agy-1", "rm -f probe.txt"));
+        state.apply_event(agy_signal(EventType::Idle, "agy-1"));
+        assert!(state.antigravity_call("agy-pane", "agy-1").is_none());
     }
 }

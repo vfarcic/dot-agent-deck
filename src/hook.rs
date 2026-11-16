@@ -222,7 +222,31 @@ fn antigravity_hook_event(input: &str) -> Option<AgentEvent> {
             .metadata
             .insert(crate::event::STATUS_REASON_METADATA_KEY.to_string(), reason);
     }
+    // Audit (CWE-345/451): what the call acts on, unaltered, for the daemon
+    // to bind and authorize a permission prompt from.
+    if tool_events
+        && let Some(subject) = antigravity_tool_subject(tool_call)
+        && subject.len() <= crate::event::TOOL_SUBJECT_MAX_BYTES
+    {
+        event.metadata.insert(
+            crate::event::TOOL_SUBJECT_METADATA_KEY.to_string(),
+            subject.to_string(),
+        );
+    }
     Some(event)
+}
+
+/// PRD #211: what an Antigravity tool call acts on, as its payload gave it:
+/// `run_command`'s `CommandLine`, `write_file`'s `Path`. `None` for any other
+/// tool, whose permission menu was not measured.
+fn antigravity_tool_subject(tool_call: Option<&Value>) -> Option<&str> {
+    let call = tool_call?;
+    let arg = match call.get("name").and_then(Value::as_str)? {
+        "run_command" => "CommandLine",
+        "write_file" => "Path",
+        _ => return None,
+    };
+    call.get("args")?.get(arg)?.as_str()
 }
 
 /// PRD #211: what an Antigravity hook prints. `agy` wants a JSON object from
@@ -270,10 +294,7 @@ fn handle_antigravity_hook() -> ExitCode {
                 }
             }
         }
-        if !answered {
-            print_antigravity_answer(&input);
-        }
-        if !turn_goes_on {
+        let report = |announce: Option<String>| {
             // Issue #318: present this pane's hook capability token.
             let token = crate::hook_provenance::token_from_env();
             if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref()) {
@@ -282,6 +303,19 @@ fn handle_antigravity_hook() -> ExitCode {
                     None => send_to_socket(&json),
                 };
             }
+        };
+        // A `PreToolUse` is reported before `agy` has its answer, so the call
+        // reaches the daemon before the permission prompt `agy` raises for it
+        // once it does (its OSC 7501 signal is bound to that call).
+        let report_first = event.event_type == crate::event::EventType::ToolStart;
+        if report_first && !turn_goes_on {
+            report(announce.take());
+        }
+        if !answered {
+            print_antigravity_answer(&input);
+        }
+        if !report_first && !turn_goes_on {
+            report(announce);
         }
         return ExitCode::SUCCESS;
     }
@@ -463,7 +497,7 @@ pub(crate) fn hook_payload_event(agent: &str, input: &str) -> Option<AgentEvent>
 /// Question payloads do not carry the agent's version. Cache the version of
 /// their PATH-resolved command across hook processes, invalidating it when the
 /// executable changes. This measures PATH, not a running process.
-pub(crate) fn question_agent_version(agent: &AgentType) -> Option<(u64, u64, u64)> {
+fn question_agent_version(agent: &AgentType) -> Option<(u64, u64, u64)> {
     let program = crate::agent_registry::spec(agent).default_command?;
     let line = question_version_line(program)?;
     line.split_whitespace().find_map(|word| {
@@ -4029,6 +4063,39 @@ mod tests {
                 .join(name),
         )
         .unwrap()
+    }
+
+    /// PRD #211 (audit, CWE-345/451): a command or file-write call carries
+    /// what it acts on unaltered, for the daemon to bind the permission prompt
+    /// to; a subject longer than the bound is left out.
+    #[test]
+    fn antigravity_tool_calls_carry_their_original_subject() {
+        let subject = |input: &str| {
+            hook_payload_event("antigravity", input)
+                .unwrap()
+                .metadata
+                .get(crate::event::TOOL_SUBJECT_METADATA_KEY)
+                .cloned()
+        };
+        assert_eq!(
+            subject(&agy("pre-tool-use-run-command.json")).as_deref(),
+            Some("echo agy-probe-1")
+        );
+        assert_eq!(
+            subject(&agy("pre-tool-use-write-file.json")).as_deref(),
+            Some("/home/user/project/probe.txt")
+        );
+        let mut multi: Value = serde_json::from_str(&agy("pre-tool-use-run-command.json")).unwrap();
+        multi["toolCall"]["args"]["CommandLine"] = "echo a\nrm -rf ./b".into();
+        assert_eq!(
+            subject(&multi.to_string()).as_deref(),
+            Some("echo a\nrm -rf ./b")
+        );
+        multi["toolCall"]["args"]["CommandLine"] =
+            "x".repeat(crate::event::TOOL_SUBJECT_MAX_BYTES + 1).into();
+        assert_eq!(subject(&multi.to_string()), None);
+        multi["toolCall"]["name"] = "web_fetch".into();
+        assert_eq!(subject(&multi.to_string()), None);
     }
 
     #[test]

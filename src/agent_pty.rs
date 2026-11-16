@@ -13289,6 +13289,35 @@ impl AgentPtyRegistry {
         }
     }
 
+    /// PRD #211 (audit suggestion): the release of `agent` that generation
+    /// `agent_id` drew in its own output, as its release scanner latched it.
+    /// `None` when the registry holds no such generation.
+    pub fn latched_release(
+        &self,
+        agent_id: &str,
+        agent: &AgentType,
+    ) -> Option<crate::doorbell_activation::LatchedRelease> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id)?.bus)
+        };
+        let release = bus.state.lock().unwrap().release.latched_for(agent);
+        Some(release)
+    }
+
+    /// PRD #211 (audit, CWE-345): the rows generation `agent_id`'s screen
+    /// shows now, read losslessly while its evidence state is Clean
+    /// ([`AgentBus::clean_frame`]). `None` when there is no such generation or
+    /// its screen cannot be read faithfully now.
+    pub fn screen_rows(&self, agent_id: &str) -> Option<Vec<String>> {
+        let bus = {
+            let inner = self.inner.lock();
+            Arc::clone(&inner.agents.get(agent_id)?.bus)
+        };
+        let grid = bus.clean_frame()?;
+        Some((0..grid.rows).map(|row| grid.text_from(row, 0)).collect())
+    }
+
     /// `agent_id`'s release capture ([`AgentBus::release`]).
     pub fn release_capture(
         &self,

@@ -515,6 +515,20 @@ pub const STATUS_SIGNAL_METADATA_KEY: &str = "status_signal";
 /// The one [`STATUS_SIGNAL_METADATA_KEY`] value: the OSC 7501 reader.
 pub const STATUS_SIGNAL_METADATA_VALUE: &str = "osc7501";
 
+/// PRD #211 (audit, CWE-345/451): `AgentEvent.metadata` key carrying what an
+/// Antigravity tool call acts on, exactly as `agy`'s `PreToolUse` gave it —
+/// `run_command`'s `CommandLine` or `write_file`'s `Path` — unaltered, so the
+/// daemon can bind an OSC 7501 permission prompt to the call it is for and
+/// authorize from the original text rather than from the signal's cleaned
+/// display copy ([`crate::question::antigravity_permission`]). Set by the
+/// hook CLI only when it is at most [`TOOL_SUBJECT_MAX_BYTES`]; a longer one
+/// is left out, and its prompt is answered at the keyboard. Additive like
+/// [`SUBAGENT_ID_METADATA_KEY`]: an older daemon ignores it.
+pub const TOOL_SUBJECT_METADATA_KEY: &str = "tool_subject";
+
+/// The longest [`TOOL_SUBJECT_METADATA_KEY`] value the hook CLI sends.
+pub const TOOL_SUBJECT_MAX_BYTES: usize = 4096;
+
 /// `AgentEvent.metadata` key marking the `Thinking` event the DAEMON authors
 /// when a message it reported not delivered ([`DELIVERY_NOTICE_METADATA_KEY`])
 /// was acknowledged after all (PRD #1666 long-turn delivery). It lifts the

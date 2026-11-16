@@ -9110,6 +9110,12 @@ fn validate_task(task: &str) -> Result<(), String> {
 /// every key. Chosen, not measured — the lane-2 Codex test is what pins it.
 const ANSWER_KEY_GAP: Duration = Duration::from_millis(400);
 
+/// PRD #211 (audit, CWE-345): why an Antigravity answer was not typed — the
+/// pane's screen does not show the menu the question offers. Both clients show
+/// it with the refusal.
+pub const ANTIGRAVITY_MENU_NOT_SHOWN: &str =
+    "the agent's screen does not show this menu, so nothing was sent; answer it in the terminal";
+
 /// PRD #1631: [`AttachRequest::AnswerQuestion`]'s handler, for a client that
 /// read `agent_id`'s pending question just now — [`answer_question_at`] naming
 /// the revision pending at the call (`None` when nothing is pending).
@@ -9452,6 +9458,22 @@ pub(crate) async fn answer_question_tokened_at(
             if typed_since(None) {
                 return Err(AnswerRefusal::KeyboardStarted);
             }
+            // PRD #211 (audit, CWE-345): Antigravity's prompt is known from its
+            // terminal signal, which anything writing to the pane can forge, so
+            // its digits are typed only while the pane's screen shows the menu
+            // they answer — checked here, and again under the writer lock just
+            // before the key goes in.
+            let menu_shown = || {
+                agent_type != crate::event::AgentType::Antigravity
+                    || registry.screen_rows(agent_id).is_some_and(|rows| {
+                        crate::question::antigravity_menu_shown(&question, rows)
+                    })
+            };
+            if !menu_shown() {
+                return Err(AnswerRefusal::WriteFailed {
+                    detail: ANTIGRAVITY_MENU_NOT_SHOWN.to_string(),
+                });
+            }
             for (typed, key) in keys.iter().enumerate() {
                 if typed > 0 {
                     tokio::time::sleep(ANSWER_KEY_GAP).await;
@@ -9459,6 +9481,7 @@ pub(crate) async fn answer_question_tokened_at(
                 let baseline = committed;
                 let still_ours = || async {
                     !typed_since(baseline)
+                        && menu_shown()
                         && state
                             .read()
                             .await

@@ -2384,6 +2384,14 @@ where
             "question: a question from a session the pane has moved past is not applied"
         );
     }
+    // PRD #211 (audit, CWE-345): an Antigravity permission question that is no
+    // longer bound to the call its agent's hook reported is not offered.
+    if state.strip_unbound_antigravity_question(&mut event) {
+        debug!(
+            pane_id = ?question_pane.as_deref().map(escape_id_for_log),
+            "question: an Antigravity prompt no longer bound to its tool call is answered by keyboard"
+        );
+    }
     // PRD #1631 (audit A4): the question's revision is the daemon's, stamped
     // here under the state lock that applies it, before the fan-out — so every
     // client's copy and the snapshot carry the same one.
@@ -3506,18 +3514,136 @@ async fn run_codex_rollout_monitor(
     }
 }
 
+/// PRD #211 (audit, CWE-400/770): the most OSC 7501 signals one generation
+/// may have waiting for [`run_status_osc_monitor`]. A pane writing them faster
+/// than the daemon applies them keeps only its latest ones: each signal states
+/// the agent's whole status, so the latest wins, and the signals kept are in
+/// the order they were written — a trailing permission prompt or sign-in
+/// signal, which the card has to see, is among them.
+pub(crate) const MAX_PENDING_STATUS_SIGNALS: usize = 16;
+
+/// PRD #211 (audit, CWE-400/770): the most generations with signals waiting.
+/// Reached only by a burst across that many live panes; past it the
+/// generation that has waited longest loses what it had waiting.
+pub(crate) const MAX_PENDING_STATUS_GENERATIONS: usize = 1024;
+
+/// PRD #211 (audit, CWE-400/770): the OSC 7501 signals waiting for
+/// [`run_status_osc_monitor`], coalesced per generation and bounded by
+/// [`MAX_PENDING_STATUS_SIGNALS`] and [`MAX_PENDING_STATUS_GENERATIONS`], so a
+/// pane flooding its terminal with valid signals cannot grow the daemon's
+/// memory or starve the other panes. Pushing never blocks the reader thread
+/// beyond one short mutex hold.
+#[derive(Default)]
+pub(crate) struct StatusSignalQueue {
+    pending: std::sync::Mutex<PendingStatus>,
+    ready: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct PendingStatus {
+    /// Each generation's waiting signals, with when it first had any waiting.
+    by_generation:
+        std::collections::HashMap<(String, String), (u64, crate::agent_pty::StatusSignals)>,
+    next: u64,
+    /// Signals dropped to the bounds since the last report of it.
+    dropped: u64,
+}
+
+impl StatusSignalQueue {
+    /// Queue `signals`, coalesced into what the same generation already has
+    /// waiting.
+    pub(crate) fn push(&self, signals: crate::agent_pty::StatusSignals) {
+        {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let key = (signals.pane_id.clone(), signals.agent_id.clone());
+            let at = pending.next;
+            let mut dropped = 0;
+            if !pending.by_generation.contains_key(&key)
+                && pending.by_generation.len() >= MAX_PENDING_STATUS_GENERATIONS
+                && let Some(oldest) = pending
+                    .by_generation
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(key, _)| key.clone())
+            {
+                dropped += pending
+                    .by_generation
+                    .remove(&oldest)
+                    .map_or(0, |(_, waiting)| waiting.signals.len() as u64);
+            }
+            let (_, waiting) = pending.by_generation.entry(key).or_insert_with(|| {
+                (
+                    at,
+                    crate::agent_pty::StatusSignals {
+                        pane_id: signals.pane_id.clone(),
+                        agent_id: signals.agent_id.clone(),
+                        agent_type: signals.agent_type.clone(),
+                        signals: Vec::new(),
+                        seen_at: signals.seen_at,
+                    },
+                )
+            });
+            waiting.signals.extend(signals.signals);
+            waiting.seen_at = signals.seen_at;
+            waiting.agent_type = signals.agent_type;
+            let excess = waiting
+                .signals
+                .len()
+                .saturating_sub(MAX_PENDING_STATUS_SIGNALS);
+            if excess > 0 {
+                waiting.signals.drain(..excess);
+                dropped += excess as u64;
+            }
+            pending.next += 1;
+            pending.dropped += dropped;
+        }
+        self.ready.notify_one();
+    }
+
+    /// Everything waiting, each generation's signals in the order they were
+    /// written and the generations in the order they first had any waiting,
+    /// with how many signals the bounds dropped since the last take.
+    pub(crate) fn take(&self) -> (Vec<crate::agent_pty::StatusSignals>, u64) {
+        let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+        let mut batches: Vec<(u64, crate::agent_pty::StatusSignals)> = pending
+            .by_generation
+            .drain()
+            .map(|(_, batch)| batch)
+            .collect();
+        batches.sort_by_key(|(at, _)| *at);
+        let dropped = std::mem::take(&mut pending.dropped);
+        (
+            batches.into_iter().map(|(_, batch)| batch).collect(),
+            dropped,
+        )
+    }
+
+    /// How many signals are waiting.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        let pending = self.pending.lock().unwrap();
+        pending
+            .by_generation
+            .values()
+            .map(|(_, batch)| batch.signals.len())
+            .sum()
+    }
+
+    /// Wait until something has been pushed since the last wait returned.
+    async fn ready(&self) {
+        self.ready.notified().await;
+    }
+}
+
 /// PRD #211: route every pane's OSC 7501 status ([`crate::status_osc`]) from
-/// its reader thread to [`run_status_osc_monitor`]. The send never blocks the
-/// reader, and the channel keeps each pane's signals in the order they were
-/// read.
-fn install_status_signal_sink(
-    registry: &Arc<AgentPtyRegistry>,
-) -> tokio::sync::mpsc::UnboundedReceiver<crate::agent_pty::StatusSignals> {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-    registry.set_status_signal_sink(Arc::new(move |signals| {
-        let _ = tx.send(signals);
-    }));
-    rx
+/// its reader thread to [`run_status_osc_monitor`] through a bounded,
+/// coalescing [`StatusSignalQueue`]. The push never blocks the reader, and each
+/// generation's signals stay in the order they were read.
+fn install_status_signal_sink(registry: &Arc<AgentPtyRegistry>) -> Arc<StatusSignalQueue> {
+    let queue = Arc::new(StatusSignalQueue::default());
+    let sink = Arc::clone(&queue);
+    registry.set_status_signal_sink(Arc::new(move |signals| sink.push(signals)));
+    queue
 }
 
 /// PRD #211: apply the status agents write to their terminals as OSC 7501
@@ -3531,12 +3657,16 @@ fn install_status_signal_sink(
 /// a held signal is shown, every signal already queued is taken in first, so a
 /// busy monitor never shows one whose `idle` was already waiting.
 ///
+/// Each iteration takes what the [`StatusSignalQueue`] holds, which its bounds
+/// cap, and skips the signals of a generation that no longer holds its pane,
+/// dropping any it held back (audit, CWE-400/770).
+///
 /// No internal shutdown signal: aborted in `run_daemon_with`'s cleanup.
 async fn run_status_osc_monitor(
     registry: Arc<AgentPtyRegistry>,
     state: SharedState,
     event_tx: broadcast::Sender<BroadcastMsg>,
-    mut signals: tokio::sync::mpsc::UnboundedReceiver<crate::agent_pty::StatusSignals>,
+    signals: Arc<StatusSignalQueue>,
 ) {
     use crate::status_osc::AuthSettle;
     // Only the panes holding a sign-in signal back have an entry.
@@ -3544,32 +3674,36 @@ async fn run_status_osc_monitor(
         (String, String),
         (crate::event::AgentType, AuthSettle),
     > = std::collections::HashMap::new();
+    let current = |(pane_id, agent_id): &(String, String)| {
+        registry.pane_current_agent_id(pane_id).as_deref() == Some(agent_id.as_str())
+    };
     loop {
         let due = held
             .values()
             .filter_map(|(_, settle)| settle.due_at())
             .min();
-        let mut batches = Vec::new();
         match due {
             Some(at) => {
                 tokio::select! {
-                    batch = signals.recv() => match batch {
-                        Some(batch) => batches.push(batch),
-                        None => return,
-                    },
+                    () = signals.ready() => {}
                     () = tokio::time::sleep_until(tokio::time::Instant::from_std(at)) => {}
                 }
             }
-            None => match signals.recv().await {
-                Some(batch) => batches.push(batch),
-                None => return,
-            },
+            None => signals.ready().await,
         }
-        while let Ok(batch) = signals.try_recv() {
-            batches.push(batch);
+        let (batches, dropped) = signals.take();
+        if dropped > 0 {
+            tracing::warn!(
+                dropped,
+                "status osc: signals arrived faster than they were applied; kept each pane's latest"
+            );
         }
+        held.retain(|key, _| current(key));
         for batch in batches {
             let key = (batch.pane_id.clone(), batch.agent_id.clone());
+            if !current(&key) {
+                continue;
+            }
             let mut settle = held
                 .remove(&key)
                 .map(|(_, settle)| settle)
@@ -3604,6 +3738,23 @@ async fn run_status_osc_monitor(
                 report_status_update(&state, &event_tx, &registry, &key, &agent_type, update).await;
             }
         }
+    }
+}
+
+/// PRD #211 (audit suggestion): the release of `agent_type` that generation
+/// `agent_id` drew in its own start-up header, as `(major, minor, patch)`.
+/// `None` when it drew none the release scanner read, or two different ones:
+/// the agent on the daemon's PATH is not evidence of what runs in the pane.
+fn pane_agent_release(
+    registry: &AgentPtyRegistry,
+    agent_id: &str,
+    agent_type: &crate::event::AgentType,
+) -> Option<(u64, u64, u64)> {
+    match registry.latched_release(agent_id, agent_type)? {
+        crate::doorbell_activation::LatchedRelease::Known(version) => {
+            Some((version.major, version.minor, version.patch))
+        }
+        _ => None,
     }
 }
 
@@ -3659,21 +3810,31 @@ async fn report_status_update(
     };
     let question = match (permission, agent_type, reason.as_deref()) {
         (true, crate::event::AgentType::Antigravity, Some(prompt)) => {
-            // The version of the `agy` on the daemon's PATH, cached across
-            // prompts like the hook's probe for Codex and Devin: a version
-            // the tables do not cover lists the menu keyboard-only.
-            let version = tokio::task::spawn_blocking(|| {
-                crate::hook::question_agent_version(&crate::event::AgentType::Antigravity)
-            })
-            .await
-            .ok()
-            .flatten();
-            crate::question::antigravity_permission(
+            // Audit (CWE-345/451): the signal says only that a prompt is up.
+            // What it approves, and the menu, come from the call this
+            // generation's own `PreToolUse` reported; the digits are those of
+            // the release this pane's `agy` drew in its header.
+            let version = pane_agent_release(registry, agent_id, agent_type);
+            let state = state.read().await;
+            let call = state.antigravity_call(pane_id, agent_id);
+            match crate::question::antigravity_permission(
                 pending_id.unwrap_or_else(crate::question::mint_question_id),
                 prompt,
+                call.as_ref(),
                 chrono::Utc::now().timestamp_millis(),
                 version,
-            )
+            ) {
+                Ok(question) => Some(question),
+                Err(why) => {
+                    tracing::info!(
+                        pane_id = %escape_id_for_log(pane_id),
+                        agent_id = %escape_id_for_log(agent_id),
+                        reason = %why,
+                        "status osc: permission prompt is answered by keyboard"
+                    );
+                    None
+                }
+            }
         }
         _ => None,
     };
@@ -22066,3 +22227,86 @@ mod held_confirmation_deadline_tests;
 #[cfg(all(test, unix))]
 #[path = "daemon_hook_event_order_tests.rs"]
 mod hook_event_order_tests;
+
+/// PRD #211 (audit, CWE-400/770): the OSC 7501 status queue's bounds.
+#[cfg(test)]
+mod status_signal_queue_tests {
+    use super::{MAX_PENDING_STATUS_GENERATIONS, MAX_PENDING_STATUS_SIGNALS, StatusSignalQueue};
+    use crate::agent_pty::StatusSignals;
+    use crate::event::AgentType;
+    use crate::status_osc::{OscSignal, OscState};
+    use std::time::Instant;
+
+    fn signal(state: OscState, kind: Option<&str>) -> OscSignal {
+        OscSignal {
+            state,
+            kind: kind.map(str::to_string),
+            app: Some("antigravity".to_string()),
+            msg: None,
+        }
+    }
+
+    fn batch(pane: &str, signals: Vec<OscSignal>) -> StatusSignals {
+        StatusSignals {
+            pane_id: pane.to_string(),
+            agent_id: format!("{pane}-agent"),
+            agent_type: AgentType::Antigravity,
+            signals,
+            seen_at: Instant::now(),
+        }
+    }
+
+    /// A pane flooding valid short signals keeps the queue at its bound, keeps
+    /// its latest signals in order — a trailing permission prompt survives —
+    /// and leaves another pane's signal waiting to be applied.
+    #[test]
+    fn a_flood_stays_bounded_and_another_pane_is_still_served() {
+        let queue = StatusSignalQueue::default();
+        queue.push(batch("quiet", vec![signal(OscState::Idle, None)]));
+        for _ in 0..100_000 {
+            queue.push(batch(
+                "loud",
+                vec![
+                    signal(OscState::Working, None),
+                    signal(OscState::Idle, None),
+                ],
+            ));
+            assert!(queue.len() <= MAX_PENDING_STATUS_SIGNALS + 1);
+        }
+        queue.push(batch(
+            "loud",
+            vec![signal(OscState::Blocked, Some("permission"))],
+        ));
+        let (batches, dropped) = queue.take();
+        assert!(dropped >= 200_000 - MAX_PENDING_STATUS_SIGNALS as u64);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            batches[0].pane_id, "quiet",
+            "the first to wait is served first"
+        );
+        assert_eq!(batches[0].signals, vec![signal(OscState::Idle, None)]);
+        assert_eq!(batches[1].signals.len(), MAX_PENDING_STATUS_SIGNALS);
+        assert_eq!(
+            batches[1].signals.last(),
+            Some(&signal(OscState::Blocked, Some("permission")))
+        );
+        assert_eq!(queue.len(), 0);
+    }
+
+    /// Past the generation bound, the one that has waited longest loses what
+    /// it had waiting; the count never grows past it.
+    #[test]
+    fn the_generations_waiting_are_bounded() {
+        let queue = StatusSignalQueue::default();
+        for pane in 0..MAX_PENDING_STATUS_GENERATIONS + 10 {
+            queue.push(batch(
+                &format!("p{pane}"),
+                vec![signal(OscState::Idle, None)],
+            ));
+        }
+        let (batches, dropped) = queue.take();
+        assert_eq!(batches.len(), MAX_PENDING_STATUS_GENERATIONS);
+        assert_eq!(dropped, 10);
+        assert_eq!(batches[0].pane_id, "p10");
+    }
+}
