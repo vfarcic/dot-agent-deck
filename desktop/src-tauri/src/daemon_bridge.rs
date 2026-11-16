@@ -7329,7 +7329,7 @@ mod tests {
                         .iter()
                         .map(|agent| agent.id.as_str())
                         .collect::<Vec<_>>(),
-                    vec!["claude", "opencode", "pi", "codex", "devin"],
+                    vec!["claude", "opencode", "pi", "codex", "devin", "agy"],
                     "the deck's own registry, in order"
                 );
                 assert!(!authoring_kinds.is_empty());
@@ -7427,7 +7427,7 @@ mod tests {
                         .iter()
                         .map(|agent| agent.id.as_str())
                         .collect::<Vec<_>>(),
-                    vec!["claude", "opencode", "pi", "codex", "devin"],
+                    vec!["claude", "opencode", "pi", "codex", "devin", "agy"],
                     "this app's compiled registry is the fallback"
                 );
                 assert_eq!(

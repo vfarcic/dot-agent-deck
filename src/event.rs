@@ -85,6 +85,13 @@ pub enum AgentType {
     /// resolved from the `devin` binary basename through the registry
     /// ([`crate::agent_registry`]).
     Devin,
+    /// Google's Antigravity CLI (`agy`, PRD #211) — a `NativeHooks` agent
+    /// like Devin. Serializes to `"antigravity"` (snake_case); resolved from
+    /// the `agy` binary basename through the registry
+    /// ([`crate::agent_registry`]). A reader older than this variant decodes
+    /// `"antigravity"` to [`AgentType::None`] through the `#[serde(other)]`
+    /// catch-all below.
+    Antigravity,
     /// "No recognized agent type." Produced by [`AgentType::from_command`] for
     /// any unrecognized binary, mapped to `Option::None` by
     /// [`crate::state::SessionState::live_snapshot`], and rendered as the "No
@@ -5083,6 +5090,58 @@ mod tests {
             serde_json::from_str::<AgentType>("\"claude_code\"").unwrap(),
             AgentType::ClaudeCode
         );
+    }
+
+    // PRD #211: `Antigravity` is a new wire value. It round-trips through its
+    // own `"antigravity"` name, and a reader built before it existed decodes
+    // it to that reader's neutral `None` instead of failing the whole event.
+    #[test]
+    fn antigravity_agent_type_round_trips_and_an_older_reader_decodes_it_to_none() {
+        assert_eq!(
+            serde_json::to_string(&AgentType::Antigravity).unwrap(),
+            "\"antigravity\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentType>("\"antigravity\"").unwrap(),
+            AgentType::Antigravity
+        );
+        assert_eq!(
+            AgentType::from_command(Some("/usr/local/bin/agy --flag")),
+            Some(AgentType::Antigravity)
+        );
+
+        // `AgentType` exactly as it stood before PRD #211.
+        #[derive(Debug, Deserialize, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum OlderAgentType {
+            ClaudeCode,
+            OpenCode,
+            Pi,
+            Codex,
+            Devin,
+            #[serde(other)]
+            None,
+        }
+        #[derive(Debug, Deserialize)]
+        struct OlderEvent {
+            agent_type: OlderAgentType,
+        }
+
+        let event: AgentEvent = serde_json::from_str(
+            r#"{
+                "session_id": "agy-1",
+                "agent_type": "antigravity",
+                "event_type": "thinking",
+                "timestamp": "2026-11-16T10:00:00Z"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(event.agent_type, AgentType::Antigravity);
+        let wire = serde_json::to_string(&event).unwrap();
+        let older: OlderEvent = serde_json::from_str(&wire).unwrap();
+        assert_eq!(older.agent_type, OlderAgentType::None);
+        let newer: AgentEvent = serde_json::from_str(&wire).unwrap();
+        assert_eq!(newer.agent_type, AgentType::Antigravity);
     }
 
     #[test]

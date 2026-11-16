@@ -1255,6 +1255,46 @@ pub static DEVIN: AgentSpec = AgentSpec {
     questions: Some(&DEVIN_QUESTIONS),
 };
 
+/// Google's Antigravity CLI (`agy`, PRD #211) — native-hooks strategy, like
+/// [`DEVIN`]. Its process comm is `agy`, the binary is `agy`.
+///
+/// This entry carries its identity and presentation only. Its hook installer,
+/// refresh, prompt keys, question tables, doorbell recognisers and OSC 7501
+/// status reader are wired by later PRD #211 tasks, so each is left at its
+/// inert default until then.
+pub static ANTIGRAVITY: AgentSpec = AgentSpec {
+    agent_type: AgentType::Antigravity,
+    label: "Antigravity",
+    detect_basenames: &["agy"],
+    default_command: Some("agy"),
+    strategy: Some(IntegrationStrategy::NativeHooks),
+    // A named ANSI colour not used by Claude (LightMagenta), OpenCode
+    // (LightGreen), Pi (LightCyan), Codex (LightYellow) or Devin (LightBlue),
+    // and never the neutral DarkGray reserved for the "No agent" placeholder.
+    badge_color: Color::LightRed,
+    // PRD #211: wired in a later task.
+    hook_install: None,
+    hook_uninstall: None,
+    materialize: None,
+    // PRD #211: wired in a later task.
+    startup_auto_install: None,
+    configured_pins: None,
+    refresh_install: None,
+    // PRD #211: wired in a later task (measured: a numbered list, digits act
+    // immediately, Esc cancels).
+    prompt_keys: None,
+    doorbell_composer: None,
+    doorbell_stranded_line: None,
+    doorbell_ready_screen: None,
+    // PRD #211: wired in a later task. Measured, `agy`'s `SessionStart` comes
+    // with the first prompt, not at start-up; until the OSC 7501 ready witness
+    // is wired, the conservative default keeps the doorbell from ringing a
+    // generation its own hooks have not reported for.
+    first_hook: FirstHook::BeforePrompt,
+    // PRD #211: wired in a later task.
+    questions: None,
+};
+
 /// Neutral entry for the "no recognized agent" placeholder. Not a real agent:
 /// it has no detection basenames, no default command, and no integration
 /// strategy. It exists so registry lookups ([`spec`]) are total — the `Display`
@@ -1287,7 +1327,7 @@ pub static NONE: AgentSpec = AgentSpec {
 /// All SHIPPED, detectable agents, in a stable order. Excludes the neutral
 /// [`NONE`] placeholder — it is not a detectable agent and has no strategy to
 /// dispatch. Detection and startup auto-install iterate this slice.
-pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX, &DEVIN];
+pub static ALL: &[&AgentSpec] = &[&CLAUDE_CODE, &OPEN_CODE, &PI, &CODEX, &DEVIN, &ANTIGRAVITY];
 
 /// The registry entry for a given agent type. Total: every [`AgentType`]
 /// variant — including the neutral [`AgentType::None`] — maps to an entry, so
@@ -1299,6 +1339,7 @@ pub fn spec(agent_type: &AgentType) -> &'static AgentSpec {
         AgentType::Pi => &PI,
         AgentType::Codex => &CODEX,
         AgentType::Devin => &DEVIN,
+        AgentType::Antigravity => &ANTIGRAVITY,
         AgentType::None => &NONE,
     }
 }
@@ -1634,7 +1675,8 @@ mod tests {
                 &AgentType::OpenCode,
                 &AgentType::Pi,
                 &AgentType::Codex,
-                &AgentType::Devin
+                &AgentType::Devin,
+                &AgentType::Antigravity
             ]
         );
         assert!(!ALL.iter().any(|spec| spec.agent_type == AgentType::None));
@@ -1715,6 +1757,16 @@ mod tests {
                 Color::DarkGray,
                 "a shipped agent's badge should not reuse the neutral placeholder colour"
             );
+        }
+        // PRD #211: no two shipped agents share a badge colour.
+        for (i, a) in ALL.iter().enumerate() {
+            for b in &ALL[i + 1..] {
+                assert_ne!(
+                    a.badge_color, b.badge_color,
+                    "{} and {} share a badge colour",
+                    a.label, b.label
+                );
+            }
         }
     }
 

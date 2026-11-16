@@ -834,7 +834,7 @@ export type AgentTab =
  * unrecognised command and any type a newer daemon names that this app does
  * not know.
  */
-export type AgentTypeId = "claude_code" | "open_code" | "pi" | "codex" | "devin" | "none";
+export type AgentTypeId = "claude_code" | "open_code" | "pi" | "codex" | "devin" | "antigravity" | "none";
 
 /**
  * PRD #1541 — whether the agent is in the middle of a turn, from the daemon's

@@ -225,6 +225,7 @@ const FIXTURE_AGENT_TYPES: Record<string, AgentTypeId> = {
   codex: "codex",
   pi: "pi",
   devin: "devin",
+  agy: "antigravity",
 };
 
 export function fixtureAgentIdentity(cli: string | undefined, status: AgentStatus): Pick<AgentSession, "agentType" | "turn" | "promptKeys"> {
@@ -666,6 +667,7 @@ export function fixtureAgentRegistry(): NewAgentOption[] {
     { id: "pi", displayName: "Pi", defaultCommand: "pi" },
     { id: "codex", displayName: "Codex", defaultCommand: "codex" },
     { id: "devin", displayName: "Devin", defaultCommand: "devin" },
+    { id: "agy", displayName: "Antigravity", defaultCommand: "agy" },
   ];
 }
 

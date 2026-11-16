@@ -214,6 +214,7 @@ pub fn agent_display_name(agent: &AgentType) -> &'static str {
         AgentType::OpenCode => "OpenCode",
         AgentType::Codex => "Codex",
         AgentType::Devin => "Devin",
+        AgentType::Antigravity => "Antigravity",
         AgentType::Pi => "Pi",
         _ => "an agent",
     }

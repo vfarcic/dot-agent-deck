@@ -2270,6 +2270,7 @@ fn agent_type_name(agent_type: &AgentType) -> &'static str {
         AgentType::Pi => "pi",
         AgentType::Codex => "codex",
         AgentType::Devin => "devin",
+        AgentType::Antigravity => "antigravity",
         AgentType::None => "none",
     }
 }

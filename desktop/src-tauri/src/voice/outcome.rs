@@ -6046,7 +6046,14 @@ const DASHBOARD_BUSY_STATUS: &str = "busy";
 
 /// The agent types the dashboard filter offers, by the wire id the agents
 /// report ([`agent_type_spoken`] says how each is called).
-const DASHBOARD_AGENT_TYPES: [&str; 5] = ["claude_code", "codex", "open_code", "pi", "devin"];
+const DASHBOARD_AGENT_TYPES: [&str; 6] = [
+    "claude_code",
+    "codex",
+    "open_code",
+    "pi",
+    "devin",
+    "antigravity",
+];
 
 /// Resolve one of a fixed vocabulary, by [`resolve_choice`]'s rule, where each
 /// name may also be followed by "agents" ("dispatcher agents").
@@ -6578,6 +6585,7 @@ pub(super) fn agent_type_spoken(agent_type: &str) -> &'static [&'static str] {
         "codex" => &["Codex"],
         "pi" => &["Pi"],
         "devin" => &["Devin"],
+        "antigravity" => &["Antigravity"],
         _ => &[],
     }
 }
@@ -7209,13 +7217,20 @@ mod tests {
         );
     }
 
-    /// Scenario: ask for Codex agents or agents on build box. The type and
-    /// daemon words resolve using existing facts into dashboard facets, leaving
-    /// daemon selection and agent-pane navigation untouched.
+    /// Scenario: ask for Codex agents, Antigravity agents or agents on build
+    /// box. The type and daemon words resolve using existing facts into
+    /// dashboard facets, leaving daemon selection and agent-pane navigation
+    /// untouched.
     #[tokio::test]
     async fn voice_outcome_dashboard_filter_type_and_daemon_phrases() {
         for (said, name, spoken, value) in [
             ("show Codex agents", "agent_type", "Codex", "codex"),
+            (
+                "show Antigravity agents",
+                "agent_type",
+                "Antigravity",
+                "antigravity",
+            ),
             (
                 "show the agents on build box",
                 "daemon",

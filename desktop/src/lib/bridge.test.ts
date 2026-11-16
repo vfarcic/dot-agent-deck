@@ -1999,7 +1999,7 @@ describe("FixtureDeckBridge scenarios", () => {
     expect(await bridge.listDirectories(FIXTURE_REMOTE_DAEMON_ID)).toEqual({ kind: "unsupported" });
     const older = await bridge.newAgentOptions(FIXTURE_REMOTE_DAEMON_ID);
     expect(older.kind).toBe("unsupported");
-    expect(older.kind === "unsupported" && older.desktopAgents.map((agent) => agent.id)).toEqual(["claude", "opencode", "pi", "codex", "devin"]);
+    expect(older.kind === "unsupported" && older.desktopAgents.map((agent) => agent.id)).toEqual(["claude", "opencode", "pi", "codex", "devin", "agy"]);
     expect(await bridge.listDirectories(FIXTURE_DAEMON_ID)).toMatchObject({ kind: "listing" });
     await bridge.dispose();
 

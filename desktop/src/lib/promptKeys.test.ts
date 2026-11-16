@@ -9,6 +9,7 @@ describe("PRD #1541 — the voice surface's view of the open agent", () => {
     expect(agentTypeLabel("codex")).toBe("Codex");
     expect(agentTypeLabel("pi")).toBe("Pi");
     expect(agentTypeLabel("devin")).toBe("Devin");
+    expect(agentTypeLabel("antigravity")).toBe("Antigravity");
     expect(agentTypeLabel("none")).toBeUndefined();
     expect(agentTypeLabel(undefined)).toBeUndefined();
   });
@@ -40,6 +41,7 @@ describe("PRD #1541 — the voice surface's view of the open agent", () => {
     expect(fixtureAgentIdentity("claude", "running")).toEqual({ agentType: "claude_code", turn: "working", promptKeys: FIXTURE_PROMPT_KEYS.claude_code });
     expect(fixtureAgentIdentity("opencode", "needs_input")).toEqual({ agentType: "open_code", turn: "idle", promptKeys: FIXTURE_PROMPT_KEYS.open_code });
     expect(fixtureAgentIdentity("devin", "running")).toEqual({ agentType: "devin", turn: "working" });
+    expect(fixtureAgentIdentity("agy", "running")).toEqual({ agentType: "antigravity", turn: "working" });
     expect(fixtureAgentIdentity("bash", "failed")).toEqual({ agentType: "none" });
     expect(fixtureAgentIdentity(undefined, "idle")).toEqual({ agentType: "none", turn: "idle" });
   });
