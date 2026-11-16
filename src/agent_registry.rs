@@ -1281,9 +1281,11 @@ pub static DEVIN: AgentSpec = AgentSpec {
 ///
 /// Its status comes from its hooks and from the OSC 7501 sequences it writes
 /// to its terminal ([`AgentSpec::status_osc7501`]): no hook reports a
-/// permission prompt or an interrupted turn. Its hook installer, refresh,
-/// prompt keys, question tables and doorbell recognisers are wired by later
-/// PRD #211 tasks, so each is left at its inert default until then.
+/// permission prompt or an interrupted turn. The doorbell types into it under
+/// its measured screen profile ([`crate::doorbell_screen::ANTIGRAVITY_PROFILE`])
+/// once that status reads Idle. Its hook installer, refresh and question
+/// tables are wired by later PRD #211 tasks, so each is left at its inert
+/// default until then.
 pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     agent_type: AgentType::Antigravity,
     label: "Antigravity",
@@ -1302,16 +1304,21 @@ pub static ANTIGRAVITY: AgentSpec = AgentSpec {
     startup_auto_install: None,
     configured_pins: None,
     refresh_install: None,
-    // PRD #211: wired in a later task (measured: a numbered list, digits act
-    // immediately, Esc cancels).
+    // PRD #211: wired in a later task (measured on 1.5.9: one ESC interrupts
+    // a turn, Ctrl+U empties a one-line prompt, one DEL removes one
+    // character; Ctrl+C quits on a second press, so it is never sent). The
+    // doorbell does not read these: it submits with CR and withdraws with the
+    // delete key its facts verify.
     prompt_keys: None,
+    // Its own terminal status says when a dialog is up (Needs Input), so the
+    // doorbell needs no screen of its own to wait for.
     doorbell_composer: None,
     doorbell_stranded_line: None,
     doorbell_ready_screen: None,
-    // PRD #211: wired in a later task. Measured, `agy`'s `SessionStart` comes
-    // with the first prompt, not at start-up; until the OSC 7501 ready witness
-    // is wired, the conservative default keeps the doorbell from ringing a
-    // generation its own hooks have not reported for.
+    // PRD #211: its hooks first fire with the first prompt (`SessionStart`
+    // with it, measured), but its terminal status writes `idle` as its
+    // composer appears, and that report is its own: the readiness the doorbell
+    // waits for. Before it, a generation is not rung on its screen alone.
     first_hook: FirstHook::BeforePrompt,
     // PRD #211: wired in a later task.
     questions: None,

@@ -1397,10 +1397,17 @@ fn claude_031_the_deck_answers_its_receipts_and_refuses_what_they_do_not_serve()
     };
     let answer = ask("question", "inbox_receipts", json!({}));
     assert_eq!(answer["one_shot_receipts"], 1, "{answer}");
-    // PRD #1666 part 3 (H4): and the senders it serves beyond Claude Code's.
+    // PRD #1666 part 3 (H4): and the senders it serves beyond Claude Code's,
+    // Antigravity's hooks among them since PRD #211.
     assert_eq!(
         answer["one_shot_senders"],
-        json!(["claude_waiter", "claude_hooks", "codex_hooks", "cli"]),
+        json!([
+            "claude_waiter",
+            "claude_hooks",
+            "codex_hooks",
+            "antigravity_hooks",
+            "cli"
+        ]),
         "{answer}"
     );
     for (tag, verb, extra) in [

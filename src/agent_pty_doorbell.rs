@@ -417,7 +417,10 @@ impl AgentPtyRegistry {
             delete_key: verified(record.delete_key.verified().is_some()),
             placeholder: verified(record.placeholder_empty.verified().is_some()),
             hook_route: hook_route
-                && matches!(agent, Some(AgentType::ClaudeCode | AgentType::Codex)),
+                && matches!(
+                    agent,
+                    Some(AgentType::ClaudeCode | AgentType::Codex | AgentType::Antigravity)
+                ),
             transcript_route: record.transcript_echo.verified().is_some(),
             // Q27: the first stage is the token head alone.
             staged_head: staged.then_some(crate::doorbell_screen::TOKEN_HEAD_CHARS),

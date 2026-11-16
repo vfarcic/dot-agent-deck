@@ -133,6 +133,7 @@ pub const ONE_SHOT_SENDERS: &[crate::event::InboxOneShotSender] = &[
     crate::event::InboxOneShotSender::ClaudeWaiter,
     crate::event::InboxOneShotSender::ClaudeHooks,
     crate::event::InboxOneShotSender::CodexHooks,
+    crate::event::InboxOneShotSender::AntigravityHooks,
     crate::event::InboxOneShotSender::Cli,
 ];
 
@@ -3584,6 +3585,7 @@ impl InboxHub {
             }
             InboxComponent::CodexHooks => Some(crate::event::AgentType::Codex),
             InboxComponent::DevinHooks => Some(crate::event::AgentType::Devin),
+            InboxComponent::AntigravityHooks => Some(crate::event::AgentType::Antigravity),
             _ => None,
         };
         let mut st = self.lock();

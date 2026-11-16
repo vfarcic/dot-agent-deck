@@ -296,14 +296,23 @@ pub enum Envelope {
     /// `{"decision":"block","reason":…}`: Codex's `Stop`, which goes on with
     /// the turn, the reason as its input.
     Block,
+    /// PRD #211: `{"injectSteps":[{"systemMessage":{"systemMessage":…}}]}`:
+    /// Antigravity's `PreInvocation`, which adds the text to the model's
+    /// context as a system message. Measured on `agy` 1.5.9: only this nested
+    /// object is read; a string `systemMessage` is rejected and ignored.
+    Inject,
+    /// PRD #211: `{"decision":"continue","reason":…}`: Antigravity's `Stop`,
+    /// which goes on with the turn, the reason as a system message the model
+    /// acts on (measured on `agy` 1.5.9).
+    Continue,
 }
 
 /// PRD #1666 part 3 (H4): which hook's one-shot hand-over this is, and how it
 /// is printed.
 #[derive(Debug, Clone, Copy)]
 pub struct HookHandOver<'a> {
-    /// `ClaudeHooks` or `CodexHooks`: whose budget, and which sender the deck
-    /// must confirm it serves.
+    /// `ClaudeHooks`, `CodexHooks` or `AntigravityHooks`: whose budget, and
+    /// which sender the deck must confirm it serves.
     pub component: crate::event::InboxComponent,
     pub consumer: InboxFetchConsumer,
     /// The message the doorbell named; none for a turn-end hand-over.
@@ -323,11 +332,14 @@ impl HookHandOver<'_> {
     }
 }
 
-/// The receipts sender a hook of `component` is: Codex's hooks, or Claude
-/// Code's.
+/// The receipts sender a hook of `component` is: Codex's hooks,
+/// Antigravity's, or Claude Code's.
 pub fn sender_of(component: crate::event::InboxComponent) -> crate::event::InboxOneShotSender {
     match component {
         crate::event::InboxComponent::CodexHooks => crate::event::InboxOneShotSender::CodexHooks,
+        crate::event::InboxComponent::AntigravityHooks => {
+            crate::event::InboxOneShotSender::AntigravityHooks
+        }
         _ => crate::event::InboxOneShotSender::ClaudeHooks,
     }
 }
@@ -499,6 +511,12 @@ pub fn codex_envelopes() -> [Envelope; 2] {
         },
         Envelope::Block,
     ]
+}
+
+/// PRD #211: the envelopes Antigravity's hooks print a hand-over in: its
+/// `PreInvocation`'s injected system message and its `Stop`'s continue.
+pub fn antigravity_envelopes() -> [Envelope; 2] {
+    [Envelope::Inject, Envelope::Continue]
 }
 
 /// The doorbell fetch `request` on the receipt verb at the deck at `path`:
@@ -695,6 +713,20 @@ impl Envelope {
             Envelope::Block => (
                 format!(
                     "{{\"decision\":\"block\",\"reason\":\"{}",
+                    json_escaped(framing)
+                ),
+                "\"}\n".to_string(),
+            ),
+            Envelope::Inject => (
+                format!(
+                    "{{\"injectSteps\":[{{\"systemMessage\":{{\"systemMessage\":\"{}",
+                    json_escaped(framing)
+                ),
+                "\"}}]}\n".to_string(),
+            ),
+            Envelope::Continue => (
+                format!(
+                    "{{\"decision\":\"continue\",\"reason\":\"{}",
                     json_escaped(framing)
                 ),
                 "\"}\n".to_string(),
@@ -1061,6 +1093,52 @@ pub fn stamp_deck_message_prompt(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PRD #211: Antigravity's envelopes print the measured shapes — the
+    /// nested `injectSteps` system message, the string form being ignored by
+    /// `agy`, and the `Stop`'s continue — each one JSON object per line.
+    #[test]
+    fn antigravity_envelopes_print_the_measured_shapes() {
+        let print = |envelope: &Envelope| {
+            let parts = envelope.parts("framing \"q\"", &["one", "two\nlines"]);
+            format!(
+                "{}{}{}{}",
+                parts.head,
+                parts.separator,
+                parts.blocks.join(&parts.separator),
+                parts.tail
+            )
+        };
+        let text = format!(
+            "framing \"q\"{sep}one{sep}two\nlines",
+            sep = crate::inbox_hub::BLOCK_SEPARATOR
+        );
+        let inject = print(&Envelope::Inject);
+        assert!(inject.ends_with('\n') && inject.lines().count() == 1);
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&inject).unwrap(),
+            serde_json::json!({"injectSteps":[{"systemMessage":{"systemMessage":text}}]})
+        );
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&print(&Envelope::Continue)).unwrap(),
+            serde_json::json!({"decision":"continue","reason":text})
+        );
+        assert_eq!(
+            sender_of(crate::event::InboxComponent::AntigravityHooks),
+            crate::event::InboxOneShotSender::AntigravityHooks
+        );
+        for envelope in antigravity_envelopes() {
+            assert!(
+                json_room(
+                    crate::event::InboxComponent::AntigravityHooks
+                        .inline_budget()
+                        .limit(),
+                    &envelope,
+                    crate::inbox_hub::AGENT_FRAMING
+                ) > 10_000
+            );
+        }
+    }
 
     /// Claude Code's prompt hook, the sender these tests stand in for.
     #[cfg(unix)]

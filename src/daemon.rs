@@ -5862,8 +5862,8 @@ fn fetch_budget(req: &crate::event::InboxFetchRequest) -> Option<crate::event::I
 /// PRD #1666 part 3 (H4): the hook component an `inbox_receipt_fetch` is
 /// served as, or `None` when the receipt verb does not serve it (it is
 /// refused `unsupported`, nothing issued). A hook names its component, and one
-/// without it is Claude Code's prompt hook (part 2's); only Claude Code's and
-/// Codex's hooks fetch this way. A model-run `inbox fetch` names none: it is
+/// without it is Claude Code's prompt hook (part 2's); only Claude Code's,
+/// Codex's and, since PRD #211, Antigravity's hooks fetch this way. A model-run `inbox fetch` names none: it is
 /// served as the hook of the generation's agent, `agent`, the spawn's type
 /// else the one its hooks reported (a routing hint for the budget and the
 /// log, not authority: the fetch is admitted like any other). A fetch a
@@ -5882,13 +5882,14 @@ fn receipt_fetch_component(
             Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
             Some(AgentType::Codex) => InboxComponent::CodexHooks,
             Some(AgentType::Devin) => InboxComponent::DevinHooks,
+            Some(AgentType::Antigravity) => InboxComponent::AntigravityHooks,
             _ => InboxComponent::Other,
         }),
         InboxFetchConsumer::DoorbellHook | InboxFetchConsumer::TurnEndHook => {
             match req.component.unwrap_or(InboxComponent::ClaudeHooks) {
-                component @ (InboxComponent::ClaudeHooks | InboxComponent::CodexHooks) => {
-                    Some(component)
-                }
+                component @ (InboxComponent::ClaudeHooks
+                | InboxComponent::CodexHooks
+                | InboxComponent::AntigravityHooks) => Some(component),
                 _ => None,
             }
         }
@@ -5950,6 +5951,7 @@ fn legacy_hook_component(
         Some(AgentType::ClaudeCode) => InboxComponent::ClaudeHooks,
         Some(AgentType::Codex) => InboxComponent::CodexHooks,
         Some(AgentType::Devin) => InboxComponent::DevinHooks,
+        Some(AgentType::Antigravity) => InboxComponent::AntigravityHooks,
         _ => match registry.inbox().announced_component(&req.pane_id, agent_id) {
             Some(InboxComponent::ClaudeHooks | InboxComponent::ClaudeWaiter) => {
                 InboxComponent::ClaudeHooks

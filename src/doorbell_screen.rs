@@ -996,6 +996,163 @@ pub static CLAUDE_PROFILE: ScreenProfile = ScreenProfile {
 };
 
 // ---------------------------------------------------------------------------
+// Antigravity CLI (`agy` 1.5.9, measured 2026-11-16, PRD #211)
+// ---------------------------------------------------------------------------
+
+/// Antigravity's composer indent: text starts two cells in, after `> `, and
+/// a wrapped line's later rows start there too.
+const ANTIGRAVITY_INDENT: u16 = 2;
+
+/// The hints Antigravity draws in an empty composer, one per agent mode that
+/// has one (the default mode's is empty). Measured on 1.5.9 in the 256-colour
+/// `terminal` scheme, where it draws them in bright black; its colour schemes
+/// change that colour, so the hint is read by its text.
+const ANTIGRAVITY_PLACEHOLDERS: [&str; 3] = [
+    "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)",
+    "Plan mode: research & plan only",
+    "Accept-edits mode: file edits auto-approved",
+];
+
+fn antigravity_placeholder(text: &str) -> bool {
+    ANTIGRAVITY_PLACEHOLDERS.contains(&text)
+}
+
+/// The composer: `>` at column 0, then a blank, on the row below a
+/// full-width rule ([`claude_rule`]), its text from column 2 and the rows
+/// below it up to the next full-width rule. Measured on 1.5.9 at 80, 120 and
+/// 175 columns: a line too long for the row wraps at a blank, and its next
+/// row starts two cells in, so rows are joined with one space; a later row
+/// that does not start at that indent, or a blank row among them, is content
+/// the text does not show ([`Composer::hidden`]). The hint is reported as
+/// `dim`, the placeholder style the profile reads ([`antigravity_placeholder`]).
+///
+/// The cursor sits right after the text, or at column 2 of an empty
+/// composer, in every measured frame. The e2e build's stand-in
+/// (`tests/fixtures/antigravity/agy`) parks it under its footer instead;
+/// [`antigravity_cursor_parked`] lets that build read a cursor there as one
+/// that edits nothing.
+fn antigravity_composer(grid: &Grid) -> Option<Composer> {
+    let prompt_row = (1..grid.rows).rev().find(|&r| {
+        grid.cell(r, 0).is_some_and(|c| c.text == ">")
+            && grid.cell(r, 1).is_none_or(|c| c.text.trim().is_empty())
+            && claude_rule(grid, r - 1)
+    })?;
+    let close = (prompt_row + 1..grid.rows).find(|&r| claude_rule(grid, r))?;
+    let mut text = grid.text_from(prompt_row, ANTIGRAVITY_INDENT);
+    let mut last_row = prompt_row;
+    let mut hidden = false;
+    for row in prompt_row + 1..close {
+        let next = grid.text_from(row, 0);
+        let indented = next
+            .strip_prefix("  ")
+            .filter(|rest| !rest.starts_with(' ') && !rest.is_empty());
+        match indented {
+            Some(rest) if !hidden && !text.is_empty() => {
+                text.push(' ');
+                text.push_str(rest);
+                last_row = row;
+            }
+            _ => hidden = true,
+        }
+    }
+    let placeholder = antigravity_placeholder(&text);
+    let end_col = if last_row == prompt_row {
+        ANTIGRAVITY_INDENT
+            + grid
+                .text_from(prompt_row, ANTIGRAVITY_INDENT)
+                .chars()
+                .count() as u16
+    } else {
+        grid.text_from(last_row, 0).chars().count() as u16
+    };
+    let cursor_at_end = antigravity_cursor_parked(grid, close)
+        || if text.is_empty() || placeholder {
+            grid.cursor == (prompt_row, ANTIGRAVITY_INDENT)
+        } else {
+            grid.cursor == (last_row, end_col)
+        };
+    Some(Composer {
+        prompt_row,
+        last_row,
+        text,
+        dim: placeholder,
+        cursor_at_end,
+        hidden,
+    })
+}
+
+/// Whether the e2e build's Antigravity stand-in has parked its cursor under
+/// the composer's closing rule (row `close`), where it edits nothing. Always
+/// `false` outside the e2e build: a real `agy` keeps its cursor in the box.
+fn antigravity_cursor_parked(grid: &Grid, close: u16) -> bool {
+    cfg!(feature = "e2e") && grid.cursor.0 > close
+}
+
+/// The ready screen: the composer framed by two full-width rules, and
+/// `? for shortcuts` at the start of the row under the lower one, which
+/// Antigravity hides while its composer holds text (measured on 1.5.9).
+fn antigravity_ready(grid: &Grid) -> bool {
+    let Some(composer) = antigravity_composer(grid) else {
+        return false;
+    };
+    let Some(close) = (composer.last_row + 1..grid.rows).find(|&r| claude_rule(grid, r)) else {
+        return false;
+    };
+    grid.text_from(close + 1, 0).starts_with("? for shortcuts")
+}
+
+/// Antigravity's dialogs. Its start-up dialogs (colour scheme, terms, folder
+/// trust, sign-in) are drawn on the alternate screen, where the main screen
+/// never is (measured on 1.5.9), and its permission prompt lists its choices
+/// as `> 1. …`, where a digit acts at once. None was seen after the ready
+/// composer, so every such screen is unrecognised, and the doorbell types
+/// into none of them.
+fn antigravity_dialog(grid: &Grid) -> Option<Dialog> {
+    if grid.alternate_screen {
+        return Some(Dialog::Unrecognised);
+    }
+    (0..grid.rows)
+        .any(|r| {
+            let text = grid.text_from(r, 0);
+            text.trim_start().strip_prefix("> ").is_some_and(|rest| {
+                let digits = rest.chars().take_while(char::is_ascii_digit).count();
+                digits > 0 && rest[digits..].starts_with('.')
+            })
+        })
+        .then_some(Dialog::Unrecognised)
+}
+
+/// How Antigravity shows a submitted message in its transcript was not
+/// measured, so no transcript line is read as one.
+fn antigravity_transcript_user_line(_grid: &Grid, _line: &str) -> bool {
+    false
+}
+
+/// Antigravity 1.5.9: the main screen, drawn inline; after each of two
+/// resizes, one of them a one-column nudge, it cleared the screen
+/// (`ESC[2J ESC[3J ESC[H`) and redrew it whole within a second, its rules
+/// across the new width. It sends no cursor position query.
+pub static ANTIGRAVITY_PROFILE: ScreenProfile = ScreenProfile {
+    id: "antigravity-2026-11",
+    composer: antigravity_composer,
+    ready: antigravity_ready,
+    placeholder: antigravity_placeholder,
+    dialog: antigravity_dialog,
+    transcript_user_line: antigravity_transcript_user_line,
+    redraw_marker: b"\x1b[2J",
+    width_witness: claude_width_witness,
+    pair_witness: no_pair_witness,
+    min_cols: 80,
+    cpr_wait_end: crate::composer_probe::query_ledger::CprWaitEnd::Counted,
+    redraw: crate::composer_probe::query_wait::RedrawTiming {
+        per_size_change: std::time::Duration::from_millis(1000),
+        margin: std::time::Duration::from_millis(500),
+        cap: std::time::Duration::from_secs(10),
+        waits_on: &[],
+    },
+};
+
+// ---------------------------------------------------------------------------
 // The e2e build's stand-in (`tests/support/empty_composer.py`)
 // ---------------------------------------------------------------------------
 
@@ -1380,7 +1537,7 @@ fn standin_arguments(_pid: u32) -> Option<Vec<Vec<u8>>> {
 
 /// The profile a record names.
 pub fn profile(id: &str) -> Option<&'static ScreenProfile> {
-    [&CODEX_PROFILE, &CLAUDE_PROFILE]
+    [&CODEX_PROFILE, &CLAUDE_PROFILE, &ANTIGRAVITY_PROFILE]
         .into_iter()
         .find(|p| p.id == id)
 }
@@ -1536,6 +1693,7 @@ pub fn profile_for_agent(
     match agent? {
         crate::event::AgentType::Codex => Some(&CODEX_PROFILE),
         crate::event::AgentType::ClaudeCode => Some(&CLAUDE_PROFILE),
+        crate::event::AgentType::Antigravity => Some(&ANTIGRAVITY_PROFILE),
         _ => None,
     }
 }
@@ -1810,5 +1968,105 @@ mod e2e_only_standin_tests {
         short.extend_from_slice(b"/bin/sh\0sh\0-c\0");
         assert_eq!(parse_procargs2(&short), None);
         assert_eq!(parse_procargs2(b"\x01\0"), None);
+    }
+}
+
+#[cfg(test)]
+mod antigravity_tests {
+    use super::*;
+
+    const PLACEHOLDER: &str = "Auto mode: edits & safe commands auto-approved (shift+tab to cycle)";
+    const LINE: &str = "(abcdfg) dot-agent-deck: message m-k3xzq2ab-0f3c9a71d2e4b850 waiting, run: /home/me/.local/bin/dot-agent-deck inbox fetch";
+
+    /// A frame drawn as `agy` 1.5.9 draws its main screen (measured
+    /// 2026-11-16): its header, the start-up notice, the composer between two
+    /// full-width rules holding `rows` (`> ` then each wrapped row's text),
+    /// a footer, and the cursor at `cursor` (1-based row and column).
+    fn frame(cols: u16, rows: &[&str], footer: &str, cursor: (u16, u16)) -> Grid {
+        let rule = "\u{2500}".repeat(cols as usize);
+        let mut bytes = format!(
+            "\x1b[2J\x1b[H\r\n      \x1b[94;1mAntigravity CLI 1.5.9\x1b[m\r\n\r\n \u{2503} Auto is now the default agent mode\r\n \u{2503} esc to dismiss\r\n\x1b[90m{rule}\x1b[m\r\n"
+        );
+        for row in rows {
+            bytes.push_str(row);
+            bytes.push_str("\r\n");
+        }
+        bytes.push_str(&format!("\x1b[90m{rule}\x1b[m\r\n{footer}"));
+        bytes.push_str(&format!("\x1b[{};{}H", cursor.0, cursor.1));
+        Grid::parse(bytes.as_bytes(), 30, cols)
+    }
+
+    /// PRD #211: the ready composer shows its agent mode's hint, in any
+    /// colour, and is empty and ready; a typed line is held exactly while the
+    /// cursor follows it; a line `agy` wrapped at a blank with its two-cell
+    /// indent reads as that line.
+    #[test]
+    fn antigravity_ready_composer_hint_and_echo() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let ready = frame(
+            120,
+            &[&format!(">\x1b[90m {PLACEHOLDER}\x1b[m")],
+            "\x1b[90m? for shortcuts\x1b[m",
+            (7, 3),
+        );
+        assert!(agy.empty_and_ready(&ready));
+        assert!(agy.placeholder_empty(&ready));
+        assert_eq!((agy.dialog)(&ready), None);
+
+        let typed = frame(
+            175,
+            &[&format!("> {LINE}")],
+            "",
+            (7, 3 + LINE.chars().count() as u16),
+        );
+        assert_eq!(agy.holds(&typed, LINE), Some(ComposerText::Exact));
+        assert!(!agy.empty_and_ready(&typed));
+        // The cursor elsewhere in the box: the text may hold more.
+        let moved = frame(175, &[&format!("> {LINE}")], "", (7, 5));
+        assert_eq!(agy.holds(&moved, LINE), Some(ComposerText::Other));
+
+        let (first, second) = LINE.split_at(LINE.find(" /home").unwrap());
+        let wrapped = frame(
+            80,
+            &[&format!("> {first}"), &format!("  {}", &second[1..])],
+            "",
+            (8, 3 + second.len() as u16 - 1),
+        );
+        assert_eq!(agy.holds(&wrapped, LINE), Some(ComposerText::Exact));
+        let unindented = frame(80, &[&format!("> {first}"), &second[1..]], "", (8, 1));
+        assert_eq!(agy.holds(&unindented, LINE), Some(ComposerText::Other));
+    }
+
+    /// After Ctrl+U `agy` 1.5.9 leaves a blank composer with no hint: empty
+    /// while the cursor sits at its start, but no placeholder confirms it. A
+    /// screen with no footer hint, a numbered choice or the alternate screen
+    /// is not the ready composer.
+    #[test]
+    fn antigravity_blank_composer_dialogs_and_other_screens() {
+        let agy = &ANTIGRAVITY_PROFILE;
+        let blank = frame(120, &[">"], "? for shortcuts", (7, 3));
+        assert!(agy.empty_and_ready(&blank));
+        assert!(!agy.placeholder_empty(&blank));
+
+        let no_footer = frame(120, &[">"], "", (7, 3));
+        assert!(!agy.empty_and_ready(&no_footer));
+
+        let permission = frame(
+            120,
+            &["> 1. Yes, run command", "  4. No, cancel"],
+            "",
+            (30, 1),
+        );
+        assert_eq!((agy.dialog)(&permission), Some(Dialog::Unrecognised));
+        assert!(!agy.empty_and_ready(&permission));
+
+        let alternate = Grid::parse(b"\x1b[?1049h  > Yes, I trust this folder", 30, 120);
+        assert_eq!((agy.dialog)(&alternate), Some(Dialog::Unrecognised));
+
+        assert_eq!(
+            profile_for_agent(Some(&crate::event::AgentType::Antigravity)).map(|p| p.id),
+            Some("antigravity-2026-11")
+        );
+        assert_eq!(profile("antigravity-2026-11").map(|p| p.id), Some(agy.id));
     }
 }

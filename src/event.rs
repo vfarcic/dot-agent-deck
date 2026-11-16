@@ -3590,6 +3590,12 @@ pub enum InboxComponent {
     PiExtension,
     CodexHooks,
     DevinHooks,
+    /// PRD #211: the deck's Antigravity CLI (`agy`) hook. Its `SessionStart`
+    /// announces it with turn-end wake; its `PreInvocation` answers a doorbell
+    /// line and its `Stop` hands over at a turn's end, both as one-shot
+    /// receivers. Additive: a reader older than it decodes it to
+    /// [`InboxComponent::Other`].
+    AntigravityHooks,
     /// A value a later CLI added. Read so a new component does not make the
     /// whole request unparseable.
     #[serde(other)]
@@ -3601,11 +3607,16 @@ impl InboxComponent {
     /// Claude caps hook output at 10,000 characters. Codex middle-truncates a
     /// hook's text at about 2,500 tokens and spills the whole of it to a
     /// group-readable file, so its budget is counted in UTF-8 bytes, which
-    /// stay under that for prose and code (PRD #1666 S7).
+    /// stay under that for prose and code (PRD #1666 S7). Antigravity's hooks
+    /// print their hand-over inside JSON too: measured on `agy` 1.5.9, a `Stop`
+    /// `reason` is cut from its end at about 48 KB, and the ceiling of a
+    /// `PreInvocation` injection was not measured, so its budget is a third of
+    /// that, in UTF-8 bytes of the whole JSON (PRD #211).
     pub fn inline_budget(self) -> InboxBudget {
         match self {
             InboxComponent::ClaudeWaiter | InboxComponent::ClaudeHooks => InboxBudget::Chars(9_000),
             InboxComponent::CodexHooks => InboxBudget::Bytes(6_000),
+            InboxComponent::AntigravityHooks => InboxBudget::Bytes(16_000),
             InboxComponent::OpenCodePlugin
             | InboxComponent::OpenCodeMini
             | InboxComponent::PiExtension
@@ -4059,6 +4070,10 @@ pub enum InboxOneShotSender {
     ClaudeHooks,
     /// Codex's prompt and `Stop` hooks.
     CodexHooks,
+    /// PRD #211: Antigravity's `PreInvocation` and `Stop` hooks. A daemon
+    /// older than it reads [`InboxOneShotSender::Unknown`] and does not name
+    /// it among the senders it serves, so the hook hands nothing over there.
+    AntigravityHooks,
     /// `dot-agent-deck inbox fetch`, run by the agent's model.
     Cli,
     /// A sender a later deck names. Read so a new one does not make the whole

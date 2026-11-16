@@ -153,8 +153,8 @@ struct AntigravityHookInput {
 ///
 /// - `SessionStart` (fired with the first prompt of a conversation) →
 ///   `SessionStart`;
-/// - `PreInvocation` → the turn's `Thinking`, which Antigravity's card shows as
-///   Working, carrying `lastUserInput` as the prompt on its first model call
+/// - `PreInvocation` → the turn's `Thinking`, as every agent's prompt is,
+///   carrying `lastUserInput` as the prompt on its first model call
 ///   (`invocationNum` 0) only, so a later call in the same turn records no
 ///   second prompt;
 /// - `PreToolUse` / `PostToolUse` → `ToolStart` / `ToolEnd`;
@@ -242,24 +242,154 @@ fn antigravity_hook_output(input: &str) -> &'static str {
 }
 
 /// PRD #211: an Antigravity hook. Its hooks file is shared by the Antigravity
-/// App and IDE, so outside a deck pane this does nothing but answer; in one it
-/// reports the event, then answers. It always exits 0: `agy` only logs a
-/// failing hook.
+/// App and IDE, so outside a deck pane this does nothing but answer. In one,
+/// it does the inbox's part ([`antigravity_inbox_hooks`]), prints the
+/// hand-over or the plain answer, and reports the event, its `SessionStart`'s
+/// announcement first on the same connection. A `Stop` whose hand-over went
+/// on with the turn reports nothing: the turn is not over, and the doorbell
+/// must not ring while `agy` works on what it was just given. It always exits
+/// 0: `agy` only logs a failing hook.
 fn handle_antigravity_hook() -> ExitCode {
     let input = read_stdin().unwrap_or_default();
     if crate::inbox_prompt::in_deck_pane()
-        && let Some(event) = antigravity_hook_event(&input)
+        && let Some(mut event) = antigravity_hook_event(&input)
     {
-        // Issue #318: present this pane's hook capability token.
-        let token = crate::hook_provenance::token_from_env();
-        if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref()) {
-            let _ = send_to_socket(&json);
+        let mut announce = None;
+        let mut answered = false;
+        let mut turn_goes_on = false;
+        if !crate::inbox_oneshot::stands_in_for_pre_inbox_hooks() {
+            match antigravity_inbox_hooks(&input, &mut event, &mut announce) {
+                AntigravityInbox::Nothing => {}
+                #[cfg(unix)]
+                AntigravityInbox::Print(output) => answered = output.print_handed(),
+                #[cfg(unix)]
+                AntigravityInbox::TurnEnd(injection) => {
+                    let ran = injection.print();
+                    answered = ran.handed_any();
+                    turn_goes_on = ran.continues_turn();
+                }
+            }
         }
+        if !answered {
+            print_antigravity_answer(&input);
+        }
+        if !turn_goes_on {
+            // Issue #318: present this pane's hook capability token.
+            let token = crate::hook_provenance::token_from_env();
+            if let Ok(json) = crate::event::agent_event_line(&event, token.as_deref()) {
+                let _ = match announce {
+                    Some(announce) => send_lines_and_drain(&format!("{announce}\n{json}")),
+                    None => send_to_socket(&json),
+                };
+            }
+        }
+        return ExitCode::SUCCESS;
     }
-    let mut out = std::io::stdout();
-    let _ = writeln!(out, "{}", antigravity_hook_output(&input));
-    let _ = out.flush();
+    print_antigravity_answer(&input);
     ExitCode::SUCCESS
+}
+
+/// [`antigravity_hook_output`] on stdout.
+fn print_antigravity_answer(input: &str) {
+    let mut out = std::io::stdout();
+    let _ = writeln!(out, "{}", antigravity_hook_output(input));
+    let _ = out.flush();
+}
+
+/// What the deck's Antigravity hook does for the inbox with one payload.
+enum AntigravityInbox {
+    Nothing,
+    /// Print this doorbell answer, then report the event as usual.
+    #[cfg(unix)]
+    Print(HookOutput),
+    /// Hand this over as the `Stop`'s continue; one written and flushed whole
+    /// goes on with the turn and reports nothing.
+    #[cfg(unix)]
+    TurnEnd(crate::inbox_prompt::OneShotInjection),
+}
+
+/// PRD #211: Antigravity's side of the inbox, for one hook payload in a deck
+/// pane, on Codex's model ([`codex_inbox_hooks`]): an idle `agy` is woken by
+/// the doorbell, and its hooks, not its model, take the messages for it.
+///
+/// - `SessionStart`, which `agy` fires with the first prompt of a
+///   conversation, queues an `inbox_announce` `TurnEnd` line, sent ahead of
+///   the status event.
+/// - `PreInvocation` on the turn's first model call (`invocationNum` 0)
+///   answers a doorbell line in `lastUserInput` with the waiting content as
+///   an injected system message ([`deck_prompt_submit`],
+///   [`crate::inbox_prompt::Envelope::Inject`]). A later call of the same
+///   turn carries the same `lastUserInput`, including the call a `Stop`
+///   continue starts, and hands nothing over again.
+/// - `Stop` that ended the turn normally (`NO_TOOL_CALL`) hands over what is
+///   waiting as `{"decision":"continue","reason":…}`, so `agy` goes on with
+///   it. One that ended in an `ERROR` hands over nothing: the mail stays
+///   queued for the next turn's end or the doorbell. `agy` stops honouring
+///   `continue` after ten in a row by itself.
+///
+/// Both hand-overs are one-shot receipt receivers under
+/// [`crate::event::InboxComponent::AntigravityHooks`], headed by
+/// [`crate::inbox_hub::AGENT_FRAMING`], their whole JSON within its byte
+/// budget. A daemon older than that component refuses them, and the hook
+/// then prints its plain answer: nothing is handed over there. Unix only, as
+/// Claude Code's and Codex's are.
+fn antigravity_inbox_hooks(
+    input: &str,
+    event: &mut AgentEvent,
+    announce: &mut Option<String>,
+) -> AntigravityInbox {
+    let Ok(payload) = serde_json::from_str::<Value>(input) else {
+        return AntigravityInbox::Nothing;
+    };
+    #[cfg(not(unix))]
+    let _ = event;
+    match payload.get("hookEventName").and_then(Value::as_str) {
+        Some("SessionStart") => {
+            *announce = inbox_announce(
+                crate::event::InboxComponent::AntigravityHooks,
+                crate::event::InboxWake::TurnEnd,
+            );
+            AntigravityInbox::Nothing
+        }
+        #[cfg(unix)]
+        Some("PreInvocation") => {
+            let first_call = payload
+                .get("invocationNum")
+                .is_none_or(|n| n.as_u64() == Some(0));
+            payload
+                .get("lastUserInput")
+                .and_then(Value::as_str)
+                .filter(|_| first_call)
+                .and_then(|prompt| {
+                    deck_prompt_submit(
+                        prompt,
+                        crate::event::InboxComponent::AntigravityHooks,
+                        crate::inbox_hub::AGENT_FRAMING,
+                        &crate::inbox_prompt::Envelope::Inject,
+                        event,
+                    )
+                })
+                .map_or(AntigravityInbox::Nothing, AntigravityInbox::Print)
+        }
+        #[cfg(unix)]
+        Some("Stop")
+            if payload.get("terminationReason").and_then(Value::as_str) == Some("NO_TOOL_CALL") =>
+        {
+            crate::inbox_prompt::one_shot_injection(
+                crate::inbox_prompt::HookHandOver {
+                    component: crate::event::InboxComponent::AntigravityHooks,
+                    consumer: crate::event::InboxFetchConsumer::TurnEndHook,
+                    rung: None,
+                    ring: None,
+                    envelope: &crate::inbox_prompt::Envelope::Continue,
+                    framing: crate::inbox_hub::AGENT_FRAMING,
+                },
+                std::time::Instant::now() + crate::inbox_prompt::prompt_receipts_wait(),
+            )
+            .map_or(AntigravityInbox::Nothing, AntigravityInbox::TurnEnd)
+        }
+        _ => AntigravityInbox::Nothing,
+    }
 }
 
 /// [`lenient_string`] for a JSON object: anything else is `None`.
@@ -625,6 +755,9 @@ fn claude_inbox_hooks(
                 prompt,
                 crate::event::InboxComponent::ClaudeHooks,
                 crate::inbox_hub::SESSION_FRAMING,
+                &crate::inbox_prompt::Envelope::Context {
+                    hook_event_name: "UserPromptSubmit".to_string(),
+                },
                 event,
             )
         }
@@ -648,6 +781,20 @@ impl HookOutput {
             #[cfg(unix)]
             one_shot: None,
         }
+    }
+
+    /// Write the output, as [`Self::print`] does, and say whether any of it
+    /// was written: a one-shot hand-over whose blocks its fence refused whole
+    /// writes nothing at all.
+    #[cfg(unix)]
+    fn print_handed(self) -> bool {
+        if let Some(one_shot) = self.one_shot {
+            return one_shot.print().handed_any();
+        }
+        let mut out = std::io::stdout();
+        writeln!(out, "{}", self.stdout)
+            .and_then(|()| out.flush())
+            .is_ok()
     }
 
     /// Write the output. A one-shot hand-over commits what it wrote in full,
@@ -755,6 +902,9 @@ fn codex_inbox_hooks(
                     prompt,
                     crate::event::InboxComponent::CodexHooks,
                     framing,
+                    &crate::inbox_prompt::Envelope::Context {
+                        hook_event_name: "UserPromptSubmit".to_string(),
+                    },
                     event,
                 )
             })
@@ -777,9 +927,11 @@ fn codex_inbox_hooks(
 }
 
 /// PRD #1666 S6: the `UserPromptSubmit` side of the inbox, agent-neutral so
-/// every agent whose hook accepts `hookSpecificOutput.additionalContext`
-/// shares it (Claude Code, and Codex since S7), each with its `component`'s
-/// budget and the `framing` that heads an injection. An ordinary prompt costs
+/// every agent whose prompt hook can hand the model text shares it (Claude
+/// Code, Codex since S7, Antigravity since PRD #211), each with its
+/// `component`'s budget, the `framing` that heads an injection and the
+/// `envelope` its hook prints it in (`hookSpecificOutput.additionalContext`
+/// for Claude Code and Codex, an injected system message for Antigravity). An ordinary prompt costs
 /// a local scan and no daemon call. A doorbell line fetches only while the
 /// message it names is queued.
 ///
@@ -791,6 +943,7 @@ pub fn deck_prompt_submit(
     prompt: &str,
     component: crate::event::InboxComponent,
     framing: &str,
+    envelope: &crate::inbox_prompt::Envelope,
     event: &mut AgentEvent,
 ) -> Option<HookOutput> {
     let ids = crate::inbox_prompt::scan(prompt);
@@ -808,9 +961,6 @@ pub fn deck_prompt_submit(
     );
     #[cfg(unix)]
     {
-        let envelope = crate::inbox_prompt::Envelope::Context {
-            hook_event_name: "UserPromptSubmit".to_string(),
-        };
         let ring = crate::inbox_prompt::ring_of(prompt);
         let injection = ids.rung.first().and_then(|rung| {
             crate::inbox_prompt::one_shot_injection(
@@ -819,7 +969,7 @@ pub fn deck_prompt_submit(
                     consumer: crate::event::InboxFetchConsumer::DoorbellHook,
                     rung: Some(rung),
                     ring: ring.as_ref(),
-                    envelope: &envelope,
+                    envelope,
                     framing,
                 },
                 receipts_by,
@@ -839,7 +989,7 @@ pub fn deck_prompt_submit(
     // doorbell does not deliver to Claude Code or Codex on Windows yet.
     #[cfg(not(unix))]
     {
-        let _ = (component, framing);
+        let _ = (component, framing, envelope);
         crate::inbox_prompt::mark_event(event, &ids, &[]);
         None
     }

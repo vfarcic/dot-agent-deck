@@ -1042,12 +1042,20 @@ const CLAUDE_REMEDY: &str = "run `dot-agent-deck hooks install --agent claude-co
 /// records their trust.
 const CODEX_REMEDY: &str = "run `dot-agent-deck hooks install --agent codex` with the build the daemon runs, which rewrites Codex's hooks and records their trust";
 
+/// The same remedy for Antigravity's hook (PRD #211): its `hooks install`
+/// rewrites the deck's named hook in `agy`'s hooks file.
+const ANTIGRAVITY_REMEDY: &str = "run `dot-agent-deck hooks install --agent antigravity` with the build the daemon runs, which rewrites the deck's Antigravity hook";
+
 /// PRD #1666 part 3 (H4): one of the notices above as `sender` says it: a
 /// notice naming Claude Code's `hooks install` names Codex's for Codex's
-/// hooks, and is otherwise the same text.
+/// hooks, and Antigravity's for Antigravity's (PRD #211), and is otherwise
+/// the same text.
 pub fn notice_for(text: &str, sender: InboxOneShotSender) -> std::borrow::Cow<'_, str> {
     match sender {
         InboxOneShotSender::CodexHooks => text.replace(CLAUDE_REMEDY, CODEX_REMEDY).into(),
+        InboxOneShotSender::AntigravityHooks => {
+            text.replace(CLAUDE_REMEDY, ANTIGRAVITY_REMEDY).into()
+        }
         _ => text.into(),
     }
 }
@@ -1119,9 +1127,9 @@ pub fn serves_receipts(reply: &InboxWaitReply, sender: InboxOneShotSender) -> bo
         .is_some_and(|served| served >= crate::inbox_hub::ONE_SHOT_RECEIPTS);
     match sender {
         InboxOneShotSender::ClaudeWaiter | InboxOneShotSender::ClaudeHooks => receipts,
-        InboxOneShotSender::CodexHooks | InboxOneShotSender::Cli => {
-            receipts && reply.one_shot_senders.contains(&sender)
-        }
+        InboxOneShotSender::CodexHooks
+        | InboxOneShotSender::AntigravityHooks
+        | InboxOneShotSender::Cli => receipts && reply.one_shot_senders.contains(&sender),
         InboxOneShotSender::Unknown => false,
     }
 }

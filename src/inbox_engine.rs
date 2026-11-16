@@ -112,7 +112,8 @@ pub(super) struct TurnClock {
 /// The receiver slot a component registers in (§4; part 2 §2.1): a stream
 /// for OpenCode and Pi, a once-waiter for Claude's `asyncRewake` waiter, a
 /// hook for Claude's prompt hook and, since part 3's H4, for Codex's hooks and
-/// for a model-run `inbox fetch` in a Codex, Devin or other agent's pane. A
+/// for a model-run `inbox fetch` in a Codex, Devin or other agent's pane, and
+/// since PRD #211 for Antigravity's hooks. A
 /// hook is registered by its own fetch and is handed what that fetch asked
 /// for, once: no component's hook is a native wake.
 pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
@@ -124,6 +125,7 @@ pub(super) fn slot_for(component: InboxComponent) -> Option<Slot> {
         InboxComponent::ClaudeHooks
         | InboxComponent::CodexHooks
         | InboxComponent::DevinHooks
+        | InboxComponent::AntigravityHooks
         | InboxComponent::Other => Some(Slot::Hook),
     }
 }
