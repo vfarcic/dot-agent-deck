@@ -7879,6 +7879,50 @@ These entries cover PRD #89 Phase 4: with auto-restore now the default, a user w
 - **Platform coverage:** mac+linux (real-agent tier is local-only).
 - **Cost note:** one minimal mini-model availability probe plus one short interactive directory-listing/file-write turn.
 
+#### antigravity/status
+
+##### antigravity/status/001 — Captured Antigravity hooks drive the visible prompt, running command and ordinary turn end.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** executable `agy` stand-in replaying the sanitized 1.5.9 payloads through the real hook CLI.
+- **Asserts:** PreInvocation shows Working with the prompt; PreToolUse names `run_command` and its command; PostToolUse removes the running tool; Stop `NO_TOOL_CALL` shows Idle.
+- **Does not assert:** real hook emission, file-tool argument extraction, or orchestration delivery.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/002 — A failed Antigravity Stop hook shows Error with its text.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying captured `stop-error.json` through the real hook CLI.
+- **Asserts:** the attached dashboard card reads Error and includes the captured error text, which the stand-in never prints.
+- **Does not assert:** a real network failure or quota classification.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/003 — OSC permission questions decode onto the card and clear on working or idle.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying measured OSC 7501 bytes from its pane PTY.
+- **Asserts:** Needs Input includes the base64-decoded permission question; working and idle each clear the question and restore their status.
+- **Does not assert:** answering a real agent's permission dialog or delivering an answer through the question API.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/004 — OSC alone ends interrupted turns, completes turns and reports terminal errors.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying measured working, idle, done and error OSC signals, without sending a Stop hook.
+- **Asserts:** the card shows Working before each ending, Idle on idle and done, and Error with decoded text on error.
+- **Does not assert:** a real Esc/Ctrl+C keystroke or distinguishing interrupted done messages from final replies.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/005 — Startup auth transients stay hidden while persistent auth needs input.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** `agy` stand-in replaying captured auth and idle signals 60 ms apart, the upper measured launch gap.
+- **Asserts:** 1 ms samples of the rendered dashboard for two seconds show neither Needs Input nor Blocked for transient auth; Idle follows; persistent auth shows Needs Input with decoded sign-in text and returns to Idle after sign-in.
+- **Does not assert:** a particular debounce implementation, real sign-in, or statuses shorter than the sampling interval.
+- **Platform coverage:** mac+linux (unix-only file).
+
+##### antigravity/status/006 — Other agent panes ignore Antigravity OSC 7501 status.
+- **Layer:** L2 PTY-attached synthetic, lane 1 (`tests/e2e_antigravity_status.rs`).
+- **Agent:** Claude Code launcher using the same replay driver and a genuine-shaped Claude PreToolUse hook.
+- **Asserts:** Working and the Claude command remain visible after foreign permission, idle, done and error OSC signals, with no foreign question.
+- **Does not assert:** a real Claude session or every other supported agent.
+- **Platform coverage:** mac+linux (unix-only file).
+
 #### codex/status
 
 ##### codex/status/001 — A deck-launched Codex whose hooks are trusted shows the status its hooks report, not its output: Idle until the first prompt and Idle again after its turn (issue #1493).

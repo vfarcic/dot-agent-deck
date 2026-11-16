@@ -1,0 +1,63 @@
+#!/usr/bin/python3
+"""Synthetic agy: replay captured hooks and OSC bytes, never call a model."""
+
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+
+root = Path.cwd()
+sequences = json.loads((root / "osc7501-sequences.json").read_text())["sequences"]
+(root / "replay-ready").touch()
+
+
+def replay(action):
+    if "hook" in action:
+        payload = json.loads((root / action["hook"]).read_text())
+        # The capture's workspace is sanitized; retain its measured event shape
+        # but point it at this test's real isolated workspace.
+        payload["cwd"] = str(root)
+        payload["workspacePaths"] = [str(root)]
+        agent = action.get("agent", "antigravity")
+        if agent == "claude-code":
+            payload = {
+                "session_id": "osc-unrelated-agent-control",
+                "hook_event_name": "PreToolUse",
+                "cwd": str(root),
+                "tool_name": "Bash",
+                "tool_input": {"command": "echo claude-control"},
+            }
+        result = subprocess.run(
+            [os.environ["AGY_TEST_DECK_BIN"], "hook", "--agent", agent],
+            input=json.dumps(payload), text=True, capture_output=True, check=False,
+        )
+        with (root / "hook-replay.log").open("a") as log:
+            log.write(f'{action["hook"]}: exit={result.returncode}\n{result.stderr}\n')
+    elif "osc" in action:
+        sequence = next(
+            item for item in sequences
+            if item["state"] == action["osc"]
+            and item["kind"] == action.get("kind")
+            and ("msg" not in action or item["msg_decoded"] == action["msg"])
+        )
+        sys.stdout.write(sequence["bytes"])
+        sys.stdout.flush()
+    elif "pause_ms" in action:
+        time.sleep(action["pause_ms"] / 1000)
+    else:
+        raise ValueError(action)
+
+
+step = 0
+while True:
+    request = root / f"request-{step}.json"
+    if not request.exists():
+        time.sleep(0.01)
+        continue
+    for action in json.loads(request.read_text()):
+        replay(action)
+    (root / f"replayed-{step}").touch()
+    step += 1
