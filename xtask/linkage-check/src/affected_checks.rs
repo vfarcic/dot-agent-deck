@@ -39,9 +39,18 @@ use std::time::Instant;
 
 use crate::gate_telemetry;
 
-/// CLAUDE.md rule 2's two commands and rule 5's per-task tier, verbatim, as
-/// argument vectors so `--run` needs no shell.
+/// Formats the tree and lists each file it rewrote (rustfmt's `-l`), so a
+/// formatting slip is fixed before [`FULL_GATES`]' `cargo fmt --check` instead of
+/// failing it (issue #2074: 13 of 225 gate runs failed on that check alone, each
+/// followed by a re-run). `--run` reads the list and reports it, because a
+/// rewritten file is a working-tree change the commit still has to stage. CI is
+/// untouched: its `fmt` job runs `cargo fmt --check` alone and fixes nothing.
+pub(crate) const FMT_WRITE: &[&str] = &["cargo", "fmt", "--", "-l"];
+
+/// CLAUDE.md rule 2's two commands, preceded by [`FMT_WRITE`], and rule 5's
+/// per-task tier, as argument vectors so `--run` needs no shell.
 pub(crate) const FULL_GATES: &[&[&str]] = &[
+    FMT_WRITE,
     &["cargo", "fmt", "--check"],
     &[
         "cargo",
@@ -499,11 +508,24 @@ fn execute(root: &Path, plan: &[Vec<String>], trace: &mut gate_telemetry::RunTra
     for command in plan {
         eprintln!("affected-checks: running {}", shell_line(command));
         let (runner, planned) = runner_of(command);
+        let writes_format = is_fmt_write(planned);
         let started = Instant::now();
-        let status = Command::new(&command[0])
-            .args(&command[1..])
-            .current_dir(root)
-            .status();
+        let mut child = Command::new(&command[0]);
+        child.args(&command[1..]).current_dir(root);
+        // The formatting step's stdout is the list of files it rewrote, read
+        // here and reported below; every other command's output goes straight
+        // to the terminal.
+        let (status, reformatted) = if writes_format {
+            match child.stderr(std::process::Stdio::inherit()).output() {
+                Ok(out) => {
+                    let files = reformatted_files(root, &String::from_utf8_lossy(&out.stdout));
+                    (Ok(out.status), Some(files))
+                }
+                Err(e) => (Err(e), None),
+            }
+        } else {
+            (child.status(), None)
+        };
         trace.command(
             shell_line(planned),
             runner.name(),
@@ -511,8 +533,12 @@ fn execute(root: &Path, plan: &[Vec<String>], trace: &mut gate_telemetry::RunTra
             gate_telemetry::CommandResult {
                 exit_code: status.as_ref().ok().and_then(|s| s.code()),
                 passed: status.as_ref().is_ok_and(|s| s.success()),
+                files_reformatted: reformatted.as_ref().map(Vec::len),
             },
         );
+        if let Some(files) = &reformatted {
+            eprint!("{}", fmt_report(files));
+        }
         match status {
             Ok(status) if status.success() => {}
             Ok(status) => {
@@ -533,6 +559,55 @@ fn execute(root: &Path, plan: &[Vec<String>], trace: &mut gate_telemetry::RunTra
     }
     eprintln!("affected-checks: all {} command(s) passed", plan.len());
     ExitCode::SUCCESS
+}
+
+/// Whether a command, as planned (without a runner's prefix), is [`FMT_WRITE`].
+pub(crate) fn is_fmt_write(planned: &[String]) -> bool {
+    planned
+        .iter()
+        .map(String::as_str)
+        .eq(FMT_WRITE.iter().copied())
+}
+
+/// The files rustfmt's `-l` listed, repo-relative where they are under `root`
+/// (cargo hands rustfmt absolute paths), in the order given, blank lines dropped.
+pub(crate) fn reformatted_files(root: &Path, listing: &str) -> Vec<String> {
+    let roots: Vec<std::path::PathBuf> = [Some(root.to_path_buf()), root.canonicalize().ok()]
+        .into_iter()
+        .flatten()
+        .collect();
+    listing
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            let path = Path::new(line);
+            roots
+                .iter()
+                .find_map(|r| path.strip_prefix(r).ok())
+                .map_or_else(
+                    || line.to_string(),
+                    |rel| rel.to_string_lossy().into_owned(),
+                )
+        })
+        .collect()
+}
+
+/// What `--run` says after [`FMT_WRITE`]: that it changed nothing, or which
+/// files it rewrote and that the commit has to stage them — the only place a
+/// developer learns of a rewrite, since the `cargo fmt --check` after it passes.
+pub(crate) fn fmt_report(files: &[String]) -> String {
+    if files.is_empty() {
+        return "affected-checks: `cargo fmt` reformatted no file\n".to_string();
+    }
+    let mut out = format!(
+        "affected-checks: `cargo fmt` reformatted {} file(s); stage them before you commit:\n",
+        files.len()
+    );
+    for file in files {
+        out.push_str(&format!("affected-checks:   {}\n", comment_text(file)));
+    }
+    out
 }
 
 /// Opt-in for running the heavy commands in an RWX sandbox instead of locally.
@@ -1159,6 +1234,7 @@ mod tests {
         assert_eq!(
             full(),
             vec![
+                "cargo fmt -- -l",
                 "cargo fmt --check",
                 "cargo clippy --workspace --all-targets --features e2e,e2e-live -- -D warnings",
                 "cargo test-fast",
@@ -1791,13 +1867,14 @@ mod tests {
     fn rwx_wraps_every_cargo_command_but_fmt() {
         let full = for_runner(Runner::Rwx, FULL_GATES.iter().map(|c| argv(c)).collect());
         let lines: Vec<String> = full.iter().map(|c| shell_line(c)).collect();
-        assert_eq!(lines[0], "cargo fmt --check");
+        assert_eq!(lines[0], "cargo fmt -- -l");
+        assert_eq!(lines[1], "cargo fmt --check");
         assert!(
-            lines[1].starts_with("rwx sandbox exec -- cargo clippy "),
+            lines[2].starts_with("rwx sandbox exec -- cargo clippy "),
             "{}",
-            lines[1]
+            lines[2]
         );
-        assert_eq!(lines[2], "rwx sandbox exec -- cargo test-fast");
+        assert_eq!(lines[3], "rwx sandbox exec -- cargo test-fast");
 
         let prefix = argv(&["rwx", "sandbox", "exec", "--"]);
         let text = for_runner(Runner::Rwx, plan(&paths(&["docs/quick-start.md"])));
@@ -1930,10 +2007,15 @@ mod tests {
         assert_eq!(
             split[0],
             (Runner::Local, planned[0].as_slice()),
+            "the formatting step stays local"
+        );
+        assert_eq!(
+            split[1],
+            (Runner::Local, planned[1].as_slice()),
             "cargo fmt stays local"
         );
-        assert_eq!(split[1], (Runner::Rwx, planned[1].as_slice()));
         assert_eq!(split[2], (Runner::Rwx, planned[2].as_slice()));
+        assert_eq!(split[3], (Runner::Rwx, planned[3].as_slice()));
         assert_eq!(
             runner_of(&argv(RWX_PREFIX)),
             (Runner::Local, argv(RWX_PREFIX).as_slice()),
@@ -1981,6 +2063,74 @@ mod tests {
         assert_eq!(
             spans[0].attr("gates.failed_command"),
             Some(&Value::Str("false".into()))
+        );
+    }
+
+    /// Issue #2074: the full plan formats before it checks, the formatting
+    /// step is recognised whichever runner the plan was rewritten for, and it
+    /// stays local, so the sandbox syncs the formatted tree.
+    #[test]
+    fn the_full_plan_formats_locally_before_it_checks_formatting() {
+        let planned = plan(&paths(&["src/ui.rs"]));
+        assert!(is_fmt_write(&planned[0]));
+        assert_eq!(shell_line(&planned[1]), "cargo fmt --check");
+        assert_eq!(
+            planned.iter().filter(|c| is_fmt_write(c)).count(),
+            1,
+            "the formatting step runs once"
+        );
+        let executed = for_runner(Runner::Rwx, planned);
+        let (runner, as_planned) = runner_of(&executed[0]);
+        assert_eq!(runner, Runner::Local);
+        assert!(is_fmt_write(as_planned));
+        assert!(!is_fmt_write(&argv(&["cargo", "fmt", "--check"])));
+        assert!(!is_fmt_write(&argv(&[
+            "cargo", "fmt", "--", "-l", "--check"
+        ])));
+        // A text-only plan has no Rust to format.
+        assert!(
+            !plan(&paths(&["docs/telemetry.md"]))
+                .iter()
+                .any(|c| is_fmt_write(c))
+        );
+    }
+
+    #[test]
+    fn rustfmts_list_is_reported_repo_relative() {
+        let root = PathBuf::from("/w/repo");
+        let listing = "/w/repo/src/ui.rs\n\n/w/repo/xtask/a/src/b.rs\n/elsewhere/c.rs\n";
+        assert_eq!(
+            reformatted_files(&root, listing),
+            paths(&["src/ui.rs", "xtask/a/src/b.rs", "/elsewhere/c.rs"])
+        );
+        assert!(reformatted_files(&root, "").is_empty());
+        // Cargo hands rustfmt canonical paths, so a root reached through a
+        // symlink is stripped through its canonical form too.
+        #[cfg(unix)]
+        {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let real = dir.path().join("real");
+            std::fs::create_dir(&real).expect("mkdir");
+            let canonical = real.canonicalize().expect("canonicalize");
+            let link = dir.path().join("link");
+            std::os::unix::fs::symlink(&real, &link).expect("symlink");
+            let listing = format!("{}\n", canonical.join("src/x.rs").display());
+            assert_eq!(reformatted_files(&link, &listing), paths(&["src/x.rs"]));
+        }
+    }
+
+    #[test]
+    fn the_fmt_report_says_what_to_stage_or_that_nothing_changed() {
+        assert_eq!(
+            fmt_report(&[]),
+            "affected-checks: `cargo fmt` reformatted no file\n"
+        );
+        let report = fmt_report(&paths(&["src/ui.rs", "src/a\nb.rs"]));
+        assert_eq!(
+            report,
+            "affected-checks: `cargo fmt` reformatted 2 file(s); stage them before you commit:\n\
+             affected-checks:   src/ui.rs\n\
+             affected-checks:   src/a\\nb.rs\n"
         );
     }
 

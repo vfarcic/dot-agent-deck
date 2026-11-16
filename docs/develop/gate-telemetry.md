@@ -43,6 +43,7 @@ The spans are sent once, after the last command and after the sandbox is stopped
 | `gates.command.runner` | `local` or the runner's name. With `rwx`, `cargo fmt` stays `local`. |
 | `gates.command.outcome` | `passed` or `failed`. |
 | `gates.command.exit_code` | The exit code, when the command exited with one; absent when it was killed by a signal or could not start. |
+| `gates.command.files_reformatted` | Only on the formatting step, `cargo fmt -- -l` (issue #2074): how many files it rewrote, `0` included. A run whose formatting step reports more than zero is one that `cargo fmt --check` would have failed before #2074. |
 
 A failed span also carries the OTLP error status. The span's duration is the command's wall time, which for a remote command includes syncing the worktree to the sandbox. A new runner adds a value to `gates.runner.used` and `gates.command.runner`, not a field.
 
