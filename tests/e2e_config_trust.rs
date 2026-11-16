@@ -2947,10 +2947,19 @@ fn request_003_a_request_raised_with_no_client_opens_when_one_attaches() {
         "the refused fire leaves one request pending with no client attached: {:?}",
         pending_trust_requests(&daemon.attach_socket)
     );
-    let listed = text(&daemon.run_schedule_cli(&["list"]));
+    // The daemon raises the request first and records the fire's refusal
+    // after it (the scheduler's notifier writes the outcome store), so the
+    // pending request says nothing about whether that write has landed. Wait
+    // for the record itself: on a CI runner with half its time stalled on IO
+    // the one-shot read came before the write on both tries.
+    let listed = std::cell::RefCell::new(String::new());
     assert!(
-        listed.contains("requested in the deck"),
-        "the recorded refusal says the approval was requested in the deck:\n{listed}"
+        common::wait_until(common::load_scaled(Duration::from_secs(15)), || {
+            *listed.borrow_mut() = text(&daemon.run_schedule_cli(&["list"]));
+            listed.borrow().contains("requested in the deck")
+        }),
+        "the recorded refusal says the approval was requested in the deck:\n{}",
+        listed.borrow()
     );
 
     let deck = TuiDeck::builder()
