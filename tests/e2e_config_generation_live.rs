@@ -91,10 +91,34 @@ const PANE_MODE_BUTTON: &str = "[Command Mode";
 /// The same button in command mode.
 const COMMAND_MODE_BUTTON: &str = "[Back to Pane";
 
+// The wait budget. Every bound below runs in sequence, and all of them must
+// expire before the deck's 840 s lifetime cap (set at launch) stops the daemon or
+// nextest's window for this test (.config/nextest.toml, 15 x 60 s) kills it;
+// either would end the run before a phase's own assertion names what stalled.
+// Measured whole runs take about 70-90 s, the boot about 20 s.
+//
+//   screen waits   7 x 30 s (harness default) + 10 s + 20 s     =  240 s
+//   BOOT_WAIT      session start                                =  120 s
+//   SETTLE_WAIT    pane settled (a warning, not a failure)      =   30 s
+//   PROPOSAL_WAIT  acknowledge + proposal turn, one deadline    =  180 s
+//   WRITE_WAIT     the file appears after approval              =  150 s
+//   WRITE_SETTLE   the write turn ends (not asserted)           =   30 s
+//                                                         sum   =  750 s
+//
+// That leaves 90 s of the 840 s cap for the unbounded steps (StartAgent, inbox
+// reads, `validate`), and the 900 s nextest window 60 s more for what runs
+// before the daemon starts. 840 s stays under linkage-check rule 11's ceiling
+// (`MAX_PINNED_ORPHAN_CAP_SECS`, 900 s). Raising a bound means lowering another.
 /// The agent's boot, measured at about 20 s on an idle box.
-const BOOT_WAIT: Duration = Duration::from_secs(180);
-/// The analysis-and-proposal turn, and separately the write turn.
-const TURN_WAIT: Duration = Duration::from_secs(300);
+const BOOT_WAIT: Duration = Duration::from_secs(120);
+/// The pane settling after boot; past it the test asks anyway.
+const SETTLE_WAIT: Duration = Duration::from_secs(30);
+/// Acknowledging the request and ending the proposal turn, as one deadline.
+const PROPOSAL_WAIT: Duration = Duration::from_secs(180);
+/// The config file appearing after the approval is submitted.
+const WRITE_WAIT: Duration = Duration::from_secs(150);
+/// The write turn ending once the file is there; not asserted.
+const WRITE_SETTLE: Duration = Duration::from_secs(30);
 /// How long the agent must stay Idle before its turn counts as over: a Stop
 /// hook is the end of a turn, and this rides out a status flicker around it.
 const IDLE_HOLD: Duration = Duration::from_secs(6);
@@ -125,8 +149,8 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
         // The agent's `dot-agent-deck inbox` and `which` resolve this build
         // first.
         .with_env("PATH", common::path_with_binary_dir())
-        // Outlast the waits below (boot + two turns); under linkage-check rule
-        // 11's ceiling.
+        // Outlast every wait below; the budget is above `BOOT_WAIT`. A literal,
+        // so linkage-check rule 11 can read it.
         .with_env("DOT_AGENT_DECK_TEST_MAX_LIFETIME_SECS", "840")
         .launch_with_fixture("config-gen-live");
     deck.wait_for_string("No active agents");
@@ -169,7 +193,7 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
         std::slice::from_ref(&agent_id),
         Duration::from_millis(1500),
         Duration::from_secs(8),
-        BOOT_WAIT,
+        SETTLE_WAIT,
     ) {
         eprintln!("warning: the agent pane never settled; asking anyway");
     }
@@ -227,17 +251,24 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
     );
 
     // ---- 3. The agent takes the request, analyses, proposes, and waits.
+    // One deadline for the whole turn, so the two waits cannot sum past it.
+    let proposal_deadline = Instant::now() + PROPOSAL_WAIT;
     assert!(
-        common::wait_until(TURN_WAIT, || request()
+        common::wait_until(PROPOSAL_WAIT, || request()
             .is_some_and(|m| m.state == StateName::Acknowledged)),
         "the agent never acknowledged the configuration request within {}s; {}",
-        TURN_WAIT.as_secs(),
+        PROPOSAL_WAIT.as_secs(),
         evidence(&deck, &socket, &agent_id)
     );
     assert!(
-        wait_for_turn_end(&socket, &agent_id, TURN_WAIT),
-        "the agent never finished its proposal turn within {}s; {}",
-        TURN_WAIT.as_secs(),
+        wait_for_turn_end(
+            &socket,
+            &agent_id,
+            proposal_deadline.saturating_duration_since(Instant::now())
+        ),
+        "the agent acknowledged the request but never finished its proposal turn within \
+         {}s of the request; {}",
+        PROPOSAL_WAIT.as_secs(),
         evidence(&deck, &socket, &agent_id)
     );
     assert!(
@@ -264,7 +295,7 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
     }
     deck.send_keys(b"\r");
 
-    let written = common::wait_until(TURN_WAIT, || {
+    let written = common::wait_until(WRITE_WAIT, || {
         std::fs::read_to_string(&config_path).is_ok_and(|c| c.contains("[[orchestrations]]"))
     });
     assert!(
@@ -272,11 +303,11 @@ fn config_gen_003_a_real_agent_generates_a_valid_config_after_approval() {
         "no .dot-agent-deck.toml with an [[orchestrations]] table appeared in {} within {}s of \
          the approval; {}",
         workdir.display(),
-        TURN_WAIT.as_secs(),
+        WRITE_WAIT.as_secs(),
         evidence(&deck, &socket, &agent_id)
     );
     // The Write tool may still be finishing; let the turn end before reading.
-    let _ = wait_for_turn_end(&socket, &agent_id, Duration::from_secs(120));
+    let _ = wait_for_turn_end(&socket, &agent_id, WRITE_SETTLE);
     let config = std::fs::read_to_string(&config_path).unwrap();
 
     // ---- 5. The deck accepts the file.
