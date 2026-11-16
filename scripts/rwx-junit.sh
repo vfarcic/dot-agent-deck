@@ -10,7 +10,9 @@
 # one line per such task: `<task-key> <state>`, where the state is
 # `downloaded`, `missing` (the task reported tests but kept no `junit.xml`:
 # a run from before #2101 merged, or a task that died before its trap ran) or
-# `failed` (the download itself failed). `<out-dir>` defaults to
+# `failed` (the artifact lookup or the download failed; RWX's message goes to
+# stderr). A task's earlier `junit.xml` in `<out-dir>` is removed first, so a
+# file left there is always this call's. `<out-dir>` defaults to
 # `rwx-junit-<run-id>`. Exits non-zero when any task is not `downloaded`.
 #
 # The run id is the last segment of the `RWX: linux` link `gh pr checks <n>`
@@ -47,19 +49,48 @@ if [[ -z $rows ]]; then
   exit 1
 fi
 
+errfile=$(mktemp)
+trap 'rm -f "$errfile"' EXIT
+
 status=0
 while IFS=$'\t' read -r key id; do
-  if ! rwx artifacts list "$id" --json 2>/dev/null \
-      | jq -e '.Artifacts[]? | select(.Key == "junit.xml")' >/dev/null; then
+  dest="$out/$key/junit.xml"
+  # A file from an earlier call for this run must not pass for this one's.
+  rm -f "$dest"
+  # A task with no artifact at all answers `Artifacts for task … not found`
+  # and exits non-zero; any other failure of the lookup is `failed`, not
+  # `missing`, with RWX's own message on stderr.
+  # stderr apart from the JSON: the CLI also prints notices there, such as
+  # "A new release of rwx is available".
+  if ! listing=$(rwx artifacts list "$id" --json 2>"$errfile"); then
+    if grep -q 'not found' "$errfile"; then
+      echo "$key missing"
+    else
+      echo "$key failed"
+      printf '%s: rwx artifacts list %s: %s\n' "$key" "$id" "$(cat "$errfile")" >&2
+    fi
+    status=1
+    continue
+  fi
+  if ! has=$(jq -r '[.Artifacts[]? | select(.Key == "junit.xml")] | length' <<<"$listing" 2>/dev/null); then
+    echo "$key failed"
+    printf '%s: unreadable artifact listing: %s\n' "$key" "$listing" >&2
+    status=1
+    continue
+  fi
+  if [[ $has == 0 ]]; then
     echo "$key missing"
     status=1
     continue
   fi
   mkdir -p "$out/$key"
-  if rwx artifacts download "$id" junit.xml --output "$out/$key/junit.xml" >/dev/null 2>&1; then
+  if err=$(rwx artifacts download "$id" junit.xml --output "$dest.part" 2>&1 >/dev/null) \
+      && mv "$dest.part" "$dest"; then
     echo "$key downloaded"
   else
+    rm -f "$dest.part"
     echo "$key failed"
+    printf '%s: rwx artifacts download %s: %s\n' "$key" "$id" "$err" >&2
     status=1
   fi
 done <<<"$rows"
