@@ -9,7 +9,7 @@ import { desktopScenario } from "./support";
  */
 
 /** Load a fixture state and open the agent dashboard through its rail control. */
-async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-restart" | "empty"): Promise<void> {
+async function overview(page: Page, state: "docs" | "docs-fleet" | "docs-pr" | "docs-generate" | "docs-restart" | "empty"): Promise<void> {
   await page.goto(`/?fixture=1&state=${state}`);
   await expect(page.getByRole("complementary", { name: "Primary navigation" })).toBeVisible();
   await page.getByTestId("open-overview").click();
@@ -75,6 +75,19 @@ desktopScenario("host-metrics", async (page) => {
   await expect(page.getByTestId("host-metrics")).toContainText("6 GiB free of 64 GiB total (warning)");
   await expect(page.getByTestId("host-metrics")).toContainText("Memory available43.5 GiB");
   await expect(page.getByTestId("host-metrics-popover").getByRole("button", { name: "Close host" })).toBeVisible();
+});
+
+// PRD #2119 — the Generate config confirmation the TUI `generate-config` image
+// shows, opened from the Plan / architecture row's button: the fixture's
+// `docs-generate` state, whose one agent has a pane.
+desktopScenario("generate-config", async (page) => {
+  await overview(page, "docs-generate");
+  await expect(page.locator(".overview-row")).toHaveCount(1);
+  await page.getByRole("button", { name: "Generate config with Plan / architecture agent" }).click();
+  const dialog = page.getByRole("alertdialog", { name: "Generate .dot-agent-deck.toml" });
+  await expect(dialog).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "Yes", exact: true })).toBeVisible();
+  await expect(dialog.getByRole("button", { name: "No", exact: true })).toBeVisible();
 });
 
 // The two agents the TUI `restart-notice` image names, stopped by a restart of
