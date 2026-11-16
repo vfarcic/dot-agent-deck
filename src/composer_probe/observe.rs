@@ -1236,7 +1236,9 @@ impl Bell {
         self.scan.swap(false, Ordering::AcqRel)
     }
 
-    /// Whether a scan was asked for and no pass has taken it yet.
+    /// Whether a scan was asked for and no pass has taken it yet. Only the
+    /// Linux observer scans.
+    #[cfg(target_os = "linux")]
     fn scan_asked(&self) -> bool {
         self.scan.load(Ordering::Acquire)
     }
